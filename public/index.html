@@ -136,25 +136,11 @@
     </div>
 
     <div class="panel">
-      <h3>Mortgage projection</h3>
-      <div class="toolbar range-btns" id="rangeBtns">
-        <button data-months="12">1 year</button>
-        <button data-months="24">2 years</button>
-        <button data-months="60" class="active">5 years</button>
-        <button data-months="120">10 years</button>
-        <button data-months="0">All (to payoff)</button>
-        <span>Custom months: <input id="customMonths" type="number" min="1" max="600" style="width:90px"></span>
-      </div>
-      <div class="msg" id="chartMsg"></div>
-      <div class="note" id="chartSummary" style="margin-left:0"></div>
-      <div class="chart-wrap"><canvas id="mortgageChart"></canvas></div>
-    </div>
-
-    <div class="panel">
-      <h3>Assessed value trend</h3>
-      <div class="note" style="margin-left:0">One point per assessment year. Every successful BC Assessment fetch records that year's value automatically; you can add, edit or delete points by hand (for example, to fill in earlier years).</div>
+      <h3>Value vs. outstanding balance</h3>
+      <div class="note" id="equitySummary" style="margin-left:0"></div>
+      <div class="chart-wrap"><canvas id="combinedChart"></canvas></div>
+      <div class="note" style="margin-left:0">The assessed-value line shows one point per assessment year, through the last known year. Every successful BC Assessment fetch records that year's value automatically; you can add, edit or delete points by hand (for example, to fill in earlier years).</div>
       <div class="note" id="trendSummary" style="margin-left:0"></div>
-      <div class="chart-wrap" id="trendWrap"><canvas id="trendChart"></canvas></div>
       <div class="msg" id="trendMsg"></div>
       <table>
         <thead><tr><th>Year</th><th class="num">Assessed value</th><th>Source</th><th>Notes</th><th></th></tr></thead>
@@ -167,6 +153,21 @@
         <button class="primary" type="submit" id="trendSubmitBtn">Add point</button>
         <button type="button" id="trendCancelBtn" class="hidden">Cancel edit</button>
       </form>
+    </div>
+
+    <div class="panel">
+      <h3>Monthly interest &amp; payment</h3>
+      <div class="toolbar range-btns" id="rangeBtns">
+        <button data-months="12">1 year</button>
+        <button data-months="24">2 years</button>
+        <button data-months="60" class="active">5 years</button>
+        <button data-months="120">10 years</button>
+        <button data-months="0">All (to payoff)</button>
+        <span>Custom months: <input id="customMonths" type="number" min="1" max="600" style="width:90px"></span>
+      </div>
+      <div class="msg" id="monthlyMsg"></div>
+      <div class="note" id="monthlySummary" style="margin-left:0"></div>
+      <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
     </div>
   </section>
 

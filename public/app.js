@@ -385,9 +385,15 @@ $('#addPropForm').addEventListener('submit', async (e) => {
 });
 
 // ---------------------------------------------------------- property detail ---
-let chart = null;
+let chartA = null; // combined chart: assessed value vs outstanding balance
+let chartB = null; // monthly chart: interest vs payment
 let fullSeries = [];
 let chartMeta = null;
+let amortError = null; // last non-ok amortization response ({ error, code })
+let detailProperty = null;
+let equityData = null;
+// Test/debug hook: lets the screenshot script read the live chart configs.
+window.__fmCharts = { a: null, b: null };
 
 function photoSrc(p) {
   if (p.photo_file) return `/photos/${p.photo_file}`;
@@ -397,6 +403,7 @@ function photoSrc(p) {
 
 async function loadPropertyDetail(id) {
   const p = await api(`/api/properties/${id}`);
+  detailProperty = p;
   const src = photoSrc(p);
   $('#photoArea').innerHTML = src
     ? `<img class="detail-photo" src="${esc(src)}" alt="">`
@@ -425,6 +432,7 @@ async function loadPropertyDetail(id) {
   renderSegments(p.segments);
   loadChart(id);
   loadTrend(id);
+  loadEquity(id);
 }
 
 function renderSegments(segments) {
@@ -520,8 +528,9 @@ $('#deletePropertyBtn').addEventListener('click', async () => {
 
 // ------------------------------------------------------------ value trend ---
 // Assessed-value history: one point per year. Auto points are written by
-// BC Assessment fetches; manual points fill earlier years by hand.
-let trendChart = null;
+// BC Assessment fetches; manual points fill earlier years by hand. The
+// points are drawn as the assessed-value line of the combined chart (A);
+// the table below it stays the editor for the points.
 let trendPoints = [];
 let trendEditingId = null;
 
@@ -548,26 +557,8 @@ async function loadTrend(id) {
   } else {
     summary.textContent = 'No history yet — fetch from BC Assessment or add a point below.';
   }
-  const ctx = $('#trendChart');
-  if (trendChart) { trendChart.destroy(); trendChart = null; }
-  if (trendPoints.length) {
-    trendChart = new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: trendPoints.map((pt) => String(pt.year)),
-        datasets: [{
-          label: 'Assessed value',
-          data: trendPoints.map((pt) => pt.value),
-          borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-          tension: 0.15, pointRadius: 4, borderWidth: 2,
-        }],
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        scales: { y: { title: { display: true, text: 'Assessed value ($)' } } },
-      },
-    });
-  }
+  renderDetailCharts();
+  loadEquity(id); // a changed latest point moves the equity readout too
 }
 
 function resetTrendForm() {
@@ -613,22 +604,33 @@ $('#trendForm').addEventListener('submit', async (e) => {
 });
 $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 
-// ------------------------------------------------------------------- chart ---
+// ------------------------------------------------------------------ charts --
+// Two charts, both driven by the same data:
+//   A (combined): assessed value (yearly history points) vs outstanding
+//     balance (monthly projection) on ONE axis — the gap is the equity.
+//     The assessed line stops at the last known year; it is deliberately
+//     NOT extended into the future (no invented forecast).
+//   B (monthly): monthly interest vs monthly payment (both monthly flows).
+// The projection only ever comes from the user's own rate plan (segments);
+// with no plan the API reports NO_RATE_PLAN and chart B stays empty with
+// a prompt instead of a made-up line.
 async function loadChart(id) {
-  const msg = $('#chartMsg');
-  msg.className = 'msg';
   const r = await api(`/api/properties/${id}/amortization`);
   if (!r.ok) {
     fullSeries = [];
     chartMeta = null;
-    showMsg(msg, 'warn', r.error);
-    $('#chartSummary').textContent = '';
-    if (chart) { chart.destroy(); chart = null; }
-    return;
+    amortError = r;
+  } else {
+    fullSeries = r.series;
+    chartMeta = r;
+    amortError = null;
   }
-  fullSeries = r.series;
-  chartMeta = r;
-  drawChart(currentRangeMonths());
+  renderDetailCharts();
+}
+
+async function loadEquity(id) {
+  equityData = await api(`/api/properties/${id}/equity`);
+  renderEquity();
 }
 
 function currentRangeMonths() {
@@ -638,40 +640,143 @@ function currentRangeMonths() {
   return active ? Number(active.dataset.months) : 60;
 }
 
-function drawChart(months) {
-  if (!fullSeries.length) return;
+// 'YYYY-MM' / 'YYYY-MM-DD' -> fractional year (January = .0), for chart A's
+// linear time axis (the vendored Chart.js has no date adapter).
+function ymDecimal(s) {
+  const [y, m] = String(s).split('-').map(Number);
+  return y + (m - 1) / 12;
+}
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function formatYearTick(x) {
+  const y = Math.floor(x);
+  const m = Math.round((x - y) * 12);
+  if (m <= 0) return String(y);
+  if (m >= 12) return String(y + 1);
+  return `${MONTH_NAMES[m]} ${y}`;
+}
+
+function renderEquity() {
+  const el = $('#equitySummary');
+  if (!el) return;
+  const a = equityData;
+  if (!a) { el.textContent = ''; return; }
+  if (a.assessedValue !== null && a.balance !== null) {
+    el.textContent =
+      `Current equity: ${money(a.equity)} — latest assessed value ${money(a.assessedValue)}` +
+      `${a.assessedYear ? ` (${a.assessedYear})` : ''} minus outstanding balance ${money(a.balance)}.`;
+  } else if (a.assessedValue !== null) {
+    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add an outstanding balance in the Mortgage panel to see the equity.`;
+  } else if (a.balance !== null) {
+    el.textContent = `Outstanding balance: ${money(a.balance)}. Fetch the assessed value from BC Assessment (or add a value-history point below) to see the equity.`;
+  } else {
+    el.textContent = 'Equity appears here once an assessed value and an outstanding balance are on record.';
+  }
+}
+
+function renderDetailCharts() {
+  renderEquity();
+  drawCombinedChart();
+  drawMonthlyChart();
+}
+
+function drawCombinedChart() {
+  const ctx = $('#combinedChart');
+  if (!ctx) return;
+  if (chartA) { chartA.destroy(); chartA = null; }
+  window.__fmCharts.a = null;
+  const datasets = [];
+  if (trendPoints.length) {
+    datasets.push({
+      label: 'Assessed value',
+      data: trendPoints.map((pt) => ({ x: pt.year, y: pt.value })),
+      borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
+      tension: 0.15, pointRadius: 4, borderWidth: 2,
+    });
+  }
+  if (chartMeta && fullSeries.length) {
+    const months = currentRangeMonths();
+    const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
+    const pts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
+      ...rows.map((r) => ({ x: ymDecimal(r.month), y: r.balance }))];
+    datasets.push({
+      label: 'Outstanding balance',
+      data: pts,
+      borderColor: '#1668c4', backgroundColor: '#1668c4',
+      tension: 0.15, pointRadius: 0, borderWidth: 2,
+    });
+  }
+  if (!datasets.length) return;
+  chartA = new Chart(ctx, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'nearest', intersect: false },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            title: (items) => formatYearTick(items[0].parsed.x),
+            label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}`,
+          },
+        },
+      },
+      scales: {
+        x: { type: 'linear', ticks: { stepSize: 1, maxTicksLimit: 12, callback: formatYearTick } },
+        y: { title: { display: true, text: 'Amount ($)' } },
+      },
+    },
+  });
+  window.__fmCharts.a = chartA;
+}
+
+function drawMonthlyChart() {
+  const ctx = $('#monthlyChart');
+  if (!ctx) return;
+  if (chartB) { chartB.destroy(); chartB = null; }
+  window.__fmCharts.b = null;
+  const msg = $('#monthlyMsg');
+  const summaryEl = $('#monthlySummary');
+  msg.className = 'msg';
+  summaryEl.textContent = '';
+  if (!chartMeta) {
+    if (amortError && amortError.code === 'NO_RATE_PLAN') {
+      showMsg(msg, 'warn', 'Add a rate plan to see the projection — add a rate segment in the Rate segments panel above, and both charts will be calculated from it.');
+    } else if (amortError && amortError.code === 'NO_PAYMENT') {
+      showMsg(msg, 'warn', 'To project the mortgage, enter a monthly payment or a remaining amortization in the Mortgage panel above.');
+    } else if (amortError) {
+      showMsg(msg, 'warn', amortError.error);
+    }
+    return;
+  }
+  const months = currentRangeMonths();
   const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
+  if (!rows.length) return;
   const totalInterest = rows.reduce((s, r) => s + r.interest, 0);
   const bits = [
     `Monthly payment used: ${money(chartMeta.paymentUsed)}${chartMeta.paymentSource === 'derived' ? ' (derived from remaining amortization)' : ''}`,
     `Interest in this range: ${money(totalInterest)}`,
     chartMeta.payoffMonth ? `Projected payoff: ${chartMeta.payoffMonth}` : 'Not paid off within the projection window',
   ];
-  if (!chartMeta.hasRates) bits.push('No rate segments set — projecting at 0%');
-  $('#chartSummary').textContent = bits.join(' · ');
-  const msg = $('#chartMsg');
+  summaryEl.textContent = bits.join(' · ');
   if (chartMeta.negativeAmortization) {
     showMsg(msg, 'warn', 'Warning: the monthly payment is below the monthly interest in some months (negative amortization) — the balance grows there.');
-  } else msg.className = 'msg';
-
-  const ctx = $('#mortgageChart');
-  if (chart) chart.destroy();
-  chart = new Chart(ctx, {
+  }
+  chartB = new Chart(ctx, {
     type: 'line',
     data: {
       labels: rows.map((r) => r.month),
       datasets: [
         {
-          label: 'Remaining balance',
-          data: rows.map((r) => r.balance),
-          borderColor: '#1668c4', backgroundColor: '#1668c4',
-          yAxisID: 'y', tension: 0.15, pointRadius: 0, borderWidth: 2,
-        },
-        {
           label: 'Monthly interest',
           data: rows.map((r) => r.interest),
           borderColor: '#d97706', backgroundColor: '#d97706',
-          yAxisID: 'y1', tension: 0.15, pointRadius: 0, borderWidth: 2,
+          tension: 0.15, pointRadius: 0, borderWidth: 2,
+        },
+        {
+          label: `Monthly payment (${chartMeta.paymentSource === 'derived' ? 'derived from amortization' : 'entered'})`,
+          data: rows.map((r) => r.payment),
+          borderColor: '#7c3aed', backgroundColor: '#7c3aed',
+          tension: 0.15, pointRadius: 0, borderWidth: 2,
         },
       ],
     },
@@ -679,12 +784,12 @@ function drawChart(months) {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        y: { type: 'linear', position: 'left', title: { display: true, text: 'Remaining balance ($)' } },
-        y1: { type: 'linear', position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Monthly interest ($)' } },
+        y: { title: { display: true, text: 'Monthly amount ($)' } },
         x: { ticks: { maxTicksLimit: 12 } },
       },
     },
   });
+  window.__fmCharts.b = chartB;
 }
 
 $('#rangeBtns').addEventListener('click', (e) => {
@@ -692,11 +797,11 @@ $('#rangeBtns').addEventListener('click', (e) => {
   if (!btn) return;
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.toggle('active', b === btn));
   $('#customMonths').value = '';
-  drawChart(Number(btn.dataset.months));
+  renderDetailCharts();
 });
 $('#customMonths').addEventListener('change', () => {
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.remove('active'));
-  drawChart(currentRangeMonths());
+  renderDetailCharts();
 });
 
 // -------------------------------------------------------------------- misc ---

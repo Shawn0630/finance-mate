@@ -159,6 +159,13 @@ try {
   r = await req('GET', '/api/summary');
   check('summary other assets back to 0', r.data.otherAssets === 0);
 
+  // Equity endpoint: no history points on pid, so the stored manual
+  // assessed value is the latest value: 800000 - 100000 = 700000.
+  r = await req('GET', `/api/properties/${pid}/equity`);
+  check('equity uses stored assessed value when no history',
+    r.data.assessedValue === 800000 && r.data.balance === 100000 && r.data.equity === 700000,
+    JSON.stringify(r.data));
+
   // A property created from a picked suggestion stores the BC Assessment
   // property id; fetching its value then goes straight to the property
   // page (no new address search) and returns the stubbed GIS values.
@@ -218,6 +225,47 @@ try {
   const pt2024 = r.data.points.find((p) => p.year === 2024);
   r = await req('DELETE', `/api/properties/${pid2}/value-history/${pt2024.id}`);
   check('history point deleted, change now starts 2025', r.data.points.length === 2 && r.data.change && r.data.change.fromYear === 2025);
+
+  // Equity with history: the newest history point (2026, 6532000) is the
+  // latest assessed value; 6532000 - 900000 = 5632000.
+  r = await req('PUT', `/api/properties/${pid2}`, { mortgage_balance: 900000 });
+  check('set balance on pid2 for equity', r.status === 200);
+  r = await req('GET', `/api/properties/${pid2}/equity`);
+  check('equity uses newest history point',
+    r.data.assessedValue === 6532000 && r.data.assessedYear === 2026 && r.data.balance === 900000 && r.data.equity === 5632000,
+    JSON.stringify(r.data));
+
+  // Rate-plan chain: a property with balance + payment but NO rate
+  // segments gets no projection at all (never a hidden default rate);
+  // adding a segment produces numbers that follow that segment, and
+  // editing the segment's rate changes the numbers.
+  r = await req('POST', '/api/properties', {
+    address: '9 Rateplan Road, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+  });
+  check('create rate-plan chain property', r.status === 201);
+  const pid3 = r.data.id;
+  r = await req('GET', `/api/properties/${pid3}/amortization`);
+  check('no rate plan -> NO_RATE_PLAN and no series',
+    r.data.ok === false && r.data.code === 'NO_RATE_PLAN' && !r.data.series,
+    JSON.stringify(r.data).slice(0, 160));
+  r = await req('POST', `/api/properties/${pid3}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('add first rate segment', r.status === 201);
+  const seg3 = r.data.id;
+  r = await req('GET', `/api/properties/${pid3}/amortization`);
+  check('projection appears with the segment',
+    r.data.ok === true && Math.abs(r.data.series[0].interest - 412.39) <= 0.02,
+    r.data.series && String(r.data.series[0].interest));
+  check('amortization carries balance + balanceDate for chart A',
+    r.data.balance === 100000 && r.data.balanceDate === '2026-10-01');
+  r = await req('PUT', `/api/properties/${pid3}/rates/${seg3}`, { annual_rate: 6 });
+  check('edit segment rate', r.status === 200 && r.data.annual_rate === 6);
+  r = await req('GET', `/api/properties/${pid3}/amortization`);
+  check('projection follows the edited rate (6% -> 493.86)',
+    r.data.ok === true && Math.abs(r.data.series[0].interest - 493.86) <= 0.02,
+    r.data.series && String(r.data.series[0].interest));
+  r = await req('DELETE', `/api/properties/${pid3}`);
+  check('delete rate-plan chain property', r.status === 200);
 
   // Segment delete + property delete paths.
   r = await req('DELETE', `/api/properties/${pid}/rates/${segId}`);

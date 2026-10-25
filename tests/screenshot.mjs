@@ -110,21 +110,26 @@ const firstId = await page.evaluate(async () => {
 await page.goto(`http://ff.local/#property/${firstId}`, { waitUntil: 'networkidle0', timeout: 30000 });
 await wait(2500);
 const chartInfo = await page.evaluate(() => {
-  const c = document.getElementById('mortgageChart');
-  return { summary: document.getElementById('chartSummary').textContent, canvasH: c ? c.height : 0 };
+  const c = document.getElementById('combinedChart');
+  return {
+    equity: document.getElementById('equitySummary').textContent,
+    summary: document.getElementById('monthlySummary').textContent,
+    canvasH: c ? c.height : 0,
+  };
 });
+console.log('equity:', chartInfo.equity);
 console.log('chart summary:', chartInfo.summary);
 await page.screenshot({ path: path.join(OUT, 'property-detail.png'), fullPage: true });
 console.log('property-detail.png', fs.statSync(path.join(OUT, 'property-detail.png')).size);
 
-// 4. Chart close-up (element screenshot of the projection panel).
+// 4. Combined-chart close-up (element screenshot of chart A's panel).
 const panel = await page.evaluateHandle(() => {
-  const c = document.getElementById('mortgageChart');
+  const c = document.getElementById('combinedChart');
   let el = c;
   while (el && !el.classList.contains('panel')) el = el.parentElement;
   return el;
 });
-await panel.asElement().screenshot({ path: path.join(OUT, 'chart.png') });
-console.log('chart.png', fs.statSync(path.join(OUT, 'chart.png')).size);
+await panel.asElement().screenshot({ path: path.join(OUT, 'combined-chart.png') });
+console.log('combined-chart.png', fs.statSync(path.join(OUT, 'combined-chart.png')).size);
 
 await browser.close();

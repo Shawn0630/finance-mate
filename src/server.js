@@ -422,9 +422,12 @@ app.delete('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
 });
 
 // ------------------------------------------------------- mortgage chart ---
-// Monthly projection from the stored balance. The monthly payment stored on
-// the property wins; otherwise it is derived from the remaining
-// amortization years and the rate in effect for the first projected month.
+// Monthly projection from the stored balance. The projection is computed
+// ONLY from the user's own rate plan (the rate segments): there is no
+// default or assumed rate anywhere. With no segments the endpoint reports
+// a NO_RATE_PLAN state instead of projecting at 0%. The monthly payment
+// stored on the property wins; otherwise it is derived from the balance,
+// the rate plan and the remaining amortization years.
 app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -432,12 +435,15 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
   if (p.mortgage_balance === null || p.mortgage_balance === undefined || !(p.mortgage_balance > 0)) {
     return res.json({ ok: false, error: 'no mortgage balance recorded for this property', segments });
   }
+  if (segments.length === 0) {
+    return res.json({ ok: false, code: 'NO_RATE_PLAN', error: 'no rate plan yet', segments });
+  }
   const balanceDate = p.mortgage_balance_date || new Date().toISOString().slice(0, 10);
   let payment = p.mortgage_payment;
   let paymentSource = 'entered';
   if (!(payment > 0)) {
     if (!(p.amortization_years > 0)) {
-      return res.json({ ok: false, error: 'enter a monthly payment or a remaining amortization (years) to project the mortgage', segments });
+      return res.json({ ok: false, code: 'NO_PAYMENT', error: 'enter a monthly payment or a remaining amortization (years) to project the mortgage', segments });
     }
     const firstMonth = balanceDate.slice(0, 7);
     const seg = segmentForMonth(segments, firstMonth);
@@ -447,13 +453,34 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
   const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments });
   res.json({
     ok: true,
+    balance: p.mortgage_balance,
+    balanceDate,
     paymentUsed: payment,
     paymentSource,
-    hasRates: segments.length > 0,
     series: r.series,
     totalInterest: r.totalInterest,
     payoffMonth: r.payoffMonth,
     negativeAmortization: r.negativeAmortization,
+  });
+});
+
+// Equity snapshot for the detail page: the latest assessed value (the
+// newest value-history point when there is one, else the value stored on
+// the property) minus the current outstanding balance. Either side may be
+// missing; the missing side comes back null and equity is null.
+app.get('/api/properties/:id/equity', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const points = historyPoints(p.id);
+  const latest = points.length ? points[points.length - 1] : null;
+  const assessed = latest ? latest.value : (p.assessed_value ?? null);
+  const assessedYear = latest ? latest.year : (p.assessed_year ?? null);
+  const balance = p.mortgage_balance ?? null;
+  res.json({
+    assessedValue: assessed,
+    assessedYear,
+    balance,
+    equity: assessed !== null && balance !== null ? assessed - balance : null,
   });
 });
 
