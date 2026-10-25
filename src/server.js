@@ -154,6 +154,15 @@ app.get('/api/properties', requireApiAuth, (req, res) => {
 app.post('/api/properties', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!b.address || !String(b.address).trim()) return res.status(400).json({ error: 'address is required' });
+  // Adding a property takes just the essentials (address + outstanding
+  // balance; owner optional). The balance is the CURRENT balance, so its
+  // date defaults to today unless one is supplied. Everything else
+  // (payment, amortization, segments, notes, photo) is filled in later
+  // on the detail page.
+  const balance = num(b.mortgage_balance);
+  if (balance === null || balance < 0) {
+    return res.status(400).json({ error: 'mortgage balance (outstanding balance) is required' });
+  }
   const bcaId = b.bca_id ? String(b.bca_id) : null;
   const own = cleanOwner(b.owner, true);
   if (own.error) return res.status(400).json({ error: own.error });
@@ -169,8 +178,8 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       num(b.assessed_value),
       num(b.assessed_year),
       b.assessed_value != null ? 'manual' : null,
-      num(b.mortgage_balance),
-      b.mortgage_balance_date || null,
+      balance,
+      b.mortgage_balance_date || new Date().toISOString().slice(0, 10),
       num(b.mortgage_payment),
       num(b.amortization_years),
       b.notes || null,

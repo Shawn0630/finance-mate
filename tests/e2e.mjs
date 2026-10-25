@@ -169,7 +169,7 @@ try {
   // A property created from a picked suggestion stores the BC Assessment
   // property id; fetching its value then goes straight to the property
   // page (no new address search) and returns the stubbed GIS values.
-  r = await req('POST', '/api/properties', { address: '1200 Government St, Victoria', bca_id: 'QkxPQy0xMjAw' });
+  r = await req('POST', '/api/properties', { address: '1200 Government St, Victoria', bca_id: 'QkxPQy0xMjAw', mortgage_balance: 500000 });
   check('create property with picked bca_id', r.status === 201 && r.data.bca_id === 'QkxPQy0xMjAw');
   const pid2 = r.data.id;
   const searchBeforeFetch = stubHits.search;
@@ -183,12 +183,12 @@ try {
 
   // Owner rules: properties may be Joint or any user; other assets may
   // be a user but never Joint.
-  r = await req('POST', '/api/properties', { address: '1 Owner Way', owner: 'Joint' });
+  r = await req('POST', '/api/properties', { address: '1 Owner Way', owner: 'Joint', mortgage_balance: 100000 });
   check('property can have Joint owner', r.status === 201 && r.data.owner === 'Joint');
   const pidOwn = r.data.id;
   r = await req('PUT', `/api/properties/${pidOwn}`, { owner: 'Shawn' });
   check('property owner can be a user', r.status === 200 && r.data.owner === 'Shawn');
-  r = await req('POST', '/api/properties', { address: '2 Owner Way', owner: 'Nobody' });
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owner: 'Nobody', mortgage_balance: 100000 });
   check('property with unknown owner rejected', r.status === 400);
   r = await req('POST', '/api/assets', { category: 'other', name: 'Joint test', owner: 'Joint' });
   check('other asset with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
@@ -266,6 +266,25 @@ try {
     r.data.series && String(r.data.series[0].interest));
   r = await req('DELETE', `/api/properties/${pid3}`);
   check('delete rate-plan chain property', r.status === 200);
+
+  // Slim add: only address + owner + outstanding balance. The balance
+  // date defaults to today (current-balance semantics); payment and
+  // amortization stay empty for the detail page to fill in, and with no
+  // rate plan yet the projection is the NO_RATE_PLAN prompt state.
+  r = await req('POST', '/api/properties', { address: '7 Slim Lane, Victoria, BC', owner: 'Shawn' });
+  check('add without balance rejected', r.status === 400 && String(r.data.error || '').includes('balance'), JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', {
+    address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456,
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  check('slim add (3 fields) creates the property', r.status === 201 && r.data.mortgage_balance === 123456, JSON.stringify(r.data).slice(0, 160));
+  check('balance date defaults to today', r.data.mortgage_balance_date === today, String(r.data.mortgage_balance_date));
+  check('payment/amortization left empty at add', (r.data.mortgage_payment ?? null) === null && (r.data.amortization_years ?? null) === null);
+  const pidSlim = r.data.id;
+  r = await req('GET', `/api/properties/${pidSlim}/amortization`);
+  check('slim-added property sits in NO_RATE_PLAN state', r.data.ok === false && r.data.code === 'NO_RATE_PLAN');
+  r = await req('DELETE', `/api/properties/${pidSlim}`);
+  check('delete slim property', r.status === 200);
 
   // Segment delete + property delete paths.
   r = await req('DELETE', `/api/properties/${pid}/rates/${segId}`);

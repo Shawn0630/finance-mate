@@ -167,6 +167,19 @@ try {
   await panel.asElement().screenshot({ path: path.join(OUT, 'combined-chart.png') });
   console.log('combined-chart.png', fs.statSync(path.join(OUT, 'combined-chart.png')).size);
   if (!equityOk || !aOk || !bOk) process.exitCode = 1;
+
+  // The Add property modal (fields change as the form evolves; this
+  // captures whatever the current slim form looks like).
+  await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+  await wait(800);
+  await page.click('#addPropertyBtn');
+  await wait(600);
+  const modalFields = await page.evaluate(() =>
+    [...document.querySelectorAll('#addPropForm label')].map((l) => l.textContent.trim()));
+  console.log('add-modal fields:', JSON.stringify(modalFields));
+  const modal = await page.evaluateHandle(() => document.querySelector('#propertyModal .modal-card'));
+  await modal.asElement().screenshot({ path: path.join(OUT, 'add-property-modal.png') });
+  console.log('add-property-modal.png', fs.statSync(path.join(OUT, 'add-property-modal.png')).size);
 } finally {
   if (browser) await browser.close();
   server.kill('SIGTERM');

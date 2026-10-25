@@ -183,20 +183,12 @@
     <div class="modal-head"><h3>Add a property</h3><button class="small" data-close-modal>Close</button></div>
     <div class="msg" id="addPropMsg"></div>
     <form id="addPropForm">
+      <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" placeholder="Start typing — suggestions come from BC Assessment" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
       <div class="grid2">
-        <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" placeholder="Start typing — suggestions come from BC Assessment" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
         <div><label>Owner</label><select name="owner" id="addPropOwner"></select></div>
+        <div><label>Outstanding balance ($) *</label><input name="mortgage_balance" type="number" step="0.01" min="0" required></div>
       </div>
-      <div class="grid2">
-        <div><label>Notes</label><input name="notes"></div>
-        <div><label>Mortgage balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
-      </div>
-      <div class="grid3">
-        <div><label>Balance as of</label><input name="mortgage_balance_date" type="date"></div>
-        <div><label>Monthly payment ($)</label><input name="mortgage_payment" type="number" step="0.01" min="0"></div>
-        <div><label>Remaining amortization (years)</label><input name="amortization_years" type="number" step="0.5" min="0"></div>
-      </div>
-      <div class="note" style="margin-left:0">Remaining amortization is used to derive the payment when no monthly payment is entered. After adding, the app tries to fetch the assessed value from BC Assessment automatically. You can refine everything on the detail page.</div>
+      <div class="note" style="margin-left:0">Just the essentials — the balance counts as of today. Monthly payment, rate segments, notes and photos can all be filled in afterwards on the property's detail page. After adding, the app tries to fetch the assessed value from BC Assessment automatically.</div>
       <div class="toolbar">
         <button class="primary" type="submit">Add property</button>
         <button type="button" data-close-modal>Cancel</button>
