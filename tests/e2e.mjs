@@ -1001,6 +1001,62 @@ try {
       const pastedProp = (r.data || []).find((p) => p.address.includes('998 Money Test Terrace'));
       check('pasted grouped balance stored as the plain number 1350000',
         !!pastedProp && pastedProp.mortgage_balance === 1350000, JSON.stringify(pastedProp && pastedProp.mortgage_balance));
+
+      // Assessed-history window: a property with 8 years on record
+      // (2019-2026) draws only the most recent 5 by default; the range
+      // buttons widen it (All = every year) and the trend summary is
+      // calculated over the same window the chart shows.
+      r = await req('POST', '/api/properties', { address: '977 Window Test Way, Victoria, BC', purchase_date: '2020-01-15', mortgage_balance: 500000 });
+      const winPid = r.data.id;
+      for (let y = 2019; y <= 2026; y++) {
+        await req('POST', `/api/properties/${winPid}/value-history`, { year: y, value: 1000000 + (y - 2019) * 50000 });
+      }
+      await page.goto(`http://ff.local/#property/${winPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const assessedYears = () => page.evaluate(() => {
+        const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Assessed value');
+        return ds ? ds.data.map((p) => p.x) : null;
+      });
+      const winDefault = await assessedYears();
+      check('detail chart A defaults to the most recent 5 assessment years (2022-2026)',
+        JSON.stringify(winDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winDefault));
+      const sumDefault = await page.evaluate(() => document.querySelector('#trendSummary').textContent);
+      check('trend summary is calculated over the displayed 5-year window',
+        sumDefault.includes('Change 2022 → 2026') && sumDefault.includes('most recent 5 years'), sumDefault);
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
+      await wait(600);
+      const winAll = await assessedYears();
+      check('range All widens the assessed line to all 8 years (2019-2026)',
+        JSON.stringify(winAll) === JSON.stringify([2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]), JSON.stringify(winAll));
+      const sumAll = await page.evaluate(() => document.querySelector('#trendSummary').textContent);
+      check('trend summary follows the widened window', sumAll.includes('Change 2019 → 2026'), sumAll);
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="60"]').click());
+      await wait(600);
+      const winBack = await assessedYears();
+      check('switching back to 5 years restores the 2022-2026 window',
+        JSON.stringify(winBack) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winBack));
+
+      // Portfolio combined chart: the same default window applies to
+      // its assessed line (years are the union across properties; this
+      // fixture's 2019 is the earliest year on record).
+      await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+      // A hash jump reuses the section's cached load (assetsLoaded), so
+      // reload once to make the portfolio read the fixture just created.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const pfYears = () => page.evaluate(() => {
+        const c = window.__fmCharts.portfolio;
+        const ds = c ? c.data.datasets.find((d) => d.label === 'Assessed value (all properties)') : null;
+        return ds ? ds.data.map((p) => p.x) : null;
+      });
+      const pfDefault = await pfYears();
+      check('portfolio assessed line defaults to the most recent 5 years',
+        JSON.stringify(pfDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(pfDefault));
+      await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="0"]').click());
+      await wait(600);
+      const pfAll = await pfYears();
+      check('portfolio All range widens the assessed line to every recorded year',
+        Array.isArray(pfAll) && pfAll.length === 8 && pfAll[0] === 2019 && pfAll[pfAll.length - 1] === 2026, JSON.stringify(pfAll));
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

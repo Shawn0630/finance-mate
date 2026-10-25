@@ -673,11 +673,14 @@ function drawPortfolioChart() {
   window.__fmCharts.portfolio = null;
   const rows = pfRangeRows();
   const datasets = [];
-  if (portfolioData.assessedByYear.length) {
+  // Same assessed-history window as the detail page: most recent
+  // 5 years by default, the range buttons widen it (All = all years).
+  const assessedRows = lastYearsWindow(portfolioData.assessedByYear, pfRangeMonths);
+  if (assessedRows.length) {
     datasets.push({
       type: 'line',
       label: 'Assessed value (all properties)',
-      data: portfolioData.assessedByYear.map((y) => ({ x: y.year, y: y.total })),
+      data: assessedRows.map((y) => ({ x: y.year, y: y.total })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
       tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
     });
@@ -1050,19 +1053,36 @@ async function loadTrend(id) {
       <button class="small danger" onclick="deleteTrendPoint(${pt.id})">Delete</button>
     </td></tr>`).join('');
   $('#trendRows').innerHTML = rows || '<tr><td colspan="5" class="note" style="margin:0">No history points yet.</td></tr>';
+  renderTrendSummary();
+  renderDetailCharts();
+  loadEquity(id); // a changed latest point moves the equity readout too
+}
+
+// Trend summary: computed over the SAME years the combined chart
+// currently shows (see lastYearsWindow), so the figure can never
+// describe a different span than the line on screen. When earlier
+// years are hidden by the window, the text says so.
+function renderTrendSummary() {
   const summary = $('#trendSummary');
-  if (r.change) {
-    const sign = r.change.abs >= 0 ? '+' : '−';
-    const absTxt = money(Math.abs(r.change.abs));
-    const pctTxt = r.change.pct === null ? '' : ` (${r.change.pct >= 0 ? '+' : ''}${r.change.pct.toFixed(1)}%)`;
-    summary.textContent = `Change ${r.change.fromYear} → ${r.change.toYear}: ${sign}${absTxt}${pctTxt} (${money(r.change.from)} → ${money(r.change.to)}).`;
+  if (!summary) return;
+  const shown = lastYearsWindow(trendPoints, currentRangeMonths());
+  if (shown.length >= 2) {
+    const first = shown[0];
+    const last = shown[shown.length - 1];
+    const abs = last.value - first.value;
+    const sign = abs >= 0 ? '+' : '−';
+    const pctTxt = first.value ? ` (${abs >= 0 ? '+' : ''}${(abs / first.value * 100).toFixed(1)}%)` : '';
+    summary.textContent = `Change ${first.year} → ${last.year}: ${sign}${money(Math.abs(abs))}${pctTxt} (${money(first.value)} → ${money(last.value)}).`
+      + (shown.length < trendPoints.length
+        ? ` Showing the most recent ${shown.length} years, as in the chart — set the chart range to All to include earlier years.`
+        : '');
+  } else if (shown.length === 1 && trendPoints.length > 1) {
+    summary.textContent = `Only the ${shown[0].year} point falls in the selected chart range — widen the range to compare years.`;
   } else if (trendPoints.length === 1) {
     summary.textContent = 'Only one year on record — add earlier years below to see the trend.';
   } else {
     summary.textContent = 'No history yet — fetch from BC Assessment or add a point below.';
   }
-  renderDetailCharts();
-  loadEquity(id); // a changed latest point moves the equity readout too
 }
 
 function resetTrendForm() {
@@ -1145,6 +1165,22 @@ function currentRangeMonths() {
   return active ? Number(active.dataset.months) : 60;
 }
 
+// Assessed-history window: the charts show only the most recent years
+// of assessed history by default — the last 5 assessment years. The
+// window follows the chart range controls: a range of N months shows
+// the last ceil(N/12) assessment years, and "All" (0 months) shows
+// every year on record. The choice lives in the range buttons
+// themselves, so re-renders (new points, fresh data) keep the user's
+// window instead of snapping back to the default. Items need a `year`;
+// history points and the portfolio's per-year rows both qualify. The
+// underlying records are never touched — this only picks what draws.
+function lastYearsWindow(items, months) {
+  if (!items.length || !(months > 0)) return items;
+  const years = Math.max(1, Math.ceil(months / 12));
+  const maxYear = Math.max(...items.map((i) => i.year));
+  return items.filter((i) => i.year > maxYear - years);
+}
+
 // 'YYYY-MM' / 'YYYY-MM-DD' -> fractional year (January = .0), for chart A's
 // linear time axis (the vendored Chart.js has no date adapter).
 function ymDecimal(s) {
@@ -1180,6 +1216,7 @@ function renderEquity() {
 
 function renderDetailCharts() {
   renderEquity();
+  renderTrendSummary(); // the summary follows the chart's current window
   drawCombinedChart();
   drawMonthlyChart();
 }
@@ -1190,16 +1227,19 @@ function drawCombinedChart() {
   if (chartA) { chartA.destroy(); chartA = null; }
   window.__fmCharts.a = null;
   const datasets = [];
+  const months = currentRangeMonths();
   if (trendPoints.length) {
+    // Assessed history defaults to the most recent 5 years; the range
+    // buttons widen it (All = every year on record).
+    const shown = lastYearsWindow(trendPoints, months);
     datasets.push({
       label: 'Assessed value',
-      data: trendPoints.map((pt) => ({ x: pt.year, y: pt.value })),
+      data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
       tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
     });
   }
   if (chartMeta && fullSeries.length) {
-    const months = currentRangeMonths();
     const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
     const pts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
       ...rows.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
