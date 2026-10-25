@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Family Finance</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/vendor/chart.umd.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Family Finance</div>
+  <nav id="mainNav">
+    <a href="#assets" data-nav="assets" class="active">Assets</a>
+    <a href="#spending" data-nav="spending">Spending</a>
+    <a href="#planning" data-nav="planning">Planning</a>
+    <a href="#tax" data-nav="tax">Tax</a>
+  </nav>
+  <div class="spacer"></div>
+  <span class="user" id="whoami"></span>
+  <button id="logoutBtn" class="small">Sign out</button>
+</header>
+<main>
+  <!-- ============================== Assets ============================== -->
+  <section id="view-assets">
+    <div class="summary-strip">
+      <div class="summary-card"><div class="k">Property value (assessed)</div><div class="v" id="sumProperty">—</div></div>
+      <div class="summary-card"><div class="k">Mortgage balance</div><div class="v" id="sumMortgage">—</div></div>
+      <div class="summary-card"><div class="k">Other assets</div><div class="v" id="sumOther">—</div></div>
+      <div class="summary-card"><div class="k">Net worth</div><div class="v" id="sumNet">—</div></div>
+    </div>
+    <div class="note">Property values are BC Assessment assessed values, not market prices.</div>
+
+    <h2>Properties</h2>
+    <div class="cards" id="propertyCards"></div>
+
+    <div class="panel" style="margin-top:14px">
+      <h3>Add a property</h3>
+      <div class="msg" id="addPropMsg"></div>
+      <form id="addPropForm">
+        <div class="grid2">
+          <div><label>Address *</label><input name="address" placeholder="1234 Example Street, Victoria, BC" required></div>
+          <div><label>Notes</label><input name="notes"></div>
+        </div>
+        <div class="grid3">
+          <div><label>Mortgage balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
+          <div><label>Balance as of</label><input name="mortgage_balance_date" type="date"></div>
+          <div><label>Monthly payment ($)</label><input name="mortgage_payment" type="number" step="0.01" min="0"></div>
+        </div>
+        <div class="grid3">
+          <div><label>Remaining amortization (years) — used to derive the payment when no monthly payment is entered</label><input name="amortization_years" type="number" step="0.5" min="0"></div>
+        </div>
+        <div class="toolbar">
+          <button class="primary" type="submit">Add property</button>
+          <span class="note" style="margin:0">After adding, the app tries to fetch the assessed value from BC Assessment automatically. You can refine everything on the detail page.</span>
+        </div>
+      </form>
+    </div>
+
+    <h2>Other assets</h2>
+    <div id="assetGroups"></div>
+    <div class="panel">
+      <h3>Add an asset</h3>
+      <div class="msg" id="addAssetMsg"></div>
+      <form id="addAssetForm">
+        <div class="grid3">
+          <div><label>Category</label>
+            <select name="category">
+              <option value="fixed_assets">Fixed assets</option>
+              <option value="stocks">Stocks</option>
+              <option value="term_deposits">Term deposits</option>
+              <option value="other">Other</option>
+            </select></div>
+          <div><label>Name *</label><input name="name" required></div>
+          <div><label>Value</label><input name="value" type="number" step="0.01"></div>
+        </div>
+        <div class="grid3">
+          <div><label>Currency</label><input name="currency" value="CAD"></div>
+          <div><label>Notes</label><input name="notes"></div>
+        </div>
+        <div class="toolbar"><button class="primary" type="submit">Add asset</button></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- ========================= Property detail ========================= -->
+  <section id="view-property" class="hidden">
+    <div class="toolbar"><a href="#assets">&larr; Back to Assets</a><div class="spacer"></div>
+      <button class="danger" id="deletePropertyBtn">Delete property</button></div>
+    <div id="photoArea"></div>
+    <div class="msg" id="detailMsg"></div>
+
+    <div class="panel">
+      <h3>Property &amp; assessment</h3>
+      <form id="propForm">
+        <div class="grid2">
+          <div><label>Address *</label><input name="address" required></div>
+          <div><label>Notes</label><input name="notes"></div>
+        </div>
+        <div class="grid3">
+          <div><label>Assessed value ($)</label><input name="assessed_value" type="number" step="0.01" min="0"></div>
+          <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
+          <div><label>Photo URL (external link)</label><input name="photo_url" placeholder="https://…"></div>
+        </div>
+        <div class="note" id="assessmentMeta" style="margin-left:0"></div>
+        <div class="toolbar">
+          <button class="primary" type="submit">Save</button>
+          <button type="button" id="fetchBcaBtn">Fetch from BC Assessment</button>
+          <label style="margin:0">Upload photo <input type="file" id="photoFile" accept="image/*" style="width:auto"></label>
+        </div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <h3>Mortgage</h3>
+      <form id="mortgageForm">
+        <div class="grid3">
+          <div><label>Remaining balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
+          <div><label>Balance as of</label><input name="mortgage_balance_date" type="date"></div>
+          <div><label>Monthly payment ($) — the projection uses this when set</label><input name="mortgage_payment" type="number" step="0.01" min="0"></div>
+        </div>
+        <div class="grid3">
+          <div><label>Remaining amortization (years) — used to derive the payment when monthly payment is empty</label><input name="amortization_years" type="number" step="0.5" min="0"></div>
+        </div>
+        <div class="toolbar"><button class="primary" type="submit">Save mortgage</button></div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <h3>Rate segments</h3>
+      <div class="note" style="margin-left:0">Add one row per rate period. A month uses the latest segment that has started; months before the first segment use the first one. Rates are nominal annual rates with Canadian semi-annual compounding. Variable rates are projected at the value you enter — in reality the rate will change over time.</div>
+      <table>
+        <thead><tr><th>Starts</th><th>Type</th><th class="num">Annual rate %</th><th></th></tr></thead>
+        <tbody id="segmentRows"></tbody>
+      </table>
+      <form id="addSegmentForm" class="toolbar" style="align-items:flex-end">
+        <div><label>Start date</label><input type="date" name="start_date" required></div>
+        <div><label>Type</label><select name="rate_type"><option value="fixed">Fixed</option><option value="variable">Variable</option></select></div>
+        <div><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0" required></div>
+        <button class="primary" type="submit">Add segment</button>
+      </form>
+    </div>
+
+    <div class="panel">
+      <h3>Mortgage projection</h3>
+      <div class="toolbar range-btns" id="rangeBtns">
+        <button data-months="12">1 year</button>
+        <button data-months="24">2 years</button>
+        <button data-months="60" class="active">5 years</button>
+        <button data-months="120">10 years</button>
+        <button data-months="0">All (to payoff)</button>
+        <span>Custom months: <input id="customMonths" type="number" min="1" max="600" style="width:90px"></span>
+      </div>
+      <div class="msg" id="chartMsg"></div>
+      <div class="note" id="chartSummary" style="margin-left:0"></div>
+      <div class="chart-wrap"><canvas id="mortgageChart"></canvas></div>
+    </div>
+  </section>
+
+  <!-- ============================ Placeholders ============================ -->
+  <section id="view-spending" class="hidden"><div class="placeholder"><h2>Spending</h2><p>This module is planned for a later round.</p></div></section>
+  <section id="view-planning" class="hidden"><div class="placeholder"><h2>Planning</h2><p>This module is planned for a later round.</p></div></section>
+  <section id="view-tax" class="hidden"><div class="placeholder"><h2>Tax</h2><p>This module is planned for a later round.</p></div></section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

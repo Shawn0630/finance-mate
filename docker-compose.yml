@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    ports:
+      - "9200:9200"
+    environment:
+      PORT: "9200"
+      DATA_DIR: /app/data
+      # The seed credentials are only used on the very first start, when the
+      # users table is still empty. Change the password before real use.
+      # SEED_ADMIN_USER: admin
+      # SEED_ADMIN_PASSWORD: admin
+    volumes:
+      - finance-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  finance-data:

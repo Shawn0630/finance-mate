@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Family Finance</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <form class="login-box" id="loginForm">
+    <h1>Family Finance</h1>
+    <div class="sub">Sign in to continue</div>
+    <div class="msg" id="msg"></div>
+    <label for="username">Username</label>
+    <input id="username" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <div style="margin-top:16px">
+      <button class="primary" type="submit" style="width:100%">Sign in</button>
+    </div>
+  </form>
+</div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('msg');
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: document.getElementById('username').value,
+      password: document.getElementById('password').value,
+    }),
+  });
+  if (res.ok) { location.href = '/'; return; }
+  const data = await res.json().catch(() => ({}));
+  msg.className = 'msg err';
+  msg.textContent = data.error || 'Sign-in failed';
+});
+</script>
+</body>
+</html>

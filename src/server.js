@@ -1,0 +1,381 @@
+// Family Finance — server. Express + SQLite, no build step.
+// Modules this round: Assets (properties / mortgages / other assets).
+// Spending, Planning and Tax are placeholder pages in the UI for now.
+import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { db, DATA_DIR, PHOTOS_DIR, seedAdmin, verifyPassword } from './db.js';
+import { simulate, derivePayment, segmentForMonth } from './engine.js';
+import { fetchAssessment } from './bca.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const PORT = Number(process.env.PORT || 9200);
+const SESSION_DAYS = 30;
+
+seedAdmin();
+
+const app = express();
+app.use(express.json({ limit: '12mb' })); // photo uploads arrive as base64 JSON
+
+// ---------------------------------------------------------------- auth ---
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0) out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return out;
+}
+
+function currentUser(req) {
+  const token = parseCookies(req).ff_session;
+  if (!token) return null;
+  const row = db
+    .prepare(
+      `SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.token = ? AND s.expires_at > ?`
+    )
+    .get(token, new Date().toISOString());
+  return row || null;
+}
+
+function requireApiAuth(req, res, next) {
+  const user = currentUser(req);
+  if (!user) return res.status(401).json({ error: 'not signed in' });
+  req.user = user;
+  next();
+}
+
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(String(username || ''));
+  if (!user || !verifyPassword(String(password || ''), user)) {
+    return res.status(401).json({ error: 'invalid username or password' });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expires = new Date(now.getTime() + SESSION_DAYS * 864e5);
+  db.prepare('INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(token, user.id, now.toISOString(), expires.toISOString());
+  res.setHeader(
+    'Set-Cookie',
+    `ff_session=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`
+  );
+  res.json({ ok: true, username: user.username });
+});
+
+app.post('/api/logout', (req, res) => {
+  const token = parseCookies(req).ff_session;
+  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  res.setHeader('Set-Cookie', 'ff_session=; HttpOnly; Path=/; Max-Age=0');
+  res.json({ ok: true });
+});
+
+app.get('/api/me', requireApiAuth, (req, res) => res.json({ username: req.user.username }));
+
+// ------------------------------------------------------------ properties ---
+const nowIso = () => new Date().toISOString();
+const num = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
+
+function getProperty(id) {
+  return db.prepare('SELECT * FROM properties WHERE id = ?').get(id);
+}
+
+function segmentsOf(propertyId) {
+  return db
+    .prepare('SELECT * FROM rate_segments WHERE property_id = ? ORDER BY start_date, id')
+    .all(propertyId);
+}
+
+// The segment in effect today (for card summaries).
+function currentSegment(segments) {
+  const today = new Date().toISOString().slice(0, 7);
+  return segmentForMonth(segments, today);
+}
+
+function propertyView(p) {
+  const segments = segmentsOf(p.id);
+  const cur = currentSegment(segments);
+  return {
+    ...p,
+    segments,
+    currentRate: cur ? { rate_type: cur.rate_type, annual_rate: cur.annual_rate, start_date: cur.start_date } : null,
+  };
+}
+
+app.get('/api/properties', requireApiAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM properties ORDER BY id').all();
+  res.json(rows.map(propertyView));
+});
+
+app.post('/api/properties', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  if (!b.address || !String(b.address).trim()) return res.status(400).json({ error: 'address is required' });
+  const info = db
+    .prepare(
+      `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
+         mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
+         notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      String(b.address).trim(),
+      num(b.assessed_value),
+      num(b.assessed_year),
+      b.assessed_value != null ? 'manual' : null,
+      num(b.mortgage_balance),
+      b.mortgage_balance_date || null,
+      num(b.mortgage_payment),
+      num(b.amortization_years),
+      b.notes || null,
+      nowIso(),
+      nowIso()
+    );
+  res.status(201).json(propertyView(getProperty(info.lastInsertRowid)));
+});
+
+app.get('/api/properties/:id', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  res.json(propertyView(p));
+});
+
+app.put('/api/properties/:id', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const b = req.body || {};
+  const next = {
+    address: b.address !== undefined ? String(b.address).trim() : p.address,
+    photo_url: b.photo_url !== undefined ? b.photo_url || null : p.photo_url,
+    assessed_value: b.assessed_value !== undefined ? num(b.assessed_value) : p.assessed_value,
+    assessed_year: b.assessed_year !== undefined ? num(b.assessed_year) : p.assessed_year,
+    assessed_source: p.assessed_source,
+    mortgage_balance: b.mortgage_balance !== undefined ? num(b.mortgage_balance) : p.mortgage_balance,
+    mortgage_balance_date: b.mortgage_balance_date !== undefined ? b.mortgage_balance_date || null : p.mortgage_balance_date,
+    mortgage_payment: b.mortgage_payment !== undefined ? num(b.mortgage_payment) : p.mortgage_payment,
+    amortization_years: b.amortization_years !== undefined ? num(b.amortization_years) : p.amortization_years,
+    notes: b.notes !== undefined ? b.notes || null : p.notes,
+  };
+  if (!next.address) return res.status(400).json({ error: 'address is required' });
+  // Editing the assessed value by hand marks it as a manual value.
+  if (b.assessed_value !== undefined && num(b.assessed_value) !== p.assessed_value) next.assessed_source = 'manual';
+  db.prepare(
+    `UPDATE properties SET address=?, photo_url=?, assessed_value=?, assessed_year=?,
+       assessed_source=?, mortgage_balance=?, mortgage_balance_date=?, mortgage_payment=?,
+       amortization_years=?, notes=?, updated_at=? WHERE id=?`
+  ).run(
+    next.address, next.photo_url, next.assessed_value, next.assessed_year, next.assessed_source,
+    next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
+    next.amortization_years, next.notes, nowIso(), p.id
+  );
+  res.json(propertyView(getProperty(p.id)));
+});
+
+app.delete('/api/properties/:id', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  if (p.photo_file) fs.promises.unlink(path.join(PHOTOS_DIR, p.photo_file)).catch(() => {});
+  db.prepare('DELETE FROM properties WHERE id = ?').run(p.id);
+  res.json({ ok: true });
+});
+
+// Best-effort BC Assessment fetch: never blocks saving; on success it fills
+// the value fields and marks them source='auto', on failure it reports the
+// stage that failed and leaves the stored values untouched.
+app.post('/api/properties/:id/fetch-bca', requireApiAuth, async (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  try {
+    const r = await fetchAssessment(p.address);
+    db.prepare(
+      `UPDATE properties SET assessed_value=?, assessed_year=?, land_value=?, building_value=?,
+         assessed_source='auto', assessed_fetched_at=?, bca_matched_address=?, bca_extract_date=?,
+         updated_at=? WHERE id=?`
+    ).run(
+      r.assessedValue, r.assessedYear, r.landValue, r.buildingValue,
+      nowIso(), r.matchedAddress, r.extractDate, nowIso(), p.id
+    );
+    res.json({ ok: true, result: r, property: propertyView(getProperty(p.id)) });
+  } catch (e) {
+    res.json({ ok: false, stage: e.stage || 'unknown', error: e.message });
+  }
+});
+
+// Photo upload as base64 JSON (keeps us dependency-free; ~12 MB body limit).
+app.post('/api/properties/:id/photo-upload', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const { dataBase64, contentType } = req.body || {};
+  const exts = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+  const ext = exts[contentType];
+  if (!dataBase64 || !ext) return res.status(400).json({ error: 'expected { dataBase64, contentType: image/jpeg|png|webp|gif }' });
+  const buf = Buffer.from(String(dataBase64), 'base64');
+  if (buf.length === 0 || buf.length > 9 * 1024 * 1024) return res.status(400).json({ error: 'image empty or too large' });
+  const name = `property-${p.id}-${Date.now()}.${ext}`;
+  fs.writeFileSync(path.join(PHOTOS_DIR, name), buf);
+  if (p.photo_file) fs.promises.unlink(path.join(PHOTOS_DIR, p.photo_file)).catch(() => {});
+  db.prepare('UPDATE properties SET photo_file=?, photo_url=NULL, updated_at=? WHERE id=?').run(name, nowIso(), p.id);
+  res.json(propertyView(getProperty(p.id)));
+});
+
+// Uploaded photos (login required).
+app.get('/photos/:name', (req, res) => {
+  if (!currentUser(req)) return res.status(401).json({ error: 'not signed in' });
+  const name = path.basename(req.params.name);
+  const file = path.join(PHOTOS_DIR, name);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'photo not found' });
+  res.sendFile(file);
+});
+
+// ---------------------------------------------------------- rate segments ---
+app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const b = req.body || {};
+  if (!b.start_date) return res.status(400).json({ error: 'start_date is required' });
+  if (!['fixed', 'variable'].includes(b.rate_type)) return res.status(400).json({ error: 'rate_type must be fixed or variable' });
+  if (num(b.annual_rate) === null || num(b.annual_rate) < 0) return res.status(400).json({ error: 'annual_rate must be a number >= 0' });
+  const info = db
+    .prepare('INSERT INTO rate_segments (property_id, start_date, rate_type, annual_rate, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(p.id, String(b.start_date), b.rate_type, num(b.annual_rate), nowIso());
+  res.status(201).json(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
+  const seg = db.prepare('SELECT * FROM rate_segments WHERE id = ? AND property_id = ?').get(req.params.segId, req.params.id);
+  if (!seg) return res.status(404).json({ error: 'segment not found' });
+  const b = req.body || {};
+  const next = {
+    start_date: b.start_date !== undefined ? String(b.start_date) : seg.start_date,
+    rate_type: b.rate_type !== undefined ? b.rate_type : seg.rate_type,
+    annual_rate: b.annual_rate !== undefined ? num(b.annual_rate) : seg.annual_rate,
+  };
+  if (!['fixed', 'variable'].includes(next.rate_type)) return res.status(400).json({ error: 'rate_type must be fixed or variable' });
+  if (next.annual_rate === null || next.annual_rate < 0) return res.status(400).json({ error: 'annual_rate must be a number >= 0' });
+  db.prepare('UPDATE rate_segments SET start_date=?, rate_type=?, annual_rate=? WHERE id=?')
+    .run(next.start_date, next.rate_type, next.annual_rate, seg.id);
+  res.json(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id));
+});
+
+app.delete('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM rate_segments WHERE id = ? AND property_id = ?').run(req.params.segId, req.params.id);
+  if (!info.changes) return res.status(404).json({ error: 'segment not found' });
+  res.json({ ok: true });
+});
+
+// ------------------------------------------------------- mortgage chart ---
+// Monthly projection from the stored balance. The monthly payment stored on
+// the property wins; otherwise it is derived from the remaining
+// amortization years and the rate in effect for the first projected month.
+app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const segments = segmentsOf(p.id);
+  if (p.mortgage_balance === null || p.mortgage_balance === undefined || !(p.mortgage_balance > 0)) {
+    return res.json({ ok: false, error: 'no mortgage balance recorded for this property', segments });
+  }
+  const balanceDate = p.mortgage_balance_date || new Date().toISOString().slice(0, 10);
+  let payment = p.mortgage_payment;
+  let paymentSource = 'entered';
+  if (!(payment > 0)) {
+    if (!(p.amortization_years > 0)) {
+      return res.json({ ok: false, error: 'enter a monthly payment or a remaining amortization (years) to project the mortgage', segments });
+    }
+    const firstMonth = balanceDate.slice(0, 7);
+    const seg = segmentForMonth(segments, firstMonth);
+    payment = derivePayment(p.mortgage_balance, seg ? seg.annual_rate : 0, p.amortization_years);
+    paymentSource = 'derived';
+  }
+  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments });
+  res.json({
+    ok: true,
+    paymentUsed: payment,
+    paymentSource,
+    hasRates: segments.length > 0,
+    series: r.series,
+    totalInterest: r.totalInterest,
+    payoffMonth: r.payoffMonth,
+    negativeAmortization: r.negativeAmortization,
+  });
+});
+
+// ------------------------------------------------------------ other assets ---
+const ASSET_CATEGORIES = ['fixed_assets', 'stocks', 'term_deposits', 'other'];
+
+app.get('/api/assets', requireApiAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM other_assets ORDER BY category, id').all());
+});
+
+app.post('/api/assets', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  if (!ASSET_CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'unknown category' });
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'name is required' });
+  const info = db
+    .prepare('INSERT INTO other_assets (category, name, value, currency, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, nowIso(), nowIso());
+  res.status(201).json(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.put('/api/assets/:id', requireApiAuth, (req, res) => {
+  const a = db.prepare('SELECT * FROM other_assets WHERE id = ?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'asset not found' });
+  const b = req.body || {};
+  const next = {
+    category: b.category !== undefined ? b.category : a.category,
+    name: b.name !== undefined ? String(b.name).trim() : a.name,
+    value: b.value !== undefined ? num(b.value) ?? 0 : a.value,
+    currency: b.currency !== undefined ? b.currency : a.currency,
+    notes: b.notes !== undefined ? b.notes || null : a.notes,
+  };
+  if (!ASSET_CATEGORIES.includes(next.category)) return res.status(400).json({ error: 'unknown category' });
+  if (!next.name) return res.status(400).json({ error: 'name is required' });
+  db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, updated_at=? WHERE id=?')
+    .run(next.category, next.name, next.value, next.currency, next.notes, nowIso(), a.id);
+  res.json(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(a.id));
+});
+
+app.delete('/api/assets/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM other_assets WHERE id = ?').run(req.params.id);
+  if (!info.changes) return res.status(404).json({ error: 'asset not found' });
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------- summary ---
+app.get('/api/summary', requireApiAuth, (req, res) => {
+  const props = db.prepare('SELECT * FROM properties').all();
+  const propertyValue = props.reduce((s, p) => s + (p.assessed_value || 0), 0);
+  const mortgageBalance = props.reduce((s, p) => s + (p.mortgage_balance || 0), 0);
+  const otherAssets = db.prepare('SELECT COALESCE(SUM(value), 0) AS s FROM other_assets').get().s;
+  res.json({
+    propertyValue,
+    mortgageBalance,
+    otherAssets,
+    netWorth: propertyValue + otherAssets - mortgageBalance,
+    propertyCount: props.length,
+  });
+});
+
+// ------------------------------------------------------------------ pages ---
+app.get('/', (req, res) => {
+  if (!currentUser(req)) return res.redirect('/login.html');
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+app.get('/index.html', (req, res) => {
+  if (!currentUser(req)) return res.redirect('/login.html');
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+app.use(express.static(PUBLIC_DIR, { index: false }));
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'internal error' });
+});
+
+// Exported for the e2e test; listening happens only when run directly.
+export { app };
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  app.listen(PORT, () => console.log(`[family-finance] listening on http://localhost:${PORT} (data: ${DATA_DIR})`));
+}
