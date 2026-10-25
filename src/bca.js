@@ -7,6 +7,12 @@
 //   2. GET /Property/Search/GetByAddress?addr=<address>
 //                                             -> JSON suggestions
 //      [{ label, value, gid }]; value is the base64 property id.
+//      The site's own JS sends this as an XHR (X-Requested-With:
+//      XMLHttpRequest) and so do we: without that header the app
+//      302-redirects failures to an HTML error page, while with it a
+//      failure comes back as the site's JSON error payload
+//      ({ Id, IsScheduledOutage }) with HTTP 500 — machine-readable
+//      either way it goes.
 //   3. GET /Property/Info/<value>             -> the property page HTML
 //      embeds a short-lived `gistoken` and a dated `mapserverUrl`
 //      (ArcGIS MapServer, e.g. .../DCX/AFP_20260414/MapServer). Both must
@@ -51,6 +57,8 @@ async function fetchWithJar(jar, url, opts = {}) {
       headers: {
         'User-Agent': UA,
         Accept: opts.accept || 'text/html,application/xhtml+xml',
+        // Ask the way the site's own jQuery calls do (see header note).
+        'X-Requested-With': 'XMLHttpRequest',
         ...(jar.size ? { Cookie: jarHeader(jar) } : {}),
         ...(opts.headers || {}),
       },
@@ -69,7 +77,34 @@ async function fetchWithJar(jar, url, opts = {}) {
 function stageError(stage, detail) {
   const e = new Error(`BC Assessment lookup failed at stage "${stage}": ${detail}`);
   e.stage = stage;
+  e.detail = detail;
   return e;
+}
+
+// Read a response that is supposed to be JSON, turning every failure
+// shape the site produces into a staged, human-readable error:
+//   - the site's own JSON error payload ({ Id, IsScheduledOutage })
+//     served with an HTTP error status when its search/GIS backends
+//     throw (this is what broke the address suggestions in Oct 2026:
+//     the backend 500s while the pages around it still load);
+//   - any other HTTP error status;
+//   - a 200 that is not JSON at all (the HTML error page the app
+//     redirects browser-like requests to).
+async function readJson(res, stage) {
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* not JSON */ }
+  if (data && typeof data === 'object' && 'IsScheduledOutage' in data && data.Id) {
+    throw stageError(
+      stage,
+      `BC Assessment's service returned an error (HTTP ${res.status}, error id ${data.Id})`
+    );
+  }
+  if (!res.ok) throw stageError(stage, `HTTP ${res.status}`);
+  if (data === null) {
+    throw stageError(stage, `unexpected non-JSON response (HTTP ${res.status}) — the site returned an HTML page instead of data`);
+  }
+  return data;
 }
 
 // The site's autocomplete is picky: a trailing "BC" or a spelled-out
@@ -130,8 +165,7 @@ export async function suggestAddresses(query) {
       `${BASE}/Property/Search/GetByAddress?addr=${encodeURIComponent(q)}`,
       { accept: 'application/json' }
     );
-    if (!res.ok) throw new Error(`suggestion search returned HTTP ${res.status}`);
-    const found = realSuggestions(await res.json());
+    const found = realSuggestions(await readJson(res, 'address suggestions'));
     if (found.length) {
       const seen = new Set();
       const out = [];
@@ -165,8 +199,7 @@ export async function fetchAssessment(address, direct) {
           `${BASE}/Property/Search/GetByAddress?addr=${encodeURIComponent(q)}`,
           { accept: 'application/json' }
         );
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const found = realSuggestions(await res.json());
+        const found = realSuggestions(await readJson(res, 'address search'));
         if (found.length) { match = found[0]; break; }
       } catch (e) {
         lastError = e;
@@ -176,7 +209,7 @@ export async function fetchAssessment(address, direct) {
   if (!match) {
     throw stageError(
       'address search',
-      lastError ? lastError.message : 'no matching property for that address (tried several address formats)'
+      lastError ? (lastError.detail || lastError.message) : 'no matching property for that address (tried several address formats)'
     );
   }
   let res;
@@ -209,13 +242,12 @@ export async function fetchAssessment(address, direct) {
       accept: 'application/json',
       headers: { Referer: `${BASE}/Property/Info/${encodeURIComponent(match.value)}` },
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await readJson(res, 'value query');
     if (data.error) throw new Error(`GIS error ${data.error.code}: ${data.error.message}`);
     if (!data.features || data.features.length === 0) throw new Error('no GIS feature for the matched address');
     attrs = data.features[0].attributes;
   } catch (e) {
-    throw stageError('value query', e.message);
+    throw stageError('value query', e.detail || e.message);
   }
 
   const extract = String(attrs.EXTRACT_DATE || '');

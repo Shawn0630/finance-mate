@@ -42,6 +42,14 @@ function attachAddressSuggest(input, list) {
   let active = -1;
   let timer = null;
   let seq = 0;
+  // Small "suggestions unavailable" note under the input (markup lives in
+  // the form, next to the dropdown list). Shown whenever the suggest
+  // endpoint reports its source is down, so an empty dropdown never reads
+  // as "no such address" when BC Assessment is actually failing.
+  const wrap = input.closest ? input.closest('.suggest-wrap') : null;
+  const note = wrap ? wrap.querySelector('.suggest-note') : null;
+  const showNote = () => { if (note) note.classList.remove('hidden'); };
+  const hideNote = () => { if (note) note.classList.add('hidden'); };
 
   function close() {
     list.classList.add('hidden');
@@ -67,6 +75,7 @@ function attachAddressSuggest(input, list) {
     input.value = s.label;
     state.id = s.id;
     state.label = s.label;
+    hideNote();
     close();
     input.focus();
   }
@@ -80,10 +89,11 @@ function attachAddressSuggest(input, list) {
       try {
         const data = await api('/api/address/suggest?q=' + encodeURIComponent(q));
         if (my !== seq) return;
+        if (data.sourceError) showNote(); else hideNote();
         items = data.suggestions || [];
         active = items.length ? 0 : -1;
         render();
-      } catch { if (my === seq) close(); }
+      } catch { if (my === seq) { showNote(); close(); } }
     }, 300);
   });
   input.addEventListener('keydown', (e) => {
@@ -96,7 +106,7 @@ function attachAddressSuggest(input, list) {
   document.addEventListener('mousedown', (e) => {
     if (!list.contains(e.target) && e.target !== input) close();
   });
-  return { state, close, reset() { state.id = null; state.label = ''; close(); } };
+  return { state, close, reset() { state.id = null; state.label = ''; hideNote(); close(); } };
 }
 const addSuggest = attachAddressSuggest(
   $('#addPropForm .address-input'), $('#addPropForm .suggest-list'));

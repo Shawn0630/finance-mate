@@ -65,6 +65,7 @@ td.num, th.num { text-align: right; }
 .suggest-list { position: absolute; top: 100%; left: 0; right: 0; z-index: 60; background: #fff; border: 1px solid #c9d2dc; border-radius: 6px; margin: 2px 0 0; padding: 4px 0; list-style: none; max-height: 264px; overflow-y: auto; box-shadow: 0 10px 26px rgba(20, 35, 50, .16); }
 .suggest-list li { padding: 7px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .suggest-list li:hover, .suggest-list li.active { background: #e6eef7; }
+.suggest-note { margin: 6px 0 0; padding: 7px 10px; border-radius: 6px; background: #fdf6e0; color: #7a5b00; font-size: 12.5px; }
 /* Assets secondary menu + sections */
 .subnav { display: flex; gap: 4px; flex-wrap: wrap; margin: 2px 0 16px; border-bottom: 1px solid #dde4ec; padding-bottom: 8px; }
 .subnav a { color: #5a6a7a; padding: 6px 12px; border-radius: 6px; font-weight: 550; }

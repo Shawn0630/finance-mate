@@ -67,14 +67,34 @@ const check = (name, cond, extra = '') => {
 // address-suggestion JSON in the real site's shape, a property page with
 // an embedded token + map URL, and the GIS value query. Hit counters let
 // the test prove the picked-id path skips the address search.
-const stubHits = { search: 0, info: [] };
+const stubHits = { search: 0, info: [], xhr: false };
+// Failure mode replicating BC Assessment's live behaviour (Oct 2026):
+// its search backend throws — XHR-shaped calls get HTTP 500 with the
+// site's JSON error payload, plain requests 302 to an HTML error page.
+let stubBcaDown = false;
 const stub = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://stub');
   if (u.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>ok</html>'); return;
   }
+  if (u.pathname === '/Property/Error/') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html><title>BC Assessment</title> An error has occured while processing the details of the property.</html>');
+    return;
+  }
   if (u.pathname === '/Property/Search/GetByAddress') {
     stubHits.search++;
+    if (req.headers['x-requested-with'] === 'XMLHttpRequest') stubHits.xhr = true;
+    if (stubBcaDown) {
+      if (req.headers['x-requested-with'] === 'XMLHttpRequest') {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ Id: 'stub-error-id', IsScheduledOutage: false }));
+      } else {
+        res.writeHead(302, { Location: '/Property/Error/?id=stub-error-id' });
+        res.end('<html><head><title>Object moved</title></head></html>');
+      }
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify([
       { label: '1200 GOVERNMENT ST VICTORIA', value: 'QkxPQy0xMjAw', gid: 101 },
@@ -199,6 +219,31 @@ try {
   check('short query returns no suggestions', Array.isArray(r.data.suggestions) && r.data.suggestions.length === 0);
   check('short query does not hit BC Assessment', stubHits.search === searchBeforeShort);
 
+  // Outage shape (the live Oct 2026 failure): BC Assessment's search
+  // backend 500s. The endpoint must surface sourceError with a readable
+  // note — never a raw JSON parse error — and the app must ask the way
+  // the site's own JS does (X-Requested-With), which the stub records.
+  stubBcaDown = true;
+  r = await req('GET', '/api/address/suggest?q=' + encodeURIComponent('1200 Government'));
+  check('suggest outage -> sourceError flagged', r.status === 200 && r.data.sourceError === true, JSON.stringify(r.data).slice(0, 200));
+  check('suggest outage -> empty suggestions', Array.isArray(r.data.suggestions) && r.data.suggestions.length === 0);
+  check('suggest outage -> clean note, no parse noise',
+    typeof r.data.note === 'string' && /HTTP 500/.test(r.data.note) && !/Unexpected token|not valid JSON/.test(r.data.note),
+    String(r.data.note));
+  check('app asks like the site own JS (X-Requested-With)', stubHits.xhr === true);
+  stubBcaDown = false;
+  r = await req('GET', '/api/address/suggest?q=' + encodeURIComponent('1200 Government'));
+  check('suggest recovers when BC Assessment is back', (r.data.suggestions || []).length === 1 && !r.data.sourceError);
+
+  // The outage note element exists in BOTH address forms and the
+  // frontend shows it when the endpoint reports sourceError.
+  const pageRes = await fetch(BASE + '/', { headers: { Cookie: cookie } });
+  const pageHtml = await pageRes.text();
+  check('both address forms carry the suggest-unavailable note', (pageHtml.match(/suggest-note/g) || []).length >= 2);
+  const jsRes = await fetch(BASE + '/app.js', { headers: { Cookie: cookie } });
+  const jsText = await jsRes.text();
+  check('address suggest UI reacts to sourceError', jsText.includes('sourceError') && jsText.includes('suggest-note'));
+
   // Property CRUD (fictional address and numbers only).
   r = await req('POST', '/api/properties', {
     address: '1234 Example Street, Victoria, BC',
@@ -264,6 +309,19 @@ try {
   // Editing the address back to free text clears the stored id.
   r = await req('PUT', `/api/properties/${pid2}`, { address: '999 Somewhere Else', bca_id: null });
   check('editing address to free text clears bca_id', r.status === 200 && r.data.bca_id === null);
+
+  // The fuzzy assessment fetch shares the address search: with BC
+  // Assessment's backend down it must fail at the "address search"
+  // stage with the same readable error, not a JSON parse error, and
+  // leave the stored values untouched.
+  stubBcaDown = true;
+  r = await req('POST', `/api/properties/${pid2}/fetch-bca`);
+  check('fetch-bca outage -> ok:false at address search stage',
+    r.data.ok === false && r.data.stage === 'address search', JSON.stringify(r.data).slice(0, 200));
+  check('fetch-bca outage -> clean error, no parse noise',
+    typeof r.data.error === 'string' && /HTTP 500/.test(r.data.error) && !/Unexpected token|not valid JSON/.test(r.data.error),
+    String(r.data.error));
+  stubBcaDown = false;
 
   // Owners are a SET of people: joint ownership is picking several
   // names. admin is never a candidate; unknown names and the literal
