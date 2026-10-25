@@ -412,6 +412,47 @@ try {
   r = await req('DELETE', `/api/properties/${pidPay}`);
   check('delete payday property', r.status === 200);
 
+  // Payment frequency: stored on the property, validated, and it
+  // drives the projection. Same loan as the engine anchors ($100,000
+  // at 5%, $600 monthly payment from 2026-10-01): monthly totals are
+  // the baseline; accelerated bi-weekly must pay off in 2047-01 with
+  // total interest 58641.44 (cross-checked in the engine tests).
+  r = await req('POST', '/api/properties', {
+    address: '3 Frequency Court, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    purchase_date: '2019-06-15',
+  });
+  const pidFreq = r.data.id;
+  await req('POST', `/api/properties/${pidFreq}/rates`, {
+    start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5,
+  });
+  r = await req('GET', `/api/properties/${pidFreq}/amortization`);
+  check('default frequency is monthly with the baseline totals',
+    r.data.frequency === 'monthly' && Math.abs(r.data.totalInterest - 69494.74) <= 0.02,
+    JSON.stringify({ f: r.data.frequency, t: r.data.totalInterest }));
+  const monthlyTotal = r.data.totalInterest;
+  const monthlyPayoff = r.data.payoffMonth;
+  r = await req('PUT', `/api/properties/${pidFreq}`, { payment_frequency: 'daily' });
+  check('unknown payment frequency rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${pidFreq}`, { payment_frequency: 'accelerated_bi_weekly' });
+  check('payment frequency stored', r.status === 200 && r.data.payment_frequency === 'accelerated_bi_weekly',
+    JSON.stringify(r.data.payment_frequency));
+  r = await req('GET', `/api/properties/${pidFreq}`);
+  check('payment frequency persisted', r.data.payment_frequency === 'accelerated_bi_weekly');
+  r = await req('GET', `/api/properties/${pidFreq}/amortization`);
+  check('accelerated bi-weekly: $300 per period, less interest, earlier payoff',
+    r.data.frequency === 'accelerated_bi_weekly' && r.data.periodPayment === 300
+      && Math.abs(r.data.totalInterest - 58641.44) <= 0.02
+      && r.data.totalInterest < monthlyTotal && r.data.payoffMonth === '2047-01'
+      && r.data.payoffMonth < monthlyPayoff && r.data.series[0].month === '2026-10',
+    JSON.stringify({ p: r.data.periodPayment, t: r.data.totalInterest, po: r.data.payoffMonth }).slice(0, 160));
+  r = await req('PUT', `/api/properties/${pidFreq}`, { payment_frequency: 'monthly' });
+  check('frequency reset to monthly', r.status === 200 && r.data.payment_frequency === 'monthly');
+  r = await req('GET', `/api/properties/${pidFreq}/amortization`);
+  check('monthly totals restored after reset', Math.abs(r.data.totalInterest - monthlyTotal) <= 0.02);
+  r = await req('DELETE', `/api/properties/${pidFreq}`);
+  check('delete frequency property', r.status === 200);
+
   // ------------------------------------------------------------ admin ---
   // User management is admin-only. The live session at this point is
   // Jiaying's (from the login checks near the top), i.e. NOT admin.

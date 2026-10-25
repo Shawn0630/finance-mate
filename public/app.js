@@ -485,9 +485,14 @@ async function loadPropertyDetail(id) {
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.purchase_date.value = p.purchase_date || '';
   $('#paymentDayInput').value = p.payment_day ?? '';
-  $('#paymentDayDisplay').textContent = p.payment_day
-    ? `Payment day: the ${ordinal(p.payment_day)} of each month — managed in the Rate segments panel below.`
-    : 'Payment day: not set — managed in the Rate segments panel below.';
+  const freqKey = FREQUENCY_LABELS[p.payment_frequency] ? p.payment_frequency : 'monthly';
+  $('#paymentFrequencySelect').value = freqKey;
+  syncFrequencyUi();
+  const dayBit = DAY_STEPPED_FREQUENCIES.includes(freqKey)
+    ? 'Payment day does not apply to this frequency.'
+    : (p.payment_day ? `Payment day: the ${ordinal(p.payment_day)} of each month.` : 'Payment day: not set.');
+  $('#paymentDayDisplay').textContent =
+    `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in the Rate segments panel below.`;
   pf.photo_url.value = p.photo_url || '';
   $('#assessmentMeta').textContent =
     p.assessed_source === 'auto'
@@ -558,15 +563,34 @@ $('#addSegmentForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });
 
-// The payment day is a property field, but it is maintained here, with
-// the rate plan: saving it re-renders both charts on their new anchor.
+// Payment frequency + payment day are property fields, but they are
+// maintained here, with the rate plan: saving re-renders both charts
+// on the new schedule. The payment day only applies to the monthly /
+// semi-monthly schedules; for the day-stepped frequencies the input
+// is disabled with an explanation.
+const FREQUENCY_LABELS = {
+  monthly: 'Monthly', semi_monthly: 'Semi-monthly', bi_weekly: 'Bi-weekly',
+  accelerated_bi_weekly: 'Accelerated bi-weekly', weekly: 'Weekly', accelerated_weekly: 'Accelerated weekly',
+};
+const DAY_STEPPED_FREQUENCIES = ['bi_weekly', 'accelerated_bi_weekly', 'weekly', 'accelerated_weekly'];
+function syncFrequencyUi() {
+  const stepped = DAY_STEPPED_FREQUENCIES.includes($('#paymentFrequencySelect').value);
+  $('#paymentDayInput').disabled = stepped;
+  $('#paymentFreqNote').textContent = stepped
+    ? 'Payment day does not apply to weekly and bi-weekly schedules — payments step by whole days from the balance date instead.'
+    : '';
+}
+$('#paymentFrequencySelect').addEventListener('change', syncFrequencyUi);
 $('#paymentDayForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const raw = $('#paymentDayInput').value.trim();
   try {
     await api(`/api/properties/${currentPropertyId}`, {
       method: 'PUT',
-      body: { payment_day: raw === '' ? null : Number(raw) },
+      body: {
+        payment_frequency: $('#paymentFrequencySelect').value,
+        payment_day: raw === '' ? null : Number(raw),
+      },
     });
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -838,8 +862,12 @@ function drawMonthlyChart() {
   const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
   if (!rows.length) return;
   const totalInterest = rows.reduce((s, r) => s + r.interest, 0);
+  const srcNote = chartMeta.paymentSource === 'derived' ? 'derived from remaining amortization' : 'entered';
+  const payBit = !chartMeta.frequency || chartMeta.frequency === 'monthly'
+    ? `Monthly payment used: ${money(chartMeta.paymentUsed)} (${srcNote})`
+    : `Payments: ${chartMeta.frequencyLabel} — ${money(chartMeta.periodPayment)} per payment, converted from a monthly payment of ${money(chartMeta.paymentUsed)} (${srcNote})`;
   const bits = [
-    `Monthly payment used: ${money(chartMeta.paymentUsed)}${chartMeta.paymentSource === 'derived' ? ' (derived from remaining amortization)' : ''}`,
+    payBit,
     `Interest in this range: ${money(totalInterest)}`,
     chartMeta.payoffMonth ? `Projected payoff: ${chartMeta.payoffMonth}` : 'Not paid off within the projection window',
   ];
@@ -859,7 +887,12 @@ function drawMonthlyChart() {
           tension: 0.15, pointRadius: 0, borderWidth: 2,
         },
         {
-          label: `Monthly payment (${chartMeta.paymentSource === 'derived' ? 'derived from amortization' : 'entered'})`,
+          // The series is sampled monthly, so for the day-stepped
+          // frequencies this line is the month's total paid, not the
+          // per-payment amount (that is in the summary line above).
+          label: !chartMeta.frequency || chartMeta.frequency === 'monthly'
+            ? `Monthly payment (${chartMeta.paymentSource === 'derived' ? 'derived from amortization' : 'entered'})`
+            : 'Paid per month (all payments in the month)',
           data: rows.map((r) => r.payment),
           borderColor: '#7c3aed', backgroundColor: '#7c3aed',
           tension: 0.15, pointRadius: 0, borderWidth: 2,

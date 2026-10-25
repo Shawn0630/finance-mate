@@ -7,7 +7,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
-import { simulate, derivePayment, segmentForMonth } from './engine.js';
+import { simulate, derivePayment, segmentForMonth, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { fetchAssessment, suggestAddresses } from './bca.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -402,6 +402,9 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     purchase_date: b.purchase_date !== undefined ? (b.purchase_date || null) : p.purchase_date,
     // Payment day is edited from the rate-plan area; null clears it.
     payment_day: p.payment_day ?? null,
+    // Payment frequency is edited from the rate-plan area too; NULL in
+    // the database (rows that predate it) means 'monthly'.
+    payment_frequency: p.payment_frequency ?? null,
   };
   if (b.purchase_date !== undefined && b.purchase_date && !isDateStr(b.purchase_date)) {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
@@ -417,6 +420,17 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
       next.payment_day = d;
     }
   }
+  if (b.payment_frequency !== undefined) {
+    if (b.payment_frequency === null || b.payment_frequency === '') {
+      next.payment_frequency = null;
+    } else if (!FREQUENCY_KEYS.includes(String(b.payment_frequency))) {
+      return res.status(400).json({
+        error: `payment frequency must be one of: ${FREQUENCY_KEYS.map((k) => FREQUENCIES[k].label).join(', ')}`,
+      });
+    } else {
+      next.payment_frequency = String(b.payment_frequency);
+    }
+  }
   if (b.owners !== undefined || b.owner !== undefined) {
     const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
     if (own.error) return res.status(400).json({ error: own.error });
@@ -429,13 +443,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
-       owners=?, purchase_date=?, payment_day=?, updated_at=? WHERE id=?`
+       owners=?, purchase_date=?, payment_day=?, payment_frequency=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
     next.amortization_years, next.notes, JSON.stringify(next.owners), next.purchase_date,
-    next.payment_day, nowIso(), p.id
+    next.payment_day, next.payment_frequency, nowIso(), p.id
   );
   res.json(propertyView(getProperty(p.id)));
 });
@@ -662,14 +676,21 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
     paymentSource = 'derived';
   }
   // The payment day only anchors the series' node dates (see engine);
-  // it never enters the interest math.
-  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments, paymentDay: p.payment_day ?? null });
+  // it never enters the interest math. The payment frequency drives
+  // the period stepping and the per-period amount (both in the
+  // engine); `payment` here stays the MONTHLY amount throughout.
+  const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments, paymentDay: p.payment_day ?? null, frequency });
   res.json({
     ok: true,
     balance: p.mortgage_balance,
     balanceDate,
     paymentUsed: payment,
     paymentSource,
+    frequency,
+    frequencyLabel: FREQUENCIES[frequency].label,
+    periodsPerYear: FREQUENCIES[frequency].periodsPerYear,
+    periodPayment: periodPaymentFor(payment, frequency),
     series: r.series,
     totalInterest: r.totalInterest,
     payoffMonth: r.payoffMonth,

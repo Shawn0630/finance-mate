@@ -113,6 +113,13 @@ if (!propCols.includes('payment_day')) {
   // math stays monthly and does not depend on it.
   db.exec('ALTER TABLE properties ADD COLUMN payment_day INTEGER');
 }
+if (!propCols.includes('payment_frequency')) {
+  // Payment frequency key (engine FREQUENCIES): 'monthly' |
+  // 'semi_monthly' | 'bi_weekly' | 'accelerated_bi_weekly' | 'weekly' |
+  // 'accelerated_weekly'. Nullable; NULL reads as 'monthly' (the
+  // pre-frequency behaviour).
+  db.exec('ALTER TABLE properties ADD COLUMN payment_frequency TEXT');
+}
 // --------------------------------------------------------------- owners ---
 // Owners are a SET of usernames: co-ownership is just several names, there
 // is no special 'Joint' value. Stored as a JSON array in an `owners`

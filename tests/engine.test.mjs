@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, segmentForMonth } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, segmentForMonth, periodicRate, periodPaymentFor } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -91,6 +91,75 @@ test('simulate: node dates anchor to the payment day, interest unchanged', () =>
   assert.equal(thirtyFirst.series[0].date, '2026-11-30'); // November has 30 days
   assert.equal(thirtyFirst.series[3].month, '2027-02');
   assert.equal(thirtyFirst.series[3].date, '2027-02-28'); // clamped to month end
+});
+
+test('periodicRate: bi-weekly anchor (1.025)^(2/26)-1 = 0.19012368%', () => {
+  assert.ok(close(periodicRate(5, 26) * 100, 0.19012368, 0.00001), periodicRate(5, 26));
+  // First bi-weekly period on $100,000 at 5%: $190.12.
+  assert.ok(close(100000 * periodicRate(5, 26), 190.12), 100000 * periodicRate(5, 26));
+  // N = 12 must reproduce the monthly rate exactly (no regression).
+  assert.ok(close(periodicRate(5, 12), monthlyRate(5), 1e-12));
+  assert.equal(periodicRate(0, 26), 0);
+});
+
+test('periodPaymentFor: Canadian conversion of a $600 monthly payment', () => {
+  assert.equal(periodPaymentFor(600, 'monthly'), 600);
+  assert.equal(periodPaymentFor(600, 'semi_monthly'), 300); // 600 * 12/24
+  assert.equal(periodPaymentFor(600, 'bi_weekly'), 276.92); // 600 * 12/26
+  assert.equal(periodPaymentFor(600, 'weekly'), 138.46); // 600 * 12/52
+  // Accelerated: half / quarter of the monthly amount (13 monthly
+  // payments a year — that is the whole point of accelerating).
+  assert.equal(periodPaymentFor(600, 'accelerated_bi_weekly'), 300);
+  assert.equal(periodPaymentFor(600, 'accelerated_weekly'), 150);
+});
+
+// Frequency anchors for one loan: $100,000 at 5%, $600 monthly payment,
+// balance date 2026-10-01. The monthly totals are the pre-frequency
+// engine's own output (regression baseline); the accelerated bi-weekly
+// totals were cross-checked against an independent day-stepped
+// calculation (period rate (1.025)^(1/13)-1, $300 every 14 days).
+const FREQ_CFG = {
+  balance: 100000,
+  balanceDate: '2026-10-01',
+  payment: 600,
+  segments: [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }],
+};
+
+test('simulate frequency: monthly reproduces the pre-frequency engine', () => {
+  const r = simulate(FREQ_CFG);
+  assert.ok(close(r.totalInterest, 69494.74), r.totalInterest);
+  assert.equal(r.payoffMonth, '2050-05');
+  assert.equal(r.series.length, 283);
+});
+
+test('simulate frequency: accelerated bi-weekly pays off earlier, less interest', () => {
+  const monthly = simulate(FREQ_CFG);
+  const accel = simulate({ ...FREQ_CFG, frequency: 'accelerated_bi_weekly' });
+  assert.ok(close(accel.totalInterest, 58641.44), accel.totalInterest);
+  assert.equal(accel.payoffMonth, '2047-01');
+  assert.ok(accel.totalInterest < monthly.totalInterest);
+  assert.ok(accel.payoffMonth < monthly.payoffMonth);
+  // October 2026 holds two periods (15th, 29th): the month's payment
+  // totals $600 and its interest is the two periods' interest summed
+  // ($190.12 + $189.91).
+  assert.equal(accel.series[0].month, '2026-10');
+  assert.ok(close(accel.series[0].payment, 600), accel.series[0].payment);
+  assert.ok(close(accel.series[0].interest, 380.03), accel.series[0].interest);
+});
+
+test('simulate frequency: regular bi-weekly and semi-monthly stay near monthly', () => {
+  const monthly = simulate(FREQ_CFG);
+  const bw = simulate({ ...FREQ_CFG, frequency: 'bi_weekly' });
+  // Same yearly total, principal lands slightly earlier: a little
+  // less interest, payoff a couple of months sooner.
+  assert.ok(close(bw.totalInterest, 69141.28), bw.totalInterest);
+  assert.ok(bw.totalInterest < monthly.totalInterest);
+  const sm = simulate({ ...FREQ_CFG, frequency: 'semi_monthly' });
+  assert.ok(close(sm.totalInterest, 69165.26), sm.totalInterest);
+  // Two $300 periods in November 2026 aggregate to one monthly row.
+  assert.equal(sm.series[0].month, '2026-11');
+  assert.ok(close(sm.series[0].payment, 600), sm.series[0].payment);
+  assert.ok(close(sm.series[0].interest, 411.77), sm.series[0].interest);
 });
 
 test('segmentForMonth: before first / gap / after last', () => {

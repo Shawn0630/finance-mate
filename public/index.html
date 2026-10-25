@@ -138,10 +138,19 @@
         <button class="primary" type="submit">Add segment</button>
       </form>
       <form id="paymentDayForm" class="toolbar" style="align-items:flex-end;margin-top:14px">
+        <div><label>Payment frequency</label><select id="paymentFrequencySelect">
+          <option value="monthly">Monthly</option>
+          <option value="semi_monthly">Semi-monthly</option>
+          <option value="bi_weekly">Bi-weekly</option>
+          <option value="accelerated_bi_weekly">Accelerated bi-weekly</option>
+          <option value="weekly">Weekly</option>
+          <option value="accelerated_weekly">Accelerated weekly</option>
+        </select></div>
         <div><label>Payment day (deduction day)</label><input type="number" id="paymentDayInput" min="1" max="31" step="1" placeholder="e.g. 1" style="width:110px"></div>
-        <button type="submit">Save payment day</button>
+        <button type="submit">Save payment schedule</button>
       </form>
-      <div class="note" style="margin-left:0">The day of the month your payment leaves your account (1–31, leave empty to clear). It only anchors the projection charts' dates — the engine works in whole months, so the interest amounts do not depend on it.</div>
+      <div class="note" style="margin-left:0">The monthly payment amount (in the Mortgage panel) is converted to a per-payment amount by frequency: regular schedules keep the same yearly total, while accelerated schedules pay half the monthly amount every two weeks (a quarter weekly) — 13 monthly payments a year. The payment day (1–31, leave empty to clear) is the day of the month your payment leaves your account; it only anchors the projection charts' dates for monthly and semi-monthly schedules, so the interest amounts do not depend on it.</div>
+      <div class="note" id="paymentFreqNote" style="margin-left:0"></div>
     </div>
 
     <div class="panel">
