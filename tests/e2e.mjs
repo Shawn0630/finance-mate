@@ -48,6 +48,9 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-e2e-'));
   const ts = new Date().toISOString();
   const insP = legacy.prepare('INSERT INTO properties (address, mortgage_balance, owner, created_at, updated_at) VALUES (?, 0, ?, ?, ?)');
   insP.run('1 Legacy Lane', 'Shawn', ts, ts);
+  // A pre-gallery single uploaded photo: the boot migration must fold
+  // it into property_photos as this property's first gallery photo.
+  legacy.prepare("UPDATE properties SET photo_file = 'legacy-photo.jpg' WHERE address = '1 Legacy Lane'").run();
   insP.run('2 Legacy Lane', 'Joint', ts, ts);
   insP.run('3 Legacy Lane', null, ts, ts);
   legacy.prepare('INSERT INTO other_assets (category, name, value, currency, owner, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?, ?)')
@@ -960,6 +963,73 @@ try {
   await req('DELETE', `/api/properties/${r.data.id}`);
   await req('DELETE', `/api/properties/${pidPrime}`);
 
+  // ---- Property photo gallery ----
+  // Uploads land in property_photos (files under data/photos); the
+  // detail response carries the ordered gallery; a legacy external
+  // photo_url rides along as one extra entry until removed.
+  const GALLERY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  r = await req('GET', '/api/properties');
+  const legacyProp = (r.data || []).find((p) => p.address === '1 Legacy Lane');
+  check('legacy single photo_file migrated into the gallery',
+    !!legacyProp && Array.isArray(legacyProp.photos) && legacyProp.photos.length === 1
+      && legacyProp.photos[0].kind === 'upload' && legacyProp.photos[0].src === '/photos/legacy-photo.jpg'
+      && legacyProp.photo_file === null,
+    JSON.stringify(legacyProp && legacyProp.photos));
+  r = await req('POST', '/api/properties', {
+    address: '77 Gallery Grove, Victoria, BC', mortgage_balance: 100000, purchase_date: '2021-05-01',
+  });
+  check('gallery fixture property created', r.status === 201, JSON.stringify(r.status));
+  const galId = r.data.id;
+  r = await req('GET', `/api/properties/${galId}`);
+  check('a new property starts with an empty gallery',
+    Array.isArray(r.data.photos) && r.data.photos.length === 0, JSON.stringify(r.data.photos));
+  r = await req('POST', `/api/properties/${galId}/photos`, {
+    images: [
+      { dataBase64: GALLERY_PNG, contentType: 'image/png' },
+      { dataBase64: GALLERY_PNG, contentType: 'image/png' },
+    ],
+  });
+  check('batch upload appends two photos in order',
+    r.status === 200 && r.data.photos.length === 2
+      && r.data.photos.every((x) => x.kind === 'upload' && x.src.startsWith('/photos/'))
+      && r.data.photos[0].id !== r.data.photos[1].id,
+    JSON.stringify(r.data.photos));
+  const firstPhoto = r.data.photos[0];
+  const served = await fetch(BASE + firstPhoto.src, { headers: { Cookie: cookie } });
+  check('an uploaded photo file is served back', served.status === 200, String(served.status));
+  r = await req('POST', `/api/properties/${galId}/photos`, { dataBase64: GALLERY_PNG, contentType: 'image/png' });
+  check('single-image upload shape also works', r.status === 200 && r.data.photos.length === 3,
+    JSON.stringify(r.data.photos && r.data.photos.length));
+  const badBatch = await req('POST', `/api/properties/${galId}/photos`, {
+    images: [
+      { dataBase64: GALLERY_PNG, contentType: 'image/png' },
+      { dataBase64: 'aGVsbG8=', contentType: 'text/plain' },
+    ],
+  });
+  check('a batch with a non-image is rejected whole', badBatch.status === 400, JSON.stringify(badBatch.data));
+  r = await req('GET', `/api/properties/${galId}`);
+  check('the rejected batch wrote nothing', r.data.photos.length === 3, JSON.stringify(r.data.photos.length));
+  // Legacy external URL: set like the old form used to, shows as an
+  // extra gallery entry, and removing it clears the field for good.
+  r = await req('PUT', `/api/properties/${galId}`, { photo_url: 'https://example.com/house.jpg' });
+  check('legacy photo_url joins the gallery as a url entry',
+    r.status === 200 && r.data.photos.length === 4
+      && r.data.photos[3].kind === 'url' && r.data.photos[3].id === 'url'
+      && r.data.photos[3].src === 'https://example.com/house.jpg',
+    JSON.stringify(r.data.photos));
+  r = await req('DELETE', `/api/properties/${galId}/photos/url`);
+  check('removing the url entry clears photo_url',
+    r.status === 200 && r.data.photo_url === null && r.data.photos.length === 3,
+    JSON.stringify(r.data.photos && r.data.photos.length));
+  r = await req('DELETE', `/api/properties/${galId}/photos/${firstPhoto.id}`);
+  check('deleting one upload leaves the rest in order',
+    r.status === 200 && r.data.photos.length === 2 && !r.data.photos.some((x) => x.id === firstPhoto.id),
+    JSON.stringify(r.data.photos));
+  const gone = await fetch(BASE + firstPhoto.src, { headers: { Cookie: cookie } });
+  check('the deleted photo file is gone', gone.status === 404, String(gone.status));
+  r = await req('DELETE', `/api/properties/${galId}/photos/99999`);
+  check('deleting a missing photo is 404', r.status === 404);
+
   // ---- Money inputs: grouped on screen, plain numbers on the wire ----
   // Every money field is a text input marked data-money; the shared
   // format/parse pair in app.js groups what the user sees and parses it
@@ -1397,6 +1467,91 @@ try {
       });
       check('portfolio assessed line is stepped with zero tension',
         !!pfStepCfg && pfStepCfg.stepped === 'before' && pfStepCfg.tension === 0, JSON.stringify(pfStepCfg));
+
+      // ---- Property panel: read-only metadata until Edit; photo carousel ----
+      page.on('dialog', (d) => d.accept()); // photo removal asks confirm()
+      const until = async (fn, tries = 40) => {
+        for (let i = 0; i < tries; i++) { if (await page.evaluate(fn)) return true; await wait(300); }
+        return false;
+      };
+      await page.goto(`http://ff.local/#property/${moneyPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      check('detail opens on the read-only property view',
+        await until(() => {
+          const body = document.querySelector('#propViewBody');
+          return body && body.textContent.includes('999 Money Test Terrace')
+            && !document.querySelector('#propView').classList.contains('hidden');
+        }));
+      const panelState = await page.evaluate(() => ({
+        formHidden: document.querySelector('#propForm').classList.contains('hidden'),
+        viewInputs: document.querySelectorAll('#propView input').length,
+        hasPhotoUrlField: !!document.querySelector('#propForm [name=photo_url]'),
+        viewText: document.querySelector('#propViewBody').textContent,
+        sourceLine: document.querySelector('#assessmentMetaView').textContent,
+        emptyGallery: document.querySelector('#photoArea').textContent.includes('No photos yet'),
+      }));
+      check('the edit form stays hidden until Edit', panelState.formHidden === true);
+      check('the read-only view has no inputs (pure metadata)', panelState.viewInputs === 0);
+      check('the Photo URL field is gone from the edit form', panelState.hasPhotoUrlField === false);
+      check('read-only view shows purchase date 2024-12-17', panelState.viewText.includes('2024-12-17'), panelState.viewText.slice(0, 160));
+      check('read-only view carries a Source line', panelState.sourceLine.trim().length > 0, panelState.sourceLine);
+      check('a property without photos shows the click-to-add placeholder', panelState.emptyGallery === true);
+      // Edit -> change purchase date -> Save: back to read-only with
+      // the new value, and the change is really persisted.
+      await page.evaluate(() => document.querySelector('#editPropBtn').click());
+      await wait(300);
+      check('Edit reveals the form', await page.evaluate(() => !document.querySelector('#propForm').classList.contains('hidden')));
+      await page.evaluate(() => { document.querySelector('#propForm [name=purchase_date]').value = '2019-03-04'; });
+      await page.evaluate(() => document.querySelector('#propForm [type=submit]').click());
+      check('Save returns to the read-only view showing the new purchase date',
+        await until(() => !document.querySelector('#propView').classList.contains('hidden')
+          && document.querySelector('#propViewBody').textContent.includes('2019-03-04')));
+      r = await req('GET', `/api/properties/${moneyPid}`);
+      check('the saved purchase date persisted', r.data.purchase_date === '2019-03-04', JSON.stringify(r.data.purchase_date));
+      // Edit -> change -> Cancel: nothing is written.
+      await page.evaluate(() => document.querySelector('#editPropBtn').click());
+      await wait(300);
+      await page.evaluate(() => { document.querySelector('#propForm [name=purchase_date]').value = '2000-01-01'; });
+      await page.evaluate(() => document.querySelector('#cancelPropEditBtn').click());
+      await wait(300);
+      const afterCancel = await page.evaluate(() => document.querySelector('#propViewBody').textContent);
+      check('Cancel discards the edit (view keeps the saved date)',
+        afterCancel.includes('2019-03-04') && !afterCancel.includes('2000-01-01'), afterCancel.slice(0, 160));
+      r = await req('GET', `/api/properties/${moneyPid}`);
+      check('Cancel wrote nothing to the server', r.data.purchase_date === '2019-03-04', JSON.stringify(r.data.purchase_date));
+      // Carousel: two uploads (via the API), switch, remove one, and
+      // the Properties card cover follows the first remaining photo.
+      const TINY = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      await req('POST', `/api/properties/${moneyPid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
+      r = await req('POST', `/api/properties/${moneyPid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
+      check('two photos uploaded for the carousel checks', r.data.photos.length === 2, JSON.stringify(r.data.photos));
+      const [ph1, ph2] = r.data.photos;
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('carousel renders one dot per photo',
+        await until(() => document.querySelectorAll('#photoArea .carousel-dots .dot').length === 2));
+      const carSrc1 = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
+      check('carousel starts on the first photo', carSrc1 === ph1.src, String(carSrc1));
+      await page.evaluate(() => document.querySelector('#photoArea [data-photo-nav="1"]').click());
+      await wait(300);
+      const carSrc2 = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
+      check('next arrow switches to the second photo', carSrc2 === ph2.src && carSrc2 !== carSrc1, String(carSrc2));
+      await page.evaluate(() => document.querySelector('#photoArea [data-photo-remove]').click());
+      check('removing the shown photo leaves a one-photo carousel',
+        await until(() => {
+          const c = document.querySelector('#photoArea .carousel-count');
+          return c && c.textContent.trim() === '1 / 1' && !document.querySelector('#photoArea .carousel-dots');
+        }));
+      r = await req('GET', `/api/properties/${moneyPid}`);
+      check('the removal persisted (one photo left, the first one)',
+        r.data.photos.length === 1 && r.data.photos[0].id === ph1.id, JSON.stringify(r.data.photos));
+      await page.evaluate(() => { location.hash = '#assets/properties'; });
+      await wait(2000);
+      const cover = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('999 Money Test Terrace'));
+        const img = card && card.querySelector('.photo img');
+        return img ? img.getAttribute('src') : null;
+      });
+      check('the Properties card cover is the first gallery photo', cover === ph1.src, String(cover));
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

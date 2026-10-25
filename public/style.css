@@ -53,6 +53,17 @@ td.num, th.num { text-align: right; }
 .placeholder { background: #fff; border: 1px dashed #c9d2dc; border-radius: 10px; padding: 42px 20px; text-align: center; color: #71808f; }
 .detail-photo { width: 100%; max-height: 300px; object-fit: cover; border-radius: 10px; }
 .detail-photo-empty { height: 170px; background: #dbe4ee; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #71808f; }
+.photo-clickable { cursor: pointer; }
+.photo-carousel { position: relative; }
+.carousel-nav { position: absolute; top: 130px; width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(20, 40, 60, .18); background: rgba(255, 255, 255, .9); color: #33424f; font-size: 20px; line-height: 1; padding: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.carousel-nav:hover { background: #fff; }
+.carousel-nav.prev { left: 10px; }
+.carousel-nav.next { right: 10px; }
+.carousel-bar { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.carousel-dots { display: inline-flex; gap: 6px; }
+.carousel-dots .dot { width: 8px; height: 8px; border-radius: 50%; background: #c9d2dc; cursor: pointer; }
+.carousel-dots .dot.active { background: #1668c4; }
+.carousel-count { color: #71808f; font-size: 12px; }
 .chart-wrap { position: relative; height: 340px; }
 .summary-card .n { color: #71808f; font-size: 12px; margin-top: 2px; }
 .portfolio-grid { display: grid; grid-template-columns: 360px 1fr; gap: 18px; margin-top: 14px; }

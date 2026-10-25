@@ -27,7 +27,7 @@ const SESSION_DAYS = 30;
 seedUsers();
 
 const app = express();
-app.use(express.json({ limit: '12mb' })); // photo uploads arrive as base64 JSON
+app.use(express.json({ limit: '48mb' })); // photo uploads arrive as base64 JSON (a gallery batch can carry several)
 
 // ---------------------------------------------------------------- auth ---
 function parseCookies(req) {
@@ -314,12 +314,27 @@ function segmentView(seg) {
   };
 }
 
+// A property's photo gallery as the client renders it: the uploaded
+// photos in their stored order, then — for properties recorded before
+// galleries existed — the old external photo_url as one extra entry
+// (kind 'url', id 'url'). Removing that entry clears the column; there
+// is no way to set a new URL (uploads only).
+function photosView(p) {
+  const rows = db
+    .prepare('SELECT id, file_name FROM property_photos WHERE property_id = ? ORDER BY sort_order, id')
+    .all(p.id);
+  const photos = rows.map((r) => ({ id: r.id, src: `/photos/${r.file_name}`, kind: 'upload' }));
+  if (p.photo_url) photos.push({ id: 'url', src: p.photo_url, kind: 'url' });
+  return photos;
+}
+
 function propertyView(p) {
   const segments = segmentsOf(p.id).map(segmentView);
   const cur = currentSegment(segments);
   return {
     ...p,
     owners: parseOwners(p.owners),
+    photos: photosView(p),
     segments,
     currentRate: cur ? {
       rate_type: cur.rate_type, annual_rate: cur.effective_rate,
@@ -692,8 +707,10 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
 app.delete('/api/properties/:id', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  if (p.photo_file) fs.promises.unlink(path.join(PHOTOS_DIR, p.photo_file)).catch(() => {});
+  // The gallery rows cascade away with the property; their files go too.
+  const files = db.prepare('SELECT file_name FROM property_photos WHERE property_id = ?').all(p.id);
   db.prepare('DELETE FROM properties WHERE id = ?').run(p.id);
+  for (const f of files) fs.promises.unlink(path.join(PHOTOS_DIR, f.file_name)).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -732,20 +749,65 @@ app.post('/api/properties/:id/pull-history', requireApiAuth, async (req, res) =>
   res.json({ ...r, property: propertyView(getProperty(p.id)), history: historyView(p.id) });
 });
 
-// Photo upload as base64 JSON (keeps us dependency-free; ~12 MB body limit).
-app.post('/api/properties/:id/photo-upload', requireApiAuth, (req, res) => {
+// Photo gallery uploads as base64 JSON (keeps us dependency-free).
+// One call carries one image ({ dataBase64, contentType }) or several
+// ({ images: [...] }); each image is validated like the avatar uploads
+// (jpeg/png/webp/gif, non-empty, ≤ 9 MB) and appended to the gallery.
+// Everything is validated before anything is written, so a bad file
+// in a batch rejects the batch untouched with the reason named.
+app.post('/api/properties/:id/photos', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  const { dataBase64, contentType } = req.body || {};
+  const b = req.body || {};
+  const items = Array.isArray(b.images) ? b.images : [b];
+  if (!items.length || items.length > 20) {
+    return res.status(400).json({ error: 'send between 1 and 20 images per upload' });
+  }
   const exts = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
-  const ext = exts[contentType];
-  if (!dataBase64 || !ext) return res.status(400).json({ error: 'expected { dataBase64, contentType: image/jpeg|png|webp|gif }' });
-  const buf = Buffer.from(String(dataBase64), 'base64');
-  if (buf.length === 0 || buf.length > 9 * 1024 * 1024) return res.status(400).json({ error: 'image empty or too large' });
-  const name = `property-${p.id}-${Date.now()}.${ext}`;
-  fs.writeFileSync(path.join(PHOTOS_DIR, name), buf);
-  if (p.photo_file) fs.promises.unlink(path.join(PHOTOS_DIR, p.photo_file)).catch(() => {});
-  db.prepare('UPDATE properties SET photo_file=?, photo_url=NULL, updated_at=? WHERE id=?').run(name, nowIso(), p.id);
+  const decoded = [];
+  let total = 0;
+  for (let i = 0; i < items.length; i++) {
+    const { dataBase64, contentType } = items[i] || {};
+    const ext = exts[contentType];
+    if (!dataBase64 || !ext) {
+      return res.status(400).json({ error: `image ${i + 1}: expected { dataBase64, contentType: image/jpeg|png|webp|gif }` });
+    }
+    const buf = Buffer.from(String(dataBase64), 'base64');
+    if (buf.length === 0) return res.status(400).json({ error: `image ${i + 1}: empty file` });
+    if (buf.length > 9 * 1024 * 1024) return res.status(400).json({ error: `image ${i + 1}: larger than 9 MB` });
+    total += buf.length;
+    decoded.push({ buf, ext });
+  }
+  if (total > 36 * 1024 * 1024) return res.status(400).json({ error: 'upload batch larger than 36 MB in total' });
+  let order = (db.prepare('SELECT MAX(sort_order) AS m FROM property_photos WHERE property_id = ?').get(p.id).m ?? -1) + 1;
+  const ins = db.prepare('INSERT INTO property_photos (property_id, file_name, sort_order, created_at) VALUES (?, ?, ?, ?)');
+  const stamp = Date.now();
+  db.transaction(() => {
+    for (let i = 0; i < decoded.length; i++) {
+      const name = `property-${p.id}-${stamp}-${i}-${crypto.randomBytes(3).toString('hex')}.${decoded[i].ext}`;
+      fs.writeFileSync(path.join(PHOTOS_DIR, name), decoded[i].buf);
+      ins.run(p.id, name, order++, nowIso());
+    }
+  })();
+  res.json(propertyView(getProperty(p.id)));
+});
+
+// Remove one gallery photo. Uploaded photos lose their row and file;
+// the legacy external URL entry (photoId 'url') clears photo_url —
+// after that the URL is gone for good (there is no URL field anymore).
+app.delete('/api/properties/:id/photos/:photoId', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  if (req.params.photoId === 'url') {
+    if (!p.photo_url) return res.status(404).json({ error: 'photo not found' });
+    db.prepare('UPDATE properties SET photo_url = NULL, updated_at = ? WHERE id = ?').run(nowIso(), p.id);
+    return res.json(propertyView(getProperty(p.id)));
+  }
+  const row = db.prepare('SELECT * FROM property_photos WHERE id = ? AND property_id = ?')
+    .get(Number(req.params.photoId), p.id);
+  if (!row) return res.status(404).json({ error: 'photo not found' });
+  db.prepare('DELETE FROM property_photos WHERE id = ?').run(row.id);
+  fs.promises.unlink(path.join(PHOTOS_DIR, row.file_name)).catch(() => {});
   res.json(propertyView(getProperty(p.id)));
 });
 

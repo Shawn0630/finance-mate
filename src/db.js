@@ -103,7 +103,41 @@ CREATE TABLE IF NOT EXISTS value_history (
   updated_at TEXT NOT NULL,
   UNIQUE (property_id, year)
 );
+-- A property's uploaded photos, in display order: the gallery the
+-- detail page shows as a carousel; the first row is the Properties
+-- card cover. Files live in PHOTOS_DIR; the row stores only the name.
+-- (The older single-photo column properties.photo_url — an external
+-- link — is NOT part of this table: it joins the gallery view as one
+-- extra entry the user can remove, which clears the column.)
+CREATE TABLE IF NOT EXISTS property_photos (
+  id INTEGER PRIMARY KEY,
+  property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  file_name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_property_photos ON property_photos(property_id, sort_order, id);
 `);
+
+// Properties used to carry ONE uploaded photo in properties.photo_file;
+// the gallery replaces it. Fold any existing single photo into the
+// gallery as a photo of that property (keeping its place as the first
+// upload), then clear the column so property_photos is the single
+// source of truth. Idempotent: an already-migrated file is skipped.
+{
+  const singles = db.prepare('SELECT id, photo_file, created_at FROM properties WHERE photo_file IS NOT NULL').all();
+  if (singles.length) {
+    const has = db.prepare('SELECT 1 FROM property_photos WHERE property_id = ? AND file_name = ?');
+    const ins = db.prepare('INSERT INTO property_photos (property_id, file_name, sort_order, created_at) VALUES (?, ?, 0, ?)');
+    const clear = db.prepare('UPDATE properties SET photo_file = NULL WHERE id = ?');
+    db.transaction(() => {
+      for (const r of singles) {
+        if (!has.get(r.id, r.photo_file)) ins.run(r.id, r.photo_file, r.created_at);
+        clear.run(r.id);
+      }
+    })();
+  }
+}
 
 // Safe add-column migrations for databases created before a column existed.
 const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);

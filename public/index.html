@@ -111,20 +111,27 @@
     <div class="toolbar"><a href="#assets/properties">&larr; Back to Properties</a><div class="spacer"></div>
       <button class="danger" id="deletePropertyBtn">Delete property</button></div>
     <div id="photoArea"></div>
+    <input type="file" id="photoFiles" accept="image/*" multiple class="hidden">
     <div class="msg" id="detailMsg"></div>
     <div class="msg warn hidden" id="primeWarning"></div>
 
     <div class="panel">
       <h3>Property &amp; assessment</h3>
-      <form id="propForm">
+      <div id="propView">
+        <table class="detail-table"><tbody id="propViewBody"></tbody></table>
+        <div class="note" id="assessmentMetaView" style="margin-left:0"></div>
+        <div class="toolbar">
+          <button class="primary" type="button" id="editPropBtn">Edit</button>
+          <button type="button" id="fetchBcaBtn">Fetch from BC Assessment</button>
+          <button type="button" id="pullHistoryBtn">Pull history from HouseSigma</button>
+        </div>
+      </div>
+      <form id="propForm" class="hidden">
         <div class="grid2">
           <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off" required><ul class="suggest-list hidden"></ul><p class="suggest-note hidden">Address suggestions are unavailable right now — you can still type the full address.</p></div></div>
           <div><label>Owners</label><div class="owner-picker" id="propOwnerPicker"><div class="owner-chips"></div><div class="owner-candidates"></div></div></div>
         </div>
-        <div class="grid2">
-          <div><label>Notes</label><input name="notes"></div>
-          <div><label>Photo URL (external link)</label><input name="photo_url" placeholder="https://…"></div>
-        </div>
+        <div><label>Notes</label><input name="notes"></div>
         <div class="grid3">
           <div><label>Assessed value ($)</label><input name="assessed_value" type="text" inputmode="decimal" data-money></div>
           <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
@@ -133,9 +140,7 @@
         <div class="note" id="assessmentMeta" style="margin-left:0"></div>
         <div class="toolbar">
           <button class="primary" type="submit">Save</button>
-          <button type="button" id="fetchBcaBtn">Fetch from BC Assessment</button>
-          <button type="button" id="pullHistoryBtn">Pull history from HouseSigma</button>
-          <label style="margin:0">Upload photo <input type="file" id="photoFile" accept="image/*" style="width:auto"></label>
+          <button type="button" id="cancelPropEditBtn">Cancel</button>
         </div>
       </form>
       <div class="note" id="paymentDayDisplay" style="margin-left:0"></div>

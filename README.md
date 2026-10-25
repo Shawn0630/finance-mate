@@ -6,7 +6,9 @@ placeholder pages for later rounds.
 
 ## Assets module
 
-- **Properties** — address, photo (external URL or upload), BC Assessment
+- **Properties** — address, a photo gallery (upload any number of local
+  photos; they show as a carousel on the detail page and the first one
+  is the card cover), BC Assessment
   assessed value, outstanding principal, and any number of **rate segments**
   (fixed / variable, each with its own start date and annual rate).
 - **Mortgage projection chart** — month-by-month **monthly interest** and
@@ -139,8 +141,10 @@ stage that failed and never overwrite your saved values. Typing the value
 manually always works, and manually edited values are marked "Manual".
 
 Note: the public BC Assessment property page shows a map, not a house
-photo, so photos cannot be fetched from it — add a photo by pasting an
-external image URL or uploading an image file.
+photo, so photos cannot be fetched from it — click the photo area on a
+property's detail page to upload photos from your computer. (Properties
+recorded earlier may still carry an external photo URL; it shows in the
+gallery as one entry and can be removed there, which clears it for good.)
 
 ## Mortgage math
 

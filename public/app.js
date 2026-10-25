@@ -375,11 +375,9 @@ async function loadAssets(force = false) {
 
   // Properties listing.
   $('#propertyCards').innerHTML = properties.map((p) => {
-    const photo = p.photo_file
-      ? `<img src="/photos/${esc(p.photo_file)}" alt="">`
-      : p.photo_url
-        ? `<img src="${esc(p.photo_url)}" alt="">`
-        : 'No photo';
+    const photo = p.photos && p.photos.length
+      ? `<img src="${esc(p.photos[0].src)}" alt="">`
+      : 'No photo';
     const rate = p.currentRate
       ? `${p.currentRate.rate_type === 'fixed' ? 'Fixed' : 'Variable'} ${Number(p.currentRate.annual_rate).toFixed(2)}%`
       : 'No rate segments';
@@ -824,19 +822,117 @@ let equityData = null;
 // Test/debug hook: lets the screenshot script read the live chart configs.
 window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null });
 
-function photoSrc(p) {
-  if (p.photo_file) return `/photos/${p.photo_file}`;
-  if (p.photo_url) return p.photo_url;
-  return null;
+// ------------------------------------------------------------ photos ---
+// The detail page's gallery: a carousel over the property's photos
+// (uploads, plus a legacy external URL entry when one is still on the
+// record). Clicking the photo area — or "Add photos" — opens the file
+// picker; uploads append to the gallery. Any photo can be removed;
+// the first photo is the Properties card cover.
+let photoIndex = 0;
+
+function renderPhotos(p) {
+  const photos = (p && p.photos) || [];
+  if (photoIndex >= photos.length) photoIndex = Math.max(0, photos.length - 1);
+  if (photoIndex < 0) photoIndex = 0;
+  const area = $('#photoArea');
+  if (!photos.length) {
+    area.innerHTML = '<div class="detail-photo-empty photo-clickable" data-photo-add>No photos yet — click to add photos</div>';
+    return;
+  }
+  const cur = photos[photoIndex];
+  area.innerHTML = `<div class="photo-carousel">
+      <img class="detail-photo photo-clickable" data-photo-add src="${esc(cur.src)}" alt="">
+      ${photos.length > 1 ? `
+        <button type="button" class="carousel-nav prev" data-photo-nav="-1" aria-label="Previous photo">&#8249;</button>
+        <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>` : ''}
+      <div class="carousel-bar">
+        ${photos.length > 1 ? `<span class="carousel-dots">${photos.map((_, i) => `<span class="dot${i === photoIndex ? ' active' : ''}" data-photo-dot="${i}"></span>`).join('')}</span>` : ''}
+        <span class="carousel-count">${photoIndex + 1} / ${photos.length}</span>
+        <span style="flex:1"></span>
+        <button type="button" class="small" data-photo-add-btn>Add photos</button>
+        <button type="button" class="small danger" data-photo-remove>Remove this photo</button>
+      </div>
+    </div>`;
 }
 
-async function loadPropertyDetail(id) {
-  const p = await api(`/api/properties/${id}`);
-  detailProperty = p;
-  const src = photoSrc(p);
-  $('#photoArea').innerHTML = src
-    ? `<img class="detail-photo" src="${esc(src)}" alt="">`
-    : '<div class="detail-photo-empty">No photo — add a photo URL or upload one below</div>';
+function stepPhoto(delta) {
+  const photos = (detailProperty && detailProperty.photos) || [];
+  if (photos.length < 2) return;
+  photoIndex = (photoIndex + delta + photos.length) % photos.length;
+  renderPhotos(detailProperty);
+}
+
+async function removeCurrentPhoto() {
+  const photos = (detailProperty && detailProperty.photos) || [];
+  const cur = photos[photoIndex];
+  if (!cur) return;
+  if (!confirm('Remove this photo from the gallery?')) return;
+  try {
+    const updated = await api(`/api/properties/${currentPropertyId}/photos/${cur.id}`, { method: 'DELETE' });
+    detailProperty = updated;
+    renderPhotos(updated);
+    markAssetsDirty(); // the card cover may have been this photo
+    showMsg($('#detailMsg'), 'ok', 'Photo removed.');
+  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+}
+
+$('#photoArea').addEventListener('click', (e) => {
+  const nav = e.target.closest('[data-photo-nav]');
+  if (nav) { stepPhoto(Number(nav.dataset.photoNav)); return; }
+  const dot = e.target.closest('[data-photo-dot]');
+  if (dot) { photoIndex = Number(dot.dataset.photoDot); renderPhotos(detailProperty); return; }
+  if (e.target.closest('[data-photo-remove]')) { removeCurrentPhoto(); return; }
+  if (e.target.closest('[data-photo-add-btn]') || e.target.closest('[data-photo-add]')) {
+    $('#photoFiles').click();
+  }
+});
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1]);
+    reader.onerror = () => reject(new Error(`could not read ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+$('#photoFiles').addEventListener('change', async (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (!files.length) return;
+  const msg = $('#detailMsg');
+  showMsg(msg, 'ok', `Uploading ${files.length} photo${files.length === 1 ? '' : 's'}…`);
+  try {
+    const images = [];
+    for (const file of files) images.push({ dataBase64: await fileToBase64(file), contentType: file.type });
+    const firstNew = ((detailProperty && detailProperty.photos) || []).filter((x) => x.kind === 'upload').length;
+    const updated = await api(`/api/properties/${currentPropertyId}/photos`, { method: 'POST', body: { images } });
+    detailProperty = updated;
+    photoIndex = Math.min(firstNew, (updated.photos || []).length - 1);
+    renderPhotos(updated);
+    markAssetsDirty(); // the first photo is the card cover
+    showMsg(msg, 'ok', `Photo${files.length === 1 ? '' : 's'} added.`);
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+// ------------------------------------------- property panel view/edit ---
+// The Property & assessment panel is read-only metadata until Edit is
+// clicked; Edit swaps in the form, Save/Cancel swap back. The form is
+// (re)filled from the loaded property on every load and every Edit, so
+// a cancelled edit never lingers in the inputs.
+function renderPropView(p) {
+  const rows = [
+    ['Address', p.address || '—'],
+    ['Owners', p.owners && p.owners.length ? ownerChipsHtml(p.owners) : '—', true],
+    ['Notes', p.notes || '—'],
+    ['Assessed value', p.assessed_value != null ? money(p.assessed_value) : '—'],
+    ['Assessment year', p.assessed_year ?? '—'],
+    ['Purchase date', p.purchase_date || '—'],
+  ];
+  $('#propViewBody').innerHTML = rows.map(([k, v, raw]) => `<tr><td>${k}</td><td>${raw ? v : esc(v)}</td></tr>`).join('');
+}
+
+function fillPropForm(p) {
   const pf = $('#propForm');
   pf.address.value = p.address || '';
   propSuggest.state.id = p.bca_id || null;
@@ -847,6 +943,32 @@ async function loadPropertyDetail(id) {
   setMoneyValue(pf.assessed_value, p.assessed_value);
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.purchase_date.value = p.purchase_date || '';
+}
+
+function setPropEditing(on) {
+  $('#propView').classList.toggle('hidden', on);
+  $('#propForm').classList.toggle('hidden', !on);
+}
+
+$('#editPropBtn').addEventListener('click', () => {
+  if (!detailProperty) return;
+  fillPropForm(detailProperty);
+  setPropEditing(true);
+});
+
+$('#cancelPropEditBtn').addEventListener('click', () => {
+  if (detailProperty) fillPropForm(detailProperty); // discard the edits
+  setPropEditing(false);
+});
+
+async function loadPropertyDetail(id) {
+  const p = await api(`/api/properties/${id}`);
+  detailProperty = p;
+  photoIndex = 0;
+  renderPhotos(p);
+  renderPropView(p);
+  fillPropForm(p);
+  setPropEditing(false);
   $('#paymentDayInput').value = p.payment_day ?? '';
   const freqKey = FREQUENCY_LABELS[p.payment_frequency] ? p.payment_frequency : 'monthly';
   $('#paymentFrequencySelect').value = freqKey;
@@ -857,18 +979,21 @@ async function loadPropertyDetail(id) {
   $('#paymentDayDisplay').textContent =
     `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in the Rate segments panel below.`;
   $('#regionDisplay').textContent = `Region: ${p.region === 'CA' || !p.region ? 'Canada (CA)' : esc(p.region)}.`;
-  pf.photo_url.value = p.photo_url || '';
-  $('#assessmentMeta').textContent =
+  // The Source line reads the same in the read-only view and in the
+  // edit form (the manual-marking note applies once you are editing).
+  let metaText =
     p.assessed_source === 'auto'
-      ? `Source: BC Assessment (auto-fetched${p.assessed_fetched_at ? ' ' + new Date(p.assessed_fetched_at).toLocaleString('en-CA') : ''}${p.bca_matched_address ? ', matched "' + p.bca_matched_address + '"' : ''}${p.land_value != null ? `, land ${money(p.land_value)} + building ${money(p.building_value)}` : ''}). Editing the value above marks it as manual.`
+      ? `Source: BC Assessment (auto-fetched${p.assessed_fetched_at ? ' ' + new Date(p.assessed_fetched_at).toLocaleString('en-CA') : ''}${p.bca_matched_address ? ', matched "' + p.bca_matched_address + '"' : ''}${p.land_value != null ? `, land ${money(p.land_value)} + building ${money(p.building_value)}` : ''}). Editing the value marks it as manual.`
       : p.assessed_source === 'manual'
         ? 'Source: entered manually. Use "Fetch from BC Assessment" to replace it with the official assessed value.'
         : 'No assessed value yet.';
   // A failed auto-refresh leaves the stored value in place; say so
   // quietly next to it rather than letting it look current.
   if (p.assessmentRefresh && p.assessmentRefresh.stale) {
-    $('#assessmentMeta').textContent += ` The latest automatic check against BC Assessment failed (${p.assessmentRefresh.error || 'unknown error'}) — showing the last known value.`;
+    metaText += ` The latest automatic check against BC Assessment failed (${p.assessmentRefresh.error || 'unknown error'}) — showing the last known value.`;
   }
+  $('#assessmentMeta').textContent = metaText;
+  $('#assessmentMetaView').textContent = metaText;
   const hsNote = $('#hsPullNote');
   if (hsNote) {
     hsNote.textContent = p.houseSigma && p.houseSigma.attempted
@@ -1100,27 +1225,8 @@ $('#pullHistoryBtn').addEventListener('click', async () => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
-$('#photoFile').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  const dataUrl = await new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.readAsDataURL(file);
-  });
-  const dataBase64 = String(dataUrl).split(',')[1];
-  try {
-    await api(`/api/properties/${currentPropertyId}/photo-upload`, {
-      method: 'POST', body: { dataBase64, contentType: file.type },
-    });
-    markAssetsDirty();
-    showMsg($('#detailMsg'), 'ok', 'Photo uploaded.');
-    loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
-});
-
 $('#deletePropertyBtn').addEventListener('click', async () => {
-  if (!confirm('Delete this property, its rate segments and its photo?')) return;
+  if (!confirm('Delete this property, its rate segments and its photos?')) return;
   await api(`/api/properties/${currentPropertyId}`, { method: 'DELETE' });
   markAssetsDirty();
   location.hash = '#assets/properties';
