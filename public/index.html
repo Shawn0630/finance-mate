@@ -54,6 +54,35 @@
         <button class="primary" id="addPropertyBtn">+ Add property</button>
       </div>
       <div class="msg" id="sectionMsg"></div>
+      <!-- Portfolio: cross-property totals and charts (filled by app.js). -->
+      <div id="portfolioBlock" class="panel hidden" style="margin-bottom:16px">
+        <h3>Portfolio</h3>
+        <div class="summary-strip">
+          <div class="summary-card"><div class="k">Total outstanding principal</div><div class="v" id="pfOutstanding">—</div></div>
+          <div class="summary-card"><div class="k">Total monthly payment</div><div class="v" id="pfPayment">—</div><div class="n">monthly equivalent</div></div>
+          <div class="summary-card"><div class="k">Total interest — projected remaining</div><div class="v" id="pfInterest">—</div><div class="n" id="pfInterestNote"></div></div>
+        </div>
+        <div class="portfolio-grid">
+          <div>
+            <div class="toolbar" style="margin-bottom:6px">
+              <button class="small" id="pfPieOutstandingBtn">Outstanding share</button>
+              <button class="small" id="pfPieAssessedBtn">Assessed share</button>
+            </div>
+            <div class="chart-wrap"><canvas id="portfolioPie"></canvas></div>
+          </div>
+          <div>
+            <div class="toolbar range-btns" id="pfRangeBtns" style="margin-bottom:6px">
+              <button data-months="12">1 year</button>
+              <button data-months="24">2 years</button>
+              <button data-months="60" class="active">5 years</button>
+              <button data-months="120">10 years</button>
+              <button data-months="0">All</button>
+            </div>
+            <div class="chart-wrap"><canvas id="portfolioChart"></canvas></div>
+          </div>
+        </div>
+        <div class="note" id="pfNotes" style="margin-left:0"></div>
+      </div>
       <div class="cards" id="propertyCards"></div>
     </div>
 

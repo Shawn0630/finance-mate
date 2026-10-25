@@ -366,6 +366,144 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   res.status(201).json(propertyView(getProperty(info.lastInsertRowid)));
 });
 
+// ------------------------------------------------------------- portfolio --
+// Aggregates across ALL properties for the Properties section's
+// Portfolio block: totals, per-property shares, the assessed-value
+// history summed by year, and the projected outstanding balances
+// summed by month (with the per-property split for stacked bars).
+// Defined before /api/properties/:id so 'portfolio' is not read as
+// an id. All projection math reuses the single-property rules: the
+// monthly payment is the entered one, else derived from the balance,
+// the rate plan and the remaining amortization (as in the
+// amortization endpoint); a property with no rate plan contributes
+// its balance and payment but no interest and no projection.
+app.get('/api/properties/portfolio', requireApiAuth, (req, res) => {
+  const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+  const today = new Date().toISOString().slice(0, 10);
+  const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
+
+  const perProperty = [];
+  const monthMaps = new Map(); // property id -> Map('YYYY-MM' -> balance)
+  const assessedPoints = new Map(); // property id -> [{ year, value }] sorted
+  let interestFrom = 0;
+  let withPlan = 0;
+
+  for (const p of props) {
+    const balance = p.mortgage_balance > 0 ? p.mortgage_balance : 0;
+    const segments = segmentsOf(p.id);
+    const balanceDate = p.mortgage_balance_date || today;
+    // Monthly payment (entered wins; else derived exactly like the
+    // amortization endpoint). Only meaningful with a balance.
+    let monthlyPayment = null;
+    if (balance > 0 && p.mortgage_payment > 0) {
+      monthlyPayment = p.mortgage_payment;
+    } else if (balance > 0 && segments.length && p.amortization_years > 0) {
+      const seg = segmentForMonth(segments, balanceDate.slice(0, 7));
+      monthlyPayment = derivePayment(balance, seg ? seg.annual_rate : 0, p.amortization_years);
+    }
+    let projectedInterest = null;
+    if (balance > 0 && segments.length) withPlan++;
+    if (balance > 0 && segments.length && monthlyPayment > 0) {
+      const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+      const r = simulate({ balance, balanceDate, payment: monthlyPayment, segments, paymentDay: p.payment_day ?? null, frequency });
+      projectedInterest = r.totalInterest;
+      interestFrom++;
+      const map = new Map();
+      for (const row of r.series) map.set(row.month, { balance: row.balance, last: row.month === r.series[r.series.length - 1].month });
+      monthMaps.set(p.id, {
+        map, payoffMonth: r.payoffMonth,
+        firstMonth: r.series.length ? r.series[0].month : null,
+        lastMonth: r.series.length ? r.series[r.series.length - 1].month : null,
+        lastBalance: r.series.length ? r.series[r.series.length - 1].balance : 0,
+      });
+    }
+    // Assessed history: the recorded value-history points; a property
+    // with a stored assessed value but no points contributes that one
+    // point in its assessed year.
+    let points = historyPoints(p.id).map((pt) => ({ year: pt.year, value: pt.value }));
+    if (!points.length && p.assessed_value != null && p.assessed_year) {
+      points = [{ year: p.assessed_year, value: p.assessed_value }];
+    }
+    assessedPoints.set(p.id, points);
+    const latestAssessed = points.length ? points[points.length - 1].value : (p.assessed_value ?? null);
+    perProperty.push({
+      id: p.id,
+      label: p.address,
+      shortLabel: String(p.address).split(',')[0],
+      outstanding: balance,
+      monthlyPayment: monthlyPayment > 0 ? monthlyPayment : 0,
+      paymentKnown: monthlyPayment > 0,
+      hasPlan: segments.length > 0,
+      projectedInterest,
+      latestAssessed,
+    });
+  }
+
+  const totalOutstanding = r2(perProperty.reduce((s, x) => s + x.outstanding, 0));
+  const totalAssessed = r2(perProperty.reduce((s, x) => s + (x.latestAssessed || 0), 0));
+  const slices = (pick, total) => perProperty
+    .filter((x) => pick(x) > 0 && total > 0)
+    .map((x) => ({ id: x.id, label: x.label, shortLabel: x.shortLabel, value: pick(x), pct: r2((pick(x) / total) * 100) }));
+
+  // Assessed totals by year, carry-forward: a property counts from
+  // its first known year on, at its most recent point at or before
+  // the year; years before its first point it is not counted.
+  const years = [...new Set(perProperty.flatMap((x) => (assessedPoints.get(x.id) || []).map((pt) => pt.year)))].sort((a, b) => a - b);
+  const assessedByYear = years.map((year) => {
+    let total = 0;
+    for (const x of perProperty) {
+      const pts = assessedPoints.get(x.id) || [];
+      let v = null;
+      for (const pt of pts) { if (pt.year <= year) v = pt.value; else break; }
+      if (v !== null) total += v;
+    }
+    return { year, total: r2(total) };
+  });
+
+  // Outstanding by month: union of all projection months. A property
+  // is null before its first projected month (not counted — never
+  // back-filled with its current balance); after its last month it is
+  // 0 when it paid off, else its final projected balance held flat
+  // (its projection hit the horizon cap). total is exactly the sum of
+  // the non-null parts, so stacked bars top out at the total line.
+  const months = [...new Set([...monthMaps.values()].flatMap((m) => [...m.map.keys()]))].sort();
+  const outstandingByMonth = months.map((month) => {
+    const byProperty = {};
+    let total = 0;
+    for (const x of perProperty) {
+      const m = monthMaps.get(x.id);
+      let v = null;
+      if (m) {
+        if (m.map.has(month)) v = m.map.get(month).balance;
+        else if (month > m.lastMonth) v = m.payoffMonth ? 0 : m.lastBalance;
+      }
+      byProperty[x.id] = v;
+      if (v !== null) total += v;
+    }
+    return { month, total: r2(total), byProperty };
+  });
+
+  res.json({
+    totals: {
+      outstanding: totalOutstanding,
+      monthlyPayment: r2(perProperty.reduce((s, x) => s + x.monthlyPayment, 0)),
+      totalInterest: r2(perProperty.reduce((s, x) => s + (x.projectedInterest || 0), 0)),
+      interestFrom,
+      withPlan,
+      propertyCount: perProperty.length,
+      paymentKnownCount: perProperty.filter((x) => x.paymentKnown).length,
+      assessedTotal: totalAssessed,
+    },
+    properties: perProperty,
+    pie: {
+      outstanding: slices((x) => x.outstanding, totalOutstanding),
+      assessed: slices((x) => x.latestAssessed || 0, totalAssessed),
+    },
+    assessedByYear,
+    outstandingByMonth,
+  });
+});
+
 app.get('/api/properties/:id', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });

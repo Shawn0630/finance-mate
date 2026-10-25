@@ -554,6 +554,90 @@ try {
   r = await req('DELETE', `/api/properties/${pid}`);
   check('delete property', r.status === 200);
 
+  // ------------------------------------------------------------ portfolio --
+  // Cross-property aggregates from GET /api/properties/portfolio.
+  // Assertions are delta-based against the portfolio as it was before
+  // the fixtures, with per-property expectations taken from the
+  // single-property endpoints (independent of the aggregation code).
+  const portBefore = (await req('GET', '/api/properties/portfolio')).data;
+  check('portfolio endpoint responds', portBefore && portBefore.totals && Array.isArray(portBefore.outstandingByMonth));
+  r = await req('POST', '/api/properties', {
+    address: '11 Portfolio Avenue, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    purchase_date: '2019-11-05',
+  });
+  const pidPA = r.data.id;
+  await req('POST', `/api/properties/${pidPA}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  r = await req('POST', '/api/properties', {
+    address: '22 Portfolio Avenue, Victoria, BC',
+    mortgage_balance: 50000, mortgage_balance_date: '2026-10-01', mortgage_payment: 500,
+    purchase_date: '2020-05-20',
+  });
+  const pidPB = r.data.id;
+  await req('POST', `/api/properties/${pidPB}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 3 });
+  const amortA = (await req('GET', `/api/properties/${pidPA}/amortization`)).data;
+  const amortB = (await req('GET', `/api/properties/${pidPB}/amortization`)).data;
+  check('portfolio fixtures project individually (A matches the 69494.74 anchor)',
+    amortA.ok && amortB.ok && Math.abs(amortA.totalInterest - 69494.74) <= 0.02,
+    JSON.stringify({ a: amortA.totalInterest, b: amortB.totalInterest }));
+  const port = (await req('GET', '/api/properties/portfolio')).data;
+  check('portfolio totals = baseline + both properties',
+    Math.abs(port.totals.outstanding - (portBefore.totals.outstanding + 150000)) <= 0.02
+      && Math.abs(port.totals.monthlyPayment - (portBefore.totals.monthlyPayment + 1100)) <= 0.02
+      && Math.abs(port.totals.totalInterest - (portBefore.totals.totalInterest + amortA.totalInterest + amortB.totalInterest)) <= 0.05,
+    JSON.stringify(port.totals));
+  const sliceA = port.pie.outstanding.find((s) => s.id === pidPA);
+  const sliceB = port.pie.outstanding.find((s) => s.id === pidPB);
+  const pctSum = port.pie.outstanding.reduce((s, x) => s + x.pct, 0);
+  check('pie shares match the balances and sum to 100',
+    !!sliceA && !!sliceB
+      && Math.abs(sliceA.pct - (100000 / port.totals.outstanding) * 100) <= 0.11
+      && Math.abs(sliceB.pct - (50000 / port.totals.outstanding) * 100) <= 0.11
+      && Math.abs(pctSum - 100) <= 0.5,
+    JSON.stringify(port.pie.outstanding).slice(0, 200));
+  const rowJun27 = port.outstandingByMonth.find((m) => m.month === '2027-06');
+  const balA27 = amortA.series.find((s) => s.month === '2027-06').balance;
+  const balB27 = amortB.series.find((s) => s.month === '2027-06').balance;
+  const stackSum = rowJun27 ? Object.values(rowJun27.byProperty).reduce((s, v) => s + (v || 0), 0) : -1;
+  check('stacked bars top out at the total line (2027-06)',
+    !!rowJun27 && Math.abs(rowJun27.byProperty[pidPA] - balA27) <= 0.02
+      && Math.abs(rowJun27.byProperty[pidPB] - balB27) <= 0.02
+      && Math.abs(stackSum - rowJun27.total) <= 0.02,
+    JSON.stringify(rowJun27).slice(0, 200));
+  // Assessed-by-year, carry rule: A's 2024 point carries into 2025;
+  // B counts only from its first point (2025).
+  await req('POST', `/api/properties/${pidPA}/value-history`, { year: 2024, value: 980000 });
+  await req('POST', `/api/properties/${pidPA}/value-history`, { year: 2026, value: 1150000 });
+  await req('POST', `/api/properties/${pidPB}/value-history`, { year: 2025, value: 500000 });
+  const port2 = (await req('GET', '/api/properties/portfolio')).data;
+  const assessedAt = (resp, y) => { const row = resp.assessedByYear.find((a) => a.year === y); return row ? row.total : 0; };
+  check('assessed-by-year deltas follow the carry rule',
+    Math.abs(assessedAt(port2, 2024) - assessedAt(port, 2024) - 980000) <= 0.02
+      && Math.abs(assessedAt(port2, 2025) - assessedAt(port, 2025) - 1480000) <= 0.02
+      && Math.abs(assessedAt(port2, 2026) - assessedAt(port, 2026) - 1650000) <= 0.02,
+    JSON.stringify(port2.assessedByYear).slice(0, 200));
+  // A property with a later balance date joins the projection only
+  // from its own start — never back-filled into earlier months.
+  r = await req('POST', '/api/properties', {
+    address: '33 Portfolio Avenue, Victoria, BC',
+    mortgage_balance: 20000, mortgage_balance_date: '2027-03-15', mortgage_payment: 300,
+    purchase_date: '2027-03-15',
+  });
+  const pidPC = r.data.id;
+  await req('POST', `/api/properties/${pidPC}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 4 });
+  const port3 = (await req('GET', '/api/properties/portfolio')).data;
+  const rowNov26 = port3.outstandingByMonth.find((m) => m.month === '2026-11');
+  const cMonths = port3.outstandingByMonth.filter((m) => m.byProperty[pidPC] != null);
+  check('a property joins the projection only from its own balance date',
+    !!rowNov26 && rowNov26.byProperty[pidPC] === null
+      && cMonths.length > 0 && cMonths[0].month === '2027-04'
+      && Math.abs(port3.totals.outstanding - (port.totals.outstanding + 20000)) <= 0.02,
+    JSON.stringify({ first: cMonths[0] && cMonths[0].month, nov: rowNov26 && rowNov26.byProperty[pidPC] }));
+  r = await req('DELETE', `/api/properties/${pidPA}`);
+  check('delete portfolio property A', r.status === 200);
+  await req('DELETE', `/api/properties/${pidPB}`);
+  await req('DELETE', `/api/properties/${pidPC}`);
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above

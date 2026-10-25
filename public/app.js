@@ -173,6 +173,9 @@ function route() {
     showView('assets');
     showSection(ASSET_SECTIONS.some((s) => s.key === key) ? key : 'overview');
     loadAssets();
+    // Portfolio charts created while the section was hidden have a
+    // zero-size canvas; redraw them once it is actually on screen.
+    if (key === 'properties') requestAnimationFrame(redrawPortfolioIfCollapsed);
   }
 }
 window.addEventListener('hashchange', route);
@@ -309,6 +312,7 @@ async function loadAssets(force = false) {
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
       </div></div>`;
   }).join('') || '<div class="note">No properties yet — use “Add property” above.</div>';
+  await loadPortfolio();
 
   // One listing table per other-asset category.
   for (const s of ASSET_SECTIONS.filter((x) => x.category)) {
@@ -451,6 +455,211 @@ $('#addPropForm').addEventListener('submit', async (e) => {
 });
 
 // ---------------------------------------------------------- property detail ---
+// --------------------------------------------------------------- portfolio --
+// Cross-property block on the Properties section: totals, a share
+// pie, and a combined chart (assessed history line + total
+// outstanding line + stacked per-property outstanding bars), all
+// from GET /api/properties/portfolio — the server aggregates, the
+// page only renders.
+let portfolioData = null;
+let portfolioPieChart = null;
+let portfolioLineChart = null;
+let pfRangeMonths = 60;
+let pfPieMetric = 'outstanding';
+const PF_COLORS = ['#1668c4', '#e67e22', '#8e44ad', '#2e7d4f', '#c0392b', '#16a085', '#b7950b', '#7d3c98', '#2e86c1', '#ba4a00'];
+window.__fmCharts = window.__fmCharts || {};
+window.__fmCharts.pie = null;
+window.__fmCharts.portfolio = null;
+
+async function loadPortfolio() {
+  const block = $('#portfolioBlock');
+  portfolioData = await api('/api/properties/portfolio');
+  if (!portfolioData || !portfolioData.totals.propertyCount) {
+    block.classList.add('hidden');
+    return;
+  }
+  block.classList.remove('hidden');
+  const t = portfolioData.totals;
+  $('#pfOutstanding').textContent = money(t.outstanding);
+  $('#pfPayment').textContent = money(t.monthlyPayment);
+  $('#pfInterest').textContent = money(t.totalInterest);
+  $('#pfInterestNote').textContent = t.interestFrom < t.propertyCount
+    ? `based on ${t.interestFrom} of ${t.propertyCount} properties with a rate plan`
+    : `based on all ${t.propertyCount} properties`;
+  const notes = [
+    'Assessed totals carry each property’s most recent value forward — a property counts from its first known year.',
+    'Outstanding bars stack up to the blue total line; a property joins the projection at its own balance date.',
+  ];
+  if (t.paymentKnownCount < t.propertyCount) {
+    notes.push(`Monthly payment counts ${t.paymentKnownCount} of ${t.propertyCount} properties — the rest have no payment on file and count as $0.`);
+  }
+  $('#pfNotes').textContent = notes.join(' ');
+  drawPortfolioPie();
+  drawPortfolioChart();
+}
+
+function pfRangeRows() {
+  const rows = portfolioData ? portfolioData.outstandingByMonth : [];
+  return pfRangeMonths > 0 ? rows.slice(0, pfRangeMonths) : rows;
+}
+
+function redrawPortfolioIfCollapsed() {
+  if (!portfolioData || !portfolioData.totals.propertyCount) return;
+  const collapsed = (c) => !c || !c.width;
+  if (!collapsed(portfolioPieChart) && !collapsed(portfolioLineChart)) return;
+  drawPortfolioPie();
+  drawPortfolioChart();
+}
+
+function drawPortfolioPie() {
+  const ctx = $('#portfolioPie');
+  if (!ctx || !portfolioData) return;
+  if (portfolioPieChart) { portfolioPieChart.destroy(); portfolioPieChart = null; }
+  window.__fmCharts.pie = null;
+  const slices = portfolioData.pie[pfPieMetric] || [];
+  if (!slices.length) return;
+  const colorOf = (id) => PF_COLORS[portfolioData.properties.findIndex((x) => x.id === id) % PF_COLORS.length];
+  portfolioPieChart = new Chart(ctx, {
+    type: 'pie',
+    data: {
+      labels: slices.map((s) => s.shortLabel),
+      datasets: [{
+        data: slices.map((s) => s.value),
+        backgroundColor: slices.map((s) => colorOf(s.id)),
+        borderColor: '#fff', borderWidth: 1,
+        hoverOffset: 10,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      // Entrance: slices sweep/scale in once; redraws on new data
+      // transition the same way. Nothing loops.
+      animation: { animateRotate: true, animateScale: true, duration: 900, easing: 'easeOutQuart' },
+      plugins: {
+        legend: { position: 'bottom' },
+        tooltip: {
+          callbacks: {
+            label: (item) => {
+              const s = slices[item.dataIndex];
+              return ` ${s.shortLabel}: ${money(s.value)} (${s.pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+  window.__fmCharts.pie = portfolioPieChart;
+}
+
+// Vertical guide line at the hovered time point (Chart.js plugin
+// API only — no extra library). Shared by the portfolio chart and
+// the detail page's combined chart.
+const guideLinePlugin = {
+  id: 'guideLine',
+  afterDatasetsDraw(chart) {
+    const active = chart.getActiveElements();
+    if (!active.length) return;
+    const x = active[0].element.x;
+    const { top, bottom } = chart.chartArea;
+    const c = chart.ctx;
+    c.save();
+    c.beginPath();
+    c.moveTo(x, top);
+    c.lineTo(x, bottom);
+    c.lineWidth = 1;
+    c.strokeStyle = 'rgba(90, 106, 122, 0.45)';
+    c.setLineDash([4, 4]);
+    c.stroke();
+    c.restore();
+  },
+};
+
+function drawPortfolioChart() {
+  const ctx = $('#portfolioChart');
+  if (!ctx || !portfolioData) return;
+  if (portfolioLineChart) { portfolioLineChart.destroy(); portfolioLineChart = null; }
+  window.__fmCharts.portfolio = null;
+  const rows = pfRangeRows();
+  const datasets = [];
+  if (portfolioData.assessedByYear.length) {
+    datasets.push({
+      type: 'line',
+      label: 'Assessed value (all properties)',
+      data: portfolioData.assessedByYear.map((y) => ({ x: y.year, y: y.total })),
+      borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
+      tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
+    });
+  }
+  if (rows.length) {
+    datasets.push({
+      type: 'line',
+      label: 'Total outstanding principal',
+      data: rows.map((m) => ({ x: ymDecimal(m.month), y: m.total })),
+      borderColor: '#1668c4', backgroundColor: '#1668c4',
+      tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
+    });
+    portfolioData.properties.forEach((p, i) => {
+      datasets.push({
+        type: 'bar',
+        label: p.shortLabel,
+        data: rows.map((m) => ({ x: ymDecimal(m.month), y: m.byProperty[p.id] ?? null })),
+        backgroundColor: PF_COLORS[i % PF_COLORS.length],
+        stack: 'outstanding',
+        maxBarThickness: 16,
+      });
+    });
+  }
+  if (!datasets.length) return;
+  portfolioLineChart = new Chart(ctx, {
+    data: { datasets },
+    plugins: [guideLinePlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      // Hover one time point: every monthly series shares the same x
+      // values, so 'index' groups them; the filter keeps only items
+      // at that exact x (the yearly assessed line joins in January,
+      // where its point lands on the same x) and drops not-yet-started
+      // properties. Default Chart.js transitions animate the rest —
+      // point hover radii, tooltip follow, range-switch redraws.
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        tooltip: {
+          filter: (item, _idx, items) => {
+            if (item.parsed.y == null) return false;
+            const ref = items.find((i) => i.parsed.y != null);
+            return Math.abs(item.parsed.x - ref.parsed.x) < 0.001;
+          },
+          callbacks: {
+            title: (items) => formatYearTick(items[0].parsed.x),
+            label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}`,
+            footer: (items) => {
+              const bars = items.filter((i) => i.dataset.stack === 'outstanding');
+              if (!bars.length) return '';
+              const total = bars.reduce((s, i) => s + (i.parsed.y || 0), 0);
+              return `Total outstanding: ${money(total)}`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { type: 'linear', stacked: true, ticks: { stepSize: 1, maxTicksLimit: 12, callback: formatYearTick } },
+        y: { stacked: true, title: { display: true, text: 'Amount ($)' } },
+      },
+    },
+  });
+  window.__fmCharts.portfolio = portfolioLineChart;
+}
+
+$('#pfRangeBtns').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-months]');
+  if (!btn) return;
+  $('#pfRangeBtns').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+  pfRangeMonths = Number(btn.dataset.months);
+  drawPortfolioChart();
+});
+$('#pfPieOutstandingBtn').addEventListener('click', () => { pfPieMetric = 'outstanding'; drawPortfolioPie(); });
+$('#pfPieAssessedBtn').addEventListener('click', () => { pfPieMetric = 'assessed'; drawPortfolioPie(); });
+
 let chartA = null; // combined chart: assessed value vs outstanding principal
 let chartB = null; // monthly chart: interest vs payment
 let fullSeries = [];
@@ -459,7 +668,7 @@ let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
 // Test/debug hook: lets the screenshot script read the live chart configs.
-window.__fmCharts = { a: null, b: null };
+window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null });
 
 function photoSrc(p) {
   if (p.photo_file) return `/photos/${p.photo_file}`;
@@ -800,7 +1009,7 @@ function drawCombinedChart() {
       label: 'Assessed value',
       data: trendPoints.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      tension: 0.15, pointRadius: 4, borderWidth: 2,
+      tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
     });
   }
   if (chartMeta && fullSeries.length) {
@@ -812,13 +1021,14 @@ function drawCombinedChart() {
       label: 'Outstanding principal',
       data: pts,
       borderColor: '#1668c4', backgroundColor: '#1668c4',
-      tension: 0.15, pointRadius: 0, borderWidth: 2,
+      tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
     });
   }
   if (!datasets.length) return;
   chartA = new Chart(ctx, {
     type: 'line',
     data: { datasets },
+    plugins: [guideLinePlugin],
     options: {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'nearest', intersect: false },
@@ -884,7 +1094,7 @@ function drawMonthlyChart() {
           label: 'Monthly interest',
           data: rows.map((r) => r.interest),
           borderColor: '#d97706', backgroundColor: '#d97706',
-          tension: 0.15, pointRadius: 0, borderWidth: 2,
+          tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
         },
         {
           // The series is sampled monthly, so for the day-stepped
@@ -895,7 +1105,7 @@ function drawMonthlyChart() {
             : 'Paid per month (all payments in the month)',
           data: rows.map((r) => r.payment),
           borderColor: '#7c3aed', backgroundColor: '#7c3aed',
-          tension: 0.15, pointRadius: 0, borderWidth: 2,
+          tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
         },
       ],
     },

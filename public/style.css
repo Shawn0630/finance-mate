@@ -54,6 +54,9 @@ td.num, th.num { text-align: right; }
 .detail-photo { width: 100%; max-height: 300px; object-fit: cover; border-radius: 10px; }
 .detail-photo-empty { height: 170px; background: #dbe4ee; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #71808f; }
 .chart-wrap { position: relative; height: 340px; }
+.summary-card .n { color: #71808f; font-size: 12px; margin-top: 2px; }
+.portfolio-grid { display: grid; grid-template-columns: 360px 1fr; gap: 18px; margin-top: 14px; }
+@media (max-width: 900px) { .portfolio-grid { grid-template-columns: 1fr; } }
 .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #16222e; }
 .login-box { background: #fff; border-radius: 12px; padding: 28px; width: 320px; }
 .login-box h1 { font-size: 19px; margin: 0 0 4px; }
