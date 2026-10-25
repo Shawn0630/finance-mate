@@ -24,6 +24,80 @@ function showMsg(el, kind, text) {
   el.textContent = text;
 }
 
+// ------------------------------------------------------- address suggest ---
+// Dropdown autocomplete bound to an address input. Suggestions come from
+// /api/address/suggest (BC Assessment's own address search, so a picked
+// suggestion is exactly the address form the assessment fetch can match).
+// Picking one fills the input with the suggestion label and remembers its
+// property id in state; editing the text afterwards clears the id again,
+// back to free-text semantics. The owning form reads state.id at submit.
+function attachAddressSuggest(input, list) {
+  const state = { id: null, label: '' };
+  let items = [];
+  let active = -1;
+  let timer = null;
+  let seq = 0;
+
+  function close() {
+    list.classList.add('hidden');
+    list.innerHTML = '';
+    items = [];
+    active = -1;
+  }
+  function render() {
+    if (!items.length) { close(); return; }
+    list.innerHTML = '';
+    items.forEach((s, i) => {
+      const li = document.createElement('li');
+      li.textContent = s.label;
+      if (i === active) li.classList.add('active');
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); pick(i); });
+      list.appendChild(li);
+    });
+    list.classList.remove('hidden');
+  }
+  function pick(i) {
+    const s = items[i];
+    if (!s) return;
+    input.value = s.label;
+    state.id = s.id;
+    state.label = s.label;
+    close();
+    input.focus();
+  }
+  input.addEventListener('input', () => {
+    if (input.value !== state.label) state.id = null;
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 4) { close(); return; }
+    timer = setTimeout(async () => {
+      const my = ++seq;
+      try {
+        const data = await api('/api/address/suggest?q=' + encodeURIComponent(q));
+        if (my !== seq) return;
+        items = data.suggestions || [];
+        active = items.length ? 0 : -1;
+        render();
+      } catch { if (my === seq) close(); }
+    }, 300);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (list.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, items.length - 1); render(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); render(); }
+    else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); pick(active); }
+    else if (e.key === 'Escape') { close(); }
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (!list.contains(e.target) && e.target !== input) close();
+  });
+  return { state, close, reset() { state.id = null; state.label = ''; close(); } };
+}
+const addSuggest = attachAddressSuggest(
+  $('#addPropForm .address-input'), $('#addPropForm .suggest-list'));
+const propSuggest = attachAddressSuggest(
+  $('#propForm .address-input'), $('#propForm .suggest-list'));
+
 // ------------------------------------------------------------ navigation ---
 let currentPropertyId = null;
 function showView(name) {
@@ -111,10 +185,12 @@ window.deleteAsset = deleteAsset;
 $('#addPropForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  if (addSuggest.state.id) f.bca_id = addSuggest.state.id;
   const msg = $('#addPropMsg');
   try {
     const p = await api('/api/properties', { method: 'POST', body: f });
     e.target.reset();
+    addSuggest.reset();
     // Best-effort automatic BC Assessment fetch right after adding.
     const r = await api(`/api/properties/${p.id}/fetch-bca`, { method: 'POST' });
     if (r.ok) {
@@ -155,6 +231,9 @@ async function loadPropertyDetail(id) {
     : '<div class="detail-photo-empty">No photo — add a photo URL or upload one below</div>';
   const pf = $('#propForm');
   pf.address.value = p.address || '';
+  propSuggest.state.id = p.bca_id || null;
+  propSuggest.state.label = p.address || '';
+  propSuggest.close();
   pf.notes.value = p.notes || '';
   pf.assessed_value.value = p.assessed_value ?? '';
   pf.assessed_year.value = p.assessed_year ?? '';
@@ -193,6 +272,7 @@ window.deleteSegment = deleteSegment;
 $('#propForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  f.bca_id = propSuggest.state.id || null;
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
     showMsg($('#detailMsg'), 'ok', 'Saved.');

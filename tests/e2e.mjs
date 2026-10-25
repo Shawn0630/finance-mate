@@ -6,6 +6,7 @@
 // summary arithmetic, and 401 again after logout.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -18,9 +19,48 @@ const check = (name, cond, extra = '') => {
   if (!cond) failures++;
 };
 
+// Stub BC Assessment site (BCA_BASE_URL points the app at it): serves the
+// address-suggestion JSON in the real site's shape, a property page with
+// an embedded token + map URL, and the GIS value query. Hit counters let
+// the test prove the picked-id path skips the address search.
+const stubHits = { search: 0, info: [] };
+const stub = http.createServer((req, res) => {
+  const u = new URL(req.url, 'http://stub');
+  if (u.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>ok</html>'); return;
+  }
+  if (u.pathname === '/Property/Search/GetByAddress') {
+    stubHits.search++;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify([
+      { label: '1200 GOVERNMENT ST VICTORIA', value: 'QkxPQy0xMjAw', gid: 101 },
+      { label: 'No results found', value: 0, gid: 0 }, // junk entry: must be filtered out
+    ]));
+    return;
+  }
+  if (u.pathname.startsWith('/Property/Info/')) {
+    stubHits.info.push(u.pathname);
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`<html><script>var gistoken = 'test-token'; var mapserverUrl = 'http://127.0.0.1:${stub.address().port}/gis';</script></html>`);
+    return;
+  }
+  if (u.pathname === '/gis/0/query') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ features: [{ attributes: {
+      ADDRESS: '1200 GOVERNMENT ST VICTORIA', TOTAL_ASSESSED: 6532000,
+      TOTAL_LAND: 4666000, TOTAL_BUILDING: 1866000, EXTRACT_DATE: '20260323',
+      JUR: '01', ROLL: '42',
+    } }] }));
+    return;
+  }
+  res.writeHead(404); res.end('not found');
+});
+await new Promise((r) => stub.listen(0, '127.0.0.1', r));
+const stubBase = `http://127.0.0.1:${stub.address().port}`;
+
 const server = spawn('node', ['src/server.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT) },
+  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
@@ -46,10 +86,24 @@ try {
   }
   check('server starts, unauthenticated /api/summary is 401', up);
 
-  let r = await req('POST', '/api/login', { username: 'admin', password: 'wrong' });
+  let r = await req('GET', '/api/address/suggest?q=' + encodeURIComponent('1200 Government'));
+  check('unauthenticated /api/address/suggest is 401', r.status === 401);
+
+  r = await req('POST', '/api/login', { username: 'admin', password: 'wrong' });
   check('wrong password rejected', r.status === 401);
   r = await req('POST', '/api/login', { username: 'admin', password: 'admin' });
   check('admin/admin login succeeds', r.status === 200 && r.data.ok === true);
+
+  // Address suggestions come from the (stubbed) BC Assessment search:
+  // the junk "No results" entry must be filtered out.
+  r = await req('GET', '/api/address/suggest?q=' + encodeURIComponent('1200 Government Street, Victoria, BC'));
+  const sug = r.data.suggestions || [];
+  check('suggest returns one real suggestion', r.status === 200 && sug.length === 1, JSON.stringify(sug));
+  check('suggest maps id + label', sug.length === 1 && sug[0].id === 'QkxPQy0xMjAw' && sug[0].label === '1200 GOVERNMENT ST VICTORIA');
+  const searchBeforeShort = stubHits.search;
+  r = await req('GET', '/api/address/suggest?q=ab');
+  check('short query returns no suggestions', Array.isArray(r.data.suggestions) && r.data.suggestions.length === 0);
+  check('short query does not hit BC Assessment', stubHits.search === searchBeforeShort);
 
   // Property CRUD (fictional address and numbers only).
   r = await req('POST', '/api/properties', {
@@ -90,6 +144,21 @@ try {
   r = await req('GET', '/api/summary');
   check('summary other assets back to 0', r.data.otherAssets === 0);
 
+  // A property created from a picked suggestion stores the BC Assessment
+  // property id; fetching its value then goes straight to the property
+  // page (no new address search) and returns the stubbed GIS values.
+  r = await req('POST', '/api/properties', { address: '1200 Government St, Victoria', bca_id: 'QkxPQy0xMjAw' });
+  check('create property with picked bca_id', r.status === 201 && r.data.bca_id === 'QkxPQy0xMjAw');
+  const pid2 = r.data.id;
+  const searchBeforeFetch = stubHits.search;
+  r = await req('POST', `/api/properties/${pid2}/fetch-bca`);
+  check('fetch-bca via picked id succeeds', r.data.ok === true && r.data.result && r.data.result.assessedValue === 6532000, JSON.stringify(r.data).slice(0, 200));
+  check('fetch-bca via picked id skipped the address search', stubHits.search === searchBeforeFetch);
+  check('fetch-bca via picked id opened the picked property page', stubHits.info.includes('/Property/Info/QkxPQy0xMjAw'));
+  // Editing the address back to free text clears the stored id.
+  r = await req('PUT', `/api/properties/${pid2}`, { address: '999 Somewhere Else', bca_id: null });
+  check('editing address to free text clears bca_id', r.status === 200 && r.data.bca_id === null);
+
   // Segment delete + property delete paths.
   r = await req('DELETE', `/api/properties/${pid}/rates/${segId}`);
   check('delete rate segment', r.status === 200);
@@ -103,6 +172,7 @@ try {
   check('after logout /api/summary is 401', r.status === 401);
 } finally {
   server.kill('SIGTERM');
+  stub.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 console.log(failures === 0 ? 'E2E: ALL PASS' : `E2E: ${failures} FAILURE(S)`);

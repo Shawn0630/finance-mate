@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, seedAdmin, verifyPassword } from './db.js';
 import { simulate, derivePayment, segmentForMonth } from './engine.js';
-import { fetchAssessment } from './bca.js';
+import { fetchAssessment, suggestAddresses } from './bca.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -76,6 +76,23 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', requireApiAuth, (req, res) => res.json({ username: req.user.username }));
 
+// ------------------------------------------------------ address suggest ---
+// Autocomplete for the address inputs. Suggestions come from BC
+// Assessment's own address search (see suggestAddresses in bca.js), so a
+// picked suggestion is exactly the address form the assessment fetch can
+// match. Any failure on the BC Assessment side returns an empty list with
+// sourceError set — the dropdown just shows no candidates, never an error.
+app.get('/api/address/suggest', requireApiAuth, async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 4) return res.json({ suggestions: [] });
+  try {
+    const suggestions = await suggestAddresses(q);
+    res.json({ suggestions });
+  } catch (e) {
+    res.json({ suggestions: [], sourceError: true, note: e.message });
+  }
+});
+
 // ------------------------------------------------------------ properties ---
 const nowIso = () => new Date().toISOString();
 const num = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
@@ -114,12 +131,13 @@ app.get('/api/properties', requireApiAuth, (req, res) => {
 app.post('/api/properties', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!b.address || !String(b.address).trim()) return res.status(400).json({ error: 'address is required' });
+  const bcaId = b.bca_id ? String(b.bca_id) : null;
   const info = db
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
          mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
-         notes, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         notes, bca_id, bca_matched_address, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       String(b.address).trim(),
@@ -131,6 +149,10 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       num(b.mortgage_payment),
       num(b.amortization_years),
       b.notes || null,
+      bcaId,
+      // The picked suggestion's label is the submitted address text
+      // itself; the fetch later replaces this with the GIS-canonical form.
+      bcaId ? String(b.address).trim() : null,
       nowIso(),
       nowIso()
     );
@@ -149,6 +171,15 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
   const b = req.body || {};
   const next = {
     address: b.address !== undefined ? String(b.address).trim() : p.address,
+    // bca_id is owned by the address field: forms that submit the address
+    // always send it (null when the text is free-typed or was edited after
+    // picking a suggestion); forms that don't (e.g. the mortgage form)
+    // leave it untouched.
+    bca_id: b.bca_id !== undefined ? (b.bca_id ? String(b.bca_id) : null) : p.bca_id,
+    bca_matched_address:
+      b.bca_id !== undefined
+        ? (b.bca_id ? (b.address !== undefined ? String(b.address).trim() : p.address) : null)
+        : p.bca_matched_address,
     photo_url: b.photo_url !== undefined ? b.photo_url || null : p.photo_url,
     assessed_value: b.assessed_value !== undefined ? num(b.assessed_value) : p.assessed_value,
     assessed_year: b.assessed_year !== undefined ? num(b.assessed_year) : p.assessed_year,
@@ -163,11 +194,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
   // Editing the assessed value by hand marks it as a manual value.
   if (b.assessed_value !== undefined && num(b.assessed_value) !== p.assessed_value) next.assessed_source = 'manual';
   db.prepare(
-    `UPDATE properties SET address=?, photo_url=?, assessed_value=?, assessed_year=?,
-       assessed_source=?, mortgage_balance=?, mortgage_balance_date=?, mortgage_payment=?,
-       amortization_years=?, notes=?, updated_at=? WHERE id=?`
+    `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
+       assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
+       mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
+       updated_at=? WHERE id=?`
   ).run(
-    next.address, next.photo_url, next.assessed_value, next.assessed_year, next.assessed_source,
+    next.address, next.bca_id, next.bca_matched_address, next.photo_url,
+    next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
     next.amortization_years, next.notes, nowIso(), p.id
   );
@@ -189,7 +222,11 @@ app.post('/api/properties/:id/fetch-bca', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
   try {
-    const r = await fetchAssessment(p.address);
+    // A property whose address was picked from the suggestion dropdown
+    // carries the BC Assessment property id: go straight to its page
+    // instead of running the fuzzy address search again.
+    const direct = p.bca_id ? { id: p.bca_id, label: p.bca_matched_address || p.address } : undefined;
+    const r = await fetchAssessment(p.address, direct);
     db.prepare(
       `UPDATE properties SET assessed_value=?, assessed_year=?, land_value=?, building_value=?,
          assessed_source='auto', assessed_fetched_at=?, bca_matched_address=?, bca_extract_date=?,

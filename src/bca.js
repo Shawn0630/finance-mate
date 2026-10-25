@@ -24,7 +24,9 @@
 // module intentionally fetches values only. Photos are user-provided
 // (URL or upload).
 
-const BASE = 'https://www.bcassessment.ca';
+// BCA_BASE_URL exists only as a test seam (the e2e suite points it at a
+// local stub); production always uses the real site.
+const BASE = process.env.BCA_BASE_URL || 'https://www.bcassessment.ca';
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -99,10 +101,8 @@ function realSuggestions(list) {
   );
 }
 
-export async function fetchAssessment(address) {
+async function newSession() {
   const jar = newJar();
-
-  // 1. Establish a session.
   let res;
   try {
     res = await fetchWithJar(jar, `${BASE}/`);
@@ -111,22 +111,66 @@ export async function fetchAssessment(address) {
   }
   if (!res.ok) throw stageError('connect', `home page returned HTTP ${res.status}`);
   await res.text();
+  return jar;
+}
 
-  // 2. Address autocomplete, trying normalized variants in order.
-  let match = null;
+// Address suggestions for the address-input dropdown. This is the single
+// suggestion source for the app: today it is BC Assessment's own address
+// search (free, and a picked suggestion is exactly the address form the
+// assessment fetch can match). It could later be swapped for Canada Post
+// AddressComplete behind this same { id, label } shape.
+// Tries the same normalized query variants as the assessment fetch and
+// returns the first variant that yields results: [{ id, label }] where id
+// is the site's property id (used to jump straight to the property page).
+export async function suggestAddresses(query) {
+  const jar = await newSession();
+  for (const q of queryVariants(query)) {
+    const res = await fetchWithJar(
+      jar,
+      `${BASE}/Property/Search/GetByAddress?addr=${encodeURIComponent(q)}`,
+      { accept: 'application/json' }
+    );
+    if (!res.ok) throw new Error(`suggestion search returned HTTP ${res.status}`);
+    const found = realSuggestions(await res.json());
+    if (found.length) {
+      const seen = new Set();
+      const out = [];
+      for (const s of found) {
+        const id = String(s.value);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id, label: s.label });
+        if (out.length >= 8) break;
+      }
+      return out;
+    }
+  }
+  return [];
+}
+
+export async function fetchAssessment(address, direct) {
+  const jar = await newSession();
+
+  // 2. Address autocomplete, trying normalized variants in order. Skipped
+  // when the caller already picked a suggestion (direct.id + direct.label):
+  // then we go straight to that property page.
+  let match = direct && direct.id ? { value: String(direct.id), label: direct.label || null } : null;
   let lastError = null;
-  for (const q of queryVariants(address)) {
-    try {
-      res = await fetchWithJar(
-        jar,
-        `${BASE}/Property/Search/GetByAddress?addr=${encodeURIComponent(q)}`,
-        { accept: 'application/json' }
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const found = realSuggestions(await res.json());
-      if (found.length) { match = found[0]; break; }
-    } catch (e) {
-      lastError = e;
+  if (!match || !match.label) {
+    match = null;
+    for (const q of queryVariants(address)) {
+      try {
+        const res = await fetchWithJar(
+          jar,
+          `${BASE}/Property/Search/GetByAddress?addr=${encodeURIComponent(q)}`,
+          { accept: 'application/json' }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const found = realSuggestions(await res.json());
+        if (found.length) { match = found[0]; break; }
+      } catch (e) {
+        lastError = e;
+      }
     }
   }
   if (!match) {
@@ -135,6 +179,7 @@ export async function fetchAssessment(address) {
       lastError ? lastError.message : 'no matching property for that address (tried several address formats)'
     );
   }
+  let res;
 
   // 3. Property page -> GIS token + map service URL.
   let gistoken, mapserverUrl;

@@ -39,7 +39,7 @@
       <div class="msg" id="addPropMsg"></div>
       <form id="addPropForm">
         <div class="grid2">
-          <div><label>Address *</label><input name="address" placeholder="1234 Example Street, Victoria, BC" required></div>
+          <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" placeholder="Start typing — suggestions come from BC Assessment" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
           <div><label>Notes</label><input name="notes"></div>
         </div>
         <div class="grid3">
@@ -94,7 +94,7 @@
       <h3>Property &amp; assessment</h3>
       <form id="propForm">
         <div class="grid2">
-          <div><label>Address *</label><input name="address" required></div>
+          <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
           <div><label>Notes</label><input name="notes"></div>
         </div>
         <div class="grid3">

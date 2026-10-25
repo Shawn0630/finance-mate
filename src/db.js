@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS other_assets (
 );
 `);
 
+// Safe add-column migrations for databases created before a column existed.
+const propCols = db.prepare('PRAGMA table_info(properties)').all().map((c) => c.name);
+if (!propCols.includes('bca_id')) {
+  // The BC Assessment property id of the suggestion the user picked from
+  // the address dropdown; lets the assessment fetch skip the fuzzy search.
+  db.exec('ALTER TABLE properties ADD COLUMN bca_id TEXT');
+}
+
 export function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
   return { salt, hash };

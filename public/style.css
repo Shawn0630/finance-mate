@@ -58,5 +58,9 @@ td.num, th.num { text-align: right; }
 .login-box { background: #fff; border-radius: 12px; padding: 28px; width: 320px; }
 .login-box h1 { font-size: 19px; margin: 0 0 4px; }
 .login-box .sub { color: #71808f; margin-bottom: 10px; }
+.suggest-wrap { position: relative; }
+.suggest-list { position: absolute; top: 100%; left: 0; right: 0; z-index: 60; background: #fff; border: 1px solid #c9d2dc; border-radius: 6px; margin: 2px 0 0; padding: 4px 0; list-style: none; max-height: 264px; overflow-y: auto; box-shadow: 0 10px 26px rgba(20, 35, 50, .16); }
+.suggest-list li { padding: 7px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.suggest-list li:hover, .suggest-list li.active { background: #e6eef7; }
 .hidden { display: none !important; }
 @media (max-width: 800px) { .summary-strip { grid-template-columns: 1fr 1fr; } .grid2, .grid3 { grid-template-columns: 1fr; } }
