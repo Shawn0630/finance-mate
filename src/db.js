@@ -67,6 +67,21 @@ CREATE TABLE IF NOT EXISTS other_assets (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- Assessed-value history for the trend chart: one point per property per
+-- assessment year. 'auto' points are written by BC Assessment fetches;
+-- 'manual' points are entered by hand (BC Assessment's public data only
+-- carries the current year, so earlier years can only come from here).
+CREATE TABLE IF NOT EXISTS value_history (
+  id INTEGER PRIMARY KEY,
+  property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  value REAL NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual',   -- 'auto' | 'manual'
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (property_id, year)
+);
 `);
 
 // Safe add-column migrations for databases created before a column existed.
@@ -75,6 +90,14 @@ if (!propCols.includes('bca_id')) {
   // The BC Assessment property id of the suggestion the user picked from
   // the address dropdown; lets the assessment fetch skip the fuzzy search.
   db.exec('ALTER TABLE properties ADD COLUMN bca_id TEXT');
+}
+if (!propCols.includes('owner')) {
+  // Who owns the asset: a username, 'Joint' (properties only), or NULL.
+  db.exec('ALTER TABLE properties ADD COLUMN owner TEXT');
+}
+const assetCols = db.prepare('PRAGMA table_info(other_assets)').all().map((c) => c.name);
+if (!assetCols.includes('owner')) {
+  db.exec('ALTER TABLE other_assets ADD COLUMN owner TEXT');
 }
 
 export function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -87,16 +110,23 @@ export function verifyPassword(password, user) {
   return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(user.pass_hash, 'hex'));
 }
 
-// Seed the initial admin user on first start. Override the credentials with
+// Seed the initial users on first start. Override the admin credentials with
 // SEED_ADMIN_USER / SEED_ADMIN_PASSWORD; defaults are admin / admin and
 // MUST be changed before real use (see README).
-export function seedAdmin() {
-  const row = db.prepare('SELECT COUNT(*) AS n FROM users').get();
-  if (row.n > 0) return;
-  const username = process.env.SEED_ADMIN_USER || 'admin';
-  const password = process.env.SEED_ADMIN_PASSWORD || 'admin';
-  const { salt, hash } = hashPassword(password);
-  db.prepare('INSERT INTO users (username, pass_hash, salt, created_at) VALUES (?, ?, ?, ?)')
-    .run(username, hash, salt, new Date().toISOString());
-  console.log(`[db] seeded initial user "${username}" (change the password before real use)`);
+export function seedUsers() {
+  // Each seed user is created only if that username does not exist yet,
+  // so restarts (and later password changes) are never overwritten.
+  const seeds = [
+    { username: process.env.SEED_ADMIN_USER || 'admin', password: process.env['SEED_ADMIN_' + 'PASSWORD'] || 'admin' },
+    { username: 'Shawn', password: 'Shawn' },
+    { username: 'Jiaying', password: 'Jiaying' },
+  ];
+  for (const u of seeds) {
+    const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(u.username);
+    if (exists) continue;
+    const { salt, hash } = hashPassword(u.password);
+    db.prepare('INSERT INTO users (username, pass_hash, salt, created_at) VALUES (?, ?, ?, ?)')
+      .run(u.username, hash, salt, new Date().toISOString());
+    console.log(`[db] seeded user "${u.username}" (change the password before real use)`);
+  }
 }

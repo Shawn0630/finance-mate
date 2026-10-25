@@ -32,20 +32,22 @@ docker compose up -d --build
 
 Then open <http://localhost:9200> (or `http://<host-ip>:9200` on the LAN).
 
-- **Default sign-in: `admin` / `admin`** — change it before real use (see
-  below).
+- **Default sign-ins: `admin` / `admin`, `Shawn` / `Shawn`,
+  `Jiaying` / `Jiaying`** — change them before real use (see below).
 - All data (SQLite database + uploaded photos) lives in the named Docker
   volume `finance-mate-data`, so rebuilds and `git pull` never touch it. Only
   `docker compose down -v` deletes it.
 
-### Changing the initial password
+### Changing the initial passwords
 
-There is no change-password page yet this round. The seed credentials are
-only used on the very first start, when the users table is empty: set
-`SEED_ADMIN_USER` / `SEED_ADMIN_PASSWORD` in `docker-compose.yml` (or a
-`.env` file) *before* the first `docker compose up`. To reset an existing
-deployment back to a fresh seed, delete the volume
-(`docker compose down -v`) — that erases all data.
+There is no change-password page yet. The three seed accounts are created
+only when that username does not exist yet, so seeds never overwrite a
+password you changed (there is currently no in-app way to change one —
+resetting means editing the database or starting over). The admin seed
+can be overridden with `SEED_ADMIN_USER` / `SEED_ADMIN_PASSWORD` in
+`docker-compose.yml` (or a `.env` file) *before* the first
+`docker compose up`. To reset an existing deployment back to a fresh seed,
+delete the volume (`docker compose down -v`) — that erases all data.
 
 ## Run without Docker (development)
 
@@ -56,6 +58,29 @@ npm start            # http://localhost:9200
 
 Environment variables: `PORT` (default 9200), `DATA_DIR` (default `./data`),
 `SEED_ADMIN_USER`, `SEED_ADMIN_PASSWORD`.
+
+## Owners
+
+Every property and every other asset can have an **owner**: one of the
+sign-in users, or — **for properties only** — `Joint`. The owner dropdowns
+are filled from the users table (admin included, since it is a real
+login). The server rejects `Joint` for non-property assets, and rejects
+names that are not users. Owners show as a chip on property cards and in
+the asset tables; summaries are not broken down by owner.
+
+## Assessed value trend
+
+The property detail page charts the assessed value per year. Every
+successful BC Assessment fetch records that year's value automatically;
+earlier years can be added, edited and deleted by hand below the chart.
+
+**BC Assessment has no prior-year values to backfill from.** Investigated
+live (Oct 2026): the full attribute set of the GIS layer behind the
+property page contains only the current extract's `TOTAL_ASSESSED` /
+`TOTAL_LAND` / `TOTAL_BUILDING` (plus sale fields, which were empty), and
+the property page itself shows no previous-year values. So the trend
+starts with the year you first fetch and grows one point per year (or
+per manual entry) from there.
 
 ## BC Assessment fetching
 

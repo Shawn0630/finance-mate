@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { db, DATA_DIR, PHOTOS_DIR, seedAdmin, verifyPassword } from './db.js';
+import { db, DATA_DIR, PHOTOS_DIR, seedUsers, verifyPassword } from './db.js';
 import { simulate, derivePayment, segmentForMonth } from './engine.js';
 import { fetchAssessment, suggestAddresses } from './bca.js';
 
@@ -15,7 +15,7 @@ const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const PORT = Number(process.env.PORT || 9200);
 const SESSION_DAYS = 30;
 
-seedAdmin();
+seedUsers();
 
 const app = express();
 app.use(express.json({ limit: '12mb' })); // photo uploads arrive as base64 JSON
@@ -76,6 +76,29 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', requireApiAuth, (req, res) => res.json({ username: req.user.username }));
 
+// Usernames for the owner dropdowns. Includes admin: it is a real login
+// and can own assets the same way; 'Joint' is added client-side for
+// properties only (and enforced server-side below).
+app.get('/api/users', requireApiAuth, (req, res) => {
+  res.json(db.prepare('SELECT username FROM users ORDER BY id').all().map((r) => r.username));
+});
+
+// ------------------------------------------------------------ owners ---
+// Owner is a username, 'Joint' (properties only), or null. Anything else
+// is rejected so the dropdown data stays clean.
+function cleanOwner(v, allowJoint) {
+  if (v === undefined) return { value: undefined };
+  const s = v === null ? '' : String(v).trim();
+  if (!s) return { value: null };
+  if (s === 'Joint') {
+    if (!allowJoint) return { error: 'Joint ownership is only available for properties' };
+    return { value: 'Joint' };
+  }
+  const known = db.prepare('SELECT 1 FROM users WHERE username = ?').get(s);
+  if (!known) return { error: `unknown owner "${s}" — pick one of the users` };
+  return { value: s };
+}
+
 // ------------------------------------------------------ address suggest ---
 // Autocomplete for the address inputs. Suggestions come from BC
 // Assessment's own address search (see suggestAddresses in bca.js), so a
@@ -132,12 +155,14 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!b.address || !String(b.address).trim()) return res.status(400).json({ error: 'address is required' });
   const bcaId = b.bca_id ? String(b.bca_id) : null;
+  const own = cleanOwner(b.owner, true);
+  if (own.error) return res.status(400).json({ error: own.error });
   const info = db
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
          mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
-         notes, bca_id, bca_matched_address, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         notes, bca_id, bca_matched_address, owner, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       String(b.address).trim(),
@@ -153,6 +178,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       // The picked suggestion's label is the submitted address text
       // itself; the fetch later replaces this with the GIS-canonical form.
       bcaId ? String(b.address).trim() : null,
+      own.value ?? null,
       nowIso(),
       nowIso()
     );
@@ -189,7 +215,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     mortgage_payment: b.mortgage_payment !== undefined ? num(b.mortgage_payment) : p.mortgage_payment,
     amortization_years: b.amortization_years !== undefined ? num(b.amortization_years) : p.amortization_years,
     notes: b.notes !== undefined ? b.notes || null : p.notes,
+    owner: p.owner,
   };
+  if (b.owner !== undefined) {
+    const own = cleanOwner(b.owner, true);
+    if (own.error) return res.status(400).json({ error: own.error });
+    next.owner = own.value;
+  }
   if (!next.address) return res.status(400).json({ error: 'address is required' });
   // Editing the assessed value by hand marks it as a manual value.
   if (b.assessed_value !== undefined && num(b.assessed_value) !== p.assessed_value) next.assessed_source = 'manual';
@@ -197,12 +229,12 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
-       updated_at=? WHERE id=?`
+       owner=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
-    next.amortization_years, next.notes, nowIso(), p.id
+    next.amortization_years, next.notes, next.owner, nowIso(), p.id
   );
   res.json(propertyView(getProperty(p.id)));
 });
@@ -235,6 +267,16 @@ app.post('/api/properties/:id/fetch-bca', requireApiAuth, async (req, res) => {
       r.assessedValue, r.assessedYear, r.landValue, r.buildingValue,
       nowIso(), r.matchedAddress, r.extractDate, nowIso(), p.id
     );
+    // Record this year's point on the value-trend history (one row per
+    // year; a re-fetch refreshes that year's auto point in place).
+    if (r.assessedValue != null && r.assessedYear) {
+      db.prepare(
+        `INSERT INTO value_history (property_id, year, value, source, created_at, updated_at)
+         VALUES (?, ?, ?, 'auto', ?, ?)
+         ON CONFLICT(property_id, year) DO UPDATE SET
+           value = excluded.value, source = 'auto', updated_at = excluded.updated_at`
+      ).run(p.id, r.assessedYear, r.assessedValue, nowIso(), nowIso());
+    }
     res.json({ ok: true, result: r, property: propertyView(getProperty(p.id)) });
   } catch (e) {
     res.json({ ok: false, stage: e.stage || 'unknown', error: e.message });
@@ -265,6 +307,82 @@ app.get('/photos/:name', (req, res) => {
   const file = path.join(PHOTOS_DIR, name);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'photo not found' });
   res.sendFile(file);
+});
+
+// --------------------------------------------------------- value history ---
+// Assessed-value trend points, one per assessment year. Auto points come
+// from BC Assessment fetches (current year only — the public GIS data has
+// no prior-year fields); manual points fill in earlier years.
+function historyPoints(propertyId) {
+  return db.prepare('SELECT * FROM value_history WHERE property_id = ? ORDER BY year').all(propertyId);
+}
+
+function historyView(propertyId) {
+  const points = historyPoints(propertyId);
+  let change = null;
+  if (points.length >= 2) {
+    const first = points[0];
+    const last = points[points.length - 1];
+    change = {
+      fromYear: first.year, toYear: last.year, from: first.value, to: last.value,
+      abs: last.value - first.value,
+      pct: first.value ? ((last.value - first.value) / first.value) * 100 : null,
+    };
+  }
+  return { points, change };
+}
+
+function validYearValue(b) {
+  const year = Number(b.year);
+  const value = num(b.value);
+  if (!Number.isInteger(year) || year < 1900 || year > 2100) return { error: 'year must be a whole year between 1900 and 2100' };
+  if (value === null || value < 0) return { error: 'value must be a number >= 0' };
+  return { year, value };
+}
+
+app.get('/api/properties/:id/value-history', requireApiAuth, (req, res) => {
+  if (!getProperty(req.params.id)) return res.status(404).json({ error: 'property not found' });
+  res.json(historyView(req.params.id));
+});
+
+app.post('/api/properties/:id/value-history', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const v = validYearValue(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  db.prepare(
+    `INSERT INTO value_history (property_id, year, value, source, notes, created_at, updated_at)
+     VALUES (?, ?, ?, 'manual', ?, ?, ?)
+     ON CONFLICT(property_id, year) DO UPDATE SET
+       value = excluded.value, source = 'manual', notes = excluded.notes, updated_at = excluded.updated_at`
+  ).run(p.id, v.year, v.value, (req.body || {}).notes || null, nowIso(), nowIso());
+  res.status(201).json(historyView(p.id));
+});
+
+app.put('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const pt = db.prepare('SELECT * FROM value_history WHERE id = ? AND property_id = ?').get(req.params.pointId, p.id);
+  if (!pt) return res.status(404).json({ error: 'history point not found' });
+  const b = req.body || {};
+  const v = validYearValue({ year: b.year !== undefined ? b.year : pt.year, value: b.value !== undefined ? b.value : pt.value });
+  if (v.error) return res.status(400).json({ error: v.error });
+  // Hand-editing a value turns the point into a manual one.
+  const source = b.value !== undefined && Number(b.value) !== pt.value ? 'manual' : pt.source;
+  try {
+    db.prepare('UPDATE value_history SET year=?, value=?, source=?, notes=?, updated_at=? WHERE id=?')
+      .run(v.year, v.value, source, b.notes !== undefined ? b.notes || null : pt.notes, nowIso(), pt.id);
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) return res.status(400).json({ error: `a point for ${v.year} already exists` });
+    throw e;
+  }
+  res.json(historyView(p.id));
+});
+
+app.delete('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM value_history WHERE id = ? AND property_id = ?').run(req.params.pointId, req.params.id);
+  if (!info.changes) return res.status(404).json({ error: 'history point not found' });
+  res.json(historyView(req.params.id));
 });
 
 // ---------------------------------------------------------- rate segments ---
@@ -356,9 +474,11 @@ app.post('/api/assets', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!ASSET_CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'unknown category' });
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'name is required' });
+  const own = cleanOwner(b.owner, false);
+  if (own.error) return res.status(400).json({ error: own.error });
   const info = db
-    .prepare('INSERT INTO other_assets (category, name, value, currency, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, nowIso(), nowIso());
+    .prepare('INSERT INTO other_assets (category, name, value, currency, notes, owner, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, own.value ?? null, nowIso(), nowIso());
   res.status(201).json(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(info.lastInsertRowid));
 });
 
@@ -372,11 +492,17 @@ app.put('/api/assets/:id', requireApiAuth, (req, res) => {
     value: b.value !== undefined ? num(b.value) ?? 0 : a.value,
     currency: b.currency !== undefined ? b.currency : a.currency,
     notes: b.notes !== undefined ? b.notes || null : a.notes,
+    owner: a.owner,
   };
+  if (b.owner !== undefined) {
+    const own = cleanOwner(b.owner, false);
+    if (own.error) return res.status(400).json({ error: own.error });
+    next.owner = own.value;
+  }
   if (!ASSET_CATEGORIES.includes(next.category)) return res.status(400).json({ error: 'unknown category' });
   if (!next.name) return res.status(400).json({ error: 'name is required' });
-  db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, updated_at=? WHERE id=?')
-    .run(next.category, next.name, next.value, next.currency, next.notes, nowIso(), a.id);
+  db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, owner=?, updated_at=? WHERE id=?')
+    .run(next.category, next.name, next.value, next.currency, next.notes, next.owner, nowIso(), a.id);
   res.json(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(a.id));
 });
 

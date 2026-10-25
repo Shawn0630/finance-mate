@@ -86,12 +86,15 @@
       <form id="propForm">
         <div class="grid2">
           <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
+          <div><label>Owner</label><select name="owner" id="propOwner"></select></div>
+        </div>
+        <div class="grid2">
           <div><label>Notes</label><input name="notes"></div>
+          <div><label>Photo URL (external link)</label><input name="photo_url" placeholder="https://…"></div>
         </div>
         <div class="grid3">
           <div><label>Assessed value ($)</label><input name="assessed_value" type="number" step="0.01" min="0"></div>
           <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
-          <div><label>Photo URL (external link)</label><input name="photo_url" placeholder="https://…"></div>
         </div>
         <div class="note" id="assessmentMeta" style="margin-left:0"></div>
         <div class="toolbar">
@@ -147,6 +150,24 @@
       <div class="chart-wrap"><canvas id="mortgageChart"></canvas></div>
     </div>
 
+    <div class="panel">
+      <h3>Assessed value trend</h3>
+      <div class="note" style="margin-left:0">One point per assessment year. Every successful BC Assessment fetch records that year's value automatically; you can add, edit or delete points by hand (for example, to fill in earlier years).</div>
+      <div class="note" id="trendSummary" style="margin-left:0"></div>
+      <div class="chart-wrap" id="trendWrap"><canvas id="trendChart"></canvas></div>
+      <div class="msg" id="trendMsg"></div>
+      <table>
+        <thead><tr><th>Year</th><th class="num">Assessed value</th><th>Source</th><th>Notes</th><th></th></tr></thead>
+        <tbody id="trendRows"></tbody>
+      </table>
+      <form id="trendForm" class="toolbar" style="align-items:flex-end">
+        <div><label>Year</label><input type="number" name="year" step="1" min="1900" max="2100" required style="width:110px"></div>
+        <div><label>Assessed value ($)</label><input type="number" name="value" step="0.01" min="0" required style="width:160px"></div>
+        <div><label>Notes</label><input type="text" name="notes" style="width:180px"></div>
+        <button class="primary" type="submit" id="trendSubmitBtn">Add point</button>
+        <button type="button" id="trendCancelBtn" class="hidden">Cancel edit</button>
+      </form>
+    </div>
   </section>
 
   <!-- ============================ Placeholders ============================ -->
@@ -163,14 +184,15 @@
     <form id="addPropForm">
       <div class="grid2">
         <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" placeholder="Start typing — suggestions come from BC Assessment" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
+        <div><label>Owner</label><select name="owner" id="addPropOwner"></select></div>
+      </div>
+      <div class="grid2">
         <div><label>Notes</label><input name="notes"></div>
+        <div><label>Mortgage balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
       </div>
       <div class="grid3">
-        <div><label>Mortgage balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
         <div><label>Balance as of</label><input name="mortgage_balance_date" type="date"></div>
         <div><label>Monthly payment ($)</label><input name="mortgage_payment" type="number" step="0.01" min="0"></div>
-      </div>
-      <div class="grid3">
         <div><label>Remaining amortization (years)</label><input name="amortization_years" type="number" step="0.5" min="0"></div>
       </div>
       <div class="note" style="margin-left:0">Remaining amortization is used to derive the payment when no monthly payment is entered. After adding, the app tries to fetch the assessed value from BC Assessment automatically. You can refine everything on the detail page.</div>
@@ -192,9 +214,10 @@
         <div><label>Category</label><input name="categoryLabel" readonly></div>
         <div><label>Name *</label><input name="name" required></div>
       </div>
-      <div class="grid2">
+      <div class="grid3">
         <div><label>Value</label><input name="value" type="number" step="0.01"></div>
         <div><label>Currency</label><input name="currency" value="CAD"></div>
+        <div><label>Owner</label><select name="owner" id="assetOwner"></select></div>
       </div>
       <div><label>Notes</label><input name="notes"></div>
       <div class="toolbar">

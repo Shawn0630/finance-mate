@@ -169,6 +169,23 @@ function route() {
 }
 window.addEventListener('hashchange', route);
 
+// ---------------------------------------------------------------- owners ---
+// Owner options come from the users table. 'Joint' is offered for
+// properties only (the server enforces the same rule for other assets).
+let ownerUsers = [];
+async function loadOwnerUsers() {
+  try { ownerUsers = await api('/api/users'); } catch { ownerUsers = []; }
+}
+function fillOwnerSelect(sel, { allowJoint, value = '' }) {
+  if (!sel) return;
+  const opts = ['<option value="">(No owner)</option>']
+    .concat(ownerUsers.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`));
+  if (allowJoint) opts.push('<option value="Joint">Joint</option>');
+  sel.innerHTML = opts.join('');
+  sel.value = value || '';
+  if (sel.value !== (value || '')) sel.value = ''; // unknown stored value -> blank
+}
+
 // ------------------------------------------------------------- assets data ---
 let assetsLoaded = false;
 
@@ -225,6 +242,7 @@ async function loadAssets(force = false) {
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
         <div class="kv"><span class="k">Mortgage balance</span><span>${money(p.mortgage_balance)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
+        ${p.owner ? `<div class="kv"><span class="k">Owner</span><span class="owner-chip">${esc(p.owner)}</span></div>` : ''}
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
       </div></div>`;
   }).join('') || '<div class="note">No properties yet — use “Add property” above.</div>';
@@ -235,6 +253,7 @@ async function loadAssets(force = false) {
     const subtotal = rows.reduce((sum, a) => sum + Number(a.value || 0), 0);
     const body = rows.map((a) => `<tr class="clickable" onclick="location.hash='#asset/${a.id}'">
       <td>${esc(a.name)}</td><td class="num">${money(a.value)}</td><td>${esc(a.currency)}</td>
+      <td>${a.owner ? `<span class="owner-chip">${esc(a.owner)}</span>` : ''}</td>
       <td>${esc(a.notes || '')}</td>
       <td style="white-space:nowrap">
         <button class="small" onclick="event.stopPropagation(); openAssetModal(${a.id})">Edit</button>
@@ -245,7 +264,7 @@ async function loadAssets(force = false) {
         <div class="spacer"></div>
         <button class="primary" onclick="openAssetModal(null, '${s.category}')">+ ${s.addLabel}</button></div>
       ${rows.length
-        ? `<div class="panel" style="padding:6px 16px"><table><thead><tr><th>Name</th><th class="num">Value</th><th>Currency</th><th>Notes</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`
+        ? `<div class="panel" style="padding:6px 16px"><table><thead><tr><th>Name</th><th class="num">Value</th><th>Currency</th><th>Owner</th><th>Notes</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`
         : '<div class="note">No entries yet.</div>'}`;
   }
 }
@@ -256,6 +275,7 @@ let assetModalCategory = 'other';
 function openAssetModal(assetId, category) {
   const form = $('#assetForm');
   form.reset();
+  fillOwnerSelect($('#assetOwner'), { allowJoint: false });
   $('#assetModalMsg').className = 'msg';
   if (assetId) {
     api('/api/assets/' + assetId).then((a) => {
@@ -267,6 +287,7 @@ function openAssetModal(assetId, category) {
       form.elements.value.value = a.value ?? '';
       form.elements.currency.value = a.currency || 'CAD';
       form.elements.notes.value = a.notes || '';
+      fillOwnerSelect($('#assetOwner'), { allowJoint: false, value: a.owner || '' });
       openModal('assetModal');
     }).catch((e) => alert(e.message));
   } else {
@@ -320,6 +341,7 @@ async function loadAssetDetail(id) {
     ['Category', CATEGORY_LABELS[a.category] || a.category],
     ['Value', money(a.value)],
     ['Currency', a.currency],
+    ['Owner', a.owner || '—'],
     ['Notes', a.notes || '—'],
     ['Created', fmtDate(a.created_at)],
     ['Last updated', fmtDate(a.updated_at)],
@@ -335,7 +357,10 @@ async function loadAssetDetail(id) {
 }
 
 // ---------------------------------------------------------- property modal ---
-$('#addPropertyBtn').addEventListener('click', () => openModal('propertyModal'));
+$('#addPropertyBtn').addEventListener('click', () => {
+  fillOwnerSelect($('#addPropOwner'), { allowJoint: true, value: $('#addPropOwner').value });
+  openModal('propertyModal');
+});
 
 $('#addPropForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -382,6 +407,7 @@ async function loadPropertyDetail(id) {
   propSuggest.state.label = p.address || '';
   propSuggest.close();
   pf.notes.value = p.notes || '';
+  fillOwnerSelect($('#propOwner'), { allowJoint: true, value: p.owner || '' });
   pf.assessed_value.value = p.assessed_value ?? '';
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.photo_url.value = p.photo_url || '';
@@ -398,6 +424,7 @@ async function loadPropertyDetail(id) {
   mf.amortization_years.value = p.amortization_years ?? '';
   renderSegments(p.segments);
   loadChart(id);
+  loadTrend(id);
 }
 
 function renderSegments(segments) {
@@ -490,6 +517,101 @@ $('#deletePropertyBtn').addEventListener('click', async () => {
   assetsLoaded = false;
   location.hash = '#assets/properties';
 });
+
+// ------------------------------------------------------------ value trend ---
+// Assessed-value history: one point per year. Auto points are written by
+// BC Assessment fetches; manual points fill earlier years by hand.
+let trendChart = null;
+let trendPoints = [];
+let trendEditingId = null;
+
+async function loadTrend(id) {
+  const r = await api(`/api/properties/${id}/value-history`);
+  trendPoints = r.points;
+  const rows = trendPoints.map((pt) => `<tr>
+    <td>${pt.year}</td><td class="num">${money(pt.value)}</td>
+    <td>${pt.source === 'auto' ? '<span class="badge">BC Assessment</span>' : '<span class="badge manual">Manual</span>'}</td>
+    <td>${esc(pt.notes || '')}</td>
+    <td style="white-space:nowrap">
+      <button class="small" onclick="editTrendPoint(${pt.id})">Edit</button>
+      <button class="small danger" onclick="deleteTrendPoint(${pt.id})">Delete</button>
+    </td></tr>`).join('');
+  $('#trendRows').innerHTML = rows || '<tr><td colspan="5" class="note" style="margin:0">No history points yet.</td></tr>';
+  const summary = $('#trendSummary');
+  if (r.change) {
+    const sign = r.change.abs >= 0 ? '+' : '−';
+    const absTxt = money(Math.abs(r.change.abs));
+    const pctTxt = r.change.pct === null ? '' : ` (${r.change.pct >= 0 ? '+' : ''}${r.change.pct.toFixed(1)}%)`;
+    summary.textContent = `Change ${r.change.fromYear} → ${r.change.toYear}: ${sign}${absTxt}${pctTxt} (${money(r.change.from)} → ${money(r.change.to)}).`;
+  } else if (trendPoints.length === 1) {
+    summary.textContent = 'Only one year on record — add earlier years below to see the trend.';
+  } else {
+    summary.textContent = 'No history yet — fetch from BC Assessment or add a point below.';
+  }
+  const ctx = $('#trendChart');
+  if (trendChart) { trendChart.destroy(); trendChart = null; }
+  if (trendPoints.length) {
+    trendChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: trendPoints.map((pt) => String(pt.year)),
+        datasets: [{
+          label: 'Assessed value',
+          data: trendPoints.map((pt) => pt.value),
+          borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
+          tension: 0.15, pointRadius: 4, borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { y: { title: { display: true, text: 'Assessed value ($)' } } },
+      },
+    });
+  }
+}
+
+function resetTrendForm() {
+  trendEditingId = null;
+  $('#trendForm').reset();
+  $('#trendSubmitBtn').textContent = 'Add point';
+  $('#trendCancelBtn').classList.add('hidden');
+}
+
+function editTrendPoint(pointId) {
+  const pt = trendPoints.find((x) => x.id === pointId);
+  if (!pt) return;
+  trendEditingId = pointId;
+  const f = $('#trendForm');
+  f.year.value = pt.year;
+  f.value.value = pt.value;
+  f.notes.value = pt.notes || '';
+  $('#trendSubmitBtn').textContent = 'Save point';
+  $('#trendCancelBtn').classList.remove('hidden');
+}
+window.editTrendPoint = editTrendPoint;
+
+async function deleteTrendPoint(pointId) {
+  if (!confirm('Delete this history point?')) return;
+  await api(`/api/properties/${currentPropertyId}/value-history/${pointId}`, { method: 'DELETE' });
+  resetTrendForm();
+  loadTrend(currentPropertyId);
+}
+window.deleteTrendPoint = deleteTrendPoint;
+
+$('#trendForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  try {
+    if (trendEditingId) {
+      await api(`/api/properties/${currentPropertyId}/value-history/${trendEditingId}`, { method: 'PUT', body: f });
+    } else {
+      await api(`/api/properties/${currentPropertyId}/value-history`, { method: 'POST', body: f });
+    }
+    resetTrendForm();
+    loadTrend(currentPropertyId);
+  } catch (err) { showMsg($('#trendMsg'), 'err', err.message); }
+});
+$('#trendCancelBtn').addEventListener('click', resetTrendForm);
 
 // ------------------------------------------------------------------- chart ---
 async function loadChart(id) {
@@ -588,5 +710,7 @@ $('#logoutBtn').addEventListener('click', async () => {
     const me = await api('/api/me');
     $('#whoami').textContent = me.username;
   } catch { /* api() already redirected */ }
+  await loadOwnerUsers();
+  fillOwnerSelect($('#addPropOwner'), { allowJoint: true });
   route();
 })();

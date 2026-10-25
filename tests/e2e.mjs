@@ -94,6 +94,17 @@ try {
   r = await req('POST', '/api/login', { username: 'admin', password: 'admin' });
   check('admin/admin login succeeds', r.status === 200 && r.data.ok === true);
 
+  // Seeded household users (idempotent seeds in db.js).
+  r = await req('GET', '/api/users');
+  check('users list has admin, Shawn, Jiaying',
+    ['admin', 'Shawn', 'Jiaying'].every((u) => (r.data || []).includes(u)), JSON.stringify(r.data));
+  r = await req('POST', '/api/login', { username: 'Shawn', password: 'wrong' });
+  check('Shawn wrong password rejected', r.status === 401);
+  r = await req('POST', '/api/login', { username: 'Shawn', password: 'Shawn' });
+  check('Shawn/Shawn login succeeds', r.status === 200 && r.data.username === 'Shawn');
+  r = await req('POST', '/api/login', { username: 'Jiaying', password: 'Jiaying' });
+  check('Jiaying/Jiaying login succeeds', r.status === 200 && r.data.username === 'Jiaying');
+
   // Address suggestions come from the (stubbed) BC Assessment search:
   // the junk "No results" entry must be filtered out.
   r = await req('GET', '/api/address/suggest?q=' + encodeURIComponent('1200 Government Street, Victoria, BC'));
@@ -162,6 +173,51 @@ try {
   // Editing the address back to free text clears the stored id.
   r = await req('PUT', `/api/properties/${pid2}`, { address: '999 Somewhere Else', bca_id: null });
   check('editing address to free text clears bca_id', r.status === 200 && r.data.bca_id === null);
+
+  // Owner rules: properties may be Joint or any user; other assets may
+  // be a user but never Joint.
+  r = await req('POST', '/api/properties', { address: '1 Owner Way', owner: 'Joint' });
+  check('property can have Joint owner', r.status === 201 && r.data.owner === 'Joint');
+  const pidOwn = r.data.id;
+  r = await req('PUT', `/api/properties/${pidOwn}`, { owner: 'Shawn' });
+  check('property owner can be a user', r.status === 200 && r.data.owner === 'Shawn');
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owner: 'Nobody' });
+  check('property with unknown owner rejected', r.status === 400);
+  r = await req('POST', '/api/assets', { category: 'other', name: 'Joint test', owner: 'Joint' });
+  check('other asset with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
+  r = await req('POST', '/api/assets', { category: 'other', name: 'Owned thing', owner: 'Jiaying' });
+  check('other asset can have a user owner', r.status === 201 && r.data.owner === 'Jiaying');
+  const aidOwn = r.data.id;
+  r = await req('PUT', `/api/assets/${aidOwn}`, { owner: 'Joint' });
+  check('other asset owner cannot be changed to Joint', r.status === 400);
+  r = await req('DELETE', `/api/properties/${pidOwn}`);
+  r = await req('DELETE', `/api/assets/${aidOwn}`);
+  check('owner fixtures cleaned up', r.status === 200);
+
+  // Value history: the stub fetch above already recorded the 2026 auto
+  // point for pid2; manual points fill the earlier years.
+  r = await req('GET', `/api/properties/${pid2}/value-history`);
+  check('fetch recorded one auto history point (2026)',
+    r.data.points && r.data.points.length === 1 && r.data.points[0].year === 2026
+      && r.data.points[0].source === 'auto' && r.data.points[0].value === 6532000,
+    JSON.stringify(r.data.points || []));
+  r = await req('POST', `/api/properties/${pid2}/value-history`, { year: 2024, value: 5900000 });
+  check('manual history point 2024 added', r.status === 201 && r.data.points.length === 2);
+  r = await req('POST', `/api/properties/${pid2}/value-history`, { year: 2025, value: 6100000 });
+  const ch = r.data.change || {};
+  check('three history points sorted by year', r.data.points.length === 3 && r.data.points.map((p) => p.year).join(',') === '2024,2025,2026');
+  check('trend change abs = +632000 (2024 -> 2026)', ch.abs === 632000, JSON.stringify(ch));
+  check('trend change pct ~ +10.71%', typeof ch.pct === 'number' && Math.abs(ch.pct - 10.7119) < 0.01, String(ch.pct));
+  const pt2025 = r.data.points.find((p) => p.year === 2025);
+  r = await req('PUT', `/api/properties/${pid2}/value-history/${pt2025.id}`, { value: 6150000 });
+  check('history point edited', r.status === 200 && r.data.points.find((p) => p.year === 2025).value === 6150000);
+  r = await req('POST', `/api/properties/${pid2}/fetch-bca`);
+  check('re-fetch does not duplicate the 2026 point', r.data.ok === true);
+  r = await req('GET', `/api/properties/${pid2}/value-history`);
+  check('still three points after re-fetch', r.data.points.length === 3, JSON.stringify(r.data.points.map((p) => p.year)));
+  const pt2024 = r.data.points.find((p) => p.year === 2024);
+  r = await req('DELETE', `/api/properties/${pid2}/value-history/${pt2024.id}`);
+  check('history point deleted, change now starts 2025', r.data.points.length === 2 && r.data.change && r.data.change.fromYear === 2025);
 
   // Segment delete + property delete paths.
   r = await req('DELETE', `/api/properties/${pid}/rates/${segId}`);
