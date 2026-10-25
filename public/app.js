@@ -705,6 +705,14 @@ function drawPortfolioChart() {
     });
   }
   if (!datasets.length) return;
+  // Same explicit axis window as the detail page's combined chart:
+  // exactly the selected range, never the library auto-fit.
+  const pfWin = mixedAxisWindow({
+    months: pfRangeMonths,
+    assessedYears: assessedRows.map((y) => y.year).sort((a, b) => a - b),
+    projStart: rows.length ? ymDecimal(rows[0].month) : null,
+    projLastX: rows.length ? ymDecimal(rows[rows.length - 1].month) : null,
+  });
   portfolioLineChart = new Chart(ctx, {
     data: { datasets },
     plugins: [guideLinePlugin],
@@ -737,7 +745,7 @@ function drawPortfolioChart() {
         },
       },
       scales: {
-        x: { type: 'linear', stacked: true, ticks: { stepSize: 1, maxTicksLimit: 12, callback: formatYearTick } },
+        x: { type: 'linear', stacked: true, ...(pfWin || {}), ticks: { ...(pfWin ? yearAxisTicks(pfWin.min, pfWin.max) : {}), callback: formatYearTick } },
         y: { stacked: true, ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' } },
       },
     },
@@ -1196,6 +1204,47 @@ function formatYearTick(x) {
   return `${MONTH_NAMES[m]} ${y}`;
 }
 
+// Explicit x-axis window for the charts that mix assessed history
+// (one point per assessment year, looking back) with a mortgage
+// projection (monthly, looking forward). Leaving the axis to the
+// Chart.js auto-fit was a bug: it unioned both series and rounded
+// the bounds outward to "nice" steps, so a 5-year selection drew an
+// 8-year axis and the All view ballooned into decades of empty span
+// (one user saw an axis running roughly 1920-2140). The window is
+// now exactly what the selected range draws — from the earliest
+// drawn thing (January of the earliest shown assessment year, or
+// the projection's balance date) to the latest (the end of the last
+// shown assessment year, or the projection start plus the selected
+// months; for All, the projection's last month). Points the range
+// windows out are not drawn and never stretch the axis. Returns
+// null when there is nothing to draw.
+function mixedAxisWindow({ months, assessedYears = [], projStart = null, projLastX = null }) {
+  let min = Infinity;
+  let max = -Infinity;
+  if (assessedYears.length) {
+    min = Math.min(min, assessedYears[0]);
+    max = Math.max(max, assessedYears[assessedYears.length - 1] + 1);
+  }
+  if (projStart !== null) {
+    min = Math.min(min, projStart);
+    max = Math.max(max, months > 0 ? projStart + months / 12 : (projLastX ?? projStart));
+  }
+  return Number.isFinite(min) ? { min, max } : null;
+}
+
+// Tick steps for the fractional-year axis, set explicitly — the
+// library's own "nice step" choice jumps straight to whole years
+// even when there is room for finer steps. Short windows tick
+// monthly (labels like "Mar 2027" via formatYearTick), mid windows
+// half-yearly (the month is still named), and only genuinely long
+// spans fall back to auto whole-year steps.
+function yearAxisTicks(min, max) {
+  const span = max - min;
+  if (span <= 2.01) return { stepSize: 1 / 12, maxTicksLimit: 25 };
+  if (span <= 10.01) return { stepSize: 0.5, maxTicksLimit: 21 };
+  return { maxTicksLimit: 13 };
+}
+
 function renderEquity() {
   const el = $('#equitySummary');
   if (!el) return;
@@ -1228,10 +1277,14 @@ function drawCombinedChart() {
   window.__fmCharts.a = null;
   const datasets = [];
   const months = currentRangeMonths();
+  const shownYears = [];
+  let projStart = null;
+  let projLastX = null;
   if (trendPoints.length) {
     // Assessed history defaults to the most recent 5 years; the range
     // buttons widen it (All = every year on record).
     const shown = lastYearsWindow(trendPoints, months);
+    shownYears.push(...shown.map((pt) => pt.year).sort((a, b) => a - b));
     datasets.push({
       label: 'Assessed value',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
@@ -1243,6 +1296,8 @@ function drawCombinedChart() {
     const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
     const pts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
       ...rows.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
+    projStart = pts[0].x;
+    projLastX = pts[pts.length - 1].x;
     datasets.push({
       label: 'Outstanding principal',
       data: pts,
@@ -1251,6 +1306,9 @@ function drawCombinedChart() {
     });
   }
   if (!datasets.length) return;
+  // The axis is exactly the selected window — never the library's
+  // auto-fit (see mixedAxisWindow).
+  const win = mixedAxisWindow({ months, assessedYears: shownYears, projStart, projLastX });
   chartA = new Chart(ctx, {
     type: 'line',
     data: { datasets },
@@ -1267,7 +1325,7 @@ function drawCombinedChart() {
         },
       },
       scales: {
-        x: { type: 'linear', ticks: { stepSize: 1, maxTicksLimit: 12, callback: formatYearTick } },
+        x: { type: 'linear', ...(win || {}), ticks: { ...(win ? yearAxisTicks(win.min, win.max) : {}), callback: formatYearTick } },
         y: { ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' } },
       },
     },

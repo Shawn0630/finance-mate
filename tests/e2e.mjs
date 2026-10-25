@@ -1036,6 +1036,51 @@ try {
       check('switching back to 5 years restores the 2022-2026 window',
         JSON.stringify(winBack) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winBack));
 
+      // Axis bounds: the x axis must be exactly the selected window,
+      // never the chart library's auto-fit (which unioned the history
+      // with the projection and rounded outward into decades of empty
+      // span). With assessed history only, the 5-year view's axis is
+      // exactly those 5 years (Jan 2022 through the end of 2026).
+      const axisA = () => page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        if (!c) return null;
+        const xs = c.data.datasets.flatMap((d) => d.data.map((p) => p.x));
+        return {
+          min: c.scales.x.min, max: c.scales.x.max,
+          ticks: c.scales.x.ticks.map((t) => t.label),
+          dataMin: Math.min(...xs), dataMax: Math.max(...xs),
+        };
+      });
+      let ax = await axisA();
+      check('chart A axis with history only spans exactly the shown 5 years (2022-2027)',
+        !!ax && ax.min === 2022 && ax.max === 2027, JSON.stringify(ax && { min: ax.min, max: ax.max }));
+
+      // Give the fixture a rate plan + payment on a known balance
+      // date, reload, and the axis must follow each selected range:
+      // 60mo -> Jan 2022 (earliest shown year) to balance+60mo (2030);
+      // 24mo -> exactly the 2 years 2025-2027 with monthly ticks;
+      // All -> the exact data extent, no padded decades either side.
+      await req('PUT', `/api/properties/${winPid}`, { mortgage_balance_date: '2025-01-15', mortgage_payment: 3000 });
+      await req('POST', `/api/properties/${winPid}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 });
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      ax = await axisA();
+      check('chart A 5-year axis is the selected window (2022 to 2030) with month ticks',
+        !!ax && ax.min === 2022 && ax.max === 2030 && ax.ticks.some((t) => /Jul/.test(t)),
+        JSON.stringify(ax && { min: ax.min, max: ax.max, ticks: ax.ticks }));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="24"]').click());
+      await wait(600);
+      ax = await axisA();
+      check('chart A 2-year axis spans exactly 2 years (2025-2027) with monthly ticks',
+        !!ax && ax.min === 2025 && ax.max === 2027 && ax.ticks.length >= 20,
+        JSON.stringify(ax && { min: ax.min, max: ax.max, nTicks: ax.ticks.length }));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
+      await wait(600);
+      ax = await axisA();
+      check('chart A All axis is the exact data extent (2019 to the last projected month)',
+        !!ax && ax.min === 2019 && ax.max === ax.dataMax && ax.max < 2060,
+        JSON.stringify(ax && { min: ax.min, max: ax.max, dataMax: ax.dataMax }));
+
       // Portfolio combined chart: the same default window applies to
       // its assessed line (years are the union across properties; this
       // fixture's 2019 is the earliest year on record).
@@ -1052,11 +1097,25 @@ try {
       const pfDefault = await pfYears();
       check('portfolio assessed line defaults to the most recent 5 years',
         JSON.stringify(pfDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(pfDefault));
+      const axisPf = () => page.evaluate(() => {
+        const c = window.__fmCharts.portfolio;
+        if (!c) return null;
+        const xs = c.data.datasets.flatMap((d) => d.data.map((p) => p.x));
+        return { min: c.scales.x.min, max: c.scales.x.max, dataMax: Math.max(...xs) };
+      });
+      let pax = await axisPf();
+      check('portfolio axis follows the selected window (starts 2022, under 9 years wide)',
+        !!pax && pax.min === 2022 && pax.max - pax.min <= 9.01,
+        JSON.stringify(pax && { min: pax.min, max: pax.max }));
       await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="0"]').click());
       await wait(600);
       const pfAll = await pfYears();
       check('portfolio All range widens the assessed line to every recorded year',
         Array.isArray(pfAll) && pfAll.length === 8 && pfAll[0] === 2019 && pfAll[pfAll.length - 1] === 2026, JSON.stringify(pfAll));
+      pax = await axisPf();
+      check('portfolio All axis is the exact data extent (2019 to the last projected month)',
+        !!pax && pax.min === 2019 && pax.max === pax.dataMax,
+        JSON.stringify(pax && { min: pax.min, max: pax.max, dataMax: pax.dataMax }));
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));
