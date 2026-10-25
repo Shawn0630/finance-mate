@@ -245,9 +245,22 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     // Purchase date can be changed any time on the detail page (the Add
     // form requires it, editing does not re-require it).
     purchase_date: b.purchase_date !== undefined ? (b.purchase_date || null) : p.purchase_date,
+    // Payment day is edited from the rate-plan area; null clears it.
+    payment_day: p.payment_day ?? null,
   };
   if (b.purchase_date !== undefined && b.purchase_date && !isDateStr(b.purchase_date)) {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
+  }
+  if (b.payment_day !== undefined) {
+    if (b.payment_day === null || b.payment_day === '') {
+      next.payment_day = null;
+    } else {
+      const d = Number(b.payment_day);
+      if (!Number.isInteger(d) || d < 1 || d > 31) {
+        return res.status(400).json({ error: 'payment day must be a whole number between 1 and 31' });
+      }
+      next.payment_day = d;
+    }
   }
   if (b.owner !== undefined) {
     const own = cleanOwner(b.owner, true);
@@ -261,12 +274,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
-       owner=?, purchase_date=?, updated_at=? WHERE id=?`
+       owner=?, purchase_date=?, payment_day=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
-    next.amortization_years, next.notes, next.owner, next.purchase_date, nowIso(), p.id
+    next.amortization_years, next.notes, next.owner, next.purchase_date,
+    next.payment_day, nowIso(), p.id
   );
   res.json(propertyView(getProperty(p.id)));
 });
@@ -482,7 +496,9 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
     payment = derivePayment(p.mortgage_balance, seg ? seg.annual_rate : 0, p.amortization_years);
     paymentSource = 'derived';
   }
-  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments });
+  // The payment day only anchors the series' node dates (see engine);
+  // it never enters the interest math.
+  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments, paymentDay: p.payment_day ?? null });
   res.json({
     ok: true,
     balance: p.mortgage_balance,

@@ -20,6 +20,20 @@ function parseYM(dateStr) {
   return { y, m };
 }
 
+// Last day of month m (1..12) of year y.
+function daysInMonth(y, m) {
+  return new Date(Date.UTC(y, m, 0)).getUTCDate();
+}
+
+// The calendar date a projected month's node falls on. With a payment
+// day (the day the payment is deducted) the node is that day of the
+// month; without one it is the balance date's day-of-month (the monthly
+// anniversary). Either way it clamps to the month's last day.
+function nodeDate({ y, m }, dayOfMonth) {
+  const d = Math.min(dayOfMonth, daysInMonth(y, m));
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
 function nextMonth({ y, m }) {
   return m === 12 ? { y: y + 1, m: 1 } : { y, m: m + 1 };
 }
@@ -58,13 +72,21 @@ export function derivePayment(balance, annualRatePct, years) {
 //                 month is the month after it
 //   payment:      monthly payment actually used
 //   segments:     [{ start_date, rate_type, annual_rate }] sorted by start
+//   paymentDay:   optional 1..31, the day of the month the payment is
+//                 deducted. It only ANCHORS each node's `date` — the
+//                 interest math is monthly and never depends on it.
+//                 Without it, node dates use the balance date's
+//                 day-of-month (its monthly anniversary).
 //   maxMonths:    hard cap so a non-amortizing loan cannot loop forever
-// Returns { series: [{ month, rate, rateType, interest, principal, payment,
-// balance }], totalInterest, payoffMonth, negativeAmortization }
-export function simulate({ balance, balanceDate, payment, segments, maxMonths = 600 }) {
+// Returns { series: [{ month, date, rate, rateType, interest, principal,
+// payment, balance }], totalInterest, payoffMonth, negativeAmortization }
+export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, maxMonths = 600 }) {
   const series = [];
   let bal = round2(Number(balance));
   let cursor = parseYM(balanceDate);
+  const anchorDay = Number.isInteger(paymentDay) && paymentDay >= 1 && paymentDay <= 31
+    ? paymentDay
+    : Number(String(balanceDate).split('-')[2]) || 1;
   let totalInterest = 0;
   let negativeAmortization = false;
 
@@ -87,6 +109,7 @@ export function simulate({ balance, balanceDate, payment, segments, maxMonths = 
     totalInterest = round2(totalInterest + interest);
     series.push({
       month,
+      date: nodeDate(cursor, anchorDay),
       rate: annualRate,
       rateType: seg ? seg.rate_type : null,
       interest,

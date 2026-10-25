@@ -100,6 +100,12 @@ if (!propCols.includes('purchase_date')) {
   // (rows predate it); the Add endpoint requires it for new properties.
   db.exec('ALTER TABLE properties ADD COLUMN purchase_date TEXT');
 }
+if (!propCols.includes('payment_day')) {
+  // Day of the month (1-31) the mortgage payment is deducted. Nullable.
+  // It only anchors the projection's monthly node dates; the interest
+  // math stays monthly and does not depend on it.
+  db.exec('ALTER TABLE properties ADD COLUMN payment_day INTEGER');
+}
 const assetCols = db.prepare('PRAGMA table_info(other_assets)').all().map((c) => c.name);
 if (!assetCols.includes('owner')) {
   db.exec('ALTER TABLE other_assets ADD COLUMN owner TEXT');

@@ -67,6 +67,32 @@ test('simulate: payment below interest flags negative amortization', () => {
   assert.equal(r.payoffMonth, null);
 });
 
+test('simulate: node dates anchor to the payment day, interest unchanged', () => {
+  const base = {
+    balance: 100000,
+    balanceDate: '2026-10-24',
+    payment: 600,
+    segments: [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }],
+  };
+  const plain = simulate(base);
+  // No payment day: monthly anniversaries of the balance date.
+  assert.equal(plain.series[0].date, '2026-11-24');
+  assert.equal(plain.series[0].interest, 412.39);
+
+  const anchored = simulate({ ...base, paymentDay: 1 });
+  assert.equal(anchored.series[0].date, '2026-11-01');
+  assert.equal(anchored.series[1].date, '2026-12-01');
+  // Anchoring moves dates only — amounts are identical.
+  assert.equal(anchored.series[0].interest, plain.series[0].interest);
+  assert.equal(anchored.series[0].balance, plain.series[0].balance);
+  assert.equal(anchored.totalInterest, plain.totalInterest);
+
+  const thirtyFirst = simulate({ ...base, paymentDay: 31 });
+  assert.equal(thirtyFirst.series[0].date, '2026-11-30'); // November has 30 days
+  assert.equal(thirtyFirst.series[3].month, '2027-02');
+  assert.equal(thirtyFirst.series[3].date, '2027-02-28'); // clamped to month end
+});
+
 test('segmentForMonth: before first / gap / after last', () => {
   const segs = [
     { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 },

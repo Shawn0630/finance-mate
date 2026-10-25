@@ -6,6 +6,11 @@ const money = (n) =>
     : Number(n).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const ordinal = (n) => {
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+};
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -418,6 +423,10 @@ async function loadPropertyDetail(id) {
   pf.assessed_value.value = p.assessed_value ?? '';
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.purchase_date.value = p.purchase_date || '';
+  $('#paymentDayInput').value = p.payment_day ?? '';
+  $('#paymentDayDisplay').textContent = p.payment_day
+    ? `Payment day: the ${ordinal(p.payment_day)} of each month — managed in the Rate segments panel below.`
+    : 'Payment day: not set — managed in the Rate segments panel below.';
   pf.photo_url.value = p.photo_url || '';
   $('#assessmentMeta').textContent =
     p.assessed_source === 'auto'
@@ -483,6 +492,20 @@ $('#addSegmentForm').addEventListener('submit', async (e) => {
     await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body: f });
     assetsLoaded = false;
     e.target.reset();
+    loadPropertyDetail(currentPropertyId);
+  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+});
+
+// The payment day is a property field, but it is maintained here, with
+// the rate plan: saving it re-renders both charts on their new anchor.
+$('#paymentDayForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const raw = $('#paymentDayInput').value.trim();
+  try {
+    await api(`/api/properties/${currentPropertyId}`, {
+      method: 'PUT',
+      body: { payment_day: raw === '' ? null : Number(raw) },
+    });
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });
@@ -698,7 +721,7 @@ function drawCombinedChart() {
     const months = currentRangeMonths();
     const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
     const pts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
-      ...rows.map((r) => ({ x: ymDecimal(r.month), y: r.balance }))];
+      ...rows.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
     datasets.push({
       label: 'Outstanding balance',
       data: pts,
@@ -765,7 +788,7 @@ function drawMonthlyChart() {
   chartB = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: rows.map((r) => r.month),
+      labels: rows.map((r) => r.date || r.month),
       datasets: [
         {
           label: 'Monthly interest',

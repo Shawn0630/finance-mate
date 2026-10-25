@@ -303,6 +303,48 @@ try {
   r = await req('DELETE', `/api/properties/${pidSlim}`);
   check('delete slim property', r.status === 200);
 
+  // Payment day (deduction day): anchors the projection's monthly node
+  // dates only — the interest amounts must not move when it changes.
+  r = await req('POST', '/api/properties', {
+    address: '24 Payday Place, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-24', mortgage_payment: 600,
+    purchase_date: '2020-01-01',
+  });
+  const pidPay = r.data.id;
+  await req('POST', `/api/properties/${pidPay}/rates`, {
+    start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5,
+  });
+  r = await req('GET', `/api/properties/${pidPay}/amortization`);
+  check('no payment day: nodes on the balance-date anniversary',
+    r.data.series[0].date === '2026-11-24' && r.data.series[0].interest === 412.39,
+    JSON.stringify(r.data.series[0]));
+  const interestBefore = r.data.series[0].interest;
+  r = await req('PUT', `/api/properties/${pidPay}`, { payment_day: 1 });
+  check('payment day stored', r.status === 200 && r.data.payment_day === 1, JSON.stringify(r.data.payment_day));
+  r = await req('GET', `/api/properties/${pidPay}/amortization`);
+  check('payment day 1: nodes land on the 1st',
+    r.data.series[0].date === '2026-11-01' && r.data.series[1].date === '2026-12-01',
+    JSON.stringify([r.data.series[0].date, r.data.series[1].date]));
+  check('payment day does not change the interest math', r.data.series[0].interest === interestBefore);
+  r = await req('PUT', `/api/properties/${pidPay}`, { payment_day: 15 });
+  check('payment day update stored', r.status === 200 && r.data.payment_day === 15);
+  r = await req('GET', `/api/properties/${pidPay}/amortization`);
+  check('nodes follow the new payment day', r.data.series[0].date === '2026-11-15', String(r.data.series[0].date));
+  await req('PUT', `/api/properties/${pidPay}`, { payment_day: 31 });
+  r = await req('GET', `/api/properties/${pidPay}/amortization`);
+  check('payment day 31 clamps to month end', r.data.series[0].date === '2026-11-30'
+    && r.data.series.find((s) => s.month === '2027-02')?.date === '2027-02-28');
+  r = await req('PUT', `/api/properties/${pidPay}`, { payment_day: 0 });
+  check('payment day 0 rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${pidPay}`, { payment_day: 32 });
+  check('payment day 32 rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${pidPay}`, { payment_day: null });
+  check('payment day cleared', r.status === 200 && (r.data.payment_day ?? null) === null);
+  r = await req('GET', `/api/properties/${pidPay}/amortization`);
+  check('cleared payment day restores anniversary nodes', r.data.series[0].date === '2026-11-24');
+  r = await req('DELETE', `/api/properties/${pidPay}`);
+  check('delete payday property', r.status === 200);
+
   // Segment delete + property delete paths.
   r = await req('DELETE', `/api/properties/${pid}/rates/${segId}`);
   check('delete rate segment', r.status === 200);
