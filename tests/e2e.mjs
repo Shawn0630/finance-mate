@@ -5,10 +5,12 @@
 // (same hand-computed fixture as the engine tests), other-asset CRUD, the
 // summary arithmetic, and 401 again after logout.
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import Database from 'better-sqlite3';
 
 const PORT = 19200 + (process.pid % 500);
@@ -72,6 +74,7 @@ const stubHits = { search: 0, info: [], xhr: false };
 // its search backend throws — XHR-shaped calls get HTTP 500 with the
 // site's JSON error payload, plain requests 302 to an HTML error page.
 let stubBcaDown = false;
+let stubInfoDown = false;
 const stub = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://stub');
   if (u.pathname === '/') {
@@ -104,6 +107,7 @@ const stub = http.createServer((req, res) => {
   }
   if (u.pathname.startsWith('/Property/Info/')) {
     stubHits.info.push(u.pathname);
+    if (stubInfoDown) { res.writeHead(500); res.end('info down'); return; }
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(`<html><script>var gistoken = 'test-token'; var mapserverUrl = 'http://127.0.0.1:${stub.address().port}/gis';</script></html>`);
     return;
@@ -141,9 +145,98 @@ const primeStub = http.createServer((req, res) => {
 await new Promise((r) => primeStub.listen(0, '127.0.0.1', r));
 const primeStubBase = `http://127.0.0.1:${primeStub.address().port}/valet`;
 
+// Stub HouseSigma site + API (HOUSESIGMA_BASE_URL points the app at
+// it): serves a home page naming a JS bundle, the bundle with an RSA
+// public key embedded the way the real bundle stores it (spaces
+// instead of newlines), the guest-token endpoint, the address
+// suggest endpoint, and the detail endpoint with the REAL encrypted
+// request/response form (RSA-OAEP-SHA1 counter + AES-128-CTR +
+// gzip), so the app's whole pull chain runs offline and exact.
+const hsKeys = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const hsPubSpaced = hsKeys.publicKey.export({ type: 'spki', format: 'pem' }).replace(/\n/g, ' ').trim();
+const HS_SECRET = 'e2etestsecret160'; // 16 chars, as the real secret_key
+const hsHistoryChristina = [
+  { year: 2026, total_int: 1931000, land_int: 1503000, building_int: 428000 },
+  { year: 2025, total_int: 2002000, land_int: 1557000, building_int: 445000 },
+  { year: 2024, total_int: 1955000, land_int: 1504000, building_int: 451000 },
+  { year: 2023, total_int: 1903000, land_int: 1456000, building_int: 447000 },
+  { year: 2022, total_int: 1730000, land_int: 1306000, building_int: 424000 },
+];
+const hsHistoryGovernment = [
+  { year: 2026, total_int: 6000000, land_int: 4000000, building_int: 2000000 },
+  { year: 2025, total_int: 6100000, land_int: 4050000, building_int: 2050000 },
+];
+let hsMode = 'ok'; // 'ok' | 'down'
+let hsLastDetailParams = null;
+const hsStub = http.createServer((req, res) => {
+  const u = new URL(req.url, 'http://hsstub');
+  const sendJson = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  if (hsMode === 'down') { res.writeHead(500); res.end('housesigma down'); return; }
+  if (u.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html><head><script src="/assets/index.test1234.js"></script></head></html>');
+    return;
+  }
+  if (u.pathname === '/assets/index.test1234.js') {
+    res.writeHead(200, { 'Content-Type': 'text/javascript' });
+    res.end(`var cfg={"HS-Client-Version":"7.22.54"};var pem="${hsPubSpaced}";`);
+    return;
+  }
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    let body = {};
+    try { body = JSON.parse(raw || '{}'); } catch { /* leave empty */ }
+    if (u.pathname === '/bkv2/api/init/accesstoken/new') {
+      sendJson(200, { status: true, data: { access_token: 'e2e-token', secret: { secret_key: HS_SECRET, is_encrypted: 1, created_at: 1, expired_at: 9999999999 } } });
+      return;
+    }
+    if (req.headers.authorization !== 'Bearer e2e-token') {
+      sendJson(200, { status: false, error: { code: 920, message: 'access token invalid' } });
+      return;
+    }
+    if (u.pathname === '/bkv2/api/search/address_v2/suggest') {
+      const term = String(body.search_term || '');
+      // The Douglas fixture belongs to the pull section below; the
+      // older sections' Government-Street property must NOT locate
+      // here, so its history stays exactly the points they put there.
+      const house = term.includes('Christina')
+        ? { id_listing: 'HS-LIST-1', id_listing_history_v2: 'HS-ADDR-1', seo_address: '2985-christina-place' }
+        : term.includes('Douglas')
+          ? { id_listing: 'HS-LIST-2', id_listing_history_v2: 'HS-ADDR-2', seo_address: '1200-douglas-street' }
+          : null;
+      sendJson(200, { status: true, data: { house_list: house ? [house] : [] }, error: { code: 0, message: '' } });
+      return;
+    }
+    if (u.pathname === '/bkv2/api/listing/info/detail_v2') {
+      try {
+        const counter = crypto.privateDecrypt(
+          { key: hsKeys.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha1' },
+          Buffer.from(body.ctr, 'base64')
+        );
+        const keyBytes = Buffer.from(HS_SECRET.padEnd(16, '*').slice(0, 16), 'utf8');
+        const dec = crypto.createDecipheriv('aes-128-ctr', keyBytes, counter);
+        const plain = Buffer.concat([dec.update(Buffer.from(body.et_payload, 'base64')), dec.final()]).toString('utf8');
+        hsLastDetailParams = JSON.parse(plain);
+        const history = hsLastDetailParams.id_address === 'HS-ADDR-2' ? hsHistoryGovernment : hsHistoryChristina;
+        const payload = JSON.stringify({ assessment: { history }, house: { id_listing: hsLastDetailParams.id_listing } });
+        const enc = crypto.createCipheriv('aes-128-ctr', keyBytes, counter);
+        const encrypted = Buffer.concat([enc.update(zlib.gzipSync(payload)), enc.final()]);
+        sendJson(200, { status: true, data: encrypted.toString('base64'), error: { code: 0, message: '' } });
+      } catch (e) {
+        sendJson(200, { status: false, error: { code: 940, message: 'secret key invalid' } });
+      }
+      return;
+    }
+    res.writeHead(404); res.end('not found');
+  });
+});
+await new Promise((r) => hsStub.listen(0, '127.0.0.1', r));
+const hsStubBase = `http://127.0.0.1:${hsStub.address().port}`;
+
 const server = spawn('node', ['src/server.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase },
+  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
@@ -1182,6 +1275,122 @@ try {
     }
   }
 
+  // ---------------------------------------------------------------
+  // HouseSigma history pull + BC Assessment fetch-on-read. The HS
+  // stub's Christina payload mirrors the real sample property's
+  // assessed values.
+  const ptOf = (hist, year) => (hist.points || []).find((p) => p.year === year);
+
+  // Adding a property fires a best-effort background pull: the
+  // HouseSigma years appear by themselves, marked housesigma.
+  r = await req('POST', '/api/properties', {
+    address: '2985 Christina Pl, Coquitlam, BC', mortgage_balance: 1350000, purchase_date: '2024-12-17',
+  });
+  check('HS fixture property added', r.status === 201, JSON.stringify(r.data));
+  const pidHs = r.data.id;
+  let hsHist = null;
+  for (let i = 0; i < 40; i++) {
+    const h = await req('GET', `/api/properties/${pidHs}/value-history`);
+    if (h.data.points && h.data.points.length === 5) { hsHist = h.data; break; }
+    await new Promise((s) => setTimeout(s, 300));
+  }
+  check('background pull imported all 5 HouseSigma years after add', !!hsHist,
+    JSON.stringify(hsHist ? hsHist.points : []));
+  check('pulled points carry the housesigma source',
+    !!hsHist && hsHist.points.every((p) => p.source === 'housesigma'));
+  check('pulled values match the HouseSigma payload (2022 = 1,730,000, 2026 = 1,931,000)',
+    !!hsHist && ptOf(hsHist, 2022).value === 1730000 && ptOf(hsHist, 2026).value === 1931000);
+  check('the detail call carried the located ids',
+    !!hsLastDetailParams && hsLastDetailParams.id_address === 'HS-ADDR-1' && hsLastDetailParams.id_listing === 'HS-LIST-1',
+    JSON.stringify(hsLastDetailParams));
+  r = await req('GET', `/api/properties/${pidHs}`);
+  check('property stored the HouseSigma ids for the next pull',
+    r.data.hs_id_address === 'HS-ADDR-1' && r.data.hs_id_listing === 'HS-LIST-1', JSON.stringify(r.data.hs_id_address));
+
+  // A manual point is never overwritten by a re-pull; HouseSigma's
+  // own points refresh in place (no duplicates).
+  r = await req('POST', `/api/properties/${pidHs}/value-history`, { year: 2024, value: 1900000 });
+  check('manual 2024 point set over the pulled one', r.status === 201 && ptOf(r.data, 2024).source === 'manual');
+  r = await req('POST', `/api/properties/${pidHs}/pull-history`);
+  check('re-pull succeeds', r.data.ok === true, JSON.stringify(r.data));
+  check('re-pull kept the manual 2024 point (value and source)',
+    ptOf(r.data.history, 2024).value === 1900000 && ptOf(r.data.history, 2024).source === 'manual');
+  check('re-pull reports the manual year as skipped',
+    (r.data.skipped || []).some((s) => s.year === 2024 && s.kept === 'manual'), JSON.stringify(r.data.skipped));
+  check('re-pull added no duplicate points', r.data.history.points.length === 5);
+
+  // BC Assessment ('auto') beats HouseSigma for the same year; a
+  // year HouseSigma has and BCA does not is filled in.
+  r = await req('POST', '/api/properties', {
+    address: '1200 Douglas St, Victoria, BC', mortgage_balance: 500000, purchase_date: '2020-06-01', bca_id: 'QkxPQy0xMjAw',
+  });
+  const pidGov = r.data.id;
+  for (let i = 0; i < 40; i++) { // let its background pull settle first
+    const h = await req('GET', `/api/properties/${pidGov}/value-history`);
+    if (h.data.points && h.data.points.some((p) => p.year === 2025)) break;
+    await new Promise((s) => setTimeout(s, 300));
+  }
+  r = await req('POST', `/api/properties/${pidGov}/fetch-bca`);
+  check('gov property manual BCA fetch ok', r.data.ok === true, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${pidGov}/pull-history`);
+  check('gov pull ok', r.data.ok === true, JSON.stringify(r.data));
+  check('BCA 2026 point kept over HouseSigma (6,532,000, auto)',
+    ptOf(r.data.history, 2026).value === 6532000 && ptOf(r.data.history, 2026).source === 'auto');
+  check('HouseSigma 2025 point stands (6,100,000, housesigma)',
+    ptOf(r.data.history, 2025).value === 6100000 && ptOf(r.data.history, 2025).source === 'housesigma');
+
+  // Fetch-on-read: a never-fetched property with a BCA id refreshes
+  // itself when its detail is loaded — through the by-id channel —
+  // and does not refetch on the next load.
+  r = await req('POST', '/api/properties', {
+    address: '1200 Douglas St, Victoria, BC', mortgage_balance: 400000, purchase_date: '2019-01-01', bca_id: 'QkxPQy0xMjAw',
+  });
+  const pidAuto = r.data.id;
+  const infoBefore = stubHits.info.length;
+  r = await req('GET', `/api/properties/${pidAuto}`);
+  check('detail load auto-fetched the BCA value (6,532,000 / 2026)',
+    r.data.assessed_value === 6532000 && r.data.assessed_year === 2026, JSON.stringify(r.data.assessed_value));
+  check('auto-refresh went through the by-id property page', stubHits.info.length > infoBefore);
+  const infoAfterFirst = stubHits.info.length;
+  r = await req('GET', `/api/properties/${pidAuto}`);
+  check('second load does not refetch (attempt gate)', stubHits.info.length === infoAfterFirst);
+
+  // A failed auto-refresh keeps the stored state and flags stale
+  // with the failing stage named.
+  stubInfoDown = true;
+  r = await req('POST', '/api/properties', {
+    address: '1200 Douglas St, Victoria, BC', mortgage_balance: 300000, purchase_date: '2018-01-01', bca_id: 'QkxPQy0xMjAw',
+  });
+  const pidFail = r.data.id;
+  r = await req('GET', `/api/properties/${pidFail}`);
+  check('failed auto-refresh leaves the value unset', r.data.assessed_value == null, JSON.stringify(r.data.assessed_value));
+  check('failed auto-refresh is flagged stale, stage named',
+    !!r.data.assessmentRefresh && r.data.assessmentRefresh.stale === true
+      && /property page/.test(r.data.assessmentRefresh.error || ''),
+    JSON.stringify(r.data.assessmentRefresh));
+  stubInfoDown = false;
+
+  // HouseSigma failures surface explicitly: a site outage fails the
+  // pull with a named stage; an address it does not know fails too.
+  hsMode = 'down';
+  r = await req('POST', '/api/properties', {
+    address: '2985 Christina Pl, Coquitlam, BC', mortgage_balance: 100000, purchase_date: '2024-01-01',
+  });
+  const pidDown = r.data.id;
+  r = await req('POST', `/api/properties/${pidDown}/pull-history`);
+  check('HouseSigma outage returns ok:false with an explicit stage',
+    r.data.ok === false && typeof r.data.stage === 'string' && r.data.stage.length > 0
+      && /HouseSigma lookup failed/.test(r.data.error || ''),
+    JSON.stringify(r.data));
+  hsMode = 'ok';
+  r = await req('POST', '/api/properties', {
+    address: '999 Nowhere Rd, Coquitlam, BC', mortgage_balance: 100000, purchase_date: '2024-01-01',
+  });
+  const pidNone = r.data.id;
+  r = await req('POST', `/api/properties/${pidNone}/pull-history`);
+  check('unknown address fails at the locate stage',
+    r.data.ok === false && r.data.stage === 'locate', JSON.stringify(r.data));
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
@@ -1191,6 +1400,7 @@ try {
   server.kill('SIGTERM');
   stub.close();
   primeStub.close();
+  hsStub.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 console.log(failures === 0 ? 'E2E: ALL PASS' : `E2E: ${failures} FAILURE(S)`);

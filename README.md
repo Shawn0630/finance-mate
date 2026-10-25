@@ -100,17 +100,32 @@ picture in Admin updates all of those places on the next load.
 
 ## Assessed value trend
 
-The property detail page charts the assessed value per year. Every
-successful BC Assessment fetch records that year's value automatically;
-earlier years can be added, edited and deleted by hand below the chart.
+The property detail page charts the assessed value per year. The app
+keeps it up to date by itself:
 
-**BC Assessment has no prior-year values to backfill from.** Investigated
-live (Oct 2026): the full attribute set of the GIS layer behind the
-property page contains only the current extract's `TOTAL_ASSESSED` /
-`TOTAL_LAND` / `TOTAL_BUILDING` (plus sale fields, which were empty), and
-the property page itself shows no previous-year values. So the trend
-starts with the year you first fetch and grows one point per year (or
-per manual entry) from there.
+- **Current year — BC Assessment, fetch-on-read.** When a property
+  detail or the portfolio is loaded, a property that carries a BC
+  Assessment id is re-fetched (through the by-id property-page + GIS
+  channel, not the address search) when it has never been fetched,
+  when its stored year is behind the current roll, or when the last
+  fetch is over 7 days old. Attempts are gated to one per property
+  per day; a failure keeps the stored value and the page flags it as
+  stale with the failing stage named.
+- **Earlier years — HouseSigma.** BC Assessment has no prior-year
+  values to backfill from (investigated live, Oct 2026: the GIS layer
+  behind the property page carries only the current extract's values,
+  and the page shows no history). The prior years are pulled from
+  HouseSigma's assessment tables, which are drawn from the same
+  public records — once in the background when a property is added,
+  and again whenever you press **Pull history from HouseSigma** on
+  the detail page. The HouseSigma ids are stored on the property so
+  later pulls skip the address lookup.
+
+Points keep the strongest source: a point you entered by hand is
+never overwritten, a BC Assessment point beats a HouseSigma point
+for the same year, and HouseSigma only fills missing years and
+refreshes its own points. Points can still be added, edited and
+deleted by hand below the chart.
 
 ## BC Assessment fetching
 
@@ -166,9 +181,11 @@ API refuses other values. A region implementation provides:
   `(1 + r/2)^(2/N) − 1`; the engine never hardcodes it)
 - the prime-rate source and fetch (Canada: Bank of Canada Valet)
 - the assessment provider (Canada: BC Assessment, via `src/bca.js`)
+- the assessment-history provider (Canada: HouseSigma, via
+  `src/housesigma.js`)
 
 To support a new region later (e.g. a US state), add one module
-implementing those three pieces and register it in
+implementing those pieces and register it in
 `src/regions/index.js` — no engine or API changes.
 
 ## Tests
@@ -186,6 +203,10 @@ node tests/screenshot.mjs   # screenshots to tests/.work-shot (server on :9200)
 - `src/regions/` — region interface + the Canada implementation
   (interest convention, prime source, assessment provider)
 - `src/prime.js` — prime-rate storage and refresh policy
+- `src/assessed.js` — assessed-value upkeep: BC Assessment
+  fetch-on-read, HouseSigma history pulls, import priority rules
 - `src/bca.js` — BC Assessment fetcher
+- `src/housesigma.js` — HouseSigma history fetcher (guest session +
+  the site's encrypted detail API, reverse-engineered Oct 2026)
 - `src/db.js` — SQLite schema and seed user
 - `public/` — frontend (plain JS, Chart.js vendored under `public/vendor/`)

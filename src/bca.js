@@ -48,7 +48,7 @@ function jarHeader(jar) {
 
 async function fetchWithJar(jar, url, opts = {}) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       redirect: 'follow',
@@ -136,11 +136,11 @@ function realSuggestions(list) {
   );
 }
 
-async function newSession() {
+async function newSession(timeoutMs) {
   const jar = newJar();
   let res;
   try {
-    res = await fetchWithJar(jar, `${BASE}/`);
+    res = await fetchWithJar(jar, `${BASE}/`, { timeoutMs });
   } catch (e) {
     throw stageError('connect', e.message);
   }
@@ -182,8 +182,12 @@ export async function suggestAddresses(query) {
   return [];
 }
 
-export async function fetchAssessment(address, direct) {
-  const jar = await newSession();
+// opts.timeoutMs caps each request (the fetch-on-read auto-refresh
+// passes a short one so a slow BC Assessment cannot stall page
+// loads; the manual Fetch button keeps the generous default).
+export async function fetchAssessment(address, direct, opts = {}) {
+  const timeoutMs = opts.timeoutMs || TIMEOUT_MS;
+  const jar = await newSession(timeoutMs);
 
   // 2. Address autocomplete, trying normalized variants in order. Skipped
   // when the caller already picked a suggestion (direct.id + direct.label):
@@ -197,7 +201,7 @@ export async function fetchAssessment(address, direct) {
         const res = await fetchWithJar(
           jar,
           `${BASE}/Property/Search/GetByAddress?addr=${encodeURIComponent(q)}`,
-          { accept: 'application/json' }
+          { accept: 'application/json', timeoutMs }
         );
         const found = realSuggestions(await readJson(res, 'address search'));
         if (found.length) { match = found[0]; break; }
@@ -217,7 +221,7 @@ export async function fetchAssessment(address, direct) {
   // 3. Property page -> GIS token + map service URL.
   let gistoken, mapserverUrl;
   try {
-    res = await fetchWithJar(jar, `${BASE}/Property/Info/${encodeURIComponent(match.value)}`);
+    res = await fetchWithJar(jar, `${BASE}/Property/Info/${encodeURIComponent(match.value)}`, { timeoutMs });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
     gistoken = (html.match(/gistoken\s*=\s*'([^']+)'/) || [])[1];
@@ -239,6 +243,7 @@ export async function fetchAssessment(address, direct) {
   let attrs;
   try {
     res = await fetchWithJar(jar, `${mapserverUrl}/0/query?${query}`, {
+      timeoutMs,
       accept: 'application/json',
       headers: { Referer: `${BASE}/Property/Info/${encodeURIComponent(match.value)}` },
     });

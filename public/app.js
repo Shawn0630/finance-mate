@@ -585,6 +585,9 @@ async function loadPortfolio() {
   if (t.paymentKnownCount < t.propertyCount) {
     notes.push(`Monthly payment counts ${t.paymentKnownCount} of ${t.propertyCount} properties — the rest have no payment on file and count as $0.`);
   }
+  if (portfolioData.assessmentRefresh && portfolioData.assessmentRefresh.staleIds.length) {
+    notes.push('One or more assessed values could not be refreshed from BC Assessment just now — showing the last known values.');
+  }
   $('#pfNotes').textContent = notes.join(' ');
   drawPortfolioPie();
   drawPortfolioChart();
@@ -836,6 +839,19 @@ async function loadPropertyDetail(id) {
       : p.assessed_source === 'manual'
         ? 'Source: entered manually. Use "Fetch from BC Assessment" to replace it with the official assessed value.'
         : 'No assessed value yet.';
+  // A failed auto-refresh leaves the stored value in place; say so
+  // quietly next to it rather than letting it look current.
+  if (p.assessmentRefresh && p.assessmentRefresh.stale) {
+    $('#assessmentMeta').textContent += ` The latest automatic check against BC Assessment failed (${p.assessmentRefresh.error || 'unknown error'}) — showing the last known value.`;
+  }
+  const hsNote = $('#hsPullNote');
+  if (hsNote) {
+    hsNote.textContent = p.houseSigma && p.houseSigma.attempted
+      ? (p.houseSigma.ok
+        ? `HouseSigma history: ${p.houseSigma.message || 'pulled'} (last checked ${new Date(p.houseSigma.at).toLocaleString('en-CA')}).`
+        : `HouseSigma history: the last pull failed — ${p.houseSigma.message || 'unknown error'}`)
+      : '';
+  }
   const mf = $('#mortgageForm');
   setMoneyValue(mf.mortgage_balance, p.mortgage_balance);
   mf.mortgage_balance_date.value = p.mortgage_balance_date || '';
@@ -1039,6 +1055,24 @@ $('#fetchBcaBtn').addEventListener('click', async () => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
+$('#pullHistoryBtn').addEventListener('click', async () => {
+  const msg = $('#detailMsg');
+  showMsg(msg, 'ok', 'Pulling assessment history from HouseSigma…');
+  try {
+    const r = await api(`/api/properties/${currentPropertyId}/pull-history`, { method: 'POST' });
+    if (r.ok) {
+      assetsLoaded = false;
+      showMsg(msg, 'ok', r.added.length
+        ? `Pulled from HouseSigma: added ${r.added.join(', ')} (${r.years.length} years on record there).`
+        : 'HouseSigma history is already up to date — no new years to add.');
+      loadPropertyDetail(currentPropertyId);
+      loadTrend(currentPropertyId);
+    } else {
+      showMsg(msg, 'err', `HouseSigma pull failed (${r.error}). Your saved points were not changed.`);
+    }
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
 $('#photoFile').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -1077,7 +1111,7 @@ async function loadTrend(id) {
   trendPoints = r.points;
   const rows = trendPoints.map((pt) => `<tr>
     <td>${pt.year}</td><td class="num">${money(pt.value)}</td>
-    <td>${pt.source === 'auto' ? '<span class="badge">BC Assessment</span>' : '<span class="badge manual">Manual</span>'}</td>
+    <td>${pt.source === 'auto' ? '<span class="badge">BC Assessment</span>' : pt.source === 'housesigma' ? '<span class="badge">HouseSigma</span>' : '<span class="badge manual">Manual</span>'}</td>
     <td>${esc(pt.notes || '')}</td>
     <td style="white-space:nowrap">
       <button class="small" onclick="editTrendPoint(${pt.id})">Edit</button>

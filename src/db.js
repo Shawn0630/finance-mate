@@ -86,15 +86,18 @@ CREATE TABLE IF NOT EXISTS other_assets (
   updated_at TEXT NOT NULL
 );
 -- Assessed-value history for the trend chart: one point per property per
--- assessment year. 'auto' points are written by BC Assessment fetches;
--- 'manual' points are entered by hand (BC Assessment's public data only
--- carries the current year, so earlier years can only come from here).
+-- assessment year. 'auto' points are written by BC Assessment fetches
+-- (current roll only — BC Assessment's public data has no prior years);
+-- 'housesigma' points come from HouseSigma history pulls (prior years);
+-- 'manual' points are entered by hand. A year keeps the strongest
+-- source: manual > auto (BC Assessment) > housesigma — imports never
+-- overwrite a stronger source's point.
 CREATE TABLE IF NOT EXISTS value_history (
   id INTEGER PRIMARY KEY,
   property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
   year INTEGER NOT NULL,
   value REAL NOT NULL,
-  source TEXT NOT NULL DEFAULT 'manual',   -- 'auto' | 'manual'
+  source TEXT NOT NULL DEFAULT 'manual',   -- 'auto' | 'manual' | 'housesigma'
   notes TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -138,6 +141,13 @@ if (!propCols.includes('region')) {
   // Region code (src/regions/): only 'CA' is implemented; the API
   // rejects anything else for now. Existing rows default to 'CA'.
   db.exec("ALTER TABLE properties ADD COLUMN region TEXT DEFAULT 'CA'");
+}
+if (!propCols.includes('hs_id_address')) {
+  // HouseSigma's ids for this property (its id_address / id_listing),
+  // stored on the first successful history pull so later pulls can
+  // skip the address locate step.
+  db.exec('ALTER TABLE properties ADD COLUMN hs_id_address TEXT');
+  db.exec('ALTER TABLE properties ADD COLUMN hs_id_listing TEXT');
 }
 // rate_segments: databases created before prime-spread pricing have
 // annual_rate NOT NULL and no rate_mode / spread columns. Prime

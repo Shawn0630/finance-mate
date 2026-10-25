@@ -11,9 +11,14 @@
 //   - assessment:  the property-assessment provider (BC Assessment,
 //                  via the existing bca.js — passed through, not
 //                  rewritten).
+//   - assessmentHistory: the prior-years provider. BC Assessment
+//                  publishes only the current roll, so the history
+//                  behind it comes from HouseSigma (its assessment
+//                  tables are drawn from the same public records).
 // A future region (e.g. a US state) implements the same shape with
 // its own conventions and providers.
 import { fetchAssessment, suggestAddresses } from '../bca.js';
+import { locateProperty, fetchHistory } from '../housesigma.js';
 
 export const code = 'CA';
 export const label = 'Canada';
@@ -62,4 +67,10 @@ export const assessment = {
   providerName: 'BC Assessment',
   suggestAddresses,
   fetchAssessment,
+};
+
+export const assessmentHistory = {
+  providerName: 'HouseSigma',
+  locateProperty,
+  fetchHistory,
 };

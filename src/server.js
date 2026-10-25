@@ -10,6 +10,10 @@ import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashP
 import { simulate, derivePayment, segmentForMonth, segmentAnnualRate, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { getRegion, REGION_CODES } from './regions/index.js';
 import { getCurrentPrime, ensureFreshPrime, refreshPrime, primeInfo, primeStatus } from './prime.js';
+import {
+  applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
+  runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
+} from './assessed.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -392,7 +396,13 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       nowIso(),
       nowIso()
     );
-  res.status(201).json(propertyView(getProperty(info.lastInsertRowid)));
+  const created = getProperty(info.lastInsertRowid);
+  // Best-effort HouseSigma history pull in the background: earlier
+  // assessment years appear on the property by themselves; a failure
+  // is recorded on the property (detail page shows it) and never
+  // blocks or fails the add.
+  pullHouseSigmaHistoryInBackground(created.id);
+  res.status(201).json(propertyView(created));
 });
 
 // ------------------------------------------------------------- portfolio --
@@ -410,6 +420,12 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
   await ensureFreshPrime();
   const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
   const today = new Date().toISOString().slice(0, 10);
+  const allProps = db.prepare('SELECT * FROM properties ORDER BY id').all();
+  // Fetch-on-read for assessed values too (BC Assessment by-id
+  // channel): properties whose stored roll is stale refresh inline
+  // before the aggregates are computed; failures keep the stored
+  // values and are reported in assessmentRefresh below.
+  await Promise.all(allProps.map((p) => ensureFreshAssessment(p)));
   const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
 
   const prime = getCurrentPrime();
@@ -541,6 +557,9 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     assessedByYear,
     outstandingByMonth,
     prime: primeStatus(),
+    assessmentRefresh: {
+      staleIds: props.filter((p) => bcaRefreshStatus(p).stale).map((p) => p.id),
+    },
   });
 });
 
@@ -548,7 +567,17 @@ app.get('/api/properties/:id', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
   await ensureFreshPrime();
-  res.json({ ...propertyView(p), prime: primeStatus() });
+  // Fetch-on-read: refresh the assessed value from BC Assessment
+  // (by-id channel) when it is due; a failed refresh keeps the
+  // stored value and is flagged in assessmentRefresh.
+  await ensureFreshAssessment(p);
+  const fresh = getProperty(p.id);
+  res.json({
+    ...propertyView(fresh),
+    prime: primeStatus(),
+    assessmentRefresh: bcaRefreshStatus(fresh),
+    houseSigma: houseSigmaPullStatus(p.id),
+  });
 });
 
 app.put('/api/properties/:id', requireApiAuth, (req, res) => {
@@ -636,6 +665,11 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     next.amortization_years, next.notes, JSON.stringify(next.owners), next.purchase_date,
     next.payment_day, next.payment_frequency, next.region, nowIso(), p.id
   );
+  // A changed address invalidates the stored HouseSigma location:
+  // clear its ids so the next history pull locates the new address.
+  if (next.address !== p.address) {
+    db.prepare('UPDATE properties SET hs_id_address = NULL, hs_id_listing = NULL WHERE id = ?').run(p.id);
+  }
   res.json(propertyView(getProperty(p.id)));
 });
 
@@ -659,28 +693,27 @@ app.post('/api/properties/:id/fetch-bca', requireApiAuth, async (req, res) => {
     // instead of running the fuzzy address search again.
     const direct = p.bca_id ? { id: p.bca_id, label: p.bca_matched_address || p.address } : undefined;
     const r = await assessmentFor(p.region).fetchAssessment(p.address, direct);
-    db.prepare(
-      `UPDATE properties SET assessed_value=?, assessed_year=?, land_value=?, building_value=?,
-         assessed_source='auto', assessed_fetched_at=?, bca_matched_address=?, bca_extract_date=?,
-         updated_at=? WHERE id=?`
-    ).run(
-      r.assessedValue, r.assessedYear, r.landValue, r.buildingValue,
-      nowIso(), r.matchedAddress, r.extractDate, nowIso(), p.id
-    );
-    // Record this year's point on the value-trend history (one row per
-    // year; a re-fetch refreshes that year's auto point in place).
-    if (r.assessedValue != null && r.assessedYear) {
-      db.prepare(
-        `INSERT INTO value_history (property_id, year, value, source, created_at, updated_at)
-         VALUES (?, ?, ?, 'auto', ?, ?)
-         ON CONFLICT(property_id, year) DO UPDATE SET
-           value = excluded.value, source = 'auto', updated_at = excluded.updated_at`
-      ).run(p.id, r.assessedYear, r.assessedValue, nowIso(), nowIso());
-    }
+    // Record this year's point on the value-trend history too (one
+    // row per year; a re-fetch refreshes that year's auto point).
+    applyBcaFetchResult(p.id, r);
+    noteBcaAttempt(p.id, true, null);
     res.json({ ok: true, result: r, property: propertyView(getProperty(p.id)) });
   } catch (e) {
+    noteBcaAttempt(p.id, false, e.message);
     res.json({ ok: false, stage: e.stage || 'unknown', error: e.message });
   }
+});
+
+// Pull the assessed-value HISTORY (prior years) from HouseSigma:
+// BC Assessment publishes only the current roll, so earlier years
+// come from there. Imported points never overwrite manual or BC
+// Assessment points (see importHistoryPoints in assessed.js).
+app.post('/api/properties/:id/pull-history', requireApiAuth, async (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const r = await runHouseSigmaPull(p);
+  if (!r.ok) return res.json(r);
+  res.json({ ...r, property: propertyView(getProperty(p.id)), history: historyView(p.id) });
 });
 
 // Photo upload as base64 JSON (keeps us dependency-free; ~12 MB body limit).
@@ -722,7 +755,8 @@ app.get('/avatars/:name', (req, res) => {
 // --------------------------------------------------------- value history ---
 // Assessed-value trend points, one per assessment year. Auto points come
 // from BC Assessment fetches (current year only — the public GIS data has
-// no prior-year fields); manual points fill in earlier years.
+// no prior-year fields); HouseSigma pulls fill in the earlier years;
+// manual points are entered by hand and outrank both.
 function historyPoints(propertyId) {
   return db.prepare('SELECT * FROM value_history WHERE property_id = ? ORDER BY year').all(propertyId);
 }
