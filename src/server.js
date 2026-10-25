@@ -375,6 +375,14 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   if (!isDateStr(b.purchase_date)) {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
   }
+  // A supplied remaining amortization must sit in the field's 1–35
+  // year range (the usual Canadian maximums are 25 insured / 30
+  // uninsured — those earn a UI hint, not a rejection; outside 1–35
+  // is a data error).
+  const amortYears = num(b.amortization_years);
+  if (amortYears !== null && (amortYears < 1 || amortYears > 35)) {
+    return res.status(400).json({ error: 'remaining amortization must be between 1 and 35 years' });
+  }
   // Region: only Canada is implemented for now (src/regions/); the
   // column exists so properties are ready when that changes.
   if (b.region !== undefined && b.region !== null && b.region !== ''
@@ -387,9 +395,9 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   const info = db
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
-         mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
+         mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years, lender,
          notes, bca_id, bca_matched_address, owners, purchase_date, region, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       String(b.address).trim(),
@@ -399,7 +407,8 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       balance,
       b.mortgage_balance_date || new Date().toISOString().slice(0, 10),
       num(b.mortgage_payment),
-      num(b.amortization_years),
+      amortYears,
+      b.lender ? String(b.lender).trim() || null : null,
       b.notes || null,
       bcaId,
       // The picked suggestion's label is the submitted address text
@@ -634,6 +643,8 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     mortgage_balance_date: b.mortgage_balance_date !== undefined ? b.mortgage_balance_date || null : p.mortgage_balance_date,
     mortgage_payment: b.mortgage_payment !== undefined ? num(b.mortgage_payment) : p.mortgage_payment,
     amortization_years: b.amortization_years !== undefined ? num(b.amortization_years) : p.amortization_years,
+    // The mortgage lender (bank): free text, trimmed; empty clears it.
+    lender: b.lender !== undefined ? (String(b.lender).trim() || null) : p.lender,
     notes: b.notes !== undefined ? b.notes || null : p.notes,
     owners: parseOwners(p.owners),
     // Purchase date can be changed any time on the detail page (the Add
@@ -653,6 +664,12 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
   if (b.region) next.region = String(b.region).toUpperCase();
   if (b.purchase_date !== undefined && b.purchase_date && !isDateStr(b.purchase_date)) {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
+  }
+  if (b.amortization_years !== undefined) {
+    const ay = num(b.amortization_years);
+    if (ay !== null && (ay < 1 || ay > 35)) {
+      return res.status(400).json({ error: 'remaining amortization must be between 1 and 35 years' });
+    }
   }
   if (b.payment_day !== undefined) {
     if (b.payment_day === null || b.payment_day === '') {
@@ -687,13 +704,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
   db.prepare(
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
-       mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
+       mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, lender=?, notes=?,
        owners=?, purchase_date=?, payment_day=?, payment_frequency=?, region=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
-    next.amortization_years, next.notes, JSON.stringify(next.owners), next.purchase_date,
+    next.amortization_years, next.lender, next.notes, JSON.stringify(next.owners), next.purchase_date,
     next.payment_day, next.payment_frequency, next.region, nowIso(), p.id
   );
   // A changed address invalidates the stored HouseSigma location:

@@ -542,7 +542,7 @@ $('#addPropForm').addEventListener('submit', async (e) => {
 // ---------------------------------------------------------- property detail ---
 // --------------------------------------------------------------- portfolio --
 // Cross-property block on the Properties section: totals, a share
-// pie, and a combined chart (assessed history line + total
+// pie, and a combined chart (assessed history points + total
 // outstanding line + stacked per-property outstanding bars), all
 // from GET /api/properties/portfolio — the server aggregates, the
 // page only renders.
@@ -701,11 +701,11 @@ function drawPortfolioChart() {
   const rows = pfRangeRows();
   const datasets = [];
   // Same look-back window as the detail page (All = every year on
-  // record). The portfolio line is a carry-forward total, so inside
-  // a look-back window the latest pre-window total is carried in at
-  // the left edge and the last shown total is carried forward to
-  // today: the line spans the whole window instead of starting late
-  // or stopping at the last assessment year.
+  // record). The portfolio points are a carry-forward total, so inside
+  // a look-back window the latest pre-window total is carried in as a
+  // point at the left edge and the last shown total is carried forward
+  // to a point at today: the points span the whole window instead of
+  // starting late or stopping at the last assessment year.
   const assessedAll = [...(portfolioData.assessedByYear || [])].sort((a, b) => a.year - b.year);
   const assessedShown = lookbackHistory(assessedAll, pfRangeMonths);
   let assessedData = assessedShown.map((y) => ({ x: y.year, y: y.total }));
@@ -726,11 +726,11 @@ function drawPortfolioChart() {
       label: 'Assessed value (all properties)',
       data: assessedData,
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      // Assessed values are yearly steps, not a continuous quantity:
-      // a roll year's value holds flat all year and jumps at the next
-      // roll. A smoothed curve would invent a year-long slide between
-      // the two Januaries, so this line is stepped with no tension.
-      stepped: 'before', tension: 0, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
+      // Points only — no connecting line. An assessed value is one
+      // number per assessment year, not a continuous quantity: any
+      // line between the years (smoothed or stepped) would invent
+      // the months in between.
+      showLine: false, pointRadius: 5, pointHoverRadius: 7,
     });
   }
   if (rows.length) {
@@ -769,8 +769,8 @@ function drawPortfolioChart() {
       responsive: true, maintainAspectRatio: false,
       // Hover one time point: every monthly series shares the same x
       // values, so 'index' groups them; the filter keeps only items
-      // at that exact x (the yearly assessed line joins in January,
-      // where its point lands on the same x) and drops not-yet-started
+      // at that exact x (the yearly assessed points land in January,
+      // where a point can share the same x) and drops not-yet-started
       // properties. Default Chart.js transitions animate the rest —
       // point hover radii, tooltip follow, range-switch redraws.
       interaction: { mode: 'index', intersect: false },
@@ -813,7 +813,7 @@ $('#pfPieOutstandingBtn').addEventListener('click', () => { pfPieMetric = 'outst
 $('#pfPieAssessedBtn').addEventListener('click', () => { pfPieMetric = 'assessed'; drawPortfolioPie(); });
 
 let chartA = null; // combined chart: assessed value vs outstanding principal
-let chartB = null; // monthly chart: interest vs payment
+let chartB = null; // monthly chart: interest vs principal portions
 let fullSeries = [];
 let chartMeta = null;
 let amortError = null; // last non-ok amortization response ({ error, code })
@@ -929,6 +929,9 @@ function renderPropView(p) {
     ['Assessment year', p.assessed_year ?? '—'],
     ['Purchase date', p.purchase_date || '—'],
   ];
+  // The lender (bank) is a mortgage fact; it joins the read-only
+  // metadata only when one is on file.
+  if (p.lender) rows.push(['Lender', p.lender]);
   $('#propViewBody').innerHTML = rows.map(([k, v, raw]) => `<tr><td>${k}</td><td>${raw ? v : esc(v)}</td></tr>`).join('');
 }
 
@@ -1007,6 +1010,9 @@ async function loadPropertyDetail(id) {
   mf.mortgage_balance_date.value = p.mortgage_balance_date || '';
   setMoneyValue(mf.mortgage_payment, p.mortgage_payment);
   mf.amortization_years.value = p.amortization_years ?? '';
+  mf.lender.value = p.lender || '';
+  $('#mortgageLenderTag').textContent = p.lender ? `— ${p.lender}` : '';
+  syncAmortWarning();
   renderSegments(p.segments);
   loadPrime();
   loadChart(id);
@@ -1061,6 +1067,14 @@ $('#mortgageForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
   parseMoneyFields(f, ['mortgage_balance', 'mortgage_payment']);
+  // The amortization field takes 1–35 years (the server enforces the
+  // same range); the usual Canadian maximums only earn the hint
+  // below, they do not block.
+  const ay = f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years);
+  if (ay !== null && (!Number.isFinite(ay) || ay < 1 || ay > 35)) {
+    showMsg($('#detailMsg'), 'err', 'Remaining amortization must be between 1 and 35 years.');
+    return;
+  }
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
     markAssetsDirty();
@@ -1068,6 +1082,32 @@ $('#mortgageForm').addEventListener('submit', async (e) => {
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });
+
+// Amortization quick picks (25 / 30 — the two Canadian maximums) fill
+// the field. Going past the usual maximums shows a note, not a block:
+// insured mortgages are generally capped at 25 years (30 for
+// first-time buyers and newly built homes since Dec 15, 2024) and
+// uninsured at 30; the field itself accepts 1–35 for planning.
+function syncAmortWarning() {
+  const form = $('#mortgageForm');
+  const warn = $('#amortWarn');
+  if (!form || !warn) return;
+  const raw = form.amortization_years.value;
+  const v = Number(raw);
+  if (raw !== '' && Number.isFinite(v) && v > 30) {
+    warn.textContent = 'That is longer than the usual Canadian maximums (25 years insured — 30 for first-time buyers and newly built homes since Dec 15, 2024 — and 30 years uninsured). It will still be saved, for planning.';
+    warn.classList.remove('hidden');
+  } else {
+    warn.textContent = '';
+    warn.classList.add('hidden');
+  }
+}
+$('#mortgageForm').amortization_years.addEventListener('input', syncAmortWarning);
+document.querySelectorAll('#mortgageForm [data-amort-years]').forEach((b) => b.addEventListener('click', () => {
+  const input = $('#mortgageForm').amortization_years;
+  input.value = b.dataset.amortYears;
+  syncAmortWarning();
+}));
 
 // ---- Prime rate (Bank of Canada, tracked by the server) ----------
 // The banner states the current prime with its real as-of date and
@@ -1235,7 +1275,7 @@ $('#deletePropertyBtn').addEventListener('click', async () => {
 // ------------------------------------------------------------ value trend ---
 // Assessed-value history: one point per year. Auto points are written by
 // BC Assessment fetches; manual points fill earlier years by hand. The
-// points are drawn as the assessed-value line of the combined chart (A);
+// points are drawn as the assessed-value points of the combined chart (A);
 // the table below it stays the editor for the points.
 let trendPoints = [];
 let trendEditingId = null;
@@ -1334,9 +1374,10 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 // Two charts, both driven by the same data:
 //   A (combined): assessed value (yearly history points) vs outstanding
 //     balance (monthly projection) on ONE axis — the gap is the equity.
-//     The assessed line stops at the last known year; it is deliberately
+//     The assessed points stop at the last known year; they are deliberately
 //     NOT extended into the future (no invented forecast).
-//   B (monthly): monthly interest vs monthly payment (both monthly flows).
+//   B (monthly): each month's payment split into its interest portion
+//     and principal portion (stacked — the two sum to the payment).
 // The projection only ever comes from the user's own rate plan (segments);
 // with no plan the API reports NO_RATE_PLAN and chart B stays empty with
 // a prompt instead of a made-up line.
@@ -1493,9 +1534,21 @@ function renderEquity() {
   }
 }
 
+// When the monthly payment was derived from the remaining
+// amortization (no payment entered), the Mortgage panel says so and
+// names the amount — the figure the projection is actually using.
+function renderDerivedPaymentNote() {
+  const el = $('#derivedPaymentNote');
+  if (!el) return;
+  el.textContent = chartMeta && chartMeta.paymentSource === 'derived'
+    ? `Monthly payment derived from the remaining amortization: ${money(chartMeta.paymentUsed)} per month — the projection uses this amount until you enter a monthly payment yourself.`
+    : '';
+}
+
 function renderDetailCharts() {
   renderEquity();
   renderTrendSummary(); // the summary follows the chart's current window
+  renderDerivedPaymentNote();
   drawCombinedChart();
   drawMonthlyChart();
 }
@@ -1506,7 +1559,7 @@ function drawCombinedChart() {
   if (chartA) { chartA.destroy(); chartA = null; }
   window.__fmCharts.a = null;
   // When the projection cannot be computed, say so right at this
-  // chart (the assessed line still draws) instead of leaving a
+  // chart (the assessed points still draw) instead of leaving a
   // silently missing blue line. Chart B shows the same state above
   // its own canvas.
   const cmsg = $('#combinedMsg');
@@ -1529,17 +1582,18 @@ function drawCombinedChart() {
   let projLastX = null;
   if (trendPoints.length) {
     // Assessed points inside the look-back window (All = every year
-    // on record). The line still stops at the last known year — it
-    // is not extended toward today (see the charts header comment).
+    // on record). The points still stop at the last known year — they
+    // are not extended toward today (see the charts header comment).
     const shown = lookbackHistory(trendPoints, months);
     shownYears.push(...shown.map((pt) => pt.year).sort((a, b) => a - b));
     datasets.push({
       label: 'Assessed value',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      // Stepped, like the portfolio line: the year's value holds flat
-      // until the next assessment year — never a smoothed slide.
-      stepped: 'before', tension: 0, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
+      // Points only — no connecting line, like the portfolio chart:
+      // one value per assessment year, and any line (smoothed or
+      // stepped) would invent the months in between.
+      showLine: false, pointRadius: 5, pointHoverRadius: 7,
     });
   }
   if (chartMeta && fullSeries.length) {
@@ -1610,50 +1664,57 @@ function drawMonthlyChart() {
   const months = currentRangeMonths();
   const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
   if (!rows.length) return;
-  const totalInterest = rows.reduce((s, r) => s + r.interest, 0);
   const srcNote = chartMeta.paymentSource === 'derived' ? 'derived from remaining amortization' : 'entered';
   const payBit = !chartMeta.frequency || chartMeta.frequency === 'monthly'
     ? `Monthly payment used: ${money(chartMeta.paymentUsed)} (${srcNote})`
     : `Payments: ${chartMeta.frequencyLabel} — ${money(chartMeta.periodPayment)} per payment, converted from a monthly payment of ${money(chartMeta.paymentUsed)} (${srcNote})`;
   const bits = [
     payBit,
-    `Interest in this range: ${money(totalInterest)}`,
+    `Projected total interest: ${money(chartMeta.totalInterest)}`,
+    `Total principal: ${money(chartMeta.balance)}`,
     chartMeta.payoffMonth ? `Projected payoff: ${chartMeta.payoffMonth}` : 'Not paid off within the projection window',
   ];
   summaryEl.textContent = bits.join(' · ');
   if (chartMeta.negativeAmortization) {
     showMsg(msg, 'warn', 'Warning: the monthly payment is below the monthly interest in some months (negative amortization) — the balance grows there.');
   }
+  // Each month's payment split in two: the interest portion and the
+  // principal portion, stacked — the bar's full height is the payment
+  // itself, so the two portions always sum to what was paid. The
+  // series is sampled monthly, so for the day-stepped frequencies a
+  // bar is the month's totals across all its payments.
   chartB = new Chart(ctx, {
-    type: 'line',
+    type: 'bar',
     data: {
       labels: rows.map((r) => r.date || r.month),
       datasets: [
         {
-          label: 'Monthly interest',
+          label: 'Interest portion',
           data: rows.map((r) => r.interest),
-          borderColor: '#d97706', backgroundColor: '#d97706',
-          tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
+          backgroundColor: '#d97706', borderColor: '#d97706',
+          stack: 'payment', borderWidth: 1,
         },
         {
-          // The series is sampled monthly, so for the day-stepped
-          // frequencies this line is the month's total paid, not the
-          // per-payment amount (that is in the summary line above).
-          label: !chartMeta.frequency || chartMeta.frequency === 'monthly'
-            ? `Monthly payment (${chartMeta.paymentSource === 'derived' ? 'derived from amortization' : 'entered'})`
-            : 'Paid per month (all payments in the month)',
-          data: rows.map((r) => r.payment),
-          borderColor: '#7c3aed', backgroundColor: '#7c3aed',
-          tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
+          label: 'Principal portion',
+          data: rows.map((r) => r.principal),
+          backgroundColor: '#2e7d4f', borderColor: '#2e7d4f',
+          stack: 'payment', borderWidth: 1,
         },
       ],
     },
     options: {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            footer: (items) => `Total payment: ${money(items.reduce((s, i) => s + (i.parsed.y || 0), 0))}`,
+          },
+        },
+      },
       scales: {
-        y: { ticks: { callback: moneyTick }, title: { display: true, text: 'Monthly amount ($)' } },
-        x: { ticks: { maxTicksLimit: 12 } },
+        x: { stacked: true, ticks: { maxTicksLimit: 12 } },
+        y: { stacked: true, ticks: { callback: moneyTick }, title: { display: true, text: 'Monthly amount ($)' } },
       },
     },
   });

@@ -156,6 +156,19 @@ payment is derived from the remaining amortization years. If the payment is
 below the monthly interest, the chart area shows a negative-amortization
 warning and the balance grows accordingly.
 
+The remaining amortization is entered in the Mortgage panel (25 / 30
+quick picks for the usual Canadian maximums — insured mortgages are
+generally capped at 25 years, 30 for first-time buyers and newly built
+homes since Dec 15, 2024, and uninsured mortgages at 30; the field
+accepts 1–35 for planning, flagging anything past 30). When the payment
+is derived, the panel names the derived amount. The monthly chart shows
+each payment split into its interest portion and principal portion
+(stacked; the two sum to the payment) with the projected total
+interest, total principal and payoff month beside it. The Mortgage
+panel also records the lender (bank) — free text with the big Canadian
+banks as suggestions; it shows in the panel heading and in the
+Property & assessment metadata once set.
+
 Variable segments can be priced two ways: as an absolute rate, or
 relative to prime ("Prime + spread", e.g. Prime − 1). The app tracks
 the Bank of Canada prime lending rate itself (Valet series

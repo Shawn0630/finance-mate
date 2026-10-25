@@ -42,6 +42,12 @@ test('derivePayment: $300k at 5% over 25 years = $1,744.81', () => {
   assert.ok(close(derivePayment(120000, 0, 10), 1000, 0.001));
 });
 
+test('derivePayment: $1.35M at prime-1 (3.95%) over 30 years = $6,381.36', () => {
+  // The user's shape: a 30-year remaining amortization turns the
+  // balance + rate plan into the payment the projection then uses.
+  assert.ok(close(derivePayment(1350000, 3.95, 30), 6381.36, 0.5), derivePayment(1350000, 3.95, 30));
+});
+
 test('simulate: pays off and stops at zero with an exact final payment', () => {
   const r = simulate({
     balance: 1000,

@@ -145,7 +145,7 @@ try {
     && info.chartA[0].label === 'Assessed value' && info.chartA[1].label === 'Outstanding principal'
     && info.chartA[0].color !== info.chartA[1].color;
   const bOk = info.chartB && info.chartB.length === 2
-    && info.chartB[0].label === 'Monthly interest' && info.chartB[1].label.startsWith('Monthly payment')
+    && info.chartB[0].label === 'Interest portion' && info.chartB[1].label === 'Principal portion'
     && info.chartB[0].color !== info.chartB[1].color;
   console.log(`equity $250,000 shown: ${equityOk} | chart A two-tone: ${aOk} | chart B two-tone: ${bOk}`);
 

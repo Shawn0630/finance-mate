@@ -865,6 +865,57 @@ try {
     JSON.stringify({ state: rowS && rowS.projState, interest: amortState2.totalInterest }));
   await req('DELETE', `/api/properties/${pidState}`);
 
+  // -------------------------------- lender + amortization-year range --
+  // The lender is a plain mortgage fact: it round-trips through the
+  // property PUT/GET and stays null until the user names their bank —
+  // the app never invents one.
+  r = await req('POST', '/api/properties', {
+    address: '77 Lender Test Road, Victoria, BC',
+    mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25',
+    purchase_date: '2024-12-17',
+  });
+  const pidLender = r.data.id;
+  check('lender starts unset (never invented)', (r.data.lender ?? null) === null, JSON.stringify(r.data.lender));
+  r = await req('PUT', `/api/properties/${pidLender}`, { lender: '  Scotiabank  ' });
+  check('lender saves trimmed', r.status === 200 && r.data.lender === 'Scotiabank', JSON.stringify(r.data.lender));
+  r = await req('GET', `/api/properties/${pidLender}`);
+  check('lender round-trips on the property', r.data.lender === 'Scotiabank', JSON.stringify(r.data.lender));
+  r = await req('PUT', `/api/properties/${pidLender}`, { amortization_years: 36 });
+  check('amortization above 35 years is rejected',
+    r.status === 400 && String(r.data.error || '').includes('between 1 and 35'), JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${pidLender}`, { amortization_years: 0.5 });
+  check('amortization below 1 year is rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${pidLender}`, { amortization_years: 35 });
+  check('amortization of 35 years is accepted (the range edge)',
+    r.status === 200 && r.data.amortization_years === 35, JSON.stringify(r.data.amortization_years));
+  await req('DELETE', `/api/properties/${pidLender}`);
+
+  // Amortization ALONE (no monthly payment) must project: the states
+  // fixture above proved a payment flips no_payment -> projected;
+  // here the remaining years do it, the payment being derived from
+  // the balance, the segment rate (stub prime 4.95 - 1 = 3.95%) and
+  // the 30 years — the same hand-computed anchor as the unit tests.
+  r = await req('POST', '/api/properties', {
+    address: '78 Amort Only Road, Victoria, BC',
+    mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25',
+    purchase_date: '2024-12-17',
+  });
+  const pidAmortOnly = r.data.id;
+  await req('POST', `/api/properties/${pidAmortOnly}/rates`, {
+    start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+  });
+  await req('PUT', `/api/properties/${pidAmortOnly}`, { amortization_years: 30 });
+  const amortOnly = (await req('GET', `/api/properties/${pidAmortOnly}/amortization`)).data;
+  check('amortization alone projects with a derived payment of $6,381.36',
+    amortOnly.ok === true && amortOnly.paymentSource === 'derived'
+      && Math.abs(amortOnly.paymentUsed - 6381.36) < 0.5,
+    JSON.stringify({ ok: amortOnly.ok, src: amortOnly.paymentSource, used: amortOnly.paymentUsed }));
+  const portAmort = (await req('GET', '/api/properties/portfolio')).data;
+  const rowAmort = portAmort.properties.find((x) => x.id === pidAmortOnly);
+  check('amortization alone flips the portfolio state to projected',
+    !!rowAmort && rowAmort.projState === 'projected', JSON.stringify(rowAmort && rowAmort.projState));
+  await req('DELETE', `/api/properties/${pidAmortOnly}`);
+
   // ------------------------------------------------------------ prime ---
   r = await req('GET', '/api/prime');
   check('fetch-on-read stored the stub prime with its as-of date',
@@ -1383,10 +1434,10 @@ try {
 
       // The user's real shape: five assessed years (2022-2026) and
       // one variable prime-spread segment, but NO monthly payment and
-      // NO amortization. The assessed line must render as year steps
-      // (a smoothed curve would smear the 2025 value down across the
-      // whole year toward 2026), the missing projection must be
-      // announced beside the chart, and after an edit on this page
+      // NO amortization. The assessed values must render as points
+      // only — any connecting line (smoothed or stepped) invents the
+      // months between assessment years — the missing projection must
+      // be announced beside the chart, and after an edit on this page
       // the portfolio must show fresh numbers without a reload.
       r = await req('POST', '/api/properties', {
         address: '966 Step Test Place, Victoria, BC',
@@ -1404,26 +1455,30 @@ try {
       await wait(1600);
       const stepCfg = await page.evaluate(() => {
         const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Assessed value');
-        return ds ? { stepped: ds.stepped, tension: ds.tension } : null;
+        return ds ? { showLine: ds.showLine, pts: ds.data } : null;
       });
-      check('detail assessed line is stepped with zero tension',
-        !!stepCfg && stepCfg.stepped === 'before' && stepCfg.tension === 0, JSON.stringify(stepCfg));
+      check('detail assessed values are points only (no connecting line)',
+        !!stepCfg && stepCfg.showLine === false, JSON.stringify(stepCfg && stepCfg.showLine));
+      check('detail assessed points are the five recorded years at their values',
+        !!stepCfg && stepCfg.pts.length === 5
+          && stepCfg.pts.every((p) => stepVals[p.x] === p.y),
+        JSON.stringify(stepCfg && stepCfg.pts));
       const combMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('detail chart A announces the missing payment beside the chart (NO_PAYMENT)',
         combMsg.includes('add a monthly payment or remaining amortization'), combMsg);
-      // Pixel-level proof of the step: scan the canvas column at
-      // mid-2025 (x = 2025.5, inside the chart area only, so neither
-      // the legend swatch nor the year-point markers can interfere)
-      // for the assessed line's green; the value found there must be
-      // the 2025 value itself — a smoothed curve would read roughly
-      // halfway down toward 2026 (~1,966,500).
-      const scanStep = await page.evaluate(() => {
+      // Pixel-level proof of points-only rendering: the canvas
+      // column at x = 2025 (inside the chart area only, so the legend
+      // swatch cannot interfere) must carry the 2025 marker at the
+      // 2025 value, and the column at mid-2025 (x = 2025.5) must be
+      // EMPTY of the assessed green — a connecting line (smoothed or
+      // stepped) would paint straight through it.
+      const scanAt = (xVal) => page.evaluate((xv) => {
         const c = window.__fmCharts.a;
         if (!c) return null;
         c.update('none');
         const canvas = c.canvas;
         const dpr = canvas.width / c.width;
-        const xPix = Math.min(canvas.width - 1, Math.max(0, Math.round(c.scales.x.getPixelForValue(2025.5) * dpr)));
+        const xPix = Math.min(canvas.width - 1, Math.max(0, Math.round(c.scales.x.getPixelForValue(xv) * dpr)));
         const top = Math.floor(c.chartArea.top * dpr);
         const bottom = Math.min(canvas.height, Math.ceil(c.chartArea.bottom * dpr));
         const img = canvas.getContext('2d').getImageData(xPix, top, 1, bottom - top).data;
@@ -1432,11 +1487,14 @@ try {
           const o = (y - top) * 4;
           if (img[o + 3] > 200 && Math.abs(img[o] - 46) < 30 && Math.abs(img[o + 1] - 125) < 30 && Math.abs(img[o + 2] - 79) < 30) ys.push(y);
         }
-        if (!ys.length) return null;
-        return { value: c.scales.y.getValueForPixel(ys[Math.floor(ys.length / 2)] / dpr), hits: ys.length };
-      });
-      check('detail assessed line holds the 2025 value at mid-2025 (step, no interpolated slide)',
-        !!scanStep && Math.abs(scanStep.value - 2002000) < 10000, JSON.stringify(scanStep));
+        return { hits: ys.length, value: ys.length ? c.scales.y.getValueForPixel(ys[Math.floor(ys.length / 2)] / dpr) : null };
+      }, xVal);
+      const scanPt = await scanAt(2025);
+      check('detail assessed marker sits at the 2025 value (2,002,000)',
+        !!scanPt && scanPt.hits > 0 && Math.abs(scanPt.value - 2002000) < 10000, JSON.stringify(scanPt));
+      const scanGap = await scanAt(2025.5);
+      check('no assessed line connects the points (the mid-2025 column is empty)',
+        !!scanGap && scanGap.hits === 0, JSON.stringify(scanGap));
 
       // Edit a value point through THIS page's own form (the trend
       // form used to leave the assets cache untouched), then go back
@@ -1460,13 +1518,97 @@ try {
       const pfIntNote = await page.evaluate(() => document.querySelector('#pfInterestNote').textContent);
       check('portfolio interest note no longer hides the gap behind "with a rate plan"',
         !pfIntNote.includes('with a rate plan') && pfIntNote.includes('based on'), pfIntNote);
-      const pfStepCfg = await page.evaluate(() => {
+      const pfPtsCfg = await page.evaluate(() => {
         const c = window.__fmCharts.portfolio;
         const ds = c ? c.data.datasets.find((d) => d.label === 'Assessed value (all properties)') : null;
-        return ds ? { stepped: ds.stepped, tension: ds.tension } : null;
+        return ds ? { showLine: ds.showLine, n: ds.data.length } : null;
       });
-      check('portfolio assessed line is stepped with zero tension',
-        !!pfStepCfg && pfStepCfg.stepped === 'before' && pfStepCfg.tension === 0, JSON.stringify(pfStepCfg));
+      check('portfolio assessed values are points only (no connecting line)',
+        !!pfPtsCfg && pfPtsCfg.showLine === false && pfPtsCfg.n >= 5, JSON.stringify(pfPtsCfg));
+
+      // ---- Amortization years in the Mortgage panel derive the payment ----
+      // The user's exact shape again (balance + one prime-spread
+      // segment, nothing else), driven through the UI this time:
+      // typing ONLY the remaining amortization (30) and a lender into
+      // the Mortgage form must flip the page from NO_PAYMENT to a
+      // full projection — the panel names the derived payment, Chart
+      // B splits every month into interest + principal portions that
+      // sum to that month's payment, and the summary totals agree
+      // with the amortization endpoint.
+      r = await req('POST', '/api/properties', {
+        address: '123 Amort Test Way, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
+      });
+      const amortPid = r.data.id;
+      await req('POST', `/api/properties/${amortPid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+      });
+      await page.goto(`http://ff.local/#property/${amortPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const beforeMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
+      check('amortization UI fixture starts unprojected (NO_PAYMENT)',
+        beforeMsg.includes('add a monthly payment or remaining amortization'), beforeMsg);
+      await focusField('#mortgageForm [name=amortization_years]');
+      await page.keyboard.type('30');
+      await focusField('#mortgageForm [name=lender]');
+      await page.keyboard.type('Scotiabank');
+      await page.evaluate(() => document.querySelector('#mortgageForm [type=submit]').click());
+      await wait(2000);
+      const amortApi = (await req('GET', `/api/properties/${amortPid}/amortization`)).data;
+      check('endpoint derives the payment from the UI-entered amortization (3.95%, 30y)',
+        amortApi.ok === true && amortApi.paymentSource === 'derived'
+          && Math.abs(amortApi.paymentUsed - 6381.36) < 0.5,
+        JSON.stringify({ ok: amortApi.ok, src: amortApi.paymentSource, used: amortApi.paymentUsed }));
+      const derivedNote = await page.evaluate(() => document.querySelector('#derivedPaymentNote').textContent);
+      check('Mortgage panel names the derived payment and its amount',
+        derivedNote.includes('derived from the remaining amortization') && derivedNote.includes('6,381'),
+        derivedNote);
+      const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
+      check('the NO_PAYMENT note beside chart A clears once amortization is in',
+        !afterMsg.includes('add a monthly payment or remaining amortization'), afterMsg);
+      const chartBInfo = await page.evaluate(() => {
+        const c = window.__fmCharts.b;
+        if (!c) return null;
+        return {
+          type: c.config.type,
+          labels: c.data.datasets.map((d) => d.label),
+          stacks: c.data.datasets.map((d) => d.stack),
+          sums: c.data.datasets[0].data.slice(0, 6).map((v, i) => v + c.data.datasets[1].data[i]),
+        };
+      });
+      check('chart B is a stacked bar split into Interest portion + Principal portion',
+        !!chartBInfo && chartBInfo.type === 'bar'
+          && chartBInfo.labels[0] === 'Interest portion' && chartBInfo.labels[1] === 'Principal portion'
+          && chartBInfo.stacks[0] === 'payment' && chartBInfo.stacks[1] === 'payment',
+        JSON.stringify(chartBInfo && { type: chartBInfo.type, labels: chartBInfo.labels, stacks: chartBInfo.stacks }));
+      let splitOk = !!chartBInfo && chartBInfo.sums.length === 6 && !!amortApi.series;
+      if (splitOk) {
+        for (let k = 0; k < 6; k++) {
+          if (Math.abs(chartBInfo.sums[k] - amortApi.series[k].payment) > 0.02) { splitOk = false; break; }
+        }
+      }
+      check('chart B portions sum to the payment in each of the first 6 months',
+        splitOk, JSON.stringify(chartBInfo && chartBInfo.sums));
+      const monthlySummary = await page.evaluate(() => document.querySelector('#monthlySummary').textContent);
+      check('chart B summary shows projected total interest, total principal and the payoff month',
+        monthlySummary.includes('Projected total interest')
+          && monthlySummary.includes('Total principal')
+          && !!amortApi.payoffMonth && monthlySummary.includes(`Projected payoff: ${amortApi.payoffMonth}`),
+        monthlySummary);
+      const lenderBits = await page.evaluate(() => ({
+        view: document.querySelector('#propViewBody').textContent,
+        tag: document.querySelector('#mortgageLenderTag').textContent,
+        input: document.querySelector('#mortgageForm [name=lender]').value,
+      }));
+      check('lender shows in the read-only panel, the Mortgage heading and the form',
+        lenderBits.view.includes('Lender') && lenderBits.view.includes('Scotiabank')
+          && lenderBits.tag.includes('Scotiabank') && lenderBits.input === 'Scotiabank',
+        JSON.stringify(lenderBits));
+      const portUi = (await req('GET', '/api/properties/portfolio')).data;
+      const rowUi = portUi.properties.find((x) => x.id === amortPid);
+      check('the UI-entered amortization flips the portfolio state to projected',
+        !!rowUi && rowUi.projState === 'projected', JSON.stringify(rowUi && rowUi.projState));
+      await req('DELETE', `/api/properties/${amortPid}`);
 
       // ---- Property panel: read-only metadata until Edit; photo carousel ----
       page.on('dialog', (d) => d.accept()); // photo removal asks confirm()

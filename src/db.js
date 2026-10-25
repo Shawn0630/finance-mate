@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS properties (
   mortgage_balance_date TEXT,         -- 'YYYY-MM-DD' the balance refers to
   mortgage_payment REAL,              -- monthly payment; engine prefers this
   amortization_years REAL,            -- used to derive payment when unset
+  lender TEXT,                        -- mortgage lender (bank), free text
   notes TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -175,6 +176,12 @@ if (!propCols.includes('region')) {
   // Region code (src/regions/): only 'CA' is implemented; the API
   // rejects anything else for now. Existing rows default to 'CA'.
   db.exec("ALTER TABLE properties ADD COLUMN region TEXT DEFAULT 'CA'");
+}
+if (!propCols.includes('lender')) {
+  // The mortgage lender (bank) for the property: free text, with the
+  // big Canadian banks offered as quick picks in the UI. Nullable;
+  // rows that predate it simply show no lender anywhere.
+  db.exec('ALTER TABLE properties ADD COLUMN lender TEXT');
 }
 if (!propCols.includes('hs_id_address')) {
   // HouseSigma's ids for this property (its id_address / id_listing),
