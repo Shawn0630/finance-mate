@@ -346,6 +346,12 @@ app.get('/api/assets', requireApiAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM other_assets ORDER BY category, id').all());
 });
 
+app.get('/api/assets/:id', requireApiAuth, (req, res) => {
+  const a = db.prepare('SELECT * FROM other_assets WHERE id = ?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'asset not found' });
+  res.json(a);
+});
+
 app.post('/api/assets', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!ASSET_CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'unknown category' });

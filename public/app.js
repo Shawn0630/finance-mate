@@ -98,45 +98,114 @@ const addSuggest = attachAddressSuggest(
 const propSuggest = attachAddressSuggest(
   $('#propForm .address-input'), $('#propForm .suggest-list'));
 
+// --------------------------------------------------------------- modals ---
+function openModal(id) { $('#' + id).classList.remove('hidden'); }
+function closeModalEl(overlay) { overlay.classList.add('hidden'); }
+document.querySelectorAll('[data-close-modal]').forEach((b) =>
+  b.addEventListener('click', () => closeModalEl(b.closest('.modal-overlay'))));
+document.querySelectorAll('.modal-overlay').forEach((o) =>
+  o.addEventListener('mousedown', (e) => { if (e.target === o) closeModalEl(o); }));
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-overlay').forEach(closeModalEl);
+});
+
 // ------------------------------------------------------------ navigation ---
+// Assets has a persistent secondary menu: Overview (totals only) plus one
+// section per asset kind, each with its own listing, Add modal and detail
+// view. The section lives in the hash: #assets/<section>.
+const ASSET_SECTIONS = [
+  { key: 'overview', label: 'Overview' },
+  { key: 'properties', label: 'Properties', addLabel: 'Add property' },
+  { key: 'fixed-assets', category: 'fixed_assets', label: 'Fixed assets', addLabel: 'Add fixed asset' },
+  { key: 'stocks', category: 'stocks', label: 'Stocks', addLabel: 'Add stock' },
+  { key: 'term-deposits', category: 'term_deposits', label: 'Term deposits', addLabel: 'Add term deposit' },
+  { key: 'other', category: 'other', label: 'Other', addLabel: 'Add asset' },
+];
+const CATEGORY_LABELS = { fixed_assets: 'Fixed assets', stocks: 'Stocks', term_deposits: 'Term deposits', other: 'Other' };
+const SECTION_OF_CATEGORY = Object.fromEntries(
+  ASSET_SECTIONS.filter((s) => s.category).map((s) => [s.category, s.key]));
+
 let currentPropertyId = null;
+let currentAssetId = null;
+let currentSection = 'overview';
+
 function showView(name) {
-  for (const v of ['assets', 'property', 'spending', 'planning', 'tax']) {
+  for (const v of ['assets', 'property', 'asset', 'spending', 'planning', 'tax']) {
     $('#view-' + v).classList.toggle('hidden', v !== name);
   }
   document.querySelectorAll('#mainNav a').forEach((a) =>
-    a.classList.toggle('active', a.dataset.nav === (name === 'property' ? 'assets' : name))
+    a.classList.toggle('active', a.dataset.nav === (name === 'property' || name === 'asset' ? 'assets' : name))
   );
 }
+
+function showSection(key) {
+  currentSection = key;
+  for (const s of ASSET_SECTIONS) {
+    $('#section-' + s.key).classList.toggle('hidden', s.key !== key);
+  }
+  document.querySelectorAll('#assetsNav a').forEach((a) =>
+    a.classList.toggle('active', a.dataset.section === key));
+}
+
 function route() {
-  const hash = location.hash || '#assets';
+  const hash = location.hash || '#assets/overview';
   if (hash.startsWith('#property/')) {
     currentPropertyId = Number(hash.split('/')[1]);
     showView('property');
     loadPropertyDetail(currentPropertyId);
+  } else if (hash.startsWith('#asset/')) {
+    currentAssetId = Number(hash.split('/')[1]);
+    showView('asset');
+    loadAssetDetail(currentAssetId);
   } else if (['#spending', '#planning', '#tax'].includes(hash)) {
     showView(hash.slice(1));
   } else {
+    // '#assets' or '#assets/<section>'
+    const key = hash.split('/')[1] || 'overview';
     showView('assets');
+    showSection(ASSET_SECTIONS.some((s) => s.key === key) ? key : 'overview');
     loadAssets();
   }
 }
 window.addEventListener('hashchange', route);
 
-// ------------------------------------------------------------- assets page ---
-const CATEGORY_LABELS = { fixed_assets: 'Fixed assets', stocks: 'Stocks', term_deposits: 'Term deposits', other: 'Other' };
+// ------------------------------------------------------------- assets data ---
+let assetsLoaded = false;
 
-async function loadAssets() {
+async function loadAssets(force = false) {
+  if (assetsLoaded && !force) return;
+  assetsLoaded = true;
   const [summary, properties, assets] = await Promise.all([
     api('/api/summary'), api('/api/properties'), api('/api/assets'),
   ]);
+
+  // Overview: totals + per-category breakdown cards.
   $('#sumProperty').textContent = money(summary.propertyValue);
   $('#sumMortgage').textContent = money(summary.mortgageBalance);
   $('#sumOther').textContent = money(summary.otherAssets);
   const net = $('#sumNet');
   net.textContent = money(summary.netWorth);
   net.classList.toggle('negative', summary.netWorth < 0);
+  const byCategory = {};
+  for (const a of assets) {
+    byCategory[a.category] = byCategory[a.category] || { count: 0, total: 0 };
+    byCategory[a.category].count++;
+    byCategory[a.category].total += Number(a.value || 0);
+  }
+  const breakdown = [
+    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · mortgages ${money(summary.mortgageBalance)}` },
+    ...ASSET_SECTIONS.filter((s) => s.category).map((s) => ({
+      key: s.key, label: s.label,
+      value: (byCategory[s.category] || { total: 0 }).total,
+      note: `${(byCategory[s.category] || { count: 0 }).count} entries`,
+    })),
+  ];
+  $('#breakdownCards').innerHTML = breakdown.map((b) => `
+    <div class="card breakdown-card" onclick="location.hash='#assets/${b.key}'">
+      <div class="k">${b.label}</div><div class="v">${money(b.value)}</div><div class="n">${esc(b.note)}</div>
+    </div>`).join('');
 
+  // Properties listing.
   $('#propertyCards').innerHTML = properties.map((p) => {
     const photo = p.photo_file
       ? `<img src="/photos/${esc(p.photo_file)}" alt="">`
@@ -158,29 +227,115 @@ async function loadAssets() {
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
       </div></div>`;
-  }).join('') || '<div class="note">No properties yet — add one below.</div>';
+  }).join('') || '<div class="note">No properties yet — use “Add property” above.</div>';
 
-  const groups = {};
-  for (const a of assets) (groups[a.category] = groups[a.category] || []).push(a);
-  $('#assetGroups').innerHTML = Object.keys(CATEGORY_LABELS).map((cat) => {
-    const rows = groups[cat] || [];
-    const subtotal = rows.reduce((s, a) => s + Number(a.value || 0), 0);
-    const body = rows.map((a) => `<tr>
+  // One listing table per other-asset category.
+  for (const s of ASSET_SECTIONS.filter((x) => x.category)) {
+    const rows = assets.filter((a) => a.category === s.category);
+    const subtotal = rows.reduce((sum, a) => sum + Number(a.value || 0), 0);
+    const body = rows.map((a) => `<tr class="clickable" onclick="location.hash='#asset/${a.id}'">
       <td>${esc(a.name)}</td><td class="num">${money(a.value)}</td><td>${esc(a.currency)}</td>
       <td>${esc(a.notes || '')}</td>
-      <td><button class="small danger" onclick="deleteAsset(${a.id})">Delete</button></td></tr>`).join('');
-    return `<div class="panel"><h3>${CATEGORY_LABELS[cat]} — subtotal ${money(subtotal)}</h3>
-      ${rows.length ? `<table><thead><tr><th>Name</th><th class="num">Value</th><th>Currency</th><th>Notes</th><th></th></tr></thead><tbody>${body}</tbody></table>` : '<div class="note" style="margin:0">No entries yet.</div>'}
-      </div>`;
-  }).join('');
+      <td style="white-space:nowrap">
+        <button class="small" onclick="event.stopPropagation(); openAssetModal(${a.id})">Edit</button>
+        <button class="small danger" onclick="event.stopPropagation(); deleteAsset(${a.id})">Delete</button>
+      </td></tr>`).join('');
+    $('#section-' + s.key).innerHTML = `
+      <div class="section-head"><h2>${s.label}</h2><span class="note" style="margin:0">Subtotal ${money(subtotal)}</span>
+        <div class="spacer"></div>
+        <button class="primary" onclick="openAssetModal(null, '${s.category}')">+ ${s.addLabel}</button></div>
+      ${rows.length
+        ? `<div class="panel" style="padding:6px 16px"><table><thead><tr><th>Name</th><th class="num">Value</th><th>Currency</th><th>Notes</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`
+        : '<div class="note">No entries yet.</div>'}`;
+  }
 }
+
+// ------------------------------------------------------------- asset modal ---
+let assetModalCategory = 'other';
+
+function openAssetModal(assetId, category) {
+  const form = $('#assetForm');
+  form.reset();
+  $('#assetModalMsg').className = 'msg';
+  if (assetId) {
+    api('/api/assets/' + assetId).then((a) => {
+      assetModalCategory = a.category;
+      $('#assetModalTitle').textContent = 'Edit ' + (CATEGORY_LABELS[a.category] || 'asset').replace(/s$/, '').toLowerCase();
+      form.elements.id.value = a.id;
+      form.elements.categoryLabel.value = CATEGORY_LABELS[a.category] || a.category;
+      form.elements.name.value = a.name || '';
+      form.elements.value.value = a.value ?? '';
+      form.elements.currency.value = a.currency || 'CAD';
+      form.elements.notes.value = a.notes || '';
+      openModal('assetModal');
+    }).catch((e) => alert(e.message));
+  } else {
+    assetModalCategory = category || 'other';
+    $('#assetModalTitle').textContent = 'Add ' + (CATEGORY_LABELS[assetModalCategory] || 'asset').replace(/s$/, '').toLowerCase();
+    form.elements.id.value = '';
+    form.elements.categoryLabel.value = CATEGORY_LABELS[assetModalCategory];
+    form.elements.currency.value = 'CAD';
+    openModal('assetModal');
+  }
+}
+window.openAssetModal = openAssetModal;
+
+$('#assetForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  const id = f.id;
+  delete f.id;
+  delete f.categoryLabel;
+  try {
+    if (id) await api('/api/assets/' + id, { method: 'PUT', body: f });
+    else await api('/api/assets', { method: 'POST', body: { ...f, category: assetModalCategory } });
+    closeModalEl($('#assetModal'));
+    assetsLoaded = false;
+    if (location.hash.startsWith('#asset/') && id) loadAssetDetail(Number(id));
+    else loadAssets();
+  } catch (err) { showMsg($('#assetModalMsg'), 'err', err.message); }
+});
 
 async function deleteAsset(id) {
   if (!confirm('Delete this asset?')) return;
   await api(`/api/assets/${id}`, { method: 'DELETE' });
-  loadAssets();
+  assetsLoaded = false;
+  if (location.hash.startsWith('#asset/')) location.hash = '#assets/overview';
+  else loadAssets();
 }
 window.deleteAsset = deleteAsset;
+
+// ------------------------------------------------------------ asset detail ---
+async function loadAssetDetail(id) {
+  let a;
+  try { a = await api('/api/assets/' + id); }
+  catch { $('#assetDetailTitle').textContent = 'Asset not found'; $('#assetDetailBody').innerHTML = ''; return; }
+  currentAssetId = a.id;
+  const section = SECTION_OF_CATEGORY[a.category] || 'overview';
+  $('#assetBackLink').href = '#assets/' + section;
+  $('#assetBackLink').textContent = '← Back to ' + (CATEGORY_LABELS[a.category] || 'Assets');
+  $('#assetDetailTitle').textContent = a.name;
+  const fmtDate = (t) => (t ? new Date(t).toLocaleString('en-CA') : '—');
+  const rows = [
+    ['Category', CATEGORY_LABELS[a.category] || a.category],
+    ['Value', money(a.value)],
+    ['Currency', a.currency],
+    ['Notes', a.notes || '—'],
+    ['Created', fmtDate(a.created_at)],
+    ['Last updated', fmtDate(a.updated_at)],
+  ];
+  $('#assetDetailBody').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join('');
+  $('#editAssetBtn').onclick = () => openAssetModal(a.id);
+  $('#deleteAssetBtn').onclick = async () => {
+    if (!confirm('Delete this asset?')) return;
+    await api('/api/assets/' + a.id, { method: 'DELETE' });
+    assetsLoaded = false;
+    location.hash = '#assets/' + section;
+  };
+}
+
+// ---------------------------------------------------------- property modal ---
+$('#addPropertyBtn').addEventListener('click', () => openModal('propertyModal'));
 
 $('#addPropForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -191,25 +346,17 @@ $('#addPropForm').addEventListener('submit', async (e) => {
     const p = await api('/api/properties', { method: 'POST', body: f });
     e.target.reset();
     addSuggest.reset();
+    closeModalEl($('#propertyModal'));
     // Best-effort automatic BC Assessment fetch right after adding.
     const r = await api(`/api/properties/${p.id}/fetch-bca`, { method: 'POST' });
-    if (r.ok) {
-      showMsg(msg, 'ok', `Property added. BC Assessment value fetched: ${money(r.result.assessedValue)} (${r.result.assessedYear || 'current'}), matched "${r.result.matchedAddress}".`);
-    } else {
-      showMsg(msg, 'warn', `Property added. Automatic BC Assessment fetch did not succeed (${r.error}). You can enter the value manually on the detail page, or retry the fetch there.`);
-    }
-    loadAssets();
+    const note = r.ok
+      ? `Property added. BC Assessment value fetched: ${money(r.result.assessedValue)} (${r.result.assessedYear || 'current'}), matched "${r.result.matchedAddress}".`
+      : `Property added. Automatic BC Assessment fetch did not succeed (${r.error}). You can enter the value manually on the detail page, or retry the fetch there.`;
+    assetsLoaded = false;
+    if (location.hash === '#assets/properties') loadAssets();
+    else location.hash = '#assets/properties';
+    showMsg($('#sectionMsg'), r.ok ? 'ok' : 'warn', note);
   } catch (err) { showMsg(msg, 'err', err.message); }
-});
-
-$('#addAssetForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const f = Object.fromEntries(new FormData(e.target).entries());
-  try {
-    await api('/api/assets', { method: 'POST', body: f });
-    e.target.reset();
-    loadAssets();
-  } catch (err) { showMsg($('#addAssetMsg'), 'err', err.message); }
 });
 
 // ---------------------------------------------------------- property detail ---
@@ -265,6 +412,7 @@ function renderSegments(segments) {
 async function deleteSegment(segId) {
   if (!confirm('Delete this rate segment?')) return;
   await api(`/api/properties/${currentPropertyId}/rates/${segId}`, { method: 'DELETE' });
+  assetsLoaded = false;
   loadPropertyDetail(currentPropertyId);
 }
 window.deleteSegment = deleteSegment;
@@ -275,6 +423,7 @@ $('#propForm').addEventListener('submit', async (e) => {
   f.bca_id = propSuggest.state.id || null;
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
+    assetsLoaded = false;
     showMsg($('#detailMsg'), 'ok', 'Saved.');
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -285,6 +434,7 @@ $('#mortgageForm').addEventListener('submit', async (e) => {
   const f = Object.fromEntries(new FormData(e.target).entries());
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
+    assetsLoaded = false;
     showMsg($('#detailMsg'), 'ok', 'Mortgage saved.');
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -295,6 +445,7 @@ $('#addSegmentForm').addEventListener('submit', async (e) => {
   const f = Object.fromEntries(new FormData(e.target).entries());
   try {
     await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body: f });
+    assetsLoaded = false;
     e.target.reset();
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -306,6 +457,7 @@ $('#fetchBcaBtn').addEventListener('click', async () => {
   try {
     const r = await api(`/api/properties/${currentPropertyId}/fetch-bca`, { method: 'POST' });
     if (r.ok) {
+      assetsLoaded = false;
       showMsg(msg, 'ok', `Fetched: assessed value ${money(r.result.assessedValue)} (${r.result.assessedYear || 'current'}), matched "${r.result.matchedAddress}".`);
       loadPropertyDetail(currentPropertyId);
     } else {
@@ -335,7 +487,8 @@ $('#photoFile').addEventListener('change', async (e) => {
 $('#deletePropertyBtn').addEventListener('click', async () => {
   if (!confirm('Delete this property, its rate segments and its photo?')) return;
   await api(`/api/properties/${currentPropertyId}`, { method: 'DELETE' });
-  location.hash = '#assets';
+  assetsLoaded = false;
+  location.hash = '#assets/properties';
 });
 
 // ------------------------------------------------------------------- chart ---

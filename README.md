@@ -13,11 +13,16 @@ placeholder pages for later rounds.
   **remaining balance** lines (dual axis), with a selectable range
   (1 / 2 / 5 / 10 years, all the way to payoff, or a custom number of
   months), the total interest in range and the projected payoff month.
-- **Other assets** — simple register grouped by category: Fixed assets,
-  Stocks, Term deposits, Other, with subtotals.
-- **Summary strip** — total property value (assessed), total mortgage
-  balance, other assets, and net worth. Property values are BC Assessment
-  *assessed* values, not market prices.
+- **Other assets** — simple register by category: Fixed assets, Stocks,
+  Term deposits, Other, with subtotals.
+- **Layout** — the Assets module has a persistent secondary menu:
+  **Overview** shows totals only (property value, mortgage balance, other
+  assets, net worth, plus per-category breakdown cards); each section
+  (Properties / Fixed assets / Stocks / Term deposits / Other) shows only
+  its own listing, an Add button that opens a modal form, and a detail
+  view per item (click a property card or an asset row). The section is
+  kept in the URL hash (`#assets/stocks`, `#property/<id>`, `#asset/<id>`).
+  Property values are BC Assessment *assessed* values, not market prices.
 
 ## Run with Docker
 

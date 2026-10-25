@@ -22,70 +22,61 @@
 </header>
 <main>
   <!-- ============================== Assets ============================== -->
-  <section id="view-assets">
-    <div class="summary-strip">
-      <div class="summary-card"><div class="k">Property value (assessed)</div><div class="v" id="sumProperty">—</div></div>
-      <div class="summary-card"><div class="k">Mortgage balance</div><div class="v" id="sumMortgage">—</div></div>
-      <div class="summary-card"><div class="k">Other assets</div><div class="v" id="sumOther">—</div></div>
-      <div class="summary-card"><div class="k">Net worth</div><div class="v" id="sumNet">—</div></div>
-    </div>
-    <div class="note">Property values are BC Assessment assessed values, not market prices.</div>
+  <section id="view-assets" class="hidden">
+    <nav class="subnav" id="assetsNav">
+      <a href="#assets/overview" data-section="overview">Overview</a>
+      <a href="#assets/properties" data-section="properties">Properties</a>
+      <a href="#assets/fixed-assets" data-section="fixed-assets">Fixed assets</a>
+      <a href="#assets/stocks" data-section="stocks">Stocks</a>
+      <a href="#assets/term-deposits" data-section="term-deposits">Term deposits</a>
+      <a href="#assets/other" data-section="other">Other</a>
+    </nav>
 
-    <h2>Properties</h2>
-    <div class="cards" id="propertyCards"></div>
-
-    <div class="panel" style="margin-top:14px">
-      <h3>Add a property</h3>
-      <div class="msg" id="addPropMsg"></div>
-      <form id="addPropForm">
-        <div class="grid2">
-          <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" placeholder="Start typing — suggestions come from BC Assessment" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
-          <div><label>Notes</label><input name="notes"></div>
-        </div>
-        <div class="grid3">
-          <div><label>Mortgage balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
-          <div><label>Balance as of</label><input name="mortgage_balance_date" type="date"></div>
-          <div><label>Monthly payment ($)</label><input name="mortgage_payment" type="number" step="0.01" min="0"></div>
-        </div>
-        <div class="grid3">
-          <div><label>Remaining amortization (years) — used to derive the payment when no monthly payment is entered</label><input name="amortization_years" type="number" step="0.5" min="0"></div>
-        </div>
-        <div class="toolbar">
-          <button class="primary" type="submit">Add property</button>
-          <span class="note" style="margin:0">After adding, the app tries to fetch the assessed value from BC Assessment automatically. You can refine everything on the detail page.</span>
-        </div>
-      </form>
+    <!-- Overview: totals only, no listings or forms. -->
+    <div id="section-overview" class="asset-section">
+      <div class="summary-strip">
+        <div class="summary-card"><div class="k">Property value (assessed)</div><div class="v" id="sumProperty">—</div></div>
+        <div class="summary-card"><div class="k">Mortgage balance</div><div class="v" id="sumMortgage">—</div></div>
+        <div class="summary-card"><div class="k">Other assets</div><div class="v" id="sumOther">—</div></div>
+        <div class="summary-card"><div class="k">Net worth</div><div class="v" id="sumNet">—</div></div>
+      </div>
+      <div class="note">Property values are BC Assessment assessed values, not market prices. Pick a section above — or a card below — to manage the individual assets.</div>
+      <div class="cards" id="breakdownCards"></div>
     </div>
 
-    <h2>Other assets</h2>
-    <div id="assetGroups"></div>
+    <!-- Properties: listing only; adding happens in a modal. -->
+    <div id="section-properties" class="asset-section hidden">
+      <div class="section-head">
+        <h2>Properties</h2>
+        <div class="spacer"></div>
+        <button class="primary" id="addPropertyBtn">+ Add property</button>
+      </div>
+      <div class="msg" id="sectionMsg"></div>
+      <div class="cards" id="propertyCards"></div>
+    </div>
+
+    <!-- One listing section per other-asset category; filled by app.js. -->
+    <div id="section-fixed-assets" class="asset-section hidden"></div>
+    <div id="section-stocks" class="asset-section hidden"></div>
+    <div id="section-term-deposits" class="asset-section hidden"></div>
+    <div id="section-other" class="asset-section hidden"></div>
+  </section>
+
+  <!-- ==================== Other-asset detail ==================== -->
+  <section id="view-asset" class="hidden">
+    <div class="toolbar"><a id="assetBackLink" href="#assets/overview">&larr; Back to Assets</a><div class="spacer"></div>
+      <button class="danger" id="deleteAssetBtn">Delete asset</button></div>
+    <div class="msg" id="assetDetailMsg"></div>
     <div class="panel">
-      <h3>Add an asset</h3>
-      <div class="msg" id="addAssetMsg"></div>
-      <form id="addAssetForm">
-        <div class="grid3">
-          <div><label>Category</label>
-            <select name="category">
-              <option value="fixed_assets">Fixed assets</option>
-              <option value="stocks">Stocks</option>
-              <option value="term_deposits">Term deposits</option>
-              <option value="other">Other</option>
-            </select></div>
-          <div><label>Name *</label><input name="name" required></div>
-          <div><label>Value</label><input name="value" type="number" step="0.01"></div>
-        </div>
-        <div class="grid3">
-          <div><label>Currency</label><input name="currency" value="CAD"></div>
-          <div><label>Notes</label><input name="notes"></div>
-        </div>
-        <div class="toolbar"><button class="primary" type="submit">Add asset</button></div>
-      </form>
+      <h3 id="assetDetailTitle">Asset</h3>
+      <table class="detail-table"><tbody id="assetDetailBody"></tbody></table>
+      <div class="toolbar"><button class="primary" id="editAssetBtn">Edit</button></div>
     </div>
   </section>
 
   <!-- ========================= Property detail ========================= -->
   <section id="view-property" class="hidden">
-    <div class="toolbar"><a href="#assets">&larr; Back to Assets</a><div class="spacer"></div>
+    <div class="toolbar"><a href="#assets/properties">&larr; Back to Properties</a><div class="spacer"></div>
       <button class="danger" id="deletePropertyBtn">Delete property</button></div>
     <div id="photoArea"></div>
     <div class="msg" id="detailMsg"></div>
@@ -155,6 +146,7 @@
       <div class="note" id="chartSummary" style="margin-left:0"></div>
       <div class="chart-wrap"><canvas id="mortgageChart"></canvas></div>
     </div>
+
   </section>
 
   <!-- ============================ Placeholders ============================ -->
@@ -162,6 +154,57 @@
   <section id="view-planning" class="hidden"><div class="placeholder"><h2>Planning</h2><p>This module is planned for a later round.</p></div></section>
   <section id="view-tax" class="hidden"><div class="placeholder"><h2>Tax</h2><p>This module is planned for a later round.</p></div></section>
 </main>
+
+<!-- ============================ Modals ============================ -->
+<div class="modal-overlay hidden" id="propertyModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Add a property</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="addPropMsg"></div>
+    <form id="addPropForm">
+      <div class="grid2">
+        <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" placeholder="Start typing — suggestions come from BC Assessment" autocomplete="off" required><ul class="suggest-list hidden"></ul></div></div>
+        <div><label>Notes</label><input name="notes"></div>
+      </div>
+      <div class="grid3">
+        <div><label>Mortgage balance ($)</label><input name="mortgage_balance" type="number" step="0.01" min="0"></div>
+        <div><label>Balance as of</label><input name="mortgage_balance_date" type="date"></div>
+        <div><label>Monthly payment ($)</label><input name="mortgage_payment" type="number" step="0.01" min="0"></div>
+      </div>
+      <div class="grid3">
+        <div><label>Remaining amortization (years)</label><input name="amortization_years" type="number" step="0.5" min="0"></div>
+      </div>
+      <div class="note" style="margin-left:0">Remaining amortization is used to derive the payment when no monthly payment is entered. After adding, the app tries to fetch the assessed value from BC Assessment automatically. You can refine everything on the detail page.</div>
+      <div class="toolbar">
+        <button class="primary" type="submit">Add property</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="assetModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="assetModalTitle">Add asset</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="assetModalMsg"></div>
+    <form id="assetForm">
+      <input type="hidden" name="id">
+      <div class="grid2">
+        <div><label>Category</label><input name="categoryLabel" readonly></div>
+        <div><label>Name *</label><input name="name" required></div>
+      </div>
+      <div class="grid2">
+        <div><label>Value</label><input name="value" type="number" step="0.01"></div>
+        <div><label>Currency</label><input name="currency" value="CAD"></div>
+      </div>
+      <div><label>Notes</label><input name="notes"></div>
+      <div class="toolbar">
+        <button class="primary" type="submit">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script src="/app.js"></script>
 </body>
 </html>

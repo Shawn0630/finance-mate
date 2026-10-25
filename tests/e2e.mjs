@@ -134,6 +134,10 @@ try {
   r = await req('POST', '/api/assets', { category: 'stocks', name: 'Test ETF', value: 5000, currency: 'CAD' });
   check('add other asset', r.status === 201);
   const aid = r.data.id;
+  r = await req('GET', `/api/assets/${aid}`);
+  check('get single asset (detail view source)', r.status === 200 && r.data.name === 'Test ETF' && r.data.category === 'stocks');
+  r = await req('GET', '/api/assets/999999');
+  check('get missing asset is 404', r.status === 404);
   r = await req('GET', '/api/summary');
   check('summary property value = 800000', r.data.propertyValue === 800000, JSON.stringify(r.data));
   check('summary mortgage = 100000', r.data.mortgageBalance === 100000);
