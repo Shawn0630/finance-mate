@@ -12,6 +12,73 @@ const ordinal = (n) => {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 };
 
+// --------------------------------------------------------- money inputs --
+// Every money field in the app is a text input marked data-money. What
+// the user sees is grouped with thousands separators ("1,350,000");
+// what leaves the browser is a plain number again (parseMoneyInput),
+// so the API, the stored data and the server's validation are exactly
+// as they were when these were <input type="number">. The pair is
+// shared by every form — add/edit property, mortgage, value-history
+// points and other assets.
+function formatMoneyInput(v) {
+  if (v === null || v === undefined || v === '') return '';
+  const s = String(v).replace(/[$,\s]/g, '');
+  const m = /^(-?)(\d+)(?:\.(\d*))?$/.exec(s);
+  if (!m) return String(v); // not a plain number: leave the text untouched
+  const grouped = m[2].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return m[1] + grouped + (m[3] !== undefined ? '.' + m[3] : '');
+}
+
+function parseMoneyInput(s) {
+  if (s === null || s === undefined) return '';
+  const cleaned = String(s).replace(/[$,\s]/g, '');
+  if (cleaned === '') return '';
+  // Anything that is not a plain number parses back to '' — exactly
+  // what a number input reported for unparseable text — so the
+  // server's existing validation, not this formatter, decides what
+  // counts as an error.
+  return /^-?\d+(\.\d*)?$/.test(cleaned) ? Number(cleaned) : '';
+}
+
+// Convert the named fields of a FormData-built object back to numbers
+// (or '' when blank) just before it is sent.
+function parseMoneyFields(f, names) {
+  for (const n of names) if (n in f) f[n] = parseMoneyInput(f[n]);
+  return f;
+}
+
+// Prefill an edit form's money field with the grouped figure.
+function setMoneyValue(input, v) {
+  if (input) input.value = formatMoneyInput(v);
+}
+
+// Live grouping while typing: reformat the integer part on every input
+// event and keep the caret after the same digit it followed before, so
+// typing "1350000" turns into "1,350,000" without the caret jumping.
+function wireMoneyInput(input) {
+  input.addEventListener('input', () => {
+    const raw = input.value;
+    const formatted = formatMoneyInput(raw);
+    if (formatted === raw) return;
+    const before = raw.slice(0, input.selectionStart ?? raw.length);
+    const sigBefore = (before.match(/[\d.]/g) || []).length;
+    input.value = formatted;
+    let pos = sigBefore === 0 ? 0 : formatted.length;
+    if (sigBefore > 0) {
+      let seen = 0;
+      for (let i = 0; i < formatted.length; i++) {
+        if (/[\d.]/.test(formatted[i])) { seen++; if (seen >= sigBefore) { pos = i + 1; break; } }
+      }
+    }
+    try { input.setSelectionRange(pos, pos); } catch { /* not a text caret */ }
+  });
+  input.addEventListener('blur', () => { input.value = formatMoneyInput(input.value); });
+}
+document.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+
+// Chart amount axes read in grouped figures too, not bare numbers.
+const moneyTick = (v) => Number(v).toLocaleString('en-CA');
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
@@ -361,7 +428,7 @@ function openAssetModal(assetId, category) {
       form.elements.id.value = a.id;
       form.elements.categoryLabel.value = CATEGORY_LABELS[a.category] || a.category;
       form.elements.name.value = a.name || '';
-      form.elements.value.value = a.value ?? '';
+      setMoneyValue(form.elements.value, a.value);
       form.elements.currency.value = a.currency || 'CAD';
       form.elements.notes.value = a.notes || '';
       assetOwnerPicker.set(a.owners || []);
@@ -381,6 +448,7 @@ window.openAssetModal = openAssetModal;
 $('#assetForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['value']);
   const id = f.id;
   delete f.id;
   delete f.categoryLabel;
@@ -443,6 +511,7 @@ $('#addPropertyBtn').addEventListener('click', () => {
 $('#addPropForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['mortgage_balance']);
   if (addSuggest.state.id) f.bca_id = addSuggest.state.id;
   f.owners = addPropOwnerPicker.get();
   const msg = $('#addPropMsg');
@@ -666,7 +735,7 @@ function drawPortfolioChart() {
       },
       scales: {
         x: { type: 'linear', stacked: true, ticks: { stepSize: 1, maxTicksLimit: 12, callback: formatYearTick } },
-        y: { stacked: true, title: { display: true, text: 'Amount ($)' } },
+        y: { stacked: true, ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' } },
       },
     },
   });
@@ -713,7 +782,7 @@ async function loadPropertyDetail(id) {
   propSuggest.close();
   pf.notes.value = p.notes || '';
   propOwnerPicker.set(p.owners || []);
-  pf.assessed_value.value = p.assessed_value ?? '';
+  setMoneyValue(pf.assessed_value, p.assessed_value);
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.purchase_date.value = p.purchase_date || '';
   $('#paymentDayInput').value = p.payment_day ?? '';
@@ -734,9 +803,9 @@ async function loadPropertyDetail(id) {
         ? 'Source: entered manually. Use "Fetch from BC Assessment" to replace it with the official assessed value.'
         : 'No assessed value yet.';
   const mf = $('#mortgageForm');
-  mf.mortgage_balance.value = p.mortgage_balance ?? '';
+  setMoneyValue(mf.mortgage_balance, p.mortgage_balance);
   mf.mortgage_balance_date.value = p.mortgage_balance_date || '';
-  mf.mortgage_payment.value = p.mortgage_payment ?? '';
+  setMoneyValue(mf.mortgage_payment, p.mortgage_payment);
   mf.amortization_years.value = p.amortization_years ?? '';
   renderSegments(p.segments);
   loadPrime();
@@ -777,6 +846,7 @@ window.deleteSegment = deleteSegment;
 $('#propForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['assessed_value']);
   f.bca_id = propSuggest.state.id || null;
   f.owners = propOwnerPicker.get();
   try {
@@ -790,6 +860,7 @@ $('#propForm').addEventListener('submit', async (e) => {
 $('#mortgageForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['mortgage_balance', 'mortgage_payment']);
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
     assetsLoaded = false;
@@ -1007,7 +1078,7 @@ function editTrendPoint(pointId) {
   trendEditingId = pointId;
   const f = $('#trendForm');
   f.year.value = pt.year;
-  f.value.value = pt.value;
+  setMoneyValue(f.value, pt.value);
   f.notes.value = pt.notes || '';
   $('#trendSubmitBtn').textContent = 'Save point';
   $('#trendCancelBtn').classList.remove('hidden');
@@ -1025,6 +1096,7 @@ window.deleteTrendPoint = deleteTrendPoint;
 $('#trendForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['value']);
   try {
     if (trendEditingId) {
       await api(`/api/properties/${currentPropertyId}/value-history/${trendEditingId}`, { method: 'PUT', body: f });
@@ -1156,7 +1228,7 @@ function drawCombinedChart() {
       },
       scales: {
         x: { type: 'linear', ticks: { stepSize: 1, maxTicksLimit: 12, callback: formatYearTick } },
-        y: { title: { display: true, text: 'Amount ($)' } },
+        y: { ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' } },
       },
     },
   });
@@ -1227,7 +1299,7 @@ function drawMonthlyChart() {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        y: { title: { display: true, text: 'Monthly amount ($)' } },
+        y: { ticks: { callback: moneyTick }, title: { display: true, text: 'Monthly amount ($)' } },
         x: { ticks: { maxTicksLimit: 12 } },
       },
     },

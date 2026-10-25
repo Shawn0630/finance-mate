@@ -823,6 +823,193 @@ try {
   await req('DELETE', `/api/properties/${r.data.id}`);
   await req('DELETE', `/api/properties/${pidPrime}`);
 
+  // ---- Money inputs: grouped on screen, plain numbers on the wire ----
+  // Every money field is a text input marked data-money; the shared
+  // format/parse pair in app.js groups what the user sees and parses it
+  // back before anything is sent, so the API still receives numbers.
+  check('money inputs are marked data-money in the page',
+    (pageHtml.match(/data-money/g) || []).length >= 6,
+    String((pageHtml.match(/data-money/g) || []).length));
+  check('frontend wires the shared money format/parse helpers',
+    jsText.includes('formatMoneyInput') && jsText.includes('parseMoneyInput') && jsText.includes('input[data-money]'));
+
+  // Real-browser pass over the money fields (same puppeteer + CDP Fetch
+  // bridge as tests/screenshot.mjs). Skipped, with a note, when no probe
+  // browser is at hand — the HTTP assertions above still hold the line.
+  await req('POST', '/api/login', { username: 'admin', password: 'admin' });
+  let puppeteer = null;
+  try {
+    const { createRequire } = await import('node:module');
+    const reqmod = createRequire(import.meta.url);
+    try { puppeteer = reqmod('puppeteer-core'); } catch { puppeteer = reqmod('/tmp/pptr/node_modules/puppeteer-core'); }
+  } catch { puppeteer = null; }
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('money UI browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forward = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      // CDP hands the request body over as a plain string (NOT base64 —
+      // decoding it as such garbles every POST the page makes).
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginRes = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValue = loginRes.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browser = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+    try {
+      const page = await browser.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forward({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValue, domain: 'ff.local', path: '/', httpOnly: true });
+      const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+      const fieldVal = (sel) => page.evaluate((s) => { const el = document.querySelector(s); return el ? el.value : null; }, sel);
+      const focusField = (sel) => page.evaluate((s) => { const el = document.querySelector(s); el.focus(); if (el.select) el.select(); }, sel);
+
+      // Add a property typing a bare number: it must group live, and
+      // the server must store the plain number.
+      await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate(() => document.querySelector('#addPropertyBtn').click());
+      await wait(500);
+      await focusField('#addPropForm .address-input');
+      await page.keyboard.type('999 Money Test Terrace, Victoria, BC');
+      await focusField('#addPropForm [name=mortgage_balance]');
+      await page.keyboard.type('1350000');
+      const typedBalance = await fieldVal('#addPropForm [name=mortgage_balance]');
+      check('add-property balance groups while typing (1350000 -> 1,350,000)', typedBalance === '1,350,000', String(typedBalance));
+      await page.evaluate(() => {
+        const d = document.querySelector('#addPropForm [name=purchase_date]');
+        d.value = '2024-12-17';
+        d.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector('#addPropForm [type=submit]').click());
+      await wait(2500);
+      r = await req('GET', '/api/properties');
+      const moneyProp = (r.data || []).find((p) => p.address.includes('Money Test Terrace'));
+      check('typed grouped balance stored as the plain number 1350000',
+        !!moneyProp && moneyProp.mortgage_balance === 1350000, JSON.stringify(moneyProp && moneyProp.mortgage_balance));
+      const moneyPid = moneyProp.id;
+
+      // Reopening the record: the mortgage form shows the grouped figure.
+      await page.goto(`http://ff.local/#property/${moneyPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const editBalance = await fieldVal('#mortgageForm [name=mortgage_balance]');
+      check('edit form opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
+
+      // Paste a pre-grouped figure into monthly payment and save: it
+      // must reach the server as the plain number 2500.
+      await focusField('#mortgageForm [name=mortgage_payment]');
+      await client.send('Input.insertText', { text: '2,500' });
+      const pastedPayment = await fieldVal('#mortgageForm [name=mortgage_payment]');
+      check('pasted grouped payment displays grouped', pastedPayment === '2,500', String(pastedPayment));
+      await page.evaluate(() => document.querySelector('#mortgageForm [type=submit]').click());
+      await wait(1400);
+      r = await req('GET', `/api/properties/${moneyPid}`);
+      check('pasted payment stored as the plain number 2500', r.data.mortgage_payment === 2500, JSON.stringify(r.data.mortgage_payment));
+
+      // The manual assessed value on the same page opens grouped too,
+      // and so does a value-history point opened for editing. Both are
+      // written through the API, then the page is RELOADED (a goto to
+      // the same hash would be a no-op) so the forms prefill afresh.
+      await req('PUT', `/api/properties/${moneyPid}`, { assessed_value: 2100000, assessed_year: 2026 });
+      await req('POST', `/api/properties/${moneyPid}/value-history`, { year: 2025, value: 1950000 });
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const editAssessed = await fieldVal('#propForm [name=assessed_value]');
+      check('assessed value opens grouped on the detail form', editAssessed === '2,100,000', String(editAssessed));
+      r = await req('GET', `/api/properties/${moneyPid}/value-history`);
+      const pt2025 = (r.data.points || []).find((pt) => pt.year === 2025);
+      await page.evaluate((id) => window.editTrendPoint(id), pt2025.id);
+      await wait(300);
+      const editTrend = await fieldVal('#trendForm [name=value]');
+      check('trend point edit opens grouped', editTrend === '1,950,000', String(editTrend));
+
+      // Other assets get the same treatment: type bare, see grouped,
+      // stored plain; reopen the editor and it is grouped again.
+      await page.goto('http://ff.local/#assets/stocks', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate(() => window.openAssetModal(null, 'stocks'));
+      await wait(500);
+      await page.evaluate(() => { document.querySelector('#assetForm [name=name]').value = 'Money Test Stock'; });
+      await focusField('#assetForm [name=value]');
+      await page.keyboard.type('750000');
+      const typedAsset = await fieldVal('#assetForm [name=value]');
+      check('asset value groups while typing (750000 -> 750,000)', typedAsset === '750,000', String(typedAsset));
+      await page.evaluate(() => document.querySelector('#assetForm [type=submit]').click());
+      await wait(1400);
+      r = await req('GET', '/api/assets');
+      const moneyAsset = (r.data || []).find((a) => a.name === 'Money Test Stock');
+      check('asset value stored as the plain number 750000',
+        !!moneyAsset && moneyAsset.value === 750000, JSON.stringify(moneyAsset && moneyAsset.value));
+      await page.evaluate((id) => window.openAssetModal(id), moneyAsset.id);
+      await wait(800);
+      const editAsset = await fieldVal('#assetForm [name=value]');
+      check('asset edit opens with the grouped value', editAsset === '750,000', String(editAsset));
+
+      // And a pasted pre-grouped balance on the add-property form is
+      // stored as the plain number.
+      await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate(() => document.querySelector('#addPropertyBtn').click());
+      await wait(500);
+      await focusField('#addPropForm .address-input');
+      await page.keyboard.type('998 Money Test Terrace, Victoria, BC');
+      await focusField('#addPropForm [name=mortgage_balance]');
+      await client.send('Input.insertText', { text: '1,350,000' });
+      await page.evaluate(() => {
+        const d = document.querySelector('#addPropForm [name=purchase_date]');
+        d.value = '2024-12-17';
+        d.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector('#addPropForm [type=submit]').click());
+      await wait(2500);
+      r = await req('GET', '/api/properties');
+      const pastedProp = (r.data || []).find((p) => p.address.includes('998 Money Test Terrace'));
+      check('pasted grouped balance stored as the plain number 1350000',
+        !!pastedProp && pastedProp.mortgage_balance === 1350000, JSON.stringify(pastedProp && pastedProp.mortgage_balance));
+    } catch (err) {
+      // A UI hiccup must surface as failed checks, not crash the suite.
+      check('money UI browser flow runs to completion', false, String((err && err.message) || err));
+    }
+    } finally {
+      await browser.close();
+    }
+  }
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
