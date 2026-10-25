@@ -7,16 +7,16 @@ placeholder pages for later rounds.
 ## Assets module
 
 - **Properties** — address, photo (external URL or upload), BC Assessment
-  assessed value, mortgage balance, and any number of **rate segments**
+  assessed value, outstanding principal, and any number of **rate segments**
   (fixed / variable, each with its own start date and annual rate).
 - **Mortgage projection chart** — month-by-month **monthly interest** and
-  **remaining balance** lines (dual axis), with a selectable range
+  **outstanding principal** lines (dual axis), with a selectable range
   (1 / 2 / 5 / 10 years, all the way to payoff, or a custom number of
   months), the total interest in range and the projected payoff month.
 - **Other assets** — simple register by category: Fixed assets, Stocks,
   Term deposits, Other, with subtotals.
 - **Layout** — the Assets module has a persistent secondary menu:
-  **Overview** shows totals only (property value, mortgage balance, other
+  **Overview** shows totals only (property value, outstanding principal, other
   assets, net worth, plus per-category breakdown cards); each section
   (Properties / Fixed assets / Stocks / Term deposits / Other) shows only
   its own listing, an Add button that opens a modal form, and a detail

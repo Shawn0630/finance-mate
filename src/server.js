@@ -322,7 +322,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   // on the detail page.
   const balance = num(b.mortgage_balance);
   if (balance === null || balance < 0) {
-    return res.status(400).json({ error: 'mortgage balance (outstanding balance) is required' });
+    return res.status(400).json({ error: 'outstanding principal is required' });
   }
   // Purchase date is required when adding (the column itself stays
   // nullable for properties recorded before it existed). It is NOT the
@@ -644,7 +644,7 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'property not found' });
   const segments = segmentsOf(p.id);
   if (p.mortgage_balance === null || p.mortgage_balance === undefined || !(p.mortgage_balance > 0)) {
-    return res.json({ ok: false, error: 'no mortgage balance recorded for this property', segments });
+    return res.json({ ok: false, error: 'no outstanding principal recorded for this property', segments });
   }
   if (segments.length === 0) {
     return res.json({ ok: false, code: 'NO_RATE_PLAN', error: 'no rate plan yet', segments });
@@ -679,7 +679,7 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
 
 // Equity snapshot for the detail page: the latest assessed value (the
 // newest value-history point when there is one, else the value stored on
-// the property) minus the current outstanding balance. Either side may be
+// the property) minus the current outstanding principal. Either side may be
 // missing; the missing side comes back null and equity is null.
 app.get('/api/properties/:id/equity', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);

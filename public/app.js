@@ -273,7 +273,7 @@ async function loadAssets(force = false) {
     byCategory[a.category].total += Number(a.value || 0);
   }
   const breakdown = [
-    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · mortgages ${money(summary.mortgageBalance)}` },
+    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · principal ${money(summary.mortgageBalance)}` },
     ...ASSET_SECTIONS.filter((s) => s.category).map((s) => ({
       key: s.key, label: s.label,
       value: (byCategory[s.category] || { total: 0 }).total,
@@ -303,7 +303,7 @@ async function loadAssets(force = false) {
       <div class="body">
         <div class="addr">${esc(p.address)}</div>
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
-        <div class="kv"><span class="k">Mortgage balance</span><span>${money(p.mortgage_balance)}</span></div>
+        <div class="kv"><span class="k">Outstanding principal</span><span>${money(p.mortgage_balance)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
         ${p.owners && p.owners.length ? `<div class="kv"><span class="k">Owners</span><span>${ownerChipsHtml(p.owners)}</span></div>` : ''}
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
@@ -451,7 +451,7 @@ $('#addPropForm').addEventListener('submit', async (e) => {
 });
 
 // ---------------------------------------------------------- property detail ---
-let chartA = null; // combined chart: assessed value vs outstanding balance
+let chartA = null; // combined chart: assessed value vs outstanding principal
 let chartB = null; // monthly chart: interest vs payment
 let fullSeries = [];
 let chartMeta = null;
@@ -749,13 +749,13 @@ function renderEquity() {
   if (a.assessedValue !== null && a.balance !== null) {
     el.textContent =
       `Current equity: ${money(a.equity)} — latest assessed value ${money(a.assessedValue)}` +
-      `${a.assessedYear ? ` (${a.assessedYear})` : ''} minus outstanding balance ${money(a.balance)}.`;
+      `${a.assessedYear ? ` (${a.assessedYear})` : ''} minus outstanding principal ${money(a.balance)}.`;
   } else if (a.assessedValue !== null) {
-    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add an outstanding balance in the Mortgage panel to see the equity.`;
+    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in the Mortgage panel to see the equity.`;
   } else if (a.balance !== null) {
-    el.textContent = `Outstanding balance: ${money(a.balance)}. Fetch the assessed value from BC Assessment (or add a value-history point below) to see the equity.`;
+    el.textContent = `Outstanding principal: ${money(a.balance)}. Fetch the assessed value from BC Assessment (or add a value-history point below) to see the equity.`;
   } else {
-    el.textContent = 'Equity appears here once an assessed value and an outstanding balance are on record.';
+    el.textContent = 'Equity appears here once an assessed value and an outstanding principal is on record.';
   }
 }
 
@@ -785,7 +785,7 @@ function drawCombinedChart() {
     const pts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
       ...rows.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
     datasets.push({
-      label: 'Outstanding balance',
+      label: 'Outstanding principal',
       data: pts,
       borderColor: '#1668c4', backgroundColor: '#1668c4',
       tension: 0.15, pointRadius: 0, borderWidth: 2,

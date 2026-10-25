@@ -1,7 +1,7 @@
 // Screenshot + DOM verification for the reorganized detail-page charts.
 // Self-contained: spawns the server on a throwaway DATA_DIR, seeds one
 // property through the API (assessed history 2024-2026 ending at
-// 1,150,000; outstanding balance 900,000 -> equity must read $250,000),
+// 1,150,000; outstanding principal 900,000 -> equity must read $250,000),
 // then drives headless Chrome through the CDP Fetch bridge (this Chrome
 // build refuses direct loopback navigation) and reports the live chart
 // configs + equity text before taking the screenshots.
@@ -142,7 +142,7 @@ try {
   console.log('DOM check:', JSON.stringify(info, null, 1));
   const equityOk = info.equityText.includes('$250,000');
   const aOk = info.chartA && info.chartA.length === 2
-    && info.chartA[0].label === 'Assessed value' && info.chartA[1].label === 'Outstanding balance'
+    && info.chartA[0].label === 'Assessed value' && info.chartA[1].label === 'Outstanding principal'
     && info.chartA[0].color !== info.chartA[1].color;
   const bOk = info.chartB && info.chartB.length === 2
     && info.chartB[0].label === 'Monthly interest' && info.chartB[1].label.startsWith('Monthly payment')

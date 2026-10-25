@@ -336,14 +336,14 @@ try {
   r = await req('DELETE', `/api/properties/${pid3}`);
   check('delete rate-plan chain property', r.status === 200);
 
-  // Slim add: only address + owner + outstanding balance + purchase
+  // Slim add: only address + owner + outstanding principal + purchase
   // date. The balance date defaults to today (current-balance
   // semantics); payment and amortization stay empty for the detail page
   // to fill in, and with no rate plan yet the projection is the
   // NO_RATE_PLAN prompt state. Purchase date is required at add time
   // (the column itself stays nullable for older rows).
   r = await req('POST', '/api/properties', { address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'] });
-  check('add without balance rejected', r.status === 400 && String(r.data.error || '').includes('balance'), JSON.stringify(r.data));
+  check('add without balance rejected', r.status === 400 && String(r.data.error || '').includes('principal'), JSON.stringify(r.data));
   r = await req('POST', '/api/properties', {
     address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'], mortgage_balance: 123456,
   });
