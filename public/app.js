@@ -332,6 +332,14 @@ const ownerPickers = [addPropOwnerPicker, propOwnerPicker, assetOwnerPicker];
 // ------------------------------------------------------------- assets data ---
 let assetsLoaded = false;
 
+// Every mutation of property/asset data (add/edit, rate segments,
+// value-history points, payment schedule, BC Assessment fetch,
+// HouseSigma pull, prime refresh) must call this: the assets views
+// are cached after their first load, and without the dirty mark a
+// user who edits on the detail page comes back to totals and charts
+// that predate the edit until a manual reload.
+function markAssetsDirty() { assetsLoaded = false; }
+
 async function loadAssets(force = false) {
   if (assetsLoaded && !force) return;
   assetsLoaded = true;
@@ -457,7 +465,7 @@ $('#assetForm').addEventListener('submit', async (e) => {
     if (id) await api('/api/assets/' + id, { method: 'PUT', body: f });
     else await api('/api/assets', { method: 'POST', body: { ...f, category: assetModalCategory } });
     closeModalEl($('#assetModal'));
-    assetsLoaded = false;
+    markAssetsDirty();
     if (location.hash.startsWith('#asset/') && id) loadAssetDetail(Number(id));
     else loadAssets();
   } catch (err) { showMsg($('#assetModalMsg'), 'err', err.message); }
@@ -466,7 +474,7 @@ $('#assetForm').addEventListener('submit', async (e) => {
 async function deleteAsset(id) {
   if (!confirm('Delete this asset?')) return;
   await api(`/api/assets/${id}`, { method: 'DELETE' });
-  assetsLoaded = false;
+  markAssetsDirty();
   if (location.hash.startsWith('#asset/')) location.hash = '#assets/overview';
   else loadAssets();
 }
@@ -497,7 +505,7 @@ async function loadAssetDetail(id) {
   $('#deleteAssetBtn').onclick = async () => {
     if (!confirm('Delete this asset?')) return;
     await api('/api/assets/' + a.id, { method: 'DELETE' });
-    assetsLoaded = false;
+    markAssetsDirty();
     location.hash = '#assets/' + section;
   };
 }
@@ -526,7 +534,7 @@ $('#addPropForm').addEventListener('submit', async (e) => {
     const note = r.ok
       ? `Property added. BC Assessment value fetched: ${money(r.result.assessedValue)} (${r.result.assessedYear || 'current'}), matched "${r.result.matchedAddress}".`
       : `Property added. Automatic BC Assessment fetch did not succeed (${r.error}). You can enter the value manually on the detail page, or retry the fetch there.`;
-    assetsLoaded = false;
+    markAssetsDirty();
     if (location.hash === '#assets/properties') loadAssets();
     else location.hash = '#assets/properties';
     showMsg($('#sectionMsg'), r.ok ? 'ok' : 'warn', note);
@@ -576,12 +584,25 @@ async function loadPortfolio() {
   $('#pfPayment').textContent = money(t.monthlyPayment);
   $('#pfInterest').textContent = money(t.totalInterest);
   $('#pfInterestNote').textContent = t.interestFrom < t.propertyCount
-    ? `based on ${t.interestFrom} of ${t.propertyCount} properties with a rate plan`
+    ? `based on ${t.interestFrom} of ${t.propertyCount} properties`
     : `based on all ${t.propertyCount} properties`;
   const notes = [
     'Assessed totals carry each property’s most recent value forward — a property counts from its first known year.',
     'Outstanding bars stack up to the blue total line; a property joins the projection at its own balance date.',
   ];
+  // Say exactly which properties are missing from the projection and
+  // why — a rate plan alone does not project: without a payment (and
+  // no amortization to derive one from) there is nothing to simulate.
+  const propNoun = t.propertyCount === 1 ? 'property' : 'properties';
+  if (t.noPlanCount > 0) {
+    notes.push(`${t.noPlanCount} of ${t.propertyCount} ${propNoun} ${t.noPlanCount === 1 ? 'has' : 'have'} no rate plan — add rate segments on the property page to include ${t.noPlanCount === 1 ? 'it' : 'them'} in the projection.`);
+  }
+  if (t.planNoPaymentCount > 0) {
+    notes.push(`${t.planNoPaymentCount} of ${t.propertyCount} ${propNoun} ${t.planNoPaymentCount === 1 ? 'has' : 'have'} a rate plan but no projection — add a monthly payment or remaining amortization to project.`);
+  }
+  if (t.planNoPrimeCount > 0) {
+    notes.push(`${t.planNoPrimeCount} of ${t.propertyCount} ${propNoun} ${t.planNoPrimeCount === 1 ? 'is' : 'are'} priced off the prime rate, which is not on record yet — the projection starts once prime has been fetched.`);
+  }
   if (t.paymentKnownCount < t.propertyCount) {
     notes.push(`Monthly payment counts ${t.paymentKnownCount} of ${t.propertyCount} properties — the rest have no payment on file and count as $0.`);
   }
@@ -707,7 +728,11 @@ function drawPortfolioChart() {
       label: 'Assessed value (all properties)',
       data: assessedData,
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
+      // Assessed values are yearly steps, not a continuous quantity:
+      // a roll year's value holds flat all year and jumps at the next
+      // roll. A smoothed curve would invent a year-long slide between
+      // the two Januaries, so this line is stepped with no tension.
+      stepped: 'before', tension: 0, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
     });
   }
   if (rows.length) {
@@ -888,7 +913,7 @@ function renderSegments(segments) {
 async function deleteSegment(segId) {
   if (!confirm('Delete this rate segment?')) return;
   await api(`/api/properties/${currentPropertyId}/rates/${segId}`, { method: 'DELETE' });
-  assetsLoaded = false;
+  markAssetsDirty();
   loadPropertyDetail(currentPropertyId);
 }
 window.deleteSegment = deleteSegment;
@@ -901,7 +926,7 @@ $('#propForm').addEventListener('submit', async (e) => {
   f.owners = propOwnerPicker.get();
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
-    assetsLoaded = false;
+    markAssetsDirty();
     showMsg($('#detailMsg'), 'ok', 'Saved.');
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -913,7 +938,7 @@ $('#mortgageForm').addEventListener('submit', async (e) => {
   parseMoneyFields(f, ['mortgage_balance', 'mortgage_payment']);
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
-    assetsLoaded = false;
+    markAssetsDirty();
     showMsg($('#detailMsg'), 'ok', 'Mortgage saved.');
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -952,6 +977,7 @@ async function loadPrime() {
 $('#primeRefreshBtn').addEventListener('click', async () => {
   try {
     primeInfoCache = await api('/api/prime/refresh', { method: 'POST' });
+    markAssetsDirty(); // a new prime reprices every variable projection
     loadPrime();
     if (currentPropertyId) loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -1000,7 +1026,7 @@ $('#addSegmentForm').addEventListener('submit', async (e) => {
   }
   try {
     await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
-    assetsLoaded = false;
+    markAssetsDirty();
     e.target.reset();
     updateSegForm();
     loadPropertyDetail(currentPropertyId);
@@ -1036,6 +1062,7 @@ $('#paymentDayForm').addEventListener('submit', async (e) => {
         payment_day: raw === '' ? null : Number(raw),
       },
     });
+    markAssetsDirty();
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });
@@ -1046,7 +1073,7 @@ $('#fetchBcaBtn').addEventListener('click', async () => {
   try {
     const r = await api(`/api/properties/${currentPropertyId}/fetch-bca`, { method: 'POST' });
     if (r.ok) {
-      assetsLoaded = false;
+      markAssetsDirty();
       showMsg(msg, 'ok', `Fetched: assessed value ${money(r.result.assessedValue)} (${r.result.assessedYear || 'current'}), matched "${r.result.matchedAddress}".`);
       loadPropertyDetail(currentPropertyId);
     } else {
@@ -1061,7 +1088,7 @@ $('#pullHistoryBtn').addEventListener('click', async () => {
   try {
     const r = await api(`/api/properties/${currentPropertyId}/pull-history`, { method: 'POST' });
     if (r.ok) {
-      assetsLoaded = false;
+      markAssetsDirty();
       showMsg(msg, 'ok', r.added.length
         ? `Pulled from HouseSigma: added ${r.added.join(', ')} (${r.years.length} years on record there).`
         : 'HouseSigma history is already up to date — no new years to add.');
@@ -1086,6 +1113,7 @@ $('#photoFile').addEventListener('change', async (e) => {
     await api(`/api/properties/${currentPropertyId}/photo-upload`, {
       method: 'POST', body: { dataBase64, contentType: file.type },
     });
+    markAssetsDirty();
     showMsg($('#detailMsg'), 'ok', 'Photo uploaded.');
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
@@ -1094,7 +1122,7 @@ $('#photoFile').addEventListener('change', async (e) => {
 $('#deletePropertyBtn').addEventListener('click', async () => {
   if (!confirm('Delete this property, its rate segments and its photo?')) return;
   await api(`/api/properties/${currentPropertyId}`, { method: 'DELETE' });
-  assetsLoaded = false;
+  markAssetsDirty();
   location.hash = '#assets/properties';
 });
 
@@ -1173,6 +1201,7 @@ window.editTrendPoint = editTrendPoint;
 async function deleteTrendPoint(pointId) {
   if (!confirm('Delete this history point?')) return;
   await api(`/api/properties/${currentPropertyId}/value-history/${pointId}`, { method: 'DELETE' });
+  markAssetsDirty();
   resetTrendForm();
   loadTrend(currentPropertyId);
 }
@@ -1188,6 +1217,7 @@ $('#trendForm').addEventListener('submit', async (e) => {
     } else {
       await api(`/api/properties/${currentPropertyId}/value-history`, { method: 'POST', body: f });
     }
+    markAssetsDirty();
     resetTrendForm();
     loadTrend(currentPropertyId);
   } catch (err) { showMsg($('#trendMsg'), 'err', err.message); }
@@ -1369,6 +1399,23 @@ function drawCombinedChart() {
   if (!ctx) return;
   if (chartA) { chartA.destroy(); chartA = null; }
   window.__fmCharts.a = null;
+  // When the projection cannot be computed, say so right at this
+  // chart (the assessed line still draws) instead of leaving a
+  // silently missing blue line. Chart B shows the same state above
+  // its own canvas.
+  const cmsg = $('#combinedMsg');
+  if (cmsg) {
+    if (amortError && amortError.code === 'NO_RATE_PLAN') {
+      showMsg(cmsg, 'warn', 'No projection yet — add a rate segment in the Rate segments panel above, and the outstanding-principal line will be projected from it.');
+    } else if (amortError && amortError.code === 'NO_PAYMENT') {
+      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — add a monthly payment or remaining amortization in the Mortgage panel above to project it.');
+    } else if (amortError) {
+      showMsg(cmsg, 'warn', amortError.error);
+    } else {
+      cmsg.className = 'msg';
+      cmsg.textContent = '';
+    }
+  }
   const datasets = [];
   const months = currentRangeMonths();
   const shownYears = [];
@@ -1384,7 +1431,9 @@ function drawCombinedChart() {
       label: 'Assessed value',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
+      // Stepped, like the portfolio line: the year's value holds flat
+      // until the next assessment year — never a smoothed slide.
+      stepped: 'before', tension: 0, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
     });
   }
   if (chartMeta && fullSeries.length) {
@@ -1526,7 +1575,7 @@ let adminUsersById = {};
 async function refreshAvatarConsumers(changedUserId) {
   // Avatars flow from the users table; refresh the places that render
   // them so a change made here is visible without a full reload.
-  assetsLoaded = false;
+  markAssetsDirty();
   await loadOwnerUsers();
   ownerPickers.forEach((p) => p.refresh());
   try {

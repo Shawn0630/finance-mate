@@ -481,6 +481,18 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     }
     assessedPoints.set(p.id, points);
     const latestAssessed = points.length ? points[points.length - 1].value : (p.assessed_value ?? null);
+    // Projection state, so the overview can say exactly WHY a property
+    // is (not) inside the projected interest instead of folding every
+    // gap into one vague "with a rate plan" count: no rate plan / a
+    // plan but nothing to compute a payment from / priced off a prime
+    // rate that is not on record / projected.
+    let projState = 'no_balance';
+    if (balance > 0) {
+      if (!segments.length) projState = 'no_plan';
+      else if (primeBlocked) projState = 'no_prime';
+      else if (!(monthlyPayment > 0)) projState = 'no_payment';
+      else projState = 'projected';
+    }
     perProperty.push({
       id: p.id,
       label: p.address,
@@ -489,6 +501,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       monthlyPayment: monthlyPayment > 0 ? monthlyPayment : 0,
       paymentKnown: monthlyPayment > 0,
       hasPlan: segments.length > 0,
+      projState,
       projectedInterest,
       latestAssessed,
     });
@@ -545,6 +558,9 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       totalInterest: r2(perProperty.reduce((s, x) => s + (x.projectedInterest || 0), 0)),
       interestFrom,
       withPlan,
+      noPlanCount: perProperty.filter((x) => x.projState === 'no_plan').length,
+      planNoPaymentCount: perProperty.filter((x) => x.projState === 'no_payment').length,
+      planNoPrimeCount: perProperty.filter((x) => x.projState === 'no_prime').length,
       propertyCount: perProperty.length,
       paymentKnownCount: perProperty.filter((x) => x.paymentKnown).length,
       assessedTotal: totalAssessed,

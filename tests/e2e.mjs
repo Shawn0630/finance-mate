@@ -818,6 +818,50 @@ try {
   await req('DELETE', `/api/properties/${pidPB}`);
   await req('DELETE', `/api/properties/${pidPC}`);
 
+  // ------------------------------------------- projection states --
+  // The portfolio must say WHY a property is missing from the
+  // projected interest, in three distinct states. The fixture mirrors
+  // a real first run: a balance and one variable prime-spread segment
+  // (2024-12-17, prime - 1), but NEITHER a monthly payment NOR an
+  // amortization — a rate plan alone cannot project (NO_PAYMENT).
+  const portStates0 = (await req('GET', '/api/properties/portfolio')).data;
+  r = await req('POST', '/api/properties', {
+    address: '44 State Test Crescent, Victoria, BC',
+    mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25',
+    purchase_date: '2024-12-17',
+  });
+  const pidState = r.data.id;
+  let portS = (await req('GET', '/api/properties/portfolio')).data;
+  let rowS = portS.properties.find((x) => x.id === pidState);
+  check('portfolio state: balance with no rate segments is no_plan',
+    !!rowS && rowS.projState === 'no_plan'
+      && portS.totals.noPlanCount === (portStates0.totals.noPlanCount || 0) + 1,
+    JSON.stringify(rowS && rowS.projState));
+  await req('POST', `/api/properties/${pidState}/rates`, {
+    start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+  });
+  const amortState = (await req('GET', `/api/properties/${pidState}/amortization`)).data;
+  check('a plan with neither payment nor amortization reports NO_PAYMENT',
+    !amortState.ok && amortState.code === 'NO_PAYMENT', JSON.stringify(amortState.code));
+  portS = (await req('GET', '/api/properties/portfolio')).data;
+  rowS = portS.properties.find((x) => x.id === pidState);
+  check('portfolio state: plan but no payment is no_payment, contributing no interest',
+    !!rowS && rowS.projState === 'no_payment'
+      && portS.totals.planNoPaymentCount === (portStates0.totals.planNoPaymentCount || 0) + 1
+      && portS.totals.interestFrom === portStates0.totals.interestFrom
+      && Math.abs(portS.totals.totalInterest - portStates0.totals.totalInterest) <= 0.02,
+    JSON.stringify({ state: rowS && rowS.projState, totals: portS.totals }));
+  await req('PUT', `/api/properties/${pidState}`, { mortgage_payment: 5000 });
+  const amortState2 = (await req('GET', `/api/properties/${pidState}/amortization`)).data;
+  portS = (await req('GET', '/api/properties/portfolio')).data;
+  rowS = portS.properties.find((x) => x.id === pidState);
+  check('portfolio state: adding a payment flips it to projected and its interest joins the total',
+    !!rowS && rowS.projState === 'projected' && amortState2.ok === true
+      && portS.totals.interestFrom === portStates0.totals.interestFrom + 1
+      && Math.abs(portS.totals.totalInterest - (portStates0.totals.totalInterest + amortState2.totalInterest)) <= 0.05,
+    JSON.stringify({ state: rowS && rowS.projState, interest: amortState2.totalInterest }));
+  await req('DELETE', `/api/properties/${pidState}`);
+
   // ------------------------------------------------------------ prime ---
   r = await req('GET', '/api/prime');
   check('fetch-on-read stored the stub prime with its as-of date',
@@ -1266,6 +1310,93 @@ try {
       check('portfolio All axis is the exact data extent (2019 to the last projected month)',
         !!pax && pax.min === 2019 && pax.max === pax.dataMax,
         JSON.stringify(pax && { min: pax.min, max: pax.max, dataMax: pax.dataMax }));
+
+      // The user's real shape: five assessed years (2022-2026) and
+      // one variable prime-spread segment, but NO monthly payment and
+      // NO amortization. The assessed line must render as year steps
+      // (a smoothed curve would smear the 2025 value down across the
+      // whole year toward 2026), the missing projection must be
+      // announced beside the chart, and after an edit on this page
+      // the portfolio must show fresh numbers without a reload.
+      r = await req('POST', '/api/properties', {
+        address: '966 Step Test Place, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
+      });
+      const stepPid = r.data.id;
+      const stepVals = { 2022: 1730000, 2023: 1903000, 2024: 1955000, 2025: 2002000, 2026: 1931000 };
+      for (const [y, v] of Object.entries(stepVals)) {
+        await req('POST', `/api/properties/${stepPid}/value-history`, { year: Number(y), value: v });
+      }
+      await req('POST', `/api/properties/${stepPid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+      });
+      await page.goto(`http://ff.local/#property/${stepPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const stepCfg = await page.evaluate(() => {
+        const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Assessed value');
+        return ds ? { stepped: ds.stepped, tension: ds.tension } : null;
+      });
+      check('detail assessed line is stepped with zero tension',
+        !!stepCfg && stepCfg.stepped === 'before' && stepCfg.tension === 0, JSON.stringify(stepCfg));
+      const combMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
+      check('detail chart A announces the missing payment beside the chart (NO_PAYMENT)',
+        combMsg.includes('add a monthly payment or remaining amortization'), combMsg);
+      // Pixel-level proof of the step: scan the canvas column at
+      // mid-2025 (x = 2025.5, inside the chart area only, so neither
+      // the legend swatch nor the year-point markers can interfere)
+      // for the assessed line's green; the value found there must be
+      // the 2025 value itself — a smoothed curve would read roughly
+      // halfway down toward 2026 (~1,966,500).
+      const scanStep = await page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        if (!c) return null;
+        c.update('none');
+        const canvas = c.canvas;
+        const dpr = canvas.width / c.width;
+        const xPix = Math.min(canvas.width - 1, Math.max(0, Math.round(c.scales.x.getPixelForValue(2025.5) * dpr)));
+        const top = Math.floor(c.chartArea.top * dpr);
+        const bottom = Math.min(canvas.height, Math.ceil(c.chartArea.bottom * dpr));
+        const img = canvas.getContext('2d').getImageData(xPix, top, 1, bottom - top).data;
+        const ys = [];
+        for (let y = top; y < bottom; y++) {
+          const o = (y - top) * 4;
+          if (img[o + 3] > 200 && Math.abs(img[o] - 46) < 30 && Math.abs(img[o + 1] - 125) < 30 && Math.abs(img[o + 2] - 79) < 30) ys.push(y);
+        }
+        if (!ys.length) return null;
+        return { value: c.scales.y.getValueForPixel(ys[Math.floor(ys.length / 2)] / dpr), hits: ys.length };
+      });
+      check('detail assessed line holds the 2025 value at mid-2025 (step, no interpolated slide)',
+        !!scanStep && Math.abs(scanStep.value - 2002000) < 10000, JSON.stringify(scanStep));
+
+      // Edit a value point through THIS page's own form (the trend
+      // form used to leave the assets cache untouched), then go back
+      // to Properties by hash only — no reload. The dirty mark must
+      // make the section refetch: the new property (created after the
+      // section's last load) and the portfolio notes must be current.
+      await focusField('#trendForm [name=year]');
+      await page.keyboard.type('2021');
+      await focusField('#trendForm [name=value]');
+      await page.keyboard.type('1600000');
+      await page.evaluate(() => document.querySelector('#trendSubmitBtn').click());
+      await wait(1400);
+      await page.evaluate(() => { location.hash = '#assets/properties'; });
+      await wait(1800);
+      const cardsText = await page.evaluate(() => document.querySelector('#propertyCards').textContent);
+      check('after a detail-page edit, returning to Properties refetches (no stale cache)',
+        cardsText.includes('966 Step Test Place'), cardsText.slice(0, 120));
+      const pfNotesText = await page.evaluate(() => document.querySelector('#pfNotes').textContent);
+      check('portfolio notes name the missing payment for a planned-but-unprojected property',
+        pfNotesText.includes('add a monthly payment or remaining amortization to project'), pfNotesText);
+      const pfIntNote = await page.evaluate(() => document.querySelector('#pfInterestNote').textContent);
+      check('portfolio interest note no longer hides the gap behind "with a rate plan"',
+        !pfIntNote.includes('with a rate plan') && pfIntNote.includes('based on'), pfIntNote);
+      const pfStepCfg = await page.evaluate(() => {
+        const c = window.__fmCharts.portfolio;
+        const ds = c ? c.data.datasets.find((d) => d.label === 'Assessed value (all properties)') : null;
+        return ds ? { stepped: ds.stepped, tension: ds.tension } : null;
+      });
+      check('portfolio assessed line is stepped with zero tension',
+        !!pfStepCfg && pfStepCfg.stepped === 'before' && pfStepCfg.tension === 0, JSON.stringify(pfStepCfg));
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));
