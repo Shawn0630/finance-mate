@@ -471,9 +471,22 @@ window.__fmCharts = window.__fmCharts || {};
 window.__fmCharts.pie = null;
 window.__fmCharts.portfolio = null;
 
+// Stale-prime warning (amber): shown when projections were
+// computed with the last known prime because today's fetch failed.
+function renderPrimeWarning(el, status) {
+  if (!el) return;
+  if (status && status.rate != null && status.fresh === false) {
+    el.textContent = `Couldn't reach the Bank of Canada — projections below use the last known prime of ${Number(status.rate).toFixed(2)}% from ${status.asOf || 'an earlier date'}.`;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
 async function loadPortfolio() {
   const block = $('#portfolioBlock');
   portfolioData = await api('/api/properties/portfolio');
+  renderPrimeWarning($('#pfPrimeWarning'), portfolioData && portfolioData.prime);
   if (!portfolioData || !portfolioData.totals.propertyCount) {
     block.classList.add('hidden');
     return;
@@ -702,6 +715,7 @@ async function loadPropertyDetail(id) {
     : (p.payment_day ? `Payment day: the ${ordinal(p.payment_day)} of each month.` : 'Payment day: not set.');
   $('#paymentDayDisplay').textContent =
     `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in the Rate segments panel below.`;
+  $('#regionDisplay').textContent = `Region: ${p.region === 'CA' || !p.region ? 'Canada (CA)' : esc(p.region)}.`;
   pf.photo_url.value = p.photo_url || '';
   $('#assessmentMeta').textContent =
     p.assessed_source === 'auto'
@@ -715,18 +729,31 @@ async function loadPropertyDetail(id) {
   mf.mortgage_payment.value = p.mortgage_payment ?? '';
   mf.amortization_years.value = p.amortization_years ?? '';
   renderSegments(p.segments);
+  loadPrime();
   loadChart(id);
   loadTrend(id);
   loadEquity(id);
+}
+
+// How a segment's rate reads in the list: absolute segments show
+// their rate; prime-spread segments show the pricing formula and
+// the rate it resolves to right now.
+function segmentRateText(s) {
+  if (s.rate_type === 'variable' && s.rate_mode === 'prime_spread') {
+    const sp = Number(s.spread || 0);
+    const formula = `Prime ${sp < 0 ? '−' : '+'} ${Math.abs(sp).toFixed(2)}%`;
+    return s.effective_rate == null ? `${formula} (prime unavailable)` : `${formula} (now ${Number(s.effective_rate).toFixed(2)}%)`;
+  }
+  return `${Number(s.effective_rate ?? s.annual_rate).toFixed(2)}%`;
 }
 
 function renderSegments(segments) {
   $('#segmentRows').innerHTML = segments.map((s) => `<tr>
     <td>${esc(s.start_date)}</td>
     <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}</td>
-    <td class="num">${Number(s.annual_rate).toFixed(2)}</td>
+    <td class="num">${esc(segmentRateText(s))}</td>
     <td><button class="small danger" onclick="deleteSegment(${s.id})">Delete</button></td></tr>`).join('')
-    || '<tr><td colspan="4" class="note" style="margin:0">No segments yet — the projection runs at 0% until one is added.</td></tr>';
+    || '<tr><td colspan="4" class="note" style="margin:0">No segments yet — add a rate plan to project this mortgage.</td></tr>';
 }
 
 async function deleteSegment(segId) {
@@ -761,13 +788,90 @@ $('#mortgageForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });
 
+// ---- Prime rate (Bank of Canada, tracked by the server) ----------
+// The banner states the current prime with its real as-of date and
+// the projection assumption; the add-segment form previews a
+// prime-spread against the same value.
+let primeInfoCache = null;
+
+async function loadPrime() {
+  try {
+    primeInfoCache = await api('/api/prime');
+  } catch { primeInfoCache = null; }
+  const banner = $('#primeBanner');
+  const changesEl = $('#primeChanges');
+  if (!banner) return;
+  const cur = primeInfoCache && primeInfoCache.current;
+  renderPrimeWarning($('#primeWarning'), primeInfoCache
+    ? { rate: cur ? cur.rate : null, asOf: primeInfoCache.asOf, fresh: primeInfoCache.fresh }
+    : null);
+  if (cur) {
+    banner.textContent = `Bank of Canada prime: ${Number(cur.rate).toFixed(2)}% (as of ${primeInfoCache.asOf || cur.date}). Variable-rate projections assume prime stays at ${Number(cur.rate).toFixed(2)}%.`;
+    const changes = primeInfoCache.changes || [];
+    changesEl.textContent = changes.length > 1
+      ? 'Recent: ' + changes.map((c) => `${Number(c.rate).toFixed(2)}% from ${c.date}`).join(' · ')
+      : '';
+  } else {
+    banner.textContent = 'Bank of Canada prime: not available yet — the app fetches it from the Bank of Canada and keeps the last known value. Prime-based variable segments cannot be projected until a value is on record.';
+    changesEl.textContent = '';
+  }
+  updateSegForm();
+}
+
+$('#primeRefreshBtn').addEventListener('click', async () => {
+  try {
+    primeInfoCache = await api('/api/prime/refresh', { method: 'POST' });
+    loadPrime();
+    if (currentPropertyId) loadPropertyDetail(currentPropertyId);
+  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+});
+
+// The add-segment form: Variable reveals the pricing mode; Prime +
+// spread swaps the absolute-rate input for a spread input with a
+// live preview against the tracked prime.
+function updateSegForm() {
+  const form = $('#addSegmentForm');
+  if (!form) return;
+  const isVariable = form.rate_type.value === 'variable';
+  const isPrime = isVariable && form.rate_mode.value === 'prime_spread';
+  $('#segModeWrap').classList.toggle('hidden', !isVariable);
+  $('#segRateWrap').classList.toggle('hidden', isPrime);
+  $('#segSpreadWrap').classList.toggle('hidden', !isPrime);
+  form.annual_rate.required = !isPrime;
+  const preview = $('#segSpreadPreview');
+  if (isPrime) {
+    const spread = Number(form.spread.value);
+    const cur = primeInfoCache && primeInfoCache.current;
+    if (cur && form.spread.value !== '' && isFinite(spread)) {
+      const eff = Math.max(0, Number(cur.rate) + spread);
+      preview.textContent = `Prime ${Number(cur.rate).toFixed(2)}% ${spread < 0 ? '−' : '+'} ${Math.abs(spread).toFixed(2)}% → ${eff.toFixed(2)}%`;
+    } else if (!cur) {
+      preview.textContent = 'Prime rate not available yet.';
+    } else {
+      preview.textContent = '';
+    }
+  }
+}
+$('#addSegmentForm').rate_type.addEventListener('change', updateSegForm);
+$('#addSegmentForm').rate_mode.addEventListener('change', updateSegForm);
+$('#addSegmentForm').spread.addEventListener('input', updateSegForm);
+
 $('#addSegmentForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
+  const body = { start_date: f.start_date, rate_type: f.rate_type };
+  if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
+    body.rate_mode = 'prime_spread';
+    body.spread = f.spread === '' ? null : Number(f.spread);
+  } else {
+    body.rate_mode = 'absolute';
+    body.annual_rate = f.annual_rate;
+  }
   try {
-    await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body: f });
+    await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
     assetsLoaded = false;
     e.target.reset();
+    updateSegForm();
     loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });

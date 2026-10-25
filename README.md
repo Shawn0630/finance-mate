@@ -133,10 +133,43 @@ Canadian convention: quoted rates are nominal with semi-annual compounding,
 so the monthly rate is `i = (1 + r/2)^(1/6) − 1`. Each projected month:
 interest = balance × (that month's rate-segment rate), principal = payment
 − interest. The monthly payment stored on the property wins; if empty, the
-payment is derived from the remaining amortization years. Variable rates
-are projected at the value entered — in reality they will change. If the
-payment is below the monthly interest, the chart area shows a
-negative-amortization warning and the balance grows accordingly.
+payment is derived from the remaining amortization years. If the payment is
+below the monthly interest, the chart area shows a negative-amortization
+warning and the balance grows accordingly.
+
+Variable segments can be priced two ways: as an absolute rate, or
+relative to prime ("Prime + spread", e.g. Prime − 1). The app tracks
+the Bank of Canada prime lending rate itself (Valet series
+V80691311; history is kept in the `prime_rates` table). Freshness is
+fetch-on-read: a projection or property request first makes sure
+prime was successfully fetched today (America/Vancouver) — if not,
+it pulls once inline (single-flight, short timeout) and computes
+with the new value. If the Bank of Canada is unreachable, the last
+known value is used instead, the API response flags it
+(`prime: { rate, asOf, fresh: false }`), and the page shows an amber
+warning naming the rate and date in use. A manual Refresh button
+sits in the Rate segments panel. A prime-priced segment always
+resolves against the latest stored prime, floored at 0%, and
+projections hold prime constant — the detail page states the value
+and its as-of date.
+
+## Regions
+
+Region-specific logic sits behind one thin interface in
+`src/regions/` (`getRegion(code)` returns the region's
+implementation). Only Canada (`CA`) is implemented and accepted for
+now — properties carry a `region` column defaulting to `CA`, and the
+API refuses other values. A region implementation provides:
+
+- `periodRate(annualRate, periodsPerYear)` — the interest convention
+  (Canada: nominal rate, semi-annual compounding,
+  `(1 + r/2)^(2/N) − 1`; the engine never hardcodes it)
+- the prime-rate source and fetch (Canada: Bank of Canada Valet)
+- the assessment provider (Canada: BC Assessment, via `src/bca.js`)
+
+To support a new region later (e.g. a US state), add one module
+implementing those three pieces and register it in
+`src/regions/index.js` — no engine or API changes.
 
 ## Tests
 
@@ -150,6 +183,9 @@ node tests/screenshot.mjs   # screenshots to tests/.work-shot (server on :9200)
 
 - `src/server.js` — Express app, auth, REST API
 - `src/engine.js` — mortgage projection (pure functions)
+- `src/regions/` — region interface + the Canada implementation
+  (interest convention, prime source, assessment provider)
+- `src/prime.js` — prime-rate storage and refresh policy
 - `src/bca.js` — BC Assessment fetcher
 - `src/db.js` — SQLite schema and seed user
 - `public/` — frontend (plain JS, Chart.js vendored under `public/vendor/`)

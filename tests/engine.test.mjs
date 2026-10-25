@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, segmentForMonth, periodicRate, periodPaymentFor } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -188,4 +188,25 @@ test('simulate: a later segment changes the rate mid-stream', () => {
   assert.equal(r.series[0].rate, 6); // 2026-02
   assert.equal(r.series[2].rate, 3); // 2026-04
   assert.equal(r.series[2].rateType, 'variable');
+});
+
+test('prime-spread segments resolve against the current prime', () => {
+  const seg = { rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 };
+  // The reporting anchor: prime 4.95 with a -1 spread is a 3.95% rate.
+  assert.equal(segmentAnnualRate(seg, 4.95), 3.95);
+  // Floored at zero, and null when no prime is known.
+  assert.equal(segmentAnnualRate({ ...seg, spread: -1 }, 0.5), 0);
+  assert.equal(segmentAnnualRate(seg, null), null);
+  // Absolute segments (and rows that predate rate_mode) ignore prime.
+  assert.equal(segmentAnnualRate({ rate_type: 'variable', annual_rate: 6.1 }, 4.95), 6.1);
+  assert.equal(segmentAnnualRate({ rate_type: 'fixed', annual_rate: 5 }, 4.95), 5);
+  // First month's interest at the resolved rates, hand-checked:
+  // $100,000 x monthlyRate(3.95%) = $326.49; at 4.45% = $367.44.
+  const segRow = { start_date: '2026-01-01', ...seg };
+  const at495 = simulate({ balance: 100000, balanceDate: '2026-10-01', payment: 600, segments: [segRow], primeRate: 4.95 });
+  assert.equal(at495.series[0].interest, 326.49);
+  // When prime moves, the same segment projects differently.
+  const at545 = simulate({ balance: 100000, balanceDate: '2026-10-01', payment: 600, segments: [segRow], primeRate: 5.45 });
+  assert.equal(at545.series[0].interest, 367.44);
+  assert.ok(at545.totalInterest > at495.totalInterest);
 });

@@ -7,8 +7,13 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
-import { simulate, derivePayment, segmentForMonth, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
-import { fetchAssessment, suggestAddresses } from './bca.js';
+import { simulate, derivePayment, segmentForMonth, segmentAnnualRate, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
+import { getRegion, REGION_CODES } from './regions/index.js';
+import { getCurrentPrime, ensureFreshPrime, refreshPrime, primeInfo, primeStatus } from './prime.js';
+
+// Region-specific providers (assessment search/fetch) are reached
+// through the region implementation, never directly.
+const assessmentFor = (regionCode) => (getRegion(regionCode) || getRegion('CA')).assessment;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -259,7 +264,7 @@ app.get('/api/address/suggest', requireApiAuth, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (q.length < 4) return res.json({ suggestions: [] });
   try {
-    const suggestions = await suggestAddresses(q);
+    const suggestions = await assessmentFor('CA').suggestAddresses(q);
     res.json({ suggestions });
   } catch (e) {
     res.json({ suggestions: [], sourceError: true, note: e.message });
@@ -292,14 +297,30 @@ function currentSegment(segments) {
   return segmentForMonth(segments, today);
 }
 
+// A segment as the API serves it: with its pricing mode normalized
+// (rows from before prime pricing read as 'absolute') and the rate
+// it effectively carries right now (prime-spread segments resolve
+// against the current prime; null when no prime is known).
+function segmentView(seg) {
+  const prime = getCurrentPrime();
+  return {
+    ...seg,
+    rate_mode: seg.rate_mode || 'absolute',
+    effective_rate: segmentAnnualRate(seg, prime ? prime.rate : null),
+  };
+}
+
 function propertyView(p) {
-  const segments = segmentsOf(p.id);
+  const segments = segmentsOf(p.id).map(segmentView);
   const cur = currentSegment(segments);
   return {
     ...p,
     owners: parseOwners(p.owners),
     segments,
-    currentRate: cur ? { rate_type: cur.rate_type, annual_rate: cur.annual_rate, start_date: cur.start_date } : null,
+    currentRate: cur ? {
+      rate_type: cur.rate_type, annual_rate: cur.effective_rate,
+      rate_mode: cur.rate_mode, spread: cur.spread ?? null, start_date: cur.start_date,
+    } : null,
   };
 }
 
@@ -307,7 +328,8 @@ function assetView(a) {
   return { ...a, owners: parseOwners(a.owners) };
 }
 
-app.get('/api/properties', requireApiAuth, (req, res) => {
+app.get('/api/properties', requireApiAuth, async (req, res) => {
+  await ensureFreshPrime(); // segment effective rates resolve against prime
   const rows = db.prepare('SELECT * FROM properties ORDER BY id').all();
   res.json(rows.map(propertyView));
 });
@@ -334,6 +356,12 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   if (!isDateStr(b.purchase_date)) {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
   }
+  // Region: only Canada is implemented for now (src/regions/); the
+  // column exists so properties are ready when that changes.
+  if (b.region !== undefined && b.region !== null && b.region !== ''
+    && !REGION_CODES.includes(String(b.region).toUpperCase())) {
+    return res.status(400).json({ error: 'only region CA (Canada) is supported for now' });
+  }
   const bcaId = b.bca_id ? String(b.bca_id) : null;
   const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
   if (own.error) return res.status(400).json({ error: own.error });
@@ -341,8 +369,8 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
          mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
-         notes, bca_id, bca_matched_address, owners, purchase_date, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         notes, bca_id, bca_matched_address, owners, purchase_date, region, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       String(b.address).trim(),
@@ -360,6 +388,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       bcaId ? String(b.address).trim() : null,
       JSON.stringify(own.value ?? []),
       b.purchase_date,
+      'CA',
       nowIso(),
       nowIso()
     );
@@ -377,11 +406,14 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
 // the rate plan and the remaining amortization (as in the
 // amortization endpoint); a property with no rate plan contributes
 // its balance and payment but no interest and no projection.
-app.get('/api/properties/portfolio', requireApiAuth, (req, res) => {
+app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
+  await ensureFreshPrime();
   const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
   const today = new Date().toISOString().slice(0, 10);
   const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
 
+  const prime = getCurrentPrime();
+  const primeRate = prime ? prime.rate : null;
   const perProperty = [];
   const monthMaps = new Map(); // property id -> Map('YYYY-MM' -> balance)
   const assessedPoints = new Map(); // property id -> [{ year, value }] sorted
@@ -399,13 +431,20 @@ app.get('/api/properties/portfolio', requireApiAuth, (req, res) => {
       monthlyPayment = p.mortgage_payment;
     } else if (balance > 0 && segments.length && p.amortization_years > 0) {
       const seg = segmentForMonth(segments, balanceDate.slice(0, 7));
-      monthlyPayment = derivePayment(balance, seg ? seg.annual_rate : 0, p.amortization_years);
+      const segRate = segmentAnnualRate(seg, primeRate);
+      // Null = a prime-spread segment with no prime on record: no
+      // honest payment can be derived, so the property contributes
+      // its balance only (same treatment as the NO_PRIME state).
+      if (segRate !== null) monthlyPayment = derivePayment(balance, segRate, p.amortization_years);
     }
     let projectedInterest = null;
     if (balance > 0 && segments.length) withPlan++;
-    if (balance > 0 && segments.length && monthlyPayment > 0) {
+    // Prime-spread segments with no prime on record cannot project.
+    const primeBlocked = primeRate === null
+      && segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread');
+    if (balance > 0 && segments.length && monthlyPayment > 0 && !primeBlocked) {
       const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
-      const r = simulate({ balance, balanceDate, payment: monthlyPayment, segments, paymentDay: p.payment_day ?? null, frequency });
+      const r = simulate({ balance, balanceDate, payment: monthlyPayment, segments, paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA' });
       projectedInterest = r.totalInterest;
       interestFrom++;
       const map = new Map();
@@ -501,13 +540,15 @@ app.get('/api/properties/portfolio', requireApiAuth, (req, res) => {
     },
     assessedByYear,
     outstandingByMonth,
+    prime: primeStatus(),
   });
 });
 
-app.get('/api/properties/:id', requireApiAuth, (req, res) => {
+app.get('/api/properties/:id', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  res.json(propertyView(p));
+  await ensureFreshPrime();
+  res.json({ ...propertyView(p), prime: primeStatus() });
 });
 
 app.put('/api/properties/:id', requireApiAuth, (req, res) => {
@@ -543,7 +584,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     // Payment frequency is edited from the rate-plan area too; NULL in
     // the database (rows that predate it) means 'monthly'.
     payment_frequency: p.payment_frequency ?? null,
+    region: p.region || 'CA',
   };
+  if (b.region !== undefined && b.region !== null && b.region !== ''
+    && !REGION_CODES.includes(String(b.region).toUpperCase())) {
+    return res.status(400).json({ error: 'only region CA (Canada) is supported for now' });
+  }
+  if (b.region) next.region = String(b.region).toUpperCase();
   if (b.purchase_date !== undefined && b.purchase_date && !isDateStr(b.purchase_date)) {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
   }
@@ -581,13 +628,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
-       owners=?, purchase_date=?, payment_day=?, payment_frequency=?, updated_at=? WHERE id=?`
+       owners=?, purchase_date=?, payment_day=?, payment_frequency=?, region=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
     next.amortization_years, next.notes, JSON.stringify(next.owners), next.purchase_date,
-    next.payment_day, next.payment_frequency, nowIso(), p.id
+    next.payment_day, next.payment_frequency, next.region, nowIso(), p.id
   );
   res.json(propertyView(getProperty(p.id)));
 });
@@ -611,7 +658,7 @@ app.post('/api/properties/:id/fetch-bca', requireApiAuth, async (req, res) => {
     // carries the BC Assessment property id: go straight to its page
     // instead of running the fuzzy address search again.
     const direct = p.bca_id ? { id: p.bca_id, label: p.bca_matched_address || p.address } : undefined;
-    const r = await fetchAssessment(p.address, direct);
+    const r = await assessmentFor(p.region).fetchAssessment(p.address, direct);
     db.prepare(
       `UPDATE properties SET assessed_value=?, assessed_year=?, land_value=?, building_value=?,
          assessed_source='auto', assessed_fetched_at=?, bca_matched_address=?, bca_extract_date=?,
@@ -749,39 +796,79 @@ app.delete('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, r
 });
 
 // ---------------------------------------------------------- rate segments ---
+// Validate/normalize a rate segment from request fields merged over
+// an existing row (PUT) or from scratch (POST, base = null). Pricing
+// modes: fixed is always absolute; variable is either 'absolute'
+// (a stored annual rate) or 'prime_spread' (priced off the current
+// prime: prime + spread, e.g. spread -1 = "Prime - 1"). Prime
+// segments store annual_rate as NULL — their effective rate is
+// always resolved live (segmentAnnualRate).
+function cleanSegment(b, base) {
+  const next = {
+    start_date: b.start_date !== undefined ? String(b.start_date) : base?.start_date,
+    rate_type: b.rate_type !== undefined ? b.rate_type : base?.rate_type,
+    rate_mode: b.rate_mode !== undefined ? b.rate_mode : base?.rate_mode || 'absolute',
+    annual_rate: b.annual_rate !== undefined ? num(b.annual_rate) : base?.annual_rate ?? null,
+    spread: b.spread !== undefined ? num(b.spread) : base?.spread ?? null,
+  };
+  if (!next.start_date) return { error: 'start_date is required' };
+  if (!['fixed', 'variable'].includes(next.rate_type)) return { error: 'rate_type must be fixed or variable' };
+  if (!['absolute', 'prime_spread'].includes(next.rate_mode)) return { error: 'rate_mode must be absolute or prime_spread' };
+  if (next.rate_type === 'fixed') { next.rate_mode = 'absolute'; next.spread = null; }
+  if (next.rate_mode === 'prime_spread') {
+    if (next.rate_type !== 'variable') return { error: 'prime-based pricing is only for variable segments' };
+    if (next.spread === null || !isFinite(next.spread) || next.spread < -10 || next.spread > 10) {
+      return { error: 'spread must be a number between -10 and 10 (e.g. -1 for Prime - 1%)' };
+    }
+    next.annual_rate = null;
+  } else {
+    next.spread = null;
+    if (next.annual_rate === null || next.annual_rate < 0) return { error: 'annual_rate must be a number >= 0' };
+  }
+  return { value: next };
+}
+
 app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  const b = req.body || {};
-  if (!b.start_date) return res.status(400).json({ error: 'start_date is required' });
-  if (!['fixed', 'variable'].includes(b.rate_type)) return res.status(400).json({ error: 'rate_type must be fixed or variable' });
-  if (num(b.annual_rate) === null || num(b.annual_rate) < 0) return res.status(400).json({ error: 'annual_rate must be a number >= 0' });
+  const clean = cleanSegment(req.body || {}, null);
+  if (clean.error) return res.status(400).json({ error: clean.error });
+  const s = clean.value;
   const info = db
-    .prepare('INSERT INTO rate_segments (property_id, start_date, rate_type, annual_rate, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(p.id, String(b.start_date), b.rate_type, num(b.annual_rate), nowIso());
-  res.status(201).json(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid));
+    .prepare('INSERT INTO rate_segments (property_id, start_date, rate_type, annual_rate, rate_mode, spread, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, nowIso());
+  res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
 });
 
 app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   const seg = db.prepare('SELECT * FROM rate_segments WHERE id = ? AND property_id = ?').get(req.params.segId, req.params.id);
   if (!seg) return res.status(404).json({ error: 'segment not found' });
-  const b = req.body || {};
-  const next = {
-    start_date: b.start_date !== undefined ? String(b.start_date) : seg.start_date,
-    rate_type: b.rate_type !== undefined ? b.rate_type : seg.rate_type,
-    annual_rate: b.annual_rate !== undefined ? num(b.annual_rate) : seg.annual_rate,
-  };
-  if (!['fixed', 'variable'].includes(next.rate_type)) return res.status(400).json({ error: 'rate_type must be fixed or variable' });
-  if (next.annual_rate === null || next.annual_rate < 0) return res.status(400).json({ error: 'annual_rate must be a number >= 0' });
-  db.prepare('UPDATE rate_segments SET start_date=?, rate_type=?, annual_rate=? WHERE id=?')
-    .run(next.start_date, next.rate_type, next.annual_rate, seg.id);
-  res.json(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id));
+  const clean = cleanSegment(req.body || {}, seg);
+  if (clean.error) return res.status(400).json({ error: clean.error });
+  const s = clean.value;
+  db.prepare('UPDATE rate_segments SET start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=? WHERE id=?')
+    .run(s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, seg.id);
+  res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
 });
 
 app.delete('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   const info = db.prepare('DELETE FROM rate_segments WHERE id = ? AND property_id = ?').run(req.params.segId, req.params.id);
   if (!info.changes) return res.status(404).json({ error: 'segment not found' });
   res.json({ ok: true });
+});
+
+// ------------------------------------------------------------- prime rate --
+// The tracked prime lending rate (region source; Canada: Bank of
+// Canada). current is the newest stored observation with its real
+// as-of date; changes are the recent change points, newest first.
+app.get('/api/prime', requireApiAuth, async (req, res) => {
+  await ensureFreshPrime();
+  res.json(primeInfo());
+});
+
+app.post('/api/prime/refresh', requireApiAuth, async (req, res) => {
+  await refreshPrime();
+  res.json(primeInfo());
 });
 
 // ------------------------------------------------------- mortgage chart ---
@@ -791,15 +878,24 @@ app.delete('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
 // a NO_RATE_PLAN state instead of projecting at 0%. The monthly payment
 // stored on the property wins; otherwise it is derived from the balance,
 // the rate plan and the remaining amortization years.
-app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
+app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
+  await ensureFreshPrime(); // fetch-on-read: compute with today's prime
   const segments = segmentsOf(p.id);
   if (p.mortgage_balance === null || p.mortgage_balance === undefined || !(p.mortgage_balance > 0)) {
     return res.json({ ok: false, error: 'no outstanding principal recorded for this property', segments });
   }
   if (segments.length === 0) {
     return res.json({ ok: false, code: 'NO_RATE_PLAN', error: 'no rate plan yet', segments });
+  }
+  // Prime-spread segments resolve against the current prime (held
+  // constant across the projection). Without a prime on record they
+  // cannot be projected at all — a named state, never a silent 0%.
+  const prime = getCurrentPrime();
+  const primeRate = prime ? prime.rate : null;
+  if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread') && primeRate === null) {
+    return res.json({ ok: false, code: 'NO_PRIME', error: 'a variable segment is priced off the prime rate, but no prime rate is available yet', segments });
   }
   const balanceDate = p.mortgage_balance_date || new Date().toISOString().slice(0, 10);
   let payment = p.mortgage_payment;
@@ -810,7 +906,7 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
     }
     const firstMonth = balanceDate.slice(0, 7);
     const seg = segmentForMonth(segments, firstMonth);
-    payment = derivePayment(p.mortgage_balance, seg ? seg.annual_rate : 0, p.amortization_years);
+    payment = derivePayment(p.mortgage_balance, segmentAnnualRate(seg, primeRate), p.amortization_years);
     paymentSource = 'derived';
   }
   // The payment day only anchors the series' node dates (see engine);
@@ -818,13 +914,15 @@ app.get('/api/properties/:id/amortization', requireApiAuth, (req, res) => {
   // the period stepping and the per-period amount (both in the
   // engine); `payment` here stays the MONTHLY amount throughout.
   const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
-  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments, paymentDay: p.payment_day ?? null, frequency });
+  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments, paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA' });
   res.json({
     ok: true,
     balance: p.mortgage_balance,
     balanceDate,
     paymentUsed: payment,
     paymentSource,
+    primeRate,
+    prime: primeStatus(),
     frequency,
     frequencyLabel: FREQUENCIES[frequency].label,
     periodsPerYear: FREQUENCIES[frequency].periodsPerYear,
@@ -943,6 +1041,9 @@ app.use((err, req, res, next) => {
 });
 
 // Exported for the e2e test; listening happens only when run directly.
+// No prime pre-warm here: prime freshness is fetch-on-read (the
+// projection and property endpoints ensure it inline), so startup
+// stays instant.
 export { app };
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   app.listen(PORT, () => console.log(`[finance-mate] listening on http://localhost:${PORT} (data: ${DATA_DIR})`));

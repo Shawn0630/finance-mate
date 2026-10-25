@@ -57,8 +57,22 @@ CREATE TABLE IF NOT EXISTS rate_segments (
   property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
   start_date TEXT NOT NULL,           -- 'YYYY-MM-DD', segment applies from here
   rate_type TEXT NOT NULL,            -- 'fixed' | 'variable'
-  annual_rate REAL NOT NULL,          -- nominal annual %, semi-annual compounding
+  annual_rate REAL,                   -- nominal annual %; NULL for prime-spread segments
+  rate_mode TEXT,                     -- 'absolute' | 'prime_spread' (variable only)
+  spread REAL,                        -- prime_spread only: percentage points vs prime (e.g. -1 = Prime - 1)
   created_at TEXT NOT NULL
+);
+-- Prime lending rate history, fetched from the region's prime
+-- source (Canada: Bank of Canada Valet). One row per observation
+-- date; the newest row is the current prime.
+CREATE TABLE IF NOT EXISTS prime_rates (
+  date TEXT PRIMARY KEY,              -- 'YYYY-MM-DD' observation date
+  rate REAL NOT NULL,                 -- %
+  source TEXT                         -- series id the value came from
+);
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_segments_property ON rate_segments(property_id, start_date);
 CREATE TABLE IF NOT EXISTS other_assets (
@@ -119,6 +133,42 @@ if (!propCols.includes('payment_frequency')) {
   // 'accelerated_weekly'. Nullable; NULL reads as 'monthly' (the
   // pre-frequency behaviour).
   db.exec('ALTER TABLE properties ADD COLUMN payment_frequency TEXT');
+}
+if (!propCols.includes('region')) {
+  // Region code (src/regions/): only 'CA' is implemented; the API
+  // rejects anything else for now. Existing rows default to 'CA'.
+  db.exec("ALTER TABLE properties ADD COLUMN region TEXT DEFAULT 'CA'");
+}
+// rate_segments: databases created before prime-spread pricing have
+// annual_rate NOT NULL and no rate_mode / spread columns. Prime
+// segments store annual_rate as NULL, so when either difference is
+// found the table is rebuilt in the new shape (existing rows become
+// 'absolute' — exactly how they were always interpreted).
+{
+  const segCols = db.prepare('PRAGMA table_info(rate_segments)').all();
+  const annual = segCols.find((c) => c.name === 'annual_rate');
+  const needsRebuild = !segCols.some((c) => c.name === 'rate_mode') || (annual && annual.notnull === 1);
+  if (segCols.length && needsRebuild) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE rate_segments_new (
+          id INTEGER PRIMARY KEY,
+          property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+          start_date TEXT NOT NULL,
+          rate_type TEXT NOT NULL,
+          annual_rate REAL,
+          rate_mode TEXT,
+          spread REAL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO rate_segments_new (id, property_id, start_date, rate_type, annual_rate, rate_mode, spread, created_at)
+          SELECT id, property_id, start_date, rate_type, annual_rate, 'absolute', NULL, created_at FROM rate_segments;
+        DROP TABLE rate_segments;
+        ALTER TABLE rate_segments_new RENAME TO rate_segments;
+        CREATE INDEX IF NOT EXISTS idx_segments_property ON rate_segments(property_id, start_date);
+      `);
+    })();
+  }
 }
 // --------------------------------------------------------------- owners ---
 // Owners are a SET of usernames: co-ownership is just several names, there

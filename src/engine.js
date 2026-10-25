@@ -1,24 +1,27 @@
 // Mortgage projection engine (pure functions, no I/O).
 //
-// Canadian convention: a quoted annual rate is nominal with semi-annual
-// compounding, so the equivalent monthly rate is
+// The interest convention itself is region-specific and comes from
+// the region implementation (src/regions/): for Canada a quoted
+// annual rate is nominal with semi-annual compounding, so the
+// equivalent monthly rate is
 //   i = (1 + r/2)^(1/6) - 1        (r = annual rate as a fraction)
-// Fixed and variable segments use the same formula; a variable rate is
-// simply projected at the value entered (in reality it will change).
+// Fixed and variable segments use the same formula; a variable rate
+// is projected at the value it resolves to (in reality it will
+// change).
+import { getRegion } from './regions/index.js';
 
 export function monthlyRate(annualRatePct) {
-  const r = Number(annualRatePct) / 100;
-  if (!isFinite(r) || r <= 0) return 0;
-  return Math.pow(1 + r / 2, 1 / 6) - 1;
+  return getRegion('CA').periodRate(annualRatePct, 12);
 }
 
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 // --------------------------------------------------------- payment frequency --
-// The six Canadian mortgage payment frequencies. The quoted rate stays
-// nominal with semi-annual compounding; the rate per payment period is
+// The six Canadian mortgage payment frequencies. The rate per
+// payment period comes from the region implementation (Canada:
 //   i = (1 + r/2)^(2/N) - 1        (N = periods per year)
-// For monthly (N = 12) that is exactly monthlyRate() above.
+// — nominal with semi-annual compounding. For monthly (N = 12)
+// that is exactly monthlyRate() above.
 // stepDays > 0 marks the day-stepped schedules (weekly / bi-weekly);
 // monthly and semi-monthly step by calendar months instead.
 export const FREQUENCIES = {
@@ -31,10 +34,8 @@ export const FREQUENCIES = {
 };
 export const FREQUENCY_KEYS = Object.keys(FREQUENCIES);
 
-export function periodicRate(annualRatePct, periodsPerYear) {
-  const r = Number(annualRatePct) / 100;
-  if (!isFinite(r) || r <= 0) return 0;
-  return Math.pow(1 + r / 2, 2 / periodsPerYear) - 1;
+export function periodicRate(annualRatePct, periodsPerYear, regionCode = 'CA') {
+  return getRegion(regionCode).periodRate(annualRatePct, periodsPerYear);
 }
 
 // The stored payment is a MONTHLY amount; the per-period amount follows
@@ -78,6 +79,23 @@ function ymKey({ y, m }) {
   return `${y}-${String(m).padStart(2, '0')}`;
 }
 
+// The annual rate a segment effectively carries, in %.
+//   - fixed segments, and variable segments priced as an absolute
+//     number (rate_mode 'absolute' or unset — the pre-prime shape):
+//     their stored annual_rate.
+//   - variable segments priced off prime (rate_mode 'prime_spread'):
+//     max(0, prime + spread), e.g. spread -1 is "Prime - 1". With no
+//     prime known the rate is null — callers surface that state
+//     instead of projecting at an invented rate.
+export function segmentAnnualRate(seg, primeRate) {
+  if (!seg) return 0;
+  if (seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread') {
+    if (primeRate === null || primeRate === undefined || !isFinite(Number(primeRate))) return null;
+    return Math.max(0, round2(Number(primeRate) + Number(seg.spread || 0)));
+  }
+  return Number(seg.annual_rate) || 0;
+}
+
 // Which segment covers a given month ('YYYY-MM')?
 // Segments are sorted by start_date. A month uses the latest segment whose
 // start month is <= the month; months before the first segment use the
@@ -119,6 +137,11 @@ export function derivePayment(balance, annualRatePct, years) {
 //                 steps reproduce the pre-frequency engine exactly:
 //                 the first projected month is the month after the
 //                 balance date, one period per month.
+//   primeRate:    the current prime rate in %; prime-spread segments
+//                 resolve against it (held constant over the whole
+//                 projection — prime is assumed not to move).
+//   region:       region code whose interest convention applies
+//                 (default 'CA', the only implementation).
 //   maxMonths:    hard cap (in months of projection) so a
 //                 non-amortizing loan cannot loop forever
 // Returns { series: [{ month, date, rate, rateType, interest, principal,
@@ -126,7 +149,7 @@ export function derivePayment(balance, annualRatePct, years) {
 // where a row aggregates every period that fell in that month: interest
 // and payment are the month's totals, balance is the balance after the
 // month's last period, and date is that last period's date.
-export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600 }) {
+export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, region = 'CA' }) {
   const f = FREQUENCIES[frequency] || FREQUENCIES.monthly;
   const perPeriod = periodPaymentFor(payment, FREQUENCIES[frequency] ? frequency : 'monthly');
   const series = [];
@@ -144,8 +167,9 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
   // display date is `dateStr`, folding it into the monthly output rows.
   function applyPeriod(monthKey, dateStr) {
     const seg = segmentForMonth(segments, monthKey);
-    const annualRate = seg ? Number(seg.annual_rate) : 0;
-    const i = periodicRate(annualRate, f.periodsPerYear);
+    const annualRate = segmentAnnualRate(seg, primeRate);
+    if (annualRate === null) throw new Error('a prime-based segment cannot be projected without a prime rate');
+    const i = periodicRate(annualRate, f.periodsPerYear, region);
     const interest = round2(bal * i);
     let principal = round2(perPeriod - interest);
     let paid = round2(perPeriod);

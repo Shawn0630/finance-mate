@@ -37,6 +37,11 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-e2e-'));
       value REAL NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'CAD',
       notes TEXT, owner TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE rate_segments (
+      id INTEGER PRIMARY KEY, property_id INTEGER NOT NULL,
+      start_date TEXT NOT NULL, rate_type TEXT NOT NULL,
+      annual_rate REAL NOT NULL, created_at TEXT NOT NULL
+    );
   `);
   const ts = new Date().toISOString();
   const insP = legacy.prepare('INSERT INTO properties (address, mortgage_balance, owner, created_at, updated_at) VALUES (?, 0, ?, ?, ?)');
@@ -45,6 +50,11 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-e2e-'));
   insP.run('3 Legacy Lane', null, ts, ts);
   legacy.prepare('INSERT INTO other_assets (category, name, value, currency, owner, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?, ?)')
     .run('other', 'Legacy thing', 'CAD', 'Jiaying', ts, ts);
+  // An old-shape variable segment (annual_rate NOT NULL, no
+  // rate_mode/spread columns): the boot migration must rebuild the
+  // table and read this row as an absolute segment, value intact.
+  legacy.prepare('INSERT INTO rate_segments (property_id, start_date, rate_type, annual_rate, created_at) VALUES (1, ?, ?, ?, ?)')
+    .run('2025-01-01', 'variable', 5, ts);
   legacy.close();
 }
 let failures = 0;
@@ -92,9 +102,28 @@ const stub = http.createServer((req, res) => {
 await new Promise((r) => stub.listen(0, '127.0.0.1', r));
 const stubBase = `http://127.0.0.1:${stub.address().port}`;
 
+// Stub Bank of Canada Valet endpoint (PRIME_API_URL points the app
+// at it): serves the real API's shape with a prime value the test
+// can move, so the refresh flow is exercised end to end.
+let stubPrime = 4.95;
+let stubDown = false;
+const primeStub = http.createServer((req, res) => {
+  if (stubDown) { res.writeHead(500); res.end('down'); return; }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    seriesDetail: { V80691311: { label: 'Prime rate' } },
+    observations: [
+      { d: '2026-10-21', V80691311: { v: String(stubPrime) } },
+      { d: '2026-10-14', V80691311: { v: '4.70' } },
+    ],
+  }));
+});
+await new Promise((r) => primeStub.listen(0, '127.0.0.1', r));
+const primeStubBase = `http://127.0.0.1:${primeStub.address().port}/valet`;
+
 const server = spawn('node', ['src/server.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase },
+  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
@@ -638,6 +667,104 @@ try {
   await req('DELETE', `/api/properties/${pidPB}`);
   await req('DELETE', `/api/properties/${pidPC}`);
 
+  // ------------------------------------------------------------ prime ---
+  r = await req('GET', '/api/prime');
+  check('fetch-on-read stored the stub prime with its as-of date',
+    r.data.current && r.data.current.rate === 4.95 && r.data.current.date === '2026-10-21'
+      && r.data.source && r.data.source.series === 'V80691311', JSON.stringify(r.data.current));
+  check('prime change points include the previous level',
+    Array.isArray(r.data.changes) && r.data.changes.length === 2 && r.data.changes[1].rate === 4.7,
+    JSON.stringify(r.data.changes));
+
+  r = await req('GET', '/api/properties/1');
+  check('legacy variable segment migrated as absolute, value intact',
+    r.data.segments.length === 1 && r.data.segments[0].rate_mode === 'absolute'
+      && r.data.segments[0].effective_rate === 5, JSON.stringify(r.data.segments));
+
+  r = await req('POST', '/api/properties', {
+    address: '7 Prime Place, Victoria, BC', mortgage_balance: 100000,
+    mortgage_balance_date: '2026-10-01', mortgage_payment: 600, purchase_date: '2020-01-01',
+  });
+  const pidPrime = r.data.id;
+  r = await req('POST', `/api/properties/${pidPrime}/rates`, { start_date: '2026-01-01', rate_type: 'variable', rate_mode: 'prime_spread' });
+  check('a prime segment without a spread is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${pidPrime}/rates`, { start_date: '2026-01-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: 99 });
+  check('an out-of-range spread is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${pidPrime}/rates`, { start_date: '2026-01-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 });
+  check('Prime - 1 at prime 4.95 resolves to 3.95 and stores no absolute rate',
+    r.status === 201 && r.data.rate_mode === 'prime_spread' && r.data.annual_rate === null && r.data.effective_rate === 3.95,
+    JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${pidPrime}/amortization`);
+  check('projection uses the resolved rate (first interest 326.49 at 3.95%)',
+    r.data.ok === true && r.data.primeRate === 4.95 && r.data.series[0].interest === 326.49,
+    JSON.stringify({ primeRate: r.data.primeRate, first: r.data.series && r.data.series[0] }));
+
+  const vanToday = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+  check('the projection response carries a fresh prime status dated today',
+    r.data.prime && r.data.prime.fresh === true && r.data.prime.rate === 4.95 && r.data.prime.asOf === vanToday,
+    JSON.stringify(r.data.prime));
+
+  // Fetch-on-read policy: within the same Vancouver day the moved
+  // stub prime is NOT picked up — the value fetched today is fresh.
+  stubPrime = 5.45;
+  r = await req('GET', `/api/properties/${pidPrime}/amortization`);
+  check('same-day reads do not refetch (still projecting at prime 4.95)',
+    r.data.ok === true && r.data.primeRate === 4.95 && r.data.prime.fresh === true,
+    JSON.stringify({ primeRate: r.data.primeRate, prime: r.data.prime }));
+
+  // Simulate the next day by backdating the fetch bookkeeping in the
+  // app's own database: the very next projection must pull the moved
+  // prime inline — no manual refresh, no restart.
+  const backdatePrimeMeta = () => {
+    const dbFile = new Database(path.join(dataDir, 'finance.db'));
+    dbFile.pragma('busy_timeout = 5000');
+    const old = String(Date.now() - 25 * 3600 * 1000);
+    dbFile.prepare("UPDATE app_meta SET value = ? WHERE key IN ('prime_last_success', 'prime_last_attempt')").run(old);
+    dbFile.close();
+  };
+  backdatePrimeMeta();
+  r = await req('GET', `/api/properties/${pidPrime}/amortization`);
+  check('the next-day projection fetches inline and uses the moved prime (367.44 at 4.45%)',
+    r.data.ok === true && r.data.primeRate === 5.45 && r.data.series[0].interest === 367.44
+      && r.data.prime && r.data.prime.fresh === true && r.data.prime.rate === 5.45 && r.data.prime.asOf === vanToday,
+    JSON.stringify({ primeRate: r.data.primeRate, prime: r.data.prime, first: r.data.series && r.data.series[0] }));
+  r = await req('GET', `/api/properties/${pidPrime}`);
+  check('the same segment now resolves to 4.45', r.data.segments[0].effective_rate === 4.45, JSON.stringify(r.data.segments[0]));
+
+  // BoC down: the request still succeeds on the last known value,
+  // and the response flags it stale (fresh: false) for the warning.
+  stubDown = true;
+  backdatePrimeMeta();
+  r = await req('GET', `/api/properties/${pidPrime}/amortization`);
+  check('with BoC down the projection falls back to the last known prime, flagged stale',
+    r.data.ok === true && r.data.primeRate === 5.45 && r.data.prime && r.data.prime.fresh === false && r.data.prime.rate === 5.45,
+    JSON.stringify({ primeRate: r.data.primeRate, prime: r.data.prime }));
+  r = await req('GET', '/api/prime');
+  check('prime info stays available and stale while BoC is down (observation as-of unchanged)',
+    r.data.current && r.data.current.rate === 5.45 && r.data.current.date === '2026-10-21' && r.data.fresh === false,
+    JSON.stringify({ current: r.data.current, fresh: r.data.fresh }));
+  stubDown = false;
+  backdatePrimeMeta();
+  r = await req('GET', `/api/properties/${pidPrime}/amortization`);
+  check('when BoC recovers, the next read is fresh again',
+    r.data.ok === true && r.data.prime && r.data.prime.fresh === true && r.data.prime.rate === 5.45,
+    JSON.stringify(r.data.prime));
+
+  // The manual refresh endpoint still forces a fetch at any time.
+  stubPrime = 4.95;
+  r = await req('POST', '/api/prime/refresh');
+  check('manual refresh forces a fetch of the current value',
+    r.data.current && r.data.current.rate === 4.95 && r.data.fresh === true, JSON.stringify(r.data.current));
+
+  r = await req('POST', '/api/properties', { address: '1 Region Road', mortgage_balance: 1000, purchase_date: '2020-01-01', region: 'US' });
+  check('a non-CA region is refused (Canada only for now)', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', { address: '2 Region Road', mortgage_balance: 1000, purchase_date: '2020-01-01', region: 'CA' });
+  check('region CA is accepted and stored', r.status === 201 && r.data.region === 'CA', JSON.stringify(r.data.region));
+  await req('DELETE', `/api/properties/${r.data.id}`);
+  await req('DELETE', `/api/properties/${pidPrime}`);
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
@@ -646,6 +773,7 @@ try {
 } finally {
   server.kill('SIGTERM');
   stub.close();
+  primeStub.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 console.log(failures === 0 ? 'E2E: ALL PASS' : `E2E: ${failures} FAILURE(S)`);

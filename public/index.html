@@ -56,6 +56,7 @@
       <div class="msg" id="sectionMsg"></div>
       <!-- Portfolio: cross-property totals and charts (filled by app.js). -->
       <div id="portfolioBlock" class="panel hidden" style="margin-bottom:16px">
+        <div class="msg warn hidden" id="pfPrimeWarning"></div>
         <h3>Portfolio</h3>
         <div class="summary-strip">
           <div class="summary-card"><div class="k">Total outstanding principal</div><div class="v" id="pfOutstanding">—</div></div>
@@ -111,6 +112,7 @@
       <button class="danger" id="deletePropertyBtn">Delete property</button></div>
     <div id="photoArea"></div>
     <div class="msg" id="detailMsg"></div>
+    <div class="msg warn hidden" id="primeWarning"></div>
 
     <div class="panel">
       <h3>Property &amp; assessment</h3>
@@ -136,6 +138,7 @@
         </div>
       </form>
       <div class="note" id="paymentDayDisplay" style="margin-left:0"></div>
+      <div class="note" id="regionDisplay" style="margin-left:0"></div>
     </div>
 
     <div class="panel">
@@ -155,6 +158,14 @@
 
     <div class="panel">
       <h3>Rate segments</h3>
+      <div class="toolbar" style="align-items:flex-start">
+        <div>
+          <div class="note" id="primeBanner" style="margin:0">Loading prime rate…</div>
+          <div class="note" id="primeChanges" style="margin:2px 0 0"></div>
+        </div>
+        <div class="spacer"></div>
+        <button type="button" class="small" id="primeRefreshBtn">Refresh prime</button>
+      </div>
       <div class="note" style="margin-left:0">Add one row per rate period. A month uses the latest segment that has started; months before the first segment use the first one. Rates are nominal annual rates with Canadian semi-annual compounding. Variable rates are projected at the value you enter — in reality the rate will change over time.</div>
       <table>
         <thead><tr><th>Starts</th><th>Type</th><th class="num">Annual rate %</th><th></th></tr></thead>
@@ -163,7 +174,9 @@
       <form id="addSegmentForm" class="toolbar" style="align-items:flex-end">
         <div><label>Start date</label><input type="date" name="start_date" required></div>
         <div><label>Type</label><select name="rate_type"><option value="fixed">Fixed</option><option value="variable">Variable</option></select></div>
-        <div><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0" required></div>
+        <div id="segModeWrap" class="hidden"><label>Pricing (variable)</label><select name="rate_mode"><option value="absolute">Absolute rate</option><option value="prime_spread">Prime + spread</option></select></div>
+        <div id="segRateWrap"><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
+        <div id="segSpreadWrap" class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" id="segSpreadPreview" style="margin:2px 0 0"></div></div>
         <button class="primary" type="submit">Add segment</button>
       </form>
       <form id="paymentDayForm" class="toolbar" style="align-items:flex-end;margin-top:14px">
