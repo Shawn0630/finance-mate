@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { db, DATA_DIR, PHOTOS_DIR, seedUsers, verifyPassword } from './db.js';
+import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
 import { simulate, derivePayment, segmentForMonth } from './engine.js';
 import { fetchAssessment, suggestAddresses } from './bca.js';
 
@@ -74,15 +74,39 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', requireApiAuth, (req, res) => res.json({ username: req.user.username }));
+app.get('/api/me', requireApiAuth, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  res.json(userView(u));
+});
+
+// The public shape of a user wherever the UI shows one (top bar, owner
+// chips, admin list): username + avatar. The users table is the single
+// source for avatar data — nothing copies it onto properties or assets.
+function userView(u) {
+  return {
+    id: u.id,
+    username: u.username,
+    avatarFile: u.avatar_file || null,
+    avatarColor: u.avatar_color || defaultAvatarColor(u.username),
+    isAdmin: u.username === adminUsername(),
+    created_at: u.created_at,
+  };
+}
 
 const adminUsername = () => process.env.SEED_ADMIN_USER || 'admin';
 
-// Usernames that can be picked as owners: every user EXCEPT admin. The
+// Owner candidates with their avatars: every user EXCEPT admin. The
 // admin account signs in to manage the app; it is never an owner
 // candidate and never appears in the owner pickers.
 app.get('/api/users', requireApiAuth, (req, res) => {
-  res.json(ownerCandidates());
+  const rows = db
+    .prepare('SELECT * FROM users WHERE username != ? ORDER BY id')
+    .all(adminUsername());
+  res.json(rows.map((u) => ({
+    username: u.username,
+    avatarFile: u.avatar_file || null,
+    avatarColor: u.avatar_color || defaultAvatarColor(u.username),
+  })));
 });
 
 // --------------------------------------------------------------- owners ---
@@ -128,6 +152,102 @@ function cleanOwners(v) {
   }
   return { value: names };
 }
+
+// --------------------------------------------------------------- admin ---
+// User management is admin-only. requireAdmin enforces it on the server
+// for every /api/admin route (the UI also hides the Admin nav entry
+// from non-admin users, but the check here is the real one).
+function requireAdmin(req, res, next) {
+  if (req.user.username !== adminUsername()) {
+    return res.status(403).json({ error: 'admin only' });
+  }
+  next();
+}
+
+app.get('/api/admin/users', requireApiAuth, requireAdmin, (req, res) => {
+  res.json(db.prepare('SELECT * FROM users ORDER BY id').all().map(userView));
+});
+
+app.post('/api/admin/users', requireApiAuth, requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const username = String(b.username || '').trim();
+  const password = String(b.password || '');
+  if (!username) return res.status(400).json({ error: 'username is required' });
+  if (!password) return res.status(400).json({ error: 'password is required' });
+  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
+    return res.status(400).json({ error: `username "${username}" already exists` });
+  }
+  const { salt, hash } = hashPassword(password);
+  const info = db
+    .prepare('INSERT INTO users (username, pass_hash, salt, avatar_color, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(username, hash, salt, defaultAvatarColor(username), nowIso());
+  res.status(201).json(userView(db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid)));
+});
+
+app.post('/api/admin/users/:id/password', requireApiAuth, requireAdmin, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  const password = String((req.body || {}).password || '');
+  if (!password) return res.status(400).json({ error: 'password is required' });
+  const { salt, hash } = hashPassword(password);
+  db.prepare('UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?').run(hash, salt, u.id);
+  // A password reset signs that user out everywhere; they sign back in
+  // with the new password.
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/users/:id', requireApiAuth, requireAdmin, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  if (u.username === adminUsername()) return res.status(400).json({ error: 'the admin user cannot be deleted' });
+  if (u.id === req.user.id) return res.status(400).json({ error: 'you cannot delete yourself' });
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
+    // Scrub the name out of every owners list, so owner data never
+    // points at a user who no longer exists.
+    for (const table of ['properties', 'other_assets']) {
+      const rows = db.prepare(`SELECT id, owners FROM ${table} WHERE owners IS NOT NULL`).all();
+      const upd = db.prepare(`UPDATE ${table} SET owners = ? WHERE id = ?`);
+      for (const row of rows) {
+        const names = parseOwners(row.owners);
+        if (names.includes(u.username)) {
+          upd.run(JSON.stringify(names.filter((n) => n !== u.username)), row.id);
+        }
+      }
+    }
+    db.prepare('DELETE FROM users WHERE id = ?').run(u.id);
+  })();
+  if (u.avatar_file) fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
+  res.json({ ok: true });
+});
+
+// Avatar photo upload — same base64-JSON shape as property photos, but
+// capped at 5 MB. The file lives in AVATARS_DIR; the user row stores
+// only its name. Deleting the avatar restores the letter default.
+app.post('/api/admin/users/:id/avatar', requireApiAuth, requireAdmin, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  const { dataBase64, contentType } = req.body || {};
+  const exts = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+  const ext = exts[contentType];
+  if (!dataBase64 || !ext) return res.status(400).json({ error: 'expected { dataBase64, contentType: image/jpeg|png|webp|gif }' });
+  const buf = Buffer.from(String(dataBase64), 'base64');
+  if (buf.length === 0 || buf.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'image empty or larger than 5 MB' });
+  const name = `user-${u.id}-${Date.now()}.${ext}`;
+  fs.writeFileSync(path.join(AVATARS_DIR, name), buf);
+  if (u.avatar_file) fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
+  db.prepare('UPDATE users SET avatar_file = ? WHERE id = ?').run(name, u.id);
+  res.json(userView(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id)));
+});
+
+app.delete('/api/admin/users/:id/avatar', requireApiAuth, requireAdmin, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  if (u.avatar_file) fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
+  db.prepare('UPDATE users SET avatar_file = NULL WHERE id = ?').run(u.id);
+  res.json(userView(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id)));
+});
 
 // ------------------------------------------------------ address suggest ---
 // Autocomplete for the address inputs. Suggestions come from BC
@@ -387,6 +507,16 @@ app.get('/photos/:name', (req, res) => {
   const name = path.basename(req.params.name);
   const file = path.join(PHOTOS_DIR, name);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'photo not found' });
+  res.sendFile(file);
+});
+
+// Uploaded user avatars (login required — every signed-in user sees
+// them in the top bar and on owner chips).
+app.get('/avatars/:name', (req, res) => {
+  if (!currentUser(req)) return res.status(401).json({ error: 'not signed in' });
+  const name = path.basename(req.params.name);
+  const file = path.join(AVATARS_DIR, name);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'avatar not found' });
   res.sendFile(file);
 });
 

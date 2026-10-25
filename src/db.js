@@ -7,7 +7,9 @@ import crypto from 'node:crypto';
 
 export const DATA_DIR = process.env.DATA_DIR || path.resolve(process.cwd(), 'data');
 export const PHOTOS_DIR = path.join(DATA_DIR, 'photos');
+export const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
 fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+fs.mkdirSync(AVATARS_DIR, { recursive: true });
 
 export const db = new Database(path.join(DATA_DIR, 'finance.db'));
 db.pragma('journal_mode = WAL');
@@ -19,6 +21,8 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   pass_hash TEXT NOT NULL,
   salt TEXT NOT NULL,
+  avatar_file TEXT,                   -- uploaded avatar photo (in AVATARS_DIR); NULL = letter avatar
+  avatar_color TEXT,                  -- letter-avatar background color (stored per user)
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -85,6 +89,13 @@ CREATE TABLE IF NOT EXISTS value_history (
 `);
 
 // Safe add-column migrations for databases created before a column existed.
+const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+if (!userCols.includes('avatar_file')) {
+  db.exec('ALTER TABLE users ADD COLUMN avatar_file TEXT');
+}
+if (!userCols.includes('avatar_color')) {
+  db.exec('ALTER TABLE users ADD COLUMN avatar_color TEXT');
+}
 const propCols = db.prepare('PRAGMA table_info(properties)').all().map((c) => c.name);
 if (!propCols.includes('bca_id')) {
   // The BC Assessment property id of the suggestion the user picked from
@@ -138,6 +149,19 @@ export function verifyPassword(password, user) {
   return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(user.pass_hash, 'hex'));
 }
 
+// Default letter-avatar colors. The household users get fixed, clearly
+// distinct colors; anyone else is assigned one from the palette by a
+// stable hash of the username. The chosen color is stored on the user
+// row (avatar_color), so it never changes under the user.
+const FIXED_AVATAR_COLORS = { admin: '#607d8b', Shawn: '#2563eb', Jiaying: '#db2777' };
+const AVATAR_PALETTE = ['#7c3aed', '#059669', '#d97706', '#0891b2', '#dc2626', '#4f46e5', '#c026d3', '#65a30d'];
+export function defaultAvatarColor(username) {
+  if (FIXED_AVATAR_COLORS[username]) return FIXED_AVATAR_COLORS[username];
+  let h = 0;
+  for (const c of String(username)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return AVATAR_PALETTE[h % AVATAR_PALETTE.length];
+}
+
 // Seed the initial users on first start. Override the admin credentials with
 // SEED_ADMIN_USER / SEED_ADMIN_PASSWORD; defaults are admin / admin and
 // MUST be changed before real use (see README).
@@ -153,8 +177,13 @@ export function seedUsers() {
     const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(u.username);
     if (exists) continue;
     const { salt, hash } = hashPassword(u.password);
-    db.prepare('INSERT INTO users (username, pass_hash, salt, created_at) VALUES (?, ?, ?, ?)')
-      .run(u.username, hash, salt, new Date().toISOString());
+    db.prepare('INSERT INTO users (username, pass_hash, salt, avatar_color, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(u.username, hash, salt, defaultAvatarColor(u.username), new Date().toISOString());
     console.log(`[db] seeded user "${u.username}" (change the password before real use)`);
   }
+  // Backfill a stored avatar color for any user who does not have one
+  // yet (rows created before avatars existed).
+  const missing = db.prepare('SELECT id, username FROM users WHERE avatar_color IS NULL').all();
+  const fill = db.prepare('UPDATE users SET avatar_color = ? WHERE id = ?');
+  for (const u of missing) fill.run(defaultAvatarColor(u.username), u.id);
 }

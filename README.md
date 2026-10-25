@@ -74,6 +74,30 @@ migrated automatically: a single stored owner becomes a one-element
 set, and a stored `Joint` becomes an empty set, since it named no
 concrete people.)
 
+## Admin & avatars
+
+Signing in as **admin** reveals an **Admin** page (the API enforces
+admin-only access with 403 for everyone else) for managing users:
+add a user (username + initial password), reset a password (which
+signs that user out everywhere), delete a user (the admin user itself
+cannot be deleted; a deleted user's name is scrubbed from every
+owners list), and set profile pictures.
+
+Every user has an **avatar**: an uploaded photo if one was set on the
+Admin page (JPEG/PNG/WebP/GIF, up to 5 MB, stored as a file under the
+data directory — the user row keeps only the file name), otherwise a
+**letter avatar** — the username's initial on a per-user background
+color that is stored on the user row (Shawn is blue `#2563eb`,
+Jiaying is pink `#db2777`, admin is slate `#607d8b`; later users get a
+color from the same palette by username hash). "Restore default" on
+the Admin page removes the photo and brings the letter avatar back.
+
+Avatars appear next to the signed-in user's name in the top bar, in
+the Admin user list, and inside every owner chip — property cards,
+the property detail page, asset tables and asset details. Owner chips
+read avatar data from the users table at render time, so changing a
+picture in Admin updates all of those places on the next load.
+
 ## Assessed value trend
 
 The property detail page charts the assessed value per year. Every

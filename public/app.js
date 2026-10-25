@@ -135,7 +135,7 @@ let currentAssetId = null;
 let currentSection = 'overview';
 
 function showView(name) {
-  for (const v of ['assets', 'property', 'asset', 'spending', 'planning', 'tax']) {
+  for (const v of ['assets', 'property', 'asset', 'spending', 'planning', 'tax', 'admin']) {
     $('#view-' + v).classList.toggle('hidden', v !== name);
   }
   document.querySelectorAll('#mainNav a').forEach((a) =>
@@ -162,6 +162,9 @@ function route() {
     currentAssetId = Number(hash.split('/')[1]);
     showView('asset');
     loadAssetDetail(currentAssetId);
+  } else if (hash === '#admin') {
+    showView('admin');
+    loadAdmin();
   } else if (['#spending', '#planning', '#tax'].includes(hash)) {
     showView(hash.slice(1));
   } else {
@@ -181,12 +184,33 @@ window.addEventListener('hashchange', route);
 // and the remaining candidates as "+ Name" buttons; a name that is
 // already picked leaves the candidate row, so it cannot be added twice.
 let ownerUsers = [];
+let ownerDirectory = {}; // username -> { username, avatarFile, avatarColor }
 async function loadOwnerUsers() {
-  try { ownerUsers = await api('/api/users'); } catch { ownerUsers = []; }
+  try {
+    const list = await api('/api/users');
+    ownerUsers = (list || []).map((u) => u.username);
+    ownerDirectory = Object.fromEntries((list || []).map((u) => [u.username, u]));
+  } catch { ownerUsers = []; ownerDirectory = {}; }
+}
+
+// --------------------------------------------------------------- avatars ---
+// A user's avatar: their uploaded photo when there is one, otherwise a
+// letter avatar (initial on their stored color). Avatar data always
+// comes from the users table (via /api/users, /api/me, /api/admin/users)
+// — property and asset records never carry a copy, so an avatar change
+// in Admin shows up everywhere on the next load.
+function avatarHtml(u, cls = '') {
+  const name = (u && u.username) || '?';
+  if (u && u.avatarFile) return `<img class="avatar ${cls}" src="/avatars/${esc(u.avatarFile)}" alt="">`;
+  const color = (u && u.avatarColor) || '#607d8b';
+  return `<span class="avatar avatar-letter ${cls}" style="background:${esc(color)}">${esc(name.charAt(0).toUpperCase())}</span>`;
+}
+function avatarForName(name, cls = 'xs') {
+  return avatarHtml(ownerDirectory[name] || { username: name }, cls);
 }
 
 function ownerChipsHtml(owners) {
-  return (owners || []).map((u) => `<span class="owner-chip">${esc(u)}</span>`).join(' ');
+  return (owners || []).map((u) => `<span class="owner-chip">${avatarForName(u)} ${esc(u)}</span>`).join(' ');
 }
 
 function createOwnerPicker(root) {
@@ -194,7 +218,7 @@ function createOwnerPicker(root) {
   let selected = [];
   function render() {
     root.querySelector('.owner-chips').innerHTML = selected.length
-      ? selected.map((u) => `<span class="owner-chip">${esc(u)}<button type="button" class="owner-x" data-owner-remove="${esc(u)}" title="Remove ${esc(u)}">&times;</button></span>`).join('')
+      ? selected.map((u) => `<span class="owner-chip">${avatarForName(u)} ${esc(u)}<button type="button" class="owner-x" data-owner-remove="${esc(u)}" title="Remove ${esc(u)}">&times;</button></span>`).join('')
       : '<span class="owner-none">No owner selected</span>';
     root.querySelector('.owner-candidates').innerHTML = ownerUsers
       .filter((u) => !selected.includes(u))
@@ -866,6 +890,100 @@ $('#customMonths').addEventListener('change', () => {
   renderDetailCharts();
 });
 
+// ----------------------------------------------------------------- admin ---
+// User management page. Admin-only: the nav entry is hidden for other
+// users and every /api/admin call is 403 for them server-side, so this
+// page simply renders what the API allows.
+let adminUsersById = {};
+
+async function refreshAvatarConsumers(changedUserId) {
+  // Avatars flow from the users table; refresh the places that render
+  // them so a change made here is visible without a full reload.
+  assetsLoaded = false;
+  await loadOwnerUsers();
+  ownerPickers.forEach((p) => p.refresh());
+  try {
+    const me = await api('/api/me');
+    $('#whoamiAvatar').innerHTML = avatarHtml(me);
+  } catch { /* redirected to login */ }
+  loadAdmin();
+}
+
+async function loadAdmin() {
+  const msg = $('#adminMsg');
+  let users;
+  try { users = await api('/api/admin/users'); }
+  catch (e) { showMsg(msg, 'err', e.message); $('#adminUserRows').innerHTML = ''; return; }
+  adminUsersById = Object.fromEntries(users.map((u) => [u.id, u]));
+  $('#adminUserRows').innerHTML = users.map((u) => `<tr>
+    <td><span class="user-cell">${avatarHtml(u, 'lg')}<span>${esc(u.username)}${u.isAdmin ? ' <span class="badge">admin</span>' : ''}</span></span></td>
+    <td>${u.created_at ? new Date(u.created_at).toLocaleDateString('en-CA') : '—'}</td>
+    <td>${u.avatarFile ? 'Photo' : 'Letter default'}</td>
+    <td style="white-space:nowrap">
+      <label class="btnlike small">Upload photo <input type="file" accept="image/*" style="display:none" onchange="adminUploadAvatar(${u.id}, this)"></label>
+      ${u.avatarFile ? `<button class="small" onclick="adminRemoveAvatar(${u.id})">Restore default</button>` : ''}
+      <button class="small" onclick="adminResetPassword(${u.id})">Reset password</button>
+      ${u.isAdmin ? '' : `<button class="small danger" onclick="adminDeleteUser(${u.id})">Delete</button>`}
+    </td></tr>`).join('');
+}
+
+window.adminUploadAvatar = async (userId, input) => {
+  const file = input.files && input.files[0];
+  input.value = '';
+  if (!file) return;
+  const dataBase64 = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+  try {
+    await api(`/api/admin/users/${userId}/avatar`, { method: 'POST', body: { dataBase64, contentType: file.type } });
+    showMsg($('#adminMsg'), 'ok', 'Avatar updated.');
+    refreshAvatarConsumers(userId);
+  } catch (e) { showMsg($('#adminMsg'), 'err', e.message); }
+};
+
+window.adminRemoveAvatar = async (userId) => {
+  try {
+    await api(`/api/admin/users/${userId}/avatar`, { method: 'DELETE' });
+    showMsg($('#adminMsg'), 'ok', 'Back to the letter default avatar.');
+    refreshAvatarConsumers(userId);
+  } catch (e) { showMsg($('#adminMsg'), 'err', e.message); }
+};
+
+window.adminResetPassword = async (userId) => {
+  const u = adminUsersById[userId];
+  const pw = prompt(`New password for ${u ? u.username : 'this user'}:`);
+  if (!pw) return;
+  try {
+    await api(`/api/admin/users/${userId}/password`, { method: 'POST', body: { password: pw } });
+    showMsg($('#adminMsg'), 'ok', `Password reset for ${u ? u.username : 'the user'}. They sign in with the new password now.`);
+  } catch (e) { showMsg($('#adminMsg'), 'err', e.message); }
+};
+
+window.adminDeleteUser = async (userId) => {
+  const u = adminUsersById[userId];
+  if (!u) return;
+  if (!confirm(`Delete user ${u.username}? They will no longer be able to sign in, and their name is removed from every owners list.`)) return;
+  try {
+    await api(`/api/admin/users/${userId}`, { method: 'DELETE' });
+    showMsg($('#adminMsg'), 'ok', `User ${u.username} deleted.`);
+    refreshAvatarConsumers(userId);
+  } catch (e) { showMsg($('#adminMsg'), 'err', e.message); }
+};
+
+$('#addUserForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  try {
+    const u = await api('/api/admin/users', { method: 'POST', body: f });
+    e.target.reset();
+    showMsg($('#adminMsg'), 'ok', `User ${u.username} added.`);
+    refreshAvatarConsumers(u.id);
+  } catch (err) { showMsg($('#adminMsg'), 'err', err.message); }
+});
+
 // -------------------------------------------------------------------- misc ---
 $('#logoutBtn').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
@@ -876,6 +994,8 @@ $('#logoutBtn').addEventListener('click', async () => {
   try {
     const me = await api('/api/me');
     $('#whoami').textContent = me.username;
+    $('#whoamiAvatar').innerHTML = avatarHtml(me);
+    if (me.isAdmin) $('#adminNavLink').classList.remove('hidden');
   } catch { /* api() already redirected */ }
   await loadOwnerUsers();
   ownerPickers.forEach((p) => p.refresh());

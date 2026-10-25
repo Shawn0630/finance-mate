@@ -15,8 +15,10 @@
     <a href="#spending" data-nav="spending">Spending</a>
     <a href="#planning" data-nav="planning">Planning</a>
     <a href="#tax" data-nav="tax">Tax</a>
+    <a href="#admin" data-nav="admin" id="adminNavLink" class="hidden">Admin</a>
   </nav>
   <div class="spacer"></div>
+  <span id="whoamiAvatar"></span>
   <span class="user" id="whoami"></span>
   <button id="logoutBtn" class="small">Sign out</button>
 </header>
@@ -175,6 +177,27 @@
       <div class="msg" id="monthlyMsg"></div>
       <div class="note" id="monthlySummary" style="margin-left:0"></div>
       <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
+    </div>
+  </section>
+
+  <!-- ============================== Admin ============================== -->
+  <section id="view-admin" class="hidden">
+    <div class="section-head"><h2>Users</h2></div>
+    <div class="msg" id="adminMsg"></div>
+    <div class="panel" style="padding:6px 16px">
+      <table>
+        <thead><tr><th>User</th><th>Member since</th><th>Avatar</th><th></th></tr></thead>
+        <tbody id="adminUserRows"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Add a user</h3>
+      <form id="addUserForm" class="toolbar" style="align-items:flex-end">
+        <div><label>Username</label><input name="username" required autocomplete="off"></div>
+        <div><label>Initial password</label><input name="password" type="text" required autocomplete="off"></div>
+        <button class="primary" type="submit">Add user</button>
+      </form>
+      <div class="note" style="margin-left:0">New users sign in with the initial password. Use “Reset password” in the list to change someone's password later; a reset signs that user out everywhere.</div>
     </div>
   </section>
 

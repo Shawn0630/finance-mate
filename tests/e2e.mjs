@@ -129,10 +129,12 @@ try {
   check('admin/admin login succeeds', r.status === 200 && r.data.ok === true);
 
   // Seeded household users (idempotent seeds in db.js). /api/users
-  // lists the owner candidates: every user EXCEPT admin.
+  // lists the owner candidates with their avatars: every user EXCEPT
+  // admin.
   r = await req('GET', '/api/users');
+  const candidateNames = (r.data || []).map((u) => u.username);
   check('owner candidates are Shawn + Jiaying (admin not offered)',
-    Array.isArray(r.data) && r.data.includes('Shawn') && r.data.includes('Jiaying') && !r.data.includes('admin'),
+    candidateNames.includes('Shawn') && candidateNames.includes('Jiaying') && !candidateNames.includes('admin'),
     JSON.stringify(r.data));
 
   // Legacy-owner migration (the pre-seeded DB above): a single stored
@@ -409,6 +411,101 @@ try {
   check('cleared payment day restores anniversary nodes', r.data.series[0].date === '2026-11-24');
   r = await req('DELETE', `/api/properties/${pidPay}`);
   check('delete payday property', r.status === 200);
+
+  // ------------------------------------------------------------ admin ---
+  // User management is admin-only. The live session at this point is
+  // Jiaying's (from the login checks near the top), i.e. NOT admin.
+  r = await req('GET', '/api/admin/users');
+  check('non-admin gets 403 on the admin user list', r.status === 403, JSON.stringify(r.data));
+  r = await req('POST', '/api/admin/users', { username: 'Nope', password: 'nope' });
+  check('non-admin cannot create users', r.status === 403);
+  r = await req('POST', '/api/login', { username: 'admin', password: 'admin' });
+  check('admin signs back in for the admin checks', r.status === 200);
+  r = await req('GET', '/api/me');
+  check('/api/me flags admin and carries avatar data',
+    r.data.isAdmin === true && typeof r.data.avatarColor === 'string' && r.data.avatarFile === null,
+    JSON.stringify(r.data));
+
+  r = await req('GET', '/api/admin/users');
+  check('admin can list all users', r.status === 200 && r.data.length === 3, JSON.stringify(r.data).slice(0, 200));
+  const byName = Object.fromEntries((r.data || []).map((u) => [u.username, u]));
+  check('default avatar colors are stored and Shawn != Jiaying',
+    !!byName.Shawn.avatarColor && !!byName.Jiaying.avatarColor && byName.Shawn.avatarColor !== byName.Jiaying.avatarColor,
+    JSON.stringify({ Shawn: byName.Shawn && byName.Shawn.avatarColor, Jiaying: byName.Jiaying && byName.Jiaying.avatarColor }));
+  check('seeded users start on letter avatars (no photo file)',
+    byName.Shawn.avatarFile === null && byName.Jiaying.avatarFile === null && byName.admin.avatarFile === null);
+  const jiayingId = byName.Jiaying.id;
+  const adminId = byName.admin.id;
+
+  // Avatar upload for Jiaying (a tiny PNG): afterwards the file is
+  // served back, and the owner-candidate directory — which the owner
+  // chips on cards and detail pages render from — carries it.
+  const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  r = await req('POST', `/api/admin/users/${jiayingId}/avatar`, { dataBase64: TINY_PNG, contentType: 'image/png' });
+  check('avatar upload accepted', r.status === 200 && !!r.data.avatarFile, JSON.stringify(r.data).slice(0, 160));
+  const jiayingAvatar = r.data.avatarFile;
+  const avRes = await fetch(`${BASE}/avatars/${jiayingAvatar}`, { headers: { Cookie: cookie } });
+  check('uploaded avatar is served back as an image',
+    avRes.status === 200 && String(avRes.headers.get('content-type')).includes('image/png'),
+    `${avRes.status} ${avRes.headers.get('content-type')}`);
+  r = await req('GET', '/api/users');
+  const jiaDir = (r.data || []).find((u) => u.username === 'Jiaying');
+  check('owner directory carries Jiaying\'s uploaded avatar (chips render from this)',
+    !!jiaDir && jiaDir.avatarFile === jiayingAvatar, JSON.stringify(jiaDir));
+  r = await req('POST', `/api/admin/users/${jiayingId}/avatar`, { dataBase64: TINY_PNG, contentType: 'text/plain' });
+  check('non-image avatar upload rejected', r.status === 400);
+
+  // A property owned by Jiaying: its owners name her, and her chip
+  // everywhere (card, detail) renders the avatar from the directory.
+  r = await req('POST', '/api/properties', { address: '5 Avatar Avenue', owners: ['Jiaying'], mortgage_balance: 200000, purchase_date: '2023-06-01' });
+  check('property owned by Jiaying created', r.status === 201 && JSON.stringify(r.data.owners) === '["Jiaying"]');
+  const pidAvatar = r.data.id;
+  r = await req('GET', `/api/properties/${pidAvatar}`);
+  check('property detail data names Jiaying as owner', JSON.stringify(r.data.owners) === '["Jiaying"]');
+
+  // Restore default: photo cleared, stored color kept, file gone.
+  r = await req('DELETE', `/api/admin/users/${jiayingId}/avatar`);
+  check('restore-default clears the photo and keeps the color',
+    r.status === 200 && r.data.avatarFile === null && r.data.avatarColor === byName.Jiaying.avatarColor,
+    JSON.stringify(r.data).slice(0, 160));
+  const avGone = await fetch(`${BASE}/avatars/${jiayingAvatar}`, { headers: { Cookie: cookie } });
+  check('removed avatar file no longer served', avGone.status === 404);
+  r = await req('DELETE', `/api/properties/${pidAvatar}`);
+  check('avatar property cleaned up', r.status === 200);
+
+  // Create / reset-password / delete lifecycle for a throwaway user.
+  r = await req('POST', '/api/admin/users', { username: 'TestUser', password: 'firstpass' });
+  check('admin creates a user (with a stored avatar color)',
+    r.status === 201 && r.data.username === 'TestUser' && !!r.data.avatarColor, JSON.stringify(r.data).slice(0, 160));
+  const testUserId = r.data.id;
+  r = await req('POST', '/api/admin/users', { username: 'TestUser', password: 'whatever' });
+  check('duplicate username rejected', r.status === 400);
+  r = await req('POST', '/api/login', { username: 'TestUser', password: 'firstpass' });
+  check('new user can sign in', r.status === 200);
+  r = await req('POST', '/api/login', { username: 'admin', password: 'admin' });
+  r = await req('POST', `/api/admin/users/${testUserId}/password`, { password: 'secondpass' });
+  check('admin resets a password', r.status === 200);
+  r = await req('POST', '/api/login', { username: 'TestUser', password: 'firstpass' });
+  check('old password fails after reset', r.status === 401);
+  r = await req('POST', '/api/login', { username: 'TestUser', password: 'secondpass' });
+  check('new password works after reset', r.status === 200);
+
+  // Deleting a user scrubs their name from owners lists and ends their
+  // sign-in; the admin user itself cannot be deleted.
+  r = await req('POST', '/api/login', { username: 'admin', password: 'admin' });
+  r = await req('POST', '/api/properties', { address: '6 Scrub Street', owners: ['TestUser'], mortgage_balance: 1000, purchase_date: '2024-01-01' });
+  const pidScrub = r.data.id;
+  check('property owned by TestUser created', r.status === 201 && JSON.stringify(r.data.owners) === '["TestUser"]');
+  r = await req('DELETE', `/api/admin/users/${testUserId}`);
+  check('admin deletes a user', r.status === 200);
+  r = await req('GET', `/api/properties/${pidScrub}`);
+  check('deleted user scrubbed from owners', JSON.stringify(r.data.owners) === '[]', JSON.stringify(r.data.owners));
+  r = await req('POST', '/api/login', { username: 'TestUser', password: 'secondpass' });
+  check('deleted user can no longer sign in', r.status === 401);
+  r = await req('DELETE', `/api/admin/users/${adminId}`);
+  check('deleting the admin user is refused', r.status === 400, JSON.stringify(r.data));
+  r = await req('DELETE', `/api/properties/${pidScrub}`);
+  check('scrub property cleaned up', r.status === 200);
 
   // Segment delete + property delete paths.
   r = await req('DELETE', `/api/properties/${pid}/rates/${segId}`);

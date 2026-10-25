@@ -89,6 +89,18 @@ tr.clickable:hover td { background: #f2f7fc; }
 .owner-candidates:empty { margin-top: 0; }
 .owner-candidate { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px dashed #9db38a; background: #f6f9f3; color: #43602c; cursor: pointer; width: auto; }
 .owner-candidate:hover { background: #eef4ea; }
+/* Avatars: uploaded photo, or a letter on the user's stored color.
+   Sizes: default (top bar), xs (owner chips), lg (admin list). */
+.avatar { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; flex: none; }
+.avatar-letter { color: #fff; font-size: 12px; font-weight: 650; }
+.avatar.xs { width: 15px; height: 15px; }
+.avatar.xs.avatar-letter { font-size: 8.5px; }
+.avatar.lg { width: 42px; height: 42px; }
+.avatar.lg.avatar-letter { font-size: 18px; }
+.owner-chip { display: inline-flex; align-items: center; gap: 4px; }
+.user-cell { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; }
+label.btnlike { display: inline-block; font: inherit; font-size: 13px; color: inherit; cursor: pointer; border: 1px solid #c9d2dc; background: #fff; border-radius: 6px; padding: 3px 8px; margin: 0; }
+label.btnlike:hover { background: #f0f4f9; }
 /* Modals */
 .modal-overlay { position: fixed; inset: 0; background: rgba(18, 28, 38, .5); z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px 24px; overflow-y: auto; }
 .modal-card { background: #fff; border-radius: 12px; padding: 18px 20px; width: 720px; max-width: 100%; box-shadow: 0 18px 50px rgba(10, 20, 30, .3); }
