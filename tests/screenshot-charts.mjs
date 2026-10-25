@@ -102,6 +102,7 @@ try {
   r = await req('POST', '/api/properties', {
     address: '88 Chart Crescent, Victoria, BC',
     mortgage_balance: 900000, mortgage_balance_date: '2026-10-01', mortgage_payment: 4981,
+    purchase_date: '2021-04-09',
   });
   const pid = r.data.id;
   await req('POST', `/api/properties/${pid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 4.5 });

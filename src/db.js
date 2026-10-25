@@ -95,6 +95,11 @@ if (!propCols.includes('owner')) {
   // Who owns the asset: a username, 'Joint' (properties only), or NULL.
   db.exec('ALTER TABLE properties ADD COLUMN owner TEXT');
 }
+if (!propCols.includes('purchase_date')) {
+  // When the property was bought ('YYYY-MM-DD'). Nullable in the schema
+  // (rows predate it); the Add endpoint requires it for new properties.
+  db.exec('ALTER TABLE properties ADD COLUMN purchase_date TEXT');
+}
 const assetCols = db.prepare('PRAGMA table_info(other_assets)').all().map((c) => c.name);
 if (!assetCols.includes('owner')) {
   db.exec('ALTER TABLE other_assets ADD COLUMN owner TEXT');

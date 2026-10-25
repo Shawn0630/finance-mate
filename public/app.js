@@ -417,6 +417,7 @@ async function loadPropertyDetail(id) {
   fillOwnerSelect($('#propOwner'), { allowJoint: true, value: p.owner || '' });
   pf.assessed_value.value = p.assessed_value ?? '';
   pf.assessed_year.value = p.assessed_year ?? '';
+  pf.purchase_date.value = p.purchase_date || '';
   pf.photo_url.value = p.photo_url || '';
   $('#assessmentMeta').textContent =
     p.assessed_source === 'auto'

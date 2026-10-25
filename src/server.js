@@ -119,6 +119,12 @@ app.get('/api/address/suggest', requireApiAuth, async (req, res) => {
 // ------------------------------------------------------------ properties ---
 const nowIso = () => new Date().toISOString();
 const num = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
+// Strict 'YYYY-MM-DD' calendar-date check (rejects 2021-13-40 etc.).
+const isDateStr = (v) => {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const d = new Date(`${v}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+};
 
 function getProperty(id) {
   return db.prepare('SELECT * FROM properties WHERE id = ?').get(id);
@@ -163,6 +169,16 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   if (balance === null || balance < 0) {
     return res.status(400).json({ error: 'mortgage balance (outstanding balance) is required' });
   }
+  // Purchase date is required when adding (the column itself stays
+  // nullable for properties recorded before it existed). It is NOT the
+  // balance date: the balance date defaults to today (current balance),
+  // the purchase date is the day the property was bought.
+  if (b.purchase_date === undefined || b.purchase_date === null || b.purchase_date === '') {
+    return res.status(400).json({ error: 'purchase date is required' });
+  }
+  if (!isDateStr(b.purchase_date)) {
+    return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
+  }
   const bcaId = b.bca_id ? String(b.bca_id) : null;
   const own = cleanOwner(b.owner, true);
   if (own.error) return res.status(400).json({ error: own.error });
@@ -170,8 +186,8 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
          mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
-         notes, bca_id, bca_matched_address, owner, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         notes, bca_id, bca_matched_address, owner, purchase_date, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       String(b.address).trim(),
@@ -188,6 +204,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       // itself; the fetch later replaces this with the GIS-canonical form.
       bcaId ? String(b.address).trim() : null,
       own.value ?? null,
+      b.purchase_date,
       nowIso(),
       nowIso()
     );
@@ -225,7 +242,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     amortization_years: b.amortization_years !== undefined ? num(b.amortization_years) : p.amortization_years,
     notes: b.notes !== undefined ? b.notes || null : p.notes,
     owner: p.owner,
+    // Purchase date can be changed any time on the detail page (the Add
+    // form requires it, editing does not re-require it).
+    purchase_date: b.purchase_date !== undefined ? (b.purchase_date || null) : p.purchase_date,
   };
+  if (b.purchase_date !== undefined && b.purchase_date && !isDateStr(b.purchase_date)) {
+    return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
+  }
   if (b.owner !== undefined) {
     const own = cleanOwner(b.owner, true);
     if (own.error) return res.status(400).json({ error: own.error });
@@ -238,12 +261,12 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
-       owner=?, updated_at=? WHERE id=?`
+       owner=?, purchase_date=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
-    next.amortization_years, next.notes, next.owner, nowIso(), p.id
+    next.amortization_years, next.notes, next.owner, next.purchase_date, nowIso(), p.id
   );
   res.json(propertyView(getProperty(p.id)));
 });

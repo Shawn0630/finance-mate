@@ -95,6 +95,7 @@
         <div class="grid3">
           <div><label>Assessed value ($)</label><input name="assessed_value" type="number" step="0.01" min="0"></div>
           <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
+          <div><label>Purchase date</label><input name="purchase_date" type="date"></div>
         </div>
         <div class="note" id="assessmentMeta" style="margin-left:0"></div>
         <div class="toolbar">
@@ -187,6 +188,10 @@
       <div class="grid2">
         <div><label>Owner</label><select name="owner" id="addPropOwner"></select></div>
         <div><label>Outstanding balance ($) *</label><input name="mortgage_balance" type="number" step="0.01" min="0" required></div>
+      </div>
+      <div class="grid2">
+        <div><label>Purchase date *</label><input name="purchase_date" type="date" required></div>
+        <div></div>
       </div>
       <div class="note" style="margin-left:0">Just the essentials — the balance counts as of today. Monthly payment, rate segments, notes and photos can all be filled in afterwards on the property's detail page. After adding, the app tries to fetch the assessed value from BC Assessment automatically.</div>
       <div class="toolbar">

@@ -120,6 +120,7 @@ try {
   r = await req('POST', '/api/properties', {
     address: '1234 Example Street, Victoria, BC',
     mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    purchase_date: '2020-03-15',
   });
   check('create property', r.status === 201 && r.data.id > 0);
   const pid = r.data.id;
@@ -169,7 +170,7 @@ try {
   // A property created from a picked suggestion stores the BC Assessment
   // property id; fetching its value then goes straight to the property
   // page (no new address search) and returns the stubbed GIS values.
-  r = await req('POST', '/api/properties', { address: '1200 Government St, Victoria', bca_id: 'QkxPQy0xMjAw', mortgage_balance: 500000 });
+  r = await req('POST', '/api/properties', { address: '1200 Government St, Victoria', bca_id: 'QkxPQy0xMjAw', mortgage_balance: 500000, purchase_date: '2018-07-01' });
   check('create property with picked bca_id', r.status === 201 && r.data.bca_id === 'QkxPQy0xMjAw');
   const pid2 = r.data.id;
   const searchBeforeFetch = stubHits.search;
@@ -183,12 +184,12 @@ try {
 
   // Owner rules: properties may be Joint or any user; other assets may
   // be a user but never Joint.
-  r = await req('POST', '/api/properties', { address: '1 Owner Way', owner: 'Joint', mortgage_balance: 100000 });
+  r = await req('POST', '/api/properties', { address: '1 Owner Way', owner: 'Joint', mortgage_balance: 100000, purchase_date: '2022-01-20' });
   check('property can have Joint owner', r.status === 201 && r.data.owner === 'Joint');
   const pidOwn = r.data.id;
   r = await req('PUT', `/api/properties/${pidOwn}`, { owner: 'Shawn' });
   check('property owner can be a user', r.status === 200 && r.data.owner === 'Shawn');
-  r = await req('POST', '/api/properties', { address: '2 Owner Way', owner: 'Nobody', mortgage_balance: 100000 });
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owner: 'Nobody', mortgage_balance: 100000, purchase_date: '2022-01-20' });
   check('property with unknown owner rejected', r.status === 400);
   r = await req('POST', '/api/assets', { category: 'other', name: 'Joint test', owner: 'Joint' });
   check('other asset with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
@@ -242,6 +243,7 @@ try {
   r = await req('POST', '/api/properties', {
     address: '9 Rateplan Road, Victoria, BC',
     mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    purchase_date: '2019-11-05',
   });
   check('create rate-plan chain property', r.status === 201);
   const pid3 = r.data.id;
@@ -267,20 +269,35 @@ try {
   r = await req('DELETE', `/api/properties/${pid3}`);
   check('delete rate-plan chain property', r.status === 200);
 
-  // Slim add: only address + owner + outstanding balance. The balance
-  // date defaults to today (current-balance semantics); payment and
-  // amortization stay empty for the detail page to fill in, and with no
-  // rate plan yet the projection is the NO_RATE_PLAN prompt state.
+  // Slim add: only address + owner + outstanding balance + purchase
+  // date. The balance date defaults to today (current-balance
+  // semantics); payment and amortization stay empty for the detail page
+  // to fill in, and with no rate plan yet the projection is the
+  // NO_RATE_PLAN prompt state. Purchase date is required at add time
+  // (the column itself stays nullable for older rows).
   r = await req('POST', '/api/properties', { address: '7 Slim Lane, Victoria, BC', owner: 'Shawn' });
   check('add without balance rejected', r.status === 400 && String(r.data.error || '').includes('balance'), JSON.stringify(r.data));
   r = await req('POST', '/api/properties', {
     address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456,
   });
+  check('add without purchase date rejected', r.status === 400 && String(r.data.error || '') === 'purchase date is required', JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', {
+    address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456, purchase_date: '2021-13-40',
+  });
+  check('add with impossible purchase date rejected', r.status === 400 && String(r.data.error || '').includes('valid date'), JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', {
+    address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456, purchase_date: '2021-05-14',
+  });
   const today = new Date().toISOString().slice(0, 10);
-  check('slim add (3 fields) creates the property', r.status === 201 && r.data.mortgage_balance === 123456, JSON.stringify(r.data).slice(0, 160));
-  check('balance date defaults to today', r.data.mortgage_balance_date === today, String(r.data.mortgage_balance_date));
+  check('slim add (4 fields) creates the property', r.status === 201 && r.data.mortgage_balance === 123456, JSON.stringify(r.data).slice(0, 160));
+  check('purchase date stored', r.data.purchase_date === '2021-05-14', String(r.data.purchase_date));
+  check('balance date defaults to today (not the purchase date)', r.data.mortgage_balance_date === today, String(r.data.mortgage_balance_date));
   check('payment/amortization left empty at add', (r.data.mortgage_payment ?? null) === null && (r.data.amortization_years ?? null) === null);
   const pidSlim = r.data.id;
+  r = await req('PUT', `/api/properties/${pidSlim}`, { purchase_date: '2022-08-30' });
+  check('purchase date changed on the detail side', r.status === 200 && r.data.purchase_date === '2022-08-30');
+  r = await req('GET', `/api/properties/${pidSlim}`);
+  check('purchase date change persisted', r.data.purchase_date === '2022-08-30');
   r = await req('GET', `/api/properties/${pidSlim}/amortization`);
   check('slim-added property sits in NO_RATE_PLAN state', r.data.ok === false && r.data.code === 'NO_RATE_PLAN');
   r = await req('DELETE', `/api/properties/${pidSlim}`);
