@@ -61,12 +61,18 @@ Environment variables: `PORT` (default 9200), `DATA_DIR` (default `./data`),
 
 ## Owners
 
-Every property and every other asset can have an **owner**: one of the
-sign-in users, or — **for properties only** — `Joint`. The owner dropdowns
-are filled from the users table (admin included, since it is a real
-login). The server rejects `Joint` for non-property assets, and rejects
-names that are not users. Owners show as a chip on property cards and in
-the asset tables; summaries are not broken down by owner.
+Every property and every other asset has **owners**: a set of people,
+picked with a multi-select tag control. Joint ownership is simply
+picking several people (e.g. Shawn + Jiaying) — there is no special
+`Joint` value. The candidates are the sign-in users **except admin**
+(the admin account manages the app and is never an owner). The server
+rejects `admin`, the literal `Joint`, and any name that is not a user.
+Owners are stored as a JSON array and show as chips on property cards,
+in the asset tables and on the detail pages; summaries are not broken
+down by owner. (Databases from before the multi-owner change are
+migrated automatically: a single stored owner becomes a one-element
+set, and a stored `Joint` becomes an empty set, since it named no
+concrete people.)
 
 ## Assessed value trend
 

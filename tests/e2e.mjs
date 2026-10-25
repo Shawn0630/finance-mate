@@ -9,10 +9,44 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 
 const PORT = 19200 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${PORT}`;
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-e2e-'));
+
+// Pre-seed a LEGACY database (single-value `owner` columns — the shape
+// from before the multi-owner change) so the startup migration in db.js
+// is exercised below: 'Shawn' must become ['Shawn'], the literal 'Joint'
+// must become an empty set (it named no concrete people), NULL stays
+// empty. All money values are 0 so these rows cannot disturb the summary
+// assertions further down.
+{
+  const legacy = new Database(path.join(dataDir, 'finance.db'));
+  legacy.exec(`
+    CREATE TABLE properties (
+      id INTEGER PRIMARY KEY, address TEXT NOT NULL, photo_url TEXT, photo_file TEXT,
+      assessed_value REAL, assessed_year INTEGER, land_value REAL, building_value REAL,
+      assessed_source TEXT, assessed_fetched_at TEXT, bca_matched_address TEXT,
+      bca_extract_date TEXT, mortgage_balance REAL, mortgage_balance_date TEXT,
+      mortgage_payment REAL, amortization_years REAL, notes TEXT, owner TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE other_assets (
+      id INTEGER PRIMARY KEY, category TEXT NOT NULL, name TEXT NOT NULL,
+      value REAL NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'CAD',
+      notes TEXT, owner TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+  `);
+  const ts = new Date().toISOString();
+  const insP = legacy.prepare('INSERT INTO properties (address, mortgage_balance, owner, created_at, updated_at) VALUES (?, 0, ?, ?, ?)');
+  insP.run('1 Legacy Lane', 'Shawn', ts, ts);
+  insP.run('2 Legacy Lane', 'Joint', ts, ts);
+  insP.run('3 Legacy Lane', null, ts, ts);
+  legacy.prepare('INSERT INTO other_assets (category, name, value, currency, owner, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?, ?)')
+    .run('other', 'Legacy thing', 'CAD', 'Jiaying', ts, ts);
+  legacy.close();
+}
 let failures = 0;
 const check = (name, cond, extra = '') => {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`);
@@ -94,10 +128,28 @@ try {
   r = await req('POST', '/api/login', { username: 'admin', password: 'admin' });
   check('admin/admin login succeeds', r.status === 200 && r.data.ok === true);
 
-  // Seeded household users (idempotent seeds in db.js).
+  // Seeded household users (idempotent seeds in db.js). /api/users
+  // lists the owner candidates: every user EXCEPT admin.
   r = await req('GET', '/api/users');
-  check('users list has admin, Shawn, Jiaying',
-    ['admin', 'Shawn', 'Jiaying'].every((u) => (r.data || []).includes(u)), JSON.stringify(r.data));
+  check('owner candidates are Shawn + Jiaying (admin not offered)',
+    Array.isArray(r.data) && r.data.includes('Shawn') && r.data.includes('Jiaying') && !r.data.includes('admin'),
+    JSON.stringify(r.data));
+
+  // Legacy-owner migration (the pre-seeded DB above): a single stored
+  // owner became a one-element set; the literal 'Joint' became an empty
+  // set; NULL stayed empty.
+  r = await req('GET', '/api/properties');
+  const legacyProps = Object.fromEntries((r.data || []).map((p) => [p.address, p.owners]));
+  check('legacy single owner migrated to a one-element set',
+    JSON.stringify(legacyProps['1 Legacy Lane']) === '["Shawn"]', JSON.stringify(legacyProps));
+  check('legacy Joint owner migrated to an empty set',
+    JSON.stringify(legacyProps['2 Legacy Lane']) === '[]');
+  check('legacy NULL owner migrated to an empty set',
+    JSON.stringify(legacyProps['3 Legacy Lane']) === '[]');
+  r = await req('GET', '/api/assets');
+  const legacyAsset = (r.data || []).find((a) => a.name === 'Legacy thing');
+  check('legacy asset owner migrated to a one-element set',
+    !!legacyAsset && JSON.stringify(legacyAsset.owners) === '["Jiaying"]');
   r = await req('POST', '/api/login', { username: 'Shawn', password: 'wrong' });
   check('Shawn wrong password rejected', r.status === 401);
   r = await req('POST', '/api/login', { username: 'Shawn', password: 'Shawn' });
@@ -182,22 +234,35 @@ try {
   r = await req('PUT', `/api/properties/${pid2}`, { address: '999 Somewhere Else', bca_id: null });
   check('editing address to free text clears bca_id', r.status === 200 && r.data.bca_id === null);
 
-  // Owner rules: properties may be Joint or any user; other assets may
-  // be a user but never Joint.
-  r = await req('POST', '/api/properties', { address: '1 Owner Way', owner: 'Joint', mortgage_balance: 100000, purchase_date: '2022-01-20' });
-  check('property can have Joint owner', r.status === 201 && r.data.owner === 'Joint');
+  // Owners are a SET of people: joint ownership is picking several
+  // names. admin is never a candidate; unknown names and the literal
+  // 'Joint' are rejected; an empty selection is allowed.
+  r = await req('POST', '/api/properties', { address: '1 Owner Way', owners: ['Shawn', 'Jiaying'], mortgage_balance: 100000, purchase_date: '2022-01-20' });
+  check('property can have two owners (co-ownership)', r.status === 201 && JSON.stringify(r.data.owners) === '["Shawn","Jiaying"]', JSON.stringify(r.data.owners));
   const pidOwn = r.data.id;
-  r = await req('PUT', `/api/properties/${pidOwn}`, { owner: 'Shawn' });
-  check('property owner can be a user', r.status === 200 && r.data.owner === 'Shawn');
-  r = await req('POST', '/api/properties', { address: '2 Owner Way', owner: 'Nobody', mortgage_balance: 100000, purchase_date: '2022-01-20' });
+  r = await req('GET', `/api/properties/${pidOwn}`);
+  check('two owners persisted', JSON.stringify(r.data.owners) === '["Shawn","Jiaying"]');
+  r = await req('PUT', `/api/properties/${pidOwn}`, { owners: ['Jiaying'] });
+  check('property owners can be reduced to one', r.status === 200 && JSON.stringify(r.data.owners) === '["Jiaying"]');
+  r = await req('PUT', `/api/properties/${pidOwn}`, { owners: [] });
+  check('property owners can be cleared', r.status === 200 && JSON.stringify(r.data.owners) === '[]');
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owners: ['Nobody'], mortgage_balance: 100000, purchase_date: '2022-01-20' });
   check('property with unknown owner rejected', r.status === 400);
-  r = await req('POST', '/api/assets', { category: 'other', name: 'Joint test', owner: 'Joint' });
-  check('other asset with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
-  r = await req('POST', '/api/assets', { category: 'other', name: 'Owned thing', owner: 'Jiaying' });
-  check('other asset can have a user owner', r.status === 201 && r.data.owner === 'Jiaying');
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owners: ['Shawn', 'Nobody'], mortgage_balance: 100000, purchase_date: '2022-01-20' });
+  check('one bad name poisons the whole owners list', r.status === 400);
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owners: ['admin'], mortgage_balance: 100000, purchase_date: '2022-01-20' });
+  check('admin as property owner rejected', r.status === 400 && String(r.data.error || '').includes('admin'), JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', { address: '2 Owner Way', owners: ['Joint'], mortgage_balance: 100000, purchase_date: '2022-01-20' });
+  check('literal Joint as property owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
+  r = await req('POST', '/api/assets', { category: 'other', name: 'Co-owned thing', owners: ['Shawn', 'Jiaying'] });
+  check('other asset can have two owners', r.status === 201 && JSON.stringify(r.data.owners) === '["Shawn","Jiaying"]', JSON.stringify(r.data.owners));
   const aidOwn = r.data.id;
-  r = await req('PUT', `/api/assets/${aidOwn}`, { owner: 'Joint' });
-  check('other asset owner cannot be changed to Joint', r.status === 400);
+  r = await req('POST', '/api/assets', { category: 'other', name: 'Joint test', owners: ['Joint'] });
+  check('other asset with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
+  r = await req('POST', '/api/assets', { category: 'other', name: 'Admin test', owners: ['admin'] });
+  check('other asset with admin owner rejected', r.status === 400);
+  r = await req('PUT', `/api/assets/${aidOwn}`, { owners: ['Shawn'] });
+  check('asset owners updated via PUT', r.status === 200 && JSON.stringify(r.data.owners) === '["Shawn"]');
   r = await req('DELETE', `/api/properties/${pidOwn}`);
   r = await req('DELETE', `/api/assets/${aidOwn}`);
   check('owner fixtures cleaned up', r.status === 200);
@@ -275,18 +340,18 @@ try {
   // to fill in, and with no rate plan yet the projection is the
   // NO_RATE_PLAN prompt state. Purchase date is required at add time
   // (the column itself stays nullable for older rows).
-  r = await req('POST', '/api/properties', { address: '7 Slim Lane, Victoria, BC', owner: 'Shawn' });
+  r = await req('POST', '/api/properties', { address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'] });
   check('add without balance rejected', r.status === 400 && String(r.data.error || '').includes('balance'), JSON.stringify(r.data));
   r = await req('POST', '/api/properties', {
-    address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456,
+    address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'], mortgage_balance: 123456,
   });
   check('add without purchase date rejected', r.status === 400 && String(r.data.error || '') === 'purchase date is required', JSON.stringify(r.data));
   r = await req('POST', '/api/properties', {
-    address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456, purchase_date: '2021-13-40',
+    address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'], mortgage_balance: 123456, purchase_date: '2021-13-40',
   });
   check('add with impossible purchase date rejected', r.status === 400 && String(r.data.error || '').includes('valid date'), JSON.stringify(r.data));
   r = await req('POST', '/api/properties', {
-    address: '7 Slim Lane, Victoria, BC', owner: 'Shawn', mortgage_balance: 123456, purchase_date: '2021-05-14',
+    address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'], mortgage_balance: 123456, purchase_date: '2021-05-14',
   });
   const today = new Date().toISOString().slice(0, 10);
   check('slim add (4 fields) creates the property', r.status === 201 && r.data.mortgage_balance === 123456, JSON.stringify(r.data).slice(0, 160));

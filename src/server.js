@@ -76,27 +76,57 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', requireApiAuth, (req, res) => res.json({ username: req.user.username }));
 
-// Usernames for the owner dropdowns. Includes admin: it is a real login
-// and can own assets the same way; 'Joint' is added client-side for
-// properties only (and enforced server-side below).
+const adminUsername = () => process.env.SEED_ADMIN_USER || 'admin';
+
+// Usernames that can be picked as owners: every user EXCEPT admin. The
+// admin account signs in to manage the app; it is never an owner
+// candidate and never appears in the owner pickers.
 app.get('/api/users', requireApiAuth, (req, res) => {
-  res.json(db.prepare('SELECT username FROM users ORDER BY id').all().map((r) => r.username));
+  res.json(ownerCandidates());
 });
 
-// ------------------------------------------------------------ owners ---
-// Owner is a username, 'Joint' (properties only), or null. Anything else
-// is rejected so the dropdown data stays clean.
-function cleanOwner(v, allowJoint) {
-  if (v === undefined) return { value: undefined };
-  const s = v === null ? '' : String(v).trim();
-  if (!s) return { value: null };
-  if (s === 'Joint') {
-    if (!allowJoint) return { error: 'Joint ownership is only available for properties' };
-    return { value: 'Joint' };
+// --------------------------------------------------------------- owners ---
+// Owners are a SET of usernames: joint ownership is expressed by picking
+// several people — there is no 'Joint' value. Stored as a JSON array in
+// the `owners` column; the API speaks `owners: string[]`.
+function ownerCandidates() {
+  return db
+    .prepare('SELECT username FROM users WHERE username != ? ORDER BY id')
+    .all(adminUsername())
+    .map((r) => r.username);
+}
+
+function parseOwners(stored) {
+  if (!stored) return [];
+  try {
+    const v = JSON.parse(stored);
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
   }
-  const known = db.prepare('SELECT 1 FROM users WHERE username = ?').get(s);
-  if (!known) return { error: `unknown owner "${s}" — pick one of the users` };
-  return { value: s };
+}
+
+// Validates an incoming owners value. undefined passes through (the field
+// is not being changed); a bare string is tolerated as a one-name list.
+// Every name must be an existing non-admin user; 'Joint' and 'admin' get
+// their own explicit errors. Returns { value } or { error }.
+function cleanOwners(v) {
+  if (v === undefined) return { value: undefined };
+  let list = v;
+  if (list === null || list === '') list = [];
+  if (typeof list === 'string') list = [list];
+  if (!Array.isArray(list)) return { error: 'owners must be a list of usernames' };
+  const candidates = new Set(ownerCandidates());
+  const names = [];
+  for (const item of list) {
+    const s = String(item ?? '').trim();
+    if (!s) continue;
+    if (s === 'Joint') return { error: '"Joint" is not an owner — select the people who co-own it instead' };
+    if (s === adminUsername()) return { error: 'admin cannot be an owner' };
+    if (!candidates.has(s)) return { error: `unknown owner "${s}" — pick from the users list` };
+    if (!names.includes(s)) names.push(s);
+  }
+  return { value: names };
 }
 
 // ------------------------------------------------------ address suggest ---
@@ -147,9 +177,14 @@ function propertyView(p) {
   const cur = currentSegment(segments);
   return {
     ...p,
+    owners: parseOwners(p.owners),
     segments,
     currentRate: cur ? { rate_type: cur.rate_type, annual_rate: cur.annual_rate, start_date: cur.start_date } : null,
   };
+}
+
+function assetView(a) {
+  return { ...a, owners: parseOwners(a.owners) };
 }
 
 app.get('/api/properties', requireApiAuth, (req, res) => {
@@ -180,13 +215,13 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: 'purchase date must be a valid date (YYYY-MM-DD)' });
   }
   const bcaId = b.bca_id ? String(b.bca_id) : null;
-  const own = cleanOwner(b.owner, true);
+  const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
   if (own.error) return res.status(400).json({ error: own.error });
   const info = db
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
          mortgage_balance, mortgage_balance_date, mortgage_payment, amortization_years,
-         notes, bca_id, bca_matched_address, owner, purchase_date, created_at, updated_at)
+         notes, bca_id, bca_matched_address, owners, purchase_date, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
@@ -203,7 +238,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       // The picked suggestion's label is the submitted address text
       // itself; the fetch later replaces this with the GIS-canonical form.
       bcaId ? String(b.address).trim() : null,
-      own.value ?? null,
+      JSON.stringify(own.value ?? []),
       b.purchase_date,
       nowIso(),
       nowIso()
@@ -241,7 +276,7 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     mortgage_payment: b.mortgage_payment !== undefined ? num(b.mortgage_payment) : p.mortgage_payment,
     amortization_years: b.amortization_years !== undefined ? num(b.amortization_years) : p.amortization_years,
     notes: b.notes !== undefined ? b.notes || null : p.notes,
-    owner: p.owner,
+    owners: parseOwners(p.owners),
     // Purchase date can be changed any time on the detail page (the Add
     // form requires it, editing does not re-require it).
     purchase_date: b.purchase_date !== undefined ? (b.purchase_date || null) : p.purchase_date,
@@ -262,10 +297,10 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
       next.payment_day = d;
     }
   }
-  if (b.owner !== undefined) {
-    const own = cleanOwner(b.owner, true);
+  if (b.owners !== undefined || b.owner !== undefined) {
+    const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
     if (own.error) return res.status(400).json({ error: own.error });
-    next.owner = own.value;
+    next.owners = own.value;
   }
   if (!next.address) return res.status(400).json({ error: 'address is required' });
   // Editing the assessed value by hand marks it as a manual value.
@@ -274,12 +309,12 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, mortgage_payment=?, amortization_years=?, notes=?,
-       owner=?, purchase_date=?, payment_day=?, updated_at=? WHERE id=?`
+       owners=?, purchase_date=?, payment_day=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date, next.mortgage_payment,
-    next.amortization_years, next.notes, next.owner, next.purchase_date,
+    next.amortization_years, next.notes, JSON.stringify(next.owners), next.purchase_date,
     next.payment_day, nowIso(), p.id
   );
   res.json(propertyView(getProperty(p.id)));
@@ -536,25 +571,25 @@ app.get('/api/properties/:id/equity', requireApiAuth, (req, res) => {
 const ASSET_CATEGORIES = ['fixed_assets', 'stocks', 'term_deposits', 'other'];
 
 app.get('/api/assets', requireApiAuth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM other_assets ORDER BY category, id').all());
+  res.json(db.prepare('SELECT * FROM other_assets ORDER BY category, id').all().map(assetView));
 });
 
 app.get('/api/assets/:id', requireApiAuth, (req, res) => {
   const a = db.prepare('SELECT * FROM other_assets WHERE id = ?').get(req.params.id);
   if (!a) return res.status(404).json({ error: 'asset not found' });
-  res.json(a);
+  res.json(assetView(a));
 });
 
 app.post('/api/assets', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!ASSET_CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'unknown category' });
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'name is required' });
-  const own = cleanOwner(b.owner, false);
+  const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
   if (own.error) return res.status(400).json({ error: own.error });
   const info = db
-    .prepare('INSERT INTO other_assets (category, name, value, currency, notes, owner, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, own.value ?? null, nowIso(), nowIso());
-  res.status(201).json(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(info.lastInsertRowid));
+    .prepare('INSERT INTO other_assets (category, name, value, currency, notes, owners, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, JSON.stringify(own.value ?? []), nowIso(), nowIso());
+  res.status(201).json(assetView(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(info.lastInsertRowid)));
 });
 
 app.put('/api/assets/:id', requireApiAuth, (req, res) => {
@@ -567,18 +602,18 @@ app.put('/api/assets/:id', requireApiAuth, (req, res) => {
     value: b.value !== undefined ? num(b.value) ?? 0 : a.value,
     currency: b.currency !== undefined ? b.currency : a.currency,
     notes: b.notes !== undefined ? b.notes || null : a.notes,
-    owner: a.owner,
+    owners: parseOwners(a.owners),
   };
-  if (b.owner !== undefined) {
-    const own = cleanOwner(b.owner, false);
+  if (b.owners !== undefined || b.owner !== undefined) {
+    const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
     if (own.error) return res.status(400).json({ error: own.error });
-    next.owner = own.value;
+    next.owners = own.value;
   }
   if (!ASSET_CATEGORIES.includes(next.category)) return res.status(400).json({ error: 'unknown category' });
   if (!next.name) return res.status(400).json({ error: 'name is required' });
-  db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, owner=?, updated_at=? WHERE id=?')
-    .run(next.category, next.name, next.value, next.currency, next.notes, next.owner, nowIso(), a.id);
-  res.json(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(a.id));
+  db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, owners=?, updated_at=? WHERE id=?')
+    .run(next.category, next.name, next.value, next.currency, next.notes, JSON.stringify(next.owners), nowIso(), a.id);
+  res.json(assetView(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(a.id)));
 });
 
 app.delete('/api/assets/:id', requireApiAuth, (req, res) => {

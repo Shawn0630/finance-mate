@@ -175,21 +175,55 @@ function route() {
 window.addEventListener('hashchange', route);
 
 // ---------------------------------------------------------------- owners ---
-// Owner options come from the users table. 'Joint' is offered for
-// properties only (the server enforces the same rule for other assets).
+// Owners are a SET of people: joint ownership is picking several names —
+// there is no 'Joint' option. Candidates come from /api/users (every user
+// except admin). The picker shows the selected people as removable chips
+// and the remaining candidates as "+ Name" buttons; a name that is
+// already picked leaves the candidate row, so it cannot be added twice.
 let ownerUsers = [];
 async function loadOwnerUsers() {
   try { ownerUsers = await api('/api/users'); } catch { ownerUsers = []; }
 }
-function fillOwnerSelect(sel, { allowJoint, value = '' }) {
-  if (!sel) return;
-  const opts = ['<option value="">(No owner)</option>']
-    .concat(ownerUsers.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`));
-  if (allowJoint) opts.push('<option value="Joint">Joint</option>');
-  sel.innerHTML = opts.join('');
-  sel.value = value || '';
-  if (sel.value !== (value || '')) sel.value = ''; // unknown stored value -> blank
+
+function ownerChipsHtml(owners) {
+  return (owners || []).map((u) => `<span class="owner-chip">${esc(u)}</span>`).join(' ');
 }
+
+function createOwnerPicker(root) {
+  if (!root) return { get: () => [], set() {}, refresh() {} };
+  let selected = [];
+  function render() {
+    root.querySelector('.owner-chips').innerHTML = selected.length
+      ? selected.map((u) => `<span class="owner-chip">${esc(u)}<button type="button" class="owner-x" data-owner-remove="${esc(u)}" title="Remove ${esc(u)}">&times;</button></span>`).join('')
+      : '<span class="owner-none">No owner selected</span>';
+    root.querySelector('.owner-candidates').innerHTML = ownerUsers
+      .filter((u) => !selected.includes(u))
+      .map((u) => `<button type="button" class="owner-candidate" data-owner-add="${esc(u)}">+ ${esc(u)}</button>`)
+      .join('');
+  }
+  root.addEventListener('click', (e) => {
+    const add = e.target.closest('[data-owner-add]');
+    const rem = e.target.closest('[data-owner-remove]');
+    if (add) {
+      const name = add.getAttribute('data-owner-add');
+      if (name && !selected.includes(name)) selected.push(name);
+      render();
+    } else if (rem) {
+      selected = selected.filter((u) => u !== rem.getAttribute('data-owner-remove'));
+      render();
+    }
+  });
+  render();
+  return {
+    get: () => [...selected],
+    set(values) { selected = [...(values || [])]; render(); },
+    refresh: render,
+  };
+}
+const addPropOwnerPicker = createOwnerPicker($('#addPropOwnerPicker'));
+const propOwnerPicker = createOwnerPicker($('#propOwnerPicker'));
+const assetOwnerPicker = createOwnerPicker($('#assetOwnerPicker'));
+const ownerPickers = [addPropOwnerPicker, propOwnerPicker, assetOwnerPicker];
 
 // ------------------------------------------------------------- assets data ---
 let assetsLoaded = false;
@@ -247,7 +281,7 @@ async function loadAssets(force = false) {
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
         <div class="kv"><span class="k">Mortgage balance</span><span>${money(p.mortgage_balance)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
-        ${p.owner ? `<div class="kv"><span class="k">Owner</span><span class="owner-chip">${esc(p.owner)}</span></div>` : ''}
+        ${p.owners && p.owners.length ? `<div class="kv"><span class="k">Owners</span><span>${ownerChipsHtml(p.owners)}</span></div>` : ''}
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
       </div></div>`;
   }).join('') || '<div class="note">No properties yet — use “Add property” above.</div>';
@@ -258,7 +292,7 @@ async function loadAssets(force = false) {
     const subtotal = rows.reduce((sum, a) => sum + Number(a.value || 0), 0);
     const body = rows.map((a) => `<tr class="clickable" onclick="location.hash='#asset/${a.id}'">
       <td>${esc(a.name)}</td><td class="num">${money(a.value)}</td><td>${esc(a.currency)}</td>
-      <td>${a.owner ? `<span class="owner-chip">${esc(a.owner)}</span>` : ''}</td>
+      <td>${ownerChipsHtml(a.owners)}</td>
       <td>${esc(a.notes || '')}</td>
       <td style="white-space:nowrap">
         <button class="small" onclick="event.stopPropagation(); openAssetModal(${a.id})">Edit</button>
@@ -269,7 +303,7 @@ async function loadAssets(force = false) {
         <div class="spacer"></div>
         <button class="primary" onclick="openAssetModal(null, '${s.category}')">+ ${s.addLabel}</button></div>
       ${rows.length
-        ? `<div class="panel" style="padding:6px 16px"><table><thead><tr><th>Name</th><th class="num">Value</th><th>Currency</th><th>Owner</th><th>Notes</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`
+        ? `<div class="panel" style="padding:6px 16px"><table><thead><tr><th>Name</th><th class="num">Value</th><th>Currency</th><th>Owners</th><th>Notes</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`
         : '<div class="note">No entries yet.</div>'}`;
   }
 }
@@ -280,7 +314,7 @@ let assetModalCategory = 'other';
 function openAssetModal(assetId, category) {
   const form = $('#assetForm');
   form.reset();
-  fillOwnerSelect($('#assetOwner'), { allowJoint: false });
+  assetOwnerPicker.set([]);
   $('#assetModalMsg').className = 'msg';
   if (assetId) {
     api('/api/assets/' + assetId).then((a) => {
@@ -292,7 +326,7 @@ function openAssetModal(assetId, category) {
       form.elements.value.value = a.value ?? '';
       form.elements.currency.value = a.currency || 'CAD';
       form.elements.notes.value = a.notes || '';
-      fillOwnerSelect($('#assetOwner'), { allowJoint: false, value: a.owner || '' });
+      assetOwnerPicker.set(a.owners || []);
       openModal('assetModal');
     }).catch((e) => alert(e.message));
   } else {
@@ -312,6 +346,7 @@ $('#assetForm').addEventListener('submit', async (e) => {
   const id = f.id;
   delete f.id;
   delete f.categoryLabel;
+  f.owners = assetOwnerPicker.get();
   try {
     if (id) await api('/api/assets/' + id, { method: 'PUT', body: f });
     else await api('/api/assets', { method: 'POST', body: { ...f, category: assetModalCategory } });
@@ -346,12 +381,12 @@ async function loadAssetDetail(id) {
     ['Category', CATEGORY_LABELS[a.category] || a.category],
     ['Value', money(a.value)],
     ['Currency', a.currency],
-    ['Owner', a.owner || '—'],
+    ['Owners', a.owners && a.owners.length ? ownerChipsHtml(a.owners) : '—', true],
     ['Notes', a.notes || '—'],
     ['Created', fmtDate(a.created_at)],
     ['Last updated', fmtDate(a.updated_at)],
   ];
-  $('#assetDetailBody').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${esc(v)}</td></tr>`).join('');
+  $('#assetDetailBody').innerHTML = rows.map(([k, v, raw]) => `<tr><td>${k}</td><td>${raw ? v : esc(v)}</td></tr>`).join('');
   $('#editAssetBtn').onclick = () => openAssetModal(a.id);
   $('#deleteAssetBtn').onclick = async () => {
     if (!confirm('Delete this asset?')) return;
@@ -363,7 +398,7 @@ async function loadAssetDetail(id) {
 
 // ---------------------------------------------------------- property modal ---
 $('#addPropertyBtn').addEventListener('click', () => {
-  fillOwnerSelect($('#addPropOwner'), { allowJoint: true, value: $('#addPropOwner').value });
+  addPropOwnerPicker.refresh();
   openModal('propertyModal');
 });
 
@@ -371,10 +406,12 @@ $('#addPropForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
   if (addSuggest.state.id) f.bca_id = addSuggest.state.id;
+  f.owners = addPropOwnerPicker.get();
   const msg = $('#addPropMsg');
   try {
     const p = await api('/api/properties', { method: 'POST', body: f });
     e.target.reset();
+    addPropOwnerPicker.set([]);
     addSuggest.reset();
     closeModalEl($('#propertyModal'));
     // Best-effort automatic BC Assessment fetch right after adding.
@@ -419,7 +456,7 @@ async function loadPropertyDetail(id) {
   propSuggest.state.label = p.address || '';
   propSuggest.close();
   pf.notes.value = p.notes || '';
-  fillOwnerSelect($('#propOwner'), { allowJoint: true, value: p.owner || '' });
+  propOwnerPicker.set(p.owners || []);
   pf.assessed_value.value = p.assessed_value ?? '';
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.purchase_date.value = p.purchase_date || '';
@@ -466,6 +503,7 @@ $('#propForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
   f.bca_id = propSuggest.state.id || null;
+  f.owners = propOwnerPicker.get();
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
     assetsLoaded = false;
@@ -840,6 +878,6 @@ $('#logoutBtn').addEventListener('click', async () => {
     $('#whoami').textContent = me.username;
   } catch { /* api() already redirected */ }
   await loadOwnerUsers();
-  fillOwnerSelect($('#addPropOwner'), { allowJoint: true });
+  ownerPickers.forEach((p) => p.refresh());
   route();
 })();

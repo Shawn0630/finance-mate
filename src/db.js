@@ -91,10 +91,6 @@ if (!propCols.includes('bca_id')) {
   // the address dropdown; lets the assessment fetch skip the fuzzy search.
   db.exec('ALTER TABLE properties ADD COLUMN bca_id TEXT');
 }
-if (!propCols.includes('owner')) {
-  // Who owns the asset: a username, 'Joint' (properties only), or NULL.
-  db.exec('ALTER TABLE properties ADD COLUMN owner TEXT');
-}
 if (!propCols.includes('purchase_date')) {
   // When the property was bought ('YYYY-MM-DD'). Nullable in the schema
   // (rows predate it); the Add endpoint requires it for new properties.
@@ -106,10 +102,31 @@ if (!propCols.includes('payment_day')) {
   // math stays monthly and does not depend on it.
   db.exec('ALTER TABLE properties ADD COLUMN payment_day INTEGER');
 }
-const assetCols = db.prepare('PRAGMA table_info(other_assets)').all().map((c) => c.name);
-if (!assetCols.includes('owner')) {
-  db.exec('ALTER TABLE other_assets ADD COLUMN owner TEXT');
+// --------------------------------------------------------------- owners ---
+// Owners are a SET of usernames: co-ownership is just several names, there
+// is no special 'Joint' value. Stored as a JSON array in an `owners`
+// column. Databases created earlier have a single-value `owner` column
+// instead (a username, 'Joint', or NULL): each value migrates to a
+// one-element array — except the literal 'Joint', which names no concrete
+// people and becomes an empty set — and the legacy column is dropped.
+function migrateOwners(table) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes('owners')) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN owners TEXT`);
+  }
+  if (!cols.includes('owner')) return;
+  const rows = db.prepare(`SELECT id, owner FROM ${table}`).all();
+  const upd = db.prepare(`UPDATE ${table} SET owners = ? WHERE id = ?`);
+  for (const r of rows) {
+    const s = r.owner === null || r.owner === undefined ? '' : String(r.owner).trim();
+    upd.run(JSON.stringify(!s || s === 'Joint' ? [] : [s]), r.id);
+  }
+  try {
+    db.exec(`ALTER TABLE ${table} DROP COLUMN owner`);
+  } catch { /* ancient SQLite without DROP COLUMN: legacy column stays, unused */ }
 }
+migrateOwners('properties');
+migrateOwners('other_assets');
 
 export function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
