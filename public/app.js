@@ -592,7 +592,12 @@ async function loadPortfolio() {
 
 function pfRangeRows() {
   const rows = portfolioData ? portfolioData.outstandingByMonth : [];
-  return pfRangeMonths > 0 ? rows.slice(0, pfRangeMonths) : rows;
+  const win = lookbackWindow(pfRangeMonths);
+  if (!win) return rows;
+  return rows.filter((m) => {
+    const x = ymDecimal(m.month);
+    return x >= win.min && x <= win.max;
+  });
 }
 
 function redrawPortfolioIfCollapsed() {
@@ -673,14 +678,31 @@ function drawPortfolioChart() {
   window.__fmCharts.portfolio = null;
   const rows = pfRangeRows();
   const datasets = [];
-  // Same assessed-history window as the detail page: most recent
-  // 5 years by default, the range buttons widen it (All = all years).
-  const assessedRows = lastYearsWindow(portfolioData.assessedByYear, pfRangeMonths);
-  if (assessedRows.length) {
+  // Same look-back window as the detail page (All = every year on
+  // record). The portfolio line is a carry-forward total, so inside
+  // a look-back window the latest pre-window total is carried in at
+  // the left edge and the last shown total is carried forward to
+  // today: the line spans the whole window instead of starting late
+  // or stopping at the last assessment year.
+  const assessedAll = [...(portfolioData.assessedByYear || [])].sort((a, b) => a.year - b.year);
+  const assessedShown = lookbackHistory(assessedAll, pfRangeMonths);
+  let assessedData = assessedShown.map((y) => ({ x: y.year, y: y.total }));
+  const pfLook = lookbackWindow(pfRangeMonths);
+  if (pfLook) {
+    const prior = assessedAll.filter((y) => y.year < pfLook.min).pop();
+    if (prior && !assessedData.some((p) => Math.abs(p.x - pfLook.min) < 1e-9)) {
+      assessedData = [{ x: pfLook.min, y: prior.total }, ...assessedData];
+      if (!assessedShown.length) assessedData.push({ x: pfLook.max, y: prior.total });
+    }
+    if (assessedData.length && assessedData[assessedData.length - 1].x < pfLook.max) {
+      assessedData.push({ x: pfLook.max, y: assessedData[assessedData.length - 1].y });
+    }
+  }
+  if (assessedData.length) {
     datasets.push({
       type: 'line',
       label: 'Assessed value (all properties)',
-      data: assessedRows.map((y) => ({ x: y.year, y: y.total })),
+      data: assessedData,
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
       tension: 0.15, pointRadius: 4, pointHoverRadius: 7, borderWidth: 2,
     });
@@ -707,11 +729,12 @@ function drawPortfolioChart() {
   if (!datasets.length) return;
   // Same explicit axis window as the detail page's combined chart:
   // exactly the selected range, never the library auto-fit.
+  const allRows = portfolioData.outstandingByMonth || [];
   const pfWin = mixedAxisWindow({
     months: pfRangeMonths,
-    assessedYears: assessedRows.map((y) => y.year).sort((a, b) => a - b),
-    projStart: rows.length ? ymDecimal(rows[0].month) : null,
-    projLastX: rows.length ? ymDecimal(rows[rows.length - 1].month) : null,
+    assessedYears: assessedAll.map((y) => y.year),
+    projStart: allRows.length ? ymDecimal(allRows[0].month) : null,
+    projLastX: allRows.length ? ymDecimal(allRows[allRows.length - 1].month) : null,
   });
   portfolioLineChart = new Chart(ctx, {
     data: { datasets },
@@ -1067,13 +1090,13 @@ async function loadTrend(id) {
 }
 
 // Trend summary: computed over the SAME years the combined chart
-// currently shows (see lastYearsWindow), so the figure can never
+// currently shows (see lookbackHistory), so the figure can never
 // describe a different span than the line on screen. When earlier
-// years are hidden by the window, the text says so.
+// years fall outside the selected range, the text says so.
 function renderTrendSummary() {
   const summary = $('#trendSummary');
   if (!summary) return;
-  const shown = lastYearsWindow(trendPoints, currentRangeMonths());
+  const shown = lookbackHistory(trendPoints, currentRangeMonths());
   if (shown.length >= 2) {
     const first = shown[0];
     const last = shown[shown.length - 1];
@@ -1082,7 +1105,7 @@ function renderTrendSummary() {
     const pctTxt = first.value ? ` (${abs >= 0 ? '+' : ''}${(abs / first.value * 100).toFixed(1)}%)` : '';
     summary.textContent = `Change ${first.year} → ${last.year}: ${sign}${money(Math.abs(abs))}${pctTxt} (${money(first.value)} → ${money(last.value)}).`
       + (shown.length < trendPoints.length
-        ? ` Showing the most recent ${shown.length} years, as in the chart — set the chart range to All to include earlier years.`
+        ? ` Showing the years that fall in the selected chart range, as in the chart — set the chart range to All to include earlier years.`
         : '');
   } else if (shown.length === 1 && trendPoints.length > 1) {
     summary.textContent = `Only the ${shown[0].year} point falls in the selected chart range — widen the range to compare years.`;
@@ -1173,20 +1196,53 @@ function currentRangeMonths() {
   return active ? Number(active.dataset.months) : 60;
 }
 
-// Assessed-history window: the charts show only the most recent years
-// of assessed history by default — the last 5 assessment years. The
-// window follows the chart range controls: a range of N months shows
-// the last ceil(N/12) assessment years, and "All" (0 months) shows
-// every year on record. The choice lives in the range buttons
-// themselves, so re-renders (new points, fresh data) keep the user's
-// window instead of snapping back to the default. Items need a `year`;
-// history points and the portfolio's per-year rows both qualify. The
-// underlying records are never touched — this only picks what draws.
-function lastYearsWindow(items, months) {
-  if (!items.length || !(months > 0)) return items;
-  const years = Math.max(1, Math.ceil(months / 12));
-  const maxYear = Math.max(...items.map((i) => i.year));
-  return items.filter((i) => i.year > maxYear - years);
+// ------------------------------------------------------- range window ---
+// The mixed charts (detail Chart A, portfolio overview) read their
+// range as a LOOK-BACK window that ENDS TODAY: "1 year" means the
+// last 12 months up to today, "5 years" the last 60, a custom month
+// count likewise. It used to be anchored at the earliest data and
+// pushed forward, which made the buttons feel dead on sparse data —
+// one assessed point plus a mostly empty axis that only changed
+// length. "All" (0 months) is the exception: it keeps the whole data
+// extent, full projection included, as the see-everything view. The
+// choice lives in the range buttons themselves, so re-renders (new
+// points, fresh data) keep the user's window instead of snapping
+// back to the default.
+
+// Fractional-year position of a Date on the axis scale (ymDecimal:
+// January of year Y is Y.0 and each month adds 1/12; days interpolate
+// within their month).
+function dateDecimal(d) {
+  const dim = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  return d.getFullYear() + d.getMonth() / 12 + (d.getDate() - 1) / (dim * 12);
+}
+
+// { min, max } of the look-back window for a range of N months, or
+// null for "All". Local dates, matching how the app treats its dates
+// everywhere else.
+function lookbackWindow(months) {
+  if (!(months > 0)) return null;
+  const end = new Date();
+  const start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  const day = start.getDate();
+  start.setDate(1);
+  start.setMonth(start.getMonth() - months);
+  const dim = new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate();
+  start.setDate(Math.min(day, dim));
+  return { min: dateDecimal(start), max: dateDecimal(end) };
+}
+
+// Which yearly items fall inside the look-back window: a year counts
+// when its point (plotted at January of that year) lies within
+// [min, max]. With the default 5-year range that is the most recent
+// 5 assessment years (2022-2026 in late 2026); "All" returns the
+// items untouched. Items need a `year`; history points and the
+// portfolio's per-year rows both qualify. The underlying records are
+// never touched — this only picks what draws.
+function lookbackHistory(items, months) {
+  const win = lookbackWindow(months);
+  if (!win || !items.length) return items;
+  return items.filter((i) => i.year >= win.min && i.year <= win.max);
 }
 
 // 'YYYY-MM' / 'YYYY-MM-DD' -> fractional year (January = .0), for chart A's
@@ -1205,20 +1261,20 @@ function formatYearTick(x) {
 }
 
 // Explicit x-axis window for the charts that mix assessed history
-// (one point per assessment year, looking back) with a mortgage
-// projection (monthly, looking forward). Leaving the axis to the
-// Chart.js auto-fit was a bug: it unioned both series and rounded
-// the bounds outward to "nice" steps, so a 5-year selection drew an
-// 8-year axis and the All view ballooned into decades of empty span
-// (one user saw an axis running roughly 1920-2140). The window is
-// now exactly what the selected range draws — from the earliest
-// drawn thing (January of the earliest shown assessment year, or
-// the projection's balance date) to the latest (the end of the last
-// shown assessment year, or the projection start plus the selected
-// months; for All, the projection's last month). Points the range
-// windows out are not drawn and never stretch the axis. Returns
-// null when there is nothing to draw.
+// with a mortgage projection. For a month range the axis IS the
+// look-back window (see lookbackWindow): exactly the selected span,
+// ending today — data outside it is clipped and never stretches the
+// axis. (Leaving the axis to the Chart.js auto-fit was a bug: it
+// unioned both series and rounded the bounds outward to "nice"
+// steps, ballooning into decades of empty span; anchoring the
+// window at the data and pushing the range forward had the subtler
+// failure that the buttons only changed the length of a mostly
+// empty axis.) For "All" the axis is the exact data extent —
+// earliest assessment year to the projection's last month, no
+// padding. Returns null when there is nothing to draw.
 function mixedAxisWindow({ months, assessedYears = [], projStart = null, projLastX = null }) {
+  const look = lookbackWindow(months);
+  if (look) return look;
   let min = Infinity;
   let max = -Infinity;
   if (assessedYears.length) {
@@ -1227,7 +1283,7 @@ function mixedAxisWindow({ months, assessedYears = [], projStart = null, projLas
   }
   if (projStart !== null) {
     min = Math.min(min, projStart);
-    max = Math.max(max, months > 0 ? projStart + months / 12 : (projLastX ?? projStart));
+    max = Math.max(max, projLastX ?? projStart);
   }
   return Number.isFinite(min) ? { min, max } : null;
 }
@@ -1240,8 +1296,12 @@ function mixedAxisWindow({ months, assessedYears = [], projStart = null, projLas
 // spans fall back to auto whole-year steps.
 function yearAxisTicks(min, max) {
   const span = max - min;
-  if (span <= 2.01) return { stepSize: 1 / 12, maxTicksLimit: 25 };
-  if (span <= 10.01) return { stepSize: 0.5, maxTicksLimit: 21 };
+  // maxTicksLimit sits a few above the exact tick count on purpose:
+  // with fractional-year bounds the generator can land one tick over
+  // the exact count, and Chart.js answers an over-limit count by
+  // doubling the step (monthly ticks would collapse to bi-monthly).
+  if (span <= 2.01) return { stepSize: 1 / 12, maxTicksLimit: 30 };
+  if (span <= 10.01) return { stepSize: 0.5, maxTicksLimit: 25 };
   return { maxTicksLimit: 13 };
 }
 
@@ -1281,9 +1341,10 @@ function drawCombinedChart() {
   let projStart = null;
   let projLastX = null;
   if (trendPoints.length) {
-    // Assessed history defaults to the most recent 5 years; the range
-    // buttons widen it (All = every year on record).
-    const shown = lastYearsWindow(trendPoints, months);
+    // Assessed points inside the look-back window (All = every year
+    // on record). The line still stops at the last known year — it
+    // is not extended toward today (see the charts header comment).
+    const shown = lookbackHistory(trendPoints, months);
     shownYears.push(...shown.map((pt) => pt.year).sort((a, b) => a - b));
     datasets.push({
       label: 'Assessed value',
@@ -1293,17 +1354,22 @@ function drawCombinedChart() {
     });
   }
   if (chartMeta && fullSeries.length) {
-    const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
-    const pts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
-      ...rows.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
-    projStart = pts[0].x;
-    projLastX = pts[pts.length - 1].x;
-    datasets.push({
-      label: 'Outstanding principal',
-      data: pts,
-      borderColor: '#1668c4', backgroundColor: '#1668c4',
-      tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
-    });
+    const allPts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
+      ...fullSeries.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
+    projStart = allPts[0].x;
+    projLastX = allPts[allPts.length - 1].x;
+    // The projection is clipped to the same look-back window as the
+    // axis: the part beyond today belongs to the All view, not here.
+    const winLb = lookbackWindow(months);
+    const pts = winLb ? allPts.filter((p) => p.x >= winLb.min && p.x <= winLb.max) : allPts;
+    if (pts.length) {
+      datasets.push({
+        label: 'Outstanding principal',
+        data: pts,
+        borderColor: '#1668c4', backgroundColor: '#1668c4',
+        tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
+      });
+    }
   }
   if (!datasets.length) return;
   // The axis is exactly the selected window — never the library's

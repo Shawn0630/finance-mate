@@ -1002,10 +1002,11 @@ try {
       check('pasted grouped balance stored as the plain number 1350000',
         !!pastedProp && pastedProp.mortgage_balance === 1350000, JSON.stringify(pastedProp && pastedProp.mortgage_balance));
 
-      // Assessed-history window: a property with 8 years on record
-      // (2019-2026) draws only the most recent 5 by default; the range
-      // buttons widen it (All = every year) and the trend summary is
-      // calculated over the same window the chart shows.
+      // Assessed-history window: the range is a LOOK-BACK window
+      // ending today. A property with 8 years on record (2019-2026)
+      // draws the 5 that fall in the default 5-year look-back
+      // (2022-2026); All widens it to every year, and the trend
+      // summary is calculated over the same window the chart shows.
       r = await req('POST', '/api/properties', { address: '977 Window Test Way, Victoria, BC', purchase_date: '2020-01-15', mortgage_balance: 500000 });
       const winPid = r.data.id;
       for (let y = 2019; y <= 2026; y++) {
@@ -1022,7 +1023,7 @@ try {
         JSON.stringify(winDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winDefault));
       const sumDefault = await page.evaluate(() => document.querySelector('#trendSummary').textContent);
       check('trend summary is calculated over the displayed 5-year window',
-        sumDefault.includes('Change 2022 → 2026') && sumDefault.includes('most recent 5 years'), sumDefault);
+        sumDefault.includes('Change 2022 → 2026') && sumDefault.includes('fall in the selected chart range'), sumDefault);
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
       await wait(600);
       const winAll = await assessedYears();
@@ -1036,11 +1037,11 @@ try {
       check('switching back to 5 years restores the 2022-2026 window',
         JSON.stringify(winBack) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winBack));
 
-      // Axis bounds: the x axis must be exactly the selected window,
-      // never the chart library's auto-fit (which unioned the history
-      // with the projection and rounded outward into decades of empty
-      // span). With assessed history only, the 5-year view's axis is
-      // exactly those 5 years (Jan 2022 through the end of 2026).
+      // Axis bounds: for a month range the x axis IS the look-back
+      // window — exactly the selected span, ending today — never the
+      // chart library's auto-fit (which unioned the history with the
+      // projection and rounded outward into decades of empty span)
+      // and never the old forward-from-the-data anchor either.
       const axisA = () => page.evaluate(() => {
         const c = window.__fmCharts.a;
         if (!c) return null;
@@ -1051,29 +1052,58 @@ try {
           dataMin: Math.min(...xs), dataMax: Math.max(...xs),
         };
       });
+      // "Today" on the axis scale, computed in the page (same clock
+      // the app uses): year + month/12 + day fraction within the month.
+      const todayDec = () => page.evaluate(() => {
+        const d = new Date();
+        const dim = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+        return d.getFullYear() + d.getMonth() / 12 + (d.getDate() - 1) / (dim * 12);
+      });
       let ax = await axisA();
-      check('chart A axis with history only spans exactly the shown 5 years (2022-2027)',
-        !!ax && ax.min === 2022 && ax.max === 2027, JSON.stringify(ax && { min: ax.min, max: ax.max }));
+      const td0 = await todayDec();
+      check('chart A axis with history only is the 5-year look-back ending today',
+        !!ax && Math.abs(ax.max - td0) < 0.02 && Math.abs(ax.min - (td0 - 5)) < 0.05,
+        JSON.stringify(ax && { min: ax.min, max: ax.max }));
 
       // Give the fixture a rate plan + payment on a known balance
       // date, reload, and the axis must follow each selected range:
-      // 60mo -> Jan 2022 (earliest shown year) to balance+60mo (2030);
-      // 24mo -> exactly the 2 years 2025-2027 with monthly ticks;
-      // All -> the exact data extent, no padded decades either side.
+      // every month range is that look-back ending today (projection
+      // clipped at today); All -> the exact data extent, no padded
+      // decades either side.
       await req('PUT', `/api/properties/${winPid}`, { mortgage_balance_date: '2025-01-15', mortgage_payment: 3000 });
       await req('POST', `/api/properties/${winPid}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 });
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
       ax = await axisA();
-      check('chart A 5-year axis is the selected window (2022 to 2030) with month ticks',
-        !!ax && ax.min === 2022 && ax.max === 2030 && ax.ticks.some((t) => /Jul/.test(t)),
+      const td1 = await todayDec();
+      check('chart A 5-year axis is the look-back ending today, with month ticks',
+        !!ax && Math.abs(ax.max - td1) < 0.02 && Math.abs(ax.min - (td1 - 5)) < 0.05
+          && ax.ticks.some((t) => /[A-Z][a-z]{2} \d{4}/.test(t)),
         JSON.stringify(ax && { min: ax.min, max: ax.max, ticks: ax.ticks }));
+      const outXs = await page.evaluate(() => {
+        const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Outstanding principal');
+        return ds ? ds.data.map((p) => p.x) : null;
+      });
+      check('chart A projection is clipped to the window (in-window months drawn, nothing past today)',
+        Array.isArray(outXs) && outXs.length > 12
+          && outXs.every((x) => x <= td1 + 0.001) && outXs.some((x) => x > td1 - 0.1),
+        JSON.stringify(outXs && { n: outXs.length, last: outXs[outXs.length - 1] }));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="24"]').click());
       await wait(600);
       ax = await axisA();
-      check('chart A 2-year axis spans exactly 2 years (2025-2027) with monthly ticks',
-        !!ax && ax.min === 2025 && ax.max === 2027 && ax.ticks.length >= 20,
+      const td2 = await todayDec();
+      check('chart A 2-year axis spans exactly the 2 years ending today, with monthly ticks',
+        !!ax && Math.abs(ax.max - td2) < 0.02 && Math.abs(ax.max - ax.min - 2) < 0.02 && ax.ticks.length >= 20,
         JSON.stringify(ax && { min: ax.min, max: ax.max, nTicks: ax.ticks.length }));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
+      await wait(600);
+      ax = await axisA();
+      const td3 = await todayDec();
+      const yrs1 = await assessedYears();
+      check('chart A 1-year axis spans the year ending today and shows only the 2026 point',
+        !!ax && Math.abs(ax.max - td3) < 0.02 && Math.abs(ax.max - ax.min - 1) < 0.02
+          && JSON.stringify(yrs1) === JSON.stringify([2026]),
+        JSON.stringify({ ax: ax && { min: ax.min, max: ax.max }, yrs1 }));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
       await wait(600);
       ax = await axisA();
@@ -1081,9 +1111,12 @@ try {
         !!ax && ax.min === 2019 && ax.max === ax.dataMax && ax.max < 2060,
         JSON.stringify(ax && { min: ax.min, max: ax.max, dataMax: ax.dataMax }));
 
-      // Portfolio combined chart: the same default window applies to
-      // its assessed line (years are the union across properties; this
-      // fixture's 2019 is the earliest year on record).
+      // Portfolio combined chart: the same look-back window applies
+      // to its assessed line (years are the union across properties;
+      // this fixture's 2019 is the earliest year on record). Being a
+      // carry-forward total, the line also carries the pre-window
+      // total in at the left edge and the last total forward to
+      // today, so it spans the whole window.
       await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
       // A hash jump reuses the section's cached load (assetsLoaded), so
       // reload once to make the portfolio read the fixture just created.
@@ -1094,19 +1127,43 @@ try {
         const ds = c ? c.data.datasets.find((d) => d.label === 'Assessed value (all properties)') : null;
         return ds ? ds.data.map((p) => p.x) : null;
       });
-      const pfDefault = await pfYears();
-      check('portfolio assessed line defaults to the most recent 5 years',
-        JSON.stringify(pfDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(pfDefault));
+      const pfPts = () => page.evaluate(() => {
+        const c = window.__fmCharts.portfolio;
+        const ds = c ? c.data.datasets.find((d) => d.label === 'Assessed value (all properties)') : null;
+        return ds ? ds.data : null;
+      });
+      const pfApi = await req('GET', '/api/properties/portfolio');
+      const rowOf = (y) => (pfApi.data.assessedByYear || []).find((rw) => rw.year === y) || {};
       const axisPf = () => page.evaluate(() => {
         const c = window.__fmCharts.portfolio;
         if (!c) return null;
         const xs = c.data.datasets.flatMap((d) => d.data.map((p) => p.x));
         return { min: c.scales.x.min, max: c.scales.x.max, dataMax: Math.max(...xs) };
       });
+      const pfDefPts = await pfPts();
+      const tdP = await todayDec();
+      const pfIntYears = (pfDefPts || []).map((p) => p.x).filter((x) => Number.isInteger(x));
+      check('portfolio assessed line defaults to the recent 5 years, carried in at the left edge',
+        JSON.stringify(pfIntYears) === JSON.stringify([2022, 2023, 2024, 2025, 2026])
+          && !!pfDefPts && Math.abs(pfDefPts[0].x - (tdP - 5)) < 0.05 && pfDefPts[0].y === rowOf(2021).total
+          && Math.abs(pfDefPts[pfDefPts.length - 1].x - tdP) < 0.02,
+        JSON.stringify(pfDefPts));
       let pax = await axisPf();
-      check('portfolio axis follows the selected window (starts 2022, under 9 years wide)',
-        !!pax && pax.min === 2022 && pax.max - pax.min <= 9.01,
+      check('portfolio axis is the 5-year look-back ending today',
+        !!pax && Math.abs(pax.max - tdP) < 0.02 && Math.abs(pax.min - (tdP - 5)) < 0.05,
         JSON.stringify(pax && { min: pax.min, max: pax.max }));
+      await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="12"]').click());
+      await wait(600);
+      const pf1Pts = await pfPts();
+      const tdP1 = await todayDec();
+      pax = await axisPf();
+      check('portfolio 1-year view: axis is the year ending today and the assessed line spans it',
+        !!pax && Math.abs(pax.max - tdP1) < 0.02 && Math.abs(pax.max - pax.min - 1) < 0.02
+          && Array.isArray(pf1Pts) && pf1Pts.length >= 3
+          && Math.abs(pf1Pts[0].x - pax.min) < 0.001 && pf1Pts[0].y === rowOf(2025).total
+          && pf1Pts.some((p) => p.x === 2026)
+          && Math.abs(pf1Pts[pf1Pts.length - 1].x - tdP1) < 0.02,
+        JSON.stringify({ pax: pax && { min: pax.min, max: pax.max }, pf1Pts }));
       await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="0"]').click());
       await wait(600);
       const pfAll = await pfYears();
