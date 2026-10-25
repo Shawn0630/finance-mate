@@ -11,8 +11,8 @@ services:
       # SEED_ADMIN_USER: admin
       # SEED_ADMIN_PASSWORD: admin
     volumes:
-      - finance-data:/app/data
+      - finance-mate-data:/app/data
     restart: unless-stopped
 
 volumes:
-  finance-data:
+  finance-mate-data:

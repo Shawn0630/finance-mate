@@ -1,4 +1,4 @@
-# Family Finance
+# Finance Mate
 
 A home web app for tracking the family's finances. This round ships the app
 shell, sign-in, and the **Assets** module. Spending, Planning and Tax are
@@ -30,7 +30,7 @@ Then open <http://localhost:9200> (or `http://<host-ip>:9200` on the LAN).
 - **Default sign-in: `admin` / `admin`** — change it before real use (see
   below).
 - All data (SQLite database + uploaded photos) lives in the named Docker
-  volume `finance-data`, so rebuilds and `git pull` never touch it. Only
+  volume `finance-mate-data`, so rebuilds and `git pull` never touch it. Only
   `docker compose down -v` deletes it.
 
 ### Changing the initial password

@@ -1,4 +1,4 @@
-// Family Finance — frontend (plain JS, no build step).
+// Finance Mate — frontend (plain JS, no build step).
 const $ = (sel, el = document) => el.querySelector(sel);
 const money = (n) =>
   n === null || n === undefined || n === ''

@@ -1,4 +1,4 @@
-// Family Finance — server. Express + SQLite, no build step.
+// Finance Mate — server. Express + SQLite, no build step.
 // Modules this round: Assets (properties / mortgages / other assets).
 // Spending, Planning and Tax are placeholder pages in the UI for now.
 import express from 'express';
@@ -377,5 +377,5 @@ app.use((err, req, res, next) => {
 // Exported for the e2e test; listening happens only when run directly.
 export { app };
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
-  app.listen(PORT, () => console.log(`[family-finance] listening on http://localhost:${PORT} (data: ${DATA_DIR})`));
+  app.listen(PORT, () => console.log(`[finance-mate] listening on http://localhost:${PORT} (data: ${DATA_DIR})`));
 }
