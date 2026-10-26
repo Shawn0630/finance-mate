@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import Database from 'better-sqlite3';
+import { simulate as engineSimulate, derivePayment as engineDerive, monthlyRate as engineMonthlyRate } from '../src/engine.js';
 
 const PORT = 19200 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -1014,6 +1015,169 @@ try {
   await req('DELETE', `/api/properties/${r.data.id}`);
   await req('DELETE', `/api/properties/${pidPrime}`);
 
+  // ---- Mortgage terms: migration, renewal, lump sums, override ----
+  // The legacy pre-seed (property '1 Legacy Lane': one old-shape
+  // segment from 2025-01-01, no amortization, no lender) must have
+  // been migrated into a Term 1 that mirrors the old model exactly.
+  r = await req('GET', '/api/properties');
+  const legacy1 = (r.data || []).find((p) => p.address === '1 Legacy Lane');
+  check('legacy property migrated to a single Term 1',
+    !!legacy1 && Array.isArray(legacy1.terms) && legacy1.terms.length === 1,
+    JSON.stringify(legacy1 && legacy1.terms));
+  check('Term 1 starts at the earliest segment, runs 60 months, opens with the balance',
+    !!legacy1 && legacy1.terms[0].start_date === '2025-01-01' && legacy1.terms[0].term_months === 60
+      && legacy1.terms[0].opening_balance === 0,
+    JSON.stringify(legacy1 && legacy1.terms[0]));
+  check('a missing amortization migrates to the flagged 25-year default',
+    !!legacy1 && legacy1.terms[0].amortization_years === 25 && legacy1.terms[0].amortization_defaulted === 1,
+    JSON.stringify(legacy1 && legacy1.terms[0]));
+  check('legacy segments were assigned to Term 1',
+    !!legacy1 && legacy1.segments.length === 1 && legacy1.segments[0].term_id === legacy1.terms[0].id,
+    JSON.stringify(legacy1 && legacy1.segments));
+
+  // His real shape, end to end over the terms model (stub prime is
+  // 4.95 here): balance 1,350,000 dated 2024-12-17, one Prime - 1
+  // segment, amortization 30 arriving later via the Mortgage form.
+  r = await req('POST', '/api/properties', {
+    address: '55 Term Test Terrace, Victoria, BC',
+    mortgage_balance: 1350000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17',
+  });
+  const termPid = r.data.id;
+  check('a new property starts with exactly one term',
+    Array.isArray(r.data.terms) && r.data.terms.length === 1, JSON.stringify(r.data.terms));
+  check('Term 1 opens on the balance date with the balance, 60 months, amortization unset',
+    r.data.terms[0].start_date === '2024-12-17' && r.data.terms[0].term_months === 60
+      && r.data.terms[0].amortization_years === null && r.data.terms[0].opening_balance === 1350000,
+    JSON.stringify(r.data.terms[0]));
+  const term1Id = r.data.terms[0].id;
+  r = await req('POST', `/api/properties/${termPid}/rates`, {
+    start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+  });
+  check('a segment added without a term lands in Term 1',
+    r.status === 201 && r.data.term_id === term1Id, JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${termPid}/amortization`);
+  check('a term with no amortization and no entered payment is NO_PAYMENT',
+    r.data.ok === false && r.data.code === 'NO_PAYMENT', JSON.stringify(r.data.code));
+  r = await req('PUT', `/api/properties/${termPid}`, { amortization_years: 30, lender: 'RBC' });
+  check('property-level amortization + lender write through to the current term',
+    r.data.amortization_years === 30 && r.data.lender === 'RBC'
+      && r.data.terms[0].amortization_years === 30 && r.data.terms[0].lender === 'RBC',
+    JSON.stringify({ lender: r.data.lender, term: r.data.terms && r.data.terms[0] }));
+  const projT1 = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  check('the term projection derives $6,381.36 (3.95%, 30y) as an auto payment',
+    projT1.ok === true && projT1.paymentSource === 'derived' && Math.abs(projT1.paymentUsed - 6381.36) < 0.5,
+    JSON.stringify({ used: projT1.paymentUsed, src: projT1.paymentSource }));
+  // Migration equivalence, locked: the series equals the pre-term
+  // engine (derivePayment + simulate) for the same inputs, to the row.
+  const legacyRun = engineSimulate({
+    balance: 1350000, balanceDate: '2024-12-17',
+    payment: engineDerive(1350000, 3.95, 30),
+    segments: [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }],
+    primeRate: 4.95,
+  });
+  check('single-term projection is month-by-month identical to the pre-term engine',
+    JSON.stringify(projT1.series) === JSON.stringify(legacyRun.series)
+      && projT1.totalInterest === legacyRun.totalInterest && projT1.payoffMonth === legacyRun.payoffMonth,
+    JSON.stringify({ rows: projT1.series && projT1.series.length, ti: projT1.totalInterest }));
+
+  // Renewal: prefilled from Term 1 (start = day after it ends,
+  // opening = its projected end balance, amortization left unset).
+  r = await req('POST', `/api/properties/${termPid}/terms`, {});
+  check('renewal prefill: starts 2029-12-17 (day after Term 1 ends), amortization unset',
+    r.status === 201 && r.data.start_date === '2029-12-17' && r.data.amortization_years === null
+      && r.data.term_months === 60,
+    JSON.stringify(r.data));
+  const term2Id = r.data.id;
+  const projCarry = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  const novRow = projCarry.series.find((x) => x.month === '2029-11');
+  check('renewal opening balance is Term 1\u2019s projected end balance',
+    !!novRow && Math.abs(r.data.opening_balance - novRow.balance) < 0.02,
+    JSON.stringify({ opening: r.data.opening_balance, nov: novRow && novRow.balance }));
+  const decCarry = projCarry.series.find((x) => x.month === '2029-12');
+  check('with no amortization on Term 2 the last payment carries over the boundary',
+    !!decCarry && Math.abs(decCarry.payment - projCarry.paymentUsed) < 0.02,
+    JSON.stringify(decCarry && decCarry.payment));
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { amortization_years: 25, lender: 'TD' });
+  check('Term 2 updated in place (new lender, fresh amortization)',
+    r.status === 200 && r.data.lender === 'TD' && r.data.amortization_years === 25,
+    JSON.stringify(r.data));
+  const projT2 = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  const nov2 = projT2.series.find((x) => x.month === '2029-11');
+  const dec2 = projT2.series.find((x) => x.month === '2029-12');
+  check('the projection is continuous across the term boundary (no balance jump)',
+    !!nov2 && !!dec2 && Math.abs(dec2.balance - (nov2.balance + dec2.interest - dec2.payment)) < 0.02
+      && Math.abs(dec2.interest - Math.round(nov2.balance * engineMonthlyRate(3.95) * 100) / 100) < 0.02,
+    JSON.stringify({ nov: nov2 && nov2.balance, dec: dec2 }));
+  check('the payment jumps at the boundary to the new term\u2019s amortization (25y)',
+    !!dec2 && Math.abs(dec2.payment - engineDerive(nov2.balance, 3.95, 25)) < 0.02
+      && Math.abs(dec2.payment - projT2.paymentUsed) > 1,
+    JSON.stringify({ decPay: dec2 && dec2.payment, t1Pay: projT2.paymentUsed }));
+
+  // Lump sum: deducts first, then the payment is recomputed.
+  const projPreLump = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-03-10', amount: 50000, note: 'Bonus' });
+  check('lump sum created in the term active on its date',
+    r.status === 201 && r.data.term_id === term1Id && r.data.amount === 50000, JSON.stringify(r.data));
+  const lumpId = r.data.id;
+  const projLump = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  const febPre = projPreLump.series.find((x) => x.month === '2025-02');
+  const febPost = projLump.series.find((x) => x.month === '2025-02');
+  const marPost = projLump.series.find((x) => x.month === '2025-03');
+  check('months before the lump sum are unchanged',
+    JSON.stringify(febPost) === JSON.stringify(febPre), JSON.stringify(febPost));
+  check('the lump month charges interest on the reduced balance and re-derives the payment (358 months left)',
+    !!marPost && Math.abs(marPost.interest - Math.round((febPost.balance - 50000) * engineMonthlyRate(3.95) * 100) / 100) < 0.02
+      && Math.abs(marPost.payment - engineDerive(febPost.balance - 50000, 3.95, 358 / 12)) < 0.02
+      && marPost.payment < projLump.paymentUsed,
+    JSON.stringify(marPost));
+  // The recompute targets the SAME amortization end date (that is
+  // what "remaining amortization" means), so the payoff month is
+  // the amortization end give or take a month of cent-rounding —
+  // the lump sum's certain effects are the lower payment (checked
+  // above) and materially less total interest.
+  check('the lump sum cuts the total interest and the payoff stays at the amortization end',
+    projLump.totalInterest < projPreLump.totalInterest - 10000 && projLump.payoffMonth <= '2054-12',
+    JSON.stringify({ interestBefore: projPreLump.totalInterest, interestAfter: projLump.totalInterest, payoff: projLump.payoffMonth }));
+  r = await req('DELETE', `/api/properties/${termPid}/lump-sums/${lumpId}`);
+  const projLumpGone = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  check('deleting the lump sum restores the previous projection',
+    r.status === 200 && JSON.stringify(projLumpGone.series) === JSON.stringify(projPreLump.series));
+
+  // The entered payment is an override inside the current term only.
+  await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: 7000 });
+  const projOv = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  check('an entered payment overrides the calculation inside the current term',
+    projOv.paymentSource === 'entered' && projOv.paymentUsed === 7000 && projOv.series[0].payment === 7000,
+    JSON.stringify({ used: projOv.paymentUsed, src: projOv.paymentSource }));
+  const novOv = projOv.series.find((x) => x.month === '2029-11');
+  const decOv = projOv.series.find((x) => x.month === '2029-12');
+  check('the override lapses at the renewal — Term 2\u2019s payment is auto-computed',
+    !!decOv && Math.abs(decOv.payment - engineDerive(novOv.balance, 3.95, 25)) < 0.02 && decOv.payment !== 7000,
+    JSON.stringify(decOv && decOv.payment));
+  await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: null });
+  const projAuto = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  check('clearing the entered payment returns to the auto calculation',
+    projAuto.paymentSource === 'derived' && Math.abs(projAuto.paymentUsed - 6381.36) < 0.5,
+    JSON.stringify({ used: projAuto.paymentUsed, src: projAuto.paymentSource }));
+
+  // Validation + term deletion rules.
+  r = await req('POST', `/api/properties/${termPid}/terms`, { term_months: 121 });
+  check('a term longer than 120 months is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${termPid}/terms`, { term_months: 0 });
+  check('a zero-length term is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${termPid}/terms`, { amortization_years: 40 });
+  check('a term amortization outside 1-35 is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-01-01', amount: -5 });
+  check('a negative lump sum is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-01-01', amount: 100, term_id: 99999 });
+  check('a lump sum naming a foreign term is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('DELETE', `/api/properties/${termPid}/terms/${term2Id}`);
+  check('deleting Term 2 leaves Term 1 standing',
+    r.status === 200 && Array.isArray(r.data.terms) && r.data.terms.length === 1, JSON.stringify(r.data.terms));
+  r = await req('DELETE', `/api/properties/${termPid}/terms/${term1Id}`);
+  check('the last remaining term cannot be deleted', r.status === 400, JSON.stringify(r.data));
+  await req('DELETE', `/api/properties/${termPid}`);
+
   // ---- Property photo gallery ----
   // Uploads land in property_photos (files under data/photos); the
   // detail response carries the ordered gallery; a legacy external
@@ -1751,6 +1915,97 @@ try {
       check('the UI-entered amortization flips the portfolio state to projected',
         !!rowUi && rowUi.projState === 'projected', JSON.stringify(rowUi && rowUi.projState));
       await req('DELETE', `/api/properties/${amortPid}`);
+
+      // ---- Terms UI: build a renewal through the accordion ----
+      // Same shape once more, driven entirely through the page this
+      // time: the card summary names the current term, "+ Add term /
+      // renewal" creates Term 2 prefilled and expanded, its form
+      // takes the new lender + amortization, and the projection then
+      // runs continuously across the boundary with the payment
+      // re-derived on Term 2's amortization. A lump sum added in
+      // Term 1 through its own form drops the payment.
+      r = await req('POST', '/api/properties', {
+        address: '888 Term UI Way, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
+      });
+      const termUiPid = r.data.id;
+      await req('POST', `/api/properties/${termUiPid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+      });
+      await req('PUT', `/api/properties/${termUiPid}`, { amortization_years: 30, lender: 'RBC' });
+      await page.goto(`http://ff.local/#property/${termUiPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // A property->property hash jump can leave the previous
+      // fixture's render in place (in-flight loads race); a reload
+      // pins the page to this property, as in earlier sections.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      // Poll for this property's summary.
+      let sumBefore = '';
+      for (let i = 0; i < 40; i++) {
+        sumBefore = await page.evaluate(() => document.querySelector('#mortgageSummary').textContent);
+        if (sumBefore.includes('RBC')) break;
+        await wait(300);
+      }
+      check('card summary names the current term, its lender and the auto payment',
+        sumBefore.includes('Term 1 of 1') && sumBefore.includes('RBC')
+          && sumBefore.includes('auto') && sumBefore.includes('6,381'),
+        sumBefore);
+      await page.evaluate(() => document.querySelector('#addTermBtn').click());
+      await wait(2000);
+      const termBlocks = await page.evaluate(() => document.querySelectorAll('#termsWrap .term-block').length);
+      check('"+ Add term / renewal" adds a second term block', termBlocks === 2, String(termBlocks));
+      await page.evaluate(() => {
+        const blocks = document.querySelectorAll('#termsWrap .term-block');
+        const form = blocks[blocks.length - 1].querySelector('[data-term-form]');
+        form.lender.value = 'TD';
+        form.amortization_years.value = '25';
+        form.requestSubmit();
+      });
+      await wait(2200);
+      r = await req('GET', `/api/properties/${termUiPid}`);
+      check('the UI-saved renewal carries the new lender + amortization',
+        r.data.terms.length === 2 && r.data.terms[1].lender === 'TD' && r.data.terms[1].amortization_years === 25,
+        JSON.stringify(r.data.terms));
+      let sumAfter = '';
+      for (let i = 0; i < 40; i++) {
+        sumAfter = await page.evaluate(() => document.querySelector('#mortgageSummary').textContent);
+        if (sumAfter.includes('Term 1 of 2')) break;
+        await wait(300);
+      }
+      check('the summary now counts two terms', sumAfter.includes('Term 1 of 2'), sumAfter);
+      const amortUi = (await req('GET', `/api/properties/${termUiPid}/amortization`)).data;
+      const t2Month = r.data.terms[1].start_date.slice(0, 7);
+      const idxB = amortUi.series.findIndex((x) => x.month === t2Month);
+      check('UI-built Term 2: projection continuous, payment re-derived at the boundary',
+        idxB > 0
+          && Math.abs(amortUi.series[idxB].payment - engineDerive(amortUi.series[idxB - 1].balance, 3.95, 25)) < 0.02
+          && Math.abs(amortUi.series[idxB].balance
+            - (amortUi.series[idxB - 1].balance + amortUi.series[idxB].interest - amortUi.series[idxB].payment)) < 0.02,
+        JSON.stringify(amortUi.series[idxB]));
+      // Lump sum through Term 1's own form (amount typed bare, it
+      // groups live like every money field).
+      await page.evaluate(() => {
+        document.querySelector('#termsWrap .term-block [data-toggle-lump]').click();
+        document.querySelector('#termsWrap .term-block [data-lump-form] [name=date]').value = '2026-12-01';
+        document.querySelector('#termsWrap .term-block [data-lump-form] [name=amount]').focus();
+      });
+      await page.keyboard.type('50000');
+      const lumpTyped = await page.evaluate(() => document.querySelector('#termsWrap .term-block [data-lump-form] [name=amount]').value);
+      check('lump sum amount groups while typing (50000 -> 50,000)', lumpTyped === '50,000', String(lumpTyped));
+      await page.evaluate(() => document.querySelector('#termsWrap .term-block [data-lump-form]').requestSubmit());
+      await wait(2200);
+      const amortLump = (await req('GET', `/api/properties/${termUiPid}/amortization`)).data;
+      const novRowL = amortLump.series.find((x) => x.month === '2026-11');
+      const decRowL = amortLump.series.find((x) => x.month === '2026-12');
+      check('UI lump sum: the lump month charges interest on the reduced balance, payment drops',
+        !!decRowL && !!novRowL
+          && Math.abs(decRowL.interest - Math.round((novRowL.balance - 50000) * engineMonthlyRate(3.95) * 100) / 100) < 0.02
+          && decRowL.payment < amortUi.paymentUsed,
+        JSON.stringify(decRowL));
+      r = await req('GET', `/api/properties/${termUiPid}`);
+      check('the lump sum is recorded under Term 1',
+        r.data.terms[0].lumpSums.length === 1 && r.data.terms[0].lumpSums[0].amount === 50000,
+        JSON.stringify(r.data.terms[0].lumpSums));
+      await req('DELETE', `/api/properties/${termUiPid}`);
 
       // ---- Property panel: read-only metadata until Edit; photo carousel ----
       page.on('dialog', (d) => d.accept()); // photo removal asks confirm()

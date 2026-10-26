@@ -247,6 +247,87 @@ function migrateOwners(table) {
 migrateOwners('properties');
 migrateOwners('other_assets');
 
+// ------------------------------------------------------- mortgage terms ---
+// The mortgage is modelled the way Canadian lenders actually run
+// it: a TERM is the top-level contract (lender, start, length in
+// months, the amortization agreed for that term, the balance it
+// opened with). Inside a term the rate can change (rate_segments,
+// each now owned by a term) and lump sums can land (lump_sums).
+// The property keeps the CURRENT balance anchor (mortgage_balance /
+// mortgage_balance_date), the payment schedule (payment_day /
+// payment_frequency) and an optional entered payment that acts as
+// an override inside the current term.
+db.exec(`
+CREATE TABLE IF NOT EXISTS mortgage_terms (
+  id INTEGER PRIMARY KEY,
+  property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  lender TEXT,                        -- the bank for this term (free text)
+  start_date TEXT NOT NULL,           -- 'YYYY-MM-DD' the term begins
+  term_months INTEGER NOT NULL DEFAULT 60,  -- contract length, 1..120
+  amortization_years REAL,            -- amortization agreed for this term; NULL = not set
+  opening_balance REAL,               -- balance the term opened with
+  amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lump_sums (
+  id INTEGER PRIMARY KEY,
+  property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  term_id INTEGER REFERENCES mortgage_terms(id) ON DELETE SET NULL,
+  date TEXT NOT NULL,                 -- 'YYYY-MM-DD' the lump sum lands
+  amount REAL NOT NULL,               -- principal paid in one shot
+  note TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_terms_property ON mortgage_terms(property_id, start_date);
+CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date);
+`);
+{
+  const segCols = db.prepare('PRAGMA table_info(rate_segments)').all().map((c) => c.name);
+  if (segCols.length && !segCols.includes('term_id')) {
+    db.exec('ALTER TABLE rate_segments ADD COLUMN term_id INTEGER REFERENCES mortgage_terms(id) ON DELETE SET NULL');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_segments_term ON rate_segments(term_id)');
+  }
+}
+// Idempotent backfill: every property gets a Term 1, and every
+// segment that does not name a term yet is assigned to its
+// property's first term. Term 1 mirrors the pre-term model exactly —
+// start at the earliest segment (else the balance date), 60 months,
+// the property's amortization (else the 25-year default, flagged),
+// the current balance as its opening balance, the property's
+// lender — so a migrated mortgage projects month-by-month exactly
+// as it did before terms existed.
+{
+  const props = db.prepare('SELECT * FROM properties').all();
+  const termCount = db.prepare('SELECT COUNT(*) AS n FROM mortgage_terms WHERE property_id = ?');
+  const firstTerm = db.prepare('SELECT id FROM mortgage_terms WHERE property_id = ? ORDER BY start_date, id LIMIT 1');
+  const firstSegStart = db.prepare('SELECT MIN(start_date) AS s FROM rate_segments WHERE property_id = ?');
+  const insTerm = db.prepare(
+    `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const assignSegs = db.prepare('UPDATE rate_segments SET term_id = ? WHERE property_id = ? AND term_id IS NULL');
+  db.transaction(() => {
+    for (const p of props) {
+      if (termCount.get(p.id).n > 0) {
+        assignSegs.run(firstTerm.get(p.id).id, p.id);
+        continue;
+      }
+      const start = firstSegStart.get(p.id).s
+        || p.mortgage_balance_date || p.purchase_date || String(p.created_at).slice(0, 10);
+      const hasAmort = p.amortization_years > 0;
+      const info = insTerm.run(
+        p.id, p.lender ?? null, start, 60,
+        hasAmort ? p.amortization_years : 25,
+        p.mortgage_balance ?? null,
+        hasAmort ? 0 : 1,
+        p.created_at, p.updated_at
+      );
+      assignSegs.run(info.lastInsertRowid, p.id);
+    }
+  })();
+}
+
 export function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
   return { salt, hash };

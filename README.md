@@ -151,27 +151,63 @@ gallery as one entry and can be removed there, which clears it for good.)
 
 ## Mortgage math
 
+A mortgage is modelled as a chain of **terms** — the way Canadian
+lenders actually run it. Each term is one contract: a lender, a
+start date, a length (1–120 months; the UI offers 1/2/3/4/5/7/10-year
+quick picks), the amortization agreed for that term, and the balance
+it opened with. Inside a term, two kinds of events can happen: a
+**rate change** (a new rate segment — fixed or variable, switchable
+at any time) and a **lump sum** (a one-off principal payment on a
+date). When a term ends, a renewal starts the next term — possibly
+with another bank and a fresh amortization; adding one prefills its
+start (the day after the previous term ends) and its opening balance
+(the previous term's projected end balance), and leaves the
+amortization for you to re-enter.
+
 Canadian convention: quoted rates are nominal with semi-annual compounding,
 so the monthly rate is `i = (1 + r/2)^(1/6) − 1`. Each projected month:
 interest = balance × (that month's rate-segment rate), principal = payment
-− interest. The monthly payment stored on the property wins; if empty, the
-payment is derived from the remaining amortization years. If the payment is
-below the monthly interest, the chart area shows a negative-amortization
-warning and the balance grows accordingly.
+− interest. The **payment is calculated automatically**: at the
+balance anchor and again at every event (term start, segment start,
+lump sum) it is recomputed from the balance at that point, the rate
+then in effect, and the active term's *remaining* amortization (its
+amortization minus the months already elapsed in the term). A lump
+sum comes off the principal first, then the payment is recomputed on
+what remains — so the payment drops and the total interest falls. A
+monthly payment entered by hand is an **override**: it rules inside
+the current term only, and the automatic calculation resumes at the
+next term. (A later term with no amortization yet keeps the previous
+payment until one is set.) If the payment is below the monthly
+interest, the chart area shows a negative-amortization warning and
+the balance grows accordingly. With no rate plan there is no
+projection at all; with a plan but no amortization on the current
+term and no entered payment, the state is NO_PAYMENT.
 
-The remaining amortization is entered in the Mortgage & rates panel
-(the mortgage terms and the rate segments live in that one card; 25 /
-30 quick picks for the usual Canadian maximums — insured mortgages are
-generally capped at 25 years, 30 for first-time buyers and newly built
-homes since Dec 15, 2024, and uninsured mortgages at 30; the field
-accepts 1–35 for planning, flagging anything past 30). When the payment
-is derived, the panel names the derived amount. The merged chart on the
-detail page shows each payment split into its interest portion and
-principal portion (stacked bars; the two sum to the payment) with the
-projected total interest, total principal and payoff month beside it.
-The Mortgage & rates panel also records the lender (bank) — free text
-with the big Canadian banks as suggestions; it shows in the panel
-heading and in the Property & assessment metadata once set.
+Terms, their segments and their lump sums all live in the one
+Mortgage & rates card on the detail page, as an accordion under a
+card-top summary (current term, lender, rate in effect, and the
+payment in use — labelled auto or entered). The Mortgage form at the
+top of the card edits the current balance anchor plus the current
+term's amortization and lender (25 / 30 quick picks for the usual
+Canadian maximums — insured mortgages are generally capped at 25
+years, 30 for first-time buyers and newly built homes since Dec 15,
+2024, and uninsured mortgages at 30; the field accepts 1–35 for
+planning, flagging anything past 30). When the payment is derived,
+the panel names the derived amount. The merged chart on the detail
+page shows each payment split into its interest portion and
+principal portion (stacked bars; the two sum to the payment) with
+the projected total interest, total principal and payoff month
+beside it. The current term's lender (free text, with the big
+Canadian banks as suggestions) also shows in the panel heading and
+in the Property & assessment metadata once set.
+
+Existing databases migrate in place on boot: each property gets a
+Term 1 that mirrors the pre-term model (start at the earliest
+segment, 60 months, the property's amortization — or a flagged
+25-year default when none was recorded — the current balance as its
+opening balance, the property's lender), and its segments are
+assigned to it, so a migrated mortgage projects month-by-month
+exactly as before.
 
 Variable segments can be priced two ways: as an absolute rate, or
 relative to prime ("Prime + spread", e.g. Prime − 1). The app tracks
@@ -184,7 +220,7 @@ with the new value. If the Bank of Canada is unreachable, the last
 known value is used instead, the API response flags it
 (`prime: { rate, asOf, fresh: false }`), and the page shows an amber
 warning naming the rate and date in use. A manual Refresh button
-sits in the Rate segments panel. A prime-priced segment always
+sits in the Mortgage & rates panel. A prime-priced segment always
 resolves against the latest stored prime, floored at 0%, and
 projections hold prime constant — the detail page states the value
 and its as-of date.

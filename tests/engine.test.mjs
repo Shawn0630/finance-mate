@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -194,6 +194,151 @@ test('simulate: a later segment changes the rate mid-stream', () => {
   assert.equal(r.series[0].rate, 6); // 2026-02
   assert.equal(r.series[2].rate, 3); // 2026-04
   assert.equal(r.series[2].rateType, 'variable');
+});
+
+// ------------------------------------------------------------ buildSchedule --
+// The term-driven schedule: payment auto-computed at the anchor and
+// recomputed at every event (term start, segment start, lump sum).
+
+test('buildSchedule: single term reproduces the old derive + simulate path exactly', () => {
+  // The migration-equivalence shape (the user's real mortgage):
+  // balance $1,350,000 at 2024-12-17, one Prime - 1 segment from the
+  // same day, 30-year amortization, prime 4.95 -> 3.95%.
+  const segments = [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }];
+  const terms = [{ id: 1, start_date: '2024-12-17', amortization_years: 30 }];
+  const sched = buildSchedule({ balance: 1350000, balanceDate: '2024-12-17', terms, segments, primeRate: 4.95 });
+  const legacy = simulate({
+    balance: 1350000, balanceDate: '2024-12-17',
+    payment: derivePayment(1350000, 3.95, 30), segments, primeRate: 4.95,
+  });
+  assert.equal(sched.state, 'projected');
+  assert.equal(sched.paymentSource, 'derived');
+  assert.ok(close(sched.paymentUsed, 6381.36, 0.5), sched.paymentUsed);
+  assert.deepEqual(sched.series, legacy.series);
+  assert.equal(sched.totalInterest, legacy.totalInterest);
+  assert.equal(sched.payoffMonth, legacy.payoffMonth);
+});
+
+test('buildSchedule: two terms — payment recomputed at the renewal on the new amortization', () => {
+  // Term 1: 5 years at fixed 5%, 25-year amortization. Term 2 from
+  // 2031-01-01: fixed 4%, amortization reset to 30 years.
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 },
+    { start_date: '2031-01-01', rate_type: 'fixed', annual_rate: 4 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2026-01-01', amortization_years: 25 },
+    { id: 2, start_date: '2031-01-01', amortization_years: 30 },
+  ];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments });
+  assert.equal(r.state, 'projected');
+  assert.equal(r.paymentSource, 'derived');
+  // Term 1 payment: derivePayment(100000, 5%, 25y) = $581.60 (the
+  // $300k anchor $1,744.81 scaled by 1/3).
+  assert.ok(close(r.paymentUsed, 581.60, 0.5), r.paymentUsed);
+  assert.ok(close(r.paymentUsed, derivePayment(100000, 5, 25), 0.02));
+  // Month 1 by hand: interest $412.39, principal $169.21.
+  assert.equal(r.series[0].month, '2026-02');
+  assert.ok(close(r.series[0].interest, 412.39), r.series[0].interest);
+  assert.ok(close(r.series[0].principal, 169.21), r.series[0].principal);
+  assert.ok(close(r.series[0].balance, 99830.79), r.series[0].balance);
+  // Every term-1 month pays the term-1 payment at 5%.
+  const t1 = r.series.filter((row) => row.month < '2031-01');
+  assert.equal(t1.length, 59); // 2026-02 .. 2030-12
+  assert.ok(t1.every((row) => close(row.payment, r.paymentUsed, 0.02) && row.rate === 5));
+  // The boundary month: balance is continuous (the term-2 opening is
+  // term 1's closing balance, no jump), interest is charged at the
+  // new 4% on that balance, and the payment is re-derived from that
+  // balance over the NEW 30-year amortization.
+  const b59 = t1[t1.length - 1].balance;
+  const first2 = r.series.find((row) => row.month === '2031-01');
+  assert.ok(first2, 'term 2 opens at 2031-01');
+  assert.equal(first2.rate, 4);
+  assert.ok(close(first2.interest, b59 * monthlyRate(4)), first2.interest);
+  assert.ok(close(first2.payment, derivePayment(b59, 4, 30), 0.02), first2.payment);
+  assert.ok(first2.payment < r.paymentUsed, 'longer amortization + lower rate -> smaller payment');
+  assert.ok(close(first2.balance, b59 + first2.interest - first2.payment), first2.balance);
+});
+
+test('buildSchedule: a lump sum deducts first, then the payment is recomputed', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];
+  const base = { balance: 100000, balanceDate: '2026-01-01', terms, segments };
+  const plain = buildSchedule(base);
+  const withLump = buildSchedule({ ...base, lumpSums: [{ date: '2027-01-15', amount: 10000 }] });
+  // Before the lump the two schedules are identical (11 payments).
+  assert.deepEqual(withLump.series.slice(0, 11), plain.series.slice(0, 11));
+  const b11 = plain.series[10].balance; // end of 2026-12
+  // January 2027: interest is charged on the REDUCED balance
+  // (b11 - 10,000), and the payment is re-derived from that balance
+  // over the remaining amortization: 300 - 11 = 289 months.
+  const jan = withLump.series[11];
+  assert.equal(jan.month, '2027-01');
+  assert.ok(close(jan.interest, (b11 - 10000) * monthlyRate(5)), jan.interest);
+  assert.ok(close(jan.payment, derivePayment(b11 - 10000, 5, 289 / 12), 0.02), jan.payment);
+  assert.ok(jan.payment < withLump.paymentUsed, 'payment drops after the lump sum');
+  // And the mortgage ends sooner, for less total interest.
+  assert.ok(withLump.payoffMonth < plain.payoffMonth, `${withLump.payoffMonth} < ${plain.payoffMonth}`);
+  assert.ok(withLump.totalInterest < plain.totalInterest);
+});
+
+test('buildSchedule: a mid-term rate change recomputes the payment on the remaining amortization', () => {
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
+    { start_date: '2026-07-01', rate_type: 'fixed', annual_rate: 3 },
+  ];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments });
+  // Month 1 at 6%: interest $493.86 (hand anchor).
+  assert.ok(close(r.series[0].interest, 493.86), r.series[0].interest);
+  assert.ok(close(r.paymentUsed, derivePayment(100000, 6, 25), 0.02), r.paymentUsed);
+  // Five payments at 6% (2026-02..2026-06), then the July payment is
+  // re-derived from the balance over the remaining 295 months at 3%.
+  const b5 = r.series[4].balance;
+  const jul = r.series[5];
+  assert.equal(jul.month, '2026-07');
+  assert.equal(jul.rate, 3);
+  assert.ok(close(jul.payment, derivePayment(b5, 3, 295 / 12), 0.02), jul.payment);
+  assert.ok(jul.payment < r.paymentUsed);
+});
+
+test('buildSchedule: the entered payment is an override inside the anchor term only', () => {
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 },
+    { start_date: '2031-01-01', rate_type: 'fixed', annual_rate: 4 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2026-01-01', amortization_years: 25 },
+    { id: 2, start_date: '2031-01-01', amortization_years: 30 },
+  ];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments, paymentOverride: 700 });
+  assert.equal(r.paymentSource, 'entered');
+  assert.equal(r.paymentUsed, 700);
+  const t1 = r.series.filter((row) => row.month < '2031-01');
+  assert.ok(t1.every((row) => row.payment === 700 || row.balance === 0));
+  // At the renewal the override lapses: the payment is auto-computed
+  // from term 2's closing balance over its 30-year amortization.
+  const bLast = t1[t1.length - 1].balance;
+  const first2 = r.series.find((row) => row.month === '2031-01');
+  assert.ok(close(first2.payment, derivePayment(bLast, 4, 30), 0.02), first2.payment);
+  assert.ok(first2.payment !== 700);
+});
+
+test('buildSchedule: no amortization and no override is a named no_payment state', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: null }];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments });
+  assert.equal(r.state, 'no_payment');
+  assert.equal(r.series.length, 0);
+  // The same term WITH an entered payment projects on the override.
+  const withOverride = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments, paymentOverride: 600 });
+  assert.equal(withOverride.state, 'projected');
+  assert.equal(withOverride.paymentUsed, 600);
+  assert.ok(close(withOverride.totalInterest, 69494.74), withOverride.totalInterest);
+  // A prime-spread segment without a prime rate is a named state too.
+  const primeSegs = [{ start_date: '2026-01-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }];
+  const noPrime = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments: primeSegs });
+  assert.equal(noPrime.state, 'no_prime');
 });
 
 test('prime-spread segments resolve against the current prime', () => {

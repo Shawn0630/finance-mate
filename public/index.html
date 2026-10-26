@@ -149,20 +149,21 @@
 
     <div class="panel">
       <h3>Mortgage &amp; rates <span class="note" id="mortgageLenderTag" style="margin:0"></span></h3>
+      <div class="note" id="mortgageSummary" style="margin-left:0"></div>
       <form id="mortgageForm">
         <div class="grid3">
           <div><label>Outstanding principal ($)</label><input name="mortgage_balance" type="text" inputmode="decimal" data-money></div>
           <div><label>Principal as of</label><input name="mortgage_balance_date" type="date"></div>
-          <div><label>Monthly payment ($) — optional; derived from the amortization when empty</label><input name="mortgage_payment" type="text" inputmode="decimal" data-money></div>
+          <div><label>Monthly payment ($) — optional override; calculated automatically when empty</label><input name="mortgage_payment" type="text" inputmode="decimal" data-money></div>
         </div>
         <div class="grid3">
-          <div><label>Remaining amortization (years)</label><input name="amortization_years" type="number" step="0.5" min="1" max="35" placeholder="e.g. 25">
+          <div><label>Remaining amortization (years) — current term</label><input name="amortization_years" type="number" step="0.5" min="1" max="35" placeholder="e.g. 25">
             <div class="toolbar" style="margin-top:6px">
               <button type="button" class="small" data-amort-years="25">25 years</button>
               <button type="button" class="small" data-amort-years="30">30 years</button>
             </div>
           </div>
-          <div><label>Lender (bank)</label><input name="lender" list="lenderOptions" placeholder="e.g. Scotiabank" autocomplete="off">
+          <div><label>Lender (bank) — current term</label><input name="lender" list="lenderOptions" placeholder="e.g. Scotiabank" autocomplete="off">
             <datalist id="lenderOptions">
               <option value="RBC"></option>
               <option value="TD"></option>
@@ -173,12 +174,12 @@
             </datalist>
           </div>
         </div>
-        <div class="note" style="margin-left:0">Canadian lenders: insured mortgages are usually capped at 25 years (30 for first-time buyers and buyers of newly built homes, since Dec 15, 2024); uninsured mortgages go up to 30 years. With no monthly payment entered, the app derives the payment from the outstanding principal, the rate plan and this remaining amortization.</div>
+        <div class="note" style="margin-left:0">Canadian lenders: insured mortgages are usually capped at 25 years (30 for first-time buyers and buyers of newly built homes, since Dec 15, 2024); uninsured mortgages go up to 30 years. With no monthly payment entered, the payment is calculated automatically from the outstanding principal, the rate in effect and the current term's remaining amortization; an entered payment overrides the calculation inside the current term only.</div>
         <div class="msg warn hidden" id="amortWarn"></div>
         <div class="note" id="derivedPaymentNote" style="margin-left:0"></div>
         <div class="toolbar"><button class="primary" type="submit">Save mortgage</button></div>
       </form>
-      <h4>Rate segments</h4>
+      <h4>Terms</h4>
       <div class="toolbar" style="align-items:flex-start">
         <div>
           <div class="note" id="primeBanner" style="margin:0">Loading prime rate…</div>
@@ -187,19 +188,12 @@
         <div class="spacer"></div>
         <button type="button" class="small" id="primeRefreshBtn">Refresh prime</button>
       </div>
-      <div class="note" style="margin-left:0">Add one row per rate period. A month uses the latest segment that has started; months before the first segment use the first one. Rates are nominal annual rates with Canadian semi-annual compounding. Variable rates are projected at the value you enter — in reality the rate will change over time.</div>
-      <table>
-        <thead><tr><th>Starts</th><th>Type</th><th class="num">Annual rate %</th><th></th></tr></thead>
-        <tbody id="segmentRows"></tbody>
-      </table>
-      <form id="addSegmentForm" class="toolbar" style="align-items:flex-end">
-        <div><label>Start date</label><input type="date" name="start_date" required></div>
-        <div><label>Type</label><select name="rate_type"><option value="fixed">Fixed</option><option value="variable">Variable</option></select></div>
-        <div id="segModeWrap" class="hidden"><label>Pricing (variable)</label><select name="rate_mode"><option value="absolute">Absolute rate</option><option value="prime_spread">Prime + spread</option></select></div>
-        <div id="segRateWrap"><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
-        <div id="segSpreadWrap" class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" id="segSpreadPreview" style="margin:2px 0 0"></div></div>
-        <button class="primary" type="submit">Add segment</button>
-      </form>
+      <div class="note" style="margin-left:0">A mortgage runs as a chain of terms — each term is one contract with a lender, a length and the amortization agreed for it. Inside a term you can change the rate (fixed ↔ variable, one row per rate period; a month uses the latest segment that has started) and make lump-sum payments. When a term ends, renew into the next term — possibly with another bank and a fresh amortization. The payment is recalculated automatically at every change, from the balance at that point, the rate then in effect and the term's remaining amortization; lump sums come off the principal first and the payment is then recalculated on what remains, so the payment drops and the total interest falls. Rates are nominal annual rates with Canadian semi-annual compounding; variable rates are projected at today's value — in reality they will change over time.</div>
+      <div id="termsWrap"></div>
+      <div class="toolbar" style="margin-top:10px">
+        <button type="button" class="primary" id="addTermBtn">+ Add term / renewal</button>
+        <span class="note" style="margin:0">Starts the day after the last term ends, opens with its projected end balance; set its amortization (and lender, if you are switching banks) in the new term.</span>
+      </div>
       <form id="paymentDayForm" class="toolbar" style="align-items:flex-end;margin-top:14px">
         <div><label>Payment frequency</label><select id="paymentFrequencySelect">
           <option value="monthly">Monthly</option>

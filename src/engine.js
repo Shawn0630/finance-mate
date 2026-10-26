@@ -237,3 +237,202 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
     negativeAmortization,
   };
 }
+
+// ------------------------------------------------------------ term schedule --
+// 'YYYY-MM' key for an absolute month index (year * 12 + month - 1).
+function ymKeyOfIdx(idx) {
+  const y = Math.floor(idx / 12);
+  const m = (idx % 12) + 1;
+  return `${y}-${String(m).padStart(2, '0')}`;
+}
+
+function monthIdxOf(dateStr) {
+  const { y, m } = parseYM(dateStr);
+  return y * 12 + (m - 1);
+}
+
+// Build a projection on top of simulate(), driven by mortgage TERMS
+// and the events inside them — the way a Canadian mortgage actually
+// runs. A term is a contract period with its own lender, amortization
+// and opening balance; inside a term the rate can change (a new rate
+// segment starts) and lump sums can land. At every event — a term
+// starting, a segment starting, a lump sum landing — the monthly
+// payment is RECOMPUTED from the balance at that point, the rate
+// then in effect and the active term's REMAINING amortization
+// (its amortization minus the months already elapsed in the term,
+// counted from the balance anchor for the anchor's term and from
+// the term's start for later terms). Between events the payment is
+// constant, so the projection is a chain of simulate() runs, one per
+// inter-event span, carrying the balance across. A lump sum deducts
+// from the balance FIRST (in its month, before that month's
+// interest), then the payment is recomputed — so a lump sum lowers
+// the payment and shortens the payoff. The entered monthly payment
+// (paymentOverride) is an override that rules only inside the term
+// containing the balance anchor; at a renewal the payment returns
+// to automatic. Prime is held constant, exactly as in simulate().
+//
+//   balance / balanceDate: the current-balance anchor (as simulate)
+//   terms:      [{ id, start_date, amortization_years }] any order
+//   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
+//               before the balance date is already reflected in the
+//               anchor balance and is ignored
+// Returns simulate()'s shape plus { state, paymentUsed,
+// paymentSource }: state is 'projected', or 'no_payment' when the
+// anchor term carries no amortization and no override is entered
+// (the payment cannot be computed), or 'no_prime' when a prime-
+// spread segment exists but no prime rate is known. paymentUsed is
+// the monthly payment in effect at the anchor; paymentSource is
+// 'entered' (the override) or 'derived' (auto-computed).
+export function buildSchedule({ balance, balanceDate, paymentOverride = null, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, region = 'CA' }) {
+  const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null, paymentSource: null };
+  if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread')
+    && (primeRate === null || primeRate === undefined || !isFinite(Number(primeRate)))) {
+    return { ...blocked, state: 'no_prime' };
+  }
+  const A = monthIdxOf(balanceDate);
+  const anchorDay = Number.isInteger(paymentDay) && paymentDay >= 1 && paymentDay <= 31
+    ? paymentDay
+    : Number(String(balanceDate).split('-')[2]) || 1;
+  const sortedTerms = [...terms].sort((a, b) => (a.start_date < b.start_date ? -1 : a.start_date > b.start_date ? 1 : a.id - b.id));
+  // The term the balance anchor sits in (the latest that has started
+  // by the balance date; the earliest term if none has).
+  let anchorTerm = null;
+  for (const t of sortedTerms) if (t.start_date <= balanceDate) anchorTerm = t;
+  if (!anchorTerm) anchorTerm = sortedTerms[0] || null;
+  // The term governing payments from month `mi` on: the latest term
+  // that has started by then (fallback: the earliest term).
+  const termAtMonth = (mi) => {
+    let t = null;
+    for (const term of sortedTerms) {
+      if (monthIdxOf(term.start_date) <= mi) t = term;
+      else break;
+    }
+    return t || sortedTerms[0] || null;
+  };
+  // The state-point from which a term's amortization counts down:
+  // the anchor term counts from the balance anchor; a later term
+  // counts from the state point just before its first payment month.
+  const epochOf = (term) => (term === anchorTerm ? A : monthIdxOf(term.start_date) - 1);
+
+  // The monthly payment in effect for months after state point S,
+  // computed from the balance at S. 'entered' only inside the
+  // anchor's term; automatic everywhere else.
+  const computePayment = (S, balNow) => {
+    const term = termAtMonth(S + 1);
+    if (paymentOverride > 0 && (!anchorTerm || !term || term.id === anchorTerm.id)) {
+      return { payment: round2(paymentOverride), source: 'entered' };
+    }
+    const rate = segmentAnnualRate(segmentForMonth(segments, ymKeyOfIdx(S + 1)), primeRate);
+    if (rate === null) return { error: 'no_prime' };
+    if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
+    const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
+    if (remaining <= 0) return { payment: round2(balNow), source: 'derived' }; // past the amortization: clear it (simulate caps at balance + interest)
+    return { payment: derivePayment(balNow, rate, remaining / 12), source: 'derived' };
+  };
+
+  // Lump sums grouped by the state point they land on (the point
+  // just before their month's payment). One dated in the anchor
+  // month but after the balance date folds into the opening balance.
+  const lumpByState = new Map(); // stateIdx -> { total, firstDate }
+  let initialLump = null;
+  for (const ls of lumpSums || []) {
+    const amount = Number(ls.amount) || 0;
+    if (!(amount > 0) || String(ls.date) <= balanceDate) continue;
+    const L = monthIdxOf(ls.date);
+    if (L <= A) {
+      if (!initialLump) initialLump = { total: 0, month: ymKeyOfIdx(L) };
+      initialLump.total = round2(initialLump.total + amount);
+    } else {
+      const S = L - 1;
+      const cur = lumpByState.get(S) || { total: 0, firstDate: String(ls.date) };
+      cur.total = round2(cur.total + amount);
+      if (String(ls.date) < cur.firstDate) cur.firstDate = String(ls.date);
+      lumpByState.set(S, cur);
+    }
+  }
+  // Event state points after the anchor: term starts, segment
+  // starts and lump-sum landings. (Anything at or before the anchor
+  // is already reflected in the opening state.)
+  const eventStates = new Set();
+  for (const t of sortedTerms) { const s = monthIdxOf(t.start_date) - 1; if (s > A) eventStates.add(s); }
+  for (const sg of segments) { const s = monthIdxOf(sg.start_date) - 1; if (s > A) eventStates.add(s); }
+  for (const s of lumpByState.keys()) eventStates.add(s);
+  const boundaries = [...eventStates].sort((a, b) => a - b);
+  boundaries.push(A + maxMonths);
+
+  let bal = round2(Number(balance));
+  const series = [];
+  let totalInterest = 0;
+  let negativeAmortization = false;
+  let payoffMonth = null;
+  let paymentUsed = null;
+  let paymentSource = null;
+  let lastPayment = null;
+
+  if (initialLump) {
+    bal = round2(bal - initialLump.total);
+    if (bal <= 0) {
+      const cp = computePayment(A, round2(Number(balance)));
+      return {
+        ...blocked, state: cp.error === 'no_prime' ? 'no_prime' : 'projected',
+        payoffMonth: initialLump.month,
+        paymentUsed: cp.error ? null : cp.payment, paymentSource: cp.error ? null : cp.source,
+      };
+    }
+  }
+
+  let S = A;
+  let chunkBalanceDate = balanceDate;
+  for (const nextS of boundaries) {
+    if (bal <= 0 || S >= A + maxMonths) break;
+    let cp = computePayment(S, bal);
+    if (cp.error) {
+      if (S === A) return { ...blocked, state: cp.error };
+      // A later term without an amortization cannot recompute the
+      // payment: the previous payment carries over unchanged.
+      cp = { payment: lastPayment, source: paymentSource };
+    }
+    if (S === A) { paymentUsed = cp.payment; paymentSource = cp.source; }
+    lastPayment = cp.payment;
+    const span = Math.min(nextS, A + maxMonths) - S;
+    if (span > 0) {
+      const r = simulate({
+        balance: bal, balanceDate: chunkBalanceDate, payment: cp.payment, segments,
+        paymentDay: anchorDay, frequency, maxMonths: span, primeRate, region,
+      });
+      series.push(...r.series);
+      totalInterest = round2(totalInterest + r.totalInterest);
+      negativeAmortization = negativeAmortization || r.negativeAmortization;
+      if (r.series.length) {
+        bal = r.series[r.series.length - 1].balance;
+        chunkBalanceDate = r.series[r.series.length - 1].date;
+      }
+      if (r.payoffMonth) { payoffMonth = r.payoffMonth; break; }
+    }
+    S = nextS;
+    if (S >= A + maxMonths) break;
+    // A lump sum landing at this state point deducts FIRST; the
+    // next loop iteration recomputes the payment on what remains.
+    const lump = lumpByState.get(S);
+    if (lump && bal > 0) {
+      const before = bal;
+      bal = round2(bal - lump.total);
+      if (bal <= 0) {
+        const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
+        series.push({
+          month: ymKeyOfIdx(S + 1), date: lump.firstDate,
+          rate: segmentAnnualRate(seg, primeRate) ?? 0, rateType: seg ? seg.rate_type : null,
+          interest: 0, principal: before, payment: before, balance: 0,
+        });
+        payoffMonth = ymKeyOfIdx(S + 1);
+        bal = 0;
+        break;
+      }
+    }
+  }
+  return {
+    state: 'projected', series, totalInterest,
+    payoffMonth: payoffMonth || (series.length && bal <= 0 ? series[series.length - 1].month : null),
+    negativeAmortization, paymentUsed, paymentSource,
+  };
+}

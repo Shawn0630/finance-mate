@@ -124,4 +124,10 @@ label.btnlike:hover { background: #f0f4f9; }
 .modal-head h3 { margin: 0; font-size: 16px; }
 .detail-table td:first-child { width: 190px; color: #5a6a7a; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 .hidden { display: none !important; }
+.term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }
+.term-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; text-align: left; background: #f6f9fc; border: none; border-radius: 0; padding: 10px 12px; font-size: 13.5px; }
+.term-head:hover { background: #eef3f9; }
+.term-head .term-title { font-weight: 650; }
+.term-body { padding: 4px 12px 12px; border-top: 1px solid #e6ecf2; }
+.term-body h5 { margin: 14px 0 6px; font-size: 12.5px; color: #33424f; }
 @media (max-width: 800px) { .summary-strip { grid-template-columns: 1fr 1fr; } .grid2, .grid3 { grid-template-columns: 1fr; } }

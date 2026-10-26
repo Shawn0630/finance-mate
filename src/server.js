@@ -7,7 +7,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
-import { simulate, derivePayment, segmentForMonth, segmentAnnualRate, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
+import { buildSchedule, segmentForMonth, segmentAnnualRate, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { getRegion, REGION_CODES } from './regions/index.js';
 import { getCurrentPrime, ensureFreshPrime, refreshPrime, primeInfo, primeStatus } from './prime.js';
 import {
@@ -328,14 +328,92 @@ function photosView(p) {
   return photos;
 }
 
+// --------------------------------------------------------- mortgage terms --
+// A mortgage is a chain of terms (contracts). Each term carries its
+// lender, start, length, amortization and opening balance; rate
+// segments and lump sums belong to a term. The term the property's
+// balance anchor sits in is the "current" term — the property-level
+// lender / amortization_years the API has always served are read
+// from it (the columns remain as a mirror for older data).
+function termsOf(propertyId) {
+  return db
+    .prepare('SELECT * FROM mortgage_terms WHERE property_id = ? ORDER BY start_date, id')
+    .all(propertyId);
+}
+
+function lumpSumsOf(propertyId) {
+  return db
+    .prepare('SELECT * FROM lump_sums WHERE property_id = ? ORDER BY date, id')
+    .all(propertyId);
+}
+
+function currentTermOf(p, terms) {
+  const list = terms || termsOf(p.id);
+  if (!list.length) return null;
+  const anchor = p.mortgage_balance_date || new Date().toISOString().slice(0, 10);
+  let cur = null;
+  for (const t of list) if (t.start_date <= anchor) cur = t;
+  return cur || list[0];
+}
+
+// 'YYYY-MM-DD' + n months (day clamped into the target month).
+function addMonthsDate(dateStr, months) {
+  const [y, m, d] = String(dateStr).split('-').map(Number);
+  const total = y * 12 + (m - 1) + months;
+  const ny = Math.floor(total / 12);
+  const nm = (total % 12) + 1;
+  const dim = new Date(Date.UTC(ny, nm, 0)).getUTCDate();
+  return `${ny}-${String(nm).padStart(2, '0')}-${String(Math.min(d, dim)).padStart(2, '0')}`;
+}
+
+function addDaysDate(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// The last day a term covers: start + term_months, minus one day.
+const termEndDate = (t) => addDaysDate(addMonthsDate(t.start_date, t.term_months), -1);
+
+// Keep the property row's lender / amortization_years columns in
+// step with the current term, so anything still reading the columns
+// directly (older clients, the migration) sees the same values the
+// API serves from the term.
+function syncTermMirror(p) {
+  const cur = currentTermOf(p);
+  if (!cur) return;
+  db.prepare('UPDATE properties SET lender = ?, amortization_years = ?, updated_at = ? WHERE id = ?')
+    .run(cur.lender ?? null, cur.amortization_years ?? null, nowIso(), p.id);
+}
+
+function termView(t, segments, lumpSums) {
+  return {
+    ...t,
+    end_date: termEndDate(t),
+    segments: segments.filter((s) => s.term_id === t.id),
+    lumpSums: lumpSums.filter((l) => l.term_id === t.id),
+  };
+}
+
 function propertyView(p) {
   const segments = segmentsOf(p.id).map(segmentView);
   const cur = currentSegment(segments);
+  const terms = termsOf(p.id);
+  const lumpSums = lumpSumsOf(p.id);
+  const curTerm = currentTermOf(p, terms);
   return {
     ...p,
+    // The lender and remaining amortization are term facts now;
+    // serve the current term's values under the long-standing field
+    // names so existing consumers keep working unchanged.
+    lender: curTerm ? (curTerm.lender ?? null) : p.lender,
+    amortization_years: curTerm ? (curTerm.amortization_years ?? null) : p.amortization_years,
     owners: parseOwners(p.owners),
     photos: photosView(p),
     segments,
+    terms: terms.map((t) => termView(t, segments, lumpSums)),
+    lumpSums,
+    currentTermId: curTerm ? curTerm.id : null,
     currentRate: cur ? {
       rate_type: cur.rate_type, annual_rate: cur.effective_rate,
       rate_mode: cur.rate_mode, spread: cur.spread ?? null, start_date: cur.start_date,
@@ -421,6 +499,24 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       nowIso()
     );
   const created = getProperty(info.lastInsertRowid);
+  // Every mortgage starts as Term 1: it opens on the balance date
+  // with the current balance, runs a standard 5 years, and carries
+  // the amortization / lender given at add time (either may be
+  // filled in later — until the term has an amortization or a
+  // payment is entered, the projection reports NO_PAYMENT).
+  db.prepare(
+    `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
+  ).run(
+    created.id,
+    created.lender ?? null,
+    created.mortgage_balance_date || new Date().toISOString().slice(0, 10),
+    60,
+    amortYears,
+    balance,
+    nowIso(),
+    nowIso()
+  );
   // Best-effort HouseSigma history pull in the background: earlier
   // assessment years appear on the property by themselves; a failure
   // is recorded on the property (detail page shows it) and never
@@ -464,37 +560,39 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     const balance = p.mortgage_balance > 0 ? p.mortgage_balance : 0;
     const segments = segmentsOf(p.id);
     const balanceDate = p.mortgage_balance_date || today;
-    // Monthly payment (entered wins; else derived exactly like the
-    // amortization endpoint). Only meaningful with a balance.
+    // Monthly payment: the entered override when there is one, else
+    // the term schedule's auto-computed payment (exactly the
+    // amortization endpoint's rules). Only meaningful with a balance.
     let monthlyPayment = null;
     if (balance > 0 && p.mortgage_payment > 0) {
       monthlyPayment = p.mortgage_payment;
-    } else if (balance > 0 && segments.length && p.amortization_years > 0) {
-      const seg = segmentForMonth(segments, balanceDate.slice(0, 7));
-      const segRate = segmentAnnualRate(seg, primeRate);
-      // Null = a prime-spread segment with no prime on record: no
-      // honest payment can be derived, so the property contributes
-      // its balance only (same treatment as the NO_PRIME state).
-      if (segRate !== null) monthlyPayment = derivePayment(balance, segRate, p.amortization_years);
     }
     let projectedInterest = null;
     if (balance > 0 && segments.length) withPlan++;
     // Prime-spread segments with no prime on record cannot project.
     const primeBlocked = primeRate === null
       && segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread');
-    if (balance > 0 && segments.length && monthlyPayment > 0 && !primeBlocked) {
+    if (balance > 0 && segments.length && !primeBlocked) {
       const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
-      const r = simulate({ balance, balanceDate, payment: monthlyPayment, segments, paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA' });
-      projectedInterest = r.totalInterest;
-      interestFrom++;
-      const map = new Map();
-      for (const row of r.series) map.set(row.month, { balance: row.balance, last: row.month === r.series[r.series.length - 1].month });
-      monthMaps.set(p.id, {
-        map, payoffMonth: r.payoffMonth,
-        firstMonth: r.series.length ? r.series[0].month : null,
-        lastMonth: r.series.length ? r.series[r.series.length - 1].month : null,
-        lastBalance: r.series.length ? r.series[r.series.length - 1].balance : 0,
+      const r = buildSchedule({
+        balance, balanceDate,
+        paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
+        terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
+        paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA',
       });
+      if (r.state === 'projected') {
+        monthlyPayment = r.paymentUsed;
+        projectedInterest = r.totalInterest;
+        interestFrom++;
+        const map = new Map();
+        for (const row of r.series) map.set(row.month, { balance: row.balance, last: row.month === r.series[r.series.length - 1].month });
+        monthMaps.set(p.id, {
+          map, payoffMonth: r.payoffMonth,
+          firstMonth: r.series.length ? r.series[0].month : null,
+          lastMonth: r.series.length ? r.series[r.series.length - 1].month : null,
+          lastBalance: r.series.length ? r.series[r.series.length - 1].balance : 0,
+        });
+      }
     }
     // Assessed history: the recorded value-history points; a property
     // with a stored assessed value but no points contributes that one
@@ -713,6 +811,21 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     next.amortization_years, next.lender, next.notes, JSON.stringify(next.owners), next.purchase_date,
     next.payment_day, next.payment_frequency, next.region, nowIso(), p.id
   );
+  // Lender and remaining amortization live on the current term
+  // now: the Mortgage form still edits them at property level, so
+  // write them through to the term the balance anchor sits in.
+  if (b.amortization_years !== undefined || b.lender !== undefined) {
+    const cur = currentTermOf(getProperty(p.id));
+    if (cur) {
+      db.prepare('UPDATE mortgage_terms SET lender = ?, amortization_years = ?, updated_at = ? WHERE id = ?')
+        .run(
+          b.lender !== undefined ? next.lender : cur.lender,
+          b.amortization_years !== undefined ? next.amortization_years : cur.amortization_years,
+          nowIso(),
+          cur.id
+        );
+    }
+  }
   // A changed address invalidates the stored HouseSigma location:
   // clear its ids so the next history pull locates the new address.
   if (next.address !== p.address) {
@@ -957,15 +1070,37 @@ function cleanSegment(b, base) {
   return { value: next };
 }
 
+// Which term a segment belongs to: the one named in the request
+// when it is valid, else the term in effect at the segment's start
+// (falling back to the earliest term). Ownership is organizational —
+// the projection prices months from the segment timeline itself —
+// but it decides which accordion the segment is edited in.
+function segmentTermId(p, body, base) {
+  const terms = termsOf(p.id);
+  if (!terms.length) return { value: null };
+  if (body.term_id !== undefined && body.term_id !== null) {
+    const t = terms.find((x) => x.id === Number(body.term_id));
+    if (!t) return { error: 'term_id does not name a term of this property' };
+    return { value: t.id };
+  }
+  if (base && base.term_id) return { value: base.term_id };
+  const start = (body.start_date !== undefined ? String(body.start_date) : base?.start_date) || '';
+  let owner = null;
+  for (const t of terms) if (t.start_date <= start) owner = t;
+  return { value: (owner || terms[0]).id };
+}
+
 app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
   const clean = cleanSegment(req.body || {}, null);
   if (clean.error) return res.status(400).json({ error: clean.error });
+  const owner = segmentTermId(p, req.body || {}, null);
+  if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
   const info = db
-    .prepare('INSERT INTO rate_segments (property_id, start_date, rate_type, annual_rate, rate_mode, spread, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, nowIso());
+    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, nowIso());
   res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
 });
 
@@ -974,15 +1109,183 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   if (!seg) return res.status(404).json({ error: 'segment not found' });
   const clean = cleanSegment(req.body || {}, seg);
   if (clean.error) return res.status(400).json({ error: clean.error });
+  const p = getProperty(req.params.id);
+  const owner = segmentTermId(p, req.body || {}, seg);
+  if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
-  db.prepare('UPDATE rate_segments SET start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=? WHERE id=?')
-    .run(s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, seg.id);
+  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=? WHERE id=?')
+    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, seg.id);
   res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
 });
 
 app.delete('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   const info = db.prepare('DELETE FROM rate_segments WHERE id = ? AND property_id = ?').run(req.params.segId, req.params.id);
   if (!info.changes) return res.status(404).json({ error: 'segment not found' });
+  res.json({ ok: true });
+});
+
+// --------------------------------------------------------- terms & lump sums --
+// Validate/normalize a term from request fields merged over an
+// existing row (PUT) or a prefilled candidate (POST). term_months
+// is the stored unit (the UI offers year quick-picks); the range
+// 1..120 covers the Canadian market (terms run 6 months to 10
+// years). Amortization follows the same 1..35 rule as properties.
+function cleanTerm(c) {
+  const next = {
+    lender: c.lender === undefined || c.lender === null ? null : (String(c.lender).trim() || null),
+    start_date: c.start_date !== undefined ? String(c.start_date) : null,
+    term_months: c.term_months !== undefined ? Number(c.term_months) : null,
+    amortization_years: c.amortization_years !== undefined ? num(c.amortization_years) : null,
+    opening_balance: c.opening_balance !== undefined ? num(c.opening_balance) : null,
+  };
+  if (!next.start_date || !isDateStr(next.start_date)) return { error: 'start_date must be a valid date (YYYY-MM-DD)' };
+  if (!Number.isInteger(next.term_months) || next.term_months < 1 || next.term_months > 120) {
+    return { error: 'term length must be a whole number of months between 1 and 120' };
+  }
+  if (next.amortization_years !== null && (next.amortization_years < 1 || next.amortization_years > 35)) {
+    return { error: 'amortization must be between 1 and 35 years' };
+  }
+  if (next.opening_balance !== null && next.opening_balance < 0) {
+    return { error: 'opening balance must be a number >= 0' };
+  }
+  return { value: next };
+}
+
+// The projected balance at the end of a month ('YYYY-MM'), from the
+// property's own schedule; null when the mortgage cannot project
+// that far (no plan / no payment / past the horizon).
+function projectedBalanceAtMonth(p, monthKey) {
+  const segments = segmentsOf(p.id);
+  if (!segments.length || !(p.mortgage_balance > 0)) return null;
+  const prime = getCurrentPrime();
+  const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+  const r = buildSchedule({
+    balance: p.mortgage_balance, balanceDate: p.mortgage_balance_date || new Date().toISOString().slice(0, 10),
+    paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
+    terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
+    paymentDay: p.payment_day ?? null, frequency,
+    primeRate: prime ? prime.rate : null, region: p.region || 'CA',
+  });
+  if (r.state !== 'projected') return null;
+  const row = r.series.find((x) => x.month === monthKey);
+  if (row) return row.balance;
+  if (r.payoffMonth && r.payoffMonth <= monthKey) return 0;
+  return null;
+}
+
+app.post('/api/properties/:id/terms', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const b = req.body || {};
+  const terms = termsOf(p.id);
+  const prev = terms.length ? terms[terms.length - 1] : null;
+  // Renewal prefill: the new term starts the day after the previous
+  // term ends, opens with the previous term's projected end balance
+  // and keeps its lender until the user says otherwise (switching
+  // banks = editing the lender here). The amortization is
+  // deliberately NOT carried over — a renewal re-agrees it, so the
+  // user re-enters it; until then the projection carries the last
+  // payment past this term's start (see buildSchedule).
+  const prevEndMonth = prev ? addMonthsDate(prev.start_date, prev.term_months - 1).slice(0, 7) : null;
+  const candidate = {
+    lender: b.lender !== undefined ? b.lender : (prev ? prev.lender : null),
+    start_date: b.start_date !== undefined ? b.start_date
+      : (prev ? addMonthsDate(prev.start_date, prev.term_months)
+        : (p.mortgage_balance_date || new Date().toISOString().slice(0, 10))),
+    term_months: b.term_months !== undefined ? b.term_months : 60,
+    amortization_years: b.amortization_years !== undefined ? b.amortization_years : null,
+    opening_balance: b.opening_balance !== undefined ? b.opening_balance
+      : (prev ? (projectedBalanceAtMonth(p, prevEndMonth) ?? prev.opening_balance ?? p.mortgage_balance) : p.mortgage_balance),
+  };
+  const clean = cleanTerm(candidate);
+  if (clean.error) return res.status(400).json({ error: clean.error });
+  const t = clean.value;
+  const info = db
+    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`)
+    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, nowIso(), nowIso());
+  syncTermMirror(getProperty(p.id));
+  const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(info.lastInsertRowid);
+  res.status(201).json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id)));
+});
+
+app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const term = db.prepare('SELECT * FROM mortgage_terms WHERE id = ? AND property_id = ?').get(req.params.termId, p.id);
+  if (!term) return res.status(404).json({ error: 'term not found' });
+  const b = req.body || {};
+  const clean = cleanTerm({
+    lender: b.lender !== undefined ? b.lender : term.lender,
+    start_date: b.start_date !== undefined ? b.start_date : term.start_date,
+    term_months: b.term_months !== undefined ? b.term_months : term.term_months,
+    amortization_years: b.amortization_years !== undefined ? b.amortization_years : term.amortization_years,
+    opening_balance: b.opening_balance !== undefined ? b.opening_balance : term.opening_balance,
+  });
+  if (clean.error) return res.status(400).json({ error: clean.error });
+  const t = clean.value;
+  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, amortization_defaulted=0, updated_at=? WHERE id=?')
+    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, nowIso(), term.id);
+  syncTermMirror(getProperty(p.id));
+  const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(term.id);
+  res.json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id)));
+});
+
+app.delete('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const term = db.prepare('SELECT * FROM mortgage_terms WHERE id = ? AND property_id = ?').get(req.params.termId, p.id);
+  if (!term) return res.status(404).json({ error: 'term not found' });
+  const terms = termsOf(p.id);
+  if (terms.length <= 1) {
+    return res.status(400).json({ error: 'a mortgage keeps at least one term — edit this term instead of deleting it' });
+  }
+  const remaining = terms.filter((t) => t.id !== term.id);
+  db.transaction(() => {
+    // The deleted term's segments move to the term in effect at
+    // their start among the remaining ones (their dates — what the
+    // projection prices from — do not change).
+    const segs = db.prepare('SELECT id, start_date FROM rate_segments WHERE term_id = ?').all(term.id);
+    const move = db.prepare('UPDATE rate_segments SET term_id = ? WHERE id = ?');
+    for (const s of segs) {
+      let owner = null;
+      for (const t of remaining) if (t.start_date <= s.start_date) owner = t;
+      move.run((owner || remaining[0]).id, s.id);
+    }
+    db.prepare('DELETE FROM lump_sums WHERE term_id = ?').run(term.id);
+    db.prepare('DELETE FROM mortgage_terms WHERE id = ?').run(term.id);
+  })();
+  syncTermMirror(getProperty(p.id));
+  res.json(propertyView(getProperty(p.id)));
+});
+
+app.post('/api/properties/:id/lump-sums', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const b = req.body || {};
+  if (!isDateStr(b.date)) return res.status(400).json({ error: 'date must be a valid date (YYYY-MM-DD)' });
+  const amount = num(b.amount);
+  if (amount === null || !(amount > 0)) return res.status(400).json({ error: 'amount must be a number > 0' });
+  const terms = termsOf(p.id);
+  let termId = null;
+  if (b.term_id !== undefined && b.term_id !== null) {
+    const t = terms.find((x) => x.id === Number(b.term_id));
+    if (!t) return res.status(400).json({ error: 'term_id does not name a term of this property' });
+    termId = t.id;
+  } else if (terms.length) {
+    let owner = null;
+    for (const t of terms) if (t.start_date <= String(b.date)) owner = t;
+    termId = (owner || terms[0]).id;
+  }
+  const info = db
+    .prepare('INSERT INTO lump_sums (property_id, term_id, date, amount, note, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, termId, String(b.date), amount, b.note ? String(b.note) : null, nowIso());
+  res.status(201).json(db.prepare('SELECT * FROM lump_sums WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.delete('/api/properties/:id/lump-sums/:lsId', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM lump_sums WHERE id = ? AND property_id = ?').run(req.params.lsId, req.params.id);
+  if (!info.changes) return res.status(404).json({ error: 'lump sum not found' });
   res.json({ ok: true });
 });
 
@@ -1004,9 +1307,11 @@ app.post('/api/prime/refresh', requireApiAuth, async (req, res) => {
 // Monthly projection from the stored balance. The projection is computed
 // ONLY from the user's own rate plan (the rate segments): there is no
 // default or assumed rate anywhere. With no segments the endpoint reports
-// a NO_RATE_PLAN state instead of projecting at 0%. The monthly payment
-// stored on the property wins; otherwise it is derived from the balance,
-// the rate plan and the remaining amortization years.
+// a NO_RATE_PLAN state instead of projecting at 0%. The payment comes
+// from the term schedule (engine buildSchedule): auto-computed from the
+// balance, the rate in effect and the current term's remaining
+// amortization, recomputed at every term start, rate change and lump
+// sum; a stored monthly payment is an override inside the current term.
 app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -1027,29 +1332,34 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
     return res.json({ ok: false, code: 'NO_PRIME', error: 'a variable segment is priced off the prime rate, but no prime rate is available yet', segments });
   }
   const balanceDate = p.mortgage_balance_date || new Date().toISOString().slice(0, 10);
-  let payment = p.mortgage_payment;
-  let paymentSource = 'entered';
-  if (!(payment > 0)) {
-    if (!(p.amortization_years > 0)) {
-      return res.json({ ok: false, code: 'NO_PAYMENT', error: 'enter a monthly payment or a remaining amortization (years) to project the mortgage', segments });
-    }
-    const firstMonth = balanceDate.slice(0, 7);
-    const seg = segmentForMonth(segments, firstMonth);
-    payment = derivePayment(p.mortgage_balance, segmentAnnualRate(seg, primeRate), p.amortization_years);
-    paymentSource = 'derived';
-  }
-  // The payment day only anchors the series' node dates (see engine);
-  // it never enters the interest math. The payment frequency drives
-  // the period stepping and the per-period amount (both in the
-  // engine); `payment` here stays the MONTHLY amount throughout.
+  // The projection is built by the term schedule (engine
+  // buildSchedule): the payment is auto-computed from the balance,
+  // the rate in effect and the current term's remaining
+  // amortization, and recomputed at every term start, rate change
+  // and lump sum. An entered monthly payment is an override that
+  // rules inside the current term only. NO_PAYMENT now means the
+  // current term has no amortization to compute a payment from and
+  // no override is entered.
   const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
-  const r = simulate({ balance: p.mortgage_balance, balanceDate, payment, segments, paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA' });
+  const r = buildSchedule({
+    balance: p.mortgage_balance, balanceDate,
+    paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
+    terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
+    paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA',
+  });
+  if (r.state === 'no_payment') {
+    return res.json({ ok: false, code: 'NO_PAYMENT', error: 'enter a monthly payment or set the current term\u2019s remaining amortization (years) to project the mortgage', segments });
+  }
+  if (r.state === 'no_prime') {
+    return res.json({ ok: false, code: 'NO_PRIME', error: 'a variable segment is priced off the prime rate, but no prime rate is available yet', segments });
+  }
+  const payment = r.paymentUsed;
   res.json({
     ok: true,
     balance: p.mortgage_balance,
     balanceDate,
     paymentUsed: payment,
-    paymentSource,
+    paymentSource: r.paymentSource,
     primeRate,
     prime: primeStatus(),
     frequency,

@@ -1024,7 +1024,10 @@ async function loadPropertyDetail(id) {
   mf.lender.value = p.lender || '';
   $('#mortgageLenderTag').textContent = p.lender ? `— ${p.lender}` : '';
   syncAmortWarning();
-  renderSegments(p.segments);
+  chartMeta = null; // the previous property's projection must not leak into this page's summary
+  amortError = null;
+  renderTerms(p);
+  renderMortgageSummary();
   loadPrime();
   loadChart(id);
   loadTrend(id);
@@ -1043,13 +1046,148 @@ function segmentRateText(s) {
   return `${Number(s.effective_rate ?? s.annual_rate).toFixed(2)}%`;
 }
 
-function renderSegments(segments) {
-  $('#segmentRows').innerHTML = segments.map((s) => `<tr>
+// ------------------------------------------------------------- terms ---
+// The Mortgage & rates card's lower half is the chain of terms.
+// Each term is an accordion: its contract fields (lender, start,
+// length, amortization, opening balance), the rate segments that
+// belong to it ("+ Change rate" adds one), and its lump sums. The
+// current term (the one the balance anchor sits in) starts open.
+// Everything saves through the terms / rates / lump-sums endpoints
+// and the page reloads, so the projection the user sees is always
+// the server's recomputation.
+const openTermIds = new Set();
+let expandTermId = null; // a term to open after the next render (e.g. just added)
+
+function termLengthLabel(months) {
+  const m = Number(months);
+  if (!m) return '—';
+  if (m % 12 === 0) { const y = m / 12; return `${y} year${y === 1 ? '' : 's'}`; }
+  return `${m} month${m === 1 ? '' : 's'}`;
+}
+
+function currentRateText(p) {
+  const c = p && p.currentRate;
+  if (!c) return 'no rate plan yet';
+  const txt = segmentRateText({
+    rate_type: c.rate_type, rate_mode: c.rate_mode, spread: c.spread, effective_rate: c.annual_rate,
+  });
+  return `${c.rate_type === 'fixed' ? 'Fixed' : 'Variable'} at ${txt}`;
+}
+
+// Card-top summary: the current term's lender, span and number,
+// the rate in effect now, and the payment the projection is using
+// (auto-computed, or the entered override).
+function renderMortgageSummary() {
+  const el = $('#mortgageSummary');
+  if (!el) return;
+  const p = detailProperty;
+  if (!p || !(p.terms || []).length) { el.textContent = ''; return; }
+  const idx = p.terms.findIndex((t) => t.id === p.currentTermId);
+  const t = p.terms[idx >= 0 ? idx : 0];
+  let payBit = 'payment not calculated yet';
+  if (chartMeta && chartMeta.paymentUsed != null) {
+    payBit = `payment ${money(chartMeta.paymentUsed)} / month (${chartMeta.paymentSource === 'entered'
+      ? 'entered — overrides the calculation inside this term'
+      : 'auto — calculated from the balance, the rate and the remaining amortization'})`;
+  } else if (amortError && amortError.code === 'NO_PAYMENT') {
+    payBit = 'no payment yet — set this term\u2019s amortization below or enter a monthly payment to project';
+  } else if (amortError && amortError.code === 'NO_RATE_PLAN') {
+    payBit = 'no payment yet — add a rate segment to project';
+  }
+  el.textContent = `Current term: Term ${(idx >= 0 ? idx : 0) + 1} of ${p.terms.length} — ${t.lender || 'lender not set'}, ${t.start_date} → ${t.end_date} (${termLengthLabel(t.term_months)}). Rate now: ${currentRateText(p)}. Monthly ${payBit}.`;
+}
+
+function segRowsHtml(segs) {
+  return segs.map((s) => `<tr>
     <td>${esc(s.start_date)}</td>
     <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}</td>
     <td class="num">${esc(segmentRateText(s))}</td>
-    <td><button class="small danger" onclick="deleteSegment(${s.id})">Delete</button></td></tr>`).join('')
-    || '<tr><td colspan="4" class="note" style="margin:0">No segments yet — add a rate plan to project this mortgage.</td></tr>';
+    <td><button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`).join('')
+    || '<tr><td colspan="4" class="note" style="margin:0">No segments in this term yet — add one with "+ Change rate".</td></tr>';
+}
+
+function lumpRowsHtml(lumps) {
+  if (!lumps.length) return '<div class="note" style="margin:0">No lump sums in this term.</div>';
+  return lumps.map((l) => `<div class="kv"><span class="k">${esc(l.date)}</span><span>${money(l.amount)}${l.note ? ` · ${esc(l.note)}` : ''}</span><button type="button" class="small danger" data-del-lump="${l.id}">Delete</button></div>`).join('');
+}
+
+function segFormHtml(t) {
+  return `<form data-seg-form="${t.id}" class="toolbar hidden" style="align-items:flex-end">
+    <div><label>Start date</label><input type="date" name="start_date" required value="${esc(t.start_date)}"></div>
+    <div><label>Type</label><select name="rate_type"><option value="fixed">Fixed</option><option value="variable">Variable</option></select></div>
+    <div data-seg-mode class="hidden"><label>Pricing (variable)</label><select name="rate_mode"><option value="absolute">Absolute rate</option><option value="prime_spread">Prime + spread</option></select></div>
+    <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
+    <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div></div>
+    <button class="primary" type="submit">Add segment</button>
+  </form>`;
+}
+
+function renderTerms(p) {
+  const wrap = $('#termsWrap');
+  if (!wrap) return;
+  const terms = p.terms || [];
+  if (expandTermId != null) { openTermIds.add(expandTermId); expandTermId = null; }
+  if (p.currentTermId != null && ![...openTermIds].some((id) => terms.some((t) => t.id === id))) {
+    openTermIds.add(p.currentTermId);
+  }
+  // Segments whose term is gone (or never set) still display, under
+  // the current term — the projection prices them either way.
+  const orphans = (p.segments || []).filter((s) => !terms.some((t) => t.id === s.term_id));
+  wrap.innerHTML = terms.map((t, i) => {
+    const open = openTermIds.has(t.id);
+    const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
+    return `<div class="term-block" data-term-block="${t.id}">
+      <button type="button" class="term-head" data-term-toggle="${t.id}">
+        <span class="term-title">Term ${i + 1}${t.id === p.currentTermId ? ' · current' : ''}</span>
+        <span>${esc(t.lender || 'Lender not set')}</span>
+        <span>${esc(t.start_date)} → ${esc(t.end_date)}</span>
+        <span>${termLengthLabel(t.term_months)}</span>
+        <span>Amortization: ${t.amortization_years != null ? `${esc(t.amortization_years)} years` : 'not set'}</span>
+        <span>Opened at ${money(t.opening_balance)}</span>
+        <span style="flex:1"></span>
+        <span data-term-arrow>${open ? '▾' : '▸'}</span>
+      </button>
+      <div class="term-body${open ? '' : ' hidden'}">
+        <form data-term-form="${t.id}">
+          <div class="grid3">
+            <div><label>Lender (bank)</label><input name="lender" list="lenderOptions" value="${esc(t.lender || '')}" autocomplete="off"></div>
+            <div><label>Term starts</label><input name="start_date" type="date" value="${esc(t.start_date)}" required></div>
+            <div><label>Opening balance ($)</label><input name="opening_balance" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(t.opening_balance ?? ''))}"></div>
+          </div>
+          <div class="grid3">
+            <div><label>Term length (months)</label><input name="term_months" type="number" min="1" max="120" step="1" value="${esc(t.term_months)}" required>
+              <div class="toolbar" style="margin-top:6px">${[1, 2, 3, 4, 5, 7, 10].map((y) => `<button type="button" class="small" data-term-years="${y}">${y} year${y === 1 ? '' : 's'}</button>`).join('')}</div>
+            </div>
+            <div><label>Amortization for this term (years)</label><input name="amortization_years" type="number" step="0.5" min="1" max="35" value="${t.amortization_years ?? ''}" placeholder="e.g. 25"></div>
+          </div>
+          ${t.amortization_defaulted ? '<div class="note" style="margin-left:0">The 25-year amortization on this term is the migration default — set the real figure if it differs.</div>' : ''}
+          <div class="toolbar">
+            <button class="primary" type="submit">Save term</button>
+            ${terms.length > 1 ? `<button type="button" class="small danger" data-del-term="${t.id}">Delete term</button>` : ''}
+          </div>
+        </form>
+        <h5>Rate segments in this term</h5>
+        <table>
+          <thead><tr><th>Starts</th><th>Type</th><th class="num">Annual rate %</th><th></th></tr></thead>
+          <tbody ${t.id === p.currentTermId ? 'id="segmentRows"' : ''}>${segRowsHtml(segs)}</tbody>
+        </table>
+        <div class="toolbar"><button type="button" class="small" data-toggle-seg="${t.id}">+ Change rate</button></div>
+        ${segFormHtml(t)}
+        <h5>Lump sums in this term</h5>
+        ${lumpRowsHtml(t.lumpSums || [])}
+        <div class="note" style="margin-left:0">A lump sum comes off the principal on its date first; the payment is then recalculated from the new balance and the remaining amortization, so the payment drops and the total interest falls.</div>
+        <div class="toolbar"><button type="button" class="small" data-toggle-lump="${t.id}">+ Add lump sum</button></div>
+        <form data-lump-form="${t.id}" class="toolbar hidden" style="align-items:flex-end">
+          <div><label>Date</label><input type="date" name="date" required></div>
+          <div><label>Amount ($)</label><input type="text" inputmode="decimal" data-money name="amount" required></div>
+          <div><label>Note</label><input type="text" name="note"></div>
+          <button class="primary" type="submit">Add lump sum</button>
+        </form>
+      </div>
+    </div>`;
+  }).join('') || '<div class="note" style="margin-left:0">No terms yet.</div>';
+  wrap.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  wrap.querySelectorAll('[data-seg-form]').forEach(syncSegForm);
 }
 
 async function deleteSegment(segId) {
@@ -1059,6 +1197,130 @@ async function deleteSegment(segId) {
   loadPropertyDetail(currentPropertyId);
 }
 window.deleteSegment = deleteSegment;
+
+// All term-accordion interactions are delegated from #termsWrap:
+// the markup is re-rendered on every load, so no per-render wiring.
+$('#termsWrap').addEventListener('click', async (e) => {
+  const toggle = e.target.closest('[data-term-toggle]');
+  if (toggle) {
+    const id = Number(toggle.dataset.termToggle);
+    const body = toggle.parentElement.querySelector('.term-body');
+    const arrow = toggle.querySelector('[data-term-arrow]');
+    const open = body.classList.toggle('hidden') === false;
+    if (open) openTermIds.add(id); else openTermIds.delete(id);
+    if (arrow) arrow.textContent = open ? '▾' : '▸';
+    return;
+  }
+  const yearsBtn = e.target.closest('[data-term-years]');
+  if (yearsBtn) {
+    const form = yearsBtn.closest('form');
+    if (form) form.term_months.value = Number(yearsBtn.dataset.termYears) * 12;
+    return;
+  }
+  const showSeg = e.target.closest('[data-toggle-seg]');
+  if (showSeg) {
+    const block = showSeg.closest('[data-term-block]');
+    const form = block && block.querySelector('[data-seg-form]');
+    if (form) { form.classList.remove('hidden'); syncSegForm(form); }
+    return;
+  }
+  const showLump = e.target.closest('[data-toggle-lump]');
+  if (showLump) {
+    const block = showLump.closest('[data-term-block]');
+    const form = block && block.querySelector('[data-lump-form]');
+    if (form) form.classList.remove('hidden');
+    return;
+  }
+  const delSeg = e.target.closest('[data-del-seg]');
+  if (delSeg) { deleteSegment(Number(delSeg.dataset.delSeg)); return; }
+  const delLump = e.target.closest('[data-del-lump]');
+  if (delLump) {
+    if (!confirm('Delete this lump sum?')) return;
+    try {
+      await api(`/api/properties/${currentPropertyId}/lump-sums/${delLump.dataset.delLump}`, { method: 'DELETE' });
+      markAssetsDirty();
+      loadPropertyDetail(currentPropertyId);
+    } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+    return;
+  }
+  const delTerm = e.target.closest('[data-del-term]');
+  if (delTerm) {
+    if (!confirm('Delete this term? Its rate segments move to a neighbouring term; its lump sums are removed.')) return;
+    try {
+      await api(`/api/properties/${currentPropertyId}/terms/${delTerm.dataset.delTerm}`, { method: 'DELETE' });
+      markAssetsDirty();
+      showMsg($('#detailMsg'), 'ok', 'Term deleted.');
+      loadPropertyDetail(currentPropertyId);
+    } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+  }
+});
+
+$('#termsWrap').addEventListener('change', (e) => {
+  const form = e.target.closest('[data-seg-form]');
+  if (form) syncSegForm(form);
+});
+$('#termsWrap').addEventListener('input', (e) => {
+  const form = e.target.closest('[data-seg-form]');
+  if (form && e.target.name === 'spread') syncSegForm(form);
+});
+
+$('#termsWrap').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  try {
+    if (form.dataset.termForm) {
+      const f = Object.fromEntries(new FormData(form).entries());
+      parseMoneyFields(f, ['opening_balance']);
+      await api(`/api/properties/${currentPropertyId}/terms/${form.dataset.termForm}`, {
+        method: 'PUT',
+        body: {
+          lender: f.lender,
+          start_date: f.start_date,
+          term_months: Number(f.term_months),
+          amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
+          opening_balance: f.opening_balance === '' || f.opening_balance == null ? null : f.opening_balance,
+        },
+      });
+      markAssetsDirty();
+      showMsg($('#detailMsg'), 'ok', 'Term saved.');
+    } else if (form.dataset.segForm) {
+      const f = Object.fromEntries(new FormData(form).entries());
+      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm) };
+      if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
+        body.rate_mode = 'prime_spread';
+        body.spread = f.spread === '' ? null : Number(f.spread);
+      } else {
+        body.rate_mode = 'absolute';
+        body.annual_rate = f.annual_rate;
+      }
+      await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
+      markAssetsDirty();
+      showMsg($('#detailMsg'), 'ok', 'Rate segment added.');
+    } else if (form.dataset.lumpForm) {
+      const f = Object.fromEntries(new FormData(form).entries());
+      parseMoneyFields(f, ['amount']);
+      await api(`/api/properties/${currentPropertyId}/lump-sums`, {
+        method: 'POST',
+        body: { date: f.date, amount: f.amount, note: f.note || null, term_id: Number(form.dataset.lumpForm) },
+      });
+      markAssetsDirty();
+      showMsg($('#detailMsg'), 'ok', 'Lump sum added.');
+    } else {
+      return;
+    }
+    loadPropertyDetail(currentPropertyId);
+  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+});
+
+$('#addTermBtn').addEventListener('click', async () => {
+  try {
+    const t = await api(`/api/properties/${currentPropertyId}/terms`, { method: 'POST', body: {} });
+    markAssetsDirty();
+    expandTermId = t.id;
+    showMsg($('#detailMsg'), 'ok', 'New term added — set its amortization (and lender, if you switched banks) in the term below.');
+    loadPropertyDetail(currentPropertyId);
+  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+});
 
 $('#propForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1147,7 +1409,7 @@ async function loadPrime() {
     banner.textContent = 'Bank of Canada prime: not available yet — the app fetches it from the Bank of Canada and keeps the last known value. Prime-based variable segments cannot be projected until a value is on record.';
     changesEl.textContent = '';
   }
-  updateSegForm();
+  refreshSegPreviews();
 }
 
 $('#primeRefreshBtn').addEventListener('click', async () => {
@@ -1159,20 +1421,20 @@ $('#primeRefreshBtn').addEventListener('click', async () => {
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 });
 
-// The add-segment form: Variable reveals the pricing mode; Prime +
-// spread swaps the absolute-rate input for a spread input with a
-// live preview against the tracked prime.
-function updateSegForm() {
-  const form = $('#addSegmentForm');
+// A term's add-segment form: Variable reveals the pricing mode;
+// Prime + spread swaps the absolute-rate input for a spread input
+// with a live preview against the tracked prime. One instance per
+// term, scoped by the form's own fields (see renderTerms).
+function syncSegForm(form) {
   if (!form) return;
   const isVariable = form.rate_type.value === 'variable';
   const isPrime = isVariable && form.rate_mode.value === 'prime_spread';
-  $('#segModeWrap').classList.toggle('hidden', !isVariable);
-  $('#segRateWrap').classList.toggle('hidden', isPrime);
-  $('#segSpreadWrap').classList.toggle('hidden', !isPrime);
+  form.querySelector('[data-seg-mode]').classList.toggle('hidden', !isVariable);
+  form.querySelector('[data-seg-rate]').classList.toggle('hidden', isPrime);
+  form.querySelector('[data-seg-spread]').classList.toggle('hidden', !isPrime);
   form.annual_rate.required = !isPrime;
-  const preview = $('#segSpreadPreview');
-  if (isPrime) {
+  const preview = form.querySelector('[data-seg-preview]');
+  if (isPrime && preview) {
     const spread = Number(form.spread.value);
     const cur = primeInfoCache && primeInfoCache.current;
     if (cur && form.spread.value !== '' && isFinite(spread)) {
@@ -1185,29 +1447,10 @@ function updateSegForm() {
     }
   }
 }
-$('#addSegmentForm').rate_type.addEventListener('change', updateSegForm);
-$('#addSegmentForm').rate_mode.addEventListener('change', updateSegForm);
-$('#addSegmentForm').spread.addEventListener('input', updateSegForm);
 
-$('#addSegmentForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const f = Object.fromEntries(new FormData(e.target).entries());
-  const body = { start_date: f.start_date, rate_type: f.rate_type };
-  if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
-    body.rate_mode = 'prime_spread';
-    body.spread = f.spread === '' ? null : Number(f.spread);
-  } else {
-    body.rate_mode = 'absolute';
-    body.annual_rate = f.annual_rate;
-  }
-  try {
-    await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
-    markAssetsDirty();
-    e.target.reset();
-    updateSegForm();
-    loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
-});
+function refreshSegPreviews() {
+  document.querySelectorAll('[data-seg-form]').forEach(syncSegForm);
+}
 
 // Payment frequency + payment day are property fields, but they are
 // maintained here, with the rate plan: saving re-renders the chart
@@ -1551,15 +1794,20 @@ function renderEquity() {
 function renderDerivedPaymentNote() {
   const el = $('#derivedPaymentNote');
   if (!el) return;
-  el.textContent = chartMeta && chartMeta.paymentSource === 'derived'
-    ? `Monthly payment derived from the remaining amortization: ${money(chartMeta.paymentUsed)} per month — the projection uses this amount until you enter a monthly payment yourself.`
-    : '';
+  if (chartMeta && chartMeta.paymentSource === 'derived') {
+    el.textContent = `Monthly payment derived from the remaining amortization: ${money(chartMeta.paymentUsed)} per month — calculated automatically, and recalculated whenever the rate changes, a lump sum lands or a new term starts. Enter a monthly payment above to override it inside the current term.`;
+  } else if (chartMeta && chartMeta.paymentSource === 'entered') {
+    el.textContent = `Monthly payment: ${money(chartMeta.paymentUsed)} per month (entered) — it overrides the automatic calculation inside the current term; from the next term on, the payment is calculated automatically again.`;
+  } else {
+    el.textContent = '';
+  }
 }
 
 function renderDetailCharts() {
   renderEquity();
   renderTrendSummary(); // the summary follows the chart's current window
   renderDerivedPaymentNote();
+  renderMortgageSummary();
   drawCombinedChart();
 }
 
