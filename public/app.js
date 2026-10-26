@@ -1076,8 +1076,8 @@ function termLengthLabel(months) {
 
 // Modal-top metadata: five read-only figures, all derived from the
 // property and its terms — nothing here is an input. The editable
-// mortgage facts live in the terms themselves; the balance anchor
-// and the payment schedule live in the current term's accordion.
+// mortgage facts live in the terms themselves; each term's card
+// carries its own principal pair, payment override and schedule.
 function renderMortgageMeta() {
   const p = detailProperty;
   if (!p || !$('#mortgageMeta')) return;
@@ -1133,26 +1133,10 @@ function segFormHtml(t) {
   </form>`;
 }
 
-// The still-editable property-level mortgage facts — the balance
-// anchor (current principal + its date), the entered-payment
-// override and the payment schedule — live in the CURRENT term's
-// accordion as one compact form: the anchor sits in this term and
-// the override rules inside it. Everything else mortgage-shaped
-// (lender, opening balance, amortization) is edited on the terms.
-function anchorFormHtml(p) {
-  const freqKey = FREQUENCY_LABELS[p.payment_frequency] ? p.payment_frequency : 'monthly';
-  const stepped = DAY_STEPPED_FREQUENCIES.includes(freqKey);
-  const opts = Object.entries(FREQUENCY_LABELS)
-    .map(([k, v]) => `<option value="${k}"${k === freqKey ? ' selected' : ''}>${v}</option>`).join('');
-  return `<h5>Balance anchor &amp; payment schedule</h5>
-        <form data-anchor-form class="toolbar" style="align-items:flex-end">
-          <div><label>Outstanding principal ($)</label><input name="mortgage_balance" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(p.mortgage_balance ?? ''))}"></div>
-          <div><label>Principal as of</label><input name="mortgage_balance_date" type="date" value="${esc(p.mortgage_balance_date || '')}"></div>
-          <div><label>Monthly payment ($) — optional override</label><input name="mortgage_payment" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(p.mortgage_payment ?? ''))}"></div>
-          <div><label>Payment frequency</label><select name="payment_frequency">${opts}</select></div>
-          <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
-          <button class="primary" type="submit">Save</button>
-        </form>`;
+// The frequency options for a term's payment-schedule select.
+function freqOptionsHtml(selectedKey) {
+  return Object.entries(FREQUENCY_LABELS)
+    .map(([k, v]) => `<option value="${k}"${k === selectedKey ? ' selected' : ''}>${v}</option>`).join('');
 }
 
 function renderTerms(p) {
@@ -1169,6 +1153,20 @@ function renderTerms(p) {
   wrap.innerHTML = terms.map((t, i) => {
     const open = openTermIds.has(t.id);
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
+    // Every term card carries the same field set: its contract
+    // fields, its principal pair, its entered-payment override and
+    // its payment schedule. The principal pair — "Outstanding
+    // principal" / "Principal as of" — binds the term's opening
+    // balance / start date, EXCEPT on the term carrying the
+    // property's balance anchor (anchor_date inside the term),
+    // where the pair binds the anchor values instead and the
+    // opening figures stay visible as a small read-only line.
+    const anchored = !!(t.anchor_date && t.anchor_balance != null);
+    const principalName = anchored ? 'anchor_balance' : 'opening_balance';
+    const principalDateName = anchored ? 'anchor_date' : 'start_date';
+    const freqKey = FREQUENCY_LABELS[t.payment_frequency] ? t.payment_frequency
+      : (FREQUENCY_LABELS[p.payment_frequency] ? p.payment_frequency : 'monthly');
+    const stepped = DAY_STEPPED_FREQUENCIES.includes(freqKey);
     return `<div class="term-block" data-term-block="${t.id}">
       <button type="button" class="term-head" data-term-toggle="${t.id}">
         <span class="term-title">Term ${i + 1}${t.id === p.currentTermId ? ' · current' : ''}</span>
@@ -1184,9 +1182,10 @@ function renderTerms(p) {
         <form data-term-form="${t.id}">
           <div class="grid3">
             <div><label>Lender (bank)</label><input name="lender" list="lenderOptions" value="${esc(t.lender || '')}" autocomplete="off"></div>
-            <div><label>Term starts</label><input name="start_date" type="date" value="${esc(t.start_date)}" required></div>
-            <div><label>Opening balance ($)</label><input name="opening_balance" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(t.opening_balance ?? ''))}"></div>
+            <div><label>Principal as of</label><input name="${principalDateName}" type="date" value="${esc(anchored ? t.anchor_date : t.start_date)}" required></div>
+            <div><label>Outstanding principal ($)</label><input name="${principalName}" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput((anchored ? t.anchor_balance : t.opening_balance) ?? ''))}"></div>
           </div>
+          ${anchored ? `<div class="note" style="margin-left:0">Term opened at ${money(t.opening_balance)} on ${esc(t.start_date)} — the principal above is the current balance anchor inside this term.</div>` : ''}
           <div class="grid3">
             <div><label>Term length (months)</label><input name="term_months" type="number" min="1" max="120" step="1" value="${esc(t.term_months)}" required>
               <div class="toolbar" style="margin-top:6px">${[1, 2, 3, 4, 5, 7, 10].map((y) => `<button type="button" class="small" data-term-years="${y}">${y} year${y === 1 ? '' : 's'}</button>`).join('')}</div>
@@ -1197,13 +1196,17 @@ function renderTerms(p) {
               <option value="equal_principal"${t.repayment_method === 'equal_principal' ? ' selected' : ''}>Equal principal — same principal every month</option>
             </select></div>
           </div>
+          <div class="grid3">
+            <div><label>Monthly payment ($) — optional override</label><input name="payment_override" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(t.payment_override ?? ''))}"></div>
+            <div><label>Payment frequency</label><select name="payment_frequency">${freqOptionsHtml(freqKey)}</select></div>
+            <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${t.payment_day ?? p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
+          </div>
           ${t.amortization_defaulted ? '<div class="note" style="margin-left:0">The 25-year amortization on this term is the migration default — set the real figure if it differs.</div>' : ''}
           <div class="toolbar">
             <button class="primary" type="submit">Save term</button>
             ${terms.length > 1 ? `<button type="button" class="small danger" data-del-term="${t.id}">Delete term</button>` : ''}
           </div>
         </form>
-        ${t.id === p.currentTermId ? anchorFormHtml(p) : ''}
         <h5>Rate segments in this term</h5>
         <table>
           <thead><tr><th>Starts</th><th>Type</th><th class="num">Annual rate %</th><th></th></tr></thead>
@@ -1293,11 +1296,11 @@ $('#termsWrap').addEventListener('click', async (e) => {
 });
 
 $('#termsWrap').addEventListener('change', (e) => {
-  const anchorForm = e.target.closest('[data-anchor-form]');
-  if (anchorForm && e.target.name === 'payment_frequency') {
+  const termFormEl = e.target.closest('[data-term-form]');
+  if (termFormEl && e.target.name === 'payment_frequency') {
     // The payment day only applies to the monthly / semi-monthly
     // schedules; the day-stepped frequencies disable the input.
-    anchorForm.payment_day.disabled = DAY_STEPPED_FREQUENCIES.includes(e.target.value);
+    termFormEl.payment_day.disabled = DAY_STEPPED_FREQUENCIES.includes(e.target.value);
     return;
   }
   const form = e.target.closest('[data-seg-form]');
@@ -1325,17 +1328,35 @@ $('#termsWrap').addEventListener('submit', async (e) => {
   try {
     if (form.dataset.termForm) {
       const f = Object.fromEntries(new FormData(form).entries());
-      parseMoneyFields(f, ['opening_balance']);
+      parseMoneyFields(f, ['opening_balance', 'anchor_balance', 'payment_override']);
+      const body = {
+        lender: f.lender,
+        term_months: Number(f.term_months),
+        amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
+        repayment_method: f.repayment_method || 'equal_payment',
+        payment_frequency: f.payment_frequency,
+        payment_override: f.payment_override === '' || f.payment_override == null ? null : f.payment_override,
+      };
+      // The principal pair binds the term's opening balance / start
+      // date — or, on the term carrying the balance anchor, the
+      // anchor values. Whichever inputs the card rendered are the
+      // ones submitted; the rest merge from the stored term.
+      if (f.start_date !== undefined) body.start_date = f.start_date;
+      if (f.opening_balance !== undefined) {
+        body.opening_balance = f.opening_balance === '' || f.opening_balance == null ? null : f.opening_balance;
+      }
+      if (f.anchor_date !== undefined) body.anchor_date = f.anchor_date || null;
+      if (f.anchor_balance !== undefined) {
+        body.anchor_balance = f.anchor_balance === '' || f.anchor_balance == null ? null : f.anchor_balance;
+      }
+      // A disabled payment-day input (day-stepped frequencies) is
+      // absent from FormData: leave the stored day untouched then.
+      if (f.payment_day !== undefined) {
+        body.payment_day = f.payment_day === '' ? null : Number(f.payment_day);
+      }
       await api(`/api/properties/${currentPropertyId}/terms/${form.dataset.termForm}`, {
         method: 'PUT',
-        body: {
-          lender: f.lender,
-          start_date: f.start_date,
-          term_months: Number(f.term_months),
-          amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
-          opening_balance: f.opening_balance === '' || f.opening_balance == null ? null : f.opening_balance,
-          repayment_method: f.repayment_method || 'equal_payment',
-        },
+        body,
       });
       markAssetsDirty();
       showMsg($('#mortgageMsg'), 'ok', 'Term saved.');
@@ -1361,23 +1382,6 @@ $('#termsWrap').addEventListener('submit', async (e) => {
       });
       markAssetsDirty();
       showMsg($('#mortgageMsg'), 'ok', 'Lump sum added.');
-    } else if (form.dataset.anchorForm !== undefined) {
-      const f = Object.fromEntries(new FormData(form).entries());
-      parseMoneyFields(f, ['mortgage_balance', 'mortgage_payment']);
-      const body = {
-        mortgage_balance: f.mortgage_balance,
-        mortgage_balance_date: f.mortgage_balance_date || null,
-        mortgage_payment: f.mortgage_payment,
-        payment_frequency: f.payment_frequency,
-      };
-      // A disabled payment-day input (day-stepped frequencies) is
-      // absent from FormData: leave the stored day untouched then.
-      if (f.payment_day !== undefined) {
-        body.payment_day = f.payment_day === '' ? null : Number(f.payment_day);
-      }
-      await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body });
-      markAssetsDirty();
-      showMsg($('#mortgageMsg'), 'ok', 'Saved.');
     } else {
       return;
     }
@@ -1699,11 +1703,11 @@ function segFormOfBlock(el) {
   return block ? block.querySelector('[data-seg-form]') : null;
 }
 
-// Payment frequency + payment day are property fields, maintained
-// in the current term's anchor form (see anchorFormHtml): saving
-// re-renders the chart on the new schedule. The payment day only
-// applies to the monthly / semi-monthly schedules; for the
-// day-stepped frequencies the anchor form disables the input.
+// Payment frequency + payment day are per-term fields, edited in
+// each term's own form: saving re-renders the chart on the new
+// schedule. The payment day only applies to the monthly /
+// semi-monthly schedules; for the day-stepped frequencies the
+// term form disables the input.
 const FREQUENCY_LABELS = {
   monthly: 'Monthly', semi_monthly: 'Semi-monthly', bi_weekly: 'Bi-weekly',
   accelerated_bi_weekly: 'Accelerated bi-weekly', weekly: 'Weekly', accelerated_weekly: 'Accelerated weekly',

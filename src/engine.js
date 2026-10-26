@@ -403,14 +403,22 @@ function monthIdxOf(dateStr) {
 //     last stored observation hold at the latest known prime).
 // Between events the plan is constant, so the projection is a
 // chain of simulate() runs, one per inter-event span, carrying the
-// balance across. The entered monthly payment
-// (paymentOverride) is an override that rules only inside the term
-// containing the balance anchor; at a renewal the payment returns
-// to automatic.
+// balance across. The entered monthly payment, the payment
+// frequency and the payment day are PER-TERM: each term may carry
+// its own payment_override / payment_frequency / payment_day, and
+// they rule only inside that term (the build-level paymentOverride
+// / frequency / paymentDay remain as the anchor term's / global
+// fallbacks for callers that still pass them that way). A term may
+// also record a balance anchor (anchor_balance as of anchor_date,
+// a date inside the term): at that month the running balance is
+// RESET to the recorded figure — a reconciliation point; the plan
+// is not recomputed for it.
 //
 //   balance / balanceDate: the current-balance anchor (as simulate)
 //   terms:      [{ id, start_date, amortization_years,
-//               repayment_method }] any order
+//               repayment_method, payment_override,
+//               payment_frequency, payment_day, anchor_balance,
+//               anchor_date }] any order
 //   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
 //               before the balance date is already reflected in the
 //               anchor balance and is ignored
@@ -455,13 +463,44 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // counts from the state point just before its first payment month.
   const epochOf = (term) => (term === anchorTerm ? A : monthIdxOf(term.start_date) - 1);
 
-  // Does the entered payment rule for months after state point S?
-  // 'entered' only inside the anchor's term; automatic elsewhere.
+  // The entered payment ruling months after state point S, or
+  // null when the payment is automatic there. Each term carries
+  // its own override now, ruling only inside that term; the
+  // build-level paymentOverride remains as the anchor term's
+  // value for callers that still pass it that way — a term's own
+  // column wins over it.
   const overrideAt = (S) => {
-    if (!(paymentOverride > 0)) return false;
     const term = termAtMonth(S + 1);
-    return !anchorTerm || !term || term.id === anchorTerm.id;
+    if (term && Number(term.payment_override) > 0) return round2(Number(term.payment_override));
+    if (paymentOverride > 0 && (!anchorTerm || !term || term.id === anchorTerm.id)) return round2(paymentOverride);
+    return null;
   };
+
+  // The payment schedule (frequency + deduction day) governing
+  // months after state point S, from the active term. A term that
+  // does not carry them (a row from before they were per-term)
+  // falls back to the build-level values, exactly as before.
+  const scheduleAt = (S) => {
+    const term = termAtMonth(S + 1);
+    const freq = term && FREQUENCIES[term.payment_frequency] ? term.payment_frequency
+      : (FREQUENCIES[frequency] ? frequency : 'monthly');
+    const day = term && Number.isInteger(term.payment_day) && term.payment_day >= 1 && term.payment_day <= 31
+      ? term.payment_day : anchorDay;
+    return { frequency: freq, paymentDay: day };
+  };
+
+  // In-term balance anchors (reconciliation points) recorded on
+  // the terms, keyed by the state point just before the anchor's
+  // month. One dated in or before the anchor month is already
+  // reflected in the opening state and is ignored.
+  const anchorByState = new Map(); // stateIdx -> balance
+  for (const t of sortedTerms) {
+    if (!t.anchor_date || t.anchor_balance == null) continue;
+    const ab = Number(t.anchor_balance);
+    if (!isFinite(ab) || ab < 0) continue;
+    const L = monthIdxOf(t.anchor_date);
+    if (L > A) anchorByState.set(L - 1, round2(ab));
+  }
 
   // The monthly payment in effect for months after state point S,
   // computed from the balance at S against the active term's
@@ -474,8 +513,9 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // is THAT month's prime from the tracked history, never today's.
   const computePayment = (S, balNow) => {
     const term = termAtMonth(S + 1);
-    if (overrideAt(S)) {
-      return { payment: round2(paymentOverride), source: 'entered' };
+    const entered = overrideAt(S);
+    if (entered !== null) {
+      return { payment: entered, source: 'entered' };
     }
     const rateMonth = S === A && term && monthIdxOf(term.start_date) === A
       ? ymKeyOfIdx(A)
@@ -524,8 +564,9 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // amortization, or beyond the projection cap), fall back to the
   // term's remaining amortization (computePayment).
   const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
-    if (overrideAt(S)) {
-      return { payment: round2(paymentOverride), source: 'entered' };
+    const entered = overrideAt(S);
+    if (entered !== null) {
+      return { payment: entered, source: 'entered' };
     }
     const newRate = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S + 1)), ymKeyOfIdx(S + 1), primeForMonth);
     if (newRate === null) return { error: 'no_prime' };
@@ -535,7 +576,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       const hypo = simulate({
         balance: balNow, balanceDate: balanceDateAtS, payment: lastPayment,
         segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: prevRate }],
-        paymentDay: anchorDay, frequency, maxMonths: A + maxMonths - S, primeRate, region,
+        paymentDay: scheduleAt(S).paymentDay, frequency: scheduleAt(S).frequency, maxMonths: A + maxMonths - S, primeRate, region,
       });
       if (hypo.payoffMonth) {
         const monthsLeft = monthIdxOf(hypo.payoffMonth) - S;
@@ -581,6 +622,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   for (const t of sortedTerms) { const s = monthIdxOf(t.start_date) - 1; if (s > A) { termStates.add(s); eventStates.add(s); } }
   for (const sg of segments) { const s = monthIdxOf(sg.start_date) - 1; if (s > A) { segStates.add(s); eventStates.add(s); } }
   for (const s of lumpByState.keys()) eventStates.add(s);
+  for (const s of anchorByState.keys()) eventStates.add(s);
   const boundaries = [...eventStates].sort((a, b) => a - b);
   boundaries.push(A + maxMonths);
 
@@ -611,11 +653,20 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   let anchorPlan = null;
   for (const nextS of boundaries) {
     if (bal <= 0 || S >= A + maxMonths) break;
+    // A balance anchor recorded inside a term resets the running
+    // balance at its month (a reconciliation point): the plan is
+    // NOT recomputed for it — the loan continues from the
+    // corrected balance on the same payment / monthly principal,
+    // so an anchor-only boundary behaves like a lump-only one.
+    if (anchorByState.has(S)) {
+      bal = anchorByState.get(S);
+      if (bal <= 0) { payoffMonth = ymKeyOfIdx(S + 1); break; }
+    }
     // The plan for the span after S, per the governing term's
     // repayment method — unless the entered payment overrides it
     // (the override is a level payment whatever the method).
     let cp;
-    const principalPlan = methodAt(S) === 'equal_principal' && !overrideAt(S);
+    const principalPlan = methodAt(S) === 'equal_principal' && overrideAt(S) === null;
     if (S === A || termStates.has(S)) {
       // The anchor, or a new term starting: derive the plan on the
       // (new) term's amortization. A segment that starts with the
@@ -653,7 +704,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
         balance: bal, balanceDate: chunkBalanceDate,
         payment: cp.payment !== undefined ? cp.payment : 0,
         principalPerMonth: cp.principalPerMonth !== undefined ? cp.principalPerMonth : null,
-        segments, paymentDay: anchorDay, frequency, maxMonths: span, primeRate, primeHistory, region,
+        segments, paymentDay: scheduleAt(S).paymentDay, frequency: scheduleAt(S).frequency, maxMonths: span, primeRate, primeHistory, region,
       });
       series.push(...r.series);
       totalInterest = round2(totalInterest + r.totalInterest);

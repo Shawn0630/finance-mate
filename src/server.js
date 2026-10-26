@@ -386,6 +386,53 @@ function syncTermMirror(p) {
     .run(cur.lender ?? null, cur.amortization_years ?? null, nowIso(), p.id);
 }
 
+// The payment schedule in effect for the CURRENT term (frequency +
+// payment day), resolved per-term first: a term carries its own
+// values now; the property columns remain as the fallback for
+// terms that do not carry them. buildSchedule applies the same
+// resolution inside every span; this is the anchor term's view of
+// it, used for the build-level arguments and the response fields.
+function termScheduleOf(p, terms) {
+  const cur = currentTermOf(p, terms);
+  const frequency = FREQUENCY_KEYS.includes(cur && cur.payment_frequency) ? cur.payment_frequency
+    : (FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly');
+  const paymentDay = cur && cur.payment_day != null ? cur.payment_day : (p.payment_day ?? null);
+  return { frequency, paymentDay };
+}
+
+// Keep the property row's payment columns in step with the anchor
+// term (entered payment / frequency / day) — the same mirror
+// pattern as lender / amortization, so readers that still look at
+// the property see the anchor term's schedule.
+function syncScheduleMirror(p) {
+  const cur = currentTermOf(p);
+  if (!cur) return;
+  db.prepare('UPDATE properties SET mortgage_payment = ?, payment_day = ?, payment_frequency = ?, updated_at = ? WHERE id = ?')
+    .run(cur.payment_override ?? null, cur.payment_day ?? null, cur.payment_frequency ?? null, nowIso(), p.id);
+}
+
+// Place the property's balance anchor on the term that contains
+// it: that term's card shows (and edits) the anchor as its
+// principal pair. An anchor dated on or before its term's start
+// folds into the term's opening balance — where it already lives —
+// so no term carries anchor columns for it.
+function syncTermAnchor(p) {
+  const terms = termsOf(p.id);
+  if (!terms.length) return;
+  const bd = p.mortgage_balance_date;
+  let owner = null;
+  if (bd) for (const t of terms) if (t.start_date <= bd) owner = t;
+  owner = owner || terms[0];
+  const place = !!(bd && p.mortgage_balance != null && bd > owner.start_date);
+  db.transaction(() => {
+    db.prepare('UPDATE mortgage_terms SET anchor_balance = NULL, anchor_date = NULL WHERE property_id = ? AND anchor_date IS NOT NULL').run(p.id);
+    if (place) {
+      db.prepare('UPDATE mortgage_terms SET anchor_balance = ?, anchor_date = ? WHERE id = ?')
+        .run(p.mortgage_balance, bd, owner.id);
+    }
+  })();
+}
+
 function termView(t, segments, lumpSums) {
   return {
     ...t,
@@ -408,6 +455,13 @@ function propertyView(p) {
     // names so existing consumers keep working unchanged.
     lender: curTerm ? (curTerm.lender ?? null) : p.lender,
     amortization_years: curTerm ? (curTerm.amortization_years ?? null) : p.amortization_years,
+    // The payment schedule is a term fact too: serve the anchor
+    // term's entered payment / frequency / day under the property
+    // field names (the term's own value wins; the property column
+    // is its mirror and the fallback for a term not carrying one).
+    mortgage_payment: curTerm ? (curTerm.payment_override ?? p.mortgage_payment ?? null) : p.mortgage_payment,
+    payment_frequency: curTerm ? (curTerm.payment_frequency ?? p.payment_frequency ?? null) : (p.payment_frequency ?? null),
+    payment_day: curTerm ? (curTerm.payment_day ?? p.payment_day ?? null) : (p.payment_day ?? null),
     owners: parseOwners(p.owners),
     photos: photosView(p),
     segments,
@@ -505,8 +559,8 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   // filled in later — until the term has an amortization or a
   // payment is entered, the projection reports NO_PAYMENT).
   db.prepare(
-    `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
+    `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, payment_override, amortization_defaulted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
   ).run(
     created.id,
     created.lender ?? null,
@@ -514,6 +568,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
     60,
     amortYears,
     balance,
+    created.mortgage_payment ?? null,
     nowIso(),
     nowIso()
   );
@@ -573,12 +628,12 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     const primeBlocked = primeRate === null
       && segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread');
     if (balance > 0 && segments.length && !primeBlocked) {
-      const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+      const { frequency, paymentDay } = termScheduleOf(p);
       const r = buildSchedule({
         balance, balanceDate,
         paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
         terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
-        paymentDay: p.payment_day ?? null, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
+        paymentDay, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
       });
       if (r.state === 'projected') {
         monthlyPayment = r.paymentUsed;
@@ -825,6 +880,34 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
           cur.id
         );
     }
+  }
+  // The payment schedule lives on the terms now, with the same
+  // property-level editing contract as before: the entered payment
+  // writes through to the anchor term's override, and the
+  // frequency / payment day — which ruled the whole mortgage
+  // before they were per-term — write through to EVERY term, so a
+  // property-level edit keeps its old whole-mortgage meaning.
+  if (b.mortgage_payment !== undefined || b.payment_day !== undefined || b.payment_frequency !== undefined) {
+    if (b.mortgage_payment !== undefined) {
+      const cur = currentTermOf(getProperty(p.id));
+      if (cur) {
+        db.prepare('UPDATE mortgage_terms SET payment_override = ?, updated_at = ? WHERE id = ?')
+          .run(next.mortgage_payment > 0 ? next.mortgage_payment : null, nowIso(), cur.id);
+      }
+    }
+    if (b.payment_day !== undefined) {
+      db.prepare('UPDATE mortgage_terms SET payment_day = ?, updated_at = ? WHERE property_id = ?')
+        .run(next.payment_day, nowIso(), p.id);
+    }
+    if (b.payment_frequency !== undefined) {
+      db.prepare('UPDATE mortgage_terms SET payment_frequency = ?, updated_at = ? WHERE property_id = ?')
+        .run(next.payment_frequency, nowIso(), p.id);
+    }
+  }
+  // A moved balance anchor re-seats itself on the term that now
+  // contains it (the anchor is carried — and edited — by that term).
+  if (b.mortgage_balance !== undefined || b.mortgage_balance_date !== undefined) {
+    syncTermAnchor(getProperty(p.id));
   }
   // A changed address invalidates the stored HouseSigma location:
   // clear its ids so the next history pull locates the new address.
@@ -1138,6 +1221,17 @@ function cleanTerm(c) {
     amortization_years: c.amortization_years !== undefined ? num(c.amortization_years) : null,
     opening_balance: c.opening_balance !== undefined ? num(c.opening_balance) : null,
     repayment_method: c.repayment_method !== undefined ? String(c.repayment_method) : 'equal_payment',
+    // The term's own payment schedule + balance anchor (see the
+    // mortgage_terms columns): the override rules inside this term
+    // only; the anchor pair is set together or not at all.
+    payment_override: c.payment_override !== undefined ? num(c.payment_override) : null,
+    payment_frequency: c.payment_frequency !== undefined && c.payment_frequency !== null && c.payment_frequency !== ''
+      ? String(c.payment_frequency) : null,
+    payment_day: c.payment_day !== undefined && c.payment_day !== null && c.payment_day !== ''
+      ? Number(c.payment_day) : null,
+    anchor_balance: c.anchor_balance !== undefined ? num(c.anchor_balance) : null,
+    anchor_date: c.anchor_date !== undefined && c.anchor_date !== null && c.anchor_date !== ''
+      ? String(c.anchor_date) : null,
   };
   if (!next.start_date || !isDateStr(next.start_date)) return { error: 'start_date must be a valid date (YYYY-MM-DD)' };
   if (!Number.isInteger(next.term_months) || next.term_months < 1 || next.term_months > 120) {
@@ -1152,6 +1246,33 @@ function cleanTerm(c) {
   if (!['equal_payment', 'equal_principal'].includes(next.repayment_method)) {
     return { error: "repayment_method must be 'equal_payment' or 'equal_principal'" };
   }
+  if (next.payment_override !== null && next.payment_override < 0) {
+    return { error: 'monthly payment override must be a number >= 0' };
+  }
+  if (next.payment_frequency !== null && !FREQUENCY_KEYS.includes(next.payment_frequency)) {
+    return {
+      error: `payment frequency must be one of: ${FREQUENCY_KEYS.map((k) => FREQUENCIES[k].label).join(', ')}`,
+    };
+  }
+  if (next.payment_day !== null && (!Number.isInteger(next.payment_day) || next.payment_day < 1 || next.payment_day > 31)) {
+    return { error: 'payment day must be a whole number between 1 and 31' };
+  }
+  if ((next.anchor_balance === null) !== (next.anchor_date === null)) {
+    return { error: 'a balance anchor needs both a balance and a date' };
+  }
+  if (next.anchor_date !== null && !isDateStr(next.anchor_date)) {
+    return { error: 'anchor date must be a valid date (YYYY-MM-DD)' };
+  }
+  if (next.anchor_balance !== null && next.anchor_balance < 0) {
+    return { error: 'anchor balance must be a number >= 0' };
+  }
+  // An anchor dated on or before the term's start IS the opening
+  // balance: fold it in and carry no anchor columns.
+  if (next.anchor_date !== null && next.anchor_date <= next.start_date) {
+    next.opening_balance = next.anchor_balance;
+    next.anchor_balance = null;
+    next.anchor_date = null;
+  }
   return { value: next };
 }
 
@@ -1162,12 +1283,12 @@ function projectedBalanceAtMonth(p, monthKey) {
   const segments = segmentsOf(p.id);
   if (!segments.length || !(p.mortgage_balance > 0)) return null;
   const prime = getCurrentPrime();
-  const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+  const { frequency, paymentDay } = termScheduleOf(p);
   const r = buildSchedule({
     balance: p.mortgage_balance, balanceDate: p.mortgage_balance_date || new Date().toISOString().slice(0, 10),
     paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
     terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
-    paymentDay: p.payment_day ?? null, frequency,
+    paymentDay, frequency,
     primeRate: prime ? prime.rate : null, primeHistory: getPrimeHistory(), region: p.region || 'CA',
   });
   if (r.state !== 'projected') return null;
@@ -1208,15 +1329,28 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
     // does — it is how the household pays, not a per-contract price.
     repayment_method: b.repayment_method !== undefined ? b.repayment_method
       : (prev ? prev.repayment_method || 'equal_payment' : 'equal_payment'),
+    // The payment schedule (frequency / day) carries over a renewal
+    // the same way; an entered payment does NOT carry — a renewal
+    // re-derives its payment — and neither does a balance anchor,
+    // which belongs to the term containing it.
+    payment_override: b.payment_override !== undefined ? b.payment_override : null,
+    payment_frequency: b.payment_frequency !== undefined ? b.payment_frequency
+      : (prev ? prev.payment_frequency ?? null : null),
+    payment_day: b.payment_day !== undefined ? b.payment_day
+      : (prev ? prev.payment_day ?? null : null),
+    anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : null,
+    anchor_date: b.anchor_date !== undefined ? b.anchor_date : null,
   };
   const clean = cleanTerm(candidate);
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const info = db
-    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, amortization_defaulted, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
-    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, nowIso(), nowIso());
+    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_override, payment_frequency, payment_day, anchor_balance, anchor_date, amortization_defaulted, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
+    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_override, t.payment_frequency, t.payment_day, t.anchor_balance, t.anchor_date, nowIso(), nowIso());
   syncTermMirror(getProperty(p.id));
+  syncTermAnchor(getProperty(p.id));
+  syncScheduleMirror(getProperty(p.id));
   const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(info.lastInsertRowid);
   res.status(201).json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id)));
 });
@@ -1234,11 +1368,32 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     amortization_years: b.amortization_years !== undefined ? b.amortization_years : term.amortization_years,
     opening_balance: b.opening_balance !== undefined ? b.opening_balance : term.opening_balance,
     repayment_method: b.repayment_method !== undefined ? b.repayment_method : term.repayment_method,
+    payment_override: b.payment_override !== undefined ? b.payment_override : term.payment_override,
+    payment_frequency: b.payment_frequency !== undefined ? b.payment_frequency : term.payment_frequency,
+    payment_day: b.payment_day !== undefined ? b.payment_day : term.payment_day,
+    anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : term.anchor_balance,
+    anchor_date: b.anchor_date !== undefined ? b.anchor_date : term.anchor_date,
   });
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
-  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, amortization_defaulted=0, updated_at=? WHERE id=?')
-    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, nowIso(), term.id);
+  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_override=?, payment_frequency=?, payment_day=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, updated_at=? WHERE id=?')
+    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_override, t.payment_frequency, t.payment_day, t.anchor_balance, t.anchor_date, nowIso(), term.id);
+  // Editing the anchor pair on the term that carries it edits the
+  // property's balance anchor itself — the two are one fact, stored
+  // in both places: write the submitted pair through, then let the
+  // placement sync re-seat the columns (a date moved onto or before
+  // the term's start has already folded into the opening balance
+  // above, and the anchor then lives there).
+  if (b.anchor_balance !== undefined || b.anchor_date !== undefined) {
+    const submittedBalance = b.anchor_balance !== undefined ? num(b.anchor_balance) : term.anchor_balance;
+    const submittedDate = b.anchor_date !== undefined ? (b.anchor_date || null) : term.anchor_date;
+    if (submittedBalance != null && submittedDate) {
+      db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
+        .run(submittedBalance, submittedDate, nowIso(), p.id);
+    }
+  }
+  syncTermAnchor(getProperty(p.id));
+  syncScheduleMirror(getProperty(p.id));
   syncTermMirror(getProperty(p.id));
   const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(term.id);
   res.json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id)));
@@ -1269,6 +1424,8 @@ app.delete('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     db.prepare('DELETE FROM mortgage_terms WHERE id = ?').run(term.id);
   })();
   syncTermMirror(getProperty(p.id));
+  syncTermAnchor(getProperty(p.id));
+  syncScheduleMirror(getProperty(p.id));
   res.json(propertyView(getProperty(p.id)));
 });
 
@@ -1369,12 +1526,12 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
     }
   }
   const prime = getCurrentPrime();
-  const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+  const { frequency, paymentDay } = termScheduleOf(p, terms);
   const r = buildSchedule({
     balance: p.mortgage_balance, balanceDate: p.mortgage_balance_date || new Date().toISOString().slice(0, 10),
     paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
     terms, segments, lumpSums: lumpSumsOf(p.id),
-    paymentDay: p.payment_day ?? null, frequency,
+    paymentDay, frequency,
     primeRate: prime ? prime.rate : null, primeHistory: getPrimeHistory(), region: p.region || 'CA',
   });
   if (r.state === 'no_payment') {
@@ -1407,7 +1564,7 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
 // sums (they shorten the loan instead) and by prime moves (a variable
 // plan's payment is set when the plan starts; prime only reprices
 // each month's interest split, against the tracked prime history);
-// a stored monthly payment is an override inside the current term.
+// a stored monthly payment is an override inside its own term.
 app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -1437,15 +1594,15 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
   // term's repayment method) at a rate change, unchanged by lump
   // sums and by prime moves. An entered
   // monthly payment is an override that
-  // rules inside the current term only. NO_PAYMENT now means the
+  // rules inside its own term only. NO_PAYMENT now means the
   // current term has no amortization to compute a payment from and
   // no override is entered.
-  const frequency = FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly';
+  const { frequency, paymentDay } = termScheduleOf(p);
   const r = buildSchedule({
     balance: p.mortgage_balance, balanceDate,
     paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
     terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
-    paymentDay: p.payment_day ?? null, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
+    paymentDay, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
   });
   if (r.state === 'no_payment') {
     return res.json({ ok: false, code: 'NO_PAYMENT', error: 'enter a monthly payment or set the current term\u2019s remaining amortization (years) to project the mortgage', segments });

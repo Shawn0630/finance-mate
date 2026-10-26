@@ -617,3 +617,88 @@ test('buildSchedule equal principal: prime steps move only the interest, the pri
   assert.ok(close(mar.interest, feb.balance * monthlyRate(3.95), 0.02), mar.interest);
   assert.ok(close(mar.payment - mar.principal, mar.interest, 0.001), 'payment = principal + that month\u2019s interest');
 });
+
+test('buildSchedule per-term override: a term column wins over the build-level override, which still covers the anchor term', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25, payment_override: 700 }];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments, paymentOverride: 650 });
+  assert.equal(r.paymentUsed, 700);
+  assert.equal(r.paymentSource, 'entered');
+  assert.ok(r.series.slice(0, 12).every((row) => row.payment === 700), 'the term override rules its span');
+  // Without the column, the build-level override rules as before.
+  const legacy = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments, paymentOverride: 650,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }],
+  });
+  assert.equal(legacy.paymentUsed, 650);
+  assert.equal(legacy.paymentSource, 'entered');
+});
+
+test('buildSchedule per-term override + frequency: the second term runs on its own schedule', () => {
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 },
+    { start_date: '2031-01-01', rate_type: 'fixed', annual_rate: 4 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2026-01-01', amortization_years: 25 },
+    { id: 2, start_date: '2031-01-01', amortization_years: 30, payment_override: 600, payment_frequency: 'bi_weekly' },
+  ];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-15', terms, segments });
+  assert.equal(r.state, 'projected');
+  // Term 1 derives its payment (100k, 5%, 25y) and pays monthly on
+  // the 15th (the balance-date day — no payment day set anywhere).
+  assert.equal(r.paymentUsed, 581.60);
+  assert.equal(r.paymentSource, 'derived');
+  const t1 = r.series.filter((row) => row.month < '2030-12');
+  assert.ok(t1.length > 50 && t1.every((row) => row.payment === 581.60), 'term 1 rows all pay the derived 581.60');
+  assert.ok(t1.every((row) => row.date.endsWith('-15')), 'term 1 nodes on the 15th');
+  // Term 2: the entered $600 a month converts to $276.92 per
+  // bi-weekly period, so each month totals 2 or 3 periods' worth —
+  // and ONLY term 2 pays that way (the boundary month 2030-12,
+  // which both spans touch, is left out of both assertions).
+  const t2 = r.series.filter((row) => row.month > '2030-12');
+  assert.ok(t2.length > 6, 'term 2 has rows');
+  assert.ok(t2.slice(0, -1).every((row) => row.payment === 553.84 || row.payment === 830.76),
+    `term 2 months total 2-3 bi-weekly periods of 276.92: ${t2.slice(0, 6).map((x) => x.payment)}`);
+  assert.ok(t2.some((row) => row.payment === 830.76), 'a 3-period month appears');
+});
+
+test('buildSchedule per-term payment day: the deduction day switches at the term boundary', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const terms = [
+    { id: 1, start_date: '2026-01-01', amortization_years: 25 },
+    { id: 2, start_date: '2031-01-01', amortization_years: 25, payment_day: 1 },
+  ];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-15', terms, segments });
+  const before = r.series.filter((row) => row.month <= '2030-12');
+  const after = r.series.filter((row) => row.month >= '2031-01');
+  assert.ok(before.length > 50 && before.every((row) => row.date.endsWith('-15')), 'term 1 nodes on the 15th');
+  assert.ok(after.length > 12 && after.every((row) => row.date.endsWith('-01')), 'term 2 nodes on the 1st');
+});
+
+test('buildSchedule in-term anchor: the balance resets at the anchor month, the plan does not recompute', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const plain = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }],
+  });
+  const anchored = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25, anchor_balance: 90000, anchor_date: '2027-01-01' }],
+  });
+  // Everything before the anchor month is identical, and the
+  // payment in effect at the anchor is untouched.
+  assert.deepEqual(
+    anchored.series.filter((row) => row.month < '2027-01'),
+    plain.series.filter((row) => row.month < '2027-01'));
+  assert.equal(anchored.paymentUsed, plain.paymentUsed);
+  // January 2027 prices off the reset balance: interest =
+  // 90000 x monthlyRate(5%) = 371.15; the payment is unchanged, so
+  // the balance after is 90000 + 371.15 - 581.60 = 89789.55.
+  const jan = anchored.series.find((row) => row.month === '2027-01');
+  assert.ok(close(jan.interest, 90000 * monthlyRate(5), 0.02), jan.interest);
+  assert.equal(jan.payment, plain.paymentUsed);
+  assert.ok(close(jan.balance, 89789.55, 0.02), jan.balance);
+  assert.ok(anchored.payoffMonth < plain.payoffMonth, 'the smaller balance pays off sooner');
+  assert.ok(anchored.totalInterest < plain.totalInterest);
+});

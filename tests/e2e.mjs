@@ -1240,6 +1240,92 @@ try {
     projAuto.paymentSource === 'derived' && Math.abs(projAuto.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5,
     JSON.stringify({ used: projAuto.paymentUsed, src: projAuto.paymentSource }));
 
+  // ---- Per-term payment schedule + balance anchors ----
+  // The override, frequency and payment day live on each term now.
+  // Term 2 takes its own entered payment: it rules only inside
+  // Term 2, and the property-level payment mirror (which follows
+  // the ANCHOR term) is untouched by it.
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: 6500 });
+  check('term 2 accepts its own payment override', r.status === 200 && r.data.payment_override === 6500,
+    JSON.stringify(r.data).slice(0, 160));
+  r = await req('GET', `/api/properties/${termPid}/amortization`);
+  const dec29o = r.data.series.find((x) => x.month === '2029-12');
+  const nov29o = r.data.series.find((x) => x.month === '2029-11');
+  check('term 2\u2019s override rules only term 2 (term 1 months still derive)',
+    !!dec29o && dec29o.payment === 6500 && !!nov29o && nov29o.payment === r.data.paymentUsed,
+    JSON.stringify({ dec: dec29o && dec29o.payment, nov: nov29o && nov29o.payment, used: r.data.paymentUsed }));
+  r = await req('GET', `/api/properties/${termPid}`);
+  check('the property payment mirror still follows the anchor term (no override there)',
+    (r.data.mortgage_payment ?? null) === null && r.data.terms[1].payment_override === 6500,
+    JSON.stringify({ mirror: r.data.mortgage_payment, t2: r.data.terms[1].payment_override }));
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: null });
+  check('term 2 override cleared', r.status === 200 && (r.data.payment_override ?? null) === null);
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_frequency: 'daily' });
+  check('an unknown term payment frequency is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { anchor_balance: 100 });
+  check('an anchor balance without its date is a 400', r.status === 400, JSON.stringify(r.data));
+
+  // A term's own frequency + day drive its span; the property PUT
+  // still writes the schedule through to every term, so a
+  // property-level edit keeps its whole-mortgage meaning.
+  r = await req('POST', '/api/properties', {
+    address: '8 Term Schedule Way, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-01-15', purchase_date: '2020-01-01',
+  });
+  const pidTs = r.data.id;
+  const tsTermId = r.data.terms[0].id;
+  await req('POST', `/api/properties/${pidTs}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  await req('PUT', `/api/properties/${pidTs}`, { amortization_years: 25 });
+  r = await req('PUT', `/api/properties/${pidTs}/terms/${tsTermId}`, { payment_day: 1, payment_frequency: 'semi_monthly' });
+  check('a term accepts its own frequency + payment day',
+    r.status === 200 && r.data.payment_frequency === 'semi_monthly' && r.data.payment_day === 1,
+    JSON.stringify(r.data).slice(0, 160));
+  r = await req('GET', `/api/properties/${pidTs}/amortization`);
+  check('the term schedule drives the projection (semi-monthly on the term\u2019s day: periods on the 1st and 16th)',
+    r.data.frequency === 'semi_monthly' && r.data.series[0].date === '2026-02-16',
+    JSON.stringify({ f: r.data.frequency, d: r.data.series && r.data.series[0] && r.data.series[0].date }));
+  r = await req('PUT', `/api/properties/${pidTs}`, { payment_frequency: 'monthly', payment_day: null });
+  check('property schedule PUT stored', r.status === 200 && r.data.payment_frequency === 'monthly');
+  r = await req('GET', `/api/properties/${pidTs}/amortization`);
+  check('the property-level schedule PUT writes through to the terms',
+    r.data.frequency === 'monthly' && r.data.series[0].date === '2026-02-15',
+    JSON.stringify({ f: r.data.frequency, d: r.data.series && r.data.series[0] && r.data.series[0].date }));
+  await req('DELETE', `/api/properties/${pidTs}`);
+
+  // In-term anchor: once the term starts before the balance date,
+  // the anchor rides on that term; editing it there writes the
+  // property anchor back, and the projection follows it. Merely
+  // placing it changes nothing (same balance, same plan).
+  r = await req('POST', '/api/properties', {
+    address: '9 Anchor Court, Victoria, BC',
+    mortgage_balance: 200000, mortgage_balance_date: '2026-06-15', purchase_date: '2020-01-01',
+  });
+  const pidAnchor = r.data.id;
+  const anchorTermId = r.data.terms[0].id;
+  await req('POST', `/api/properties/${pidAnchor}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  await req('PUT', `/api/properties/${pidAnchor}/terms/${anchorTermId}`, { amortization_years: 25 });
+  const anchorBefore = (await req('GET', `/api/properties/${pidAnchor}/amortization`)).data;
+  r = await req('PUT', `/api/properties/${pidAnchor}/terms/${anchorTermId}`, { start_date: '2026-01-01' });
+  check('moving the term start earlier puts the balance anchor on the term',
+    r.status === 200 && r.data.anchor_date === '2026-06-15' && r.data.anchor_balance === 200000,
+    JSON.stringify(r.data).slice(0, 200));
+  const anchorAfter = (await req('GET', `/api/properties/${pidAnchor}/amortization`)).data;
+  check('the projection is unchanged by the anchor placement (same balance, same plan)',
+    JSON.stringify(anchorAfter.series) === JSON.stringify(anchorBefore.series)
+      && anchorAfter.paymentUsed === anchorBefore.paymentUsed,
+    JSON.stringify({ rows: anchorAfter.series && anchorAfter.series.length }));
+  r = await req('PUT', `/api/properties/${pidAnchor}/terms/${anchorTermId}`, { anchor_balance: 195000, anchor_date: '2026-06-15' });
+  check('editing the anchor on the term is accepted', r.status === 200 && r.data.anchor_balance === 195000,
+    JSON.stringify(r.data).slice(0, 200));
+  r = await req('GET', `/api/properties/${pidAnchor}`);
+  check('the property anchor follows the term edit',
+    r.data.mortgage_balance === 195000 && r.data.mortgage_balance_date === '2026-06-15',
+    JSON.stringify({ b: r.data.mortgage_balance, d: r.data.mortgage_balance_date }));
+  r = await req('GET', `/api/properties/${pidAnchor}/amortization`);
+  check('the projection re-derives from the corrected anchor balance',
+    Math.abs(r.data.paymentUsed - engineDerive(195000, 5, 25)) < 0.02, String(r.data.paymentUsed));
+  await req('DELETE', `/api/properties/${pidAnchor}`);
+
   // Validation + term deletion rules.
   r = await req('POST', `/api/properties/${termPid}/terms`, { term_months: 121 });
   check('a term longer than 120 months is a 400', r.status === 400, JSON.stringify(r.data));
@@ -1422,14 +1508,18 @@ try {
   // Every money field is a text input marked data-money; the shared
   // format/parse pair in app.js groups what the user sees and parses it
   // back before anything is sent, so the API still receives numbers.
-  // The balance / payment money fields moved with the anchor form
-  // into the client-rendered term accordion: count the static page
-  // and the rendered templates together.
+  // The principal / payment money fields live in the term cards
+  // (client-rendered in the terms accordion): count the static page
+  // and the rendered templates together. The principal pair's input
+  // name switches between opening_balance and anchor_balance (the
+  // term carrying the balance anchor edits the anchor values).
   const appJsRes2 = await fetch(BASE + '/app.js', { headers: { Cookie: cookie } });
   const appJsText2 = await appJsRes2.text();
   check('money inputs are marked data-money in the page',
     (pageHtml.match(/data-money/g) || []).length >= 4
-      && (appJsText2.match(/name="mortgage_(balance|payment)"[^>]*data-money/g) || []).length === 2,
+      && (appJsText2.match(/name="payment_override"[^>]*data-money/g) || []).length === 1
+      && (appJsText2.match(/name="\$\{principalName\}"[^>]*data-money/g) || []).length === 1
+      && appJsText2.includes("anchored ? 'anchor_balance' : 'opening_balance'"),
     String((pageHtml.match(/data-money/g) || []).length));
   check('frontend wires the shared money format/parse helpers',
     jsText.includes('formatMoneyInput') && jsText.includes('parseMoneyInput') && jsText.includes('input[data-money]'));
@@ -1526,24 +1616,25 @@ try {
       const moneyPid = moneyProp.id;
 
       // Reopening the record: the modal's read-only metadata shows
-      // the grouped current principal, and the balance anchor form
-      // (in the current term's accordion) opens grouped too.
+      // the grouped current principal, and the current term's card
+      // (which carries the principal pair) opens grouped too.
       await page.goto(`http://ff.local/#property/${moneyPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
       const metaPrincipal = await page.evaluate(() => document.querySelector('#metaCurrentPrincipal').textContent);
       check('modal metadata shows the grouped current principal', metaPrincipal.includes('1,350,000'), String(metaPrincipal));
-      const editBalance = await fieldVal('[data-anchor-form] [name=mortgage_balance]');
-      check('anchor form opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
+      const editBalance = await fieldVal('[data-term-form] [name=opening_balance]');
+      check('the term card opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
 
-      // Paste a pre-grouped figure into monthly payment and save: it
-      // must reach the server as the plain number 2500.
-      await focusField('[data-anchor-form] [name=mortgage_payment]');
+      // Paste a pre-grouped figure into the term's monthly payment
+      // override and save the term: it must reach the server as the
+      // plain number 2500.
+      await focusField('[data-term-form] [name=payment_override]');
       await client.send('Input.insertText', { text: '2,500' });
-      const pastedPayment = await fieldVal('[data-anchor-form] [name=mortgage_payment]');
+      const pastedPayment = await fieldVal('[data-term-form] [name=payment_override]');
       check('pasted grouped payment displays grouped', pastedPayment === '2,500', String(pastedPayment));
-      await page.evaluate(() => document.querySelector('[data-anchor-form] [type=submit]').click());
+      await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
       await wait(1400);
       r = await req('GET', `/api/properties/${moneyPid}`);
       check('pasted payment stored as the plain number 2500', r.data.mortgage_payment === 2500, JSON.stringify(r.data.mortgage_payment));
@@ -2335,7 +2426,7 @@ try {
         const modal = document.querySelector('#mortgageModal');
         const inside = (sel) => { const el = document.querySelector(sel); return !!el && modal.contains(el); };
         return {
-          all: inside('#mortgageMeta') && inside('#segmentRows') && inside('[data-anchor-form]') && inside('#termsWrap'),
+          all: inside('#mortgageMeta') && inside('#segmentRows') && inside('[data-term-form] [name=payment_override]') && inside('#termsWrap'),
           heading: modal.querySelector('h3').textContent.trim(),
           onPage: !!document.querySelector('#view-property #mortgageMeta'),
         };
@@ -2347,12 +2438,12 @@ try {
       const rowUi = portUi.properties.find((x) => x.id === amortPid);
       check('the UI-entered amortization flips the portfolio state to projected',
         !!rowUi && rowUi.projState === 'projected', JSON.stringify(rowUi && rowUi.projState));
-      // Entering an override in the anchor form flips the stat to
+      // Entering an override in the term form flips the stat to
       // the entered figure with its "entered" tag — in the
       // projection head and in the modal metadata alike.
-      await focusField('[data-anchor-form] [name=mortgage_payment]');
+      await focusField('[data-term-form] [name=payment_override]');
       await page.keyboard.type('2500');
-      await page.evaluate(() => document.querySelector('[data-anchor-form] [type=submit]').click());
+      await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
       await wait(2000);
       const enteredStat = await page.evaluate(() => ({
         value: document.querySelector('#estPaymentValue').textContent,
@@ -2461,6 +2552,63 @@ try {
           && Math.abs(amortUi.series[idxB].balance
             - (amortUi.series[idxB - 1].balance + amortUi.series[idxB].interest - amortUi.series[idxB].payment)) < 0.02,
         JSON.stringify(amortUi.series[idxB]));
+      // Every term card carries the full field set — principal
+      // pair, payment override, frequency, day — and the old
+      // standalone anchor form is gone from the page entirely.
+      const fieldSets = await page.evaluate(() => ({
+        forms: [...document.querySelectorAll('#termsWrap .term-block [data-term-form]')].map((f) => ({
+          override: !!f.querySelector('[name=payment_override]'),
+          freq: !!f.querySelector('[name=payment_frequency]'),
+          day: !!f.querySelector('[name=payment_day]'),
+          principal: !!f.querySelector('[name=opening_balance], [name=anchor_balance]'),
+          principalDate: !!f.querySelector('[name=start_date], [name=anchor_date]'),
+        })),
+        anchorForms: document.querySelectorAll('[data-anchor-form]').length,
+      }));
+      check('every term card carries the principal/payment/frequency/day field set (no separate anchor form)',
+        fieldSets.forms.length === 2
+          && fieldSets.forms.every((s) => s.override && s.freq && s.day && s.principal && s.principalDate)
+          && fieldSets.anchorForms === 0,
+        JSON.stringify(fieldSets));
+      // One form, one Save per term card: the term's contract
+      // fields and its payment schedule (override / frequency /
+      // day, and its anchor when it carries one) save together in
+      // a single submit — there is no second Save button anywhere
+      // in the card (the Add segment / Add lump sum buttons belong
+      // to their own hidden creation forms, not to the term).
+      const saveCounts = await page.evaluate(() => [...document.querySelectorAll('#termsWrap .term-block')].map((block) => {
+        const forms = block.querySelectorAll('[data-term-form]');
+        const form = forms[0];
+        return {
+          termForms: forms.length,
+          submitsInForm: form ? form.querySelectorAll('button[type=submit]').length : 0,
+          saveButtonsInCard: [...block.querySelectorAll('button[type=submit]')]
+            .filter((b) => b.textContent.trim().startsWith('Save')).length,
+        };
+      }));
+      check('each term card is one form with exactly one Save button',
+        saveCounts.length === 2
+          && saveCounts.every((s) => s.termForms === 1 && s.submitsInForm === 1 && s.saveButtonsInCard === 1),
+        JSON.stringify(saveCounts));
+      // Editing Term 2's override in its own card changes only
+      // Term 2's span; Term 1 keeps its derived payment. (Cleared
+      // again via the API so the lump-sum checks below run on the
+      // un-overridden schedule.)
+      await page.evaluate(() => {
+        const blocks = document.querySelectorAll('#termsWrap .term-block');
+        const form = blocks[blocks.length - 1].querySelector('[data-term-form]');
+        form.payment_override.value = '2000';
+        form.requestSubmit();
+      });
+      await wait(2200);
+      const amortT2o = (await req('GET', `/api/properties/${termUiPid}/amortization`)).data;
+      const t1RowO = amortT2o.series.find((x) => x.month === '2026-11');
+      const t2RowO = amortT2o.series.find((x) => x.month === t2Month);
+      check('editing Term 2\u2019s override in its own card changes only Term 2\u2019s span',
+        !!t2RowO && t2RowO.payment === 2000 && !!t1RowO && Math.abs(t1RowO.payment - amortUi.paymentUsed) < 0.02,
+        JSON.stringify({ t2: t2RowO && t2RowO.payment, t1: t1RowO && t1RowO.payment, used: amortUi.paymentUsed }));
+      const term2UiId = (await req('GET', `/api/properties/${termUiPid}`)).data.terms[1].id;
+      await req('PUT', `/api/properties/${termUiPid}/terms/${term2UiId}`, { payment_override: null });
       // Lump sum through Term 1's own form (amount typed bare, it
       // groups live like every money field).
       await page.evaluate(() => {

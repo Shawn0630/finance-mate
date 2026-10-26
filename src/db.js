@@ -254,9 +254,14 @@ migrateOwners('other_assets');
 // opened with). Inside a term the rate can change (rate_segments,
 // each now owned by a term) and lump sums can land (lump_sums).
 // The property keeps the CURRENT balance anchor (mortgage_balance /
-// mortgage_balance_date), the payment schedule (payment_day /
-// payment_frequency) and an optional entered payment that acts as
-// an override inside the current term.
+// mortgage_balance_date). The payment schedule and the entered
+// payment live ON each term (payment_override / payment_frequency /
+// payment_day) — a renewal can change banks and schedule together —
+// and the term containing the balance anchor also carries it
+// (anchor_balance / anchor_date) when the anchor date falls inside
+// the term, after its start. The property's mortgage_payment /
+// payment_frequency / payment_day columns remain as mirrors of the
+// anchor term's values for older readers.
 db.exec(`
 CREATE TABLE IF NOT EXISTS mortgage_terms (
   id INTEGER PRIMARY KEY,
@@ -268,6 +273,11 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   opening_balance REAL,               -- balance the term opened with
   repayment_method TEXT NOT NULL DEFAULT 'equal_payment',  -- 'equal_payment' (level payment) | 'equal_principal' (fixed monthly principal)
   amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
+  payment_override REAL,              -- entered monthly payment ruling inside this term only; NULL = automatic
+  payment_frequency TEXT,             -- payment schedule for this term; NULL = fall back to the property mirror
+  payment_day INTEGER,                -- deduction day 1..31 for this term; NULL = fall back
+  anchor_balance REAL,                -- the property's balance anchor, when it lands inside this term after its start
+  anchor_date TEXT,                   -- 'YYYY-MM-DD' of that anchor; both anchor columns are set together or neither
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -295,6 +305,16 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   const termCols = db.prepare('PRAGMA table_info(mortgage_terms)').all().map((c) => c.name);
   if (termCols.length && !termCols.includes('repayment_method')) {
     db.exec("ALTER TABLE mortgage_terms ADD COLUMN repayment_method TEXT NOT NULL DEFAULT 'equal_payment'");
+  }
+  // Per-term payment schedule + balance anchors: the columns land
+  // nullable and the backfill after the Term-1 pass seeds them from
+  // the property, so a migrated mortgage behaves exactly as before.
+  if (termCols.length) {
+    if (!termCols.includes('payment_override')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_override REAL');
+    if (!termCols.includes('payment_frequency')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_frequency TEXT');
+    if (!termCols.includes('payment_day')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_day INTEGER');
+    if (!termCols.includes('anchor_balance')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN anchor_balance REAL');
+    if (!termCols.includes('anchor_date')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN anchor_date TEXT');
   }
 }
 // Idempotent backfill: every property gets a Term 1, and every
@@ -332,6 +352,44 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
         p.created_at, p.updated_at
       );
       assignSegs.run(info.lastInsertRowid, p.id);
+    }
+  })();
+}
+// Seed the per-term schedule fields from the property (their
+// pre-term home) and place the balance anchor on the term that
+// contains it. Idempotent: a term only receives a value it does
+// not already carry, so a value later edited (or deliberately
+// cleared-and-reset by the server's syncs) is never resurrected by
+// a restart. The property's frequency/day go to EVERY term (they
+// ruled globally before, so every span keeps its behavior); the
+// entered payment goes to the anchor term only (it ruled only
+// there). An anchor dated on or before its term's start folds
+// into the term's opening balance — where it already lives — so
+// no anchor columns are set for it; a later anchor lands on the
+// term as anchor_balance / anchor_date.
+{
+  const props = db.prepare('SELECT * FROM properties').all();
+  const termsOfProp = db.prepare('SELECT * FROM mortgage_terms WHERE property_id = ? ORDER BY start_date, id');
+  const setFreq = db.prepare('UPDATE mortgage_terms SET payment_frequency = ? WHERE id = ? AND payment_frequency IS NULL');
+  const setDay = db.prepare('UPDATE mortgage_terms SET payment_day = ? WHERE id = ? AND payment_day IS NULL');
+  const setOverride = db.prepare('UPDATE mortgage_terms SET payment_override = ? WHERE id = ? AND payment_override IS NULL');
+  const setAnchor = db.prepare('UPDATE mortgage_terms SET anchor_balance = ?, anchor_date = ? WHERE id = ? AND anchor_date IS NULL');
+  db.transaction(() => {
+    for (const p of props) {
+      const terms = termsOfProp.all(p.id);
+      if (!terms.length) continue;
+      for (const t of terms) {
+        if (p.payment_frequency != null) setFreq.run(p.payment_frequency, t.id);
+        if (p.payment_day != null) setDay.run(p.payment_day, t.id);
+      }
+      const bd = p.mortgage_balance_date;
+      let anchorTerm = null;
+      if (bd) for (const t of terms) if (t.start_date <= bd) anchorTerm = t;
+      anchorTerm = anchorTerm || terms[0];
+      if (p.mortgage_payment > 0) setOverride.run(p.mortgage_payment, anchorTerm.id);
+      if (bd && p.mortgage_balance != null && bd > anchorTerm.start_date) {
+        setAnchor.run(p.mortgage_balance, bd, anchorTerm.id);
+      }
     }
   })();
 }
