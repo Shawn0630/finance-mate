@@ -833,6 +833,8 @@ let chartMeta = null;
 let chartBarsBasis = null; // 'monthly' | 'yearly' | null — set by drawCombinedChart
 let scheduleYear = null; // the monthly schedule's open year page; null = automatic
 let customRange = null; // detail chart range the user picked by month { start, end } ('YYYY-MM'); null = a preset rules
+let monthPopFor = null; // which From/To field the month picker is open for: 'start' | 'end' | null
+let monthPopYear = null; // the year the open month picker is browsing
 let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
@@ -2079,22 +2081,28 @@ function detailRangeWindow() {
   return { startYM: r.start, endYM: r.end, min: ymDecimal(r.start), max: ymDecimal(r.end) + 1 / 12 };
 }
 
-// The From/To inputs always show the range actually in force
-// (preset-derived or clamped custom alike), bounded by the span.
+// 'YYYY-MM' -> "Jan 2026", the From/To fields' display format.
+function formatYM(ym) {
+  if (!ym) return '—';
+  const [y, m] = String(ym).split('-').map(Number);
+  return `${MONTH_NAMES[m - 1]} ${y}`;
+}
+
+// The From/To fields always show the range actually in force
+// (preset-derived or clamped custom alike): the formatted month
+// as the button text, the 'YYYY-MM' on data-value.
 function syncRangeInputs() {
   const s = $('#rangeStart');
   const e = $('#rangeEnd');
   if (!s || !e) return;
   const span = dataSpanMonths();
-  if (span) {
-    s.min = span.start; s.max = span.end;
-    e.min = span.start; e.max = span.end;
-  }
   const r = currentDetailRange();
-  s.value = r ? r.start : '';
-  e.value = r ? r.end : '';
-  s.disabled = !span;
-  e.disabled = !span;
+  for (const [btn, ym] of [[s, r && r.start], [e, r && r.end]]) {
+    btn.dataset.value = ym || '';
+    btn.textContent = formatYM(ym);
+    btn.disabled = !span;
+  }
+  if (monthPopFor) renderMonthPop(); // keep an open picker in step with fresh bounds
 }
 
 // ------------------------------------------------------- range window ---
@@ -2551,22 +2559,100 @@ $('#rangeBtns').addEventListener('click', (e) => {
   customRange = null; // a preset fills the From/To pair on render
   if (currentPropertyId) loadChart(currentPropertyId);
 });
-// Picking a start or end month by hand: the preset highlight
-// clears and the picked pair rules. The pair is clamped into the
-// data span (a start past the end pulls the end up to the start),
-// and syncRangeInputs writes the clamped pair back into the
-// inputs — here, and again on the re-render after the refetch.
-function onRangeMonthChange() {
-  const start = $('#rangeStart').value;
-  const end = $('#rangeEnd').value;
+// ------------------------------------------------------ month picker ---
+// From/To are button fields; one shared popover (a year stepper
+// over a 12-month grid) serves both. Picking a month applies the
+// pair exactly as the pickers' state machine always has: the
+// preset highlight clears, the pair clamps into the data span (a
+// start past the end pulls the end up to the start) and the
+// projection refetches. Months outside the data span render
+// disabled in the grid, and the year stepper stops at the span's
+// first/last years.
+function renderMonthPop() {
+  const pop = $('#monthPop');
+  if (!pop || !monthPopFor) return;
+  const span = dataSpanMonths();
+  if (!span) { closeMonthPop(); return; }
+  const field = monthPopFor === 'start' ? $('#rangeStart') : $('#rangeEnd');
+  const selected = field ? field.dataset.value : '';
+  // The stepper's bounds are the span's years, widened to include
+  // the field's own year when a preset filled a pair reaching
+  // past the span (a look-back can start a few months before the
+  // first data point) — the current value must stay visible.
+  const selYear = selected ? Number(selected.slice(0, 4)) : null;
+  const minYear = Math.min(Number(span.start.slice(0, 4)), selYear ?? Infinity);
+  const maxYear = Math.max(Number(span.end.slice(0, 4)), selYear ?? -Infinity);
+  if (monthPopYear == null) monthPopYear = selected ? Number(selected.slice(0, 4)) : maxYear;
+  monthPopYear = Math.min(Math.max(monthPopYear, minYear), maxYear);
+  $('#monthPopYear').textContent = String(monthPopYear);
+  $('#monthPopPrev').disabled = monthPopYear <= minYear;
+  $('#monthPopNext').disabled = monthPopYear >= maxYear;
+  $('#monthPopGrid').innerHTML = MONTH_NAMES.map((name, i) => {
+    const ym = `${monthPopYear}-${String(i + 1).padStart(2, '0')}`;
+    const off = ym < span.start || ym > span.end;
+    return `<button type="button" data-ym="${ym}"${off ? ' disabled' : ''}${ym === selected ? ' class="sel"' : ''}>${name}</button>`;
+  }).join('');
+}
+
+function openMonthPop(which) {
+  const field = which === 'start' ? $('#rangeStart') : $('#rangeEnd');
+  if (!field || field.disabled) return;
+  monthPopFor = which;
+  monthPopYear = field.dataset.value ? Number(field.dataset.value.slice(0, 4)) : null;
+  renderMonthPop();
+  if (!monthPopFor) return; // no data span — renderMonthPop closed it
+  const pop = $('#monthPop');
+  pop.classList.remove('hidden');
+  const bar = $('#rangeBtns');
+  const left = Math.max(0, Math.min(field.offsetLeft, bar.clientWidth - pop.offsetWidth - 4));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${field.offsetTop + field.offsetHeight + 6}px`;
+  $('#rangeStart').setAttribute('aria-expanded', String(which === 'start'));
+  $('#rangeEnd').setAttribute('aria-expanded', String(which === 'end'));
+}
+
+function closeMonthPop() {
+  monthPopFor = null;
+  const pop = $('#monthPop');
+  if (pop) pop.classList.add('hidden');
+  const s = $('#rangeStart');
+  const e = $('#rangeEnd');
+  if (s) s.setAttribute('aria-expanded', 'false');
+  if (e) e.setAttribute('aria-expanded', 'false');
+}
+
+function onMonthFieldClick(which) {
+  if (monthPopFor === which) { closeMonthPop(); return; }
+  openMonthPop(which);
+}
+$('#rangeStart').addEventListener('click', () => onMonthFieldClick('start'));
+$('#rangeEnd').addEventListener('click', () => onMonthFieldClick('end'));
+
+$('#monthPop').addEventListener('click', (e) => {
+  if (e.target.closest('#monthPopPrev')) { monthPopYear -= 1; renderMonthPop(); return; }
+  if (e.target.closest('#monthPopNext')) { monthPopYear += 1; renderMonthPop(); return; }
+  const cell = e.target.closest('button[data-ym]');
+  if (!cell || cell.disabled || !monthPopFor) return;
+  const start = monthPopFor === 'start' ? cell.dataset.ym : $('#rangeStart').dataset.value;
+  const end = monthPopFor === 'end' ? cell.dataset.ym : $('#rangeEnd').dataset.value;
+  closeMonthPop();
   if (!start || !end) return;
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.remove('active'));
   customRange = clampRange({ start, end }, dataSpanMonths());
   syncRangeInputs();
   if (currentPropertyId) loadChart(currentPropertyId);
-}
-$('#rangeStart').addEventListener('change', onRangeMonthChange);
-$('#rangeEnd').addEventListener('change', onRangeMonthChange);
+});
+
+// Popover etiquette: a click anywhere outside it (or Esc) closes
+// it; only one is ever open — the other field's click retargets it.
+document.addEventListener('click', (e) => {
+  if (!monthPopFor) return;
+  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd')) return;
+  closeMonthPop();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && monthPopFor) closeMonthPop();
+});
 
 // ----------------------------------------------------------------- admin ---
 // User management page. Admin-only: the nav entry is hidden for other

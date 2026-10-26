@@ -50,9 +50,22 @@ th { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing:
 td.num, th.num { text-align: right; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
 .toolbar .spacer { flex: 1; }
+.range-btns { position: relative; }
 .range-btns button.active { background: #1668c4; color: #fff; border-color: #1668c4; }
 .range-pick { display: inline-flex; align-items: center; gap: 6px; color: #5a6a7a; }
-.range-pick input { width: 152px; }
+/* From/To month fields: buttons that read like inputs and open the
+   shared month-picker popover below. */
+.month-field { min-width: 118px; text-align: left; color: #1c2733; }
+.month-field::after { content: "▾"; float: right; color: #71808f; margin-left: 8px; }
+.month-field:disabled { opacity: .5; cursor: default; }
+.month-pop { position: absolute; z-index: 30; width: 248px; background: #fff; border: 1px solid #c9d2dc; border-radius: 10px; box-shadow: 0 10px 28px rgba(22, 34, 46, .18); padding: 10px; }
+.month-pop-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.month-pop-year { font-weight: 650; font-size: 15px; }
+.month-pop-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.month-pop-grid button { padding: 6px 0; font-size: 13px; text-align: center; }
+.month-pop-grid button.sel { background: #1668c4; border-color: #1668c4; color: #fff; }
+.month-pop-grid button:disabled { opacity: .35; cursor: default; }
+.month-pop-grid button:disabled:hover { background: #fff; }
 .msg { padding: 9px 12px; border-radius: 8px; margin: 10px 0; display: none; }
 .msg.ok { background: #e7f6ec; color: #14632f; display: block; }
 .msg.err { background: #fdeceb; color: #b3261e; display: block; }

@@ -1748,8 +1748,8 @@ try {
       // into decades of empty span). The presets only FILL the
       // pair: a look-back preset fills end = the current month.
       const rangePair = () => page.evaluate(() => ({
-        start: document.querySelector('#rangeStart').value,
-        end: document.querySelector('#rangeEnd').value,
+        start: document.querySelector('#rangeStart').dataset.value,
+        end: document.querySelector('#rangeEnd').dataset.value,
       }));
       const ymDecA = (s) => { const [y, m] = s.split('-').map(Number); return y + (m - 1) / 12; };
       const curMonthStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
@@ -2082,12 +2082,29 @@ try {
       const rangeAmort = (await req('GET', `/api/properties/${rangePid}/amortization`)).data;
       await page.goto(`http://ff.local/#property/${rangePid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
-      const setRange = (start, end) => page.evaluate(([s, e]) => {
-        document.querySelector('#rangeStart').value = s;
-        const ei = document.querySelector('#rangeEnd');
-        ei.value = e;
-        ei.dispatchEvent(new Event('change', { bubbles: true }));
-      }, [start, end]);
+      // Drive the custom month picker like a user: open the
+      // field's popover, step its year to the target year, click
+      // the month cell (which applies the pair and refetches).
+      const pickMonthUI = (fieldSel, ym) => page.evaluate(([sel, target]) => {
+        document.querySelector(sel).click();
+        const ty = Number(target.slice(0, 4));
+        const yearEl = document.querySelector('#monthPopYear');
+        let guard = 0;
+        while (Number(yearEl.textContent) !== ty && guard++ < 80) {
+          const btn = ty < Number(yearEl.textContent)
+            ? document.querySelector('#monthPopPrev') : document.querySelector('#monthPopNext');
+          if (!btn || btn.disabled) break;
+          btn.click();
+        }
+        const cell = document.querySelector(`#monthPopGrid button[data-ym="${target}"]`);
+        if (!cell || cell.disabled) throw new Error(`month cell ${target} not pickable`);
+        cell.click();
+      }, [fieldSel, ym]);
+      const setRange = async (start, end) => {
+        await pickMonthUI('#rangeStart', start);
+        await wait(1400); // the start pick applies + refetches before the end pick
+        await pickMonthUI('#rangeEnd', end);
+      };
       const totalInfo = () => page.evaluate(() => {
         const total = document.querySelector('#scheduleTotalRow');
         if (!total) return null;
@@ -2156,8 +2173,8 @@ try {
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
       await wait(1200);
       const rpAll = await page.evaluate(() => ({
-        start: document.querySelector('#rangeStart').value,
-        end: document.querySelector('#rangeEnd').value,
+        start: document.querySelector('#rangeStart').dataset.value,
+        end: document.querySelector('#rangeEnd').dataset.value,
         active: (document.querySelector('#rangeBtns button.active') || {}).dataset?.months,
       }));
       check('All refills the pair with the whole data span',
@@ -2167,8 +2184,8 @@ try {
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
       await wait(1200);
       const rp1y = await page.evaluate(() => ({
-        start: document.querySelector('#rangeStart').value,
-        end: document.querySelector('#rangeEnd').value,
+        start: document.querySelector('#rangeStart').dataset.value,
+        end: document.querySelector('#rangeEnd').dataset.value,
         active: (document.querySelector('#rangeBtns button.active') || {}).dataset?.months,
       }));
       check('the 1-year preset refills the pair ending at the current month (12 months inclusive)',
@@ -2179,8 +2196,8 @@ try {
       await setRange('2026-05', '2026-03');
       await wait(1200);
       const rpClamp = await page.evaluate(() => ({
-        start: document.querySelector('#rangeStart').value,
-        end: document.querySelector('#rangeEnd').value,
+        start: document.querySelector('#rangeStart').dataset.value,
+        end: document.querySelector('#rangeEnd').dataset.value,
         anyActive: !!document.querySelector('#rangeBtns button.active'),
       }));
       check('start past end clamps the end up to the start (and picking clears the preset)',
@@ -2192,6 +2209,82 @@ try {
         !!totClamp && !!mayRow && totClamp.label.includes('Total — May 2026 to May 2026 (1 month)')
           && Math.abs(totClamp.payment - mayRow.payment) < 0.005,
         JSON.stringify(totClamp));
+
+      // ---- The From/To month picker UI ----
+      // Button fields showing "Mon YYYY" (machine value on
+      // data-value) and one shared popover: year stepper + a
+      // 12-month grid, out-of-span months disabled.
+      const fieldState = () => page.evaluate(() => ({
+        startText: document.querySelector('#rangeStart').textContent,
+        startVal: document.querySelector('#rangeStart').dataset.value,
+        endText: document.querySelector('#rangeEnd').textContent,
+        endVal: document.querySelector('#rangeEnd').dataset.value,
+        popHidden: document.querySelector('#monthPop').classList.contains('hidden'),
+        startExpanded: document.querySelector('#rangeStart').getAttribute('aria-expanded'),
+        endExpanded: document.querySelector('#rangeEnd').getAttribute('aria-expanded'),
+      }));
+      const fs0 = await fieldState();
+      check('From/To are button fields showing "Mon YYYY" with the month on data-value, picker closed',
+        fs0.startText === 'May 2026' && fs0.startVal === '2026-05'
+          && fs0.endText === 'May 2026' && fs0.endVal === '2026-05' && fs0.popHidden,
+        JSON.stringify(fs0));
+      await page.evaluate(() => document.querySelector('#rangeStart').click());
+      await wait(250);
+      const pop1 = await page.evaluate(() => ({
+        hidden: document.querySelector('#monthPop').classList.contains('hidden'),
+        year: document.querySelector('#monthPopYear').textContent,
+        selYm: (document.querySelector('#monthPopGrid button.sel') || {}).dataset?.ym,
+        expanded: document.querySelector('#rangeStart').getAttribute('aria-expanded'),
+      }));
+      check('clicking From opens the picker on the field year with its month selected',
+        !pop1.hidden && pop1.year === '2026' && pop1.selYm === '2026-05' && pop1.expanded === 'true',
+        JSON.stringify(pop1));
+      await page.evaluate(() => document.querySelector('#monthPopNext').click());
+      const yrNext = await page.evaluate(() => document.querySelector('#monthPopYear').textContent);
+      await page.evaluate(() => document.querySelector('#monthPopPrev').click());
+      await page.evaluate(() => document.querySelector('#monthPopPrev').click());
+      await page.evaluate(() => document.querySelector('#monthPopPrev').click());
+      const popMin = await page.evaluate(() => ({
+        year: document.querySelector('#monthPopYear').textContent,
+        prevDisabled: document.querySelector('#monthPopPrev').disabled,
+        janDisabled: document.querySelector('#monthPopGrid button[data-ym="2024-01"]').disabled,
+        decDisabled: document.querySelector('#monthPopGrid button[data-ym="2024-12"]').disabled,
+      }));
+      check('the year stepper steps one year at a time and stops at the span start (2024: Jan-Nov disabled, Dec pickable)',
+        yrNext === '2027' && popMin.year === '2024' && popMin.prevDisabled && popMin.janDisabled && !popMin.decDisabled,
+        JSON.stringify({ yrNext, popMin }));
+      await page.keyboard.press('Escape');
+      await wait(150);
+      const escClosed = await page.evaluate(() => document.querySelector('#monthPop').classList.contains('hidden'));
+      check('Esc closes the month picker', escClosed);
+      await page.evaluate(() => document.querySelector('#rangeStart').click());
+      await wait(200);
+      await page.evaluate(() => document.querySelector('#rangeEnd').click());
+      await wait(200);
+      const retarget = await fieldState();
+      check('one picker only: clicking To while From is open retargets the same popover',
+        !retarget.popHidden && retarget.startExpanded === 'false' && retarget.endExpanded === 'true',
+        JSON.stringify(retarget));
+      await page.evaluate(() => document.querySelector('#projectionPanel h3').click());
+      await wait(200);
+      const outsideClosed = await page.evaluate(() => document.querySelector('#monthPop').classList.contains('hidden'));
+      check('clicking outside closes the month picker', outsideClosed);
+      // A full pick through the popover moves the field value, its
+      // display text, the chart bars and the Total together.
+      await pickMonthUI('#rangeStart', '2025-01');
+      await wait(1400);
+      const fsPick = await fieldState();
+      const totPick = await totalInfo();
+      const barsPick = await page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        const ints = c ? c.data.datasets.find((d) => d.label === 'Interest portion') : null;
+        return ints ? ints.data.length : null;
+      });
+      check('picking a month moves data-value, display text, chart bars and the Total together',
+        fsPick.startVal === '2025-01' && fsPick.startText === 'Jan 2025' && fsPick.popHidden
+          && barsPick === 17
+          && !!totPick && totPick.label.includes('Total — Jan 2025 to May 2026 (17 months)'),
+        JSON.stringify({ fsPick, barsPick, label: totPick && totPick.label }));
       await req('DELETE', `/api/properties/${rangePid}`);
 
       // Portfolio combined chart: the same look-back window applies

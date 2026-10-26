@@ -177,8 +177,16 @@
         <button data-months="60" class="active">5 years</button>
         <button data-months="120">10 years</button>
         <button data-months="0">All (to payoff)</button>
-        <span class="range-pick">From <input id="rangeStart" type="month" aria-label="Range start month"></span>
-        <span class="range-pick">To <input id="rangeEnd" type="month" aria-label="Range end month"></span>
+        <span class="range-pick">From <button type="button" id="rangeStart" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range start month">—</button></span>
+        <span class="range-pick">To <button type="button" id="rangeEnd" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range end month">—</button></span>
+        <div class="month-pop hidden" id="monthPop" role="dialog" aria-label="Choose a month">
+          <div class="month-pop-head">
+            <button type="button" class="small" id="monthPopPrev" aria-label="Previous year">&#8249;</button>
+            <span class="month-pop-year" id="monthPopYear"></span>
+            <button type="button" class="small" id="monthPopNext" aria-label="Next year">&#8250;</button>
+          </div>
+          <div class="month-pop-grid" id="monthPopGrid"></div>
+        </div>
       </div>
       <div class="msg" id="combinedMsg"></div>
       <div class="msg" id="monthlyMsg"></div>
