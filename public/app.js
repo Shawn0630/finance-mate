@@ -832,6 +832,7 @@ let fullSeries = [];
 let chartMeta = null;
 let chartBarsBasis = null; // 'monthly' | 'yearly' | null — set by drawCombinedChart
 let scheduleYear = null; // the monthly schedule's open year page; null = automatic
+let schedulePageFirst = false; // a range change reopens the schedule on the range's FIRST year page
 let customRange = null; // detail chart range the user picked by month { start, end } ('YYYY-MM'); null = a preset rules
 let monthPopFor = null; // which From/To field the month picker is open for: 'start' | 'end' | null
 let monthPopYear = null; // the year the open month picker is browsing
@@ -2505,7 +2506,13 @@ function renderSchedule() {
   const years = [...new Set(rows.map((r) => String(r.month).slice(0, 4)))];
   const todayYear = String(new Date().getFullYear());
   if (!scheduleYear || !years.includes(scheduleYear)) {
-    scheduleYear = years.includes(todayYear) ? todayYear : years[0];
+    // Automatic page: today's year — EXCEPT right after a range
+    // change, which reopens on the range's first page so the table
+    // visibly starts where the picked range starts (with the old
+    // rule a pick that kept today's year in range left the visible
+    // rows byte-identical and the table looked unresponsive).
+    scheduleYear = !schedulePageFirst && years.includes(todayYear) ? todayYear : years[0];
+    schedulePageFirst = false;
   }
   const pageRows = rows.filter((r) => String(r.month).slice(0, 4) === scheduleYear);
   tbody.innerHTML = pageRows.map((r) => `<tr>
@@ -2557,7 +2564,7 @@ $('#rangeBtns').addEventListener('click', (e) => {
   if (!btn) return;
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.toggle('active', b === btn));
   customRange = null; // a preset fills the From/To pair on render
-  if (currentPropertyId) loadChart(currentPropertyId);
+  if (currentPropertyId) { schedulePageFirst = true; loadChart(currentPropertyId); }
 });
 // ------------------------------------------------------ month picker ---
 // From/To are button fields; one shared popover (a year stepper
@@ -2640,7 +2647,7 @@ $('#monthPop').addEventListener('click', (e) => {
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.remove('active'));
   customRange = clampRange({ start, end }, dataSpanMonths());
   syncRangeInputs();
-  if (currentPropertyId) loadChart(currentPropertyId);
+  if (currentPropertyId) { schedulePageFirst = true; loadChart(currentPropertyId); }
 });
 
 // Popover etiquette: a click anywhere outside it (or Esc) closes

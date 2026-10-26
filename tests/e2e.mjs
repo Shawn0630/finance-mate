@@ -1949,7 +1949,9 @@ try {
       // ---- Monthly schedule: monthly rows, year pages, one Total row ----
       // The table under the chart lists the endpoint's series months
       // inside the chart window (All here = the whole series), one
-      // calendar year per page, opening on today's year. Its Total
+      // calendar year per page. At load it opens on today's year;
+      // the All preset click above is a range change, so the page
+      // has since reset to the window's first year. Its Total
       // row sums the ENTIRE range to the cent and must not move when
       // the page turns.
       const schedInfo = () => page.evaluate(() => {
@@ -1972,10 +1974,10 @@ try {
       const allYears = [...new Set(winAmort.series.map((r) => r.month.slice(0, 4)))];
       const thisYear = String(new Date().getFullYear());
       let sc = await schedInfo();
-      check('schedule opens on the page for today\u2019s year, listing exactly that year\u2019s months',
-        sc.year === thisYear && sc.months.length === rowsOfYear(thisYear).length
-          && sc.months.length > 0 && sc.months.every((m) => m.endsWith(thisYear)),
-        JSON.stringify({ year: sc.year, n: sc.months.length, exp: rowsOfYear(thisYear).length }));
+      check('after the All range change the schedule sits on the window\u2019s first year page, listing exactly that year\u2019s months',
+        sc.year === allYears[0] && sc.months.length === rowsOfYear(allYears[0]).length
+          && sc.months.length > 0 && sc.months.every((m) => m.endsWith(allYears[0])),
+        JSON.stringify({ year: sc.year, n: sc.months.length, exp: rowsOfYear(allYears[0]).length }));
       check('schedule Total row sums the whole range exactly (payment / principal / interest)',
         sc.totalPayment !== null
           && Math.abs(sc.totalPayment - apiTotals.payment) < 0.005
@@ -2080,8 +2082,35 @@ try {
       });
       await req('PUT', `/api/properties/${rangePid}`, { amortization_years: 25 });
       const rangeAmort = (await req('GET', `/api/properties/${rangePid}/amortization`)).data;
+      // rangePid reuses the just-deleted refetchPid's id (SQLite
+      // recycles the max rowid), so a direct hash goto to it is a
+      // no-op navigation and the page would keep showing the
+      // deleted property's view — detour via the root hash so
+      // the hash really changes and the property loads.
+      await page.goto('http://ff.local/#', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(400);
       await page.goto(`http://ff.local/#property/${rangePid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
+      // A fresh property load (no range change yet) still opens
+      // the schedule on today's year page — the first-page reset
+      // belongs to range changes only. Wait for THIS property's
+      // schedule to settle first (the table can still show the
+      // previous property's rows while the refetch is in flight).
+      const openYear = String(new Date().getFullYear());
+      const openRows = rangeAmort.series.filter((x) => x.month.startsWith(openYear) && x.month <= curMonthStr());
+      await page.waitForFunction((y, n) => {
+        const sel = document.querySelector('#scheduleYearSelect');
+        return !!sel && sel.value === y
+          && document.querySelectorAll('#scheduleRows tr').length === n;
+      }, { timeout: 20000 }, openYear, openRows.length).catch(() => {});
+      const scOpen = await page.evaluate(() => ({
+        year: document.querySelector('#scheduleYearSelect').value,
+        months: [...document.querySelectorAll('#scheduleRows tr')].map((tr) => tr.children[0].textContent),
+      }));
+      check('a freshly opened property schedule sits on today’s year page (the first-page reset is for range changes only)',
+        scOpen.year === openYear && scOpen.months.length === openRows.length
+          && scOpen.months.length > 0 && scOpen.months.every((m) => m.endsWith(openYear)),
+        JSON.stringify({ got: scOpen, exp: openRows.length }));
       // Drive the custom month picker like a user: open the
       // field's popover, step its year to the target year, click
       // the month cell (which applies the pair and refetches).
@@ -2149,6 +2178,40 @@ try {
       const schedYearsPicked = await page.evaluate(() => [...document.querySelectorAll('#scheduleYearSelect option')].map((o) => o.value));
       check('picked range: the schedule pages are the years inside the range',
         JSON.stringify(schedYearsPicked) === JSON.stringify(['2025', '2026']), JSON.stringify(schedYearsPicked));
+      // The VISIBLE rows follow the pick too: a range change
+      // reopens the schedule on the range's first year page (the
+      // old auto-page pinned today's year, so a pick that kept
+      // 2026 in range left the visible rows byte-identical and
+      // the table looked unresponsive — the user's report).
+      const visibleRows = () => page.evaluate(() => {
+        const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const toYM = (label) => {
+          const [mon, yr] = label.trim().split(' ');
+          return `${yr}-${String(MON.indexOf(mon) + 1).padStart(2, '0')}`;
+        };
+        return {
+          months: [...document.querySelectorAll('#scheduleRows tr')].map((tr) => toYM(tr.children[0].textContent)),
+          page: document.querySelector('#scheduleYearSelect').value,
+          pageCount: document.querySelectorAll('#scheduleYearSelect option').length,
+          prevDisabled: document.querySelector('#schedulePrevYear').disabled,
+          nextDisabled: document.querySelector('#scheduleNextYear').disabled,
+        };
+      });
+      const vis1 = await visibleRows();
+      check('picked range: the visible schedule rows are the range first page (Jan-Dec 2025), all inside the range',
+        vis1.page === '2025' && vis1.pageCount === 2 && vis1.months.length === 12
+          && vis1.months[0] === '2025-01' && vis1.months[vis1.months.length - 1] === '2025-12'
+          && vis1.months.every((m) => m >= '2025-01' && m <= '2026-10')
+          && vis1.prevDisabled === true && vis1.nextDisabled === false,
+        JSON.stringify(vis1));
+      await page.evaluate(() => document.querySelector('#scheduleNextYear').click());
+      await wait(300);
+      const vis2 = await visibleRows();
+      check('picked range: the second page holds the remaining rows (Jan-Oct 2026), so the pages match the row count',
+        vis2.page === '2026' && vis2.months.length === 10
+          && vis2.months[0] === '2026-01' && vis2.months[vis2.months.length - 1] === '2026-10'
+          && vis2.nextDisabled === true,
+        JSON.stringify(vis2));
       const pagerText = await page.evaluate(() => document.querySelector('#schedulePager').textContent);
       check('the schedule pager note (explanation prose) is gone',
         !pagerText.includes('one year per page') && !pagerText.includes('Total row covers'),
@@ -2167,6 +2230,11 @@ try {
           && Math.abs(tot2.interest - junDecSums.interest) < 0.005
           && Math.abs(tot2.remaining - junDec[junDec.length - 1].balance) < 0.51,
         JSON.stringify({ tot: tot2, sums: junDecSums }));
+      const vis3 = await visibleRows();
+      check('re-picked range: the visible rows are exactly Jun-Dec 2025 on a single first page',
+        vis3.page === '2025' && vis3.pageCount === 1 && vis3.months.length === 7
+          && vis3.months[0] === '2025-06' && vis3.months[vis3.months.length - 1] === '2025-12',
+        JSON.stringify(vis3));
 
       // Presets refill the pair: All = the whole data span; a
       // look-back preset ends at the current month.
@@ -2181,6 +2249,16 @@ try {
         rpAll.start === '2024-12' && rpAll.end === rangeAmort.series[rangeAmort.series.length - 1].month
           && rpAll.active === '0',
         JSON.stringify(rpAll));
+      const visAll = await visibleRows();
+      const allSeriesYears = [...new Set(rangeAmort.series.map((x) => x.month.slice(0, 4)))];
+      const firstYearRows = rangeAmort.series.filter((x) => x.month.startsWith(allSeriesYears[0]));
+      check('All preset: the schedule reopens on the first page of the widened span',
+        visAll.page === allSeriesYears[0] && visAll.pageCount === allSeriesYears.length
+          && visAll.months.length === firstYearRows.length
+          && visAll.months[0] === firstYearRows[0].month
+          && visAll.months[visAll.months.length - 1] === firstYearRows[firstYearRows.length - 1].month
+          && visAll.prevDisabled === true,
+        JSON.stringify(visAll));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
       await wait(1200);
       const rp1y = await page.evaluate(() => ({
