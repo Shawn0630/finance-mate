@@ -1346,9 +1346,12 @@ try {
         !!moneyProp && moneyProp.mortgage_balance === 1350000, JSON.stringify(moneyProp && moneyProp.mortgage_balance));
       const moneyPid = moneyProp.id;
 
-      // Reopening the record: the mortgage form shows the grouped figure.
+      // Reopening the record: the mortgage form (in the Mortgage
+      // Terms & Rates modal) shows the grouped figure.
       await page.goto(`http://ff.local/#property/${moneyPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
       const editBalance = await fieldVal('#mortgageForm [name=mortgage_balance]');
       check('edit form opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
 
@@ -1556,6 +1559,10 @@ try {
             xs: ints.data.map((p) => p.x),
             sums: ints.data.map((p, i) => p.y + prins.data[i].y),
           } : null,
+          axisOf: Object.fromEntries(c.data.datasets.map((d) => [d.label, d.yAxisID || 'y'])),
+          y1Min: c.scales.y1 ? c.scales.y1.min : null,
+          y1Max: c.scales.y1 ? c.scales.y1.max : null,
+          lineMaxY: Math.max(...c.data.datasets.filter((d) => d.type === 'line').flatMap((d) => d.data.map((p) => p.y))),
         };
       });
       const samePanel = await page.evaluate(() => {
@@ -1587,6 +1594,12 @@ try {
           && bi.bars.xs.length === exp60.length && exp60.length > 12
           && bi.bars.sums.slice(0, 6).every((s, k) => Math.abs(s - exp60[k].payment) < 0.02),
         JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, exp: exp60.length }));
+      const maxPay60 = Math.max(...exp60.map((r) => r.payment));
+      check('dual axis: lines ride the left axis, payment bars the right axis — right max covers the largest payment, left max the largest balance',
+        !!bi && bi.axisOf['Assessed value'] === 'y' && bi.axisOf['Outstanding principal'] === 'y'
+          && bi.axisOf['Interest portion'] === 'y1' && bi.axisOf['Principal portion'] === 'y1'
+          && bi.y1Min === 0 && bi.y1Max >= maxPay60 && bi.yMax >= bi.lineMaxY,
+        JSON.stringify(bi && { axisOf: bi.axisOf, y1Max: bi.y1Max, maxPay60, yMax: bi.yMax, lineMaxY: bi.lineMaxY }));
       const stackGeo = await page.evaluate(() => {
         const c = window.__fmCharts.a;
         if (!c) return null;
@@ -1596,7 +1609,7 @@ try {
         const ei = c.getDatasetMeta(mi).data[3];
         const ep = c.getDatasetMeta(mp).data[3];
         if (!ei || !ep) return null;
-        return { intBase: ei.base, intTop: ei.y, prinBase: ep.base, zeroPix: c.scales.y.getPixelForValue(0) };
+        return { intBase: ei.base, intTop: ei.y, prinBase: ep.base, zeroPix: c.scales.y1.getPixelForValue(0) };
       });
       check('merged chart bars really stack (principal sits on interest, interest on zero)',
         !!stackGeo && Math.abs(stackGeo.intBase - stackGeo.zeroPix) < 2
@@ -1625,14 +1638,77 @@ try {
       const yearsAll = [...new Set(winAmort.series.map((r) => r.month.slice(0, 4)))];
       const totBars = bi && bi.bars ? bi.bars.sums.reduce((s, v) => s + v, 0) : 0;
       const totApi = winAmort.series.reduce((s, r) => s + r.payment, 0);
-      const sumText = await page.evaluate(() => document.querySelector('#monthlySummary').textContent);
+      const sumText = await page.evaluate(() => document.querySelector('#scheduleNote').textContent);
       check('All view aggregates the bars by year (one bar per projection year)',
         !!bi && !!bi.bars && bi.bars.xs.length === yearsAll.length
           && bi.bars.xs.every((x) => Number.isInteger(x))
           && Math.abs(totBars - totApi) < 1,
         JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, years: yearsAll.length, totBars, totApi }));
-      check('the summary names the yearly bar basis on the All span',
+      check('the schedule note names the yearly bar basis on the All span',
         sumText.includes('yearly interest & principal totals'), sumText);
+
+      // ---- Monthly schedule: monthly rows, year pages, one Total row ----
+      // The table under the chart lists the endpoint's series months
+      // inside the chart window (All here = the whole series), one
+      // calendar year per page, opening on today's year. Its Total
+      // row sums the ENTIRE range to the cent and must not move when
+      // the page turns.
+      const schedInfo = () => page.evaluate(() => {
+        const total = document.querySelector('#scheduleTotalRow');
+        return {
+          months: [...document.querySelectorAll('#scheduleRows tr')].map((tr) => tr.children[0].textContent),
+          year: document.querySelector('#scheduleYearSelect').value,
+          totalLabel: total ? total.children[0].textContent : '',
+          totalPayment: total ? Number(total.querySelector('.sum-payment').dataset.value) : null,
+          totalPrincipal: total ? Number(total.querySelector('.sum-principal').dataset.value) : null,
+          totalInterest: total ? Number(total.querySelector('.sum-interest').dataset.value) : null,
+        };
+      });
+      const apiTotals = {
+        payment: winAmort.series.reduce((s, r) => s + r.payment, 0),
+        principal: winAmort.series.reduce((s, r) => s + r.principal, 0),
+        interest: winAmort.series.reduce((s, r) => s + r.interest, 0),
+      };
+      const rowsOfYear = (y) => winAmort.series.filter((r) => r.month.startsWith(y));
+      const allYears = [...new Set(winAmort.series.map((r) => r.month.slice(0, 4)))];
+      const thisYear = String(new Date().getFullYear());
+      let sc = await schedInfo();
+      check('schedule opens on the page for today\u2019s year, listing exactly that year\u2019s months',
+        sc.year === thisYear && sc.months.length === rowsOfYear(thisYear).length
+          && sc.months.length > 0 && sc.months.every((m) => m.endsWith(thisYear)),
+        JSON.stringify({ year: sc.year, n: sc.months.length, exp: rowsOfYear(thisYear).length }));
+      check('schedule Total row sums the whole range exactly (payment / principal / interest)',
+        sc.totalPayment !== null
+          && Math.abs(sc.totalPayment - apiTotals.payment) < 0.005
+          && Math.abs(sc.totalPrincipal - apiTotals.principal) < 0.005
+          && Math.abs(sc.totalInterest - apiTotals.interest) < 0.005,
+        JSON.stringify({ got: [sc.totalPayment, sc.totalPrincipal, sc.totalInterest], api: apiTotals }));
+      check('schedule Total row labels its range and the payoff month inside it',
+        sc.totalLabel.includes('Total') && !!winAmort.payoffMonth
+          && sc.totalLabel.includes(`Paid off ${winAmort.payoffMonth}`),
+        sc.totalLabel);
+      await page.evaluate((y) => {
+        const s = document.querySelector('#scheduleYearSelect');
+        s.value = y;
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      }, allYears[0]);
+      await wait(300);
+      const scFirst = await schedInfo();
+      check('jumping the schedule to the first year lists only that year\u2019s months',
+        scFirst.year === allYears[0] && scFirst.months.length === rowsOfYear(allYears[0]).length
+          && scFirst.months.every((m) => m.endsWith(allYears[0])),
+        JSON.stringify({ year: scFirst.year, n: scFirst.months.length, exp: rowsOfYear(allYears[0]).length }));
+      await page.evaluate(() => document.querySelector('#scheduleNextYear').click());
+      await wait(300);
+      const scNext = await schedInfo();
+      check('the next-year pager steps to the following year\u2019s months',
+        scNext.year === allYears[1] && scNext.months.length === rowsOfYear(allYears[1]).length
+          && scNext.months.every((m) => m.endsWith(allYears[1])),
+        JSON.stringify({ year: scNext.year, n: scNext.months.length, exp: rowsOfYear(allYears[1]).length }));
+      check('the Total row does not change when the schedule page turns',
+        scNext.totalPayment === sc.totalPayment && scNext.totalPrincipal === sc.totalPrincipal
+          && scNext.totalInterest === sc.totalInterest && scNext.totalLabel === sc.totalLabel,
+        JSON.stringify({ before: sc.totalLabel, after: scNext.totalLabel }));
 
       // Portfolio combined chart: the same look-back window applies
       // to its assessed line (years are the union across properties;
@@ -1773,17 +1849,22 @@ try {
       check('a straight line joins the points (mid-2025 reads the two years\u2019 average, 1,966,500)',
         !!scanMid && scanMid.hits > 0 && Math.abs(scanMid.value - 1966500) < 10000, JSON.stringify(scanMid));
 
-      // Edit a value point through THIS page's own form (the trend
-      // form used to leave the assets cache untouched), then go back
-      // to Properties by hash only — no reload. The dirty mark must
-      // make the section refetch: the new property (created after the
-      // section's last load) and the portfolio notes must be current.
+      // Edit a value point through this page's own history editor
+      // (the Assessment History modal — its form used to leave the
+      // assets cache untouched), then go back to Properties by hash
+      // only — no reload. The dirty mark must make the section
+      // refetch: the new property (created after the section's last
+      // load) and the portfolio notes must be current.
+      await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
+      await wait(500);
       await focusField('#trendForm [name=year]');
       await page.keyboard.type('2021');
       await focusField('#trendForm [name=value]');
       await page.keyboard.type('1600000');
       await page.evaluate(() => document.querySelector('#trendSubmitBtn').click());
       await wait(1400);
+      await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
+      await wait(300);
       await page.evaluate(() => { location.hash = '#assets/properties'; });
       await wait(1800);
       const cardsText = await page.evaluate(() => document.querySelector('#propertyCards').textContent);
@@ -1804,7 +1885,7 @@ try {
         !!pfPtsCfg && pfPtsCfg.showLine !== false && pfPtsCfg.tension === 0 && !pfPtsCfg.stepped && pfPtsCfg.n >= 5,
         JSON.stringify(pfPtsCfg));
 
-      // ---- Amortization years in the Mortgage & rates panel derive the payment ----
+      // ---- Amortization years in Mortgage Terms & Rates derive the payment ----
       // The user's exact shape again (balance + one prime-spread
       // segment, nothing else), driven through the UI this time:
       // typing ONLY the remaining amortization (30) and a lender into
@@ -1826,6 +1907,8 @@ try {
       const beforeMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('amortization UI fixture starts unprojected (NO_PAYMENT)',
         beforeMsg.includes('add a monthly payment or remaining amortization'), beforeMsg);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
       await focusField('#mortgageForm [name=amortization_years]');
       await page.keyboard.type('30');
       await focusField('#mortgageForm [name=lender]');
@@ -1838,7 +1921,7 @@ try {
           && Math.abs(amortApi.paymentUsed - 6381.36) < 0.5,
         JSON.stringify({ ok: amortApi.ok, src: amortApi.paymentSource, used: amortApi.paymentUsed }));
       const derivedNote = await page.evaluate(() => document.querySelector('#derivedPaymentNote').textContent);
-      check('Mortgage & rates panel names the derived payment and its amount',
+      check('Mortgage Terms & Rates names the derived payment and its amount',
         derivedNote.includes('derived from the remaining amortization') && derivedNote.includes('6,381'),
         derivedNote);
       const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
@@ -1886,30 +1969,56 @@ try {
       }
       check('merged chart bar portions sum to each year\u2019s payments (first 6 years)',
         splitOk, JSON.stringify(chartBInfo && chartBInfo.sums.slice(0, 6)));
-      const monthlySummary = await page.evaluate(() => document.querySelector('#monthlySummary').textContent);
-      check('merged chart summary shows projected total interest, total principal and the payoff month',
-        monthlySummary.includes('Projected total interest')
-          && monthlySummary.includes('Total principal')
-          && !!amortApi.payoffMonth && monthlySummary.includes(`Projected payoff: ${amortApi.payoffMonth}`),
-        monthlySummary);
+      // The old text summary over the chart is gone; the figures
+      // live in the schedule's Total row (range = All here, so the
+      // row sums the endpoint's whole series) with the payoff month
+      // in its label.
+      const schedTotal = await page.evaluate(() => {
+        const total = document.querySelector('#scheduleTotalRow');
+        if (!total) return null;
+        return {
+          label: total.children[0].textContent,
+          payment: Number(total.querySelector('.sum-payment').dataset.value),
+          principal: Number(total.querySelector('.sum-principal').dataset.value),
+          interest: Number(total.querySelector('.sum-interest').dataset.value),
+        };
+      });
+      const amortTotals = {
+        payment: amortApi.series.reduce((s, r) => s + r.payment, 0),
+        principal: amortApi.series.reduce((s, r) => s + r.principal, 0),
+        interest: amortApi.series.reduce((s, r) => s + r.interest, 0),
+      };
+      check('schedule Total row carries the projected totals (payment, principal, interest) and the payoff month',
+        !!schedTotal
+          && Math.abs(schedTotal.payment - amortTotals.payment) < 0.005
+          && Math.abs(schedTotal.principal - amortTotals.principal) < 0.005
+          && Math.abs(schedTotal.interest - amortTotals.interest) < 0.005
+          && Math.abs(schedTotal.interest - amortApi.totalInterest) < 0.02
+          && !!amortApi.payoffMonth && schedTotal.label.includes(`Paid off ${amortApi.payoffMonth}`),
+        JSON.stringify(schedTotal));
+      check('no text summary block remains over the chart',
+        await page.evaluate(() => !document.querySelector('#monthlySummary')));
       const lenderBits = await page.evaluate(() => ({
         view: document.querySelector('#propViewBody').textContent,
         tag: document.querySelector('#mortgageLenderTag').textContent,
         input: document.querySelector('#mortgageForm [name=lender]').value,
       }));
-      check('lender shows in the read-only panel, the Mortgage & rates heading and the form',
+      check('lender shows in the read-only panel, the Mortgage Terms & Rates heading and the form',
         lenderBits.view.includes('Lender') && lenderBits.view.includes('Scotiabank')
           && lenderBits.tag.includes('Scotiabank') && lenderBits.input === 'Scotiabank',
         JSON.stringify(lenderBits));
-      const sameCard = await page.evaluate(() => {
-        const p1 = document.querySelector('#mortgageForm').closest('.panel');
-        const p2 = document.querySelector('#segmentRows').closest('.panel');
-        const p3 = document.querySelector('#paymentDayForm').closest('.panel');
-        return { same: !!p1 && p1 === p2 && p1 === p3, heading: p1 ? p1.querySelector('h3').textContent.trim() : '' };
+      const inModal = await page.evaluate(() => {
+        const modal = document.querySelector('#mortgageModal');
+        const inside = (sel) => { const el = document.querySelector(sel); return !!el && modal.contains(el); };
+        return {
+          all: inside('#mortgageForm') && inside('#segmentRows') && inside('#paymentDayForm') && inside('#termsWrap'),
+          heading: modal.querySelector('h3').textContent.trim(),
+          onPage: !!document.querySelector('#view-property #mortgageForm'),
+        };
       });
-      check('mortgage terms and rate segments live in one Mortgage & rates card',
-        sameCard.same && sameCard.heading.startsWith('Mortgage & rates'),
-        JSON.stringify(sameCard));
+      check('mortgage terms and rate segments live in the Mortgage Terms & Rates modal, not on the page',
+        inModal.all && inModal.heading.startsWith('Mortgage Terms & Rates') && !inModal.onPage,
+        JSON.stringify(inModal));
       const portUi = (await req('GET', '/api/properties/portfolio')).data;
       const rowUi = portUi.properties.find((x) => x.id === amortPid);
       check('the UI-entered amortization flips the portfolio state to projected',
@@ -1918,7 +2027,7 @@ try {
 
       // ---- Terms UI: build a renewal through the accordion ----
       // Same shape once more, driven entirely through the page this
-      // time: the card summary names the current term, "+ Add term /
+      // time: the modal summary names the current term, "+ Add term /
       // renewal" creates Term 2 prefilled and expanded, its form
       // takes the new lender + amortization, and the projection then
       // runs continuously across the boundary with the payment
@@ -1945,10 +2054,12 @@ try {
         if (sumBefore.includes('RBC')) break;
         await wait(300);
       }
-      check('card summary names the current term, its lender and the auto payment',
+      check('modal summary names the current term, its lender and the auto payment',
         sumBefore.includes('Term 1 of 1') && sumBefore.includes('RBC')
           && sumBefore.includes('auto') && sumBefore.includes('6,381'),
         sumBefore);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
       await page.evaluate(() => document.querySelector('#addTermBtn').click());
       await wait(2000);
       const termBlocks = await page.evaluate(() => document.querySelectorAll('#termsWrap .term-block').length);
@@ -2025,15 +2136,46 @@ try {
         viewInputs: document.querySelectorAll('#propView input').length,
         hasPhotoUrlField: !!document.querySelector('#propForm [name=photo_url]'),
         viewText: document.querySelector('#propViewBody').textContent,
-        sourceLine: document.querySelector('#assessmentMetaView').textContent,
         emptyGallery: document.querySelector('#photoArea').textContent.includes('No photos yet'),
       }));
       check('the edit form stays hidden until Edit', panelState.formHidden === true);
       check('the read-only view has no inputs (pure metadata)', panelState.viewInputs === 0);
       check('the Photo URL field is gone from the edit form', panelState.hasPhotoUrlField === false);
       check('read-only view shows purchase date 2024-12-17', panelState.viewText.includes('2024-12-17'), panelState.viewText.slice(0, 160));
-      check('read-only view carries a Source line', panelState.sourceLine.trim().length > 0, panelState.sourceLine);
       check('a property without photos shows the click-to-add placeholder', panelState.emptyGallery === true);
+      // Layout: Gallery -> Property Details -> Value & Mortgage
+      // Projection in that order; Edit in the Property Details head;
+      // the mortgage setup, the history editor and the fetch/pull
+      // buttons live in their modals, not on the page body. The BCA
+      // source line moved with them into Assessment History.
+      const layout = await page.evaluate(() => {
+        const g = document.getElementById('galleryPanel');
+        const pd = document.getElementById('propertyDetailsPanel');
+        const vp = document.getElementById('projectionPanel');
+        const follows = (a, b) => !!(a && b && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+        return {
+          order: follows(g, pd) && follows(pd, vp),
+          headings: [g, pd, vp].map((el) => ((el.querySelector('h3') || {}).textContent || '').trim()),
+          editInHead: !!document.querySelector('#propertyDetailsPanel .panel-head #editPropBtn'),
+          mortgageOnPage: !!document.querySelector('#view-property #mortgageForm'),
+          historyOnPage: !!document.querySelector('#view-property #trendForm'),
+          fetchOnPage: !!document.querySelector('#view-property #fetchBcaBtn'),
+        };
+      });
+      check('detail layout order is Gallery, Property Details, Value & Mortgage Projection',
+        layout.order && layout.headings[0] === 'Gallery' && layout.headings[1] === 'Property Details'
+          && layout.headings[2] === 'Value & Mortgage Projection',
+        JSON.stringify(layout.headings));
+      check('Property Details Edit sits in the panel head (top right)', layout.editInHead === true);
+      check('the page body carries neither the mortgage setup nor the assessment history (modals only)',
+        !layout.mortgageOnPage && !layout.historyOnPage && !layout.fetchOnPage,
+        JSON.stringify(layout));
+      await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
+      await wait(400);
+      const srcLine = await page.evaluate(() => document.querySelector('#assessmentMetaView').textContent);
+      check('the Assessment History modal carries the BCA source line', srcLine.trim().length > 0, srcLine);
+      await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
+      await wait(300);
       // Edit -> change purchase date -> Save: back to read-only with
       // the new value, and the change is really persisted.
       await page.evaluate(() => document.querySelector('#editPropBtn').click());
@@ -2065,19 +2207,19 @@ try {
       check('two photos uploaded for the carousel checks', r.data.photos.length === 2, JSON.stringify(r.data.photos));
       const [ph1, ph2] = r.data.photos;
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
-      check('carousel renders one dot per photo',
-        await until(() => document.querySelectorAll('#photoArea .carousel-dots .dot').length === 2));
+      check('gallery renders one thumbnail per photo',
+        await until(() => document.querySelectorAll('#photoArea .photo-thumbs .thumb').length === 2));
       const carSrc1 = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
-      check('carousel starts on the first photo', carSrc1 === ph1.src, String(carSrc1));
+      check('gallery starts on the first photo', carSrc1 === ph1.src, String(carSrc1));
       await page.evaluate(() => document.querySelector('#photoArea [data-photo-nav="1"]').click());
       await wait(300);
       const carSrc2 = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
       check('next arrow switches to the second photo', carSrc2 === ph2.src && carSrc2 !== carSrc1, String(carSrc2));
       await page.evaluate(() => document.querySelector('#photoArea [data-photo-remove]').click());
-      check('removing the shown photo leaves a one-photo carousel',
+      check('removing the shown photo leaves a one-photo gallery',
         await until(() => {
           const c = document.querySelector('#photoArea .carousel-count');
-          return c && c.textContent.trim() === '1 / 1' && !document.querySelector('#photoArea .carousel-dots');
+          return c && c.textContent.trim() === '1 / 1' && !document.querySelector('#photoArea .photo-thumbs');
         }));
       r = await req('GET', `/api/properties/${moneyPid}`);
       check('the removal persisted (one photo left, the first one)',

@@ -113,7 +113,7 @@ const chartInfo = await page.evaluate(() => {
   const c = document.getElementById('combinedChart');
   return {
     equity: document.getElementById('equitySummary').textContent,
-    summary: document.getElementById('monthlySummary').textContent,
+    summary: (document.querySelector('#scheduleTotalRow td') || {}).textContent || '',
     canvasH: c ? c.height : 0,
   };
 });

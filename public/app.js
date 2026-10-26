@@ -827,6 +827,8 @@ $('#pfPieAssessedBtn').addEventListener('click', () => { pfPieMetric = 'assessed
 let chartA = null; // merged detail chart: assessed + outstanding lines, interest/principal bars
 let fullSeries = [];
 let chartMeta = null;
+let chartBarsBasis = null; // 'monthly' | 'yearly' | null — set by drawCombinedChart
+let scheduleYear = null; // the monthly schedule's open year page; null = automatic
 let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
@@ -855,9 +857,9 @@ function renderPhotos(p) {
       <img class="detail-photo photo-clickable" data-photo-add src="${esc(cur.src)}" alt="">
       ${photos.length > 1 ? `
         <button type="button" class="carousel-nav prev" data-photo-nav="-1" aria-label="Previous photo">&#8249;</button>
-        <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>` : ''}
+        <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>
+        <div class="photo-thumbs">${photos.map((ph, i) => `<button type="button" class="thumb${i === photoIndex ? ' active' : ''}" data-photo-dot="${i}" aria-label="Photo ${i + 1}"><img src="${esc(ph.src)}" alt=""></button>`).join('')}</div>` : ''}
       <div class="carousel-bar">
-        ${photos.length > 1 ? `<span class="carousel-dots">${photos.map((_, i) => `<span class="dot${i === photoIndex ? ' active' : ''}" data-photo-dot="${i}"></span>`).join('')}</span>` : ''}
         <span class="carousel-count">${photoIndex + 1} / ${photos.length}</span>
         <span style="flex:1"></span>
         <button type="button" class="small" data-photo-add-btn>Add photos</button>
@@ -927,7 +929,7 @@ $('#photoFiles').addEventListener('change', async (e) => {
 });
 
 // ------------------------------------------- property panel view/edit ---
-// The Property & assessment panel is read-only metadata until Edit is
+// The Property Details panel is read-only metadata until Edit is
 // clicked; Edit swaps in the form, Save/Cancel swap back. The form is
 // (re)filled from the loaded property on every load and every Edit, so
 // a cancelled edit never lingers in the inputs.
@@ -962,7 +964,14 @@ function fillPropForm(p) {
 function setPropEditing(on) {
   $('#propView').classList.toggle('hidden', on);
   $('#propForm').classList.toggle('hidden', !on);
+  // The Edit button lives in the panel head now; it steps aside
+  // while the form is open (the form has its own Save/Cancel).
+  $('#editPropBtn').classList.toggle('hidden', on);
 }
+
+// The projection section's two edit surfaces open as modals.
+$('#openMortgageBtn').addEventListener('click', () => openModal('mortgageModal'));
+$('#openHistoryBtn').addEventListener('click', () => openModal('historyModal'));
 
 $('#editPropBtn').addEventListener('click', () => {
   if (!detailProperty) return;
@@ -991,7 +1000,7 @@ async function loadPropertyDetail(id) {
     ? 'Payment day does not apply to this frequency.'
     : (p.payment_day ? `Payment day: the ${ordinal(p.payment_day)} of each month.` : 'Payment day: not set.');
   $('#paymentDayDisplay').textContent =
-    `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in the Mortgage & rates panel below.`;
+    `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in “Mortgage Terms & Rates”.`;
   $('#regionDisplay').textContent = `Region: ${p.region === 'CA' || !p.region ? 'Canada (CA)' : esc(p.region)}.`;
   // The Source line reads the same in the read-only view and in the
   // edit form (the manual-marking note applies once you are editing).
@@ -1047,7 +1056,7 @@ function segmentRateText(s) {
 }
 
 // ------------------------------------------------------------- terms ---
-// The Mortgage & rates card's lower half is the chain of terms.
+// The Mortgage Terms & Rates modal's lower half is the chain of terms.
 // Each term is an accordion: its contract fields (lender, start,
 // length, amortization, opening balance), the rate segments that
 // belong to it ("+ Change rate" adds one), and its lump sums. The
@@ -1074,7 +1083,7 @@ function currentRateText(p) {
   return `${c.rate_type === 'fixed' ? 'Fixed' : 'Variable'} at ${txt}`;
 }
 
-// Card-top summary: the current term's lender, span and number,
+// Modal-top summary: the current term's lender, span and number,
 // the rate in effect now, and the payment the projection is using
 // (auto-computed, or the entered override).
 function renderMortgageSummary() {
@@ -1240,7 +1249,7 @@ $('#termsWrap').addEventListener('click', async (e) => {
       await api(`/api/properties/${currentPropertyId}/lump-sums/${delLump.dataset.delLump}`, { method: 'DELETE' });
       markAssetsDirty();
       loadPropertyDetail(currentPropertyId);
-    } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+    } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
     return;
   }
   const delTerm = e.target.closest('[data-del-term]');
@@ -1249,9 +1258,9 @@ $('#termsWrap').addEventListener('click', async (e) => {
     try {
       await api(`/api/properties/${currentPropertyId}/terms/${delTerm.dataset.delTerm}`, { method: 'DELETE' });
       markAssetsDirty();
-      showMsg($('#detailMsg'), 'ok', 'Term deleted.');
+      showMsg($('#mortgageMsg'), 'ok', 'Term deleted.');
       loadPropertyDetail(currentPropertyId);
-    } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+    } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
   }
 });
 
@@ -1282,7 +1291,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         },
       });
       markAssetsDirty();
-      showMsg($('#detailMsg'), 'ok', 'Term saved.');
+      showMsg($('#mortgageMsg'), 'ok', 'Term saved.');
     } else if (form.dataset.segForm) {
       const f = Object.fromEntries(new FormData(form).entries());
       const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm) };
@@ -1295,7 +1304,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
       }
       await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
       markAssetsDirty();
-      showMsg($('#detailMsg'), 'ok', 'Rate segment added.');
+      showMsg($('#mortgageMsg'), 'ok', 'Rate segment added.');
     } else if (form.dataset.lumpForm) {
       const f = Object.fromEntries(new FormData(form).entries());
       parseMoneyFields(f, ['amount']);
@@ -1304,12 +1313,12 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         body: { date: f.date, amount: f.amount, note: f.note || null, term_id: Number(form.dataset.lumpForm) },
       });
       markAssetsDirty();
-      showMsg($('#detailMsg'), 'ok', 'Lump sum added.');
+      showMsg($('#mortgageMsg'), 'ok', 'Lump sum added.');
     } else {
       return;
     }
     loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
 $('#addTermBtn').addEventListener('click', async () => {
@@ -1317,9 +1326,9 @@ $('#addTermBtn').addEventListener('click', async () => {
     const t = await api(`/api/properties/${currentPropertyId}/terms`, { method: 'POST', body: {} });
     markAssetsDirty();
     expandTermId = t.id;
-    showMsg($('#detailMsg'), 'ok', 'New term added — set its amortization (and lender, if you switched banks) in the term below.');
+    showMsg($('#mortgageMsg'), 'ok', 'New term added — set its amortization (and lender, if you switched banks) in the term below.');
     loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
 $('#propForm').addEventListener('submit', async (e) => {
@@ -1345,15 +1354,15 @@ $('#mortgageForm').addEventListener('submit', async (e) => {
   // below, they do not block.
   const ay = f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years);
   if (ay !== null && (!Number.isFinite(ay) || ay < 1 || ay > 35)) {
-    showMsg($('#detailMsg'), 'err', 'Remaining amortization must be between 1 and 35 years.');
+    showMsg($('#mortgageMsg'), 'err', 'Remaining amortization must be between 1 and 35 years.');
     return;
   }
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
     markAssetsDirty();
-    showMsg($('#detailMsg'), 'ok', 'Mortgage saved.');
+    showMsg($('#mortgageMsg'), 'ok', 'Mortgage saved.');
     loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
 // Amortization quick picks (25 / 30 — the two Canadian maximums) fill
@@ -1418,7 +1427,7 @@ $('#primeRefreshBtn').addEventListener('click', async () => {
     markAssetsDirty(); // a new prime reprices every variable projection
     loadPrime();
     if (currentPropertyId) loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
 // A term's add-segment form: Variable reveals the pricing mode;
@@ -1483,11 +1492,11 @@ $('#paymentDayForm').addEventListener('submit', async (e) => {
     });
     markAssetsDirty();
     loadPropertyDetail(currentPropertyId);
-  } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
 $('#fetchBcaBtn').addEventListener('click', async () => {
-  const msg = $('#detailMsg');
+  const msg = $('#historyMsg');
   showMsg(msg, 'ok', 'Fetching from BC Assessment…');
   try {
     const r = await api(`/api/properties/${currentPropertyId}/fetch-bca`, { method: 'POST' });
@@ -1502,7 +1511,7 @@ $('#fetchBcaBtn').addEventListener('click', async () => {
 });
 
 $('#pullHistoryBtn').addEventListener('click', async () => {
-  const msg = $('#detailMsg');
+  const msg = $('#historyMsg');
   showMsg(msg, 'ok', 'Pulling assessment history from HouseSigma…');
   try {
     const r = await api(`/api/properties/${currentPropertyId}/pull-history`, { method: 'POST' });
@@ -1529,8 +1538,8 @@ $('#deletePropertyBtn').addEventListener('click', async () => {
 // ------------------------------------------------------------ value trend ---
 // Assessed-value history: one point per year. Auto points are written by
 // BC Assessment fetches; manual points fill earlier years by hand. The
-// points are drawn as the assessed-value points of the combined chart (A);
-// the table below it stays the editor for the points.
+// points are drawn as the assessed-value points of the combined chart;
+// the editor for the points is the Assessment History modal.
 let trendPoints = [];
 let trendEditingId = null;
 
@@ -1572,9 +1581,9 @@ function renderTrendSummary() {
   } else if (shown.length === 1 && trendPoints.length > 1) {
     summary.textContent = `Only the ${shown[0].year} point falls in the selected chart range — widen the range to compare years.`;
   } else if (trendPoints.length === 1) {
-    summary.textContent = 'Only one year on record — add earlier years below to see the trend.';
+    summary.textContent = 'Only one year on record — add earlier years in “Assessment History” to see the trend.';
   } else {
-    summary.textContent = 'No history yet — fetch from BC Assessment or add a point below.';
+    summary.textContent = 'No history yet — fetch from BC Assessment or add a point in “Assessment History”.';
   }
 }
 
@@ -1636,6 +1645,7 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 // with no plan the API reports NO_RATE_PLAN and the projection stays
 // absent with a prompt instead of a made-up line.
 async function loadChart(id) {
+  scheduleYear = null; // a new property's schedule opens on its default page
   const r = await api(`/api/properties/${id}/amortization`);
   if (!r.ok) {
     fullSeries = [];
@@ -1780,9 +1790,9 @@ function renderEquity() {
       `Current equity: ${money(a.equity)} — latest assessed value ${money(a.assessedValue)}` +
       `${a.assessedYear ? ` (${a.assessedYear})` : ''} minus outstanding principal ${money(a.balance)}.`;
   } else if (a.assessedValue !== null) {
-    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in the Mortgage & rates panel to see the equity.`;
+    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in “Mortgage Terms & Rates” to see the equity.`;
   } else if (a.balance !== null) {
-    el.textContent = `Outstanding principal: ${money(a.balance)}. Fetch the assessed value from BC Assessment (or add a value-history point below) to see the equity.`;
+    el.textContent = `Outstanding principal: ${money(a.balance)}. Fetch the assessed value from BC Assessment (in “Assessment History”) to see the equity.`;
   } else {
     el.textContent = 'Equity appears here once an assessed value and an outstanding principal is on record.';
   }
@@ -1809,6 +1819,7 @@ function renderDetailCharts() {
   renderDerivedPaymentNote();
   renderMortgageSummary();
   drawCombinedChart();
+  renderSchedule();
 }
 
 // The detail page's one chart (merged from the former pair): the
@@ -1830,9 +1841,9 @@ function drawCombinedChart() {
   const cmsg = $('#combinedMsg');
   if (cmsg) {
     if (amortError && amortError.code === 'NO_RATE_PLAN') {
-      showMsg(cmsg, 'warn', 'No projection yet — add a rate segment in the Mortgage & rates panel above, and the outstanding-principal line will be projected from it.');
+      showMsg(cmsg, 'warn', 'No projection yet — set up a rate plan: open “Mortgage Terms & Rates” (above) and add a rate segment, and the outstanding-principal line will be projected from it.');
     } else if (amortError && amortError.code === 'NO_PAYMENT') {
-      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — add a monthly payment or remaining amortization in the Mortgage & rates panel above to project it.');
+      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — add a monthly payment or remaining amortization in “Mortgage Terms & Rates” (above) to project it.');
     } else if (amortError) {
       showMsg(cmsg, 'warn', amortError.error);
     } else {
@@ -1841,9 +1852,7 @@ function drawCombinedChart() {
     }
   }
   const mmsg = $('#monthlyMsg');
-  const summaryEl = $('#monthlySummary');
   mmsg.className = 'msg';
-  summaryEl.textContent = '';
   const datasets = [];
   const months = currentRangeMonths();
   const shownYears = [];
@@ -1858,6 +1867,7 @@ function drawCombinedChart() {
     datasets.push({
       type: 'line',
       label: 'Assessed value',
+      yAxisID: 'y',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
       // One value per assessment year, joined by straight line
@@ -1879,6 +1889,7 @@ function drawCombinedChart() {
       datasets.push({
         type: 'line',
         label: 'Outstanding principal',
+        yAxisID: 'y',
         data: pts,
         borderColor: '#1668c4', backgroundColor: '#1668c4',
         tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2, order: 1,
@@ -1930,6 +1941,7 @@ function drawCombinedChart() {
       datasets.push({
         type: 'bar',
         label: 'Interest portion',
+        yAxisID: 'y1',
         data: pts.map((p) => ({ x: p.x, y: p.interest })),
         backgroundColor: '#d97706', borderColor: '#d97706',
         stack: 'payment', borderWidth: 1, order: 2,
@@ -1937,39 +1949,34 @@ function drawCombinedChart() {
       datasets.push({
         type: 'bar',
         label: 'Principal portion',
+        yAxisID: 'y1',
         data: pts.map((p) => ({ x: p.x, y: p.principal })),
         backgroundColor: '#2e7d4f', borderColor: '#2e7d4f',
         stack: 'payment', borderWidth: 1, order: 2,
       });
     }
   }
-  // The projection summary that used to sit over the separate
-  // monthly chart now sits over this one.
-  if (chartMeta) {
-    const srcNote = chartMeta.paymentSource === 'derived' ? 'derived from remaining amortization' : 'entered';
-    const payBit = !chartMeta.frequency || chartMeta.frequency === 'monthly'
-      ? `Monthly payment used: ${money(chartMeta.paymentUsed)} (${srcNote})`
-      : `Payments: ${chartMeta.frequencyLabel} — ${money(chartMeta.periodPayment)} per payment, converted from a monthly payment of ${money(chartMeta.paymentUsed)} (${srcNote})`;
-    const bits = [
-      payBit,
-      `Projected total interest: ${money(chartMeta.totalInterest)}`,
-      `Total principal: ${money(chartMeta.balance)}`,
-      chartMeta.payoffMonth ? `Projected payoff: ${chartMeta.payoffMonth}` : 'Not paid off within the projection window',
-    ];
-    if (barsBasis === 'yearly') bits.push('Bars: yearly interest & principal totals (the displayed span is over 10 years)');
-    else if (barsBasis === 'monthly') bits.push('Bars: monthly interest & principal portions');
-    summaryEl.textContent = bits.join(' · ');
-    if (chartMeta.negativeAmortization) {
-      showMsg(mmsg, 'warn', 'Warning: the monthly payment is below the monthly interest in some months (negative amortization) — the balance grows there.');
-    }
+  chartBarsBasis = barsBasis;
+  // The projection's figures (payment used, total interest, total
+  // principal, payoff) live in the monthly schedule's Total row
+  // below the chart now — no text summary block over the chart. The
+  // one warning with no tabular home stays beside the chart.
+  if (chartMeta && chartMeta.negativeAmortization) {
+    showMsg(mmsg, 'warn', 'Warning: the monthly payment is below the monthly interest in some months (negative amortization) — the balance grows there.');
   }
   if (!datasets.length) return;
-  // The amount axis always starts at 0 and tops out just above the
-  // largest value drawn (assessed points, projection line, stacked
-  // bar totals) — never a truncated axis starting near the balance.
-  let dataMax = 0;
-  for (const ds of datasets) for (const p of ds.data) if (p.y > dataMax) dataMax = p.y;
-  for (const t of barTotals) if (t > dataMax) dataMax = t;
+  // Two axes, two maxima: the lines set the left (amount) axis, the
+  // stacked bar totals set the right (payment) axis. Both start at
+  // 0 — the payments are three orders of magnitude below the
+  // balances, so on one shared axis the bars were invisible; on
+  // their own axis they read at their real size.
+  let lineMax = 0;
+  for (const ds of datasets) {
+    if (ds.type !== 'line') continue;
+    for (const p of ds.data) if (p.y > lineMax) lineMax = p.y;
+  }
+  let barMax = 0;
+  for (const t of barTotals) if (t > barMax) barMax = t;
   chartA = new Chart(ctx, {
     data: { datasets },
     plugins: [guideLinePlugin],
@@ -1977,10 +1984,22 @@ function drawCombinedChart() {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'nearest', intersect: false },
       plugins: {
+        legend: {
+          labels: {
+            // Each series names its axis in the legend — with two
+            // scales this far apart, a bare label would invite
+            // reading a bar against the amount axis.
+            generateLabels: (chart) => chart.data.datasets.map((ds, i) => ({
+              text: `${ds.label}${ds.yAxisID === 'y1' ? ' (payment axis)' : ' (value axis)'}`,
+              fillStyle: ds.backgroundColor, strokeStyle: ds.borderColor, lineWidth: 1,
+              datasetIndex: i, hidden: !chart.isDatasetVisible(i),
+            })),
+          },
+        },
         tooltip: {
           callbacks: {
             title: (items) => formatYearTick(items[0].parsed.x),
-            label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}`,
+            label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}${item.dataset.yAxisID === 'y1' ? ' (payment axis)' : ' (value axis)'}`,
             footer: (items) => {
               const it = items[0];
               if (!it || it.dataset.stack !== 'payment') return '';
@@ -1993,16 +2012,121 @@ function drawCombinedChart() {
       },
       scales: {
         x: { type: 'linear', ...(win || {}), ticks: { ...(win ? yearAxisTicks(win.min, win.max) : {}), callback: formatYearTick } },
+        // Left axis: assessed values and outstanding balances.
+        // Right axis: the payment split only, grid lines off (the
+        // left axis draws the grid), hidden entirely when there
+        // are no bars to scale.
         y: {
           min: 0,
-          ...(dataMax > 0 ? { max: dataMax * 1.05 } : {}),
+          ...(lineMax > 0 ? { max: lineMax * 1.05 } : {}),
           ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' },
+        },
+        y1: {
+          position: 'right',
+          display: barTotals.length > 0,
+          min: 0,
+          ...(barMax > 0 ? { max: barMax * 1.1 } : {}),
+          grid: { drawOnChartArea: false },
+          ticks: { callback: moneyTick }, title: { display: true, text: 'Payment ($)' },
         },
       },
     },
   });
   window.__fmCharts.a = chartA;
 }
+
+// ------------------------------------------------------ monthly schedule ---
+// The table under the projection chart: the very series the bars
+// draw, one row per month — Month | Payment | Principal | Interest |
+// Remaining principal — clipped to the chart's current window and
+// paged by calendar year (one year per page). Its Total row sums
+// the WHOLE window, not the open page: the projection's totals
+// (total payment / principal / interest, and the payoff month when
+// it lands in range) live there now, in place of the old text
+// summary over the chart. The exact sums ride in data attributes
+// next to the app's usual rounded money display.
+function monthLabel(ym) {
+  const [y, m] = String(ym).split('-').map(Number);
+  return `${MONTH_NAMES[(m || 1) - 1]} ${y}`;
+}
+
+function scheduleWindowRows() {
+  if (!chartMeta || !fullSeries.length) return [];
+  const winLb = lookbackWindow(currentRangeMonths());
+  if (!winLb) return fullSeries.slice();
+  return fullSeries.filter((r) => {
+    const x = ymDecimal(r.month);
+    return x >= winLb.min && x <= winLb.max;
+  });
+}
+
+function scheduleYears() {
+  return [...new Set(scheduleWindowRows().map((r) => String(r.month).slice(0, 4)))];
+}
+
+function renderSchedule() {
+  const tbody = $('#scheduleRows');
+  if (!tbody) return;
+  const pager = $('#schedulePager');
+  const totalRow = $('#scheduleTotalRow');
+  const note = $('#scheduleNote');
+  if (note) {
+    note.textContent = chartBarsBasis === 'yearly'
+      ? 'On spans over 10 years the chart bars are yearly interest & principal totals; this table always stays monthly.'
+      : '';
+  }
+  const rows = scheduleWindowRows();
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="note" style="margin:0">No projected months fall in the selected range.</td></tr>';
+    if (pager) pager.classList.add('hidden');
+    if (totalRow) totalRow.classList.add('hidden');
+    return;
+  }
+  const years = [...new Set(rows.map((r) => String(r.month).slice(0, 4)))];
+  const todayYear = String(new Date().getFullYear());
+  if (!scheduleYear || !years.includes(scheduleYear)) {
+    scheduleYear = years.includes(todayYear) ? todayYear : years[0];
+  }
+  const pageRows = rows.filter((r) => String(r.month).slice(0, 4) === scheduleYear);
+  tbody.innerHTML = pageRows.map((r) => `<tr>
+    <td>${monthLabel(r.month)}</td>
+    <td class="num">${money(r.payment)}</td>
+    <td class="num">${money(r.principal)}</td>
+    <td class="num">${money(r.interest)}</td>
+    <td class="num">${money(r.balance)}</td></tr>`).join('');
+  const sel = $('#scheduleYearSelect');
+  sel.innerHTML = years.map((y) => `<option value="${y}"${y === scheduleYear ? ' selected' : ''}>${y}</option>`).join('');
+  const idx = years.indexOf(scheduleYear);
+  $('#schedulePrevYear').disabled = idx <= 0;
+  $('#scheduleNextYear').disabled = idx >= years.length - 1;
+  pager.classList.remove('hidden');
+  const sum = (k) => rows.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  let label = `Total — ${monthLabel(first.month)} to ${monthLabel(last.month)} (${rows.length} month${rows.length === 1 ? '' : 's'})`;
+  if (chartMeta.payoffMonth && chartMeta.payoffMonth >= first.month && chartMeta.payoffMonth <= last.month) {
+    label += ` · Paid off ${chartMeta.payoffMonth}`;
+  }
+  totalRow.classList.remove('hidden');
+  totalRow.innerHTML = `<td>${esc(label)}</td>
+    <td class="num sum-payment" data-value="${sum('payment')}">${money(sum('payment'))}</td>
+    <td class="num sum-principal" data-value="${sum('principal')}">${money(sum('principal'))}</td>
+    <td class="num sum-interest" data-value="${sum('interest')}">${money(sum('interest'))}</td>
+    <td class="num">${money(last.balance)}</td>`;
+}
+
+function stepScheduleYear(delta) {
+  const years = scheduleYears();
+  const i = years.indexOf(scheduleYear);
+  const next = years[i + delta];
+  if (next) { scheduleYear = next; renderSchedule(); }
+}
+$('#schedulePrevYear').addEventListener('click', () => stepScheduleYear(-1));
+$('#scheduleNextYear').addEventListener('click', () => stepScheduleYear(1));
+$('#scheduleYearSelect').addEventListener('change', (e) => {
+  scheduleYear = e.target.value;
+  renderSchedule();
+});
 
 $('#rangeBtns').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-months]');

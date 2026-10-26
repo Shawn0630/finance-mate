@@ -183,23 +183,32 @@ the balance grows accordingly. With no rate plan there is no
 projection at all; with a plan but no amortization on the current
 term and no entered payment, the state is NO_PAYMENT.
 
-Terms, their segments and their lump sums all live in the one
-Mortgage & rates card on the detail page, as an accordion under a
-card-top summary (current term, lender, rate in effect, and the
-payment in use — labelled auto or entered). The Mortgage form at the
-top of the card edits the current balance anchor plus the current
-term's amortization and lender (25 / 30 quick picks for the usual
-Canadian maximums — insured mortgages are generally capped at 25
-years, 30 for first-time buyers and newly built homes since Dec 15,
-2024, and uninsured mortgages at 30; the field accepts 1–35 for
-planning, flagging anything past 30). When the payment is derived,
-the panel names the derived amount. The merged chart on the detail
-page shows each payment split into its interest portion and
-principal portion (stacked bars; the two sum to the payment) with
-the projected total interest, total principal and payoff month
-beside it. The current term's lender (free text, with the big
-Canadian banks as suggestions) also shows in the panel heading and
-in the Property & assessment metadata once set.
+The detail page is laid out as: Gallery (the photo wall),
+Property Details (minimal read-only metadata, Edit in the panel
+head), then Value & Mortgage Projection — the hero section, whose
+chart plots assessed value and outstanding principal on the left
+axis and the payment split on a right payment axis, over a monthly
+schedule table (paged by year) whose Total row carries the
+projection's total payment, principal and interest and the payoff
+month. Terms, their segments and their lump sums all live in the
+Mortgage Terms & Rates modal (opened from the projection section),
+as an accordion under a modal-top summary (current term, lender,
+rate in effect, and the payment in use — labelled auto or entered).
+The Mortgage form at the top of the modal edits the current balance
+anchor plus the current term's amortization and lender (25 / 30
+quick picks for the usual Canadian maximums — insured mortgages are
+generally capped at 25 years, 30 for first-time buyers and newly
+built homes since Dec 15, 2024, and uninsured mortgages at 30; the
+field accepts 1–35 for planning, flagging anything past 30). When
+the payment is derived, the modal names the derived amount. The
+merged chart shows each payment split into its interest portion and
+principal portion (stacked bars; the two sum to the payment). The
+current term's lender (free text, with the big Canadian banks as
+suggestions) also shows in the modal heading and in the Property
+Details metadata once set. The assessment source data — BC
+Assessment fetch, HouseSigma history pull, the history points and
+their editor — lives in the Assessment History modal, also opened
+from the projection section.
 
 Existing databases migrate in place on boot: each property gets a
 Term 1 that mirrors the pre-term model (start at the earliest
@@ -220,7 +229,7 @@ with the new value. If the Bank of Canada is unreachable, the last
 known value is used instead, the API response flags it
 (`prime: { rate, asOf, fresh: false }`), and the page shows an amber
 warning naming the rate and date in use. A manual Refresh button
-sits in the Mortgage & rates panel. A prime-priced segment always
+sits in the Mortgage Terms & Rates modal. A prime-priced segment always
 resolves against the latest stored prime, floored at 0%, and
 projections hold prime constant — the detail page states the value
 and its as-of date.

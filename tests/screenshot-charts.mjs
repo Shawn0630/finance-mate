@@ -139,7 +139,7 @@ try {
     return {
       canvases: [...document.querySelectorAll('#view-property canvas')].map((c) => c.id),
       equityText: document.getElementById('equitySummary').textContent,
-      monthlySummary: document.getElementById('monthlySummary').textContent,
+      scheduleTotal: (document.querySelector('#scheduleTotalRow td') || {}).textContent || '',
       chartA: describe(window.__fmCharts.a),
     };
   });
