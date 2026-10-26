@@ -148,7 +148,7 @@
     </div>
 
     <div class="panel">
-      <h3>Mortgage <span class="note" id="mortgageLenderTag" style="margin:0"></span></h3>
+      <h3>Mortgage &amp; rates <span class="note" id="mortgageLenderTag" style="margin:0"></span></h3>
       <form id="mortgageForm">
         <div class="grid3">
           <div><label>Outstanding principal ($)</label><input name="mortgage_balance" type="text" inputmode="decimal" data-money></div>
@@ -178,10 +178,7 @@
         <div class="note" id="derivedPaymentNote" style="margin-left:0"></div>
         <div class="toolbar"><button class="primary" type="submit">Save mortgage</button></div>
       </form>
-    </div>
-
-    <div class="panel">
-      <h3>Rate segments</h3>
+      <h4>Rate segments</h4>
       <div class="toolbar" style="align-items:flex-start">
         <div>
           <div class="note" id="primeBanner" style="margin:0">Loading prime rate…</div>
@@ -215,16 +212,26 @@
         <div><label>Payment day (deduction day)</label><input type="number" id="paymentDayInput" min="1" max="31" step="1" placeholder="e.g. 1" style="width:110px"></div>
         <button type="submit">Save payment schedule</button>
       </form>
-      <div class="note" style="margin-left:0">The monthly payment amount (in the Mortgage panel) is converted to a per-payment amount by frequency: regular schedules keep the same yearly total, while accelerated schedules pay half the monthly amount every two weeks (a quarter weekly) — 13 monthly payments a year. The payment day (1–31, leave empty to clear) is the day of the month your payment leaves your account; it only anchors the projection charts' dates for monthly and semi-monthly schedules, so the interest amounts do not depend on it.</div>
+      <div class="note" style="margin-left:0">The monthly payment amount (above, in this panel) is converted to a per-payment amount by frequency: regular schedules keep the same yearly total, while accelerated schedules pay half the monthly amount every two weeks (a quarter weekly) — 13 monthly payments a year. The payment day (1–31, leave empty to clear) is the day of the month your payment leaves your account; it only anchors the projection charts' dates for monthly and semi-monthly schedules, so the interest amounts do not depend on it.</div>
       <div class="note" id="paymentFreqNote" style="margin-left:0"></div>
     </div>
 
     <div class="panel">
-      <h3>Value vs. outstanding principal</h3>
+      <h3>Value, outstanding principal &amp; payments</h3>
       <div class="note" id="equitySummary" style="margin-left:0"></div>
+      <div class="toolbar range-btns" id="rangeBtns">
+        <button data-months="12">1 year</button>
+        <button data-months="24">2 years</button>
+        <button data-months="60" class="active">5 years</button>
+        <button data-months="120">10 years</button>
+        <button data-months="0">All (to payoff)</button>
+        <span>Custom months: <input id="customMonths" type="number" min="1" max="600" style="width:90px"></span>
+      </div>
       <div class="msg" id="combinedMsg"></div>
+      <div class="msg" id="monthlyMsg"></div>
+      <div class="note" id="monthlySummary" style="margin-left:0"></div>
       <div class="chart-wrap"><canvas id="combinedChart"></canvas></div>
-      <div class="note" style="margin-left:0">The assessed values are plotted as one point per assessment year, through the last known year, connected by straight lines. The current year is fetched from BC Assessment automatically (and records that year's point); earlier years are pulled from HouseSigma — once when the property is added, and again whenever you press "Pull history from HouseSigma". Pulled points never overwrite a point you entered by hand or one fetched from BC Assessment. You can still add, edit or delete points by hand.</div>
+      <div class="note" style="margin-left:0">The assessed values are plotted as one point per assessment year, through the last known year, connected by straight lines. The bars split each payment into its interest and principal portions (stacked, so a bar's full height is the payment); on spans over 10 years they are yearly totals instead of monthly ones. The current year is fetched from BC Assessment automatically (and records that year's point); earlier years are pulled from HouseSigma — once when the property is added, and again whenever you press "Pull history from HouseSigma". Pulled points never overwrite a point you entered by hand or one fetched from BC Assessment. You can still add, edit or delete points by hand.</div>
       <div class="note" id="trendSummary" style="margin-left:0"></div>
       <div class="note" id="hsPullNote" style="margin-left:0"></div>
       <div class="msg" id="trendMsg"></div>
@@ -241,20 +248,6 @@
       </form>
     </div>
 
-    <div class="panel">
-      <h3>Monthly interest &amp; principal</h3>
-      <div class="toolbar range-btns" id="rangeBtns">
-        <button data-months="12">1 year</button>
-        <button data-months="24">2 years</button>
-        <button data-months="60" class="active">5 years</button>
-        <button data-months="120">10 years</button>
-        <button data-months="0">All (to payoff)</button>
-        <span>Custom months: <input id="customMonths" type="number" min="1" max="600" style="width:90px"></span>
-      </div>
-      <div class="msg" id="monthlyMsg"></div>
-      <div class="note" id="monthlySummary" style="margin-left:0"></div>
-      <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
-    </div>
   </section>
 
   <!-- ============================== Admin ============================== -->

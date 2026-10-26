@@ -1369,6 +1369,107 @@ try {
         !!ax && ax.min === 2019 && ax.max === ax.dataMax && ax.max < 2060,
         JSON.stringify(ax && { min: ax.min, max: ax.max, dataMax: ax.dataMax }));
 
+      // ---- Merged chart: the payment-split bars live in chart A now ----
+      // One canvas on the detail page, its own range controls inside
+      // the chart's panel, the y axis anchored at 0, and the bars
+      // governed by the same look-back window as the lines: monthly
+      // inside a range, summed into yearly bars on the All span.
+      const winAmort = (await req('GET', `/api/properties/${winPid}/amortization`)).data;
+      const ymDec = (s) => { const [y, m] = s.split('-').map(Number); return y + (m - 1) / 12; };
+      const barInfo = () => page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        if (!c) return null;
+        const ints = c.data.datasets.find((d) => d.label === 'Interest portion');
+        const prins = c.data.datasets.find((d) => d.label === 'Principal portion');
+        return {
+          canvasCount: document.querySelectorAll('#view-property canvas').length,
+          hasMonthlyCanvas: !!document.querySelector('#monthlyChart'),
+          labels: c.data.datasets.map((d) => d.label),
+          yMin: c.scales.y.min, yMax: c.scales.y.max,
+          dataMaxY: Math.max(...c.data.datasets.flatMap((d) => d.data.map((p) => p.y))),
+          bars: ints && prins ? {
+            stack: [ints.stack, prins.stack], types: [ints.type, prins.type],
+            xs: ints.data.map((p) => p.x),
+            sums: ints.data.map((p, i) => p.y + prins.data[i].y),
+          } : null,
+        };
+      });
+      const samePanel = await page.evaluate(() => {
+        const rb = document.querySelector('#rangeBtns');
+        const cc = document.querySelector('#combinedChart');
+        return !!rb && !!cc && rb.closest('.panel') === cc.closest('.panel');
+      });
+      check('the merged chart panel carries its own range controls', samePanel === true);
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="60"]').click());
+      await wait(600);
+      const tdB = await todayDec();
+      const rowsIn = (monthsBack) => winAmort.series.filter((r) => {
+        const x = ymDec(r.month);
+        return x >= tdB - monthsBack / 12 - 0.001 && x <= tdB + 0.001;
+      });
+      const exp60 = rowsIn(60);
+      let bi = await barInfo();
+      check('detail page has exactly one chart canvas (the merged chart)',
+        !!bi && bi.canvasCount === 1 && bi.hasMonthlyCanvas === false,
+        JSON.stringify(bi && { n: bi.canvasCount, monthly: bi.hasMonthlyCanvas }));
+      check('merged chart draws all four datasets (2 lines + 2 bar portions)',
+        !!bi && ['Assessed value', 'Outstanding principal', 'Interest portion', 'Principal portion']
+          .every((l) => bi.labels.includes(l)), JSON.stringify(bi && bi.labels));
+      check('merged chart y axis starts at 0 with modest headroom above the data',
+        !!bi && bi.yMin === 0 && bi.yMax > bi.dataMaxY && bi.yMax < bi.dataMaxY * 1.2,
+        JSON.stringify(bi && { yMin: bi.yMin, yMax: bi.yMax, dataMaxY: bi.dataMaxY }));
+      check('merged chart bars are monthly in the 5-year window and match the API series',
+        !!bi && !!bi.bars && bi.bars.types[0] === 'bar' && bi.bars.stack[0] === 'payment'
+          && bi.bars.xs.length === exp60.length && exp60.length > 12
+          && bi.bars.sums.slice(0, 6).every((s, k) => Math.abs(s - exp60[k].payment) < 0.02),
+        JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, exp: exp60.length }));
+      const stackGeo = await page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        if (!c) return null;
+        c.update('none');
+        const mi = c.data.datasets.findIndex((d) => d.label === 'Interest portion');
+        const mp = c.data.datasets.findIndex((d) => d.label === 'Principal portion');
+        const ei = c.getDatasetMeta(mi).data[3];
+        const ep = c.getDatasetMeta(mp).data[3];
+        if (!ei || !ep) return null;
+        return { intBase: ei.base, intTop: ei.y, prinBase: ep.base, zeroPix: c.scales.y.getPixelForValue(0) };
+      });
+      check('merged chart bars really stack (principal sits on interest, interest on zero)',
+        !!stackGeo && Math.abs(stackGeo.intBase - stackGeo.zeroPix) < 2
+          && Math.abs(stackGeo.prinBase - stackGeo.intTop) < 2,
+        JSON.stringify(stackGeo));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="24"]').click());
+      await wait(600);
+      bi = await barInfo();
+      ax = await axisA();
+      const exp24 = rowsIn(24);
+      check('clicking 2 years in the chart panel rescales the axis and redraws the bars to the window',
+        !!ax && Math.abs(ax.max - ax.min - 2) < 0.02
+          && !!bi && !!bi.bars && bi.bars.xs.length === exp24.length
+          && bi.bars.xs.every((x) => x >= ax.min - 0.001 && x <= ax.max + 0.001),
+        JSON.stringify({ ax: ax && { min: ax.min, max: ax.max }, bars: bi && bi.bars && bi.bars.xs.length, exp: exp24.length }));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
+      await wait(600);
+      bi = await barInfo();
+      const exp12 = rowsIn(12);
+      check('clicking 1 year shrinks the bars to just that year of payments',
+        !!bi && !!bi.bars && bi.bars.xs.length === exp12.length && exp12.length < exp60.length,
+        JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, exp: exp12.length }));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
+      await wait(600);
+      bi = await barInfo();
+      const yearsAll = [...new Set(winAmort.series.map((r) => r.month.slice(0, 4)))];
+      const totBars = bi && bi.bars ? bi.bars.sums.reduce((s, v) => s + v, 0) : 0;
+      const totApi = winAmort.series.reduce((s, r) => s + r.payment, 0);
+      const sumText = await page.evaluate(() => document.querySelector('#monthlySummary').textContent);
+      check('All view aggregates the bars by year (one bar per projection year)',
+        !!bi && !!bi.bars && bi.bars.xs.length === yearsAll.length
+          && bi.bars.xs.every((x) => Number.isInteger(x))
+          && Math.abs(totBars - totApi) < 1,
+        JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, years: yearsAll.length, totBars, totApi }));
+      check('the summary names the yearly bar basis on the All span',
+        sumText.includes('yearly interest & principal totals'), sumText);
+
       // Portfolio combined chart: the same look-back window applies
       // to its assessed line (years are the union across properties;
       // this fixture's 2019 is the earliest year on record). Being a
@@ -1410,6 +1511,11 @@ try {
       check('portfolio axis is the 5-year look-back ending today',
         !!pax && Math.abs(pax.max - tdP) < 0.02 && Math.abs(pax.min - (tdP - 5)) < 0.05,
         JSON.stringify(pax && { min: pax.min, max: pax.max }));
+      const pfY = await page.evaluate(() => {
+        const c = window.__fmCharts.portfolio;
+        return c ? { min: c.scales.y.min, max: c.scales.y.max } : null;
+      });
+      check('portfolio y axis starts at 0', !!pfY && pfY.min === 0, JSON.stringify(pfY));
       await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="12"]').click());
       await wait(600);
       const pf1Pts = await pfPts();
@@ -1467,6 +1573,10 @@ try {
       const combMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('detail chart A announces the missing payment beside the chart (NO_PAYMENT)',
         combMsg.includes('add a monthly payment or remaining amortization'), combMsg);
+      const stepLabels = await page.evaluate(() => window.__fmCharts.a.data.datasets.map((d) => d.label));
+      check('with no payment there are no payment bars (projection absent, note shown)',
+        !stepLabels.includes('Interest portion') && !stepLabels.includes('Principal portion'),
+        JSON.stringify(stepLabels));
       // Pixel-level proof of the straight-line rendering: the canvas
       // column at x = 2025 (inside the chart area only, so the legend
       // swatch cannot interfere) must carry the 2025 marker at the
@@ -1530,15 +1640,15 @@ try {
         !!pfPtsCfg && pfPtsCfg.showLine !== false && pfPtsCfg.tension === 0 && !pfPtsCfg.stepped && pfPtsCfg.n >= 5,
         JSON.stringify(pfPtsCfg));
 
-      // ---- Amortization years in the Mortgage panel derive the payment ----
+      // ---- Amortization years in the Mortgage & rates panel derive the payment ----
       // The user's exact shape again (balance + one prime-spread
       // segment, nothing else), driven through the UI this time:
       // typing ONLY the remaining amortization (30) and a lender into
       // the Mortgage form must flip the page from NO_PAYMENT to a
-      // full projection — the panel names the derived payment, Chart
-      // B splits every month into interest + principal portions that
-      // sum to that month's payment, and the summary totals agree
-      // with the amortization endpoint.
+      // full projection — the panel names the derived payment, the
+      // merged chart splits every payment into interest + principal
+      // portions that sum to it, and the summary totals agree with
+      // the amortization endpoint.
       r = await req('POST', '/api/properties', {
         address: '123 Amort Test Way, Victoria, BC',
         mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
@@ -1564,37 +1674,56 @@ try {
           && Math.abs(amortApi.paymentUsed - 6381.36) < 0.5,
         JSON.stringify({ ok: amortApi.ok, src: amortApi.paymentSource, used: amortApi.paymentUsed }));
       const derivedNote = await page.evaluate(() => document.querySelector('#derivedPaymentNote').textContent);
-      check('Mortgage panel names the derived payment and its amount',
+      check('Mortgage & rates panel names the derived payment and its amount',
         derivedNote.includes('derived from the remaining amortization') && derivedNote.includes('6,381'),
         derivedNote);
       const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('the NO_PAYMENT note beside chart A clears once amortization is in',
         !afterMsg.includes('add a monthly payment or remaining amortization'), afterMsg);
+      // The split bars live in the merged chart now (the former
+      // Chart B). This fixture's balance date is today, so inside
+      // the default look-back window the projection is still in the
+      // future — switch to All, where the bars are yearly sums, and
+      // compare year by year against the endpoint's series.
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
+      await wait(600);
       const chartBInfo = await page.evaluate(() => {
-        const c = window.__fmCharts.b;
+        const c = window.__fmCharts.a;
         if (!c) return null;
+        const ints = c.data.datasets.find((d) => d.label === 'Interest portion');
+        const prins = c.data.datasets.find((d) => d.label === 'Principal portion');
+        if (!ints || !prins) return null;
         return {
-          type: c.config.type,
-          labels: c.data.datasets.map((d) => d.label),
-          stacks: c.data.datasets.map((d) => d.stack),
-          sums: c.data.datasets[0].data.slice(0, 6).map((v, i) => v + c.data.datasets[1].data[i]),
+          types: [ints.type, prins.type],
+          labels: [ints.label, prins.label],
+          stacks: [ints.stack, prins.stack],
+          sums: ints.data.map((p, i) => p.y + prins.data[i].y),
         };
       });
-      check('chart B is a stacked bar split into Interest portion + Principal portion',
-        !!chartBInfo && chartBInfo.type === 'bar'
+      check('the merged chart carries the stacked Interest portion + Principal portion bars',
+        !!chartBInfo && chartBInfo.types[0] === 'bar'
           && chartBInfo.labels[0] === 'Interest portion' && chartBInfo.labels[1] === 'Principal portion'
           && chartBInfo.stacks[0] === 'payment' && chartBInfo.stacks[1] === 'payment',
-        JSON.stringify(chartBInfo && { type: chartBInfo.type, labels: chartBInfo.labels, stacks: chartBInfo.stacks }));
-      let splitOk = !!chartBInfo && chartBInfo.sums.length === 6 && !!amortApi.series;
+        JSON.stringify(chartBInfo && { types: chartBInfo.types, labels: chartBInfo.labels, stacks: chartBInfo.stacks }));
+      const yearSums = [];
+      if (amortApi.series) {
+        const byY = new Map();
+        for (const r of amortApi.series) {
+          const y = r.month.slice(0, 4);
+          byY.set(y, (byY.get(y) || 0) + r.payment);
+        }
+        yearSums.push(...[...byY.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([, v]) => v));
+      }
+      let splitOk = !!chartBInfo && chartBInfo.sums.length === yearSums.length && yearSums.length > 6;
       if (splitOk) {
         for (let k = 0; k < 6; k++) {
-          if (Math.abs(chartBInfo.sums[k] - amortApi.series[k].payment) > 0.02) { splitOk = false; break; }
+          if (Math.abs(chartBInfo.sums[k] - yearSums[k]) > 1) { splitOk = false; break; }
         }
       }
-      check('chart B portions sum to the payment in each of the first 6 months',
-        splitOk, JSON.stringify(chartBInfo && chartBInfo.sums));
+      check('merged chart bar portions sum to each year\u2019s payments (first 6 years)',
+        splitOk, JSON.stringify(chartBInfo && chartBInfo.sums.slice(0, 6)));
       const monthlySummary = await page.evaluate(() => document.querySelector('#monthlySummary').textContent);
-      check('chart B summary shows projected total interest, total principal and the payoff month',
+      check('merged chart summary shows projected total interest, total principal and the payoff month',
         monthlySummary.includes('Projected total interest')
           && monthlySummary.includes('Total principal')
           && !!amortApi.payoffMonth && monthlySummary.includes(`Projected payoff: ${amortApi.payoffMonth}`),
@@ -1604,10 +1733,19 @@ try {
         tag: document.querySelector('#mortgageLenderTag').textContent,
         input: document.querySelector('#mortgageForm [name=lender]').value,
       }));
-      check('lender shows in the read-only panel, the Mortgage heading and the form',
+      check('lender shows in the read-only panel, the Mortgage & rates heading and the form',
         lenderBits.view.includes('Lender') && lenderBits.view.includes('Scotiabank')
           && lenderBits.tag.includes('Scotiabank') && lenderBits.input === 'Scotiabank',
         JSON.stringify(lenderBits));
+      const sameCard = await page.evaluate(() => {
+        const p1 = document.querySelector('#mortgageForm').closest('.panel');
+        const p2 = document.querySelector('#segmentRows').closest('.panel');
+        const p3 = document.querySelector('#paymentDayForm').closest('.panel');
+        return { same: !!p1 && p1 === p2 && p1 === p3, heading: p1 ? p1.querySelector('h3').textContent.trim() : '' };
+      });
+      check('mortgage terms and rate segments live in one Mortgage & rates card',
+        sameCard.same && sameCard.heading.startsWith('Mortgage & rates'),
+        JSON.stringify(sameCard));
       const portUi = (await req('GET', '/api/properties/portfolio')).data;
       const rowUi = portUi.properties.find((x) => x.id === amortPid);
       check('the UI-entered amortization flips the portfolio state to projected',

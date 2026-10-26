@@ -11,10 +11,13 @@ placeholder pages for later rounds.
   is the card cover), BC Assessment
   assessed value, outstanding principal, and any number of **rate segments**
   (fixed / variable, each with its own start date and annual rate).
-- **Mortgage projection chart** — month-by-month **monthly interest** and
-  **outstanding principal** lines (dual axis), with a selectable range
+- **Mortgage projection chart** — one merged chart on the property page:
+  the assessed-value and **outstanding principal** lines plus stacked
+  bars splitting each payment into its **interest** and **principal**
+  portions (yearly bars on spans over 10 years), on a single amount
+  axis that starts at 0. The chart panel carries its own range controls
   (1 / 2 / 5 / 10 years, all the way to payoff, or a custom number of
-  months), the total interest in range and the projected payoff month.
+  months), with the projected total interest and payoff month beside it.
 - **Other assets** — simple register by category: Fixed assets, Stocks,
   Term deposits, Other, with subtotals.
 - **Layout** — the Assets module has a persistent secondary menu:
@@ -156,18 +159,19 @@ payment is derived from the remaining amortization years. If the payment is
 below the monthly interest, the chart area shows a negative-amortization
 warning and the balance grows accordingly.
 
-The remaining amortization is entered in the Mortgage panel (25 / 30
-quick picks for the usual Canadian maximums — insured mortgages are
+The remaining amortization is entered in the Mortgage & rates panel
+(the mortgage terms and the rate segments live in that one card; 25 /
+30 quick picks for the usual Canadian maximums — insured mortgages are
 generally capped at 25 years, 30 for first-time buyers and newly built
 homes since Dec 15, 2024, and uninsured mortgages at 30; the field
 accepts 1–35 for planning, flagging anything past 30). When the payment
-is derived, the panel names the derived amount. The monthly chart shows
-each payment split into its interest portion and principal portion
-(stacked; the two sum to the payment) with the projected total
-interest, total principal and payoff month beside it. The Mortgage
-panel also records the lender (bank) — free text with the big Canadian
-banks as suggestions; it shows in the panel heading and in the
-Property & assessment metadata once set.
+is derived, the panel names the derived amount. The merged chart on the
+detail page shows each payment split into its interest portion and
+principal portion (stacked bars; the two sum to the payment) with the
+projected total interest, total principal and payoff month beside it.
+The Mortgage & rates panel also records the lender (bank) — free text
+with the big Canadian banks as suggestions; it shows in the panel
+heading and in the Property & assessment metadata once set.
 
 Variable segments can be priced two ways: as an absolute rate, or
 relative to prime ("Prime + spread", e.g. Prime − 1). The app tracks

@@ -37,6 +37,7 @@ h2 { font-size: 16px; margin: 22px 0 10px; }
 .badge.var { background: #f3e8fd; color: #6d28a8; }
 .panel { background: #fff; border: 1px solid #dde4ec; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
 .panel h3 { margin: 0 0 8px; font-size: 15px; }
+.panel h4 { margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid #e6ecf2; font-size: 13.5px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
 table { width: 100%; border-collapse: collapse; }

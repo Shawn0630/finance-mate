@@ -760,6 +760,11 @@ function drawPortfolioChart() {
     projStart: allRows.length ? ymDecimal(allRows[0].month) : null,
     projLastX: allRows.length ? ymDecimal(allRows[allRows.length - 1].month) : null,
   });
+  // Largest value the y axis must reach: the biggest assessed total
+  // drawn and the biggest stacked outstanding total in the window.
+  let pfMax = 0;
+  for (const p of assessedData) if (p.y > pfMax) pfMax = p.y;
+  for (const m of rows) if (m.total > pfMax) pfMax = m.total;
   portfolioLineChart = new Chart(ctx, {
     data: { datasets },
     plugins: [guideLinePlugin],
@@ -792,8 +797,17 @@ function drawPortfolioChart() {
         },
       },
       scales: {
-        x: { type: 'linear', stacked: true, ...(pfWin || {}), ticks: { ...(pfWin ? yearAxisTicks(pfWin.min, pfWin.max) : {}), callback: formatYearTick } },
-        y: { stacked: true, ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' } },
+        x: { type: 'linear', ...(pfWin || {}), ticks: { ...(pfWin ? yearAxisTicks(pfWin.min, pfWin.max) : {}), callback: formatYearTick } },
+        // The amount axis always starts at 0 (a truncated axis made
+        // the values look wildly larger than they are) and tops out
+        // just above the largest value drawn. The per-property bars
+        // stack via their dataset `stack` group — the axis itself is
+        // NOT `stacked`, so the two lines are never stacked.
+        y: {
+          min: 0,
+          ...(pfMax > 0 ? { max: pfMax * 1.05 } : {}),
+          ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' },
+        },
       },
     },
   });
@@ -810,8 +824,7 @@ $('#pfRangeBtns').addEventListener('click', (e) => {
 $('#pfPieOutstandingBtn').addEventListener('click', () => { pfPieMetric = 'outstanding'; drawPortfolioPie(); });
 $('#pfPieAssessedBtn').addEventListener('click', () => { pfPieMetric = 'assessed'; drawPortfolioPie(); });
 
-let chartA = null; // combined chart: assessed value vs outstanding principal
-let chartB = null; // monthly chart: interest vs principal portions
+let chartA = null; // merged detail chart: assessed + outstanding lines, interest/principal bars
 let fullSeries = [];
 let chartMeta = null;
 let amortError = null; // last non-ok amortization response ({ error, code })
@@ -978,7 +991,7 @@ async function loadPropertyDetail(id) {
     ? 'Payment day does not apply to this frequency.'
     : (p.payment_day ? `Payment day: the ${ordinal(p.payment_day)} of each month.` : 'Payment day: not set.');
   $('#paymentDayDisplay').textContent =
-    `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in the Rate segments panel below.`;
+    `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in the Mortgage & rates panel below.`;
   $('#regionDisplay').textContent = `Region: ${p.region === 'CA' || !p.region ? 'Canada (CA)' : esc(p.region)}.`;
   // The Source line reads the same in the read-only view and in the
   // edit form (the manual-marking note applies once you are editing).
@@ -1197,7 +1210,7 @@ $('#addSegmentForm').addEventListener('submit', async (e) => {
 });
 
 // Payment frequency + payment day are property fields, but they are
-// maintained here, with the rate plan: saving re-renders both charts
+// maintained here, with the rate plan: saving re-renders the chart
 // on the new schedule. The payment day only applies to the monthly /
 // semi-monthly schedules; for the day-stepped frequencies the input
 // is disabled with an explanation.
@@ -1369,16 +1382,16 @@ $('#trendForm').addEventListener('submit', async (e) => {
 $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 
 // ------------------------------------------------------------------ charts --
-// Two charts, both driven by the same data:
-//   A (combined): assessed value (yearly history points) vs outstanding
-//     balance (monthly projection) on ONE axis — the gap is the equity.
-//     The assessed points stop at the last known year; they are deliberately
-//     NOT extended into the future (no invented forecast).
-//   B (monthly): each month's payment split into its interest portion
-//     and principal portion (stacked — the two sum to the payment).
+// ONE merged chart on the detail page: assessed value (yearly history
+// points) and outstanding balance (monthly projection) as lines — the
+// gap is the equity — plus the payment split as bars: each projected
+// month's interest portion and principal portion, stacked to the
+// payment (summed into yearly bars on spans over 10 years). The
+// assessed points stop at the last known year; they are deliberately
+// NOT extended into the future (no invented forecast).
 // The projection only ever comes from the user's own rate plan (segments);
-// with no plan the API reports NO_RATE_PLAN and chart B stays empty with
-// a prompt instead of a made-up line.
+// with no plan the API reports NO_RATE_PLAN and the projection stays
+// absent with a prompt instead of a made-up line.
 async function loadChart(id) {
   const r = await api(`/api/properties/${id}/amortization`);
   if (!r.ok) {
@@ -1524,7 +1537,7 @@ function renderEquity() {
       `Current equity: ${money(a.equity)} — latest assessed value ${money(a.assessedValue)}` +
       `${a.assessedYear ? ` (${a.assessedYear})` : ''} minus outstanding principal ${money(a.balance)}.`;
   } else if (a.assessedValue !== null) {
-    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in the Mortgage panel to see the equity.`;
+    el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in the Mortgage & rates panel to see the equity.`;
   } else if (a.balance !== null) {
     el.textContent = `Outstanding principal: ${money(a.balance)}. Fetch the assessed value from BC Assessment (or add a value-history point below) to see the equity.`;
   } else {
@@ -1548,24 +1561,30 @@ function renderDetailCharts() {
   renderTrendSummary(); // the summary follows the chart's current window
   renderDerivedPaymentNote();
   drawCombinedChart();
-  drawMonthlyChart();
 }
 
+// The detail page's one chart (merged from the former pair): the
+// assessed-value line and the outstanding-principal projection share
+// its time axis with the payment-split bars — each projected month's
+// (or, on spans over 10 years, each year's) interest and principal
+// portions, stacked to the payment itself. Everything is governed by
+// the same look-back window as before: "All" draws the full
+// projection; a month range clips the lines AND the bars at today.
 function drawCombinedChart() {
   const ctx = $('#combinedChart');
   if (!ctx) return;
   if (chartA) { chartA.destroy(); chartA = null; }
   window.__fmCharts.a = null;
+  window.__fmCharts.b = null; // legacy hook: there is no second chart anymore
   // When the projection cannot be computed, say so right at this
-  // chart (the assessed points still draw) instead of leaving a
-  // silently missing blue line. Chart B shows the same state above
-  // its own canvas.
+  // chart (the assessed points still draw) instead of leaving
+  // silently missing lines/bars.
   const cmsg = $('#combinedMsg');
   if (cmsg) {
     if (amortError && amortError.code === 'NO_RATE_PLAN') {
-      showMsg(cmsg, 'warn', 'No projection yet — add a rate segment in the Rate segments panel above, and the outstanding-principal line will be projected from it.');
+      showMsg(cmsg, 'warn', 'No projection yet — add a rate segment in the Mortgage & rates panel above, and the outstanding-principal line will be projected from it.');
     } else if (amortError && amortError.code === 'NO_PAYMENT') {
-      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — add a monthly payment or remaining amortization in the Mortgage panel above to project it.');
+      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — add a monthly payment or remaining amortization in the Mortgage & rates panel above to project it.');
     } else if (amortError) {
       showMsg(cmsg, 'warn', amortError.error);
     } else {
@@ -1573,6 +1592,10 @@ function drawCombinedChart() {
       cmsg.textContent = '';
     }
   }
+  const mmsg = $('#monthlyMsg');
+  const summaryEl = $('#monthlySummary');
+  mmsg.className = 'msg';
+  summaryEl.textContent = '';
   const datasets = [];
   const months = currentRangeMonths();
   const shownYears = [];
@@ -1585,13 +1608,14 @@ function drawCombinedChart() {
     const shown = lookbackHistory(trendPoints, months);
     shownYears.push(...shown.map((pt) => pt.year).sort((a, b) => a - b));
     datasets.push({
+      type: 'line',
       label: 'Assessed value',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
       // One value per assessment year, joined by straight line
       // segments like the portfolio chart (tension 0 — no smoothing
       // curve, no step).
-      showLine: true, tension: 0, pointRadius: 5, pointHoverRadius: 7,
+      showLine: true, tension: 0, pointRadius: 5, pointHoverRadius: 7, order: 1,
     });
   }
   if (chartMeta && fullSeries.length) {
@@ -1605,19 +1629,100 @@ function drawCombinedChart() {
     const pts = winLb ? allPts.filter((p) => p.x >= winLb.min && p.x <= winLb.max) : allPts;
     if (pts.length) {
       datasets.push({
+        type: 'line',
         label: 'Outstanding principal',
         data: pts,
         borderColor: '#1668c4', backgroundColor: '#1668c4',
-        tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
+        tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2, order: 1,
       });
     }
   }
-  if (!datasets.length) return;
   // The axis is exactly the selected window — never the library's
   // auto-fit (see mixedAxisWindow).
   const win = mixedAxisWindow({ months, assessedYears: shownYears, projStart, projLastX });
+  // Payment-split bars, clipped to the same window as the lines.
+  // Each bar is one projected month's interest + principal portions
+  // stacked to that month's payment; when the displayed span runs
+  // over 10 years the months are summed into yearly bars, so a
+  // decades-long projection doesn't dissolve into hundreds of hair-
+  // thin columns. (The series is sampled monthly, so for the
+  // day-stepped frequencies a bar is the month's totals across all
+  // its payments.)
+  let barsBasis = null; // 'monthly' | 'yearly' when bars are drawn
+  const barTotals = [];
+  if (chartMeta && fullSeries.length && win) {
+    const winLb = lookbackWindow(months);
+    const rows = winLb
+      ? fullSeries.filter((r) => { const x = ymDecimal(r.month); return x >= winLb.min && x <= winLb.max; })
+      : fullSeries;
+    if (rows.length) {
+      let pts;
+      if (win.max - win.min > 10) {
+        barsBasis = 'yearly';
+        const byYear = new Map();
+        for (const r of rows) {
+          const y = Number(String(r.month).slice(0, 4));
+          const g = byYear.get(y) || { interest: 0, principal: 0 };
+          g.interest += r.interest;
+          g.principal += r.principal;
+          byYear.set(y, g);
+        }
+        pts = [...byYear.entries()].sort((a, b) => a[0] - b[0])
+          .map(([y, g]) => ({ x: y, interest: g.interest, principal: g.principal }));
+      } else {
+        barsBasis = 'monthly';
+        pts = rows.map((r) => ({ x: ymDecimal(r.month), interest: r.interest, principal: r.principal }));
+      }
+      for (const p of pts) barTotals.push(p.interest + p.principal);
+      // The two portions share a stack group, so they pile up to the
+      // payment; the y axis itself is NOT stacked, so the lines are
+      // never stacked (Chart.js stacks a dataset when its axis is
+      // stacked, or when the axis leaves it open and the dataset
+      // names a stack — the bars do, the lines don't).
+      datasets.push({
+        type: 'bar',
+        label: 'Interest portion',
+        data: pts.map((p) => ({ x: p.x, y: p.interest })),
+        backgroundColor: '#d97706', borderColor: '#d97706',
+        stack: 'payment', borderWidth: 1, order: 2,
+      });
+      datasets.push({
+        type: 'bar',
+        label: 'Principal portion',
+        data: pts.map((p) => ({ x: p.x, y: p.principal })),
+        backgroundColor: '#2e7d4f', borderColor: '#2e7d4f',
+        stack: 'payment', borderWidth: 1, order: 2,
+      });
+    }
+  }
+  // The projection summary that used to sit over the separate
+  // monthly chart now sits over this one.
+  if (chartMeta) {
+    const srcNote = chartMeta.paymentSource === 'derived' ? 'derived from remaining amortization' : 'entered';
+    const payBit = !chartMeta.frequency || chartMeta.frequency === 'monthly'
+      ? `Monthly payment used: ${money(chartMeta.paymentUsed)} (${srcNote})`
+      : `Payments: ${chartMeta.frequencyLabel} — ${money(chartMeta.periodPayment)} per payment, converted from a monthly payment of ${money(chartMeta.paymentUsed)} (${srcNote})`;
+    const bits = [
+      payBit,
+      `Projected total interest: ${money(chartMeta.totalInterest)}`,
+      `Total principal: ${money(chartMeta.balance)}`,
+      chartMeta.payoffMonth ? `Projected payoff: ${chartMeta.payoffMonth}` : 'Not paid off within the projection window',
+    ];
+    if (barsBasis === 'yearly') bits.push('Bars: yearly interest & principal totals (the displayed span is over 10 years)');
+    else if (barsBasis === 'monthly') bits.push('Bars: monthly interest & principal portions');
+    summaryEl.textContent = bits.join(' · ');
+    if (chartMeta.negativeAmortization) {
+      showMsg(mmsg, 'warn', 'Warning: the monthly payment is below the monthly interest in some months (negative amortization) — the balance grows there.');
+    }
+  }
+  if (!datasets.length) return;
+  // The amount axis always starts at 0 and tops out just above the
+  // largest value drawn (assessed points, projection line, stacked
+  // bar totals) — never a truncated axis starting near the balance.
+  let dataMax = 0;
+  for (const ds of datasets) for (const p of ds.data) if (p.y > dataMax) dataMax = p.y;
+  for (const t of barTotals) if (t > dataMax) dataMax = t;
   chartA = new Chart(ctx, {
-    type: 'line',
     data: { datasets },
     plugins: [guideLinePlugin],
     options: {
@@ -1628,95 +1733,27 @@ function drawCombinedChart() {
           callbacks: {
             title: (items) => formatYearTick(items[0].parsed.x),
             label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}`,
+            footer: (items) => {
+              const it = items[0];
+              if (!it || it.dataset.stack !== 'payment') return '';
+              const bars = it.chart.data.datasets.filter((d) => d.stack === 'payment');
+              const total = bars.reduce((s, d) => s + (d.data[it.dataIndex] ? d.data[it.dataIndex].y : 0), 0);
+              return barsBasis === 'yearly' ? `Total payments that year: ${money(total)}` : `Total payment: ${money(total)}`;
+            },
           },
         },
       },
       scales: {
         x: { type: 'linear', ...(win || {}), ticks: { ...(win ? yearAxisTicks(win.min, win.max) : {}), callback: formatYearTick } },
-        y: { ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' } },
+        y: {
+          min: 0,
+          ...(dataMax > 0 ? { max: dataMax * 1.05 } : {}),
+          ticks: { callback: moneyTick }, title: { display: true, text: 'Amount ($)' },
+        },
       },
     },
   });
   window.__fmCharts.a = chartA;
-}
-
-function drawMonthlyChart() {
-  const ctx = $('#monthlyChart');
-  if (!ctx) return;
-  if (chartB) { chartB.destroy(); chartB = null; }
-  window.__fmCharts.b = null;
-  const msg = $('#monthlyMsg');
-  const summaryEl = $('#monthlySummary');
-  msg.className = 'msg';
-  summaryEl.textContent = '';
-  if (!chartMeta) {
-    if (amortError && amortError.code === 'NO_RATE_PLAN') {
-      showMsg(msg, 'warn', 'Add a rate plan to see the projection — add a rate segment in the Rate segments panel above, and both charts will be calculated from it.');
-    } else if (amortError && amortError.code === 'NO_PAYMENT') {
-      showMsg(msg, 'warn', 'To project the mortgage, enter a monthly payment or a remaining amortization in the Mortgage panel above.');
-    } else if (amortError) {
-      showMsg(msg, 'warn', amortError.error);
-    }
-    return;
-  }
-  const months = currentRangeMonths();
-  const rows = months > 0 ? fullSeries.slice(0, months) : fullSeries;
-  if (!rows.length) return;
-  const srcNote = chartMeta.paymentSource === 'derived' ? 'derived from remaining amortization' : 'entered';
-  const payBit = !chartMeta.frequency || chartMeta.frequency === 'monthly'
-    ? `Monthly payment used: ${money(chartMeta.paymentUsed)} (${srcNote})`
-    : `Payments: ${chartMeta.frequencyLabel} — ${money(chartMeta.periodPayment)} per payment, converted from a monthly payment of ${money(chartMeta.paymentUsed)} (${srcNote})`;
-  const bits = [
-    payBit,
-    `Projected total interest: ${money(chartMeta.totalInterest)}`,
-    `Total principal: ${money(chartMeta.balance)}`,
-    chartMeta.payoffMonth ? `Projected payoff: ${chartMeta.payoffMonth}` : 'Not paid off within the projection window',
-  ];
-  summaryEl.textContent = bits.join(' · ');
-  if (chartMeta.negativeAmortization) {
-    showMsg(msg, 'warn', 'Warning: the monthly payment is below the monthly interest in some months (negative amortization) — the balance grows there.');
-  }
-  // Each month's payment split in two: the interest portion and the
-  // principal portion, stacked — the bar's full height is the payment
-  // itself, so the two portions always sum to what was paid. The
-  // series is sampled monthly, so for the day-stepped frequencies a
-  // bar is the month's totals across all its payments.
-  chartB = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: rows.map((r) => r.date || r.month),
-      datasets: [
-        {
-          label: 'Interest portion',
-          data: rows.map((r) => r.interest),
-          backgroundColor: '#d97706', borderColor: '#d97706',
-          stack: 'payment', borderWidth: 1,
-        },
-        {
-          label: 'Principal portion',
-          data: rows.map((r) => r.principal),
-          backgroundColor: '#2e7d4f', borderColor: '#2e7d4f',
-          stack: 'payment', borderWidth: 1,
-        },
-      ],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        tooltip: {
-          callbacks: {
-            footer: (items) => `Total payment: ${money(items.reduce((s, i) => s + (i.parsed.y || 0), 0))}`,
-          },
-        },
-      },
-      scales: {
-        x: { stacked: true, ticks: { maxTicksLimit: 12 } },
-        y: { stacked: true, ticks: { callback: moneyTick }, title: { display: true, text: 'Monthly amount ($)' } },
-      },
-    },
-  });
-  window.__fmCharts.b = chartB;
 }
 
 $('#rangeBtns').addEventListener('click', (e) => {

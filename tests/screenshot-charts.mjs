@@ -126,35 +126,39 @@ try {
   });
   await page.goto(`http://ff.local/#property/${pid}`, { waitUntil: 'networkidle0', timeout: 30000 });
   await wait(2500);
+  // The merged chart only shows payment bars for months inside the
+  // look-back window; this fixture's projection starts next month, so
+  // switch to All (full projection, yearly bars) before describing.
+  await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
+  await wait(800);
 
   const info = await page.evaluate(() => {
     const describe = (c) => (c ? c.data.datasets.map((d) => ({
       label: d.label, color: d.borderColor, points: d.data.length,
     })) : null);
     return {
-      canvases: [...document.querySelectorAll('canvas')].map((c) => c.id),
+      canvases: [...document.querySelectorAll('#view-property canvas')].map((c) => c.id),
       equityText: document.getElementById('equitySummary').textContent,
       monthlySummary: document.getElementById('monthlySummary').textContent,
       chartA: describe(window.__fmCharts.a),
-      chartB: describe(window.__fmCharts.b),
     };
   });
   console.log('DOM check:', JSON.stringify(info, null, 1));
   const equityOk = info.equityText.includes('$250,000');
-  const aOk = info.chartA && info.chartA.length === 2
+  const aOk = info.chartA && info.chartA.length === 4
     && info.chartA[0].label === 'Assessed value' && info.chartA[1].label === 'Outstanding principal'
     && info.chartA[0].color !== info.chartA[1].color;
-  const bOk = info.chartB && info.chartB.length === 2
-    && info.chartB[0].label === 'Interest portion' && info.chartB[1].label === 'Principal portion'
-    && info.chartB[0].color !== info.chartB[1].color;
-  console.log(`equity $250,000 shown: ${equityOk} | chart A two-tone: ${aOk} | chart B two-tone: ${bOk}`);
+  const bOk = info.chartA && info.chartA.length === 4
+    && info.chartA[2].label === 'Interest portion' && info.chartA[3].label === 'Principal portion'
+    && info.chartA[2].color !== info.chartA[3].color;
+  const oneCanvasOk = info.canvases.length === 1 && info.canvases[0] === 'combinedChart';
+  console.log(`equity $250,000 shown: ${equityOk} | merged chart lines two-tone: ${aOk} | merged chart bars two-tone: ${bOk} | one canvas: ${oneCanvasOk}`);
 
   // Full-page screenshots resize the viewport, which restarts Chart.js
   // animations and can catch the lines mid-draw; settle them first.
   await page.evaluate(() => {
-    for (const c of [window.__fmCharts.a, window.__fmCharts.b]) {
-      if (c) { c.options.animation = false; c.update('none'); }
-    }
+    const c = window.__fmCharts.a;
+    if (c) { c.options.animation = false; c.update('none'); }
   });
   await wait(600);
   await page.screenshot({ path: path.join(OUT, 'property-detail.png'), fullPage: true });
@@ -167,7 +171,7 @@ try {
   });
   await panel.asElement().screenshot({ path: path.join(OUT, 'combined-chart.png') });
   console.log('combined-chart.png', fs.statSync(path.join(OUT, 'combined-chart.png')).size);
-  if (!equityOk || !aOk || !bOk) process.exitCode = 1;
+  if (!equityOk || !aOk || !bOk || !oneCanvasOk) process.exitCode = 1;
 
   // The Add property modal (fields change as the form evolves; this
   // captures whatever the current slim form looks like).
