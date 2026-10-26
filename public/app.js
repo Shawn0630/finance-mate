@@ -831,6 +831,7 @@ let fullSeries = [];
 let chartMeta = null;
 let chartBarsBasis = null; // 'monthly' | 'yearly' | null — set by drawCombinedChart
 let scheduleYear = null; // the monthly schedule's open year page; null = automatic
+let customRange = null; // detail chart range the user picked by month { start, end } ('YYYY-MM'); null = a preset rules
 let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
@@ -1830,13 +1831,16 @@ async function loadTrend(id) {
 }
 
 // Trend summary: a single change figure computed over the SAME
-// years the combined chart currently shows (see lookbackHistory),
-// so it can never describe a different span than the line on
-// screen — the figure only, no guidance prose around it.
+// years the combined chart currently shows (the detail range's
+// window), so it can never describe a different span than the
+// line on screen — the figure only, no guidance prose around it.
 function renderTrendSummary() {
   const summary = $('#trendSummary');
   if (!summary) return;
-  const shown = lookbackHistory(trendPoints, currentRangeMonths());
+  const win = detailRangeWindow();
+  const shown = win
+    ? trendPoints.filter((pt) => pt.year >= win.min && pt.year < win.max)
+    : trendPoints;
   if (shown.length >= 2) {
     const first = shown[0];
     const last = shown[shown.length - 1];
@@ -1930,25 +1934,112 @@ async function loadEquity(id) {
   renderEquity();
 }
 
-function currentRangeMonths() {
-  const custom = Number($('#customMonths').value);
-  if (custom > 0) return custom;
+// --------------------------------------------------- detail range ---
+// The detail panel's range is an explicit pair of months — a start
+// month and an end month ('YYYY-MM') — and everything in the panel
+// (chart, schedule, Total row, trend summary) follows exactly that
+// pair. The preset buttons are shortcuts that FILL the pair: a
+// look-back preset ends at the current month and starts N-1 months
+// earlier (N months inclusive); "All" fills the whole data span.
+// Picking either month by hand clears the preset highlight and the
+// picked pair rules instead. (The portfolio overview keeps its own
+// look-back buttons — separate state, untouched.)
+function monthStrOf(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function addMonthsYM(ym, n) {
+  const [y, m] = String(ym).split('-').map(Number);
+  const t = y * 12 + (m - 1) + n;
+  return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, '0')}`;
+}
+
+// The months the current property's data spans: from the earliest
+// of (first assessed year, balance month, first projected month) to
+// the latest of (last projected month, last assessed year's end).
+// Null when there is no data at all.
+function dataSpanMonths() {
+  let start = null;
+  let end = null;
+  const lo = (v) => { if (v && (!start || v < start)) start = v; };
+  const hi = (v) => { if (v && (!end || v > end)) end = v; };
+  if (trendPoints.length) {
+    lo(`${trendPoints[0].year}-01`);
+    hi(`${trendPoints[trendPoints.length - 1].year}-12`);
+  }
+  if (chartMeta && chartMeta.balanceDate) lo(String(chartMeta.balanceDate).slice(0, 7));
+  if (fullSeries.length) {
+    lo(fullSeries[0].month);
+    hi(fullSeries[fullSeries.length - 1].month);
+  }
+  return start && end ? { start, end } : null;
+}
+
+// A user-picked pair is clamped into the data span, and a start
+// past the end pulls the END up to the start (never a swap, never
+// an inverted range).
+function clampRange(r, span) {
+  if (!r) return null;
+  let { start, end } = r;
+  if (span) {
+    if (start < span.start) start = span.start;
+    if (start > span.end) start = span.end;
+    if (end < span.start) end = span.start;
+    if (end > span.end) end = span.end;
+  }
+  if (start > end) end = start;
+  return { start, end };
+}
+
+// The range currently in force on the detail panel.
+function currentDetailRange() {
+  const span = dataSpanMonths();
   const active = $('#rangeBtns button.active');
-  return active ? Number(active.dataset.months) : 60;
+  if (!active && customRange) return clampRange(customRange, span);
+  const months = active ? Number(active.dataset.months) : 60;
+  if (months === 0) return span; // All = the whole data span
+  const end = monthStrOf(new Date());
+  return { start: addMonthsYM(end, -(months - 1)), end };
+}
+
+// The range as a fractional-year window for the chart axis: from
+// the first day of the start month to the first day of the month
+// AFTER the end month, so the whole end month is inside.
+function detailRangeWindow() {
+  const r = currentDetailRange();
+  if (!r) return null;
+  return { startYM: r.start, endYM: r.end, min: ymDecimal(r.start), max: ymDecimal(r.end) + 1 / 12 };
+}
+
+// The From/To inputs always show the range actually in force
+// (preset-derived or clamped custom alike), bounded by the span.
+function syncRangeInputs() {
+  const s = $('#rangeStart');
+  const e = $('#rangeEnd');
+  if (!s || !e) return;
+  const span = dataSpanMonths();
+  if (span) {
+    s.min = span.start; s.max = span.end;
+    e.min = span.start; e.max = span.end;
+  }
+  const r = currentDetailRange();
+  s.value = r ? r.start : '';
+  e.value = r ? r.end : '';
+  s.disabled = !span;
+  e.disabled = !span;
 }
 
 // ------------------------------------------------------- range window ---
-// The mixed charts (detail Chart A, portfolio overview) read their
-// range as a LOOK-BACK window that ENDS TODAY: "1 year" means the
-// last 12 months up to today, "5 years" the last 60, a custom month
-// count likewise. It used to be anchored at the earliest data and
-// pushed forward, which made the buttons feel dead on sparse data —
-// one assessed point plus a mostly empty axis that only changed
-// length. "All" (0 months) is the exception: it keeps the whole data
-// extent, full projection included, as the see-everything view. The
-// choice lives in the range buttons themselves, so re-renders (new
-// points, fresh data) keep the user's window instead of snapping
-// back to the default.
+// The portfolio overview reads its range as a LOOK-BACK window
+// that ENDS TODAY: "1 year" means the last 12 months up to today,
+// "5 years" the last 60. "All" (0 months) is the exception: it
+// keeps the whole data extent, full projection included, as the
+// see-everything view. The choice lives in the range buttons
+// themselves, so re-renders (new points, fresh data) keep the
+// user's window instead of snapping back to the default. (The
+// detail panel does NOT use this window anymore — it follows an
+// explicit start/end month pair, see "detail range" above; only
+// the portfolio helpers below still speak look-back.)
 
 // Fractional-year position of a Date on the axis scale (ymDecimal:
 // January of year Y is Y.0 and each month adds 1/12; days interpolate
@@ -2001,9 +2092,10 @@ function formatYearTick(x) {
   return `${MONTH_NAMES[m]} ${y}`;
 }
 
-// Explicit x-axis window for the charts that mix assessed history
-// with a mortgage projection. For a month range the axis IS the
-// look-back window (see lookbackWindow): exactly the selected span,
+// Explicit x-axis window for the portfolio chart (which mixes
+// assessed history with a mortgage projection). For a month range
+// the axis IS the look-back window (see lookbackWindow): exactly
+// the selected span,
 // ending today — data outside it is clipped and never stretches the
 // axis. (Leaving the axis to the Chart.js auto-fit was a bug: it
 // unioned both series and rounded the bounds outward to "nice"
@@ -2075,6 +2167,7 @@ function renderEstPayment() {
 }
 
 function renderDetailCharts() {
+  syncRangeInputs(); // the From/To inputs show the range in force
   renderEquity();
   renderTrendSummary(); // the summary follows the chart's current window
   renderEstPayment();
@@ -2087,9 +2180,9 @@ function renderDetailCharts() {
 // assessed-value line and the outstanding-principal projection share
 // its time axis with the payment-split bars — each projected month's
 // (or, on spans over 10 years, each year's) interest and principal
-// portions, stacked to the payment itself. Everything is governed by
-// the same look-back window as before: "All" draws the full
-// projection; a month range clips the lines AND the bars at today.
+// portions, stacked to the payment itself. Everything is governed
+// by the panel's start/end month range: the lines AND the bars
+// draw only the months inside it.
 function drawCombinedChart() {
   const ctx = $('#combinedChart');
   if (!ctx) return;
@@ -2115,16 +2208,16 @@ function drawCombinedChart() {
   const mmsg = $('#monthlyMsg');
   mmsg.className = 'msg';
   const datasets = [];
-  const months = currentRangeMonths();
-  const shownYears = [];
-  let projStart = null;
-  let projLastX = null;
+  const win0 = detailRangeWindow();
   if (trendPoints.length) {
-    // Assessed points inside the look-back window (All = every year
-    // on record). The points still stop at the last known year — they
-    // are not extended toward today (see the charts header comment).
-    const shown = lookbackHistory(trendPoints, months);
-    shownYears.push(...shown.map((pt) => pt.year).sort((a, b) => a - b));
+    // Assessed points inside the selected month range (All = every
+    // year on record). The points still stop at the last known
+    // year — they are not extended toward today (see the charts
+    // header comment). A year's point sits at its January, so it
+    // counts as inside when that January falls in the range.
+    const shown = win0
+      ? trendPoints.filter((pt) => pt.year >= win0.min && pt.year < win0.max)
+      : trendPoints;
     datasets.push({
       type: 'line',
       label: 'Assessed value',
@@ -2140,12 +2233,9 @@ function drawCombinedChart() {
   if (chartMeta && fullSeries.length) {
     const allPts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
       ...fullSeries.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
-    projStart = allPts[0].x;
-    projLastX = allPts[allPts.length - 1].x;
-    // The projection is clipped to the same look-back window as the
-    // axis: the part beyond today belongs to the All view, not here.
-    const winLb = lookbackWindow(months);
-    const pts = winLb ? allPts.filter((p) => p.x >= winLb.min && p.x <= winLb.max) : allPts;
+    // The projection is clipped to the same month range as the
+    // axis: months outside the selected pair are not drawn here.
+    const pts = win0 ? allPts.filter((p) => p.x >= win0.min && p.x < win0.max) : allPts;
     if (pts.length) {
       datasets.push({
         type: 'line',
@@ -2157,9 +2247,9 @@ function drawCombinedChart() {
       });
     }
   }
-  // The axis is exactly the selected window — never the library's
-  // auto-fit (see mixedAxisWindow).
-  const win = mixedAxisWindow({ months, assessedYears: shownYears, projStart, projLastX });
+  // The axis is exactly the selected month range — never the
+  // library's auto-fit.
+  const win = win0 ? { min: win0.min, max: win0.max } : null;
   // Payment-split bars, clipped to the same window as the lines.
   // Each bar is one projected month's interest + principal portions
   // stacked to that month's payment; when the displayed span runs
@@ -2171,10 +2261,7 @@ function drawCombinedChart() {
   let barsBasis = null; // 'monthly' | 'yearly' when bars are drawn
   const barTotals = [];
   if (chartMeta && fullSeries.length && win) {
-    const winLb = lookbackWindow(months);
-    const rows = winLb
-      ? fullSeries.filter((r) => { const x = ymDecimal(r.month); return x >= winLb.min && x <= winLb.max; })
-      : fullSeries;
+    const rows = fullSeries.filter((r) => r.month >= win0.startYM && r.month <= win0.endYM);
     if (rows.length) {
       let pts;
       if (win.max - win.min > 10) {
@@ -2318,12 +2405,9 @@ function monthLabel(ym) {
 
 function scheduleWindowRows() {
   if (!chartMeta || !fullSeries.length) return [];
-  const winLb = lookbackWindow(currentRangeMonths());
-  if (!winLb) return fullSeries.slice();
-  return fullSeries.filter((r) => {
-    const x = ymDecimal(r.month);
-    return x >= winLb.min && x <= winLb.max;
-  });
+  const r = currentDetailRange();
+  if (!r) return fullSeries.slice();
+  return fullSeries.filter((row) => row.month >= r.start && row.month <= r.end);
 }
 
 function scheduleYears() {
@@ -2396,13 +2480,25 @@ $('#rangeBtns').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-months]');
   if (!btn) return;
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.toggle('active', b === btn));
-  $('#customMonths').value = '';
+  customRange = null; // a preset fills the From/To pair on render
   if (currentPropertyId) loadChart(currentPropertyId);
 });
-$('#customMonths').addEventListener('change', () => {
+// Picking a start or end month by hand: the preset highlight
+// clears and the picked pair rules. The pair is clamped into the
+// data span (a start past the end pulls the end up to the start),
+// and syncRangeInputs writes the clamped pair back into the
+// inputs — here, and again on the re-render after the refetch.
+function onRangeMonthChange() {
+  const start = $('#rangeStart').value;
+  const end = $('#rangeEnd').value;
+  if (!start || !end) return;
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.remove('active'));
+  customRange = clampRange({ start, end }, dataSpanMonths());
+  syncRangeInputs();
   if (currentPropertyId) loadChart(currentPropertyId);
-});
+}
+$('#rangeStart').addEventListener('change', onRangeMonthChange);
+$('#rangeEnd').addEventListener('change', onRangeMonthChange);
 
 // ----------------------------------------------------------------- admin ---
 // User management page. Admin-only: the nav entry is hidden for other

@@ -51,6 +51,8 @@ td.num, th.num { text-align: right; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
 .toolbar .spacer { flex: 1; }
 .range-btns button.active { background: #1668c4; color: #fff; border-color: #1668c4; }
+.range-pick { display: inline-flex; align-items: center; gap: 6px; color: #5a6a7a; }
+.range-pick input { width: 152px; }
 .msg { padding: 9px 12px; border-radius: 8px; margin: 10px 0; display: none; }
 .msg.ok { background: #e7f6ec; color: #14632f; display: block; }
 .msg.err { background: #fdeceb; color: #b3261e; display: block; }

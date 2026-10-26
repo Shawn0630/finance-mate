@@ -1705,11 +1705,12 @@ try {
       check('pasted grouped balance stored as the plain number 1350000',
         !!pastedProp && pastedProp.mortgage_balance === 1350000, JSON.stringify(pastedProp && pastedProp.mortgage_balance));
 
-      // Assessed-history window: the range is a LOOK-BACK window
-      // ending today. A property with 8 years on record (2019-2026)
-      // draws the 5 that fall in the default 5-year look-back
-      // (2022-2026); All widens it to every year, and the trend
-      // summary is calculated over the same window the chart shows.
+      // Assessed-history window: the range is a start/end month
+      // pair (the default 5-year preset fills Nov 2021-Oct 2026).
+      // A property with 8 years on record (2019-2026) draws the 5
+      // whose January falls in the pair (2022-2026); All widens it
+      // to every year, and the trend summary is calculated over
+      // the same range the chart shows.
       r = await req('POST', '/api/properties', { address: '977 Window Test Way, Victoria, BC', purchase_date: '2020-01-15', mortgage_balance: 500000 });
       const winPid = r.data.id;
       for (let y = 2019; y <= 2026; y++) {
@@ -1740,11 +1741,23 @@ try {
       check('switching back to 5 years restores the 2022-2026 window',
         JSON.stringify(winBack) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winBack));
 
-      // Axis bounds: for a month range the x axis IS the look-back
-      // window — exactly the selected span, ending today — never the
-      // chart library's auto-fit (which unioned the history with the
-      // projection and rounded outward into decades of empty span)
-      // and never the old forward-from-the-data anchor either.
+      // Axis bounds: the x axis IS the picked start/end month pair
+      // — from the first day of the start month to the end of the
+      // end month — never the chart library's auto-fit (which
+      // unioned the history with the projection and rounded outward
+      // into decades of empty span). The presets only FILL the
+      // pair: a look-back preset fills end = the current month.
+      const rangePair = () => page.evaluate(() => ({
+        start: document.querySelector('#rangeStart').value,
+        end: document.querySelector('#rangeEnd').value,
+      }));
+      const ymDecA = (s) => { const [y, m] = s.split('-').map(Number); return y + (m - 1) / 12; };
+      const curMonthStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
+      const addMonthsStr = (ym, n) => {
+        const [y, m] = ym.split('-').map(Number);
+        const t = y * 12 + (m - 1) + n;
+        return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, '0')}`;
+      };
       const axisA = () => page.evaluate(() => {
         const c = window.__fmCharts.a;
         if (!c) return null;
@@ -1763,61 +1776,70 @@ try {
         return d.getFullYear() + d.getMonth() / 12 + (d.getDate() - 1) / (dim * 12);
       });
       let ax = await axisA();
-      const td0 = await todayDec();
-      check('chart A axis with history only is the 5-year look-back ending today',
-        !!ax && Math.abs(ax.max - td0) < 0.02 && Math.abs(ax.min - (td0 - 5)) < 0.05,
-        JSON.stringify(ax && { min: ax.min, max: ax.max }));
+      let rp = await rangePair();
+      check('chart A axis with history only is the picked month pair (5-year preset fills it, ending at the current month)',
+        !!ax && rp.end === curMonthStr() && rp.start === addMonthsStr(rp.end, -59)
+          && Math.abs(ax.min - ymDecA(rp.start)) < 0.001
+          && Math.abs(ax.max - (ymDecA(rp.end) + 1 / 12)) < 0.001,
+        JSON.stringify({ rp, ax: ax && { min: ax.min, max: ax.max } }));
 
       // Give the fixture a rate plan + amortization on a known
-      // balance date, reload, and the axis must follow each selected range:
-      // every month range is that look-back ending today (projection
-      // clipped at today); All -> the exact data extent, no padded
+      // balance date, reload, and the axis must follow each selected
+      // range: every preset fills its month pair and the projection
+      // clips to it; All -> the exact data extent, no padded
       // decades either side.
       await req('PUT', `/api/properties/${winPid}`, { mortgage_balance_date: '2025-01-15', amortization_years: 25 });
       await req('POST', `/api/properties/${winPid}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 });
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
       ax = await axisA();
-      const td1 = await todayDec();
-      check('chart A 5-year axis is the look-back ending today, with month ticks',
-        !!ax && Math.abs(ax.max - td1) < 0.02 && Math.abs(ax.min - (td1 - 5)) < 0.05
+      rp = await rangePair();
+      check('chart A 5-year axis is the filled month pair, with month ticks',
+        !!ax && rp.end === curMonthStr() && rp.start === addMonthsStr(rp.end, -59)
+          && Math.abs(ax.min - ymDecA(rp.start)) < 0.001
+          && Math.abs(ax.max - (ymDecA(rp.end) + 1 / 12)) < 0.001
           && ax.ticks.some((t) => /[A-Z][a-z]{2} \d{4}/.test(t)),
-        JSON.stringify(ax && { min: ax.min, max: ax.max, ticks: ax.ticks }));
+        JSON.stringify({ rp, ax: ax && { min: ax.min, max: ax.max, ticks: ax.ticks } }));
       const outXs = await page.evaluate(() => {
         const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Outstanding principal');
         return ds ? ds.data.map((p) => p.x) : null;
       });
-      check('chart A projection is clipped to the window (in-window months drawn, nothing past today)',
+      check('chart A projection is clipped to the picked pair (in-range months drawn, the current month last)',
         Array.isArray(outXs) && outXs.length > 12
-          && outXs.every((x) => x <= td1 + 0.001) && outXs.some((x) => x > td1 - 0.1),
+          && outXs.every((x) => x >= ymDecA(rp.start) - 0.001 && x < ymDecA(rp.end) + 1 / 12 + 0.001)
+          && Math.abs(outXs[outXs.length - 1] - ymDecA(rp.end)) < 0.001,
         JSON.stringify(outXs && { n: outXs.length, last: outXs[outXs.length - 1] }));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="24"]').click());
       await wait(600);
       ax = await axisA();
-      const td2 = await todayDec();
-      check('chart A 2-year axis spans exactly the 2 years ending today, with monthly ticks',
-        !!ax && Math.abs(ax.max - td2) < 0.02 && Math.abs(ax.max - ax.min - 2) < 0.02 && ax.ticks.length >= 20,
-        JSON.stringify(ax && { min: ax.min, max: ax.max, nTicks: ax.ticks.length }));
+      rp = await rangePair();
+      check('chart A 2-year axis spans exactly the filled 24 months, with monthly ticks',
+        !!ax && rp.end === curMonthStr() && rp.start === addMonthsStr(rp.end, -23)
+          && Math.abs(ax.max - ax.min - 2) < 0.02 && ax.ticks.length >= 20,
+        JSON.stringify({ rp, ax: ax && { min: ax.min, max: ax.max, nTicks: ax.ticks.length } }));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
       await wait(600);
       ax = await axisA();
-      const td3 = await todayDec();
+      rp = await rangePair();
       const yrs1 = await assessedYears();
-      check('chart A 1-year axis spans the year ending today and shows only the 2026 point',
-        !!ax && Math.abs(ax.max - td3) < 0.02 && Math.abs(ax.max - ax.min - 1) < 0.02
+      check('chart A 1-year axis spans the filled 12 months and shows only the 2026 point',
+        !!ax && rp.end === curMonthStr() && rp.start === addMonthsStr(rp.end, -11)
+          && Math.abs(ax.max - ax.min - 1) < 0.02
           && JSON.stringify(yrs1) === JSON.stringify([2026]),
-        JSON.stringify({ ax: ax && { min: ax.min, max: ax.max }, yrs1 }));
+        JSON.stringify({ rp, ax: ax && { min: ax.min, max: ax.max }, yrs1 }));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
       await wait(600);
       ax = await axisA();
-      check('chart A All axis is the exact data extent (2019 to the last projected month)',
-        !!ax && ax.min === 2019 && ax.max === ax.dataMax && ax.max < 2060,
-        JSON.stringify(ax && { min: ax.min, max: ax.max, dataMax: ax.dataMax }));
+      rp = await rangePair();
+      check('chart A All axis is the exact data extent (2019 to the end of the last projected month)',
+        !!ax && ax.min === 2019 && rp.start === '2019-01'
+          && Math.abs(ax.max - (ax.dataMax + 1 / 12)) < 0.001 && ax.max < 2060,
+        JSON.stringify({ rp, ax: ax && { min: ax.min, max: ax.max, dataMax: ax.dataMax } }));
 
       // ---- Merged chart: the payment-split bars live in chart A now ----
       // One canvas on the detail page, its own range controls inside
       // the chart's panel, the y axis anchored at 0, and the bars
-      // governed by the same look-back window as the lines: monthly
+      // governed by the same month pair as the lines: monthly
       // inside a range, summed into yearly bars on the All span.
       const winAmort = (await req('GET', `/api/properties/${winPid}/amortization`)).data;
       const ymDec = (s) => { const [y, m] = s.split('-').map(Number); return y + (m - 1) / 12; };
@@ -1851,12 +1873,11 @@ try {
       check('the merged chart panel carries its own range controls', samePanel === true);
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="60"]').click());
       await wait(600);
-      const tdB = await todayDec();
-      const rowsIn = (monthsBack) => winAmort.series.filter((r) => {
-        const x = ymDec(r.month);
-        return x >= tdB - monthsBack / 12 - 0.001 && x <= tdB + 0.001;
-      });
-      const exp60 = rowsIn(60);
+      const rowsIn = async () => {
+        const pair = await rangePair();
+        return winAmort.series.filter((r) => r.month >= pair.start && r.month <= pair.end);
+      };
+      const exp60 = await rowsIn();
       let bi = await barInfo();
       check('detail page has exactly one chart canvas (the merged chart)',
         !!bi && bi.canvasCount === 1 && bi.hasMonthlyCanvas === false,
@@ -1897,7 +1918,7 @@ try {
       await wait(600);
       bi = await barInfo();
       ax = await axisA();
-      const exp24 = rowsIn(24);
+      const exp24 = await rowsIn();
       check('clicking 2 years in the chart panel rescales the axis and redraws the bars to the window',
         !!ax && Math.abs(ax.max - ax.min - 2) < 0.02
           && !!bi && !!bi.bars && bi.bars.xs.length === exp24.length
@@ -1906,7 +1927,7 @@ try {
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
       await wait(600);
       bi = await barInfo();
-      const exp12 = rowsIn(12);
+      const exp12 = await rowsIn();
       check('clicking 1 year shrinks the bars to just that year of payments',
         !!bi && !!bi.bars && bi.bars.xs.length === exp12.length && exp12.length < exp60.length,
         JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, exp: exp12.length }));
@@ -2041,6 +2062,137 @@ try {
           && febAfter.remaining === febBefore.remaining,
         JSON.stringify({ marBefore, marAfter, marHand }));
       await req('DELETE', `/api/properties/${refetchPid}`);
+
+      // ---- Detail range: picked start/end months drive everything ----
+      // The user's real shape (his Christina Pl mortgage): $1.35M
+      // at 2024-12-17, Prime - 1.00, 25-year amortization. He reads
+      // the schedule Total for a span he picks BY MONTH — Jan 2025
+      // to Oct 2026 in his message ("Total — Jan 2025 to Oct 2026
+      // (22 months)") — and every figure in the row must come from
+      // exactly those months of the series.
+      r = await req('POST', '/api/properties', {
+        address: '555 Range Picker Road, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17',
+      });
+      const rangePid = r.data.id;
+      await req('POST', `/api/properties/${rangePid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+      });
+      await req('PUT', `/api/properties/${rangePid}`, { amortization_years: 25 });
+      const rangeAmort = (await req('GET', `/api/properties/${rangePid}/amortization`)).data;
+      await page.goto(`http://ff.local/#property/${rangePid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const setRange = (start, end) => page.evaluate(([s, e]) => {
+        document.querySelector('#rangeStart').value = s;
+        const ei = document.querySelector('#rangeEnd');
+        ei.value = e;
+        ei.dispatchEvent(new Event('change', { bubbles: true }));
+      }, [start, end]);
+      const totalInfo = () => page.evaluate(() => {
+        const total = document.querySelector('#scheduleTotalRow');
+        if (!total) return null;
+        return {
+          label: total.children[0].textContent,
+          payment: Number(total.querySelector('.sum-payment').dataset.value),
+          principal: Number(total.querySelector('.sum-principal').dataset.value),
+          interest: Number(total.querySelector('.sum-interest').dataset.value),
+          remaining: Number(total.children[4].textContent.replace(/[$,]/g, '')),
+        };
+      });
+      const spanSums = (rows) => ({
+        payment: rows.reduce((s, x) => s + x.payment, 0),
+        principal: rows.reduce((s, x) => s + x.principal, 0),
+        interest: rows.reduce((s, x) => s + x.interest, 0),
+      });
+      await setRange('2025-01', '2026-10');
+      await wait(1200);
+      const janOct = rangeAmort.series.filter((x) => x.month >= '2025-01' && x.month <= '2026-10');
+      const janOctSums = spanSums(janOct);
+      const tot1 = await totalInfo();
+      check('picked range Jan 2025-Oct 2026: the Total row covers exactly those 22 months',
+        janOct.length === 22 && !!tot1 && tot1.label.includes('Total — Jan 2025 to Oct 2026 (22 months)'),
+        JSON.stringify({ n: janOct.length, label: tot1 && tot1.label }));
+      check('picked range: Total sums and the ending balance equal the series rows inside it',
+        !!tot1
+          && Math.abs(tot1.payment - janOctSums.payment) < 0.005
+          && Math.abs(tot1.principal - janOctSums.principal) < 0.005
+          && Math.abs(tot1.interest - janOctSums.interest) < 0.005
+          && Math.abs(tot1.remaining - janOct[janOct.length - 1].balance) < 0.51,
+        JSON.stringify({ tot: tot1, sums: janOctSums, lastBal: janOct[janOct.length - 1].balance }));
+      const barsPicked = await page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        const ints = c ? c.data.datasets.find((d) => d.label === 'Interest portion') : null;
+        return ints ? ints.data.map((p) => p.x) : null;
+      });
+      check('picked range: the chart bars are exactly the 22 picked months',
+        Array.isArray(barsPicked) && barsPicked.length === 22
+          && Math.abs(barsPicked[0] - ymDec('2025-01')) < 0.001
+          && Math.abs(barsPicked[barsPicked.length - 1] - ymDec('2026-10')) < 0.001,
+        JSON.stringify(barsPicked && { n: barsPicked.length, first: barsPicked[0], last: barsPicked[barsPicked.length - 1] }));
+      const schedYearsPicked = await page.evaluate(() => [...document.querySelectorAll('#scheduleYearSelect option')].map((o) => o.value));
+      check('picked range: the schedule pages are the years inside the range',
+        JSON.stringify(schedYearsPicked) === JSON.stringify(['2025', '2026']), JSON.stringify(schedYearsPicked));
+      const pagerText = await page.evaluate(() => document.querySelector('#schedulePager').textContent);
+      check('the schedule pager note (explanation prose) is gone',
+        !pagerText.includes('one year per page') && !pagerText.includes('Total row covers'),
+        pagerText.trim());
+
+      // A second, narrower pick moves everything again.
+      await setRange('2025-06', '2025-12');
+      await wait(1200);
+      const junDec = rangeAmort.series.filter((x) => x.month >= '2025-06' && x.month <= '2025-12');
+      const junDecSums = spanSums(junDec);
+      const tot2 = await totalInfo();
+      check('re-picked range Jun-Dec 2025: Total label, sums and ending balance follow the new pair',
+        junDec.length === 7 && !!tot2 && tot2.label.includes('Total — Jun 2025 to Dec 2025 (7 months)')
+          && Math.abs(tot2.payment - junDecSums.payment) < 0.005
+          && Math.abs(tot2.principal - junDecSums.principal) < 0.005
+          && Math.abs(tot2.interest - junDecSums.interest) < 0.005
+          && Math.abs(tot2.remaining - junDec[junDec.length - 1].balance) < 0.51,
+        JSON.stringify({ tot: tot2, sums: junDecSums }));
+
+      // Presets refill the pair: All = the whole data span; a
+      // look-back preset ends at the current month.
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
+      await wait(1200);
+      const rpAll = await page.evaluate(() => ({
+        start: document.querySelector('#rangeStart').value,
+        end: document.querySelector('#rangeEnd').value,
+        active: (document.querySelector('#rangeBtns button.active') || {}).dataset?.months,
+      }));
+      check('All refills the pair with the whole data span',
+        rpAll.start === '2024-12' && rpAll.end === rangeAmort.series[rangeAmort.series.length - 1].month
+          && rpAll.active === '0',
+        JSON.stringify(rpAll));
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="12"]').click());
+      await wait(1200);
+      const rp1y = await page.evaluate(() => ({
+        start: document.querySelector('#rangeStart').value,
+        end: document.querySelector('#rangeEnd').value,
+        active: (document.querySelector('#rangeBtns button.active') || {}).dataset?.months,
+      }));
+      check('the 1-year preset refills the pair ending at the current month (12 months inclusive)',
+        rp1y.end === curMonthStr() && rp1y.start === addMonthsStr(rp1y.end, -11) && rp1y.active === '12',
+        JSON.stringify(rp1y));
+
+      // A start past the end clamps the end up to the start.
+      await setRange('2026-05', '2026-03');
+      await wait(1200);
+      const rpClamp = await page.evaluate(() => ({
+        start: document.querySelector('#rangeStart').value,
+        end: document.querySelector('#rangeEnd').value,
+        anyActive: !!document.querySelector('#rangeBtns button.active'),
+      }));
+      check('start past end clamps the end up to the start (and picking clears the preset)',
+        rpClamp.start === '2026-05' && rpClamp.end === '2026-05' && rpClamp.anyActive === false,
+        JSON.stringify(rpClamp));
+      const mayRow = rangeAmort.series.find((x) => x.month === '2026-05');
+      const totClamp = await totalInfo();
+      check('the clamped single-month range totals exactly that month',
+        !!totClamp && !!mayRow && totClamp.label.includes('Total — May 2026 to May 2026 (1 month)')
+          && Math.abs(totClamp.payment - mayRow.payment) < 0.005,
+        JSON.stringify(totClamp));
+      await req('DELETE', `/api/properties/${rangePid}`);
 
       // Portfolio combined chart: the same look-back window applies
       // to its assessed line (years are the union across properties;

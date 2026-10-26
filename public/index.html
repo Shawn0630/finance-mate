@@ -178,7 +178,8 @@
         <button data-months="60" class="active">5 years</button>
         <button data-months="120">10 years</button>
         <button data-months="0">All (to payoff)</button>
-        <span>Custom months: <input id="customMonths" type="number" min="1" max="600" style="width:90px"></span>
+        <span class="range-pick">From <input id="rangeStart" type="month" aria-label="Range start month"></span>
+        <span class="range-pick">To <input id="rangeEnd" type="month" aria-label="Range end month"></span>
       </div>
       <div class="msg" id="combinedMsg"></div>
       <div class="msg" id="monthlyMsg"></div>
@@ -188,7 +189,6 @@
         <button type="button" class="small" id="schedulePrevYear" aria-label="Previous year">&#8249;</button>
         <select id="scheduleYearSelect" aria-label="Schedule year"></select>
         <button type="button" class="small" id="scheduleNextYear" aria-label="Next year">&#8250;</button>
-        <span class="note" style="margin:0">Monthly schedule — one year per page; the Total row covers the whole chart range.</span>
       </div>
       <table id="scheduleTable">
         <thead><tr><th>Month</th><th class="num">Payment</th><th class="num">Principal</th><th class="num">Interest</th><th class="num">Remaining principal</th></tr></thead>
