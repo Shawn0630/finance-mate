@@ -260,7 +260,7 @@ test('buildSchedule: two terms — payment recomputed at the renewal on the new 
   assert.ok(close(first2.balance, b59 + first2.interest - first2.payment), first2.balance);
 });
 
-test('buildSchedule: a lump sum deducts first, then the payment is recomputed', () => {
+test('buildSchedule: a lump sum deducts first and the payment stays the same (bank standard)', () => {
   const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
   const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];
   const base = { balance: 100000, balanceDate: '2026-01-01', terms, segments };
@@ -270,19 +270,96 @@ test('buildSchedule: a lump sum deducts first, then the payment is recomputed', 
   assert.deepEqual(withLump.series.slice(0, 11), plain.series.slice(0, 11));
   const b11 = plain.series[10].balance; // end of 2026-12
   // January 2027: interest is charged on the REDUCED balance
-  // (b11 - 10,000), and the payment is re-derived from that balance
-  // over the remaining amortization: 300 - 11 = 289 months.
+  // (b11 - 10,000) — the lump comes off before that month's
+  // interest — but the payment is NOT recomputed: it stays at
+  // $581.60, the plain schedule's payment, every single month.
   const jan = withLump.series[11];
   assert.equal(jan.month, '2027-01');
   assert.ok(close(jan.interest, (b11 - 10000) * monthlyRate(5)), jan.interest);
-  assert.ok(close(jan.payment, derivePayment(b11 - 10000, 5, 289 / 12), 0.02), jan.payment);
-  assert.ok(jan.payment < withLump.paymentUsed, 'payment drops after the lump sum');
-  // And the mortgage ends sooner, for less total interest.
-  assert.ok(withLump.payoffMonth < plain.payoffMonth, `${withLump.payoffMonth} < ${plain.payoffMonth}`);
-  assert.ok(withLump.totalInterest < plain.totalInterest);
+  assert.equal(jan.payment, plain.paymentUsed);
+  assert.ok(withLump.series.slice(0, -1).every((row) => row.payment === plain.paymentUsed),
+    'every payment before the final one equals the no-lump payment');
+  assert.ok(withLump.series.every((row, i) => i === withLump.series.length - 1
+    || row.payment === plain.series[i].payment), 'payments match the plain schedule month by month');
+  // The unchanged payment on a smaller balance pays the loan off
+  // sooner for less interest: payoff 2051-02 -> 2046-11 (51 months
+  // earlier), total interest $74,482.97 -> $54,891.20.
+  assert.equal(plain.payoffMonth, '2051-02');
+  assert.equal(withLump.payoffMonth, '2046-11');
+  assert.ok(close(plain.totalInterest, 74482.97), plain.totalInterest);
+  assert.ok(close(withLump.totalInterest, 54891.20), withLump.totalInterest);
 });
 
-test('buildSchedule: a mid-term rate change recomputes the payment on the remaining amortization', () => {
+test('buildSchedule: a $100k lump sum on the $1.35M shape keeps $6,381.36 and pulls the payoff in', () => {
+  // The user's real shape; the lump lands in projected month 13
+  // (January 2026). Payments must be identical to the no-lump run
+  // month by month; only the payoff and the interest move.
+  const segments = [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }];
+  const terms = [{ id: 1, start_date: '2024-12-17', amortization_years: 30 }];
+  const base = { balance: 1350000, balanceDate: '2024-12-17', terms, segments, primeRate: 4.95 };
+  const plain = buildSchedule(base);
+  const withLump = buildSchedule({ ...base, lumpSums: [{ date: '2026-01-15', amount: 100000 }] });
+  assert.equal(plain.paymentUsed, 6381.36);
+  assert.equal(withLump.paymentUsed, 6381.36);
+  // The first 12 months predate the lump: identical rows.
+  assert.deepEqual(withLump.series.slice(0, 12), plain.series.slice(0, 12));
+  // Month 13 charges interest on the balance less the $100k, and
+  // still pays exactly $6,381.36.
+  const b12 = plain.series[11].balance;
+  const m13 = withLump.series[12];
+  assert.equal(m13.month, '2026-01');
+  assert.ok(close(m13.interest, (b12 - 100000) * monthlyRate(3.95)), m13.interest);
+  assert.equal(m13.payment, 6381.36);
+  assert.ok(withLump.series.every((row, i) => i === withLump.series.length - 1
+    || row.payment === plain.series[i].payment), 'payments match the plain schedule month by month');
+  // Payoff 2054-12 -> 2051-03 (45 months earlier); total interest
+  // $947,288.76 -> $758,293.51.
+  assert.equal(plain.payoffMonth, '2054-12');
+  assert.ok(close(plain.totalInterest, 947288.76), plain.totalInterest);
+  assert.equal(withLump.payoffMonth, '2051-03');
+  assert.ok(close(withLump.totalInterest, 758293.51), withLump.totalInterest);
+});
+
+test('buildSchedule: a rate change after a lump sum recasts against the post-lump trajectory endpoint', () => {
+  // 6% for the first stretch, a $20,000 lump sum in September 2026,
+  // then the rate drops to 3% in March 2027. The lump keeps the
+  // $639.81 payment and pulls the trajectory's payoff in to
+  // 2042-07; the March 2027 recast must target THAT endpoint (185
+  // months out), not the term's remaining amortization (287
+  // months), which is what the pre-change rule derived.
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
+    { start_date: '2027-03-01', rate_type: 'fixed', annual_rate: 3 },
+  ];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];
+  const base = { balance: 100000, balanceDate: '2026-01-01', terms, segments };
+  const r = buildSchedule({ ...base, lumpSums: [{ date: '2026-09-10', amount: 20000 }] });
+  assert.ok(close(r.paymentUsed, derivePayment(100000, 6, 25), 0.02), r.paymentUsed);
+  // The payment is untouched from the first month through the lump
+  // and up to the rate change.
+  const throughFeb = r.series.filter((row) => row.month <= '2027-02');
+  assert.ok(throughFeb.every((row) => row.payment === r.paymentUsed), 'payment constant until the rate change');
+  // The pre-change trajectory endpoint, extrapolated independently:
+  // the February 2027 balance at the old payment and old rate.
+  const feb = r.series.find((row) => row.month === '2027-02');
+  const hypo = simulate({
+    balance: feb.balance, balanceDate: feb.date, payment: r.paymentUsed,
+    segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: 6 }],
+  });
+  assert.equal(hypo.payoffMonth, '2042-07');
+  const monthsLeft = 185; // 2027-02 -> 2042-07
+  const mar = r.series.find((row) => row.month === '2027-03');
+  assert.equal(mar.rate, 3);
+  assert.ok(close(mar.payment, derivePayment(feb.balance, 3, monthsLeft / 12), 0.02), mar.payment);
+  assert.ok(close(mar.payment, 522.69), mar.payment);
+  // The old remaining-amortization derivation would have given a
+  // materially smaller payment ($377.71) and re-extended the loan.
+  assert.ok(Math.abs(mar.payment - derivePayment(feb.balance, 3, 287 / 12)) > 100);
+  // And the loan indeed ends at the preserved endpoint.
+  assert.equal(r.payoffMonth, '2042-07');
+});
+
+test('buildSchedule: a mid-term rate change recasts the payment against the trajectory endpoint', () => {
   const segments = [
     { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
     { start_date: '2026-07-01', rate_type: 'fixed', annual_rate: 3 },
@@ -293,7 +370,10 @@ test('buildSchedule: a mid-term rate change recomputes the payment on the remain
   assert.ok(close(r.series[0].interest, 493.86), r.series[0].interest);
   assert.ok(close(r.paymentUsed, derivePayment(100000, 6, 25), 0.02), r.paymentUsed);
   // Five payments at 6% (2026-02..2026-06), then the July payment is
-  // re-derived from the balance over the remaining 295 months at 3%.
+  // recast so the loan still ends at the trajectory's payoff month.
+  // With no lump sum that endpoint is the amortization end, 295
+  // months out — the same figure the remaining-amortization
+  // derivation gives, so the two rules coincide here.
   const b5 = r.series[4].balance;
   const jul = r.series[5];
   assert.equal(jul.month, '2026-07');

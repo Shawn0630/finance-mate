@@ -255,18 +255,30 @@ function monthIdxOf(dateStr) {
 // and the events inside them — the way a Canadian mortgage actually
 // runs. A term is a contract period with its own lender, amortization
 // and opening balance; inside a term the rate can change (a new rate
-// segment starts) and lump sums can land. At every event — a term
-// starting, a segment starting, a lump sum landing — the monthly
-// payment is RECOMPUTED from the balance at that point, the rate
-// then in effect and the active term's REMAINING amortization
-// (its amortization minus the months already elapsed in the term,
-// counted from the balance anchor for the anchor's term and from
-// the term's start for later terms). Between events the payment is
-// constant, so the projection is a chain of simulate() runs, one per
-// inter-event span, carrying the balance across. A lump sum deducts
-// from the balance FIRST (in its month, before that month's
-// interest), then the payment is recomputed — so a lump sum lowers
-// the payment and shortens the payoff. The entered monthly payment
+// segment starts) and lump sums can land. The monthly payment is
+// recomputed at SOME events, the bank-standard way:
+//   - a TERM starting: derived from the balance at that point, the
+//     rate then in effect and the new term's amortization;
+//   - a RATE CHANGE (a segment starting): re-derived against the
+//     payoff the loan was already heading to — the pre-change
+//     trajectory (previous payment, previous rate, held constant)
+//     is extrapolated to its projected payoff month and the new
+//     payment amortizes the balance to that same month at the new
+//     rate, so a rate change moves the payment only through the
+//     rate itself and never re-sets the payoff. If the pre-change
+//     trajectory never pays off (negative amortization), the
+//     fallback is the active term's REMAINING amortization (its
+//     amortization minus the months already elapsed in the term,
+//     counted from the balance anchor for the anchor's term and
+//     from the term's start for later terms);
+//   - a LUMP SUM landing: the payment does NOT change. The lump sum
+//     deducts from the balance FIRST (in its month, before that
+//     month's interest) and the unchanged payment then pays the
+//     loan off sooner, for less total interest — how Canadian
+//     lenders treat a prepayment.
+// Between events the payment is constant, so the projection is a
+// chain of simulate() runs, one per inter-event span, carrying the
+// balance across. The entered monthly payment
 // (paymentOverride) is an override that rules only inside the term
 // containing the balance anchor; at a renewal the payment returns
 // to automatic. Prime is held constant, exactly as in simulate().
@@ -314,12 +326,20 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // counts from the state point just before its first payment month.
   const epochOf = (term) => (term === anchorTerm ? A : monthIdxOf(term.start_date) - 1);
 
+  // Does the entered payment rule for months after state point S?
+  // 'entered' only inside the anchor's term; automatic elsewhere.
+  const overrideAt = (S) => {
+    if (!(paymentOverride > 0)) return false;
+    const term = termAtMonth(S + 1);
+    return !anchorTerm || !term || term.id === anchorTerm.id;
+  };
+
   // The monthly payment in effect for months after state point S,
-  // computed from the balance at S. 'entered' only inside the
-  // anchor's term; automatic everywhere else.
+  // computed from the balance at S against the active term's
+  // REMAINING amortization — the anchor / term-start derivation.
   const computePayment = (S, balNow) => {
     const term = termAtMonth(S + 1);
-    if (paymentOverride > 0 && (!anchorTerm || !term || term.id === anchorTerm.id)) {
+    if (overrideAt(S)) {
       return { payment: round2(paymentOverride), source: 'entered' };
     }
     const rate = segmentAnnualRate(segmentForMonth(segments, ymKeyOfIdx(S + 1)), primeRate);
@@ -328,6 +348,40 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
     if (remaining <= 0) return { payment: round2(balNow), source: 'derived' }; // past the amortization: clear it (simulate caps at balance + interest)
     return { payment: derivePayment(balNow, rate, remaining / 12), source: 'derived' };
+  };
+
+  // The payment after a RATE CHANGE at state point S (a new segment
+  // governs months from S + 1 on). Bank-standard recast: find the
+  // payoff month the loan was already heading to — extrapolate the
+  // pre-change trajectory (the previous payment at the previous
+  // rate, held constant) — and derive the new payment so the
+  // balance still amortizes to that same month at the new rate.
+  // A lump sum that landed earlier therefore keeps its earlier
+  // payoff through a rate change; only the rate moves the payment.
+  // `lastPayment` / `balanceDateAtS` describe the pre-change state.
+  // If the pre-change trajectory never pays off (negative
+  // amortization, or beyond the projection cap), fall back to the
+  // term's remaining amortization (computePayment).
+  const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
+    if (overrideAt(S)) {
+      return { payment: round2(paymentOverride), source: 'entered' };
+    }
+    const newRate = segmentAnnualRate(segmentForMonth(segments, ymKeyOfIdx(S + 1)), primeRate);
+    if (newRate === null) return { error: 'no_prime' };
+    const prevSeg = segmentForMonth(segments, ymKeyOfIdx(S));
+    const prevRate = segmentAnnualRate(prevSeg, primeRate);
+    if (prevRate !== null && lastPayment > 0) {
+      const hypo = simulate({
+        balance: balNow, balanceDate: balanceDateAtS, payment: lastPayment,
+        segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: prevRate }],
+        paymentDay: anchorDay, frequency, maxMonths: A + maxMonths - S, primeRate, region,
+      });
+      if (hypo.payoffMonth) {
+        const monthsLeft = monthIdxOf(hypo.payoffMonth) - S;
+        if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12), source: 'derived' };
+      }
+    }
+    return computePayment(S, balNow);
   };
 
   // Lump sums grouped by the state point they land on (the point
@@ -352,10 +406,16 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   }
   // Event state points after the anchor: term starts, segment
   // starts and lump-sum landings. (Anything at or before the anchor
-  // is already reflected in the opening state.)
+  // is already reflected in the opening state.) The three kinds are
+  // tracked separately because they treat the payment differently:
+  // a term start re-derives it on the new amortization, a rate
+  // change recasts it against the current trajectory's payoff, and
+  // a lump sum leaves it unchanged.
+  const termStates = new Set();
+  const segStates = new Set();
   const eventStates = new Set();
-  for (const t of sortedTerms) { const s = monthIdxOf(t.start_date) - 1; if (s > A) eventStates.add(s); }
-  for (const sg of segments) { const s = monthIdxOf(sg.start_date) - 1; if (s > A) eventStates.add(s); }
+  for (const t of sortedTerms) { const s = monthIdxOf(t.start_date) - 1; if (s > A) { termStates.add(s); eventStates.add(s); } }
+  for (const sg of segments) { const s = monthIdxOf(sg.start_date) - 1; if (s > A) { segStates.add(s); eventStates.add(s); } }
   for (const s of lumpByState.keys()) eventStates.add(s);
   const boundaries = [...eventStates].sort((a, b) => a - b);
   boundaries.push(A + maxMonths);
@@ -385,7 +445,22 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   let chunkBalanceDate = balanceDate;
   for (const nextS of boundaries) {
     if (bal <= 0 || S >= A + maxMonths) break;
-    let cp = computePayment(S, bal);
+    let cp;
+    if (S === A || termStates.has(S)) {
+      // The anchor, or a new term starting: derive the payment on
+      // the (new) term's amortization. A segment that starts with
+      // the term is the term's opening rate plan, not a mid-stream
+      // rate change.
+      cp = computePayment(S, bal);
+    } else if (segStates.has(S)) {
+      // A rate change inside the running schedule.
+      cp = computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
+    } else {
+      // A lump-sum-only boundary: the balance was already reduced
+      // below; the payment carries over unchanged and the loan
+      // simply pays off sooner.
+      cp = { payment: lastPayment, source: paymentSource };
+    }
     if (cp.error) {
       if (S === A) return { ...blocked, state: cp.error };
       // A later term without an amortization cannot recompute the
@@ -412,7 +487,8 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     S = nextS;
     if (S >= A + maxMonths) break;
     // A lump sum landing at this state point deducts FIRST; the
-    // next loop iteration recomputes the payment on what remains.
+    // payment itself is NOT recomputed for it (see the boundary
+    // handling above) — the smaller balance just pays off sooner.
     const lump = lumpByState.get(S);
     if (lump && bal > 0) {
       const before = bal;

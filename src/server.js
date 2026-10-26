@@ -1309,9 +1309,11 @@ app.post('/api/prime/refresh', requireApiAuth, async (req, res) => {
 // default or assumed rate anywhere. With no segments the endpoint reports
 // a NO_RATE_PLAN state instead of projecting at 0%. The payment comes
 // from the term schedule (engine buildSchedule): auto-computed from the
-// balance, the rate in effect and the current term's remaining
-// amortization, recomputed at every term start, rate change and lump
-// sum; a stored monthly payment is an override inside the current term.
+// balance, the rate in effect and the current term's amortization —
+// re-derived at a term start, recast against the current trajectory's
+// payoff at a rate change, and left unchanged by lump sums (they
+// shorten the loan instead); a stored monthly payment is an override
+// inside the current term.
 app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -1334,9 +1336,10 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
   const balanceDate = p.mortgage_balance_date || new Date().toISOString().slice(0, 10);
   // The projection is built by the term schedule (engine
   // buildSchedule): the payment is auto-computed from the balance,
-  // the rate in effect and the current term's remaining
-  // amortization, and recomputed at every term start, rate change
-  // and lump sum. An entered monthly payment is an override that
+  // the rate in effect and the current term's amortization —
+  // re-derived at a term start, recast against the trajectory's
+  // payoff at a rate change, unchanged by lump sums. An entered
+  // monthly payment is an override that
   // rules inside the current term only. NO_PAYMENT now means the
   // current term has no amortization to compute a payment from and
   // no override is entered.

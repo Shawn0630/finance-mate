@@ -1184,7 +1184,7 @@ function renderTerms(p) {
         ${segFormHtml(t)}
         <h5>Lump sums in this term</h5>
         ${lumpRowsHtml(t.lumpSums || [])}
-        <div class="note" style="margin-left:0">A lump sum comes off the principal on its date first; the payment is then recalculated from the new balance and the remaining amortization, so the payment drops and the total interest falls.</div>
+        <div class="note" style="margin-left:0">Your payment stays the same — the lump sum shortens the loan and reduces total interest.</div>
         <div class="toolbar"><button type="button" class="small" data-toggle-lump="${t.id}">+ Add lump sum</button></div>
         <form data-lump-form="${t.id}" class="toolbar hidden" style="align-items:flex-end">
           <div><label>Date</label><input type="date" name="date" required></div>
@@ -1805,7 +1805,7 @@ function renderDerivedPaymentNote() {
   const el = $('#derivedPaymentNote');
   if (!el) return;
   if (chartMeta && chartMeta.paymentSource === 'derived') {
-    el.textContent = `Monthly payment derived from the remaining amortization: ${money(chartMeta.paymentUsed)} per month — calculated automatically, and recalculated whenever the rate changes, a lump sum lands or a new term starts. Enter a monthly payment above to override it inside the current term.`;
+    el.textContent = `Monthly payment derived from the remaining amortization: ${money(chartMeta.paymentUsed)} per month — calculated automatically, and recalculated when the rate changes or a new term starts. A lump sum leaves the payment unchanged — it shortens the loan and reduces total interest instead. Enter a monthly payment above to override it inside the current term.`;
   } else if (chartMeta && chartMeta.paymentSource === 'entered') {
     el.textContent = `Monthly payment: ${money(chartMeta.paymentUsed)} per month (entered) — it overrides the automatic calculation inside the current term; from the next term on, the payment is calculated automatically again.`;
   } else {

@@ -1113,7 +1113,10 @@ try {
       && Math.abs(dec2.payment - projT2.paymentUsed) > 1,
     JSON.stringify({ decPay: dec2 && dec2.payment, t1Pay: projT2.paymentUsed }));
 
-  // Lump sum: deducts first, then the payment is recomputed.
+  // Lump sum: deducts first; the payment does NOT change (bank
+  // standard) — the smaller balance just pays off sooner inside
+  // the running term, and at the renewal the benefit reappears as
+  // a lower re-derived Term 2 payment.
   const projPreLump = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
   r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-03-10', amount: 50000, note: 'Bonus' });
   check('lump sum created in the term active on its date',
@@ -1125,19 +1128,25 @@ try {
   const marPost = projLump.series.find((x) => x.month === '2025-03');
   check('months before the lump sum are unchanged',
     JSON.stringify(febPost) === JSON.stringify(febPre), JSON.stringify(febPost));
-  check('the lump month charges interest on the reduced balance and re-derives the payment (358 months left)',
+  check('the lump month charges interest on the reduced balance and the payment is unchanged',
     !!marPost && Math.abs(marPost.interest - Math.round((febPost.balance - 50000) * engineMonthlyRate(3.95) * 100) / 100) < 0.02
-      && Math.abs(marPost.payment - engineDerive(febPost.balance - 50000, 3.95, 358 / 12)) < 0.02
-      && marPost.payment < projLump.paymentUsed,
+      && Math.abs(marPost.payment - projPreLump.paymentUsed) < 0.02,
     JSON.stringify(marPost));
-  // The recompute targets the SAME amortization end date (that is
-  // what "remaining amortization" means), so the payoff month is
-  // the amortization end give or take a month of cent-rounding —
-  // the lump sum's certain effects are the lower payment (checked
-  // above) and materially less total interest.
-  check('the lump sum cuts the total interest and the payoff stays at the amortization end',
-    projLump.totalInterest < projPreLump.totalInterest - 10000 && projLump.payoffMonth <= '2054-12',
-    JSON.stringify({ interestBefore: projPreLump.totalInterest, interestAfter: projLump.totalInterest, payoff: projLump.payoffMonth }));
+  // The payoff inside Term 1 pulls in, but the renewal re-derives
+  // Term 2's payment on its own fresh amortization — so end to end
+  // the lump's certain effects are materially less total interest
+  // ($944,662.80 -> $900,138.41) and a lower payment from the
+  // renewal on ($6,393.88 -> $6,078.80), not a changed Term 1
+  // payment or an earlier final payoff.
+  const decPreLump = projPreLump.series.find((x) => x.month === '2029-12');
+  const decPostLump = projLump.series.find((x) => x.month === '2029-12');
+  check('the lump sum cuts the total interest and lowers the payment re-derived at the renewal',
+    projLump.totalInterest < projPreLump.totalInterest - 10000
+      && !!decPreLump && !!decPostLump && decPostLump.payment < decPreLump.payment - 100,
+    JSON.stringify({
+      interestBefore: projPreLump.totalInterest, interestAfter: projLump.totalInterest,
+      decBefore: decPreLump && decPreLump.payment, decAfter: decPostLump && decPostLump.payment,
+    }));
   r = await req('DELETE', `/api/properties/${termPid}/lump-sums/${lumpId}`);
   const projLumpGone = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
   check('deleting the lump sum restores the previous projection',
@@ -2032,7 +2041,8 @@ try {
       // takes the new lender + amortization, and the projection then
       // runs continuously across the boundary with the payment
       // re-derived on Term 2's amortization. A lump sum added in
-      // Term 1 through its own form drops the payment.
+      // Term 1 through its own form leaves the payment unchanged
+      // and pulls the payoff earlier.
       r = await req('POST', '/api/properties', {
         address: '888 Term UI Way, Victoria, BC',
         mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
@@ -2107,11 +2117,22 @@ try {
       const amortLump = (await req('GET', `/api/properties/${termUiPid}/amortization`)).data;
       const novRowL = amortLump.series.find((x) => x.month === '2026-11');
       const decRowL = amortLump.series.find((x) => x.month === '2026-12');
-      check('UI lump sum: the lump month charges interest on the reduced balance, payment drops',
+      // The lump leaves the Term 1 payment untouched; the payoff
+      // it pulls in is then absorbed by the renewal, whose payment
+      // is re-derived on Term 2's amortization from the smaller
+      // balance — so the visible wins are the lower renewal
+      // payment and the lower total interest, not an earlier
+      // final payoff (that needs a single-term loan; see the
+      // engine unit tests).
+      const t2Before = amortUi.series.find((x) => x.month === t2Month);
+      const t2After = amortLump.series.find((x) => x.month === t2Month);
+      check('UI lump sum: the lump month charges interest on the reduced balance, the payment is unchanged, the renewal payment drops',
         !!decRowL && !!novRowL
           && Math.abs(decRowL.interest - Math.round((novRowL.balance - 50000) * engineMonthlyRate(3.95) * 100) / 100) < 0.02
-          && decRowL.payment < amortUi.paymentUsed,
-        JSON.stringify(decRowL));
+          && Math.abs(decRowL.payment - amortUi.paymentUsed) < 0.02
+          && !!t2Before && !!t2After && t2After.payment < t2Before.payment - 100
+          && amortLump.totalInterest < amortUi.totalInterest - 10000,
+        JSON.stringify({ dec: decRowL, t2Before: t2Before && t2Before.payment, t2After: t2After && t2After.payment }));
       r = await req('GET', `/api/properties/${termUiPid}`);
       check('the lump sum is recorded under Term 1',
         r.data.terms[0].lumpSums.length === 1 && r.data.terms[0].lumpSums[0].amount === 50000,
