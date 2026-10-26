@@ -3,11 +3,12 @@
 // throwaway DATA_DIR, seeds one property through the API (assessed
 // history 2022-2026, a fixed segment, amortization-derived payment,
 // two photos), then drives headless Chrome through the CDP Fetch
-// bridge and captures: the full detail page (Gallery -> Property
-// Details -> Value & Mortgage Projection), the Mortgage Terms &
-// Rates modal, and the Assessment History modal. Also prints the
-// live layout facts it asserts on (section order, axis maxima,
-// schedule page + Total row).
+// bridge and captures: the full detail page (one merged Property
+// Details + photo carousel panel -> Value & Mortgage Projection),
+// the merged overview panel in its empty-photo and with-photos
+// states, the Mortgage Terms & Rates modal, and the Assessment
+// History modal. Also prints the live layout facts it asserts on
+// (merged structure, axis maxima, schedule page + Total row).
 //   node tests/screenshot-layout.mjs
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
@@ -112,9 +113,6 @@ try {
   for (const [year, value] of [[2022, 1730000], [2023, 1903000], [2024, 1955000], [2025, 2002000], [2026, 1931000]]) {
     await req('POST', `/api/properties/${pid}/value-history`, { year, value });
   }
-  await req('POST', `/api/properties/${pid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
-  await req('POST', `/api/properties/${pid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
-
   browser = await puppeteer.launch({
     executablePath: '/opt/meta-chromium/chrome',
     headless: 'new',
@@ -128,17 +126,40 @@ try {
   });
   await page.goto(`http://ff.local/#property/${pid}`, { waitUntil: 'networkidle0', timeout: 30000 });
   await wait(2500);
+  // The merged overview panel before any photos: empty-photo state.
+  const ovEmpty = await page.evaluateHandle(() => document.querySelector('#propertyOverview'));
+  await ovEmpty.asElement().screenshot({ path: path.join(OUT, 'layout-overview-empty.png') });
+  console.log('layout-overview-empty.png', fs.statSync(path.join(OUT, 'layout-overview-empty.png')).size);
+
+  await req('POST', `/api/properties/${pid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
+  await req('POST', `/api/properties/${pid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
+  await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+  await wait(2500);
   // All: the full projection (yearly bars) + the schedule's whole span.
   await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
   await wait(800);
 
   const facts = await page.evaluate(() => {
     const c = window.__fmCharts.a;
-    const heads = ['galleryPanel', 'propertyDetailsPanel', 'projectionPanel']
-      .map((id) => document.getElementById(id).querySelector('h3').textContent.trim());
+    const ov = document.getElementById('propertyOverview');
+    const heads = [
+      ov ? ov.querySelector('h3').textContent.trim() : '',
+      document.getElementById('projectionPanel').querySelector('h3').textContent.trim(),
+    ];
     const total = document.querySelector('#scheduleTotalRow');
+    const det = ov ? ov.querySelector('.overview-details') : null;
+    const pho = ov ? ov.querySelector('.overview-photos') : null;
+    const dr = det ? det.getBoundingClientRect() : null;
+    const pr = pho ? pho.getBoundingClientRect() : null;
+    const tag = ov ? ov.querySelector('.region-tag') : null;
     return {
       headings: heads,
+      merged: !!ov && !document.getElementById('galleryPanel') && !document.getElementById('propertyDetailsPanel'),
+      leftRight: !!(dr && pr && dr.left < pr.left && Math.abs(dr.top - pr.top) < 4),
+      detailLabels: [...document.querySelectorAll('#propViewBody tr td:first-child')].map((td) => td.textContent.trim()),
+      detailAssessed: document.getElementById('detailAssessedValue').textContent,
+      detailRemaining: document.getElementById('detailRemainingBalance').textContent,
+      regionTag: tag ? { text: tag.textContent, title: tag.getAttribute('title') } : null,
       equity: document.getElementById('equitySummary').textContent,
       yMax: c ? c.scales.y.max : null,
       y1Max: c ? c.scales.y1.max : null,
@@ -150,11 +171,20 @@ try {
     };
   });
   console.log('layout facts:', JSON.stringify(facts, null, 1));
-  const factsOk = facts.headings.join('|') === 'Gallery|Property Details|Value & Mortgage Projection'
+  const factsOk = facts.headings.join('|') === 'Property Details|Value & Mortgage Projection'
+    && facts.merged && facts.leftRight
+    && facts.detailLabels.join('|') === 'Address|Owners|Purchase date'
+    && facts.detailAssessed === '$1,931,000' && /^\$[\d,]+$/.test(facts.detailRemaining)
+    && !!facts.regionTag && facts.regionTag.title === 'Canada (CA)'
+    && /^Current equity: \$[\d,]+$/.test(facts.equity.trim())
     && facts.y1Max > 0 && facts.y1Max < 100000 && facts.yMax > 1900000
     && facts.barAxis.every((a) => a === 'y1') && facts.scheduleRows > 0 && facts.thumbs === 2;
   console.log('layout facts OK:', factsOk);
   if (!factsOk) process.exitCode = 1;
+
+  const ovFull = await page.evaluateHandle(() => document.querySelector('#propertyOverview'));
+  await ovFull.asElement().screenshot({ path: path.join(OUT, 'layout-overview-photos.png') });
+  console.log('layout-overview-photos.png', fs.statSync(path.join(OUT, 'layout-overview-photos.png')).size);
 
   await page.evaluate(() => {
     const c = window.__fmCharts.a;

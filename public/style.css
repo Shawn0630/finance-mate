@@ -56,6 +56,12 @@ td.num, th.num { text-align: right; }
 .msg.err { background: #fdeceb; color: #b3261e; display: block; }
 .msg.warn { background: #fdf6e0; color: #7a5b00; display: block; }
 .placeholder { background: #fff; border: 1px dashed #c9d2dc; border-radius: 10px; padding: 42px 20px; text-align: center; color: #71808f; }
+/* Property overview: one panel, details left / photo carousel
+   right; stacks on narrow screens. */
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 760px) { .overview-grid { grid-template-columns: 1fr; } }
+.detail-stats { display: flex; gap: 28px; flex-wrap: wrap; margin: 2px 0 10px; }
+.region-tag { font-size: 15px; line-height: 1; vertical-align: -2px; margin-left: 6px; cursor: default; }
 .detail-photo { width: 100%; max-height: 300px; object-fit: cover; border-radius: 10px; }
 .detail-photo-empty { height: 170px; background: #dbe4ee; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #71808f; }
 .photo-clickable { cursor: pointer; }

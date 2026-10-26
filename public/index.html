@@ -110,47 +110,55 @@
   <section id="view-property" class="hidden">
     <div class="toolbar"><a href="#assets/properties">&larr; Back to Properties</a><div class="spacer"></div>
       <button class="danger" id="deletePropertyBtn">Delete property</button></div>
-    <!-- Gallery: the photo wall — main photo plus a thumbnail strip. -->
-    <div class="panel" id="galleryPanel">
-      <h3>Gallery</h3>
-      <div id="photoArea"></div>
-      <input type="file" id="photoFiles" accept="image/*" multiple class="hidden">
-    </div>
-    <div class="msg" id="detailMsg"></div>
-    <div class="msg warn hidden" id="primeWarning"></div>
-
-    <!-- Property Details: minimal read-only metadata. The assessment
-         source data (fetch / pull / history points) is not here — it
-         lives in the "Assessment History" modal. -->
-    <div class="panel" id="propertyDetailsPanel">
+    <!-- Property overview: ONE panel at the top of the page —
+         details on the left, the photo carousel on the right. The
+         read-only details lead with two headline figures (assessed
+         value, today's remaining balance) over address / owners /
+         purchase date; Edit swaps in the form. The region rides
+         beside the address as a flag tag. The assessment source
+         data (fetch / pull / history points) is not here — it lives
+         in the "Assessment History" modal. -->
+    <div class="panel" id="propertyOverview">
       <div class="panel-head">
         <h3>Property Details</h3>
         <div class="spacer"></div>
         <button class="primary" type="button" id="editPropBtn">Edit</button>
       </div>
-      <div id="propView">
-        <table class="detail-table"><tbody id="propViewBody"></tbody></table>
+      <div class="overview-grid">
+        <div class="overview-details">
+          <div id="propView">
+            <div class="detail-stats">
+              <div class="detail-stat"><div class="head-stat-k">Assessed value</div><div class="head-stat-v" id="detailAssessedValue">—</div></div>
+              <div class="detail-stat"><div class="head-stat-k">Remaining balance</div><div class="head-stat-v" id="detailRemainingBalance">—</div></div>
+            </div>
+            <table class="detail-table"><tbody id="propViewBody"></tbody></table>
+          </div>
+          <form id="propForm" class="hidden">
+            <div class="grid2">
+              <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off" required><ul class="suggest-list hidden"></ul><p class="suggest-note hidden">Address suggestions are unavailable right now — you can still type the full address.</p></div></div>
+              <div><label>Owners</label><div class="owner-picker" id="propOwnerPicker"><div class="owner-chips"></div><div class="owner-candidates"></div></div></div>
+            </div>
+            <div><label>Notes</label><input name="notes"></div>
+            <div class="grid3">
+              <div><label>Assessed value ($)</label><input name="assessed_value" type="text" inputmode="decimal" data-money></div>
+              <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
+              <div><label>Purchase date</label><input name="purchase_date" type="date"></div>
+            </div>
+            <div class="note" id="assessmentMeta" style="margin-left:0"></div>
+            <div class="toolbar">
+              <button class="primary" type="submit">Save</button>
+              <button type="button" id="cancelPropEditBtn">Cancel</button>
+            </div>
+          </form>
+        </div>
+        <div class="overview-photos">
+          <div id="photoArea"></div>
+          <input type="file" id="photoFiles" accept="image/*" multiple class="hidden">
+        </div>
       </div>
-      <form id="propForm" class="hidden">
-        <div class="grid2">
-          <div><label>Address *</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off" required><ul class="suggest-list hidden"></ul><p class="suggest-note hidden">Address suggestions are unavailable right now — you can still type the full address.</p></div></div>
-          <div><label>Owners</label><div class="owner-picker" id="propOwnerPicker"><div class="owner-chips"></div><div class="owner-candidates"></div></div></div>
-        </div>
-        <div><label>Notes</label><input name="notes"></div>
-        <div class="grid3">
-          <div><label>Assessed value ($)</label><input name="assessed_value" type="text" inputmode="decimal" data-money></div>
-          <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
-          <div><label>Purchase date</label><input name="purchase_date" type="date"></div>
-        </div>
-        <div class="note" id="assessmentMeta" style="margin-left:0"></div>
-        <div class="toolbar">
-          <button class="primary" type="submit">Save</button>
-          <button type="button" id="cancelPropEditBtn">Cancel</button>
-        </div>
-      </form>
-      <div class="note" id="paymentDayDisplay" style="margin-left:0"></div>
-      <div class="note" id="regionDisplay" style="margin-left:0"></div>
     </div>
+    <div class="msg" id="detailMsg"></div>
+    <div class="msg warn hidden" id="primeWarning"></div>
 
     <div class="panel" id="projectionPanel">
       <div class="panel-head">
@@ -175,9 +183,7 @@
       <div class="msg" id="combinedMsg"></div>
       <div class="msg" id="monthlyMsg"></div>
       <div class="chart-wrap tall"><canvas id="combinedChart"></canvas></div>
-      <div class="note" style="margin-left:0">The assessed values are plotted as one point per assessment year, through the last known year, connected by straight lines (left axis). The bars ride the right axis and split each payment into its interest and principal portions (stacked, so a bar’s full height is the payment); on spans over 10 years they are yearly totals instead of monthly ones, while the table below always stays monthly. The current year is fetched from BC Assessment automatically (and records that year’s point); earlier years are pulled from HouseSigma — once when the property is added, and again whenever you pull history in “Assessment History”. Pulled points never overwrite a point you entered by hand or one fetched from BC Assessment. Points are added, edited and deleted in “Assessment History”; the mortgage setup lives in “Mortgage Terms &amp; Rates”.</div>
       <div class="note" id="trendSummary" style="margin-left:0"></div>
-      <div class="note" id="scheduleNote" style="margin-left:0"></div>
       <div class="schedule-pager hidden" id="schedulePager">
         <button type="button" class="small" id="schedulePrevYear" aria-label="Previous year">&#8249;</button>
         <select id="scheduleYearSelect" aria-label="Schedule year"></select>

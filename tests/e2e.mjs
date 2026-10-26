@@ -1725,8 +1725,8 @@ try {
       check('detail chart A defaults to the most recent 5 assessment years (2022-2026)',
         JSON.stringify(winDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winDefault));
       const sumDefault = await page.evaluate(() => document.querySelector('#trendSummary').textContent);
-      check('trend summary is calculated over the displayed 5-year window',
-        sumDefault.includes('Change 2022 → 2026') && sumDefault.includes('fall in the selected chart range'), sumDefault);
+      check('trend summary is calculated over the displayed 5-year window (figure only, no range-guidance tail)',
+        sumDefault.includes('Change 2022 → 2026') && !sumDefault.includes('fall in the selected chart range'), sumDefault);
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
       await wait(600);
       const winAll = await assessedYears();
@@ -1916,14 +1916,14 @@ try {
       const yearsAll = [...new Set(winAmort.series.map((r) => r.month.slice(0, 4)))];
       const totBars = bi && bi.bars ? bi.bars.sums.reduce((s, v) => s + v, 0) : 0;
       const totApi = winAmort.series.reduce((s, r) => s + r.payment, 0);
-      const sumText = await page.evaluate(() => document.querySelector('#scheduleNote').textContent);
+      const schedNoteGone = await page.evaluate(() => !document.querySelector('#scheduleNote'));
       check('All view aggregates the bars by year (one bar per projection year)',
         !!bi && !!bi.bars && bi.bars.xs.length === yearsAll.length
           && bi.bars.xs.every((x) => Number.isInteger(x))
           && Math.abs(totBars - totApi) < 1,
         JSON.stringify(bi && bi.bars && { n: bi.bars.xs.length, years: yearsAll.length, totBars, totApi }));
-      check('the schedule note names the yearly bar basis on the All span',
-        sumText.includes('yearly interest & principal totals'), sumText);
+      check('no schedule-basis note remains under the chart (explanation prose removed)',
+        schedNoteGone === true);
 
       // ---- Monthly schedule: monthly rows, year pages, one Total row ----
       // The table under the chart lists the endpoint's series months
@@ -2479,8 +2479,8 @@ try {
         meta: document.querySelector('#metaCurrentLender').textContent,
         input: document.querySelector('[data-term-form] [name=lender]').value,
       }));
-      check('lender shows in the read-only panel, the modal metadata and the term form',
-        lenderBits.view.includes('Lender') && lenderBits.view.includes('Scotiabank')
+      check('lender shows in the modal metadata and the term form — and NOT in the slimmed details panel',
+        !lenderBits.view.includes('Lender')
           && lenderBits.meta === 'Scotiabank' && lenderBits.input === 'Scotiabank',
         JSON.stringify(lenderBits));
       const inModal = await page.evaluate(() => {
@@ -2585,9 +2585,8 @@ try {
         remMeta.includes(groupNum(remAmort.remainingBalance)) && !remMeta.includes('1,350,000'),
         String(remMeta));
       const remEqText = await page.evaluate(() => document.querySelector('#equitySummary').textContent);
-      check('detail equity line is the assessed value minus the remaining balance',
-        remEqText.includes(`Current equity: $${groupNum(1931000 - remAmort.remainingBalance)}`)
-          && remEqText.includes(`outstanding principal $${groupNum(remAmort.remainingBalance)}`),
+      check('detail equity line is the bare figure (assessed minus remaining, no derivation tail)',
+        remEqText.trim() === `Current equity: $${groupNum(1931000 - remAmort.remainingBalance)}`,
         remEqText);
       await page.evaluate(() => document.querySelector('#mortgageModal [data-close-modal]').click());
       await wait(300);
@@ -2844,33 +2843,82 @@ try {
       check('the Photo URL field is gone from the edit form', panelState.hasPhotoUrlField === false);
       check('read-only view shows purchase date 2024-12-17', panelState.viewText.includes('2024-12-17'), panelState.viewText.slice(0, 160));
       check('a property without photos shows the click-to-add placeholder', panelState.emptyGallery === true);
-      // Layout: Gallery -> Property Details -> Value & Mortgage
-      // Projection in that order; Edit in the Property Details head;
-      // the mortgage setup, the history editor and the fetch/pull
-      // buttons live in their modals, not on the page body. The BCA
-      // source line moved with them into Assessment History.
+      // Layout: ONE merged overview panel (details left, photo
+      // carousel right) above Value & Mortgage Projection; the old
+      // separate Gallery / Property Details panels are gone. Edit
+      // sits in the merged panel's head; the mortgage setup, the
+      // history editor and the fetch/pull buttons live in their
+      // modals, not on the page body. The BCA source line moved
+      // with them into Assessment History.
       const layout = await page.evaluate(() => {
-        const g = document.getElementById('galleryPanel');
-        const pd = document.getElementById('propertyDetailsPanel');
+        const ov = document.getElementById('propertyOverview');
         const vp = document.getElementById('projectionPanel');
         const follows = (a, b) => !!(a && b && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+        const det = ov ? ov.querySelector('.overview-details') : null;
+        const pho = ov ? ov.querySelector('.overview-photos') : null;
+        const dr = det ? det.getBoundingClientRect() : null;
+        const pr = pho ? pho.getBoundingClientRect() : null;
         return {
-          order: follows(g, pd) && follows(pd, vp),
-          headings: [g, pd, vp].map((el) => ((el.querySelector('h3') || {}).textContent || '').trim()),
-          editInHead: !!document.querySelector('#propertyDetailsPanel .panel-head #editPropBtn'),
+          merged: !!ov && !document.getElementById('galleryPanel') && !document.getElementById('propertyDetailsPanel'),
+          order: follows(ov, vp),
+          headings: [ov, vp].map((el) => ((el.querySelector('h3') || {}).textContent || '').trim()),
+          editInHead: !!document.querySelector('#propertyOverview .panel-head #editPropBtn'),
+          columns: !!(det && pho && det.contains(document.getElementById('propView'))
+            && pho.contains(document.getElementById('photoArea'))),
+          leftRight: !!(dr && pr && dr.left < pr.left && Math.abs(dr.top - pr.top) < 4),
           mortgageOnPage: !!document.querySelector('#view-property #termsWrap'),
           historyOnPage: !!document.querySelector('#view-property #trendForm'),
           fetchOnPage: !!document.querySelector('#view-property #fetchBcaBtn'),
         };
       });
-      check('detail layout order is Gallery, Property Details, Value & Mortgage Projection',
-        layout.order && layout.headings[0] === 'Gallery' && layout.headings[1] === 'Property Details'
-          && layout.headings[2] === 'Value & Mortgage Projection',
-        JSON.stringify(layout.headings));
-      check('Property Details Edit sits in the panel head (top right)', layout.editInHead === true);
+      check('detail layout is one merged overview panel above Value & Mortgage Projection',
+        layout.merged && layout.order && layout.headings[0] === 'Property Details'
+          && layout.headings[1] === 'Value & Mortgage Projection',
+        JSON.stringify(layout));
+      check('overview columns: details on the left, photo carousel on the right',
+        layout.columns && layout.leftRight, JSON.stringify(layout));
+      check('Property Details Edit sits in the merged panel head (top right)', layout.editInHead === true);
       check('the page body carries neither the mortgage setup nor the assessment history (modals only)',
         !layout.mortgageOnPage && !layout.historyOnPage && !layout.fetchOnPage,
         JSON.stringify(layout));
+      // Details content, exactly as ruled: two headline figures
+      // (assessed value, remaining balance) over Address / Owners /
+      // Purchase date — no Notes, Assessment year or Lender rows,
+      // no payment-frequency or region prose lines, and the region
+      // rides beside the address as a flag tag.
+      const detailsBits = await page.evaluate(() => {
+        const tag = document.querySelector('#propViewBody .region-tag');
+        return {
+          labels: [...document.querySelectorAll('#propViewBody tr td:first-child')].map((td) => td.textContent.trim()),
+          assessed: document.querySelector('#detailAssessedValue').textContent,
+          remaining: document.querySelector('#detailRemainingBalance').textContent,
+          viewText: document.querySelector('#propView').textContent,
+          tagText: tag ? tag.textContent : null,
+          tagTitle: tag ? tag.getAttribute('title') : null,
+          proseGone: !document.querySelector('#paymentDayDisplay') && !document.querySelector('#regionDisplay'),
+          bigParaGone: ![...document.querySelectorAll('#projectionPanel .note')]
+            .some((n) => n.textContent.includes('plotted as one point per assessment year')),
+        };
+      });
+      const vhNow = (await req('GET', `/api/properties/${moneyPid}/value-history`)).data;
+      const propNow = (await req('GET', `/api/properties/${moneyPid}`)).data;
+      const latestPt = vhNow.points && vhNow.points.length ? vhNow.points[vhNow.points.length - 1] : null;
+      const fmt$ = (n) => '$' + Number(n).toLocaleString('en-CA', { maximumFractionDigits: 0 });
+      const expAssessed = latestPt ? latestPt.value : propNow.assessed_value;
+      const expRemaining = propNow.remainingBalance != null ? propNow.remainingBalance : propNow.mortgage_balance;
+      check('details carry exactly the two headline figures over Address / Owners / Purchase date',
+        detailsBits.labels.join('|') === 'Address|Owners|Purchase date'
+          && detailsBits.assessed === fmt$(expAssessed)
+          && detailsBits.remaining === fmt$(expRemaining),
+        JSON.stringify({ detailsBits, expAssessed, expRemaining }));
+      check('details carry no Notes / Assessment year / Lender rows and no prose lines',
+        !detailsBits.viewText.includes('Notes') && !detailsBits.viewText.includes('Assessment year')
+          && !detailsBits.viewText.includes('Lender') && !detailsBits.viewText.includes('Payment frequency')
+          && !detailsBits.viewText.includes('Region:') && detailsBits.proseGone && detailsBits.bigParaGone,
+        JSON.stringify(detailsBits));
+      check('region shows as a flag tag beside the address (details panel)',
+        detailsBits.tagText === '🇨🇦' && detailsBits.tagTitle === 'Canada (CA)',
+        JSON.stringify(detailsBits));
       await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
       await wait(400);
       const srcLine = await page.evaluate(() => document.querySelector('#assessmentMetaView').textContent);
@@ -2934,6 +2982,15 @@ try {
         return img ? img.getAttribute('src') : null;
       });
       check('the Properties card cover is the first gallery photo', cover === ph1.src, String(cover));
+      const cardTag = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('999 Money Test Terrace'));
+        const tag = card && card.querySelector('.addr .region-tag');
+        return tag ? { text: tag.textContent, title: tag.getAttribute('title') } : null;
+      });
+      check('the Properties card carries the region flag tag beside its address',
+        !!cardTag && cardTag.text === '🇨🇦' && cardTag.title === 'Canada (CA)',
+        JSON.stringify(cardTag));
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

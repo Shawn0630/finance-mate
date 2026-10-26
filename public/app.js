@@ -6,11 +6,6 @@ const money = (n) =>
     : Number(n).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const ordinal = (n) => {
-  const s = ['th', 'st', 'nd', 'rd'];
-  const v = n % 100;
-  return n + (s[(v - 20) % 10] || s[v] || s[0]);
-};
 
 // --------------------------------------------------------- money inputs --
 // Every money field in the app is a text input marked data-money. What
@@ -392,7 +387,7 @@ async function loadAssets(force = false) {
     return `<div class="card">
       <div class="photo">${photo}</div>
       <div class="body">
-        <div class="addr">${esc(p.address)}</div>
+        <div class="addr">${esc(p.address)}${regionTagHtml(p.region)}</div>
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
         <div class="kv"><span class="k">Outstanding principal</span><span>${money(p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
@@ -941,17 +936,22 @@ $('#photoFiles').addEventListener('change', async (e) => {
 // (re)filled from the loaded property on every load and every Edit, so
 // a cancelled edit never lingers in the inputs.
 function renderPropView(p) {
+  // The details lead with two headline figures — the assessed value
+  // (re-based on the latest history point when the trend loads, as
+  // the equity readout reads it) and TODAY's remaining balance
+  // (the projection's balance at the current month, not the anchor
+  // the loan started from) — over
+  // exactly three rows: address (with the region flag tag), owners,
+  // purchase date. Nothing else lives here by the user's ruling:
+  // no notes / assessment-year / lender rows, no prose lines.
+  $('#detailAssessedValue').textContent = p.assessed_value != null ? money(p.assessed_value) : '—';
+  const remaining = p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance;
+  $('#detailRemainingBalance').textContent = remaining != null ? money(remaining) : '—';
   const rows = [
-    ['Address', p.address || '—'],
+    ['Address', `${esc(p.address || '—')}${regionTagHtml(p.region)}`, true],
     ['Owners', p.owners && p.owners.length ? ownerChipsHtml(p.owners) : '—', true],
-    ['Notes', p.notes || '—'],
-    ['Assessed value', p.assessed_value != null ? money(p.assessed_value) : '—'],
-    ['Assessment year', p.assessed_year ?? '—'],
     ['Purchase date', p.purchase_date || '—'],
   ];
-  // The lender (bank) is a mortgage fact; it joins the read-only
-  // metadata only when one is on file.
-  if (p.lender) rows.push(['Lender', p.lender]);
   $('#propViewBody').innerHTML = rows.map(([k, v, raw]) => `<tr><td>${k}</td><td>${raw ? v : esc(v)}</td></tr>`).join('');
 }
 
@@ -999,13 +999,7 @@ async function loadPropertyDetail(id) {
   renderPropView(p);
   fillPropForm(p);
   setPropEditing(false);
-  const freqKey = FREQUENCY_LABELS[p.payment_frequency] ? p.payment_frequency : 'monthly';
-  const dayBit = DAY_STEPPED_FREQUENCIES.includes(freqKey)
-    ? 'Payment day does not apply to this frequency.'
-    : (p.payment_day ? `Payment day: the ${ordinal(p.payment_day)} of each month.` : 'Payment day: not set.');
-  $('#paymentDayDisplay').textContent =
-    `Payment frequency: ${FREQUENCY_LABELS[freqKey]}. ${dayBit} Both are managed in “Mortgage Terms & Rates”.`;
-  $('#regionDisplay').textContent = `Region: ${p.region === 'CA' || !p.region ? 'Canada (CA)' : esc(p.region)}.`;
+
   // The Source line reads the same in the read-only view and in the
   // edit form (the manual-marking note applies once you are editing).
   let metaText =
@@ -1191,8 +1185,8 @@ function renderTerms(p) {
     // principal" / "Principal as of" — binds the term's opening
     // balance / start date, EXCEPT on the term carrying the
     // property's balance anchor (anchor_date inside the term),
-    // where the pair binds the anchor values instead and the
-    // opening figures stay visible as a small read-only line.
+    // where the pair binds the anchor values instead (the opening
+    // figures stay visible in the term's head line).
     const anchored = !!(t.anchor_date && t.anchor_balance != null);
     const principalName = anchored ? 'anchor_balance' : 'opening_balance';
     const principalDateName = anchored ? 'anchor_date' : 'start_date';
@@ -1217,7 +1211,7 @@ function renderTerms(p) {
             <div><label>Principal as of</label><input name="${principalDateName}" type="date" value="${esc(anchored ? t.anchor_date : t.start_date)}" required></div>
             <div><label>Outstanding principal ($)</label><input name="${principalName}" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput((anchored ? t.anchor_balance : t.opening_balance) ?? ''))}"></div>
           </div>
-          ${anchored ? `<div class="note" style="margin-left:0">Term opened at ${money(t.opening_balance)} on ${esc(t.start_date)} — the principal above is the current balance anchor inside this term.</div>` : ''}
+
           <div class="grid3">
             <div><label>Term length (months)</label><input name="term_months" type="number" min="1" max="120" step="1" value="${esc(t.term_months)}" required>
               <div class="toolbar" style="margin-top:6px">${[1, 2, 3, 4, 5, 7, 10].map((y) => `<button type="button" class="small" data-term-years="${y}">${y} year${y === 1 ? '' : 's'}</button>`).join('')}</div>
@@ -1746,6 +1740,21 @@ const FREQUENCY_LABELS = {
 };
 const DAY_STEPPED_FREQUENCIES = ['bi_weekly', 'accelerated_bi_weekly', 'weekly', 'accelerated_weekly'];
 
+// The region rides beside the address as a flag tag — rendered
+// FROM the property's region field (a lookup, like FREQUENCY_LABELS
+// above), never written into a template as fixed text. A region
+// with no entry falls back to its bare code.
+const REGION_TAGS = {
+  CA: { flag: '🇨🇦', label: 'Canada (CA)' },
+};
+function regionTagHtml(region) {
+  const code = String(region || 'CA').toUpperCase();
+  const tag = REGION_TAGS[code];
+  return tag
+    ? `<span class="region-tag" title="${esc(tag.label)}">${tag.flag}</span>`
+    : `<span class="region-tag" title="${esc(code)}">${esc(code)}</span>`;
+}
+
 $('#fetchBcaBtn').addEventListener('click', async () => {
   const msg = $('#historyMsg');
   showMsg(msg, 'ok', 'Fetching from BC Assessment…');
@@ -1797,6 +1806,15 @@ let trendEditingId = null;
 async function loadTrend(id) {
   const r = await api(`/api/properties/${id}/value-history`);
   trendPoints = r.points;
+  // The details panel's headline assessed figure follows the same
+  // source as the equity readout: the latest history point wins
+  // over the property row's stored value.
+  if (detailProperty && String(detailProperty.id) === String(id)) {
+    const latest = trendPoints.length ? trendPoints[trendPoints.length - 1] : null;
+    $('#detailAssessedValue').textContent = latest
+      ? money(latest.value)
+      : (detailProperty.assessed_value != null ? money(detailProperty.assessed_value) : '—');
+  }
   const rows = trendPoints.map((pt) => `<tr>
     <td>${pt.year}</td><td class="num">${money(pt.value)}</td>
     <td>${pt.source === 'auto' ? '<span class="badge">BC Assessment</span>' : pt.source === 'housesigma' ? '<span class="badge">HouseSigma</span>' : '<span class="badge manual">Manual</span>'}</td>
@@ -1811,10 +1829,10 @@ async function loadTrend(id) {
   loadEquity(id); // a changed latest point moves the equity readout too
 }
 
-// Trend summary: computed over the SAME years the combined chart
-// currently shows (see lookbackHistory), so the figure can never
-// describe a different span than the line on screen. When earlier
-// years fall outside the selected range, the text says so.
+// Trend summary: a single change figure computed over the SAME
+// years the combined chart currently shows (see lookbackHistory),
+// so it can never describe a different span than the line on
+// screen — the figure only, no guidance prose around it.
 function renderTrendSummary() {
   const summary = $('#trendSummary');
   if (!summary) return;
@@ -1825,10 +1843,7 @@ function renderTrendSummary() {
     const abs = last.value - first.value;
     const sign = abs >= 0 ? '+' : '−';
     const pctTxt = first.value ? ` (${abs >= 0 ? '+' : ''}${(abs / first.value * 100).toFixed(1)}%)` : '';
-    summary.textContent = `Change ${first.year} → ${last.year}: ${sign}${money(Math.abs(abs))}${pctTxt} (${money(first.value)} → ${money(last.value)}).`
-      + (shown.length < trendPoints.length
-        ? ` Showing the years that fall in the selected chart range, as in the chart — set the chart range to All to include earlier years.`
-        : '');
+    summary.textContent = `Change ${first.year} → ${last.year}: ${sign}${money(Math.abs(abs))}${pctTxt} (${money(first.value)} → ${money(last.value)}).`;
   } else if (shown.length === 1 && trendPoints.length > 1) {
     summary.textContent = `Only the ${shown[0].year} point falls in the selected chart range — widen the range to compare years.`;
   } else if (trendPoints.length === 1) {
@@ -2037,9 +2052,9 @@ function renderEquity() {
   const a = equityData;
   if (!a) { el.textContent = ''; return; }
   if (a.assessedValue !== null && a.balance !== null) {
-    el.textContent =
-      `Current equity: ${money(a.equity)} — latest assessed value ${money(a.assessedValue)}` +
-      `${a.assessedYear ? ` (${a.assessedYear})` : ''} minus outstanding principal ${money(a.balance)}.`;
+    // A bare figure, by the user's ruling — no derivation sentence
+    // trailing it ("— latest assessed value … minus outstanding …").
+    el.textContent = `Current equity: ${money(a.equity)}`;
   } else if (a.assessedValue !== null) {
     el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in “Mortgage Terms & Rates” to see the equity.`;
   } else if (a.balance !== null) {
@@ -2320,12 +2335,6 @@ function renderSchedule() {
   if (!tbody) return;
   const pager = $('#schedulePager');
   const totalRow = $('#scheduleTotalRow');
-  const note = $('#scheduleNote');
-  if (note) {
-    note.textContent = chartBarsBasis === 'yearly'
-      ? 'On spans over 10 years the chart bars are yearly interest & principal totals; this table always stays monthly.'
-      : '';
-  }
   const rows = scheduleWindowRows();
   if (!rows.length) {
     tbody.innerHTML = '<tr><td colspan="5" class="note" style="margin:0">No projected months fall in the selected range.</td></tr>';
