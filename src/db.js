@@ -261,12 +261,13 @@ migrateOwners('other_assets');
 // anchor date falls inside the term, after its start. The property's
 // payment_frequency / payment_day columns remain as mirrors of the
 // anchor term's values for older readers. The monthly payment is
-// ALWAYS calculated (from balance, rate plan and amortization) and
-// never entered: the payment_override column below and the
-// property's mortgage_payment column are DORMANT — kept only so
-// existing databases keep their shape; nothing reads or writes
-// them, and a value left over from the entered-payment era no
-// longer rules anything.
+// always CALCULATED first (from balance, rate plan and
+// amortization); a term may then override it via the
+// payment_override column below — a positive value makes the term
+// run on that fixed payment, NULL means the calculated one rules.
+// The property's own mortgage_payment column stays DORMANT — kept
+// only so existing databases keep their shape; nothing reads or
+// writes it.
 db.exec(`
 CREATE TABLE IF NOT EXISTS mortgage_terms (
   id INTEGER PRIMARY KEY,
@@ -278,7 +279,7 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   opening_balance REAL,               -- balance the term opened with
   repayment_method TEXT NOT NULL DEFAULT 'equal_payment',  -- 'equal_payment' (level payment) | 'equal_principal' (fixed monthly principal)
   amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
-  payment_override REAL,              -- DORMANT (entered-payment era): the payment is always calculated now; never read or written
+  payment_override REAL,              -- optional monthly payment override for this term; NULL = the calculated payment rules
   payment_frequency TEXT,             -- payment schedule for this term; NULL = fall back to the property mirror
   payment_day INTEGER,                -- deduction day 1..31 for this term; NULL = fall back
   anchor_balance REAL,                -- the property's balance anchor, when it lands inside this term after its start

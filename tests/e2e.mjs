@@ -1229,10 +1229,13 @@ try {
   check('deleting the lump sum restores the previous projection',
     r.status === 200 && JSON.stringify(projLumpGone.series) === JSON.stringify(projPreLump.series));
 
-  // The monthly payment cannot be entered anywhere — it is always
-  // calculated. Every write path that used to accept one refuses
-  // it with a 400 (a contract error, never silently swallowed),
-  // and the projection is the calculated one throughout.
+  // The monthly payment is always calculated first; it cannot be
+  // entered at the PROPERTY level at all (the property write paths
+  // refuse it with a 400 — a contract error, never silently
+  // swallowed), and a term-level override must be a positive
+  // number (an invalid one is a 400 too). The dedicated override
+  // section below exercises the valid writes; here the projection
+  // stays the calculated one throughout.
   r = await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: 7000 });
   check('entering a monthly payment on the property is refused (400)',
     r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
@@ -1243,13 +1246,17 @@ try {
   check('creating a property with a monthly payment is refused (400)',
     r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
     JSON.stringify(r.data));
-  r = await req('POST', `/api/properties/${termPid}/terms`, { payment_override: 100 });
-  check('creating a term with a payment override is refused (400)',
-    r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
+  r = await req('POST', `/api/properties/${termPid}/terms`, { payment_override: -100 });
+  check('creating a term with a non-positive payment override is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('greater than 0'),
     JSON.stringify(r.data));
-  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: 6500 });
-  check('editing a term with a payment override is refused (400)',
-    r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: 0 });
+  check('editing a term with a zero payment override is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('greater than 0'),
+    JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: 'abc' });
+  check('editing a term with a non-numeric payment override is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('greater than 0'),
     JSON.stringify(r.data));
   const projCalc = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
   const novCalc = projCalc.series.find((x) => x.month === '2029-11');
@@ -1258,6 +1265,68 @@ try {
     Math.abs(projCalc.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5
       && !!decCalc && !!novCalc && Math.abs(decCalc.payment - engineDerive(novCalc.balance, 3.95, 25)) < 0.02,
     JSON.stringify({ used: projCalc.paymentUsed, dec: decCalc && decCalc.payment }));
+
+  // ---- Term payment override (API) ----
+  // The engine derives the payment first (the baseline); a term
+  // may then carry an override that runs the term on that fixed
+  // payment instead. Fixture: $100,000 at 5% fixed over 25y —
+  // derived $581.60 (payoff 2051-02, interest $74,482.97);
+  // override $700 (payoff 2044-02, interest $51,293.17) — the
+  // engine unit tests anchor both trajectories.
+  r = await req('POST', '/api/properties', {
+    address: '9 Override Court, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-01-01', purchase_date: '2025-06-01', amortization_years: 25,
+  });
+  const ovPid = r.data.id;
+  const ovTermId = r.data.terms[0].id;
+  await req('POST', `/api/properties/${ovPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  const ovBase = (await req('GET', `/api/properties/${ovPid}/amortization`)).data;
+  check('override fixture: the baseline triple is the derived payment, not overridden',
+    ovBase.paymentUsed === 581.6 && ovBase.paymentDerived === 581.6 && ovBase.paymentOverridden === false
+      && ovBase.payoffMonth === '2051-02' && ovBase.totalInterest === 74482.97,
+    JSON.stringify({ u: ovBase.paymentUsed, d: ovBase.paymentDerived, o: ovBase.paymentOverridden }));
+  r = await req('PUT', `/api/properties/${ovPid}/terms/${ovTermId}`, { payment_override: 700 });
+  check('a term payment_override write succeeds (200), stores the value and serves the term triple',
+    r.status === 200 && r.data.payment_override === 700
+      && r.data.paymentUsed === 700 && r.data.paymentDerived === 581.6 && r.data.paymentOverridden === true,
+    JSON.stringify(r.data));
+  const ovProj = (await req('GET', `/api/properties/${ovPid}/amortization`)).data;
+  check('the projection runs on the override (used 700, derived 581.60 beside it, payoff 2044-02, interest 51,293.17)',
+    ovProj.paymentUsed === 700 && ovProj.paymentDerived === 581.6 && ovProj.paymentOverridden === true
+      && ovProj.payoffMonth === '2044-02' && ovProj.totalInterest === 51293.17
+      && ovProj.series[0].payment === 700 && ovProj.series[0].principal === 287.61,
+    JSON.stringify({ u: ovProj.paymentUsed, d: ovProj.paymentDerived, p: ovProj.payoffMonth, i: ovProj.totalInterest }));
+  const ovEngine = engineSchedule({
+    balance: 100000, balanceDate: '2026-01-01',
+    terms: [{ id: ovTermId, start_date: '2026-01-01', amortization_years: 25, payment_override: 700 }],
+    segments: [{ id: 1, start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }],
+  });
+  check('the override trajectory matches the engine run to the row',
+    JSON.stringify(ovProj.series) === JSON.stringify(ovEngine.series));
+  const ovProp = (await req('GET', `/api/properties/${ovPid}`)).data;
+  check('the property payload serves the triple at property level and term level',
+    ovProp.paymentUsed === 700 && ovProp.paymentDerived === 581.6 && ovProp.paymentOverridden === true
+      && ovProp.terms[0].paymentUsed === 700 && ovProp.terms[0].paymentDerived === 581.6 && ovProp.terms[0].paymentOverridden === true,
+    JSON.stringify({ u: ovProp.paymentUsed, d: ovProp.paymentDerived, o: ovProp.paymentOverridden }));
+  const ovPort = (await req('GET', '/api/properties/portfolio')).data;
+  const ovRow = ovPort.properties.find((x) => x.id === ovPid);
+  check('the portfolio row serves the used payment with its derived beside it (the total sums used values)',
+    !!ovRow && ovRow.monthlyPayment === 700 && ovRow.paymentDerived === 581.6 && ovRow.paymentOverridden === true,
+    JSON.stringify(ovRow));
+  r = await req('POST', `/api/properties/${ovPid}/preview`, { start_date: '2027-01-01', rate_type: 'fixed', annual_rate: 4.5, term_id: ovTermId });
+  check('the plan preview inside an overridden term previews the override payment with the derived beside it',
+    r.data.ok === true && r.data.payment === 700 && r.data.paymentOverridden === true
+      && r.data.paymentDerived !== 700 && r.data.paymentDerived > 0,
+    JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${ovPid}/terms/${ovTermId}`, { payment_override: null });
+  const ovCleared = (await req('GET', `/api/properties/${ovPid}/amortization`)).data;
+  check('clearing the override restores the pure-derived schedule to the cent',
+    r.status === 200 && r.data.payment_override === null
+      && ovCleared.paymentUsed === 581.6 && ovCleared.paymentDerived === 581.6 && ovCleared.paymentOverridden === false
+      && JSON.stringify(ovCleared.series) === JSON.stringify(ovBase.series)
+      && ovCleared.totalInterest === ovBase.totalInterest,
+    JSON.stringify({ u: ovCleared.paymentUsed, o: ovCleared.paymentOverridden }));
+  await req('DELETE', `/api/properties/${ovPid}`);
 
   // ---- Per-term payment schedule + balance anchors ----
   // The frequency and payment day live on each term now.
@@ -1514,13 +1583,14 @@ try {
   // and the rendered templates together. The principal pair's input
   // name switches between opening_balance and anchor_balance (the
   // term carrying the balance anchor edits the anchor values).
-  // There is NO payment money field any more — the monthly payment
-  // is calculated, never typed in.
+  // The term's payment OVERRIDE is a money field like the others;
+  // there is still no PROPERTY-level payment field anywhere.
   const appJsRes2 = await fetch(BASE + '/app.js', { headers: { Cookie: cookie } });
   const appJsText2 = await appJsRes2.text();
-  check('money inputs are marked data-money in the page (and no payment input remains)',
+  check('money inputs are marked data-money in the page (and the term override is one of them)',
     (pageHtml.match(/data-money/g) || []).length >= 4
-      && !appJsText2.includes('name="payment_override"')
+      && (appJsText2.match(/name="payment_override"[^>]*data-money/g) || []).length === 1
+      && !appJsText2.includes('name="mortgage_payment"')
       && (appJsText2.match(/name="\$\{principalName\}"[^>]*data-money/g) || []).length === 1
       && appJsText2.includes("anchored ? 'anchor_balance' : 'opening_balance'"),
     String((pageHtml.match(/data-money/g) || []).length));
@@ -2822,20 +2892,23 @@ try {
       const rowUi = portUi.properties.find((x) => x.id === amortPid);
       check('the UI-entered amortization flips the portfolio state to projected',
         !!rowUi && rowUi.projState === 'projected', JSON.stringify(rowUi && rowUi.projState));
-      // There is no payment field to type into anywhere, and no
-      // entered/auto tag: the stat and the metadata show the
-      // calculated figure, plain. The term form carries the
-      // figure read-only instead of an input.
+      // There is no PROPERTY-level payment field to type into, and
+      // no entered/auto tag: with no override set on this fixture,
+      // the stat, the metadata and the term card all show the
+      // calculated figure, plain (no strikethrough). The term form
+      // carries the figure read-only plus its override input.
       const noEntry = await page.evaluate(() => ({
-        paymentInputs: document.querySelectorAll('#mortgageModal [name=payment_override], #mortgageModal [name=mortgage_payment]').length,
+        propertyPaymentInputs: document.querySelectorAll('#mortgageModal [name=mortgage_payment]').length,
+        overrideInputs: document.querySelectorAll('#mortgageModal [name=payment_override]').length,
+        struck: document.querySelectorAll('#mortgageModal [data-term-payment] s, #metaCurrentPayment s, #estPaymentValue s').length,
         estTag: !!document.querySelector('#estPaymentTag'),
         metaTag: !!document.querySelector('#metaPaymentTag'),
         termFigure: document.querySelector('[data-term-form] [data-term-payment]').textContent,
         stat: document.querySelector('#estPaymentValue').textContent,
         meta: document.querySelector('#metaCurrentPayment').textContent,
       }));
-      check('no payment input and no entered/auto tag — the calculated figure shows in the stat, the metadata and the term card',
-        noEntry.paymentInputs === 0 && !noEntry.estTag && !noEntry.metaTag
+      check('no property payment input and no entered/auto tag — the calculated figure shows plain in the stat, the metadata and the term card (override input present, empty)',
+        noEntry.propertyPaymentInputs === 0 && noEntry.overrideInputs >= 1 && noEntry.struck === 0 && !noEntry.estTag && !noEntry.metaTag
           && noEntry.termFigure.includes('6,381') && noEntry.stat.includes('6,381') && noEntry.meta.includes('6,381'),
         JSON.stringify(noEntry));
       await req('DELETE', `/api/properties/${amortPid}`);
@@ -3014,12 +3087,14 @@ try {
             - (amortUi.series[idxB - 1].balance + amortUi.series[idxB].interest - amortUi.series[idxB].payment)) < 0.02,
         JSON.stringify(amortUi.series[idxB]));
       // Every term card carries the full field set — principal
-      // pair, frequency, day, and the calculated monthly payment
-      // as a read-only figure (NEVER a payment input) — and the old
-      // standalone anchor form is gone from the page entirely.
+      // pair, frequency, day, the calculated monthly payment as
+      // a read-only figure and the payment override input (never
+      // a property-level payment input) — and the old standalone
+      // anchor form is gone from the page entirely.
       const fieldSets = await page.evaluate(() => ({
         forms: [...document.querySelectorAll('#termsWrap .term-block [data-term-form]')].map((f) => ({
-          paymentInput: !!f.querySelector('[name=payment_override], [name=mortgage_payment]'),
+          overrideInput: !!f.querySelector('[name=payment_override]'),
+          propertyPaymentInput: !!f.querySelector('[name=mortgage_payment]'),
           paymentFigure: !!f.querySelector('[data-term-payment]'),
           freq: !!f.querySelector('[name=payment_frequency]'),
           day: !!f.querySelector('[name=payment_day]'),
@@ -3028,9 +3103,9 @@ try {
         })),
         anchorForms: document.querySelectorAll('[data-anchor-form]').length,
       }));
-      check('every term card carries the principal/frequency/day field set and a read-only payment figure — no payment input (no separate anchor form)',
+      check('every term card carries the principal/frequency/day field set, a read-only payment figure and the override input — no property payment input (no separate anchor form)',
         fieldSets.forms.length === 2
-          && fieldSets.forms.every((s) => !s.paymentInput && s.paymentFigure && s.freq && s.day && s.principal && s.principalDate)
+          && fieldSets.forms.every((s) => s.overrideInput && !s.propertyPaymentInput && s.paymentFigure && s.freq && s.day && s.principal && s.principalDate)
           && fieldSets.anchorForms === 0,
         JSON.stringify(fieldSets));
       const termPayFig = await page.evaluate(() =>
@@ -3341,6 +3416,130 @@ try {
       check('the Properties card carries the region flag tag beside its address',
         !!cardTag && cardTag.text === '🇨🇦' && cardTag.title === 'Canada (CA)',
         JSON.stringify(cardTag));
+
+      // ---- Payment override, driven through the UI ----
+      // $1,350,000 at 3.95% fixed over 30y derives $6,381.36.
+      // Typing a $6,000 override into Term 1's form and saving
+      // must re-render every payment surface the same way: the
+      // used amount bold, the derived amount struck through
+      // beside it — term card figure, modal metadata, detail stat
+      // and the Properties card — and the projection must follow
+      // the override trajectory. Clearing the field restores the
+      // plain derived figure everywhere.
+      r = await req('POST', '/api/properties', {
+        address: '777 Override UI Avenue, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2026-01-01', purchase_date: '2025-06-01', amortization_years: 30,
+      });
+      const ovUiPid = r.data.id;
+      const ovUiTermId = r.data.terms[0].id;
+      await req('POST', `/api/properties/${ovUiPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 3.95 });
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, ovUiPid);
+      check('override UI fixture: the detail stat shows the derived payment plain',
+        await until(() => document.querySelector('#estPaymentValue').textContent.includes('6,381')
+          && !document.querySelector('#estPaymentValue s')));
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      await focusField('[data-term-form] [name=payment_override]');
+      await page.keyboard.type('6000');
+      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
+      const tripleOf = (sel) => page.evaluate((s) => {
+        const el = document.querySelector(s);
+        if (!el) return null;
+        const struck = el.querySelector('s');
+        return {
+          text: el.textContent,
+          used: (el.querySelector('.pay-used') || {}).textContent || null,
+          struckText: struck ? struck.textContent : null,
+          struckStyle: struck ? getComputedStyle(struck).textDecorationLine : null,
+        };
+      }, sel);
+      const untilNode = async (fn, tries = 40) => {
+        for (let i = 0; i < tries; i++) { if (await fn()) return true; await wait(300); }
+        return false;
+      };
+      check('override saved in the term form: the term card figure shows $6,000 bold with $6,381 struck through',
+        await untilNode(async () => {
+          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          return !!t && t.used === '$6,000' && t.struckText === '$6,381' && String(t.struckStyle).includes('line-through');
+        }));
+      const metaTriple = await tripleOf('#metaCurrentPayment');
+      check('the modal metadata Current Monthly Payment shows the same override rendering',
+        !!metaTriple && metaTriple.used === '$6,000' && metaTriple.struckText === '$6,381'
+          && String(metaTriple.struckStyle).includes('line-through'),
+        JSON.stringify(metaTriple));
+      const statTriple = await tripleOf('#estPaymentValue');
+      check('the detail stat Estimated monthly payment shows the same override rendering',
+        !!statTriple && statTriple.used === '$6,000' && statTriple.struckText === '$6,381'
+          && String(statTriple.struckStyle).includes('line-through'),
+        JSON.stringify(statTriple));
+      const ovUiProj = (await req('GET', `/api/properties/${ovUiPid}/amortization`)).data;
+      const ovUiEngine = engineSchedule({
+        balance: 1350000, balanceDate: '2026-01-01',
+        terms: [{ id: ovUiTermId, start_date: '2026-01-01', amortization_years: 30, payment_override: 6000 }],
+        segments: [{ id: 1, start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 3.95 }],
+      });
+      check('the UI-saved override drives the projection (API payoff/interest match the engine override run)',
+        ovUiProj.paymentUsed === 6000 && ovUiProj.paymentDerived === 6381.36 && ovUiProj.paymentOverridden === true
+          && ovUiProj.payoffMonth === ovUiEngine.payoffMonth && ovUiProj.totalInterest === ovUiEngine.totalInterest,
+        JSON.stringify({ p: ovUiProj.payoffMonth, i: ovUiProj.totalInterest, ep: ovUiEngine.payoffMonth, ei: ovUiEngine.totalInterest }));
+      // The segment editor's live preview inside the overridden
+      // term: the previewed payment is the override, derived
+      // struck through beside it.
+      await page.evaluate(() => document.querySelector('[data-toggle-seg]').click());
+      await wait(400);
+      await page.evaluate(() => {
+        const form = document.querySelector('[data-seg-form]');
+        form.start_date.value = '2027-01-01';
+        form.start_date.dispatchEvent(new Event('input', { bubbles: true }));
+        const rate = form.querySelector('[name=annual_rate]');
+        rate.value = '4.5';
+        rate.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      check('the live plan preview inside the overridden term shows the override with the derived struck through',
+        await until(() => {
+          const out = document.querySelector('[data-plan-preview]');
+          return !!out && out.textContent.includes('payment') && out.textContent.includes('6,000')
+            && !!out.querySelector('s');
+        }));
+      await page.evaluate(() => document.querySelector('#mortgageModal [data-close-modal]').click());
+      await wait(300);
+      await page.evaluate(() => { location.hash = '#assets/properties'; });
+      await wait(2000);
+      const cardPay = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('777 Override UI Avenue'));
+        if (!card) return null;
+        const kv = [...card.querySelectorAll('.kv')].find((x) => x.querySelector('.k') && x.querySelector('.k').textContent === 'Monthly payment');
+        const struck = kv ? kv.querySelector('s') : null;
+        return { text: kv ? kv.textContent : null, struckText: struck ? struck.textContent : null };
+      });
+      check('the Properties card shows the override payment with the derived struck through',
+        !!cardPay && cardPay.text.includes('6,000') && cardPay.struckText === '$6,381',
+        JSON.stringify(cardPay));
+      // Clear the override through the same form: figures return
+      // to the plain derived payment, strikethrough gone.
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, ovUiPid);
+      await wait(1500);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      await focusField('[data-term-form] [name=payment_override]');
+      await page.keyboard.press('Backspace');
+      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
+      check('clearing the override restores the plain derived figure (no strikethrough anywhere)',
+        await untilNode(async () => {
+          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          const m = await tripleOf('#metaCurrentPayment');
+          const s = await tripleOf('#estPaymentValue');
+          return !!t && !!m && !!s
+            && t.text.includes('6,381') && t.struckText === null
+            && m.text.includes('6,381') && m.struckText === null
+            && s.text.includes('6,381') && s.struckText === null;
+        }));
+      const ovUiCleared = (await req('GET', `/api/properties/${ovUiPid}/amortization`)).data;
+      check('after the UI clear, the API projection is the derived one again',
+        ovUiCleared.paymentUsed === 6381.36 && ovUiCleared.paymentOverridden === false,
+        JSON.stringify({ u: ovUiCleared.paymentUsed, o: ovUiCleared.paymentOverridden }));
+      await req('DELETE', `/api/properties/${ovUiPid}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

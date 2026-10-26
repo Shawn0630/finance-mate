@@ -7,6 +7,22 @@ const money = (n) =>
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// The ONE rendering rule for a payment triple — every surface that
+// shows a monthly payment (term card figure, modal metadata,
+// detail-page stat, property card, plan preview) renders through
+// here, from the paymentUsed / paymentDerived / paymentOverridden
+// fields the API serves at term level, property level and in the
+// preview: not overridden → the amount alone; overridden → the
+// used amount bold, the derived amount right after it struck
+// through and muted.
+function paymentHtml(t) {
+  if (!t || t.paymentUsed === null || t.paymentUsed === undefined) return '—';
+  if (t.paymentOverridden && t.paymentDerived !== null && t.paymentDerived !== undefined) {
+    return `<span class="pay-used">${money(t.paymentUsed)}</span> <s class="pay-derived">${money(t.paymentDerived)}</s>`;
+  }
+  return money(t.paymentUsed);
+}
+
 // --------------------------------------------------------- money inputs --
 // Every money field in the app is a text input marked data-money. What
 // the user sees is grouped with thousands separators ("1,350,000");
@@ -391,6 +407,7 @@ async function loadAssets(force = false) {
         <div class="addr">${esc(p.address)}${regionTagHtml(p.region)}</div>
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
         <div class="kv"><span class="k">Outstanding principal</span><span>${money(p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance)}</span></div>
+        <div class="kv"><span class="k">Monthly payment</span><span>${paymentHtml(p)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
         ${p.owners && p.owners.length ? `<div class="kv"><span class="k">Owners</span><span>${ownerChipsHtml(p.owners)}</span></div>` : ''}
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
@@ -1052,9 +1069,10 @@ function termLengthLabel(months) {
 // Modal-top metadata: five read-only figures, all derived from the
 // property and its terms — nothing here is an input. The editable
 // mortgage facts live in the terms themselves; each term's card
-// carries its own principal pair and payment schedule. The monthly
-// payment is always the calculated one — there is no entered
-// variant and no tag saying where it came from.
+// carries its own principal pair and payment schedule. Payments
+// render from their API triple via paymentHtml: the used figure,
+// with the derived figure struck through beside it when the term
+// overrides the calculated payment.
 function renderMortgageMeta() {
   const p = detailProperty;
   if (!p || !$('#mortgageMeta')) return;
@@ -1070,23 +1088,16 @@ function renderMortgageMeta() {
   $('#metaCurrentPrincipal').textContent =
     p.remainingBalance != null ? money(p.remainingBalance)
       : (p.mortgage_balance != null ? money(p.mortgage_balance) : '—');
-  $('#metaCurrentPayment').textContent =
-    chartMeta && chartMeta.paymentUsed != null ? money(chartMeta.paymentUsed) : '—';
-  // Each term card also shows its own calculated monthly payment
-  // read-only, beside its schedule fields: the payment of the
-  // first projected month falling inside that term's span (for an
+  $('#metaCurrentPayment').innerHTML = paymentHtml(chartMeta);
+  // Each term card also shows its own monthly payment read-only,
+  // beside its schedule fields: the payment its span opens with,
+  // from the term's own triple in the property payload (for an
   // equal-principal term, its first — highest — month). A term
-  // whose span the projection does not reach, or no projection at
-  // all (no rate plan / no amortization yet), shows '—'.
+  // the projection does not reach, or no projection at all (no
+  // rate plan / no amortization yet), shows '—'.
   document.querySelectorAll('[data-term-payment]').forEach((el) => {
-    const from = el.dataset.termPayment;
-    const to = el.dataset.termPaymentEnd;
-    let v = null;
-    if (chartMeta && chartMeta.series && chartMeta.series.length) {
-      const row = chartMeta.series.find((x) => x.month >= from && x.month <= to);
-      if (row) v = row.payment;
-    }
-    el.textContent = v != null ? money(v) : '—';
+    const term = terms.find((t) => String(t.id) === el.dataset.termPaymentFor);
+    el.innerHTML = paymentHtml(term);
   });
   // The engine counts the current term's amortization down from
   // the balance anchor (its epoch), so at the anchor the remaining
@@ -1164,8 +1175,9 @@ function renderTerms(p) {
     const open = openTermIds.has(t.id);
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
     // Every term card carries the same field set: its contract
-    // fields, its principal pair, its calculated monthly payment
-    // (read-only — it is never typed in) and its payment schedule.
+    // fields, its principal pair, its monthly payment figure
+    // (read-only, rendered from the term's payment triple), its
+    // optional payment override input and its payment schedule.
     // The principal pair — "Outstanding
     // principal" / "Principal as of" — binds the term's opening
     // balance / start date, EXCEPT on the term carrying the
@@ -1208,9 +1220,12 @@ function renderTerms(p) {
             </select></div>
           </div>
           <div class="grid3">
-            <div><label>Monthly payment ($)</label><div class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}">—</div></div>
+            <div><label>Monthly payment ($)</label><div class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}" data-term-payment-for="${t.id}">—</div></div>
             <div><label>Payment frequency</label><select name="payment_frequency">${freqOptionsHtml(freqKey)}</select></div>
             <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${t.payment_day ?? p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
+          </div>
+          <div class="grid3">
+            <div><label>Monthly payment override ($)</label><input name="payment_override" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(t.payment_override ?? ''))}"></div>
           </div>
           ${t.amortization_defaulted ? '<div class="note" style="margin-left:0">The 25-year amortization on this term is the migration default — set the real figure if it differs.</div>' : ''}
           <div class="toolbar">
@@ -1331,10 +1346,11 @@ $('#termsWrap').addEventListener('change', (e) => {
   }
   const form = e.target.closest('[data-seg-form]');
   if (form) { syncSegForm(form); refreshPlanPreview(form); return; }
-  // The term's plan fields (repayment method, amortization) re-price
-  // the preview of that term's draft segment.
+  // The term's plan fields (repayment method, amortization,
+  // payment override) re-price the preview of that term's draft
+  // segment.
   if (e.target.closest('[data-term-form]')
-    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years')) {
+    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }
@@ -1342,7 +1358,7 @@ $('#termsWrap').addEventListener('change', (e) => {
 $('#termsWrap').addEventListener('input', (e) => {
   const form = e.target.closest('[data-seg-form]');
   if (form) { if (e.target.name === 'spread') syncSegForm(form); refreshPlanPreview(form); return; }
-  if (e.target.closest('[data-term-form]') && e.target.name === 'amortization_years') {
+  if (e.target.closest('[data-term-form]') && (e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }
@@ -1354,13 +1370,16 @@ $('#termsWrap').addEventListener('submit', async (e) => {
   try {
     if (form.dataset.termForm) {
       const f = Object.fromEntries(new FormData(form).entries());
-      parseMoneyFields(f, ['opening_balance', 'anchor_balance']);
+      parseMoneyFields(f, ['opening_balance', 'anchor_balance', 'payment_override']);
       const body = {
         lender: f.lender,
         term_months: Number(f.term_months),
         amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
         repayment_method: f.repayment_method || 'equal_payment',
         payment_frequency: f.payment_frequency,
+        // Blank clears the override (the calculated payment rules
+        // again); a number sets it.
+        payment_override: f.payment_override === '' || f.payment_override == null ? null : f.payment_override,
       };
       // The principal pair binds the term's opening balance / start
       // date — or, on the term carrying the balance anchor, the
@@ -1659,8 +1678,10 @@ function refreshSegPreviews() {
 // first month in effect — payment, interest, principal and the rate
 // — so the figures can be checked BEFORE anything is saved.
 // Debounced per form; the term's plan fields as currently edited
-// (repayment method, amortization) ride along, so changing them
-// re-prices the preview too.
+// (repayment method, amortization, payment override) ride along,
+// so changing them re-prices the preview too. When the term
+// carries an override the previewed payment IS the override, with
+// the derived figure struck through beside it (paymentHtml).
 const planPreviewTimers = new WeakMap();
 function refreshPlanPreview(form) {
   if (!form || !currentPropertyId) return;
@@ -1688,6 +1709,12 @@ function refreshPlanPreview(form) {
       amortization_years: termForm && termForm.amortization_years.value !== ''
         ? Number(termForm.amortization_years.value) : null,
     };
+    // The term form's override field as currently edited (blank =
+    // no override in the draft).
+    if (termForm && termForm.payment_override) {
+      const po = parseMoneyInput(termForm.payment_override.value);
+      body.payment_override = po === '' ? null : po;
+    }
     if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
       body.rate_mode = 'prime_spread';
       body.spread = f.spread === '' ? null : Number(f.spread);
@@ -1698,9 +1725,11 @@ function refreshPlanPreview(form) {
     try {
       const r = await api(`/api/properties/${currentPropertyId}/preview`, { method: 'POST', body });
       if (!form.isConnected) return;
-      out.textContent = r.ok
-        ? `Next month (${r.month}): payment ${money(r.payment)} — interest ${money(r.interest)}, principal ${money(r.principal)}, at ${Number(r.rate).toFixed(2)}%`
-        : (r.error || '');
+      if (r.ok) {
+        out.innerHTML = `Next month (${r.month}): payment ${paymentHtml({ paymentUsed: r.payment, paymentDerived: r.paymentDerived, paymentOverridden: r.paymentOverridden })} — interest ${money(r.interest)}, principal ${money(r.principal)}, at ${Number(r.rate).toFixed(2)}%`;
+      } else {
+        out.textContent = r.error || '';
+      }
     } catch (err) {
       if (form.isConnected) out.textContent = err.message;
     }
@@ -2234,13 +2263,15 @@ function renderEquity() {
 }
 
 // The projection panel head's dedicated stat: the monthly payment
-// the engine calculated — from the balance, the rate in effect
-// and the remaining amortization. It only exists once a rate plan
-// (and an amortization) does; before that it shows '—'.
+// in effect — the engine's calculated figure, or the current
+// term's override when one is set (rendered via paymentHtml, so
+// the calculated figure shows struck through beside it). It only
+// exists once a rate plan (and an amortization) does; before that
+// it shows '—'.
 function renderEstPayment() {
   const v = $('#estPaymentValue');
   if (!v) return;
-  v.textContent = chartMeta && chartMeta.paymentUsed != null ? money(chartMeta.paymentUsed) : '—';
+  v.innerHTML = paymentHtml(chartMeta);
 }
 
 function renderDetailCharts() {

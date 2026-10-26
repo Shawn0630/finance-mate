@@ -383,7 +383,7 @@ test('buildSchedule: a mid-term rate change recasts the payment against the traj
   assert.ok(jul.payment < r.paymentUsed);
 });
 
-test('buildSchedule: there is no entered payment — a stray paymentOverride argument is not consulted', () => {
+test('buildSchedule: a stray top-level paymentOverride argument is not consulted (the override lives on the term)', () => {
   const segments = [
     { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 },
     { start_date: '2031-01-01', rate_type: 'fixed', annual_rate: 4 },
@@ -410,22 +410,106 @@ test('buildSchedule: there is no entered payment — a stray paymentOverride arg
   assert.ok(close(first2.payment, derivePayment(bLast, 4, 30), 0.02), first2.payment);
 });
 
-test('buildSchedule: dormant payment_override values on terms do not rule any span', () => {
-  // Rows written by the entered-payment era can still carry a
-  // payment_override value (the column is dormant now). The engine
-  // must not consult it: with residue on BOTH terms the schedule
-  // is the plain derived one, to the row.
+test('buildSchedule: a term payment_override rules its span — the schedule is the fixed-payment one', () => {
+  // The derived payment is computed first (the baseline); a term
+  // carrying a positive payment_override then runs on that fixed
+  // payment for its whole span. Anchor figures, hand- and
+  // kernel-checked: $100,000 at 5% over 25y derives $581.60;
+  // paying $700 flat instead, the schedule is simulate()'s own
+  // $700 run to the row, clearing 2044-02 with $51,293.17 of
+  // interest (vs 2051-02 / $74,482.97 derived).
   const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
   const plain = buildSchedule({
     balance: 100000, balanceDate: '2026-01-01', segments,
     terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }],
   });
-  const residue = buildSchedule({
+  assert.equal(plain.paymentUsed, 581.60);
+  assert.equal(plain.paymentDerived, 581.60);
+  assert.equal(plain.paymentOverridden, false);
+  assert.equal(plain.payoffMonth, '2051-02');
+  assert.equal(plain.totalInterest, 74482.97);
+  const over = buildSchedule({
     balance: 100000, balanceDate: '2026-01-01', segments,
     terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25, payment_override: 700 }],
   });
-  assert.deepEqual(residue.series, plain.series);
-  assert.equal(residue.paymentUsed, 581.60);
+  assert.equal(over.paymentUsed, 700);
+  assert.equal(over.paymentDerived, 581.60);
+  assert.equal(over.paymentOverridden, true);
+  const kernel = simulate({ balance: 100000, balanceDate: '2026-01-01', payment: 700, segments });
+  assert.deepEqual(over.series, kernel.series);
+  assert.equal(over.payoffMonth, '2044-02');
+  assert.equal(over.totalInterest, 51293.17);
+  // Month 1 at the override: interest $412.39, principal $287.61.
+  assert.equal(over.series[0].interest, 412.39);
+  assert.equal(over.series[0].principal, 287.61);
+  assert.equal(over.series[0].balance, 99712.39);
+  // The per-term triple rides along, keyed by term id.
+  assert.deepEqual(over.termPayments[1], { paymentUsed: 700, paymentDerived: 581.60, paymentOverridden: true });
+  assert.deepEqual(plain.termPayments[1], { paymentUsed: 581.60, paymentDerived: 581.60, paymentOverridden: false });
+});
+
+test('buildSchedule: clearing the override reproduces the pure-derived schedule to the cent', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const plain = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }],
+  });
+  for (const cleared of [null, undefined, 0, -50]) {
+    const r = buildSchedule({
+      balance: 100000, balanceDate: '2026-01-01', segments,
+      terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25, payment_override: cleared }],
+    });
+    assert.deepEqual(r.series, plain.series, `override ${cleared}`);
+    assert.equal(r.totalInterest, plain.totalInterest);
+    assert.equal(r.payoffMonth, plain.payoffMonth);
+    assert.equal(r.paymentUsed, 581.60);
+    assert.equal(r.paymentOverridden, false);
+  }
+});
+
+test('buildSchedule: an override does not move when a rate segment changes mid-term', () => {
+  // Same shape as the recast test: 6% then 3% from 2026-07. The
+  // derived plan recasts at the change; the overridden plan keeps
+  // paying the override through it, at both rates.
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
+    { start_date: '2026-07-01', rate_type: 'fixed', annual_rate: 3 },
+  ];
+  const r = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25, payment_override: 700 }],
+  });
+  assert.equal(r.paymentUsed, 700);
+  assert.ok(r.series.length > 6);
+  for (const row of r.series.slice(0, -1)) assert.equal(row.payment, 700, row.month);
+  assert.equal(r.series[5].month, '2026-07');
+  assert.equal(r.series[5].rate, 3);
+  assert.equal(r.series[5].payment, 700);
+  // Sanity: without the override the July payment DOES recast.
+  const derived = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }],
+  });
+  assert.notEqual(derived.series[5].payment, derived.paymentUsed);
+});
+
+test('buildSchedule: an override beats the equal-principal method (the term runs on the fixed payment)', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
+  const r = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 25, repayment_method: 'equal_principal', payment_override: 700 }],
+  });
+  assert.equal(r.paymentUsed, 700);
+  assert.equal(r.paymentOverridden, true);
+  // The derived figure beside it is the equal-principal plan's
+  // first month: principal $100,000 / 300 = $333.33 plus month-1
+  // interest $412.39 = $745.72.
+  assert.equal(r.paymentDerived, 745.72);
+  // The rows pay the flat override, not the declining
+  // principal-plus-interest shape.
+  for (const row of r.series.slice(0, -1)) assert.equal(row.payment, 700, row.month);
+  const kernel = simulate({ balance: 100000, balanceDate: '2026-01-01', payment: 700, segments });
+  assert.deepEqual(r.series, kernel.series);
 });
 
 test('buildSchedule: no amortization is a named no_payment state', () => {

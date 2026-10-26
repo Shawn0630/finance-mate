@@ -435,13 +435,28 @@ function syncTermAnchor(p) {
   })();
 }
 
-function termView(t, segments, lumpSums) {
+// A term's payment triple from a projection run (buildSchedule's
+// termPayments): the payment the term opens with — used, derived
+// and whether an override is in play. Nulls when the projection
+// does not reach the term (or cannot run at all).
+function termView(t, segments, lumpSums, payMap) {
+  const pay = (payMap && payMap[t.id]) || null;
   return {
     ...t,
     end_date: termEndDate(t),
+    paymentDerived: pay ? pay.paymentDerived : null,
+    paymentUsed: pay ? pay.paymentUsed : null,
+    paymentOverridden: pay ? !!pay.paymentOverridden : false,
     segments: segments.filter((s) => s.term_id === t.id),
     lumpSums: lumpSums.filter((l) => l.term_id === t.id),
   };
+}
+
+// The term payment map of a property's projection, for term views
+// served outside a full property view.
+function termPayMapFor(p) {
+  const r = projectionFor(p);
+  return r ? r.termPayments : null;
 }
 
 function propertyView(p) {
@@ -454,8 +469,12 @@ function propertyView(p) {
   // current month), as opposed to mortgage_balance — the anchor
   // the loan was last reconciled at, which falls ever further
   // behind as payments land. Falls back to the anchor when the
-  // mortgage cannot project (see remainingBalanceFor).
-  const remaining = remainingBalanceFor(p);
+  // mortgage cannot project (see remainingBalanceFor). One
+  // projection run also serves the payment triples below.
+  const proj = projectionFor(p);
+  const remaining = proj
+    ? remainingBalanceAt(proj.series, currentMonthKey(), p.mortgage_balance ?? null, proj.payoffMonth)
+    : { balance: p.mortgage_balance ?? null, month: null };
   return {
     ...p,
     // The lender and remaining amortization are term facts now;
@@ -466,15 +485,20 @@ function propertyView(p) {
     // The payment schedule is a term fact too: serve the anchor
     // term's frequency / day under the property field names (the
     // term's own value wins; the property column is its mirror and
-    // the fallback for a term not carrying one). There is no
-    // mortgage_payment here: the payment is always calculated by
-    // the projection, never stored.
+    // the fallback for a term not carrying one). The monthly
+    // payment itself is served as the projection's triple —
+    // paymentUsed (what actually runs; a term override when one
+    // is set), paymentDerived (the engine's computed figure) and
+    // paymentOverridden — never as a stored mortgage_payment.
     payment_frequency: curTerm ? (curTerm.payment_frequency ?? p.payment_frequency ?? null) : (p.payment_frequency ?? null),
     payment_day: curTerm ? (curTerm.payment_day ?? p.payment_day ?? null) : (p.payment_day ?? null),
+    paymentDerived: proj ? proj.paymentDerived : null,
+    paymentUsed: proj ? proj.paymentUsed : null,
+    paymentOverridden: proj ? !!proj.paymentOverridden : false,
     owners: parseOwners(p.owners),
     photos: photosView(p),
     segments,
-    terms: terms.map((t) => termView(t, segments, lumpSums)),
+    terms: terms.map((t) => termView(t, segments, lumpSums, proj ? proj.termPayments : null)),
     lumpSums,
     remainingBalance: remaining.balance,
     remainingBalanceMonth: remaining.month,
@@ -500,8 +524,9 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!b.address || !String(b.address).trim()) return res.status(400).json({ error: 'address is required' });
   // The monthly payment is always calculated from the balance, the
-  // rate plan and the amortization — it is never entered, so a
-  // request carrying one is a contract error, not silently ignored.
+  // rate plan and the amortization — it is never entered at the
+  // PROPERTY level (an override lives on a term), so a request
+  // carrying one is a contract error, not silently ignored.
   if (b.mortgage_payment !== undefined) {
     return res.status(400).json({ error: 'the monthly payment is calculated automatically and cannot be entered' });
   }
@@ -632,10 +657,14 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     const balance = p.mortgage_balance > 0 ? p.mortgage_balance : 0;
     const segments = segmentsOf(p.id);
     const balanceDate = p.mortgage_balance_date || today;
-    // Monthly payment: the term schedule's calculated payment
-    // (exactly the amortization endpoint's rules), set below when
-    // the property projects. Only meaningful with a balance.
+    // Monthly payment: the term schedule's payment (exactly the
+    // amortization endpoint's rules — the used figure, i.e. a term
+    // override when one is set, with the derived figure beside
+    // it), set below when the property projects. Only meaningful
+    // with a balance.
     let monthlyPayment = null;
+    let paymentDerived = null;
+    let paymentOverridden = false;
     let projectedInterest = null;
     // Outstanding means what is still owed TODAY — the
     // projection's balance at the current month (the detail
@@ -655,6 +684,8 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       });
       if (r.state === 'projected') {
         monthlyPayment = r.paymentUsed;
+        paymentDerived = r.paymentDerived;
+        paymentOverridden = !!r.paymentOverridden;
         projectedInterest = r.totalInterest;
         outstandingNow = remainingBalanceAt(r.series, currentMonth, balance, r.payoffMonth).balance;
         interestFrom++;
@@ -695,6 +726,8 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       shortLabel: String(p.address).split(',')[0],
       outstanding: outstandingNow,
       monthlyPayment: monthlyPayment > 0 ? monthlyPayment : 0,
+      paymentDerived: paymentDerived !== null && paymentDerived !== undefined ? paymentDerived : null,
+      paymentOverridden,
       paymentKnown: monthlyPayment > 0,
       hasPlan: segments.length > 0,
       projState,
@@ -796,8 +829,9 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
   const b = req.body || {};
-  // The monthly payment is always calculated — never entered (see
-  // the POST handler); a request carrying one is a contract error.
+  // The monthly payment is always calculated — never entered at
+  // the property level (see the POST handler); a request carrying
+  // one is a contract error.
   if (b.mortgage_payment !== undefined) {
     return res.status(400).json({ error: 'the monthly payment is calculated automatically and cannot be entered' });
   }
@@ -1238,10 +1272,15 @@ function cleanTerm(c) {
     amortization_years: c.amortization_years !== undefined ? num(c.amortization_years) : null,
     opening_balance: c.opening_balance !== undefined ? num(c.opening_balance) : null,
     repayment_method: c.repayment_method !== undefined ? String(c.repayment_method) : 'equal_payment',
+    // The term's optional monthly payment override: the engine
+    // always derives the payment first; a positive override makes
+    // the term run on that fixed payment instead. Empty / null
+    // clears it (the derived payment rules).
+    payment_override: c.payment_override !== undefined && c.payment_override !== null && c.payment_override !== ''
+      ? num(c.payment_override) : null,
     // The term's own payment schedule + balance anchor (see the
     // mortgage_terms columns); the anchor pair is set together or
-    // not at all. (No payment field: the monthly payment is always
-    // calculated, and the endpoints refuse one before this runs.)
+    // not at all.
     payment_frequency: c.payment_frequency !== undefined && c.payment_frequency !== null && c.payment_frequency !== ''
       ? String(c.payment_frequency) : null,
     payment_day: c.payment_day !== undefined && c.payment_day !== null && c.payment_day !== ''
@@ -1262,6 +1301,9 @@ function cleanTerm(c) {
   }
   if (!['equal_payment', 'equal_principal'].includes(next.repayment_method)) {
     return { error: "repayment_method must be 'equal_payment' or 'equal_principal'" };
+  }
+  if (next.payment_override !== null && (!isFinite(next.payment_override) || next.payment_override <= 0)) {
+    return { error: 'monthly payment override must be a number greater than 0' };
   }
   if (next.payment_frequency !== null && !FREQUENCY_KEYS.includes(next.payment_frequency)) {
     return {
@@ -1344,11 +1386,6 @@ function projectedBalanceAtMonth(p, monthKey) {
 app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  // The monthly payment is always calculated — a term never takes
-  // one (see the property handlers); refuse it as a contract error.
-  if ((req.body || {}).payment_override !== undefined) {
-    return res.status(400).json({ error: 'the monthly payment is calculated automatically and cannot be entered' });
-  }
   // The renewal prefill below computes a projected balance: like
   // every other calculation entry, refresh prime first so the
   // prefill prices against the latest full history.
@@ -1379,12 +1416,14 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
       : (prev ? prev.repayment_method || 'equal_payment' : 'equal_payment'),
     // The payment schedule (frequency / day) carries over a renewal
     // the same way; a balance anchor does not — it belongs to the
-    // term containing it. (The payment needs no carrying rule: a
-    // renewal re-derives it from its own amortization, as always.)
+    // term containing it. A payment override does not carry over
+    // either: a renewal re-derives its payment from its own
+    // amortization unless an override is entered on it directly.
     payment_frequency: b.payment_frequency !== undefined ? b.payment_frequency
       : (prev ? prev.payment_frequency ?? null : null),
     payment_day: b.payment_day !== undefined ? b.payment_day
       : (prev ? prev.payment_day ?? null : null),
+    payment_override: b.payment_override !== undefined ? b.payment_override : null,
     anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : null,
     anchor_date: b.anchor_date !== undefined ? b.anchor_date : null,
   };
@@ -1392,14 +1431,14 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const info = db
-    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, anchor_balance, anchor_date, amortization_defaulted, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
-    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.anchor_balance, t.anchor_date, nowIso(), nowIso());
+    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
+    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, nowIso(), nowIso());
   syncTermMirror(getProperty(p.id));
   syncTermAnchor(getProperty(p.id));
   syncScheduleMirror(getProperty(p.id));
   const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(info.lastInsertRowid);
-  res.status(201).json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id)));
+  res.status(201).json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id), termPayMapFor(getProperty(p.id))));
 });
 
 app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
@@ -1408,10 +1447,6 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
   const term = db.prepare('SELECT * FROM mortgage_terms WHERE id = ? AND property_id = ?').get(req.params.termId, p.id);
   if (!term) return res.status(404).json({ error: 'term not found' });
   const b = req.body || {};
-  // The monthly payment is always calculated — never entered.
-  if (b.payment_override !== undefined) {
-    return res.status(400).json({ error: 'the monthly payment is calculated automatically and cannot be entered' });
-  }
   const clean = cleanTerm({
     lender: b.lender !== undefined ? b.lender : term.lender,
     start_date: b.start_date !== undefined ? b.start_date : term.start_date,
@@ -1421,13 +1456,14 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     repayment_method: b.repayment_method !== undefined ? b.repayment_method : term.repayment_method,
     payment_frequency: b.payment_frequency !== undefined ? b.payment_frequency : term.payment_frequency,
     payment_day: b.payment_day !== undefined ? b.payment_day : term.payment_day,
+    payment_override: b.payment_override !== undefined ? b.payment_override : term.payment_override,
     anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : term.anchor_balance,
     anchor_date: b.anchor_date !== undefined ? b.anchor_date : term.anchor_date,
   });
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
-  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, updated_at=? WHERE id=?')
-    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.anchor_balance, t.anchor_date, nowIso(), term.id);
+  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, updated_at=? WHERE id=?')
+    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, nowIso(), term.id);
   // Editing the anchor pair on the term that carries it edits the
   // property's balance anchor itself — the two are one fact, stored
   // in both places: write the submitted pair through, then let the
@@ -1446,7 +1482,7 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
   syncScheduleMirror(getProperty(p.id));
   syncTermMirror(getProperty(p.id));
   const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(term.id);
-  res.json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id)));
+  res.json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id), termPayMapFor(getProperty(p.id))));
 });
 
 app.delete('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
@@ -1574,6 +1610,20 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
       }
       owner.amortization_years = ay;
     }
+    // The owner term's payment override rides along the same way
+    // (the term form's current value, saved or not): while it is
+    // set the previewed payment IS the override.
+    if (b.payment_override !== undefined) {
+      if (b.payment_override === null || b.payment_override === '') {
+        owner.payment_override = null;
+      } else {
+        const po = num(b.payment_override);
+        if (po === null || !isFinite(po) || po <= 0) {
+          return res.status(400).json({ error: 'monthly payment override must be a number greater than 0' });
+        }
+        owner.payment_override = po;
+      }
+    }
   }
   const prime = getCurrentPrime();
   const { frequency, paymentDay } = termScheduleOf(p, terms);
@@ -1592,11 +1642,30 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
   const startMonth = draft.start_date.slice(0, 7);
   const row = r.series.find((x) => x.month >= startMonth);
   if (!row) return res.json({ ok: false, error: 'this plan starts after the mortgage is paid off' });
+  // The payment triple for the previewed month: `payment` is the
+  // row's own (the override, when the owner term carries one);
+  // the derived figure comes from a second run with the owner's
+  // override stripped — the same month's row of that run.
+  const ownerOverride = owner ? Number(owner.payment_override) : NaN;
+  const paymentOverridden = isFinite(ownerOverride) && ownerOverride > 0;
+  let paymentDerived = row.payment;
+  if (paymentOverridden) {
+    const derivedTerms = terms.map((t) => (t === owner ? { ...t, payment_override: null } : t));
+    const rd = buildSchedule({
+      balance: p.mortgage_balance, balanceDate: p.mortgage_balance_date || new Date().toISOString().slice(0, 10),
+      terms: derivedTerms, segments, lumpSums: lumpSumsOf(p.id),
+      paymentDay, frequency,
+      primeRate: prime ? prime.rate : null, primeHistory: getPrimeHistory(), region: p.region || 'CA',
+    });
+    const dRow = rd.series.find((x) => x.month === row.month) || rd.series.find((x) => x.month >= startMonth);
+    paymentDerived = dRow ? dRow.payment : null;
+  }
   res.json({
     ok: true,
     month: row.month, date: row.date,
     payment: row.payment, interest: row.interest, principal: row.principal,
     balance: row.balance, rate: row.rate,
+    paymentDerived, paymentOverridden,
   });
 });
 
@@ -1613,8 +1682,10 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
 // sums (they shorten the loan instead) and by prime moves (a variable
 // plan's payment is set when the plan starts; prime only reprices
 // each month's interest split, against the tracked prime history).
-// The payment is never entered anywhere — it only ever comes out
-// of this calculation.
+// The derived payment only ever comes out of this calculation; a
+// term may carry a payment override that replaces it for that
+// term's span — paymentUsed reports what actually runs,
+// paymentDerived the calculated figure beside it.
 app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -1668,6 +1739,8 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
     remainingBalance: remaining.balance,
     remainingBalanceMonth: remaining.month,
     paymentUsed: payment,
+    paymentDerived: r.paymentDerived,
+    paymentOverridden: r.paymentOverridden,
     primeRate,
     primeAssumption: primeRate !== null
       ? `Past months use actual Bank of Canada prime history; future months assume prime stays at the latest known rate of ${Number(primeRate).toFixed(2)}%. For variable plans the payment is set when the plan starts and does not change when prime moves; only the interest/principal split changes.`

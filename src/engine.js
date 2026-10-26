@@ -407,12 +407,16 @@ function monthIdxOf(dateStr) {
 // PER-TERM: each term may carry its own payment_frequency /
 // payment_day, and they rule only inside that term (the build-level
 // frequency / paymentDay remain as the anchor term's / global
-// fallbacks for callers that still pass them that way). There is
-// NO entered payment anywhere: the monthly payment is always
-// computed from the balance, the rate in effect and the governing
-// term's amortization, per the rules above. (The mortgage_terms
-// table still carries a dormant payment_override column from the
-// era when a payment could be typed in; nothing reads it.) A term may
+// fallbacks for callers that still pass them that way). The
+// DERIVED payment — computed from the balance, the rate in effect
+// and the governing term's amortization, per the rules above — is
+// always the baseline. A term may additionally carry a
+// payment_override (a positive monthly amount): while it is set,
+// that term runs on the override as a fixed payment for its whole
+// span — rate changes and prime moves inside the term never recast
+// it, the repayment method has no effect, and a lump sum still
+// leaves it unchanged (payoff moves earlier). The derived plan is
+// still tracked alongside, so callers can report both figures. A term may
 // also record a balance anchor (anchor_balance as of anchor_date,
 // a date inside the term): at that month the running balance is
 // RESET to the recorded figure — a reconciliation point; the plan
@@ -426,16 +430,21 @@ function monthIdxOf(dateStr) {
 //   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
 //               before the balance date is already reflected in the
 //               anchor balance and is ignored
-// Returns simulate()'s shape plus { state, paymentUsed }:
-// state is 'projected', or 'no_payment' when the anchor term
-// carries no amortization (the payment cannot be computed), or
-// 'no_prime' when a prime-spread segment exists but no prime rate
-// is known. paymentUsed is the monthly payment in effect at the
-// anchor (for an equal-principal plan, its FIRST month's payment —
-// the payments decline from there). The payment is always the
-// computed one; there is no entered-payment variant to report.
+// Returns simulate()'s shape plus { state, paymentUsed,
+// paymentDerived, paymentOverridden, termPayments }: state is
+// 'projected', or 'no_payment' when the anchor term carries no
+// amortization and no override (the payment cannot be computed),
+// or 'no_prime' when a prime-spread segment exists but no prime
+// rate is known. paymentUsed is the monthly payment in effect at
+// the anchor (for an equal-principal plan, its FIRST month's
+// payment — the payments decline from there); paymentDerived is
+// the same figure with every override ignored (the system's own
+// computed payment), and paymentOverridden says the two differ
+// because the anchor term carries an override. termPayments maps
+// each reached term's id to the same triple for that term's
+// opening plan: { paymentUsed, paymentDerived, paymentOverridden }.
 export function buildSchedule({ balance, balanceDate, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
-  const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null };
+  const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null, paymentDerived: null, paymentOverridden: false, termPayments: {} };
   const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
   if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread')
     && !primeForMonth) {
@@ -521,6 +530,46 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   const methodAt = (S) => {
     const term = termAtMonth(S + 1);
     return term && term.repayment_method === 'equal_principal' ? 'equal_principal' : 'equal_payment';
+  };
+
+  // The payment override governing months after state point S:
+  // the active term's payment_override when it is a positive
+  // number, else null. An override replaces the derived plan with
+  // a fixed payment for the whole term — it is consulted before
+  // every plan computation below, so no in-term event (rate
+  // change, prime move, lump sum) ever recasts it.
+  const overrideAt = (S) => {
+    const term = termAtMonth(S + 1);
+    if (!term) return null;
+    const v = Number(term.payment_override);
+    return isFinite(v) && v > 0 ? round2(v) : null;
+  };
+
+  // The single payment figure a plan reports: its level payment,
+  // or — for an equal-principal plan — its first month's payment
+  // (the payments decline from there). `firstRowPayment` is the
+  // first row of the span the plan actually ran; for a plan that
+  // did not run (the derived plan beside an override) a one-month
+  // simulate() at the same state point gives the same figure.
+  const planFigure = (plan, firstRowPayment) => {
+    if (!plan || plan.error) return null;
+    if (plan.payment !== undefined) return plan.payment;
+    if (plan.principalPerMonth !== undefined) return firstRowPayment ?? null;
+    return null;
+  };
+  const derivedFigureAt = (S, plan, balNow, dateNow) => {
+    if (!plan || plan.error) return null;
+    if (plan.payment !== undefined) return plan.payment;
+    if (plan.principalPerMonth !== undefined) {
+      const r1 = simulate({
+        balance: balNow, balanceDate: dateNow, payment: 0,
+        principalPerMonth: plan.principalPerMonth, segments,
+        paymentDay: scheduleAt(S).paymentDay, frequency: scheduleAt(S).frequency,
+        maxMonths: 1, primeRate, primeHistory, region,
+      });
+      return r1.series.length ? r1.series[0].payment : null;
+    }
+    return null;
   };
 
   // The equal-principal plan at state point S: a fixed monthly
@@ -619,11 +668,25 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   if (initialLump) {
     bal = round2(bal - initialLump.total);
     if (bal <= 0) {
-      const cp = computePayment(A, round2(Number(balance)));
+      const derived = computePayment(A, round2(Number(balance)));
+      const ovA = overrideAt(A);
+      const usedFigure = ovA !== null ? ovA : (derived.error ? null : (derived.payment ?? null));
+      const anchorT = termAtMonth(A + 1);
+      const tp = {};
+      if (anchorT && anchorT.id !== undefined && anchorT.id !== null) {
+        tp[anchorT.id] = {
+          paymentUsed: usedFigure,
+          paymentDerived: derived.error ? null : (derived.payment ?? null),
+          paymentOverridden: ovA !== null,
+        };
+      }
       return {
-        ...blocked, state: cp.error === 'no_prime' ? 'no_prime' : 'projected',
+        ...blocked, state: derived.error === 'no_prime' ? 'no_prime' : 'projected',
         payoffMonth: initialLump.month,
-        paymentUsed: cp.error ? null : cp.payment,
+        paymentUsed: usedFigure,
+        paymentDerived: derived.error ? null : (derived.payment ?? null),
+        paymentOverridden: ovA !== null,
+        termPayments: tp,
       };
     }
   }
@@ -631,7 +694,13 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   let S = A;
   let chunkBalanceDate = balanceDate;
   let lastPlan = null; // the running plan: { payment } or { principalPerMonth }
+  let lastDerivedPlan = null; // the same, with every override ignored
+  let lastDerivedPayment = null;
   let anchorPlan = null;
+  let anchorDerivedPlan = null;
+  let anchorOverridden = false;
+  let anchorBal = bal;
+  const termPlans = new Map(); // term id -> { paymentUsed, paymentDerived, paymentOverridden }
   for (const nextS of boundaries) {
     if (bal <= 0 || S >= A + maxMonths) break;
     // A balance anchor recorded inside a term resets the running
@@ -643,40 +712,57 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
       bal = anchorByState.get(S);
       if (bal <= 0) { payoffMonth = ymKeyOfIdx(S + 1); break; }
     }
-    // The plan for the span after S, per the governing term's
-    // repayment method.
-    let cp;
+    // The DERIVED plan for the span after S, per the governing
+    // term's repayment method — always computed first; an override
+    // (below) replaces it for the run, never the other way round.
+    let derivedCp;
     const principalPlan = methodAt(S) === 'equal_principal';
     if (S === A || termStates.has(S)) {
       // The anchor, or a new term starting: derive the plan on the
       // (new) term's amortization. A segment that starts with the
       // term is the term's opening rate plan, not a mid-stream
       // rate change.
-      cp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
+      derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
     } else if (segStates.has(S)) {
       // A rate change inside the running schedule: equal payment
       // recasts against the trajectory's payoff; equal principal
       // re-anchors the monthly principal on the balance and the
       // amortization months left.
-      cp = principalPlan ? computePrincipal(S, bal) : computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
+      derivedCp = principalPlan ? computePrincipal(S, bal) : computeRateChangePayment(S, bal, lastDerivedPayment, chunkBalanceDate);
     } else {
       // A lump-sum-only boundary: the balance was already reduced
       // below; the plan carries over unchanged (same payment, or
       // same monthly principal) and the loan simply pays off sooner.
-      cp = lastPlan;
+      derivedCp = lastDerivedPlan;
     }
-    if (cp.error) {
-      if (S === A) return { ...blocked, state: cp.error };
+    if (derivedCp && derivedCp.error && S !== A) derivedCp = lastDerivedPlan;
+    // The plan that actually runs: the governing term's override,
+    // when it carries one — a fixed payment for the whole term,
+    // immune to the rate change / prime move that produced this
+    // boundary and to the term's repayment method.
+    const ov = overrideAt(S);
+    let cp = ov !== null ? { payment: ov } : derivedCp;
+    if (!cp || cp.error) {
+      if (S === A) return { ...blocked, state: (cp && cp.error) || 'no_payment' };
       // A later term without an amortization cannot recompute the
       // plan: the previous plan carries over unchanged.
       cp = lastPlan;
     }
     if (S === A) {
       anchorPlan = cp;
+      anchorDerivedPlan = derivedCp;
+      anchorOverridden = ov !== null;
+      anchorBal = bal;
       paymentUsed = cp.payment !== undefined ? cp.payment : null; // principal plan: filled from the first row below
     }
     lastPlan = cp;
+    if (derivedCp && !derivedCp.error) {
+      lastDerivedPlan = derivedCp;
+      if (derivedCp.payment !== undefined) lastDerivedPayment = derivedCp.payment;
+    }
     if (cp.payment !== undefined) lastPayment = cp.payment;
+    const spanBal = bal;
+    const spanDate = chunkBalanceDate;
     const span = Math.min(nextS, A + maxMonths) - S;
     if (span > 0) {
       const r = simulate({
@@ -695,6 +781,16 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
         // equal-principal span's most recent actual payment is the
         // closest stand-in (its payments decline month by month).
         if (cp.principalPerMonth !== undefined) lastPayment = r.series[r.series.length - 1].payment;
+        // Record the term's opening triple the first time a span
+        // governed by it actually runs.
+        const gov = termAtMonth(S + 1);
+        if (gov && gov.id !== undefined && gov.id !== null && !termPlans.has(gov.id)) {
+          termPlans.set(gov.id, {
+            paymentUsed: planFigure(cp, r.series[0].payment),
+            paymentDerived: derivedFigureAt(S, derivedCp, spanBal, spanDate),
+            paymentOverridden: ov !== null,
+          });
+        }
       }
       if (r.payoffMonth) { payoffMonth = r.payoffMonth; break; }
     }
@@ -726,10 +822,21 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   if (paymentUsed === null && anchorPlan && anchorPlan.principalPerMonth !== undefined && series.length) {
     paymentUsed = series[0].payment;
   }
+  // The derived anchor figure, same convention: the derived plan's
+  // level payment, or its first month's payment when it is an
+  // equal-principal plan (a one-month run of the derived plan at
+  // the anchor state — exact, and identical to paymentUsed when no
+  // override is in play).
+  const paymentDerived = anchorDerivedPlan && !anchorDerivedPlan.error
+    ? derivedFigureAt(A, anchorDerivedPlan, anchorBal, balanceDate)
+    : null;
+  const termPayments = {};
+  for (const [id, v] of termPlans) termPayments[id] = v;
   return {
     state: 'projected', series, totalInterest,
     payoffMonth: payoffMonth || (series.length && bal <= 0 ? series[series.length - 1].month : null),
-    negativeAmortization, paymentUsed,
+    negativeAmortization, paymentUsed, paymentDerived,
+    paymentOverridden: anchorOverridden, termPayments,
   };
 }
 
