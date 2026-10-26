@@ -72,6 +72,7 @@ td.num, th.num { text-align: right; }
 .chart-wrap { position: relative; height: 340px; }
 .chart-wrap.tall { height: 420px; }
 .chart-wrap.short { height: 180px; margin: 4px 0 10px; }
+.chart-wrap.prime-pop { height: 200px; }
 /* Gallery photo wall: thumbnail strip under the main photo. */
 .photo-thumbs { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .photo-thumbs .thumb { width: 88px; height: 58px; padding: 0; border: 2px solid #c9d2dc; border-radius: 8px; overflow: hidden; background: #dbe4ee; }

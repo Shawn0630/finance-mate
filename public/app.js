@@ -183,13 +183,10 @@ const propSuggest = attachAddressSuggest(
 // --------------------------------------------------------------- modals ---
 function openModal(id) {
   $('#' + id).classList.remove('hidden');
-  // The prime history chart is built only once its modal is open —
-  // a canvas sized while hidden would stay at zero size.
-  if (id === 'mortgageModal') syncPrimeChart();
 }
 function closeModalEl(overlay) {
   overlay.classList.add('hidden');
-  if (overlay && overlay.id === 'mortgageModal') destroyPrimeChart();
+  if (overlay && overlay.id === 'primeModal') destroyPrimeChart();
 }
 document.querySelectorAll('[data-close-modal]').forEach((b) =>
   b.addEventListener('click', () => closeModalEl(b.closest('.modal-overlay'))));
@@ -1035,7 +1032,6 @@ async function loadPropertyDetail(id) {
   chartMeta = null; // the previous property's projection must not leak into this page's summary
   amortError = null;
   renderTerms(p);
-  syncPrimeChart(); // the in-effect segment may have changed with this property
   renderMortgageMeta();
   loadPrime();
   loadChart(id);
@@ -1122,11 +1118,20 @@ function renderMortgageMeta() {
 }
 
 function segRowsHtml(segs) {
-  return segs.map((s) => `<tr>
+  return segs.map((s) => {
+    // A prime-spread segment's rate text is the one door to the
+    // prime history: it renders as a link that opens the prime
+    // modal, windowed on this segment. Every other segment's rate
+    // stays plain text.
+    const rateCell = s.rate_type === 'variable' && s.rate_mode === 'prime_spread'
+      ? `<a href="#" data-prime-link data-seg-start="${esc(s.start_date)}">${esc(segmentRateText(s))}</a>`
+      : esc(segmentRateText(s));
+    return `<tr>
     <td>${esc(s.start_date)}</td>
     <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}</td>
-    <td class="num">${esc(segmentRateText(s))}</td>
-    <td><button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`).join('')
+    <td class="num">${rateCell}</td>
+    <td><button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`;
+  }).join('')
     || '<tr><td colspan="4" class="note" style="margin:0">No segments in this term yet — add one with "+ Change rate".</td></tr>';
 }
 
@@ -1307,6 +1312,12 @@ $('#termsWrap').addEventListener('click', async (e) => {
     if (form) form.classList.remove('hidden');
     return;
   }
+  const primeLink = e.target.closest('[data-prime-link]');
+  if (primeLink) {
+    e.preventDefault();
+    openPrimeModal(primeLink.dataset.segStart);
+    return;
+  }
   const delSeg = e.target.closest('[data-del-seg]');
   if (delSeg) { deleteSegment(Number(delSeg.dataset.delSeg)); return; }
   const delLump = e.target.closest('[data-del-lump]');
@@ -1449,38 +1460,54 @@ $('#propForm').addEventListener('submit', async (e) => {
 });
 
 // ---- Prime rate (Bank of Canada, tracked by the server) ----------
-// The banner states the current prime with its real as-of date and
-// the projection assumption; the add-segment form previews a
-// prime-spread against the same value.
+// No prime text lives in the Mortgage Terms & Rates modal: the
+// prime history sits behind the link on each prime-spread
+// segment's rate (the prime modal, below), and the add-segment
+// form previews a prime-spread against the tracked value. The
+// only prime words that may appear uninvited are functional
+// states — the stale warnings, shown only while the tracked
+// value is out of date.
 let primeInfoCache = null;
 
 async function loadPrime() {
   try {
     primeInfoCache = await api('/api/prime');
   } catch { primeInfoCache = null; }
-  const banner = $('#primeBanner');
-  if (!banner) return;
   const cur = primeInfoCache && primeInfoCache.current;
   renderPrimeWarning($('#primeWarning'), primeInfoCache
     ? { rate: cur ? cur.rate : null, asOf: primeInfoCache.asOf, fresh: primeInfoCache.fresh }
     : null);
-  banner.textContent = cur
-    ? `Bank of Canada prime: ${Number(cur.rate).toFixed(2)}% (as of ${primeInfoCache.asOf || cur.date}).`
-    : 'Bank of Canada prime: not available yet — the app fetches it from the Bank of Canada and keeps the last known value. Prime-based variable segments cannot be projected until a value is on record.';
-  syncPrimeChart();
+  renderPrimeStaleNote();
   refreshSegPreviews();
 }
 
-// ---- Prime history chart (Mortgage Terms & Rates modal) ----------
-// When the current term's plan in effect prices off prime (a
-// prime-spread variable segment), the banner's "Recent: …" text
-// gives way to a stepped chart of the tracked prime history: each
-// step is one Bank of Canada move, drawn from a little before the
-// plan in effect began through today. On any other plan (fixed,
-// absolute) there is no chart and the banner keeps its text form.
-// The chart is built only while the modal is open and destroyed on
+// The Mortgage modal's stale-prime line: one small amber line,
+// present only while the tracked prime is stale (the last fetch
+// failed and plans price off the last known value). While prime
+// is fresh the modal carries no prime text at all.
+function renderPrimeStaleNote() {
+  const el = $('#primeStaleNote');
+  if (!el) return;
+  const info = primeInfoCache;
+  const cur = info && info.current;
+  if (info && cur && info.fresh === false) {
+    el.textContent = `Couldn't reach the Bank of Canada — plans here use the last known prime of ${Number(cur.rate).toFixed(2)}% from ${info.asOf || cur.date}.`;
+    el.classList.remove('hidden');
+  } else {
+    el.textContent = '';
+    el.classList.add('hidden');
+  }
+}
+
+// ---- Prime history chart (the prime modal) ----------
+// A prime-spread segment's rate text is a link; clicking it opens
+// the prime modal with a stepped chart of the tracked prime
+// history: each step is one Bank of Canada move, drawn from a
+// little before the clicked segment began through today. The
+// chart is built only while the modal is open and destroyed on
 // close, so its canvas never sizes against a hidden layout.
 let primeChart = null;
+let primeModalSegStart = null; // start_date of the segment whose link opened the modal
 
 function destroyPrimeChart() {
   if (primeChart) { primeChart.destroy(); primeChart = null; }
@@ -1500,41 +1527,17 @@ function addMonthsStr(dateStr, months) {
   return localDateStr(new Date(first.getFullYear(), first.getMonth(), Math.min(d || 1, dim)));
 }
 
-// The current term's segments, with termless segments folded in —
-// the same set the terms list shows under the current term.
-function currentTermSegments(p) {
-  const terms = p.terms || [];
-  const cur = terms.find((t) => t.id === p.currentTermId) || null;
-  if (!cur) return [];
-  const orphans = (p.segments || []).filter((s) => !terms.some((t) => t.id === s.term_id));
-  return [...(cur.segments || []), ...orphans]
-    .sort((a, b) => (String(a.start_date) < String(b.start_date) ? -1
-      : String(a.start_date) > String(b.start_date) ? 1 : (a.id || 0) - (b.id || 0)));
-}
-
-// The segment in effect this month, with the engine's rule (the
-// latest segment that has started; the earliest when none has).
-function segmentInEffect(segments) {
-  if (!segments || !segments.length) return null;
-  const monthKey = localDateStr(new Date()).slice(0, 7);
-  let chosen = segments[0];
-  for (const seg of segments) {
-    if (String(seg.start_date).slice(0, 7) <= monthKey) chosen = seg;
-    else break;
-  }
-  return chosen;
-}
-
-// The chart's points and axis window: from three months before the
-// plan in effect began (or the first stored observation, when that
-// is later) through today. The opening point carries the rate in
-// effect at the window start; every stored step inside the window
-// follows; the line ends at today's date at the current rate.
-function primeChartData(history, planStart) {
+// The chart's points and axis window: from three months before
+// the clicked segment began (or the first stored observation,
+// when that is later) through today. The opening point carries
+// the rate in effect at the window start; every stored step
+// inside the window follows; the line ends at today's date at
+// the current rate.
+function primeChartData(history, segStart) {
   const firstDate = history[0].date;
   let winStart = firstDate;
-  if (planStart) {
-    const ctx = addMonthsStr(planStart, -3);
+  if (segStart) {
+    const ctx = addMonthsStr(segStart, -3);
     if (ctx > winStart) winStart = ctx;
   }
   const today = localDateStr(new Date());
@@ -1553,8 +1556,7 @@ function primeChartData(history, planStart) {
   };
 }
 
-// The current rate, drawn at the line's end (the banner line above
-// states it too; the chart repeats it where the eye lands).
+// The current rate, drawn at the line's end where the eye lands.
 const primeEndLabelPlugin = {
   id: 'primeEndLabel',
   afterDatasetsDraw(chart) {
@@ -1572,40 +1574,26 @@ const primeEndLabelPlugin = {
   },
 };
 
-function syncPrimeChart() {
-  const wrap = $('#primeChartWrap');
-  const changesEl = $('#primeChanges');
-  if (!wrap || !changesEl) return;
+// Open the prime modal windowed on the clicked segment: the
+// header names the current prime with its as-of date, and the
+// chart covers the segment's own window.
+function openPrimeModal(segStart) {
+  primeModalSegStart = segStart || null;
+  openModal('primeModal');
+  buildPrimeChart();
+}
+
+function buildPrimeChart() {
   const info = primeInfoCache;
-  const p = detailProperty;
-  const seg = p ? segmentInEffect(currentTermSegments(p)) : null;
-  const showChart = !!(info && info.current && Array.isArray(info.history) && info.history.length > 1
-    && seg && seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread');
-  if (!showChart) {
-    wrap.classList.add('hidden');
-    destroyPrimeChart();
-    // No chart: the banner keeps its text form (recent change points).
-    const changes = (info && info.changes) || [];
-    changesEl.textContent = info && info.current && changes.length > 1
-      ? 'Recent: ' + changes.map((c) => `${Number(c.rate).toFixed(2)}% from ${c.date}`).join(' · ')
-      : '';
-    return;
+  const cur = info && info.current;
+  const head = $('#primeModalCurrent');
+  if (head) {
+    head.textContent = cur
+      ? `Bank of Canada prime: ${Number(cur.rate).toFixed(2)}% (as of ${info.asOf || cur.date}).`
+      : 'Bank of Canada prime: not available yet — the app fetches it from the Bank of Canada and keeps the last known value.';
   }
-  // With the chart drawn, the "Recent: …" string would only repeat it.
-  changesEl.textContent = '';
-  wrap.classList.remove('hidden');
-  const modal = $('#mortgageModal');
-  if (!modal || modal.classList.contains('hidden')) { destroyPrimeChart(); return; }
-  const terms = p.terms || [];
-  const cur = terms.find((t) => t.id === p.currentTermId) || null;
-  // The window anchors on when the plan in effect began: the earlier
-  // of the current term's start and its in-effect segment's start.
-  // (A freshly recorded property's term opens on the balance date,
-  // while its rate plan reaches back to the mortgage's real start —
-  // the steps that priced the loan live in between.)
-  const planStart = [cur ? cur.start_date : null, seg ? seg.start_date : null]
-    .filter(Boolean).sort()[0] || null;
-  const { min, max, data } = primeChartData(info.history, planStart);
+  if (!info || !Array.isArray(info.history) || !info.history.length) { destroyPrimeChart(); return; }
+  const { min, max, data } = primeChartData(info.history, primeModalSegStart);
   const rates = data.map((d) => d.y);
   destroyPrimeChart();
   primeChart = new Chart($('#primeChart'), {
@@ -1651,6 +1639,7 @@ $('#primeRefreshBtn').addEventListener('click', async () => {
     markAssetsDirty(); // a new prime reprices every variable projection
     loadPrime();
     if (currentPropertyId) loadPropertyDetail(currentPropertyId);
+    if (!$('#primeModal').classList.contains('hidden')) buildPrimeChart();
   } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 

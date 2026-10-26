@@ -288,19 +288,23 @@
         <option value="National Bank"></option>
       </datalist>
       <h4>Terms</h4>
-      <div class="toolbar" style="align-items:flex-start">
-        <div>
-          <div class="note" id="primeBanner" style="margin:0">Loading prime rate…</div>
-          <div class="note" id="primeChanges" style="margin:2px 0 0"></div>
-        </div>
-        <div class="spacer"></div>
-        <button type="button" class="small" id="primeRefreshBtn">Refresh prime</button>
-      </div>
-      <div class="chart-wrap short hidden" id="primeChartWrap"><canvas id="primeChart"></canvas></div>
+      <div class="msg warn hidden" id="primeStaleNote"></div>
       <div id="termsWrap"></div>
       <div class="toolbar" style="margin-top:10px">
         <button type="button" class="primary" id="addTermBtn">+ Add term / renewal</button>
       </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="primeModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Bank of Canada prime history</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="toolbar" style="margin:0 0 6px">
+      <div class="note" id="primeModalCurrent" style="margin:0"></div>
+      <div class="spacer"></div>
+      <button type="button" class="small" id="primeRefreshBtn">Refresh prime</button>
+    </div>
+    <div class="chart-wrap prime-pop"><canvas id="primeChart"></canvas></div>
   </div>
 </div>
 

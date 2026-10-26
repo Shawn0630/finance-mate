@@ -2306,46 +2306,100 @@ try {
           && !metaGrid.prose.includes('A mortgage runs as a chain of terms')
           && !metaGrid.prose.includes('Monthly payment derived from the remaining amortization'),
         metaGrid.prose.slice(0, 200));
-      // Prime history chart: this fixture's plan in effect is a
-      // prime-spread variable segment, so the banner's "Recent: …"
-      // text gives way to the stepped chart. Its steps are the
-      // stored history's change points (read back from the API, so
-      // both sides walk the same series) and its last value is the
-      // current prime.
+      // Prime history: no banner lives in this modal — no title
+      // line, no "Recent: …" string, no standing chart. The
+      // prime-spread segment's rate text is a LINK; clicking it
+      // opens the prime modal with the stepped history chart.
+      // Its steps are the stored history's change points (read
+      // back from the API, so both sides walk the same series)
+      // and its last value is the current prime.
       const primeNow = (await req('GET', '/api/prime')).data;
+      const noBanner = await page.evaluate(() => {
+        const link = document.querySelector('#segmentRows [data-prime-link]');
+        return {
+          bannerGone: !document.querySelector('#primeBanner') && !document.querySelector('#primeChanges')
+            && !document.querySelector('#primeChartWrap'),
+          modalText: document.querySelector('#mortgageModal').textContent,
+          staleHidden: document.querySelector('#primeStaleNote').classList.contains('hidden'),
+          link: link ? { text: link.textContent, start: link.dataset.segStart } : null,
+        };
+      });
+      check('the Mortgage modal carries no prime banner and no standing chart (stale line hidden while fresh)',
+        noBanner.bannerGone && !noBanner.modalText.includes('Bank of Canada prime:') && noBanner.staleHidden,
+        JSON.stringify({ bannerGone: noBanner.bannerGone, staleHidden: noBanner.staleHidden }));
+      check('the prime-spread segment rate renders as a link carrying the segment start date',
+        !!noBanner.link && noBanner.link.text.includes('Prime') && noBanner.link.start === '2024-12-17',
+        JSON.stringify(noBanner.link));
       let primeUi = null;
       for (let i = 0; i < 20; i++) {
         primeUi = await page.evaluate(() => {
-          const wrap = document.querySelector('#primeChartWrap');
           const canvas = document.querySelector('#primeChart');
           const rect = canvas ? canvas.getBoundingClientRect() : null;
           const c = window.__fmCharts.prime;
           const ds = c ? c.data.datasets[0] : null;
           return {
-            wrapHidden: !wrap || wrap.classList.contains('hidden'),
+            open: !document.querySelector('#primeModal').classList.contains('hidden'),
             hasChart: !!c,
             stepped: ds ? ds.stepped : null,
             ys: ds ? [...new Set(ds.data.map((pt) => pt.y))].sort((a, b) => a - b) : [],
             lastY: ds ? ds.data[ds.data.length - 1].y : null,
             w: rect ? rect.width : 0,
             h: rect ? rect.height : 0,
-            changes: document.querySelector('#primeChanges').textContent,
-            banner: document.querySelector('#primeBanner').textContent,
+            head: document.querySelector('#primeModalCurrent').textContent,
           };
         });
         if (primeUi.hasChart) break;
+        // (Re)click the link: a first click can land before
+        // loadPrime has cached the history; opening is idempotent.
+        await page.evaluate(() => {
+          const a = document.querySelector('#segmentRows [data-prime-link]');
+          if (a) a.click();
+        });
         await wait(300);
       }
       const histRates = [...new Set((primeNow.history || []).map((h) => h.rate))].sort((a, b) => a - b);
-      check('prime-spread plan: the modal draws the stepped prime history chart and the "Recent:" text is gone',
-        !primeUi.wrapHidden && primeUi.hasChart && primeUi.stepped === 'after'
+      check('clicking the rate link opens the prime modal with the stepped prime history chart',
+        primeUi.open && primeUi.hasChart && primeUi.stepped === 'after'
           && JSON.stringify(primeUi.ys) === JSON.stringify(histRates)
           && primeUi.ys.includes(5.45) && primeUi.ys.includes(4.45)
           && primeUi.lastY === primeNow.current.rate
-          && primeUi.changes === '' && primeUi.banner.startsWith('Bank of Canada prime:'),
+          && primeUi.head.startsWith('Bank of Canada prime:'),
         JSON.stringify(primeUi));
-      check('the prime chart renders at a real size inside the open modal',
+      check('the prime chart renders at a real size inside the prime modal',
         primeUi.w > 200 && primeUi.h > 100, JSON.stringify({ w: primeUi.w, h: primeUi.h }));
+      await page.evaluate(() => document.querySelector('#primeModal [data-close-modal]').click());
+      await wait(300);
+      const primeGone = await page.evaluate(() => window.__fmCharts.prime);
+      check('closing the prime modal destroys the chart instance',
+        primeGone === null, JSON.stringify(primeGone));
+      // Stale prime: when /api/prime reports the tracked value is
+      // stale (fresh: false), the Mortgage modal shows its one
+      // small amber line; fresh again, the line is gone. (Stubbed
+      // at the fetch layer, as in screenshot-prime — server-side
+      // freshness is date-based and covered by the API checks.)
+      const staleUi = await page.evaluate(async () => {
+        const origFetch = window.fetch.bind(window);
+        window.fetch = (url, opts) => {
+          if (String(url).includes('/api/prime') && (!opts || !opts.method || opts.method === 'GET')) {
+            return Promise.resolve(new Response(JSON.stringify({
+              current: { date: '2026-10-21', rate: 4.45 }, fresh: false, asOf: '2026-10-23',
+              changes: [], history: [], lastFetchedAt: null,
+              source: { name: 'Bank of Canada Valet', series: 'V80691311', label: 'Bank of Canada prime rate' },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+          }
+          return origFetch(url, opts);
+        };
+        await loadPrime();
+        const el = document.querySelector('#primeStaleNote');
+        const shown = { hidden: el.classList.contains('hidden'), text: el.textContent };
+        window.fetch = origFetch;
+        await loadPrime();
+        return { shown, hiddenAfterFresh: document.querySelector('#primeStaleNote').classList.contains('hidden') };
+      });
+      check('stale prime shows one small amber line in the Mortgage modal; fresh hides it',
+        !staleUi.shown.hidden && staleUi.shown.text.includes('last known prime of 4.45%')
+          && staleUi.hiddenAfterFresh === true,
+        JSON.stringify(staleUi));
       const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('the NO_PAYMENT note beside chart A clears once amortization is in',
         !afterMsg.includes('set the remaining amortization'), afterMsg);
@@ -2539,8 +2593,8 @@ try {
       await wait(300);
       await req('DELETE', `/api/properties/${remPid}`);
 
-      // A fixed plan in effect draws NO prime chart — the banner
-      // keeps its text form with the recent change points.
+      // A fixed plan has no prime door at all: its segment rate is
+      // plain text (no link), and the prime modal stays shut.
       r = await req('POST', '/api/properties', {
         address: '456 Fixed Test Court, Victoria, BC',
         mortgage_balance: 500000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
@@ -2556,13 +2610,16 @@ try {
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
       const fixedPrimeUi = await page.evaluate(() => ({
-        wrapHidden: document.querySelector('#primeChartWrap').classList.contains('hidden'),
+        links: document.querySelectorAll('#termsWrap [data-prime-link]').length,
+        bannerGone: !document.querySelector('#primeBanner') && !document.querySelector('#primeChartWrap'),
+        modalOpen: !document.querySelector('#primeModal').classList.contains('hidden'),
         hasChart: !!window.__fmCharts.prime,
-        changes: document.querySelector('#primeChanges').textContent,
+        modalText: document.querySelector('#mortgageModal').textContent,
       }));
-      check('fixed plan: no prime chart in the modal, the banner keeps its "Recent:" text',
-        fixedPrimeUi.wrapHidden && !fixedPrimeUi.hasChart && fixedPrimeUi.changes.includes('Recent:'),
-        JSON.stringify(fixedPrimeUi));
+      check('fixed plan: no prime link on the segment, no prime banner, the prime modal stays shut',
+        fixedPrimeUi.links === 0 && fixedPrimeUi.bannerGone && !fixedPrimeUi.modalOpen
+          && !fixedPrimeUi.hasChart && !fixedPrimeUi.modalText.includes('Bank of Canada prime:'),
+        JSON.stringify({ links: fixedPrimeUi.links, bannerGone: fixedPrimeUi.bannerGone, modalOpen: fixedPrimeUi.modalOpen }));
       await req('DELETE', `/api/properties/${fixedPid}`);
 
       // ---- Terms UI: build a renewal through the accordion ----
