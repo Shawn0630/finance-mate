@@ -397,7 +397,7 @@ async function loadAssets(force = false) {
       <div class="body">
         <div class="addr">${esc(p.address)}</div>
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
-        <div class="kv"><span class="k">Outstanding principal</span><span>${money(p.mortgage_balance)}</span></div>
+        <div class="kv"><span class="k">Outstanding principal</span><span>${money(p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
         ${p.owners && p.owners.length ? `<div class="kv"><span class="k">Owners</span><span>${ownerChipsHtml(p.owners)}</span></div>` : ''}
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
@@ -1088,8 +1088,13 @@ function renderMortgageMeta() {
   const cur = terms.find((t) => t.id === p.currentTermId) || null;
   $('#metaOpeningPrincipal').textContent =
     first && first.opening_balance != null ? money(first.opening_balance) : '—';
+  // Current Principal is what is still owed TODAY — the
+  // projection's balance at the current month, served as
+  // remainingBalance — not the anchor the loan started from.
+  // The anchor is only the fallback for an unprojectable mortgage.
   $('#metaCurrentPrincipal').textContent =
-    p.mortgage_balance != null ? money(p.mortgage_balance) : '—';
+    p.remainingBalance != null ? money(p.remainingBalance)
+      : (p.mortgage_balance != null ? money(p.mortgage_balance) : '—');
   $('#metaCurrentPayment').textContent =
     chartMeta && chartMeta.paymentUsed != null ? money(chartMeta.paymentUsed) : '—';
   // Each term card also shows its own calculated monthly payment

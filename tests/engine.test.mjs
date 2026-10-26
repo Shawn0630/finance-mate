@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeStepMonths } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -721,4 +721,71 @@ test('buildSchedule in-term anchor: the balance resets at the anchor month, the 
   assert.ok(close(jan.balance, 89789.55, 0.02), jan.balance);
   assert.ok(anchored.payoffMonth < plain.payoffMonth, 'the smaller balance pays off sooner');
   assert.ok(anchored.totalInterest < plain.totalInterest);
+});
+
+test('remainingBalanceAt: mid-plan reads the last row at or before the current month', () => {
+  const series = [
+    { month: '2025-01', balance: 990000 },
+    { month: '2025-02', balance: 980000 },
+    { month: '2025-03', balance: 970000 },
+  ];
+  assert.deepEqual(remainingBalanceAt(series, '2025-02', 1000000), { balance: 980000, month: '2025-02' });
+  // Past the last row without a payoff (horizon cap): the final
+  // projected balance holds flat.
+  assert.deepEqual(remainingBalanceAt(series, '2026-01', 1000000), { balance: 970000, month: '2025-03' });
+});
+
+test('remainingBalanceAt: a plan that has not started falls back to the anchor', () => {
+  const series = [{ month: '2027-01', balance: 999000 }];
+  assert.deepEqual(remainingBalanceAt(series, '2026-10', 1000000), { balance: 1000000, month: null });
+});
+
+test('remainingBalanceAt: no plan (empty or missing series) falls back to the anchor', () => {
+  assert.deepEqual(remainingBalanceAt([], '2026-10', 1000000), { balance: 1000000, month: null });
+  assert.deepEqual(remainingBalanceAt(null, '2026-10', 1000000), { balance: 1000000, month: null });
+});
+
+test('remainingBalanceAt: a paid-off loan reads 0 at and after the payoff month', () => {
+  const series = [
+    { month: '2025-01', balance: 5000 },
+    { month: '2025-02', balance: 0 },
+  ];
+  assert.deepEqual(remainingBalanceAt(series, '2025-02', 1000000, '2025-02'), { balance: 0, month: '2025-02' });
+  assert.deepEqual(remainingBalanceAt(series, '2025-09', 1000000, '2025-02'), { balance: 0, month: '2025-02' });
+  // The payoff recorded with no final row still clears the balance.
+  assert.deepEqual(remainingBalanceAt([], '2025-09', 1000000, '2025-02'), { balance: 0, month: '2025-02' });
+  // A payoff still in the future changes nothing.
+  assert.deepEqual(remainingBalanceAt(series, '2025-01', 1000000, '2025-02'), { balance: 5000, month: '2025-01' });
+});
+
+test('remainingBalanceAt: the user shape reproduces his Oct 2026 remaining balance', () => {
+  // His real mortgage, priced off the actual BoC prime change
+  // points: $1,350,000 at 2024-12-17, Prime - 1.00, 25-year
+  // amortization, the payment derived once at signing (prime
+  // 5.45 -> 4.45% -> $7,434.41) and never recast. His app's Total
+  // row for Jan 2025 - Oct 2026 (22 months) shows $75,116 of
+  // principal paid, i.e. $1,274,884 still owed at Oct 2026 — the
+  // figure Current Principal must show, not $1,350,000.
+  const primeHistory = [
+    { date: '2024-06-12', rate: 6.95 }, { date: '2024-07-31', rate: 6.70 },
+    { date: '2024-09-11', rate: 6.45 }, { date: '2024-10-30', rate: 5.95 },
+    { date: '2024-12-18', rate: 5.45 }, { date: '2025-02-05', rate: 5.20 },
+    { date: '2025-03-19', rate: 4.95 }, { date: '2025-09-24', rate: 4.70 },
+    { date: '2025-11-05', rate: 4.45 },
+  ];
+  const r = buildSchedule({
+    balance: 1350000, balanceDate: '2024-12-17',
+    terms: [{ id: 1, start_date: '2024-12-17', amortization_years: 25 }],
+    segments: [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }],
+    primeRate: 4.45, primeHistory,
+  });
+  assert.equal(r.state, 'projected');
+  assert.ok(close(r.paymentUsed, 7434.41, 0.02), r.paymentUsed);
+  const rem = remainingBalanceAt(r.series, '2026-10', 1350000, r.payoffMonth);
+  assert.equal(rem.month, '2026-10');
+  assert.ok(close(rem.balance, 1274884, 0.5), rem.balance); // 1,274,883.56 before display rounding
+  // One month earlier exactly one more payment of principal is owed.
+  const sep = remainingBalanceAt(r.series, '2026-09', 1350000, r.payoffMonth);
+  const octRow = r.series.find((x) => x.month === '2026-10');
+  assert.ok(close(sep.balance - rem.balance, octRow.principal, 0.02));
 });

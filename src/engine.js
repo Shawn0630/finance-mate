@@ -732,3 +732,31 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
     negativeAmortization, paymentUsed,
   };
 }
+
+// The remaining balance TODAY, read off a projection: the balance
+// of the last series row at or before `currentMonth` ('YYYY-MM').
+// This is the figure "Current Principal" must show — what is still
+// owed now — not the anchor balance the loan started from. Falls
+// back to the anchor balance itself when no row qualifies (the
+// plan has not started yet: nothing has been paid down) and to 0
+// once the payoff month has passed. `month` names the series month
+// the value was taken from (the payoff month for a cleared loan),
+// or null when the value is the anchor fallback. A projection that
+// ran into the horizon cap without paying off holds its final
+// balance flat past its last row, matching the portfolio's
+// convention for the same rows.
+export function remainingBalanceAt(series, currentMonth, anchorBalance, payoffMonth = null) {
+  let balance = anchorBalance;
+  let month = null;
+  for (const row of series || []) {
+    if (row && row.month && row.month <= currentMonth) {
+      balance = row.balance;
+      month = row.month;
+    }
+  }
+  if (payoffMonth && payoffMonth <= currentMonth && (month === null || payoffMonth >= month)) {
+    balance = 0;
+    month = payoffMonth;
+  }
+  return { balance, month };
+}

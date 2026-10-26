@@ -7,9 +7,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
-import { buildSchedule, segmentForMonth, segmentAnnualRate, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
+import { buildSchedule, segmentForMonth, segmentAnnualRate, remainingBalanceAt, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { getRegion, REGION_CODES } from './regions/index.js';
-import { getCurrentPrime, getPrimeHistory, ensureFreshPrime, refreshPrime, primeInfo, primeStatus } from './prime.js';
+import { getCurrentPrime, getPrimeHistory, ensureFreshPrime, refreshPrime, primeInfo, primeStatus, vancouverToday } from './prime.js';
 import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
@@ -450,6 +450,12 @@ function propertyView(p) {
   const terms = termsOf(p.id);
   const lumpSums = lumpSumsOf(p.id);
   const curTerm = currentTermOf(p, terms);
+  // What is still owed TODAY (the projection's balance at the
+  // current month), as opposed to mortgage_balance — the anchor
+  // the loan was last reconciled at, which falls ever further
+  // behind as payments land. Falls back to the anchor when the
+  // mortgage cannot project (see remainingBalanceFor).
+  const remaining = remainingBalanceFor(p);
   return {
     ...p,
     // The lender and remaining amortization are term facts now;
@@ -470,6 +476,8 @@ function propertyView(p) {
     segments,
     terms: terms.map((t) => termView(t, segments, lumpSums)),
     lumpSums,
+    remainingBalance: remaining.balance,
+    remainingBalanceMonth: remaining.month,
     currentTermId: curTerm ? curTerm.id : null,
     currentRate: cur ? {
       rate_type: cur.rate_type, annual_rate: cur.effective_rate,
@@ -613,6 +621,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
 
   const prime = getCurrentPrime();
   const primeRate = prime ? prime.rate : null;
+  const currentMonth = currentMonthKey();
   const perProperty = [];
   const monthMaps = new Map(); // property id -> Map('YYYY-MM' -> balance)
   const assessedPoints = new Map(); // property id -> [{ year, value }] sorted
@@ -628,6 +637,11 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     // the property projects. Only meaningful with a balance.
     let monthlyPayment = null;
     let projectedInterest = null;
+    // Outstanding means what is still owed TODAY — the
+    // projection's balance at the current month (the detail
+    // page's remainingBalance, same figure) — once the property
+    // projects; until then the recorded anchor balance stands.
+    let outstandingNow = balance;
     if (balance > 0 && segments.length) withPlan++;
     // Prime-spread segments with no prime on record cannot project.
     const primeBlocked = primeRate === null
@@ -642,6 +656,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       if (r.state === 'projected') {
         monthlyPayment = r.paymentUsed;
         projectedInterest = r.totalInterest;
+        outstandingNow = remainingBalanceAt(r.series, currentMonth, balance, r.payoffMonth).balance;
         interestFrom++;
         const map = new Map();
         for (const row of r.series) map.set(row.month, { balance: row.balance, last: row.month === r.series[r.series.length - 1].month });
@@ -678,7 +693,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       id: p.id,
       label: p.address,
       shortLabel: String(p.address).split(',')[0],
-      outstanding: balance,
+      outstanding: outstandingNow,
       monthlyPayment: monthlyPayment > 0 ? monthlyPayment : 0,
       paymentKnown: monthlyPayment > 0,
       hasPlan: segments.length > 0,
@@ -1275,10 +1290,11 @@ function cleanTerm(c) {
   return { value: next };
 }
 
-// The projected balance at the end of a month ('YYYY-MM'), from the
-// property's own schedule; null when the mortgage cannot project
-// that far (no plan / no payment / past the horizon).
-function projectedBalanceAtMonth(p, monthKey) {
+// The property's full projection (the engine's buildSchedule
+// result), or null when the mortgage cannot project: no balance,
+// no rate plan, a state other than 'projected' (no payment / no
+// prime), so callers fall back instead of inventing numbers.
+function projectionFor(p) {
   const segments = segmentsOf(p.id);
   if (!segments.length || !(p.mortgage_balance > 0)) return null;
   const prime = getCurrentPrime();
@@ -1289,7 +1305,36 @@ function projectedBalanceAtMonth(p, monthKey) {
     paymentDay, frequency,
     primeRate: prime ? prime.rate : null, primeHistory: getPrimeHistory(), region: p.region || 'CA',
   });
-  if (r.state !== 'projected') return null;
+  return r.state === 'projected' ? r : null;
+}
+
+// The current month ('YYYY-MM') on the household's calendar
+// (America/Vancouver) — the month "today" means for balances.
+function currentMonthKey() {
+  return vancouverToday().slice(0, 7);
+}
+
+// The balance still owed TODAY: the projection's balance at the
+// current month (see remainingBalanceAt in the engine). This is
+// the one "current debt" figure every surface shows — the modal's
+// Current Principal, the equity readout and the portfolio's
+// outstanding — while mortgage_balance stays the recorded anchor.
+// When the mortgage cannot project, the anchor is the fallback:
+// it is the last balance actually recorded, never 0 or blank.
+function remainingBalanceFor(p) {
+  const anchor = p.mortgage_balance ?? null;
+  if (!(p.mortgage_balance > 0)) return { balance: anchor, month: null };
+  const r = projectionFor(p);
+  if (!r) return { balance: anchor, month: null };
+  return remainingBalanceAt(r.series, currentMonthKey(), anchor, r.payoffMonth);
+}
+
+// The projected balance at the end of a month ('YYYY-MM'), from the
+// property's own schedule; null when the mortgage cannot project
+// that far (no plan / no payment / past the horizon).
+function projectedBalanceAtMonth(p, monthKey) {
+  const r = projectionFor(p);
+  if (!r) return null;
   const row = r.series.find((x) => x.month === monthKey);
   if (row) return row.balance;
   if (r.payoffMonth && r.payoffMonth <= monthKey) return 0;
@@ -1612,10 +1657,16 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
     return res.json({ ok: false, code: 'NO_PRIME', error: 'a variable segment is priced off the prime rate, but no prime rate is available yet', segments });
   }
   const payment = r.paymentUsed;
+  // What is still owed today, off this same projection (the
+  // modal's Current Principal and the equity readout use the
+  // matching server-side figure, so all three agree by construction).
+  const remaining = remainingBalanceAt(r.series, currentMonthKey(), p.mortgage_balance, r.payoffMonth);
   res.json({
     ok: true,
     balance: p.mortgage_balance,
     balanceDate,
+    remainingBalance: remaining.balance,
+    remainingBalanceMonth: remaining.month,
     paymentUsed: payment,
     primeRate,
     primeAssumption: primeRate !== null
@@ -1635,20 +1686,26 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
 
 // Equity snapshot for the detail page: the latest assessed value (the
 // newest value-history point when there is one, else the value stored on
-// the property) minus the current outstanding principal. Either side may be
+// the property) minus the balance still owed TODAY (the projection's
+// balance at the current month — the same remainingBalance the modal's
+// Current Principal shows; the recorded anchor is only the fallback
+// when the mortgage cannot project). Either side may be
 // missing; the missing side comes back null and equity is null.
-app.get('/api/properties/:id/equity', requireApiAuth, (req, res) => {
+app.get('/api/properties/:id/equity', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
+  await ensureFreshPrime(); // the remaining balance prices off the prime history
   const points = historyPoints(p.id);
   const latest = points.length ? points[points.length - 1] : null;
   const assessed = latest ? latest.value : (p.assessed_value ?? null);
   const assessedYear = latest ? latest.year : (p.assessed_year ?? null);
-  const balance = p.mortgage_balance ?? null;
+  const remaining = remainingBalanceFor(p);
+  const balance = remaining.balance;
   res.json({
     assessedValue: assessed,
     assessedYear,
     balance,
+    remainingBalanceMonth: remaining.month,
     equity: assessed !== null && balance !== null ? assessed - balance : null,
   });
 });
@@ -1712,7 +1769,10 @@ app.delete('/api/assets/:id', requireApiAuth, (req, res) => {
 app.get('/api/summary', requireApiAuth, (req, res) => {
   const props = db.prepare('SELECT * FROM properties').all();
   const propertyValue = props.reduce((s, p) => s + (p.assessed_value || 0), 0);
-  const mortgageBalance = props.reduce((s, p) => s + (p.mortgage_balance || 0), 0);
+  // The mortgage total is what is still owed TODAY (each
+  // property's remaining balance, anchor as the fallback) — the
+  // same figure the portfolio and the detail page report.
+  const mortgageBalance = props.reduce((s, p) => s + (remainingBalanceFor(p).balance || 0), 0);
   const otherAssets = db.prepare('SELECT COALESCE(SUM(value), 0) AS s FROM other_assets').get().s;
   res.json({
     propertyValue,

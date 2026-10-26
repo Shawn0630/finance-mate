@@ -2463,6 +2463,82 @@ try {
         JSON.stringify(noEntry));
       await req('DELETE', `/api/properties/${amortPid}`);
 
+      // ---- Current Principal is TODAY's remaining balance ----
+      // His exact shape (1,350,000 at 2024-12-17, Prime - 1, 25y):
+      // the anchor is nearly two years stale, so the detail
+      // payload, the modal's Current Principal and the equity
+      // readout must all show the projection's balance at the
+      // CURRENT month instead. The expected figure is taken
+      // dynamically from the returned series (the last row at or
+      // before this month, on the Vancouver calendar) — no
+      // hard-coded date or dollar value.
+      r = await req('POST', '/api/properties', {
+        address: '77 Remaining Balance Road, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17',
+      });
+      const remPid = r.data.id;
+      await req('PUT', `/api/properties/${remPid}`, { amortization_years: 25 });
+      await req('POST', `/api/properties/${remPid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+      });
+      for (const [year, value] of [[2022, 1730000], [2023, 1903000], [2024, 1955000], [2025, 2002000], [2026, 1931000]]) {
+        await req('POST', `/api/properties/${remPid}/value-history`, { year, value });
+      }
+      const remAmort = (await req('GET', `/api/properties/${remPid}/amortization`)).data;
+      const vanToday = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date());
+      const curMonth = vanToday.slice(0, 7);
+      const rowsToNow = (remAmort.series || []).filter((x) => x.month <= curMonth);
+      const lastRow = rowsToNow[rowsToNow.length - 1];
+      check('remaining-balance fixture projects with rows up to the current month',
+        remAmort.ok === true && !!lastRow && rowsToNow.length >= 12,
+        JSON.stringify({ ok: remAmort.ok, curMonth, rows: rowsToNow.length }));
+      check('projection payload: remainingBalance is the series balance at the current month (below the stale anchor)',
+        remAmort.remainingBalance === (lastRow && lastRow.balance)
+          && remAmort.remainingBalanceMonth === (lastRow && lastRow.month)
+          && remAmort.remainingBalance < 1350000 && remAmort.remainingBalance > 0,
+        JSON.stringify({ rem: remAmort.remainingBalance, row: lastRow && lastRow.balance, month: remAmort.remainingBalanceMonth }));
+      const remDetail = (await req('GET', `/api/properties/${remPid}`)).data;
+      check('detail payload carries the same remainingBalance',
+        remDetail.remainingBalance === remAmort.remainingBalance
+          && remDetail.remainingBalanceMonth === remAmort.remainingBalanceMonth,
+        JSON.stringify({ rem: remDetail.remainingBalance, month: remDetail.remainingBalanceMonth }));
+      const remEquity = (await req('GET', `/api/properties/${remPid}/equity`)).data;
+      check('equity subtracts the remaining balance, not the anchor (1,931,000 - remaining)',
+        remEquity.balance === remAmort.remainingBalance
+          && Math.abs(remEquity.equity - (1931000 - remAmort.remainingBalance)) < 0.02,
+        JSON.stringify(remEquity));
+      const remPort = (await req('GET', '/api/properties/portfolio')).data;
+      const remRow = remPort.properties.find((x) => x.id === remPid);
+      check('portfolio outstanding for the property is the same remaining balance',
+        !!remRow && Math.abs(remRow.outstanding - remAmort.remainingBalance) < 0.02,
+        JSON.stringify(remRow && remRow.outstanding));
+      // Browser: the modal cell and the equity line show that figure.
+      // (Detour via the properties section first: the deleted
+      // amortPid's id is reused by this fixture, so the hash may
+      // already read #property/<same id> and a direct jump would
+      // fire no hashchange at all.)
+      const groupNum = (n) => Number(n).toLocaleString('en-CA', { maximumFractionDigits: 0 });
+      await page.evaluate(() => { location.hash = '#assets/properties'; });
+      await wait(800);
+      await page.goto(`http://ff.local/#property/${remPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
+      const remMeta = await page.evaluate(() => document.querySelector('#metaCurrentPrincipal').textContent);
+      check('modal Current Principal shows today\u2019s remaining balance, not the 1,350,000 anchor',
+        remMeta.includes(groupNum(remAmort.remainingBalance)) && !remMeta.includes('1,350,000'),
+        String(remMeta));
+      const remEqText = await page.evaluate(() => document.querySelector('#equitySummary').textContent);
+      check('detail equity line is the assessed value minus the remaining balance',
+        remEqText.includes(`Current equity: $${groupNum(1931000 - remAmort.remainingBalance)}`)
+          && remEqText.includes(`outstanding principal $${groupNum(remAmort.remainingBalance)}`),
+        remEqText);
+      await page.evaluate(() => document.querySelector('#mortgageModal [data-close-modal]').click());
+      await wait(300);
+      await req('DELETE', `/api/properties/${remPid}`);
+
       // A fixed plan in effect draws NO prime chart — the banner
       // keeps its text form with the recent change points.
       r = await req('POST', '/api/properties', {
