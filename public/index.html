@@ -144,7 +144,6 @@
               <div><label>Assessment year</label><input name="assessed_year" type="number" step="1"></div>
               <div><label>Purchase date</label><input name="purchase_date" type="date"></div>
             </div>
-            <div class="note" id="assessmentMeta" style="margin-left:0"></div>
             <div class="toolbar">
               <button class="primary" type="submit">Save</button>
               <button type="button" id="cancelPropEditBtn">Cancel</button>
@@ -317,13 +316,12 @@
 <div class="modal-overlay hidden" id="historyModal">
   <div class="modal-card wide">
     <div class="modal-head"><h3>Assessment History</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="chart-wrap history-pop"><canvas id="historyChart"></canvas></div>
     <div class="msg" id="historyMsg"></div>
     <div class="toolbar">
       <button type="button" id="fetchBcaBtn">Fetch from BC Assessment</button>
       <button type="button" id="pullHistoryBtn">Pull history from HouseSigma</button>
     </div>
-    <div class="note" id="assessmentMetaView" style="margin-left:0"></div>
-    <div class="note" id="hsPullNote" style="margin-left:0"></div>
     <div class="msg" id="trendMsg"></div>
       <table>
         <thead><tr><th>Year</th><th class="num">Assessed value</th><th>Source</th><th>Notes</th><th></th></tr></thead>

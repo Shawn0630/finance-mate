@@ -182,6 +182,7 @@ function openModal(id) {
 function closeModalEl(overlay) {
   overlay.classList.add('hidden');
   if (overlay && overlay.id === 'primeModal') destroyPrimeChart();
+  if (overlay && overlay.id === 'historyModal') destroyHistoryChart();
 }
 document.querySelectorAll('[data-close-modal]').forEach((b) =>
   b.addEventListener('click', () => closeModalEl(b.closest('.modal-overlay'))));
@@ -836,7 +837,7 @@ let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
 // Test/debug hook: lets the screenshot script read the live chart configs.
-window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null });
+window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null });
 
 // ------------------------------------------------------------ photos ---
 // The detail page's gallery: a carousel over the property's photos
@@ -979,7 +980,7 @@ function setPropEditing(on) {
 
 // The projection section's two edit surfaces open as modals.
 $('#openMortgageBtn').addEventListener('click', () => openModal('mortgageModal'));
-$('#openHistoryBtn').addEventListener('click', () => openModal('historyModal'));
+$('#openHistoryBtn').addEventListener('click', () => { openModal('historyModal'); renderHistoryChart(); });
 
 $('#editPropBtn').addEventListener('click', () => {
   if (!detailProperty) return;
@@ -1001,29 +1002,9 @@ async function loadPropertyDetail(id) {
   fillPropForm(p);
   setPropEditing(false);
 
-  // The Source line reads the same in the read-only view and in the
-  // edit form (the manual-marking note applies once you are editing).
-  let metaText =
-    p.assessed_source === 'auto'
-      ? `Source: BC Assessment (auto-fetched${p.assessed_fetched_at ? ' ' + new Date(p.assessed_fetched_at).toLocaleString('en-CA') : ''}${p.bca_matched_address ? ', matched "' + p.bca_matched_address + '"' : ''}${p.land_value != null ? `, land ${money(p.land_value)} + building ${money(p.building_value)}` : ''}). Editing the value marks it as manual.`
-      : p.assessed_source === 'manual'
-        ? 'Source: entered manually. Use "Fetch from BC Assessment" to replace it with the official assessed value.'
-        : 'No assessed value yet.';
-  // A failed auto-refresh leaves the stored value in place; say so
-  // quietly next to it rather than letting it look current.
-  if (p.assessmentRefresh && p.assessmentRefresh.stale) {
-    metaText += ` The latest automatic check against BC Assessment failed (${p.assessmentRefresh.error || 'unknown error'}) — showing the last known value.`;
-  }
-  $('#assessmentMeta').textContent = metaText;
-  $('#assessmentMetaView').textContent = metaText;
-  const hsNote = $('#hsPullNote');
-  if (hsNote) {
-    hsNote.textContent = p.houseSigma && p.houseSigma.attempted
-      ? (p.houseSigma.ok
-        ? `HouseSigma history: ${p.houseSigma.message || 'pulled'} (last checked ${new Date(p.houseSigma.at).toLocaleString('en-CA')}).`
-        : `HouseSigma history: the last pull failed — ${p.houseSigma.message || 'unknown error'}`)
-      : '';
-  }
+  // No source/status prose anywhere: where a value came from is
+  // visible in the Assessment History chart and table (each point
+  // carries its source), and fetch/pull outcomes show there too.
   chartMeta = null; // the previous property's projection must not leak into this page's summary
   amortError = null;
   renderTerms(p);
@@ -1756,6 +1737,9 @@ function regionTagHtml(region) {
     : `<span class="region-tag" title="${esc(code)}">${esc(code)}</span>`;
 }
 
+// Fetch / pull report nothing on success — the new point lands in
+// the chart and the table, which is the report. A failure is a
+// short error line (functional status), nothing more.
 $('#fetchBcaBtn').addEventListener('click', async () => {
   const msg = $('#historyMsg');
   showMsg(msg, 'ok', 'Fetching from BC Assessment…');
@@ -1763,10 +1747,10 @@ $('#fetchBcaBtn').addEventListener('click', async () => {
     const r = await api(`/api/properties/${currentPropertyId}/fetch-bca`, { method: 'POST' });
     if (r.ok) {
       markAssetsDirty();
-      showMsg(msg, 'ok', `Fetched: assessed value ${money(r.result.assessedValue)} (${r.result.assessedYear || 'current'}), matched "${r.result.matchedAddress}".`);
+      showMsg(msg, 'ok', '');
       loadPropertyDetail(currentPropertyId);
     } else {
-      showMsg(msg, 'err', `BC Assessment fetch failed (${r.error}). Your saved values were not changed — you can enter the value manually.`);
+      showMsg(msg, 'err', `BC Assessment fetch failed (${r.error}).`);
     }
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
@@ -1778,13 +1762,11 @@ $('#pullHistoryBtn').addEventListener('click', async () => {
     const r = await api(`/api/properties/${currentPropertyId}/pull-history`, { method: 'POST' });
     if (r.ok) {
       markAssetsDirty();
-      showMsg(msg, 'ok', r.added.length
-        ? `Pulled from HouseSigma: added ${r.added.join(', ')} (${r.years.length} years on record there).`
-        : 'HouseSigma history is already up to date — no new years to add.');
+      showMsg(msg, 'ok', '');
       loadPropertyDetail(currentPropertyId);
       loadTrend(currentPropertyId);
     } else {
-      showMsg(msg, 'err', `HouseSigma pull failed (${r.error}). Your saved points were not changed.`);
+      showMsg(msg, 'err', `HouseSigma pull failed (${r.error}).`);
     }
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
@@ -1825,9 +1807,95 @@ async function loadTrend(id) {
       <button class="small danger" onclick="deleteTrendPoint(${pt.id})">Delete</button>
     </td></tr>`).join('');
   $('#trendRows').innerHTML = rows || '<tr><td colspan="5" class="note" style="margin:0">No history points yet.</td></tr>';
+  renderHistoryChart();
   renderTrendSummary();
   renderDetailCharts();
   loadEquity(id); // a changed latest point moves the equity readout too
+}
+
+// ---- Assessed history chart (the Assessment History modal) ----
+// The modal's top is the history itself as bars: one bar per
+// recorded year, oldest first, the amount written on top of each
+// bar. The tooltip names the point's source — and its land /
+// building split when the point carries one. Built only while
+// the modal is open (a canvas sized against a hidden layout would
+// come out wrong), redrawn whenever the points change under it
+// (fetch / pull / add / edit / delete all funnel through
+// loadTrend), and destroyed on close.
+let historyChart = null;
+
+function destroyHistoryChart() {
+  if (historyChart) { historyChart.destroy(); historyChart = null; }
+  window.__fmCharts.history = null;
+}
+
+const TREND_SOURCE_LABELS = { auto: 'BC Assessment', housesigma: 'HouseSigma', manual: 'Manual' };
+
+// The amount on top of each bar, in the site's assessed green.
+const historyBarLabelPlugin = {
+  id: 'historyBarLabels',
+  afterDatasetsDraw(chart) {
+    const meta = chart.getDatasetMeta(0);
+    if (!meta || !meta.data) return;
+    const c = chart.ctx;
+    c.save();
+    c.font = '700 11px system-ui, sans-serif';
+    c.fillStyle = '#20573a';
+    c.textAlign = 'center';
+    meta.data.forEach((bar, i) => {
+      c.fillText(money(chart.data.datasets[0].data[i]), bar.x, bar.y - 4);
+    });
+    c.restore();
+  },
+};
+
+function renderHistoryChart() {
+  const modal = $('#historyModal');
+  if (!modal || modal.classList.contains('hidden')) return;
+  if (!trendPoints.length) { destroyHistoryChart(); return; }
+  const pts = [...trendPoints].sort((a, b) => a.year - b.year);
+  destroyHistoryChart();
+  historyChart = new Chart($('#historyChart'), {
+    type: 'bar',
+    data: {
+      labels: pts.map((pt) => String(pt.year)),
+      datasets: [{
+        label: 'Assessed value',
+        data: pts.map((pt) => pt.value),
+        pointMeta: pts,
+        backgroundColor: 'rgba(46, 125, 79, 0.75)',
+        borderColor: '#2e7d4f',
+        borderWidth: 1,
+        maxBarThickness: 90,
+      }],
+    },
+    plugins: [historyBarLabelPlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      layout: { padding: { top: 16 } }, // headroom for the bar-top amounts
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => `Assessed value — ${items[0].label}`,
+            label: (item) => {
+              const pt = item.dataset.pointMeta[item.dataIndex];
+              const lines = [` ${money(item.parsed.y)}`, ` Source: ${TREND_SOURCE_LABELS[pt.source] || pt.source}`];
+              if (pt.land_value != null && pt.building_value != null) {
+                lines.push(` Land ${money(pt.land_value)} + building ${money(pt.building_value)}`);
+              }
+              return lines;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false } },
+        y: { beginAtZero: true, ticks: { callback: (v) => moneyTick(v) } },
+      },
+    },
+  });
+  window.__fmCharts.history = historyChart;
 }
 
 // Trend summary: a single change figure computed over the SAME

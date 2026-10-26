@@ -3073,8 +3073,35 @@ try {
         JSON.stringify(detailsBits));
       await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
       await wait(400);
-      const srcLine = await page.evaluate(() => document.querySelector('#assessmentMetaView').textContent);
-      check('the Assessment History modal carries the BCA source line', srcLine.trim().length > 0, srcLine);
+      // The modal opens on the assessed-history bar chart; the old
+      // BCA source line and HouseSigma status line are gone (the
+      // elements themselves no longer exist).
+      const histBits = await page.evaluate(() => {
+        const modal = document.querySelector('#historyModal');
+        const c = window.__fmCharts.history;
+        const canvas = modal.querySelector('#historyChart');
+        const rect = canvas ? canvas.getBoundingClientRect() : { width: 0, height: 0 };
+        return {
+          text: modal.textContent,
+          metaGone: !document.querySelector('#assessmentMetaView') && !document.querySelector('#hsPullNote')
+            && !document.querySelector('#assessmentMeta'),
+          labels: c ? c.data.labels : null,
+          values: c ? c.data.datasets[0].data : null,
+          sources: c ? c.data.datasets[0].pointMeta.map((p) => p.source) : null,
+          canvasW: rect.width, canvasH: rect.height,
+        };
+      });
+      check('the Assessment History modal carries no BCA source line and no HouseSigma status line',
+        !histBits.text.includes('Source: BC Assessment') && !histBits.text.includes('HouseSigma history:')
+          && histBits.metaGone,
+        histBits.text.slice(0, 200));
+      check('the Assessment History modal tops out with the history bar chart (one bar per point, ascending years)',
+        !!histBits.values && histBits.values.length === vhNow.points.length
+          && histBits.values.every((v, i) => v === vhNow.points[i].value)
+          && histBits.labels.every((l, i) => l === String(vhNow.points[i].year))
+          && histBits.sources.every((s, i) => s === vhNow.points[i].source)
+          && histBits.canvasW > 0 && histBits.canvasH >= 150,
+        JSON.stringify(histBits));
       await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
       await wait(300);
       // Edit -> change purchase date -> Save: back to read-only with
@@ -3267,6 +3294,161 @@ try {
   r = await req('POST', `/api/properties/${pidNone}/pull-history`);
   check('unknown address fails at the locate stage',
     r.data.ok === false && r.data.stage === 'locate', JSON.stringify(r.data));
+
+  // ---------------------------------------------------------------
+  // Assessment History modal in the browser: it opens on the
+  // assessed-history bar chart (no source/status prose anywhere),
+  // an in-modal HouseSigma pull grows the chart in place, and a BC
+  // Assessment outage still surfaces as a short error line.
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('history modal browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    // A Christina property: the background pull imports all five
+    // HouseSigma years; drop the 2023 point so the in-modal pull
+    // has a year to add back.
+    r = await req('POST', '/api/properties', {
+      address: '2985 Christina Pl, Coquitlam, BC', mortgage_balance: 1350000, purchase_date: '2024-12-17',
+    });
+    const pidHist = r.data.id;
+    let hist0 = null;
+    for (let i = 0; i < 40; i++) {
+      const h = await req('GET', `/api/properties/${pidHist}/value-history`);
+      if (h.data.points && h.data.points.length === 5) { hist0 = h.data; break; }
+      await new Promise((s) => setTimeout(s, 300));
+    }
+    check('history-modal fixture: background pull imported the 5 years', !!hist0,
+      JSON.stringify(hist0 ? hist0.points : []));
+    const pt2023 = hist0 && hist0.points.find((p) => p.year === 2023);
+    r = await req('DELETE', `/api/properties/${pidHist}/value-history/${pt2023.id}`);
+    check('history-modal fixture: 2023 point removed (4 points left)',
+      !!r.data.points && r.data.points.length === 4, JSON.stringify(r.data.points && r.data.points.length));
+
+    const forwardH = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResH = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueH = loginResH.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserH = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      const page = await browserH.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardH({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueH, domain: 'ff.local', path: '/', httpOnly: true });
+      const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+      const until = async (fn, tries = 48) => {
+        for (let i = 0; i < tries; i++) {
+          try { const v = await page.evaluate(fn); if (v) return v; } catch {}
+          await wait(250);
+        }
+        return null;
+      };
+
+      await page.goto(`http://ff.local/#property/${pidHist}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
+      await wait(600);
+      const before = await page.evaluate(() => {
+        const modal = document.querySelector('#historyModal');
+        const c = window.__fmCharts.history;
+        const canvas = modal.querySelector('#historyChart');
+        const rect = canvas ? canvas.getBoundingClientRect() : { width: 0, height: 0 };
+        return {
+          text: modal.textContent,
+          metaGone: !modal.querySelector('#assessmentMetaView') && !modal.querySelector('#hsPullNote'),
+          bars: c ? c.data.datasets[0].data.length : null,
+          labels: c ? c.data.labels : null,
+          canvasW: rect.width, canvasH: rect.height,
+          chartAboveButtons: canvas.getBoundingClientRect().top
+            < document.querySelector('#fetchBcaBtn').getBoundingClientRect().top,
+        };
+      });
+      check('history modal opens on the bar chart (4 bars, chart above the buttons, real size)',
+        before.bars === 4 && before.labels.join(',') === '2022,2024,2025,2026'
+          && before.chartAboveButtons && before.canvasW > 0 && before.canvasH >= 150,
+        JSON.stringify(before));
+      check('history modal carries no BCA source line and no HouseSigma status line',
+        !before.text.includes('Source: BC Assessment') && !before.text.includes('HouseSigma history:')
+          && before.metaGone,
+        before.text.slice(0, 200));
+
+      // Pull: the missing year comes back and the chart grows.
+      await page.evaluate(() => document.querySelector('#pullHistoryBtn').click());
+      const grown = await until(() => {
+        const c = window.__fmCharts.history;
+        return c && c.data.datasets[0].data.length === 5 ? true : null;
+      });
+      check('in-modal HouseSigma pull grows the chart to 5 bars', !!grown);
+      const after = await page.evaluate(() => {
+        const c = window.__fmCharts.history;
+        const i = c.data.labels.indexOf('2023');
+        const cb = c.options.plugins.tooltip.callbacks.label;
+        const tip = cb({
+          dataIndex: i, datasetIndex: 0, dataset: c.data.datasets[0],
+          parsed: { y: c.data.datasets[0].data[i] },
+        });
+        return {
+          value2023: c.data.datasets[0].data[i],
+          src2023: c.data.datasets[0].pointMeta[i].source,
+          tip: Array.isArray(tip) ? tip.join(' | ') : String(tip),
+          msg: document.querySelector('#historyMsg').textContent,
+        };
+      });
+      check('the pulled 2023 bar is a HouseSigma point in the chart data and its tooltip',
+        after.value2023 === 1903000 && after.src2023 === 'housesigma'
+          && after.tip.includes('HouseSigma') && after.tip.includes('1,903,000'),
+        JSON.stringify(after));
+      check('a successful pull writes no status sentence (the chart is the report)',
+        !after.msg.includes('Pulled from HouseSigma') && !after.msg.includes('up to date'),
+        after.msg);
+
+      // BCA outage: the Fetch button still reports a short error.
+      stubBcaDown = true;
+      await page.evaluate(() => document.querySelector('#fetchBcaBtn').click());
+      const errShown = await until(() =>
+        document.querySelector('#historyMsg').textContent.includes('BC Assessment fetch failed') ? true : null);
+      stubBcaDown = false;
+      check('BCA outage in the modal shows the short fetch error (functional status kept)', !!errShown);
+    } catch (err) {
+      check('history modal browser flow runs to completion', false, String((err && err.message) || err));
+    } finally {
+      await browserH.close();
+    }
+  }
 
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
