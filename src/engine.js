@@ -5,9 +5,11 @@
 // annual rate is nominal with semi-annual compounding, so the
 // equivalent monthly rate is
 //   i = (1 + r/2)^(1/6) - 1        (r = annual rate as a fraction)
-// Fixed and variable segments use the same formula; a variable rate
-// is projected at the value it resolves to (in reality it will
-// change).
+// Fixed and variable segments use the same formula. A variable
+// segment priced off prime resolves MONTH BY MONTH against the
+// tracked prime history (src/prime.js): each projected month pays
+// the prime in effect in that month, and only months beyond the
+// last stored observation hold at the latest known prime.
 import { getRegion } from './regions/index.js';
 
 export function monthlyRate(annualRatePct) {
@@ -110,6 +112,83 @@ export function segmentForMonth(segments, monthKey) {
   return chosen;
 }
 
+// ------------------------------------------------------------ prime history --
+// A resolver for the prime rate in effect in a month ('YYYY-MM').
+// primeHistory is the stored observation list [{ date, rate }]
+// (Bank of Canada Valet, weekly) in any order. A month prices at
+// the last observation dated on or before the month's END — the
+// weekly series posts each Wednesday, so the month-end reading is
+// the closest monthly truth. Months before the first observation
+// use the earliest stored one; months after the last use the
+// latest known rate (the one assumption a projection must make,
+// and the UI states it). Without a history, a scalar primeRate is
+// a constant resolver (the pre-history behaviour, kept for tests
+// and single-value callers). Null when neither is available.
+export function primeHistoryResolver(primeHistory, primeRate) {
+  if (Array.isArray(primeHistory)) {
+    const obs = primeHistory
+      .map((o) => ({ date: String(o && o.date), rate: Number(o && o.rate) }))
+      .filter((o) => /^\d{4}-\d{2}-\d{2}/.test(o.date) && isFinite(o.rate))
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    if (obs.length) {
+      const cache = new Map();
+      return (monthKey) => {
+        if (cache.has(monthKey)) return cache.get(monthKey);
+        const cutoff = `${monthKey}-31`;
+        let lo = 0;
+        let hi = obs.length - 1;
+        let found = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (obs[mid].date <= cutoff) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        const v = found >= 0 ? obs[found].rate : obs[0].rate;
+        cache.set(monthKey, v);
+        return v;
+      };
+    }
+  }
+  if (primeRate !== null && primeRate !== undefined && isFinite(Number(primeRate))) {
+    const v = Number(primeRate);
+    return () => v;
+  }
+  return null;
+}
+
+// Month keys whose priced prime differs from the previous month's —
+// the prime-CHANGE months. A step's first priced month is the month
+// of the observation that posts the new rate (see the resolver's
+// month-end rule). These months are payment-recalculation events
+// for prime-spread segments in buildSchedule.
+export function primeStepMonths(primeHistory) {
+  if (!Array.isArray(primeHistory) || primeHistory.length < 2) return [];
+  const obs = primeHistory
+    .map((o) => ({ date: String(o && o.date), rate: Number(o && o.rate) }))
+    .filter((o) => /^\d{4}-\d{2}-\d{2}/.test(o.date) && isFinite(o.rate))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  const steps = [];
+  for (let i = 1; i < obs.length; i++) {
+    if (obs[i].rate !== obs[i - 1].rate) steps.push(String(obs[i].date).slice(0, 7));
+  }
+  return [...new Set(steps)];
+}
+
+// The annual rate a segment carries in a given month, in %: like
+// segmentAnnualRate, but a prime-spread segment resolves against
+// the prime in effect in THAT month (via the resolver), not one
+// current snapshot. Null when a prime-spread segment has no prime
+// to resolve against.
+export function segmentRateForMonth(seg, monthKey, primeForMonth) {
+  if (!seg) return 0;
+  if (seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread') {
+    if (!primeForMonth) return null;
+    const prime = primeForMonth(monthKey);
+    if (prime === null || prime === undefined || !isFinite(Number(prime))) return null;
+    return Math.max(0, round2(Number(prime) + Number(seg.spread || 0)));
+  }
+  return Number(seg.annual_rate) || 0;
+}
+
 // Derive a monthly payment from a balance, an annual rate and a remaining
 // amortization in years:  P = B * i / (1 - (1 + i)^-n)
 export function derivePayment(balance, annualRatePct, years) {
@@ -137,9 +216,14 @@ export function derivePayment(balance, annualRatePct, years) {
 //                 steps reproduce the pre-frequency engine exactly:
 //                 the first projected month is the month after the
 //                 balance date, one period per month.
-//   primeRate:    the current prime rate in %; prime-spread segments
-//                 resolve against it (held constant over the whole
-//                 projection — prime is assumed not to move).
+//   primeRate:    a single prime rate in %; prime-spread segments
+//                 resolve against it in every month (constant —
+//                 the legacy path, kept for single-value callers).
+//   primeHistory: [{ date, rate }] prime observations; when given,
+//                 prime-spread segments resolve against the prime
+//                 in effect in each projected month instead (see
+//                 primeHistoryResolver), falling back to primeRate
+//                 only when the history is empty.
 //   region:       region code whose interest convention applies
 //                 (default 'CA', the only implementation).
 //   maxMonths:    hard cap (in months of projection) so a
@@ -149,7 +233,8 @@ export function derivePayment(balance, annualRatePct, years) {
 // where a row aggregates every period that fell in that month: interest
 // and payment are the month's totals, balance is the balance after the
 // month's last period, and date is that last period's date.
-export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, region = 'CA' }) {
+export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
+  const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
   const f = FREQUENCIES[frequency] || FREQUENCIES.monthly;
   const perPeriod = periodPaymentFor(payment, FREQUENCIES[frequency] ? frequency : 'monthly');
   const series = [];
@@ -167,7 +252,7 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
   // display date is `dateStr`, folding it into the monthly output rows.
   function applyPeriod(monthKey, dateStr) {
     const seg = segmentForMonth(segments, monthKey);
-    const annualRate = segmentAnnualRate(seg, primeRate);
+    const annualRate = segmentRateForMonth(seg, monthKey, primeForMonth);
     if (annualRate === null) throw new Error('a prime-based segment cannot be projected without a prime rate');
     const i = periodicRate(annualRate, f.periodsPerYear, region);
     const interest = round2(bal * i);
@@ -275,13 +360,23 @@ function monthIdxOf(dateStr) {
 //     deducts from the balance FIRST (in its month, before that
 //     month's interest) and the unchanged payment then pays the
 //     loan off sooner, for less total interest — how Canadian
-//     lenders treat a prepayment.
+//     lenders treat a prepayment;
+//   - a PRIME CHANGE (a step in the tracked prime history) while a
+//     prime-spread segment governs: the payment is re-derived from
+//     the step month on, exactly like a rate change — the balance
+//     at that point, the new rate (that month's prime + spread) and
+//     the current trajectory's payoff month. This is the
+//     adjustable-rate replay: a variable payment tracks prime as
+//     it actually moved, month by month, instead of being priced
+//     at today's prime for the loan's whole life. Fixed and
+//     absolute segments never trigger it, and months beyond the
+//     last stored observation price at the latest known prime.
 // Between events the payment is constant, so the projection is a
 // chain of simulate() runs, one per inter-event span, carrying the
 // balance across. The entered monthly payment
 // (paymentOverride) is an override that rules only inside the term
 // containing the balance anchor; at a renewal the payment returns
-// to automatic. Prime is held constant, exactly as in simulate().
+// to automatic.
 //
 //   balance / balanceDate: the current-balance anchor (as simulate)
 //   terms:      [{ id, start_date, amortization_years }] any order
@@ -295,10 +390,11 @@ function monthIdxOf(dateStr) {
 // spread segment exists but no prime rate is known. paymentUsed is
 // the monthly payment in effect at the anchor; paymentSource is
 // 'entered' (the override) or 'derived' (auto-computed).
-export function buildSchedule({ balance, balanceDate, paymentOverride = null, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, region = 'CA' }) {
+export function buildSchedule({ balance, balanceDate, paymentOverride = null, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
   const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null, paymentSource: null };
+  const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
   if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread')
-    && (primeRate === null || primeRate === undefined || !isFinite(Number(primeRate)))) {
+    && !primeForMonth) {
     return { ...blocked, state: 'no_prime' };
   }
   const A = monthIdxOf(balanceDate);
@@ -337,12 +433,21 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // The monthly payment in effect for months after state point S,
   // computed from the balance at S against the active term's
   // REMAINING amortization — the anchor / term-start derivation.
+  // The rate is the segment's rate in the month the derivation is
+  // priced at: for a term starting in the anchor month that is the
+  // term's START month (a contract prices its first payment off the
+  // rate in effect when it starts); otherwise the first month the
+  // payment applies to (S + 1). For a prime-spread segment the prime
+  // is THAT month's prime from the tracked history, never today's.
   const computePayment = (S, balNow) => {
     const term = termAtMonth(S + 1);
     if (overrideAt(S)) {
       return { payment: round2(paymentOverride), source: 'entered' };
     }
-    const rate = segmentAnnualRate(segmentForMonth(segments, ymKeyOfIdx(S + 1)), primeRate);
+    const rateMonth = S === A && term && monthIdxOf(term.start_date) === A
+      ? ymKeyOfIdx(A)
+      : ymKeyOfIdx(S + 1);
+    const rate = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S + 1)), rateMonth, primeForMonth);
     if (rate === null) return { error: 'no_prime' };
     if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
@@ -362,14 +467,17 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // If the pre-change trajectory never pays off (negative
   // amortization, or beyond the projection cap), fall back to the
   // term's remaining amortization (computePayment).
+  // Also the recast for a PRIME CHANGE at S: the "new rate" is the
+  // governing segment priced at month S + 1's prime, the "previous
+  // rate" the same segment priced at month S's prime.
   const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
     if (overrideAt(S)) {
       return { payment: round2(paymentOverride), source: 'entered' };
     }
-    const newRate = segmentAnnualRate(segmentForMonth(segments, ymKeyOfIdx(S + 1)), primeRate);
+    const newRate = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S + 1)), ymKeyOfIdx(S + 1), primeForMonth);
     if (newRate === null) return { error: 'no_prime' };
     const prevSeg = segmentForMonth(segments, ymKeyOfIdx(S));
-    const prevRate = segmentAnnualRate(prevSeg, primeRate);
+    const prevRate = segmentRateForMonth(prevSeg, ymKeyOfIdx(S), primeForMonth);
     if (prevRate !== null && lastPayment > 0) {
       const hypo = simulate({
         balance: balNow, balanceDate: balanceDateAtS, payment: lastPayment,
@@ -382,6 +490,19 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       }
     }
     return computePayment(S, balNow);
+  };
+
+  // Does the boundary at S recast for a prime change? Only when the
+  // segment governing the months after S is priced off prime AND
+  // its effective rate actually moves between month S and S + 1
+  // (a step the spread floor could in principle mask). A fixed or
+  // absolute segment never recasts for prime.
+  const isPrimeRecast = (S) => {
+    const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
+    if (!seg || seg.rate_type !== 'variable' || seg.rate_mode !== 'prime_spread') return false;
+    const before = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S)), ymKeyOfIdx(S), primeForMonth);
+    const after = segmentRateForMonth(seg, ymKeyOfIdx(S + 1), primeForMonth);
+    return before !== null && after !== null && before !== after;
   };
 
   // Lump sums grouped by the state point they land on (the point
@@ -413,10 +534,19 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // a lump sum leaves it unchanged.
   const termStates = new Set();
   const segStates = new Set();
+  const primeStates = new Set();
   const eventStates = new Set();
   for (const t of sortedTerms) { const s = monthIdxOf(t.start_date) - 1; if (s > A) { termStates.add(s); eventStates.add(s); } }
   for (const sg of segments) { const s = monthIdxOf(sg.start_date) - 1; if (s > A) { segStates.add(s); eventStates.add(s); } }
   for (const s of lumpByState.keys()) eventStates.add(s);
+  // Prime steps (from the tracked history) are events too: a prime
+  // change recasts the payment of a prime-spread segment from the
+  // step month on. Steps at or before the anchor are already priced
+  // into the anchor derivation.
+  for (const mk of primeStepMonths(primeHistory)) {
+    const s = monthIdxOf(mk) - 1;
+    if (s > A) { primeStates.add(s); eventStates.add(s); }
+  }
   const boundaries = [...eventStates].sort((a, b) => a - b);
   boundaries.push(A + maxMonths);
 
@@ -455,6 +585,10 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     } else if (segStates.has(S)) {
       // A rate change inside the running schedule.
       cp = computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
+    } else if (primeStates.has(S) && isPrimeRecast(S)) {
+      // A prime change while a prime-spread segment governs: an
+      // adjustable-rate recast, same rule as a rate change.
+      cp = computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
     } else {
       // A lump-sum-only boundary: the balance was already reduced
       // below; the payment carries over unchanged and the loan
@@ -473,7 +607,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     if (span > 0) {
       const r = simulate({
         balance: bal, balanceDate: chunkBalanceDate, payment: cp.payment, segments,
-        paymentDay: anchorDay, frequency, maxMonths: span, primeRate, region,
+        paymentDay: anchorDay, frequency, maxMonths: span, primeRate, primeHistory, region,
       });
       series.push(...r.series);
       totalInterest = round2(totalInterest + r.totalInterest);
@@ -497,7 +631,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
         const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
         series.push({
           month: ymKeyOfIdx(S + 1), date: lump.firstDate,
-          rate: segmentAnnualRate(seg, primeRate) ?? 0, rateType: seg ? seg.rate_type : null,
+          rate: segmentRateForMonth(seg, ymKeyOfIdx(S + 1), primeForMonth) ?? 0, rateType: seg ? seg.rate_type : null,
           interest: 0, principal: before, payment: before, balance: 0,
         });
         payoffMonth = ymKeyOfIdx(S + 1);

@@ -39,13 +39,17 @@ export const primeSource = {
 };
 
 // Fetch the prime series from the Bank of Canada Valet API and
-// return [{ date, rate }] newest first (about two years of weekly
-// observations). Throws on any failure — callers keep the last known
-// values rather than inventing one. PRIME_API_URL is a test seam
-// (the e2e suite points it at a stub), mirroring BCA_BASE_URL.
+// return [{ date, rate }] newest first. The range starts 2023-01-01
+// and runs to the newest observation (~200 weekly rows): the full
+// history, not a recent window — projections price each past month
+// at that month's prime, so the stored series has to reach back as
+// far as a mortgage can. Throws on any failure — callers keep the
+// last known values rather than inventing one. PRIME_API_URL is a
+// test seam (the e2e suite points it at a stub), mirroring
+// BCA_BASE_URL.
 export async function fetchPrimeRates(timeoutMs = 10000) {
   const url = process.env.PRIME_API_URL
-    || 'https://www.bankofcanada.ca/valet/observations/V80691311/json?recent=104';
+    || 'https://www.bankofcanada.ca/valet/observations/V80691311/json?start_date=2023-01-01';
   const res = await fetch(url, {
     headers: { 'User-Agent': 'FinanceMate/1.0' },
     signal: AbortSignal.timeout(timeoutMs),

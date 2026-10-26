@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
 import { buildSchedule, segmentForMonth, segmentAnnualRate, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { getRegion, REGION_CODES } from './regions/index.js';
-import { getCurrentPrime, ensureFreshPrime, refreshPrime, primeInfo, primeStatus } from './prime.js';
+import { getCurrentPrime, getPrimeHistory, ensureFreshPrime, refreshPrime, primeInfo, primeStatus } from './prime.js';
 import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
@@ -578,7 +578,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
         balance, balanceDate,
         paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
         terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
-        paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA',
+        paymentDay: p.payment_day ?? null, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
       });
       if (r.state === 'projected') {
         monthlyPayment = r.paymentUsed;
@@ -1164,7 +1164,7 @@ function projectedBalanceAtMonth(p, monthKey) {
     paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
     terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
     paymentDay: p.payment_day ?? null, frequency,
-    primeRate: prime ? prime.rate : null, region: p.region || 'CA',
+    primeRate: prime ? prime.rate : null, primeHistory: getPrimeHistory(), region: p.region || 'CA',
   });
   if (r.state !== 'projected') return null;
   const row = r.series.find((x) => x.month === monthKey);
@@ -1173,9 +1173,13 @@ function projectedBalanceAtMonth(p, monthKey) {
   return null;
 }
 
-app.post('/api/properties/:id/terms', requireApiAuth, (req, res) => {
+app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
+  // The renewal prefill below computes a projected balance: like
+  // every other calculation entry, refresh prime first so the
+  // prefill prices against the latest full history.
+  await ensureFreshPrime();
   const b = req.body || {};
   const terms = termsOf(p.id);
   const prev = terms.length ? terms[terms.length - 1] : null;
@@ -1311,13 +1315,15 @@ app.post('/api/prime/refresh', requireApiAuth, async (req, res) => {
 // from the term schedule (engine buildSchedule): auto-computed from the
 // balance, the rate in effect and the current term's amortization —
 // re-derived at a term start, recast against the current trajectory's
-// payoff at a rate change, and left unchanged by lump sums (they
+// payoff at a rate change, recast at every prime change while a
+// prime-spread segment runs (adjustable-rate replay against the
+// tracked prime history), and left unchanged by lump sums (they
 // shorten the loan instead); a stored monthly payment is an override
 // inside the current term.
 app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  await ensureFreshPrime(); // fetch-on-read: compute with today's prime
+  await ensureFreshPrime(); // fetch-on-read: refresh the prime history before computing
   const segments = segmentsOf(p.id);
   if (p.mortgage_balance === null || p.mortgage_balance === undefined || !(p.mortgage_balance > 0)) {
     return res.json({ ok: false, error: 'no outstanding principal recorded for this property', segments });
@@ -1325,9 +1331,11 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
   if (segments.length === 0) {
     return res.json({ ok: false, code: 'NO_RATE_PLAN', error: 'no rate plan yet', segments });
   }
-  // Prime-spread segments resolve against the current prime (held
-  // constant across the projection). Without a prime on record they
-  // cannot be projected at all — a named state, never a silent 0%.
+  // Prime-spread segments resolve month by month against the
+  // tracked prime history (each month at its own prime; only months
+  // beyond the last observation hold at the latest known rate).
+  // Without any prime on record they cannot be projected at all —
+  // a named state, never a silent 0%.
   const prime = getCurrentPrime();
   const primeRate = prime ? prime.rate : null;
   if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread') && primeRate === null) {
@@ -1348,7 +1356,7 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
     balance: p.mortgage_balance, balanceDate,
     paymentOverride: p.mortgage_payment > 0 ? p.mortgage_payment : null,
     terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
-    paymentDay: p.payment_day ?? null, frequency, primeRate, region: p.region || 'CA',
+    paymentDay: p.payment_day ?? null, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
   });
   if (r.state === 'no_payment') {
     return res.json({ ok: false, code: 'NO_PAYMENT', error: 'enter a monthly payment or set the current term\u2019s remaining amortization (years) to project the mortgage', segments });
@@ -1364,6 +1372,9 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
     paymentUsed: payment,
     paymentSource: r.paymentSource,
     primeRate,
+    primeAssumption: primeRate !== null
+      ? `Past months use actual Bank of Canada prime history; future months assume prime stays at the latest known rate of ${Number(primeRate).toFixed(2)}%.`
+      : null,
     prime: primeStatus(),
     frequency,
     frequencyLabel: FREQUENCIES[frequency].label,

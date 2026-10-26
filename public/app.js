@@ -819,7 +819,9 @@ $('#pfRangeBtns').addEventListener('click', (e) => {
   if (!btn) return;
   $('#pfRangeBtns').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
   pfRangeMonths = Number(btn.dataset.months);
-  drawPortfolioChart();
+  // Re-fetch the portfolio (fresh projections at the latest prime
+  // history) rather than re-clipping the payload already loaded.
+  loadPortfolio();
 });
 $('#pfPieOutstandingBtn').addEventListener('click', () => { pfPieMetric = 'outstanding'; drawPortfolioPie(); });
 $('#pfPieAssessedBtn').addEventListener('click', () => { pfPieMetric = 'assessed'; drawPortfolioPie(); });
@@ -1409,7 +1411,7 @@ async function loadPrime() {
     ? { rate: cur ? cur.rate : null, asOf: primeInfoCache.asOf, fresh: primeInfoCache.fresh }
     : null);
   if (cur) {
-    banner.textContent = `Bank of Canada prime: ${Number(cur.rate).toFixed(2)}% (as of ${primeInfoCache.asOf || cur.date}). Variable-rate projections assume prime stays at ${Number(cur.rate).toFixed(2)}%.`;
+    banner.textContent = `Bank of Canada prime: ${Number(cur.rate).toFixed(2)}% (as of ${primeInfoCache.asOf || cur.date}). Past months use actual Bank of Canada prime history; future months assume prime stays at the latest known rate of ${Number(cur.rate).toFixed(2)}%.`;
     const changes = primeInfoCache.changes || [];
     changesEl.textContent = changes.length > 1
       ? 'Recent: ' + changes.map((c) => `${Number(c.rate).toFixed(2)}% from ${c.date}`).join(' · ')
@@ -2128,16 +2130,20 @@ $('#scheduleYearSelect').addEventListener('change', (e) => {
   renderSchedule();
 });
 
+// A range change RE-FETCHES the projection instead of re-clipping
+// the payload already on the page: the server re-prices every month
+// against the latest prime history (refreshed fetch-on-read), and
+// the chart + schedule redraw from the fresh series.
 $('#rangeBtns').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-months]');
   if (!btn) return;
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.toggle('active', b === btn));
   $('#customMonths').value = '';
-  renderDetailCharts();
+  if (currentPropertyId) loadChart(currentPropertyId);
 });
 $('#customMonths').addEventListener('change', () => {
   document.querySelectorAll('#rangeBtns button').forEach((b) => b.classList.remove('active'));
-  renderDetailCharts();
+  if (currentPropertyId) loadChart(currentPropertyId);
 });
 
 // ----------------------------------------------------------------- admin ---

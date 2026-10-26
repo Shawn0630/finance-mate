@@ -42,6 +42,16 @@ export function getCurrentPrime() {
   return row || null;
 }
 
+// The full stored prime history, oldest first: [{ date, rate }].
+// Projections price prime-spread segments month by month against
+// this (the engine's primeHistory), so it must span the whole
+// period a projection can reach back to — fetches pull the series
+// from 2023 (see regions/ca.js), and ensureFreshPrime() backfills
+// once on databases that only ever fetched the recent window.
+export function getPrimeHistory() {
+  return db.prepare('SELECT date, rate FROM prime_rates ORDER BY date ASC').all();
+}
+
 // Recent change points, newest first: each entry is the first date
 // a rate was observed at that level. The first entry is the current
 // rate; older entries are what it changed from.
@@ -71,6 +81,9 @@ function fetchAndStore(timeoutMs) {
         for (const r of rates) ins.run(r.date, r.rate, region.primeSource.series);
       })();
       setMeta('prime_last_success', String(Date.now()));
+      // A successful fetch now returns the full-range history, so
+      // the stored series is complete back to 2023 from here on.
+      setMeta('prime_history_backfilled', '1');
     } catch (err) {
       console.warn(`[prime] fetch failed, keeping last known value: ${err.message}`);
     } finally {
@@ -82,9 +95,19 @@ function fetchAndStore(timeoutMs) {
 }
 
 // Read-path freshness gate: resolves to the current prime after at
-// most one inline fetch. Never throws.
+// most one inline fetch. Never throws. Every computation entry
+// (projection, property detail, portfolio) calls this first, so a
+// calculation always prices against a just-refreshed full history —
+// never against a stale cache.
 export async function ensureFreshPrime() {
-  if (fetchedToday()) return getCurrentPrime();
+  // One-time backfill: databases from before full-history pricing
+  // hold only the recent window (their projections reached back
+  // further than their stored prime). Fetch once even when today's
+  // freshness already holds, so the stored series is complete; a
+  // failed attempt keeps the last known values and retries under
+  // the usual backoff.
+  const backfilled = getMeta('prime_history_backfilled') === '1';
+  if (backfilled && fetchedToday()) return getCurrentPrime();
   if (!inflight) {
     const lastAttempt = Number(getMeta('prime_last_attempt') || 0);
     // A recent failed attempt (success would have made it fresh):

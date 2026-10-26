@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeStepMonths } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -440,4 +440,101 @@ test('prime-spread segments resolve against the current prime', () => {
   const at545 = simulate({ balance: 100000, balanceDate: '2026-10-01', payment: 600, segments: [segRow], primeRate: 5.45 });
   assert.equal(at545.series[0].interest, 367.44);
   assert.ok(at545.totalInterest > at495.totalInterest);
+});
+
+test('prime history: each month prices at that month\u2019s prime (month-end rule)', () => {
+  // Fake Valet history: 6.00% through 2024, 5.00% from the mid-January
+  // 2025 observation on. A month prices at the last observation dated
+  // on or before its end: Dec 2024 = 6.00 (the November observation),
+  // Jan 2025 = 5.00 (the January one), later months hold at 5.00.
+  const resolve = primeHistoryResolver([
+    { date: '2024-11-13', rate: 6.00 },
+    { date: '2025-01-15', rate: 5.00 },
+  ], null);
+  assert.equal(resolve('2024-12'), 6.00);
+  assert.equal(resolve('2025-01'), 5.00);
+  assert.equal(resolve('2025-06'), 5.00);
+  assert.deepEqual(primeStepMonths([
+    { date: '2024-11-13', rate: 6.00 },
+    { date: '2025-01-15', rate: 5.00 },
+  ]), ['2025-01']);
+  // Months before the first observation fall back to the earliest.
+  assert.equal(resolve('2024-06'), 6.00);
+  // No history and no scalar: no resolver (the no_prime state).
+  assert.equal(primeHistoryResolver([], null), null);
+  assert.equal(primeHistoryResolver(null, 4.95)('2030-01'), 4.95);
+});
+
+test('prime history: a Prime - 1 segment charges December at 5% and January at 4%', () => {
+  // Same fake history as above. Balance dated mid-November 2024, so
+  // December is a projected month: its interest is 100000 x
+  // monthlyRate(6.00 - 1) = the familiar $412.39 at 5%; January's is
+  // the December-end balance x monthlyRate(5.00 - 1).
+  const primeHistory = [
+    { date: '2024-11-13', rate: 6.00 },
+    { date: '2025-01-15', rate: 5.00 },
+  ];
+  const { series } = simulate({
+    balance: 100000, balanceDate: '2024-11-15', payment: 600,
+    segments: [{ start_date: '2024-11-15', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }],
+    primeHistory,
+  });
+  assert.equal(series[0].month, '2024-12');
+  assert.equal(series[0].rate, 5);
+  assert.ok(close(series[0].interest, 412.39), series[0].interest);
+  assert.equal(series[1].month, '2025-01');
+  assert.equal(series[1].rate, 4);
+  assert.ok(close(series[1].interest, series[0].balance * monthlyRate(4), 0.011), series[1].interest);
+  // A fixed segment ignores the history entirely.
+  const fixed = simulate({
+    balance: 100000, balanceDate: '2024-11-15', payment: 600,
+    segments: [{ start_date: '2024-11-15', rate_type: 'fixed', annual_rate: 5 }],
+    primeHistory,
+  });
+  assert.ok(fixed.series.every((row) => row.rate === 5));
+  assert.ok(close(fixed.series[1].interest, 411.62), fixed.series[1].interest);
+});
+
+test('buildSchedule: a prime step recasts the payment from the step month (adjustable-rate replay)', () => {
+  // Fake history in the real series' shape: prime 5.45 when the term
+  // starts (Dec 2024), stepping to 4.95 in March 2025. The payment is
+  // derived at the START month's prime (5.45 - 1 = 4.45%, 25 years);
+  // from March it is recast at 3.95% against the payoff the loan was
+  // already heading to — hand-checkable below via a fixed-rate
+  // extrapolation of the February state.
+  const primeHistory = [
+    { date: '2024-12-11', rate: 5.95 },
+    { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-01-29', rate: 5.45 },
+    { date: '2025-03-12', rate: 4.95 },
+  ];
+  const segments = [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }];
+  const terms = [{ id: 1, start_date: '2024-12-17', amortization_years: 25 }];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2024-12-17', terms, segments, primeHistory });
+  assert.equal(r.state, 'projected');
+  const first = derivePayment(100000, 4.45, 25);
+  assert.ok(close(r.paymentUsed, first, 0.001), r.paymentUsed);
+  const jan = r.series.find((row) => row.month === '2025-01');
+  const feb = r.series.find((row) => row.month === '2025-02');
+  const mar = r.series.find((row) => row.month === '2025-03');
+  assert.equal(jan.rate, 4.45);
+  assert.equal(jan.payment, r.paymentUsed);
+  assert.equal(feb.payment, r.paymentUsed);
+  assert.equal(mar.rate, 3.95);
+  // Hand-check the recast: extrapolate the February state at the old
+  // rate/payment to its payoff, then derive at 3.95% over the months
+  // left to that same payoff.
+  const hypo = simulate({
+    balance: feb.balance, balanceDate: feb.date, payment: r.paymentUsed,
+    segments: [{ start_date: '2025-02-01', rate_type: 'fixed', annual_rate: 4.45 }],
+  });
+  const [py, pm] = hypo.payoffMonth.split('-').map(Number);
+  const [fy, fm] = feb.month.split('-').map(Number);
+  const monthsLeft = (py * 12 + pm) - (fy * 12 + fm);
+  const expected = derivePayment(feb.balance, 3.95, monthsLeft / 12);
+  assert.ok(close(mar.payment, expected, 0.02), `${mar.payment} vs ${expected}`);
+  assert.ok(mar.payment < r.paymentUsed, 'the payment steps DOWN with prime');
+  // And it then holds at the recast value (no further steps).
+  const apr = r.series.find((row) => row.month === '2025-04');
+  assert.equal(apr.payment, mar.payment);
 });

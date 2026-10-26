@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import Database from 'better-sqlite3';
-import { simulate as engineSimulate, derivePayment as engineDerive, monthlyRate as engineMonthlyRate } from '../src/engine.js';
+import { simulate as engineSimulate, derivePayment as engineDerive, monthlyRate as engineMonthlyRate, buildSchedule as engineSchedule } from '../src/engine.js';
 
 const PORT = 19200 + (process.pid % 500);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -132,9 +132,23 @@ const stubBase = `http://127.0.0.1:${stub.address().port}`;
 
 // Stub Bank of Canada Valet endpoint (PRIME_API_URL points the app
 // at it): serves the real API's shape with a prime value the test
-// can move, so the refresh flow is exercised end to end.
+// can move, so the refresh flow is exercised end to end. The served
+// history mirrors the real series' change points (5.45 in Dec 2024,
+// stepping down through 2025 to 4.45, then the current level the
+// refresh tests move), because projections now price every month
+// at that month's own prime — the list below is shared with the
+// in-test engine comparisons, so both sides price identically.
 let stubPrime = 4.95;
 let stubDown = false;
+const stubPrimeHistory = [
+  { date: '2024-12-11', rate: 5.95 },
+  { date: '2024-12-18', rate: 5.45 },
+  { date: '2025-02-05', rate: 5.20 },
+  { date: '2025-03-19', rate: 4.95 },
+  { date: '2025-09-24', rate: 4.70 },
+  { date: '2025-11-05', rate: 4.45 },
+  { date: '2026-10-14', rate: 4.70 },
+];
 const primeStub = http.createServer((req, res) => {
   if (stubDown) { res.writeHead(500); res.end('down'); return; }
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -142,7 +156,8 @@ const primeStub = http.createServer((req, res) => {
     seriesDetail: { V80691311: { label: 'Prime rate' } },
     observations: [
       { d: '2026-10-21', V80691311: { v: String(stubPrime) } },
-      { d: '2026-10-14', V80691311: { v: '4.70' } },
+      ...[...stubPrimeHistory].reverse()
+        .map((o) => ({ d: o.date, V80691311: { v: String(o.rate) } })),
     ],
   }));
 });
@@ -922,8 +937,9 @@ try {
   check('fetch-on-read stored the stub prime with its as-of date',
     r.data.current && r.data.current.rate === 4.95 && r.data.current.date === '2026-10-21'
       && r.data.source && r.data.source.series === 'V80691311', JSON.stringify(r.data.current));
-  check('prime change points include the previous level',
-    Array.isArray(r.data.changes) && r.data.changes.length === 2 && r.data.changes[1].rate === 4.7,
+  check('prime change points walk back through the stored history (4.95, 4.70, 4.45, ...)',
+    Array.isArray(r.data.changes) && r.data.changes.length === 5
+      && r.data.changes[0].rate === 4.95 && r.data.changes[1].rate === 4.7 && r.data.changes[2].rate === 4.45,
     JSON.stringify(r.data.changes));
 
   r = await req('GET', '/api/properties/1');
@@ -1008,6 +1024,47 @@ try {
   check('manual refresh forces a fetch of the current value',
     r.data.current && r.data.current.rate === 4.95 && r.data.fresh === true, JSON.stringify(r.data.current));
 
+  // The user's real shape, replayed on the stub history: $1,350,000
+  // dated 2024-12-17, Prime - 1, 25-year amortization, and NO
+  // entered payment — the payment must come out of the model. It is
+  // derived at the start month's prime (Dec 2024: 5.45 -> 4.45%),
+  // each month prices at its own prime (Feb 5.20 -> 4.20%, Mar 4.95
+  // -> 3.95%, Sep 4.70 -> 3.70%, Nov 4.45 -> 3.45%), and the payment
+  // steps DOWN at each prime step (adjustable-rate replay) instead
+  // of being priced at today's prime for the whole loan.
+  r = await req('POST', '/api/properties', {
+    address: '9 Replay Road, Victoria, BC', mortgage_balance: 1350000,
+    mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17',
+  });
+  const pidReplay = r.data.id;
+  await req('POST', `/api/properties/${pidReplay}/rates`, {
+    start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+  });
+  await req('PUT', `/api/properties/${pidReplay}`, { amortization_years: 25 });
+  const replay = (await req('GET', `/api/properties/${pidReplay}/amortization`)).data;
+  const replayRow = (m) => replay.series.find((x) => x.month === m) || {};
+  check('replay: the payment is derived at the start month\u2019s prime (4.45%), nothing entered',
+    replay.ok === true && replay.paymentSource === 'derived'
+      && Math.abs(replay.paymentUsed - engineDerive(1350000, 4.45, 25)) < 0.02
+      && replayRow('2025-01').rate === 4.45
+      && replayRow('2025-01').interest === Math.round(1350000 * engineMonthlyRate(4.45) * 100) / 100,
+    JSON.stringify({ used: replay.paymentUsed, first: replay.series && replay.series[0] }));
+  check('replay: every month prices at its own prime and the payment steps down at each step',
+    replayRow('2025-02').rate === 4.2 && replayRow('2025-03').rate === 3.95
+      && replayRow('2025-09').rate === 3.7 && replayRow('2025-11').rate === 3.45
+      && replayRow('2025-02').payment < replay.paymentUsed
+      && replayRow('2025-03').payment < replayRow('2025-02').payment
+      && replayRow('2025-09').payment < replayRow('2025-03').payment
+      && replayRow('2025-11').payment < replayRow('2025-09').payment,
+    JSON.stringify(['2025-01', '2025-02', '2025-03', '2025-09', '2025-11']
+      .map((m) => [m, replayRow(m).rate, replayRow(m).payment])));
+  check('replay: the response states the pricing assumption (history for the past, latest known for the future)',
+    typeof replay.primeAssumption === 'string'
+      && replay.primeAssumption.includes('actual Bank of Canada prime history')
+      && replay.primeAssumption.includes('4.95%'),
+    JSON.stringify(replay.primeAssumption));
+  await req('DELETE', `/api/properties/${pidReplay}`);
+
   r = await req('POST', '/api/properties', { address: '1 Region Road', mortgage_balance: 1000, purchase_date: '2020-01-01', region: 'US' });
   check('a non-CA region is refused (Canada only for now)', r.status === 400, JSON.stringify(r.data));
   r = await req('POST', '/api/properties', { address: '2 Region Road', mortgage_balance: 1000, purchase_date: '2020-01-01', region: 'CA' });
@@ -1064,20 +1121,22 @@ try {
       && r.data.terms[0].amortization_years === 30 && r.data.terms[0].lender === 'RBC',
     JSON.stringify({ lender: r.data.lender, term: r.data.terms && r.data.terms[0] }));
   const projT1 = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  check('the term projection derives $6,381.36 (3.95%, 30y) as an auto payment',
-    projT1.ok === true && projT1.paymentSource === 'derived' && Math.abs(projT1.paymentUsed - 6381.36) < 0.5,
+  check('the term projection derives its payment at the start month\u2019s prime (5.45 - 1 = 4.45%, 30y)',
+    projT1.ok === true && projT1.paymentSource === 'derived'
+      && Math.abs(projT1.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5,
     JSON.stringify({ used: projT1.paymentUsed, src: projT1.paymentSource }));
-  // Migration equivalence, locked: the series equals the pre-term
-  // engine (derivePayment + simulate) for the same inputs, to the row.
-  const legacyRun = engineSimulate({
+  // Projection equivalence, locked: the series equals the engine's
+  // term schedule for the same inputs (same stub prime history), to
+  // the row — pricing every month at its own prime, recast included.
+  const engineRun = engineSchedule({
     balance: 1350000, balanceDate: '2024-12-17',
-    payment: engineDerive(1350000, 3.95, 30),
+    terms: [{ id: term1Id, start_date: '2024-12-17', amortization_years: 30 }],
     segments: [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }],
-    primeRate: 4.95,
+    primeHistory: [...stubPrimeHistory, { date: '2026-10-21', rate: stubPrime }],
   });
-  check('single-term projection is month-by-month identical to the pre-term engine',
-    JSON.stringify(projT1.series) === JSON.stringify(legacyRun.series)
-      && projT1.totalInterest === legacyRun.totalInterest && projT1.payoffMonth === legacyRun.payoffMonth,
+  check('single-term projection is month-by-month identical to the engine schedule',
+    JSON.stringify(projT1.series) === JSON.stringify(engineRun.series)
+      && projT1.totalInterest === engineRun.totalInterest && projT1.payoffMonth === engineRun.payoffMonth,
     JSON.stringify({ rows: projT1.series && projT1.series.length, ti: projT1.totalInterest }));
 
   // Renewal: prefilled from Term 1 (start = day after it ends,
@@ -1094,9 +1153,9 @@ try {
     !!novRow && Math.abs(r.data.opening_balance - novRow.balance) < 0.02,
     JSON.stringify({ opening: r.data.opening_balance, nov: novRow && novRow.balance }));
   const decCarry = projCarry.series.find((x) => x.month === '2029-12');
-  check('with no amortization on Term 2 the last payment carries over the boundary',
-    !!decCarry && Math.abs(decCarry.payment - projCarry.paymentUsed) < 0.02,
-    JSON.stringify(decCarry && decCarry.payment));
+  check('with no amortization on Term 2 the running payment carries over the boundary unchanged',
+    !!decCarry && !!novRow && Math.abs(decCarry.payment - novRow.payment) < 0.02,
+    JSON.stringify({ dec: decCarry && decCarry.payment, nov: novRow && novRow.payment }));
   r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { amortization_years: 25, lender: 'TD' });
   check('Term 2 updated in place (new lender, fresh amortization)',
     r.status === 200 && r.data.lender === 'TD' && r.data.amortization_years === 25,
@@ -1118,25 +1177,27 @@ try {
   // the running term, and at the renewal the benefit reappears as
   // a lower re-derived Term 2 payment.
   const projPreLump = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-03-10', amount: 50000, note: 'Bonus' });
+  // The lump lands in May 2025 — a month with no prime step in the
+  // stub history — so the payment around it must be exactly the
+  // running payment (no recast event confounds the comparison).
+  r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-05-10', amount: 50000, note: 'Bonus' });
   check('lump sum created in the term active on its date',
     r.status === 201 && r.data.term_id === term1Id && r.data.amount === 50000, JSON.stringify(r.data));
   const lumpId = r.data.id;
   const projLump = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  const febPre = projPreLump.series.find((x) => x.month === '2025-02');
-  const febPost = projLump.series.find((x) => x.month === '2025-02');
-  const marPost = projLump.series.find((x) => x.month === '2025-03');
+  const aprPre = projPreLump.series.find((x) => x.month === '2025-04');
+  const aprPost = projLump.series.find((x) => x.month === '2025-04');
+  const mayPost = projLump.series.find((x) => x.month === '2025-05');
   check('months before the lump sum are unchanged',
-    JSON.stringify(febPost) === JSON.stringify(febPre), JSON.stringify(febPost));
-  check('the lump month charges interest on the reduced balance and the payment is unchanged',
-    !!marPost && Math.abs(marPost.interest - Math.round((febPost.balance - 50000) * engineMonthlyRate(3.95) * 100) / 100) < 0.02
-      && Math.abs(marPost.payment - projPreLump.paymentUsed) < 0.02,
-    JSON.stringify(marPost));
+    JSON.stringify(aprPost) === JSON.stringify(aprPre), JSON.stringify(aprPost));
+  check('the lump month charges interest on the reduced balance (May prices at prime 4.95) and the payment is unchanged',
+    !!mayPost && Math.abs(mayPost.interest - Math.round((aprPost.balance - 50000) * engineMonthlyRate(3.95) * 100) / 100) < 0.02
+      && Math.abs(mayPost.payment - aprPre.payment) < 0.02,
+    JSON.stringify(mayPost));
   // The payoff inside Term 1 pulls in, but the renewal re-derives
   // Term 2's payment on its own fresh amortization — so end to end
   // the lump's certain effects are materially less total interest
-  // ($944,662.80 -> $900,138.41) and a lower payment from the
-  // renewal on ($6,393.88 -> $6,078.80), not a changed Term 1
+  // and a lower payment from the renewal on, not a changed Term 1
   // payment or an earlier final payoff.
   const decPreLump = projPreLump.series.find((x) => x.month === '2029-12');
   const decPostLump = projLump.series.find((x) => x.month === '2029-12');
@@ -1166,7 +1227,7 @@ try {
   await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: null });
   const projAuto = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
   check('clearing the entered payment returns to the auto calculation',
-    projAuto.paymentSource === 'derived' && Math.abs(projAuto.paymentUsed - 6381.36) < 0.5,
+    projAuto.paymentSource === 'derived' && Math.abs(projAuto.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5,
     JSON.stringify({ used: projAuto.paymentUsed, src: projAuto.paymentSource }));
 
   // Validation + term deletion rules.
@@ -1718,6 +1779,60 @@ try {
         scNext.totalPayment === sc.totalPayment && scNext.totalPrincipal === sc.totalPrincipal
           && scNext.totalInterest === sc.totalInterest && scNext.totalLabel === sc.totalLabel,
         JSON.stringify({ before: sc.totalLabel, after: scNext.totalLabel }));
+
+      // ---- Range switch re-fetches the projection (no stale clip) ----
+      // A prime-spread fixture backdated to Dec 2024. Switching the
+      // range must re-request the projection from the server (which
+      // re-prices at the latest prime history) rather than re-clip
+      // the payload already on the page — and the recomputation must
+      // not drift: March 2025's interest in the monthly table equals
+      // the hand-computed value at that month's own prime (stub
+      // history: Mar 2025 prime 4.95 -> rate 3.95), before and after
+      // the switch alike.
+      r = await req('POST', '/api/properties', {
+        address: '321 Refetch Crescent, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17',
+      });
+      const refetchPid = r.data.id;
+      await req('POST', `/api/properties/${refetchPid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
+      });
+      await req('PUT', `/api/properties/${refetchPid}`, { amortization_years: 25 });
+      await page.goto(`http://ff.local/#property/${refetchPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const schedRow = (label) => page.evaluate((lbl) => {
+        const tr = [...document.querySelectorAll('#scheduleRows tr')]
+          .find((x) => x.children[0].textContent === lbl);
+        if (!tr) return null;
+        const num = (i) => Number(tr.children[i].textContent.replace(/[$,]/g, ''));
+        return { payment: num(1), principal: num(2), interest: num(3), remaining: num(4) };
+      }, label);
+      const pickYear = (y) => page.evaluate((yy) => {
+        const s = document.querySelector('#scheduleYearSelect');
+        s.value = yy;
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      }, y);
+      await pickYear('2025');
+      await wait(300);
+      const febBefore = await schedRow('Feb 2025');
+      const marBefore = await schedRow('Mar 2025');
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="24"]').click());
+      await wait(1200);
+      await pickYear('2025');
+      await wait(300);
+      const febAfter = await schedRow('Feb 2025');
+      const marAfter = await schedRow('Mar 2025');
+      // The table displays whole dollars, so the hand-check rounds
+      // the same way (February's displayed remaining x the monthly
+      // rate at March's own prime, 4.95 - 1 = 3.95%).
+      const marHand = febBefore ? Math.round(febBefore.remaining * engineMonthlyRate(3.95)) : null;
+      check('range switch re-fetches: March 2025 interest equals its own month\u2019s prime hand-check, unchanged by the switch',
+        !!marBefore && !!marAfter && !!febBefore
+          && Math.abs(marBefore.interest - marHand) <= 1
+          && marAfter.interest === marBefore.interest
+          && febAfter.remaining === febBefore.remaining,
+        JSON.stringify({ marBefore, marAfter, marHand }));
+      await req('DELETE', `/api/properties/${refetchPid}`);
 
       // Portfolio combined chart: the same look-back window applies
       // to its assessed line (years are the union across properties;
