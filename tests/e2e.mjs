@@ -1414,8 +1414,14 @@ try {
   // Every money field is a text input marked data-money; the shared
   // format/parse pair in app.js groups what the user sees and parses it
   // back before anything is sent, so the API still receives numbers.
+  // The balance / payment money fields moved with the anchor form
+  // into the client-rendered term accordion: count the static page
+  // and the rendered templates together.
+  const appJsRes2 = await fetch(BASE + '/app.js', { headers: { Cookie: cookie } });
+  const appJsText2 = await appJsRes2.text();
   check('money inputs are marked data-money in the page',
-    (pageHtml.match(/data-money/g) || []).length >= 6,
+    (pageHtml.match(/data-money/g) || []).length >= 4
+      && (appJsText2.match(/name="mortgage_(balance|payment)"[^>]*data-money/g) || []).length === 2,
     String((pageHtml.match(/data-money/g) || []).length));
   check('frontend wires the shared money format/parse helpers',
     jsText.includes('formatMoneyInput') && jsText.includes('parseMoneyInput') && jsText.includes('input[data-money]'));
@@ -1511,22 +1517,25 @@ try {
         !!moneyProp && moneyProp.mortgage_balance === 1350000, JSON.stringify(moneyProp && moneyProp.mortgage_balance));
       const moneyPid = moneyProp.id;
 
-      // Reopening the record: the mortgage form (in the Mortgage
-      // Terms & Rates modal) shows the grouped figure.
+      // Reopening the record: the modal's read-only metadata shows
+      // the grouped current principal, and the balance anchor form
+      // (in the current term's accordion) opens grouped too.
       await page.goto(`http://ff.local/#property/${moneyPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
-      const editBalance = await fieldVal('#mortgageForm [name=mortgage_balance]');
-      check('edit form opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
+      const metaPrincipal = await page.evaluate(() => document.querySelector('#metaCurrentPrincipal').textContent);
+      check('modal metadata shows the grouped current principal', metaPrincipal.includes('1,350,000'), String(metaPrincipal));
+      const editBalance = await fieldVal('[data-anchor-form] [name=mortgage_balance]');
+      check('anchor form opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
 
       // Paste a pre-grouped figure into monthly payment and save: it
       // must reach the server as the plain number 2500.
-      await focusField('#mortgageForm [name=mortgage_payment]');
+      await focusField('[data-anchor-form] [name=mortgage_payment]');
       await client.send('Input.insertText', { text: '2,500' });
-      const pastedPayment = await fieldVal('#mortgageForm [name=mortgage_payment]');
+      const pastedPayment = await fieldVal('[data-anchor-form] [name=mortgage_payment]');
       check('pasted grouped payment displays grouped', pastedPayment === '2,500', String(pastedPayment));
-      await page.evaluate(() => document.querySelector('#mortgageForm [type=submit]').click());
+      await page.evaluate(() => document.querySelector('[data-anchor-form] [type=submit]').click());
       await wait(1400);
       r = await req('GET', `/api/properties/${moneyPid}`);
       check('pasted payment stored as the plain number 2500', r.data.mortgage_payment === 2500, JSON.stringify(r.data.mortgage_payment));
@@ -2108,11 +2117,12 @@ try {
       // The user's exact shape again (balance + one prime-spread
       // segment, nothing else), driven through the UI this time:
       // typing ONLY the remaining amortization (30) and a lender into
-      // the Mortgage form must flip the page from NO_PAYMENT to a
-      // full projection — the panel names the derived payment, the
-      // merged chart splits every payment into interest + principal
-      // portions that sum to it, and the summary totals agree with
-      // the amortization endpoint.
+      // Term 1's own form must flip the page from NO_PAYMENT to a
+      // full projection — the projection head's Estimated monthly
+      // payment stat names the derived payment, the merged chart
+      // splits every payment into interest + principal portions
+      // that sum to it, and the summary totals agree with the
+      // amortization endpoint.
       r = await req('POST', '/api/properties', {
         address: '123 Amort Test Way, Victoria, BC',
         mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
@@ -2128,21 +2138,68 @@ try {
         beforeMsg.includes('add a monthly payment or remaining amortization'), beforeMsg);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
-      await focusField('#mortgageForm [name=amortization_years]');
+      await focusField('[data-term-form] [name=amortization_years]');
       await page.keyboard.type('30');
-      await focusField('#mortgageForm [name=lender]');
+      await focusField('[data-term-form] [name=lender]');
       await page.keyboard.type('Scotiabank');
-      await page.evaluate(() => document.querySelector('#mortgageForm [type=submit]').click());
+      await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
       await wait(2000);
       const amortApi = (await req('GET', `/api/properties/${amortPid}/amortization`)).data;
       check('endpoint derives the payment from the UI-entered amortization (3.95%, 30y)',
         amortApi.ok === true && amortApi.paymentSource === 'derived'
           && Math.abs(amortApi.paymentUsed - 6381.36) < 0.5,
         JSON.stringify({ ok: amortApi.ok, src: amortApi.paymentSource, used: amortApi.paymentUsed }));
-      const derivedNote = await page.evaluate(() => document.querySelector('#derivedPaymentNote').textContent);
-      check('Mortgage Terms & Rates names the derived payment and its amount',
-        derivedNote.includes('derived from the remaining amortization') && derivedNote.includes('6,381'),
-        derivedNote);
+      const estStat = await page.evaluate(() => {
+        const stat = document.querySelector('#estPaymentStat');
+        const head = document.querySelector('#projectionPanel .panel-head');
+        const v = document.querySelector('#estPaymentValue');
+        return {
+          inHead: !!stat && !!head && head.contains(stat),
+          text: v ? v.textContent : '',
+          weight: v ? Number(getComputedStyle(v).fontWeight) : 0,
+          tagHidden: document.querySelector('#estPaymentTag').classList.contains('hidden'),
+        };
+      });
+      check('the projection head carries an Estimated monthly payment stat, bold, equal to the endpoint payment',
+        estStat.inHead && Math.abs(parseFloat(estStat.text.replace(/[^0-9.]/g, '')) - amortApi.paymentUsed) < 0.5
+          && estStat.weight >= 600 && estStat.tagHidden,
+        JSON.stringify(estStat));
+      const metaGrid = await page.evaluate(() => {
+        const meta = document.querySelector('#mortgageMeta');
+        const pay = document.querySelector('#metaCurrentPayment');
+        return {
+          labels: [...meta.querySelectorAll('.meta-k')].map((e) => e.textContent.trim()),
+          inputs: meta.querySelectorAll('input, select, textarea').length,
+          opening: document.querySelector('#metaOpeningPrincipal').textContent,
+          current: document.querySelector('#metaCurrentPrincipal').textContent,
+          payment: pay.textContent,
+          paymentTag: document.querySelector('#metaPaymentTag').textContent,
+          paymentWeight: Number(getComputedStyle(pay).fontWeight),
+          remaining: document.querySelector('#metaRemainingAmort').textContent,
+          lender: document.querySelector('#metaCurrentLender').textContent,
+          formGone: !document.querySelector('#mortgageForm'),
+          stray: [...document.querySelectorAll('#mortgageModal [name=lender], #mortgageModal [name=amortization_years]')]
+            .filter((el) => !el.closest('[data-term-form]')).length,
+          prose: document.querySelector('#mortgageModal').textContent,
+        };
+      });
+      check('modal metadata: exactly the five derived figures, no inputs among them',
+        JSON.stringify(metaGrid.labels) === JSON.stringify(['Opening principal ($)', 'Current Principal', 'Current Monthly Payment', 'Remaining amortization (years)', 'Current Lender'])
+          && metaGrid.inputs === 0,
+        JSON.stringify(metaGrid.labels));
+      check('modal metadata values derive from the terms and the projection (payment bold, tagged auto)',
+        metaGrid.opening.includes('1,350,000') && metaGrid.current.includes('1,350,000')
+          && metaGrid.payment.includes('6,381') && metaGrid.paymentTag === 'auto' && metaGrid.paymentWeight >= 600
+          && metaGrid.remaining === '30.0' && metaGrid.lender === 'Scotiabank',
+        JSON.stringify(metaGrid));
+      check('the property-level mortgage form is gone; lender/amortization live only in term forms',
+        metaGrid.formGone && metaGrid.stray === 0,
+        JSON.stringify({ formGone: metaGrid.formGone, stray: metaGrid.stray }));
+      check('the tutorial prose is gone from the modal',
+        !metaGrid.prose.includes('Canadian lenders: insured mortgages are usually capped')
+          && !metaGrid.prose.includes('A mortgage runs as a chain of terms')
+          && !metaGrid.prose.includes('Monthly payment derived from the remaining amortization'),
+        metaGrid.prose.slice(0, 200));
       const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('the NO_PAYMENT note beside chart A clears once amortization is in',
         !afterMsg.includes('add a monthly payment or remaining amortization'), afterMsg);
@@ -2219,20 +2276,20 @@ try {
         await page.evaluate(() => !document.querySelector('#monthlySummary')));
       const lenderBits = await page.evaluate(() => ({
         view: document.querySelector('#propViewBody').textContent,
-        tag: document.querySelector('#mortgageLenderTag').textContent,
-        input: document.querySelector('#mortgageForm [name=lender]').value,
+        meta: document.querySelector('#metaCurrentLender').textContent,
+        input: document.querySelector('[data-term-form] [name=lender]').value,
       }));
-      check('lender shows in the read-only panel, the Mortgage Terms & Rates heading and the form',
+      check('lender shows in the read-only panel, the modal metadata and the term form',
         lenderBits.view.includes('Lender') && lenderBits.view.includes('Scotiabank')
-          && lenderBits.tag.includes('Scotiabank') && lenderBits.input === 'Scotiabank',
+          && lenderBits.meta === 'Scotiabank' && lenderBits.input === 'Scotiabank',
         JSON.stringify(lenderBits));
       const inModal = await page.evaluate(() => {
         const modal = document.querySelector('#mortgageModal');
         const inside = (sel) => { const el = document.querySelector(sel); return !!el && modal.contains(el); };
         return {
-          all: inside('#mortgageForm') && inside('#segmentRows') && inside('#paymentDayForm') && inside('#termsWrap'),
+          all: inside('#mortgageMeta') && inside('#segmentRows') && inside('[data-anchor-form]') && inside('#termsWrap'),
           heading: modal.querySelector('h3').textContent.trim(),
-          onPage: !!document.querySelector('#view-property #mortgageForm'),
+          onPage: !!document.querySelector('#view-property #mortgageMeta'),
         };
       });
       check('mortgage terms and rate segments live in the Mortgage Terms & Rates modal, not on the page',
@@ -2242,11 +2299,29 @@ try {
       const rowUi = portUi.properties.find((x) => x.id === amortPid);
       check('the UI-entered amortization flips the portfolio state to projected',
         !!rowUi && rowUi.projState === 'projected', JSON.stringify(rowUi && rowUi.projState));
+      // Entering an override in the anchor form flips the stat to
+      // the entered figure with its "entered" tag — in the
+      // projection head and in the modal metadata alike.
+      await focusField('[data-anchor-form] [name=mortgage_payment]');
+      await page.keyboard.type('2500');
+      await page.evaluate(() => document.querySelector('[data-anchor-form] [type=submit]').click());
+      await wait(2000);
+      const enteredStat = await page.evaluate(() => ({
+        value: document.querySelector('#estPaymentValue').textContent,
+        tag: document.querySelector('#estPaymentTag').textContent,
+        tagHidden: document.querySelector('#estPaymentTag').classList.contains('hidden'),
+        meta: document.querySelector('#metaCurrentPayment').textContent,
+        metaTag: document.querySelector('#metaPaymentTag').textContent,
+      }));
+      check('an entered payment shows in the stat with the entered tag',
+        enteredStat.value.includes('2,500') && !enteredStat.tagHidden && enteredStat.tag === 'entered'
+          && enteredStat.meta.includes('2,500') && enteredStat.metaTag === 'entered',
+        JSON.stringify(enteredStat));
       await req('DELETE', `/api/properties/${amortPid}`);
 
       // ---- Terms UI: build a renewal through the accordion ----
       // Same shape once more, driven entirely through the page this
-      // time: the modal summary names the current term, "+ Add term /
+      // time: the modal metadata names the current lender, "+ Add term /
       // renewal" creates Term 2 prefilled and expanded, its form
       // takes the new lender + amortization, and the projection then
       // runs continuously across the boundary with the payment
@@ -2267,16 +2342,15 @@ try {
       // fixture's render in place (in-flight loads race); a reload
       // pins the page to this property, as in earlier sections.
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
-      // Poll for this property's summary.
+      // Poll for this property's metadata.
       let sumBefore = '';
       for (let i = 0; i < 40; i++) {
-        sumBefore = await page.evaluate(() => document.querySelector('#mortgageSummary').textContent);
+        sumBefore = await page.evaluate(() => document.querySelector('#mortgageMeta').textContent);
         if (sumBefore.includes('RBC')) break;
         await wait(300);
       }
-      check('modal summary names the current term, its lender and the auto payment',
-        sumBefore.includes('Term 1 of 1') && sumBefore.includes('RBC')
-          && sumBefore.includes('auto') && sumBefore.includes('6,381'),
+      check('modal metadata names the current lender and the auto payment',
+        sumBefore.includes('RBC') && sumBefore.includes('auto') && sumBefore.includes('6,381'),
         sumBefore);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
@@ -2298,11 +2372,12 @@ try {
         JSON.stringify(r.data.terms));
       let sumAfter = '';
       for (let i = 0; i < 40; i++) {
-        sumAfter = await page.evaluate(() => document.querySelector('#mortgageSummary').textContent);
-        if (sumAfter.includes('Term 1 of 2')) break;
+        sumAfter = await page.evaluate(() => document.querySelector('#termsWrap').textContent);
+        if (sumAfter.includes('Term 2') && sumAfter.includes('TD')) break;
         await wait(300);
       }
-      check('the summary now counts two terms', sumAfter.includes('Term 1 of 2'), sumAfter);
+      check('the terms list now shows the renewal with its lender',
+        sumAfter.includes('Term 2') && sumAfter.includes('TD'), sumAfter.slice(0, 200));
       const amortUi = (await req('GET', `/api/properties/${termUiPid}/amortization`)).data;
       const t2Month = r.data.terms[1].start_date.slice(0, 7);
       const idxB = amortUi.series.findIndex((x) => x.month === t2Month);
@@ -2435,7 +2510,7 @@ try {
           order: follows(g, pd) && follows(pd, vp),
           headings: [g, pd, vp].map((el) => ((el.querySelector('h3') || {}).textContent || '').trim()),
           editInHead: !!document.querySelector('#propertyDetailsPanel .panel-head #editPropBtn'),
-          mortgageOnPage: !!document.querySelector('#view-property #mortgageForm'),
+          mortgageOnPage: !!document.querySelector('#view-property #termsWrap'),
           historyOnPage: !!document.querySelector('#view-property #trendForm'),
           fetchOnPage: !!document.querySelector('#view-property #fetchBcaBtn'),
         };

@@ -139,6 +139,20 @@ label.btnlike:hover { background: #f0f4f9; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .modal-head h3 { margin: 0; font-size: 16px; }
 .detail-table td:first-child { width: 190px; color: #5a6a7a; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+/* Mortgage modal's read-only metadata grid: derived figures only,
+   no inputs — what can change lives in the terms below it. */
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 8px 0 4px; }
+.meta-item { background: #f6f9fc; border: 1px solid #e6ecf2; border-radius: 8px; padding: 8px 12px; }
+.meta-k { font-size: 11px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
+.meta-v { font-size: 16px; margin-top: 2px; }
+.meta-v.strong { font-weight: 700; font-size: 18px; }
+.meta-tag { font-size: 11px; font-weight: 400; color: #71808f; margin-left: 6px; }
+/* The projection head's Estimated monthly payment stat: the
+   derived payment gets its own prominent spot next to the equity. */
+.head-stat { margin-left: 10px; }
+.head-stat-k { font-size: 11px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
+.head-stat-v { font-size: 21px; font-weight: 700; line-height: 1.2; }
+.head-stat-tag { font-size: 11px; font-weight: 400; color: #71808f; margin-left: 6px; }
 .hidden { display: none !important; }
 .term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }
 .term-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; text-align: left; background: #f6f9fc; border: none; border-radius: 0; padding: 10px 12px; font-size: 13.5px; }

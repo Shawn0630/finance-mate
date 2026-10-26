@@ -156,6 +156,10 @@
       <div class="panel-head">
         <h3>Value &amp; Mortgage Projection</h3>
         <span class="note" id="equitySummary" style="margin:0"></span>
+        <div class="head-stat" id="estPaymentStat">
+          <div class="head-stat-k">Estimated monthly payment</div>
+          <div class="head-stat-v"><span id="estPaymentValue">—</span><span class="head-stat-tag hidden" id="estPaymentTag">entered</span></div>
+        </div>
         <div class="spacer"></div>
         <button type="button" id="openMortgageBtn">Mortgage Terms &amp; Rates</button>
         <button type="button" id="openHistoryBtn">Assessment History</button>
@@ -266,38 +270,23 @@
 
 <div class="modal-overlay hidden" id="mortgageModal">
   <div class="modal-card wide">
-    <div class="modal-head"><h3>Mortgage Terms &amp; Rates <span class="note" id="mortgageLenderTag" style="margin:0"></span></h3><button class="small" data-close-modal>Close</button></div>
+    <div class="modal-head"><h3>Mortgage Terms &amp; Rates</h3><button class="small" data-close-modal>Close</button></div>
     <div class="msg" id="mortgageMsg"></div>
-      <div class="note" id="mortgageSummary" style="margin-left:0"></div>
-      <form id="mortgageForm">
-        <div class="grid3">
-          <div><label>Outstanding principal ($)</label><input name="mortgage_balance" type="text" inputmode="decimal" data-money></div>
-          <div><label>Principal as of</label><input name="mortgage_balance_date" type="date"></div>
-          <div><label>Monthly payment ($) — optional override; calculated automatically when empty</label><input name="mortgage_payment" type="text" inputmode="decimal" data-money></div>
-        </div>
-        <div class="grid3">
-          <div><label>Remaining amortization (years) — current term</label><input name="amortization_years" type="number" step="0.5" min="1" max="35" placeholder="e.g. 25">
-            <div class="toolbar" style="margin-top:6px">
-              <button type="button" class="small" data-amort-years="25">25 years</button>
-              <button type="button" class="small" data-amort-years="30">30 years</button>
-            </div>
-          </div>
-          <div><label>Lender (bank) — current term</label><input name="lender" list="lenderOptions" placeholder="e.g. Scotiabank" autocomplete="off">
-            <datalist id="lenderOptions">
-              <option value="RBC"></option>
-              <option value="TD"></option>
-              <option value="Scotiabank"></option>
-              <option value="BMO"></option>
-              <option value="CIBC"></option>
-              <option value="National Bank"></option>
-            </datalist>
-          </div>
-        </div>
-        <div class="note" style="margin-left:0">Canadian lenders: insured mortgages are usually capped at 25 years (30 for first-time buyers and buyers of newly built homes, since Dec 15, 2024); uninsured mortgages go up to 30 years. With no monthly payment entered, the payment is calculated automatically from the outstanding principal, the rate in effect and the current term's remaining amortization; an entered payment overrides the calculation inside the current term only.</div>
-        <div class="msg warn hidden" id="amortWarn"></div>
-        <div class="note" id="derivedPaymentNote" style="margin-left:0"></div>
-        <div class="toolbar"><button class="primary" type="submit">Save mortgage</button></div>
-      </form>
+      <div class="meta-grid" id="mortgageMeta">
+        <div class="meta-item"><div class="meta-k">Opening principal ($)</div><div class="meta-v" id="metaOpeningPrincipal">—</div></div>
+        <div class="meta-item"><div class="meta-k">Current Principal</div><div class="meta-v" id="metaCurrentPrincipal">—</div></div>
+        <div class="meta-item"><div class="meta-k">Current Monthly Payment</div><div class="meta-v strong"><span id="metaCurrentPayment">—</span><span class="meta-tag hidden" id="metaPaymentTag"></span></div></div>
+        <div class="meta-item"><div class="meta-k">Remaining amortization (years)</div><div class="meta-v" id="metaRemainingAmort">—</div></div>
+        <div class="meta-item"><div class="meta-k">Current Lender</div><div class="meta-v" id="metaCurrentLender">—</div></div>
+      </div>
+      <datalist id="lenderOptions">
+        <option value="RBC"></option>
+        <option value="TD"></option>
+        <option value="Scotiabank"></option>
+        <option value="BMO"></option>
+        <option value="CIBC"></option>
+        <option value="National Bank"></option>
+      </datalist>
       <h4>Terms</h4>
       <div class="toolbar" style="align-items:flex-start">
         <div>
@@ -307,26 +296,10 @@
         <div class="spacer"></div>
         <button type="button" class="small" id="primeRefreshBtn">Refresh prime</button>
       </div>
-      <div class="note" style="margin-left:0">A mortgage runs as a chain of terms — each term is one contract with a lender, a length and the amortization agreed for it. Inside a term you can change the rate (fixed ↔ variable, one row per rate period; a month uses the latest segment that has started) and make lump-sum payments. When a term ends, renew into the next term — possibly with another bank and a fresh amortization. The payment is calculated automatically: a new term derives it from the balance, the rate then in effect and the term's amortization; a rate change recalculates it against the payoff the loan was already heading to, so it moves only with the rate; and a lump sum leaves the payment unchanged — it comes off the principal and instead shortens the loan and reduces the total interest. Each term also picks a repayment method: equal payment (the same total every month; the interest share shrinks as the principal share grows) or equal principal (the same principal every month — the balance divided by the remaining amortization — so the payment starts higher and declines). For variable plans the payment is set when the plan starts and does not change when prime moves; only the interest/principal split changes, because every month is priced at that month's own prime (past months use the tracked Bank of Canada history; future months hold at the latest known prime). Rates are nominal annual rates with Canadian semi-annual compounding.</div>
       <div id="termsWrap"></div>
       <div class="toolbar" style="margin-top:10px">
         <button type="button" class="primary" id="addTermBtn">+ Add term / renewal</button>
-        <span class="note" style="margin:0">Starts the day after the last term ends, opens with its projected end balance; set its amortization (and lender, if you are switching banks) in the new term.</span>
       </div>
-      <form id="paymentDayForm" class="toolbar" style="align-items:flex-end;margin-top:14px">
-        <div><label>Payment frequency</label><select id="paymentFrequencySelect">
-          <option value="monthly">Monthly</option>
-          <option value="semi_monthly">Semi-monthly</option>
-          <option value="bi_weekly">Bi-weekly</option>
-          <option value="accelerated_bi_weekly">Accelerated bi-weekly</option>
-          <option value="weekly">Weekly</option>
-          <option value="accelerated_weekly">Accelerated weekly</option>
-        </select></div>
-        <div><label>Payment day (deduction day)</label><input type="number" id="paymentDayInput" min="1" max="31" step="1" placeholder="e.g. 1" style="width:110px"></div>
-        <button type="submit">Save payment schedule</button>
-      </form>
-      <div class="note" style="margin-left:0">The monthly payment amount (above) is converted to a per-payment amount by frequency: regular schedules keep the same yearly total, while accelerated schedules pay half the monthly amount every two weeks (a quarter weekly) — 13 monthly payments a year. The payment day (1–31, leave empty to clear) is the day of the month your payment leaves your account; it only anchors the projection charts' dates for monthly and semi-monthly schedules, so the interest amounts do not depend on it.</div>
-      <div class="note" id="paymentFreqNote" style="margin-left:0"></div>
   </div>
 </div>
 
