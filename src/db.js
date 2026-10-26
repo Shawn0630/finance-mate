@@ -266,6 +266,7 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   term_months INTEGER NOT NULL DEFAULT 60,  -- contract length, 1..120
   amortization_years REAL,            -- amortization agreed for this term; NULL = not set
   opening_balance REAL,               -- balance the term opened with
+  repayment_method TEXT NOT NULL DEFAULT 'equal_payment',  -- 'equal_payment' (level payment) | 'equal_principal' (fixed monthly principal)
   amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -287,6 +288,13 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   if (segCols.length && !segCols.includes('term_id')) {
     db.exec('ALTER TABLE rate_segments ADD COLUMN term_id INTEGER REFERENCES mortgage_terms(id) ON DELETE SET NULL');
     db.exec('CREATE INDEX IF NOT EXISTS idx_segments_term ON rate_segments(term_id)');
+  }
+  // Terms from before repayment methods existed are level-payment
+  // plans — the only shape the engine had — so the column lands
+  // with that default and their projections do not move.
+  const termCols = db.prepare('PRAGMA table_info(mortgage_terms)').all().map((c) => c.name);
+  if (termCols.length && !termCols.includes('repayment_method')) {
+    db.exec("ALTER TABLE mortgage_terms ADD COLUMN repayment_method TEXT NOT NULL DEFAULT 'equal_payment'");
   }
 }
 // Idempotent backfill: every property gets a Term 1, and every

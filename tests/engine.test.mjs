@@ -495,13 +495,14 @@ test('prime history: a Prime - 1 segment charges December at 5% and January at 4
   assert.ok(close(fixed.series[1].interest, 411.62), fixed.series[1].interest);
 });
 
-test('buildSchedule: a prime step recasts the payment from the step month (adjustable-rate replay)', () => {
+test('buildSchedule: a prime step reprices interest but never recasts the payment (fixed-payment variable)', () => {
   // Fake history in the real series' shape: prime 5.45 when the term
   // starts (Dec 2024), stepping to 4.95 in March 2025. The payment is
-  // derived at the START month's prime (5.45 - 1 = 4.45%, 25 years);
-  // from March it is recast at 3.95% against the payoff the loan was
-  // already heading to — hand-checkable below via a fixed-rate
-  // extrapolation of the February state.
+  // derived ONCE, at the START month's prime (5.45 - 1 = 4.45%, 25
+  // years), and prime moving afterwards does NOT touch it — the
+  // user's variable product is fixed-payment: only the
+  // interest/principal split moves, because each month's interest is
+  // priced at that month's own prime.
   const primeHistory = [
     { date: '2024-12-11', rate: 5.95 },
     { date: '2024-12-18', rate: 5.45 },
@@ -517,24 +518,102 @@ test('buildSchedule: a prime step recasts the payment from the step month (adjus
   const jan = r.series.find((row) => row.month === '2025-01');
   const feb = r.series.find((row) => row.month === '2025-02');
   const mar = r.series.find((row) => row.month === '2025-03');
+  // The monthly RATE steps with prime (Jan 4.45%, Mar 3.95%)...
   assert.equal(jan.rate, 4.45);
-  assert.equal(jan.payment, r.paymentUsed);
-  assert.equal(feb.payment, r.paymentUsed);
   assert.equal(mar.rate, 3.95);
-  // Hand-check the recast: extrapolate the February state at the old
-  // rate/payment to its payoff, then derive at 3.95% over the months
-  // left to that same payoff.
-  const hypo = simulate({
-    balance: feb.balance, balanceDate: feb.date, payment: r.paymentUsed,
-    segments: [{ start_date: '2025-02-01', rate_type: 'fixed', annual_rate: 4.45 }],
+  // ...but the payment is the derived payment in EVERY month (bar
+  // the smaller final one), before and after the step alike.
+  assert.ok(r.series.slice(0, -1).every((row) => row.payment === r.paymentUsed),
+    'payment constant across the prime step');
+  // What changes at the step is the split: January's interest is the
+  // opening balance at 4.45%; March's is the February-end balance at
+  // 3.95% — each hand-checkable at its own month's prime.
+  assert.ok(close(jan.interest, 100000 * monthlyRate(4.45), 0.02), jan.interest);
+  assert.ok(close(mar.interest, feb.balance * monthlyRate(3.95), 0.02), mar.interest);
+  assert.ok(mar.principal > jan.principal, 'a bigger share of the same payment reaches principal after the step');
+});
+
+// ------------------------------------------------------- equal principal --
+// 等额本金: the monthly principal is fixed (balance at the plan's
+// start / amortization months remaining there) and each month pays
+// it plus that month's interest, so payments decline steadily and
+// the balance clears exactly at the amortization end.
+// Hand fixture: $120,000 at 6% fixed, 10-year amortization.
+//   monthly principal = 120000 / 120 = $1,000
+//   month 1 interest = 120000 x monthlyRate(6%) = 120000 x 0.00493862
+//                    = $592.63  -> payment $1,592.63, balance $119,000
+//   month 2 interest = 119000 x 0.00493862 = $587.70 -> payment $1,587.70
+
+test('buildSchedule equal principal: fixed principal, declining payments, clears at the amortization end', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 }];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 10, repayment_method: 'equal_principal' }];
+  const r = buildSchedule({ balance: 120000, balanceDate: '2026-01-01', terms, segments });
+  assert.equal(r.state, 'projected');
+  assert.equal(r.paymentSource, 'derived');
+  assert.equal(r.series.length, 120); // exactly the amortization, no drift
+  assert.equal(r.payoffMonth, '2036-01');
+  assert.ok(r.series.every((row) => row.principal === 1000), 'every month pays exactly $1,000 of principal');
+  assert.ok(close(r.series[0].interest, 592.63), r.series[0].interest);
+  assert.ok(close(r.series[0].payment, 1592.63), r.series[0].payment);
+  assert.ok(close(r.series[0].balance, 119000), r.series[0].balance);
+  assert.ok(close(r.series[1].interest, 587.70), r.series[1].interest);
+  assert.ok(close(r.series[1].payment, 1587.70), r.series[1].payment);
+  // Payments decline monotonically; the last is principal + one
+  // month's interest on the final $1,000.
+  assert.ok(r.series.every((row, i) => i === 0 || row.payment < r.series[i - 1].payment), 'payments decline every month');
+  assert.ok(close(r.series[119].payment, 1000 + 1000 * monthlyRate(6), 0.02), r.series[119].payment);
+  assert.equal(r.series[119].balance, 0);
+  // paymentUsed reports the first (highest) payment.
+  assert.ok(close(r.paymentUsed, 1592.63), r.paymentUsed);
+  // Equal principal costs less interest than the level payment on
+  // the same loan (principal comes off faster from month one).
+  const level = buildSchedule({
+    balance: 120000, balanceDate: '2026-01-01', segments,
+    terms: [{ id: 1, start_date: '2026-01-01', amortization_years: 10 }],
   });
-  const [py, pm] = hypo.payoffMonth.split('-').map(Number);
-  const [fy, fm] = feb.month.split('-').map(Number);
-  const monthsLeft = (py * 12 + pm) - (fy * 12 + fm);
-  const expected = derivePayment(feb.balance, 3.95, monthsLeft / 12);
-  assert.ok(close(mar.payment, expected, 0.02), `${mar.payment} vs ${expected}`);
-  assert.ok(mar.payment < r.paymentUsed, 'the payment steps DOWN with prime');
-  // And it then holds at the recast value (no further steps).
-  const apr = r.series.find((row) => row.month === '2025-04');
-  assert.equal(apr.payment, mar.payment);
+  assert.ok(close(level.paymentUsed, derivePayment(120000, 6, 10), 0.02), level.paymentUsed);
+  assert.ok(r.totalInterest < level.totalInterest, `${r.totalInterest} < ${level.totalInterest}`);
+});
+
+test('buildSchedule equal principal: a lump sum keeps the monthly principal and pulls the payoff in', () => {
+  const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 }];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 10, repayment_method: 'equal_principal' }];
+  const base = { balance: 120000, balanceDate: '2026-01-01', terms, segments };
+  const plain = buildSchedule(base);
+  // $12,000 lands in projected month 13 (January 2027): exactly 12
+  // monthly principals' worth, so the payoff pulls in 12 months.
+  const withLump = buildSchedule({ ...base, lumpSums: [{ date: '2027-01-15', amount: 12000 }] });
+  assert.deepEqual(withLump.series.slice(0, 11), plain.series.slice(0, 11));
+  // January 2027: interest on the reduced balance (109,000 - 12,000
+  // = 97,000), principal still exactly $1,000.
+  const jan = withLump.series[11];
+  assert.equal(jan.month, '2027-01');
+  assert.ok(close(jan.interest, 97000 * monthlyRate(6), 0.02), jan.interest);
+  assert.equal(jan.principal, 1000);
+  assert.ok(withLump.series.every((row) => row.principal === 1000), 'the monthly principal never changes');
+  assert.equal(withLump.payoffMonth, '2035-01'); // 12 months earlier than 2036-01
+  assert.ok(withLump.totalInterest < plain.totalInterest);
+});
+
+test('buildSchedule equal principal: prime steps move only the interest, the principal is constant', () => {
+  // Same fake prime history shape as the fixed-payment test, on an
+  // equal-principal term: principal is 100000 / 300 = $333.33 every
+  // month; January's interest prices at 4.45%, March's at 3.95%, so
+  // the payment steps at the prime step by the interest difference
+  // alone.
+  const primeHistory = [
+    { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-03-12', rate: 4.95 },
+  ];
+  const segments = [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 }];
+  const terms = [{ id: 1, start_date: '2024-12-17', amortization_years: 25, repayment_method: 'equal_principal' }];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2024-12-17', terms, segments, primeHistory });
+  assert.equal(r.state, 'projected');
+  assert.ok(r.series.every((row) => Math.abs(row.principal - 333.33) < 0.005 || row.balance === 0),
+    'principal fixed at balance / amortization months');
+  const feb = r.series.find((row) => row.month === '2025-02');
+  const mar = r.series.find((row) => row.month === '2025-03');
+  assert.equal(mar.rate, 3.95);
+  assert.ok(close(mar.interest, feb.balance * monthlyRate(3.95), 0.02), mar.interest);
+  assert.ok(close(mar.payment - mar.principal, mar.interest, 0.001), 'payment = principal + that month\u2019s interest');
 });

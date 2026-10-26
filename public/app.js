@@ -1130,6 +1130,7 @@ function segFormHtml(t) {
     <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
     <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div></div>
     <button class="primary" type="submit">Add segment</button>
+    <div class="note" data-plan-preview style="flex-basis:100%;margin:2px 0 0"></div>
   </form>`;
 }
 
@@ -1170,6 +1171,11 @@ function renderTerms(p) {
               <div class="toolbar" style="margin-top:6px">${[1, 2, 3, 4, 5, 7, 10].map((y) => `<button type="button" class="small" data-term-years="${y}">${y} year${y === 1 ? '' : 's'}</button>`).join('')}</div>
             </div>
             <div><label>Amortization for this term (years)</label><input name="amortization_years" type="number" step="0.5" min="1" max="35" value="${t.amortization_years ?? ''}" placeholder="e.g. 25"></div>
+            <div><label>Repayment method</label><select name="repayment_method">
+              <option value="equal_payment"${t.repayment_method !== 'equal_principal' ? ' selected' : ''}>Equal payment — same total every month</option>
+              <option value="equal_principal"${t.repayment_method === 'equal_principal' ? ' selected' : ''}>Equal principal — same principal every month</option>
+            </select>
+            <div class="note" style="margin:2px 0 0">Equal payment: the interest share shrinks and the principal share grows inside one level payment. Equal principal: the principal part is fixed (balance ÷ remaining amortization) and the payment starts higher, then declines each month.</div></div>
           </div>
           ${t.amortization_defaulted ? '<div class="note" style="margin-left:0">The 25-year amortization on this term is the migration default — set the real figure if it differs.</div>' : ''}
           <div class="toolbar">
@@ -1232,7 +1238,7 @@ $('#termsWrap').addEventListener('click', async (e) => {
   if (showSeg) {
     const block = showSeg.closest('[data-term-block]');
     const form = block && block.querySelector('[data-seg-form]');
-    if (form) { form.classList.remove('hidden'); syncSegForm(form); }
+    if (form) { form.classList.remove('hidden'); syncSegForm(form); refreshPlanPreview(form); }
     return;
   }
   const showLump = e.target.closest('[data-toggle-lump]');
@@ -1268,11 +1274,22 @@ $('#termsWrap').addEventListener('click', async (e) => {
 
 $('#termsWrap').addEventListener('change', (e) => {
   const form = e.target.closest('[data-seg-form]');
-  if (form) syncSegForm(form);
+  if (form) { syncSegForm(form); refreshPlanPreview(form); return; }
+  // The term's plan fields (repayment method, amortization) re-price
+  // the preview of that term's draft segment.
+  if (e.target.closest('[data-term-form]')
+    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years')) {
+    const seg = segFormOfBlock(e.target);
+    if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
+  }
 });
 $('#termsWrap').addEventListener('input', (e) => {
   const form = e.target.closest('[data-seg-form]');
-  if (form && e.target.name === 'spread') syncSegForm(form);
+  if (form) { if (e.target.name === 'spread') syncSegForm(form); refreshPlanPreview(form); return; }
+  if (e.target.closest('[data-term-form]') && e.target.name === 'amortization_years') {
+    const seg = segFormOfBlock(e.target);
+    if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
+  }
 });
 
 $('#termsWrap').addEventListener('submit', async (e) => {
@@ -1290,6 +1307,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
           term_months: Number(f.term_months),
           amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
           opening_balance: f.opening_balance === '' || f.opening_balance == null ? null : f.opening_balance,
+          repayment_method: f.repayment_method || 'equal_payment',
         },
       });
       markAssetsDirty();
@@ -1461,6 +1479,59 @@ function syncSegForm(form) {
 
 function refreshSegPreviews() {
   document.querySelectorAll('[data-seg-form]').forEach(syncSegForm);
+}
+
+// Live plan preview: while a rate plan is being drafted in a term's
+// add-segment form, the server runs the draft through the same
+// schedule engine as the saved projection and returns the plan's
+// first month in effect — payment, interest, principal and the rate
+// — so the figures can be checked BEFORE anything is saved.
+// Debounced per form; the term's plan fields as currently edited
+// (repayment method, amortization) ride along, so changing them
+// re-prices the preview too.
+const planPreviewTimers = new WeakMap();
+function refreshPlanPreview(form) {
+  if (!form || !currentPropertyId) return;
+  const out = form.querySelector('[data-plan-preview]');
+  if (!out) return;
+  clearTimeout(planPreviewTimers.get(form));
+  planPreviewTimers.set(form, setTimeout(async () => {
+    if (!form.isConnected) return;
+    const block = form.closest('[data-term-block]');
+    const termForm = block && block.querySelector('[data-term-form]');
+    const f = Object.fromEntries(new FormData(form).entries());
+    const body = {
+      start_date: f.start_date,
+      rate_type: f.rate_type,
+      term_id: Number(form.dataset.segForm),
+      repayment_method: termForm ? termForm.repayment_method.value : 'equal_payment',
+      amortization_years: termForm && termForm.amortization_years.value !== ''
+        ? Number(termForm.amortization_years.value) : null,
+    };
+    if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
+      body.rate_mode = 'prime_spread';
+      body.spread = f.spread === '' ? null : Number(f.spread);
+    } else {
+      body.rate_mode = 'absolute';
+      body.annual_rate = f.annual_rate === '' ? null : Number(f.annual_rate);
+    }
+    try {
+      const r = await api(`/api/properties/${currentPropertyId}/preview`, { method: 'POST', body });
+      if (!form.isConnected) return;
+      out.textContent = r.ok
+        ? `Next month (${r.month}): payment ${money(r.payment)} — interest ${money(r.interest)}, principal ${money(r.principal)}, at ${Number(r.rate).toFixed(2)}%`
+        : (r.error || '');
+    } catch (err) {
+      if (form.isConnected) out.textContent = err.message;
+    }
+  }, 300));
+}
+
+// A term block's open add-segment form, if any (previews refresh
+// when the term's own plan fields change too).
+function segFormOfBlock(el) {
+  const block = el && el.closest('[data-term-block]');
+  return block ? block.querySelector('[data-seg-form]') : null;
 }
 
 // Payment frequency + payment day are property fields, but they are

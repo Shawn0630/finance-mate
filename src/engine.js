@@ -158,8 +158,7 @@ export function primeHistoryResolver(primeHistory, primeRate) {
 // Month keys whose priced prime differs from the previous month's —
 // the prime-CHANGE months. A step's first priced month is the month
 // of the observation that posts the new rate (see the resolver's
-// month-end rule). These months are payment-recalculation events
-// for prime-spread segments in buildSchedule.
+// month-end rule).
 export function primeStepMonths(primeHistory) {
   if (!Array.isArray(primeHistory) || primeHistory.length < 2) return [];
   const obs = primeHistory
@@ -204,7 +203,14 @@ export function derivePayment(balance, annualRatePct, years) {
 //   balance:      current remaining balance (at balanceDate)
 //   balanceDate:  'YYYY-MM-DD' the balance refers to
 //   payment:      MONTHLY payment actually used; the per-period amount
-//                 is derived from it by frequency (periodPaymentFor)
+//                 is derived from it by frequency (periodPaymentFor).
+//                 Ignored when principalPerMonth is given.
+//   principalPerMonth: equal-principal mode — the fixed MONTHLY
+//                 principal (converted per period exactly like a
+//                 payment). Each period then pays that principal
+//                 plus the interest on the balance at that period's
+//                 own rate, so the total payment declines month by
+//                 month as the balance falls.
 //   segments:     [{ start_date, rate_type, annual_rate }] sorted by start
 //   paymentDay:   optional 1..31, the day of the month the payment is
 //                 deducted. For monthly / semi-monthly it ANCHORS each
@@ -233,10 +239,14 @@ export function derivePayment(balance, annualRatePct, years) {
 // where a row aggregates every period that fell in that month: interest
 // and payment are the month's totals, balance is the balance after the
 // month's last period, and date is that last period's date.
-export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
+export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA', principalPerMonth = null }) {
   const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
   const f = FREQUENCIES[frequency] || FREQUENCIES.monthly;
-  const perPeriod = periodPaymentFor(payment, FREQUENCIES[frequency] ? frequency : 'monthly');
+  const freqKey = FREQUENCIES[frequency] ? frequency : 'monthly';
+  const perPeriod = periodPaymentFor(payment, freqKey);
+  const principalMode = principalPerMonth !== null && principalPerMonth !== undefined
+    && isFinite(Number(principalPerMonth));
+  const perPeriodPrincipal = principalMode ? periodPaymentFor(Number(principalPerMonth), freqKey) : null;
   const series = [];
   let bal = round2(Number(balance));
   const start = parseYM(balanceDate);
@@ -256,12 +266,21 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
     if (annualRate === null) throw new Error('a prime-based segment cannot be projected without a prime rate');
     const i = periodicRate(annualRate, f.periodsPerYear, region);
     const interest = round2(bal * i);
-    let principal = round2(perPeriod - interest);
-    let paid = round2(perPeriod);
-    if (principal >= bal) {
-      // Final payment: clear the balance exactly.
-      principal = bal;
-      paid = round2(bal + interest);
+    let principal;
+    let paid;
+    if (principalMode) {
+      // Equal principal: the period pays its fixed principal slice
+      // (capped at the balance) plus this period's interest.
+      principal = Math.min(perPeriodPrincipal, bal);
+      paid = round2(principal + interest);
+    } else {
+      principal = round2(perPeriod - interest);
+      paid = round2(perPeriod);
+      if (principal >= bal) {
+        // Final payment: clear the balance exactly.
+        principal = bal;
+        paid = round2(bal + interest);
+      }
     }
     if (principal < 0) negativeAmortization = true;
     bal = round2(bal - principal);
@@ -340,38 +359,49 @@ function monthIdxOf(dateStr) {
 // and the events inside them — the way a Canadian mortgage actually
 // runs. A term is a contract period with its own lender, amortization
 // and opening balance; inside a term the rate can change (a new rate
-// segment starts) and lump sums can land. The monthly payment is
-// recomputed at SOME events, the bank-standard way:
+// segment starts) and lump sums can land. Each term also picks a
+// REPAYMENT METHOD (term.repayment_method):
+//   - 'equal_payment' (default): a level monthly payment — interest
+//     shrinks and principal grows inside it (the 等额本息 shape);
+//   - 'equal_principal': a fixed monthly PRINCIPAL — the balance at
+//     the plan's start divided by the amortization months remaining
+//     at that point — plus each month's interest at that month's own
+//     rate, so the payment starts higher and declines month by
+//     month (the 等额本金 shape), clearing the balance exactly at
+//     the amortization end.
+// The plan (payment, or principal) is recomputed at SOME events,
+// the bank-standard way:
 //   - a TERM starting: derived from the balance at that point, the
-//     rate then in effect and the new term's amortization;
-//   - a RATE CHANGE (a segment starting): re-derived against the
-//     payoff the loan was already heading to — the pre-change
-//     trajectory (previous payment, previous rate, held constant)
-//     is extrapolated to its projected payoff month and the new
-//     payment amortizes the balance to that same month at the new
-//     rate, so a rate change moves the payment only through the
-//     rate itself and never re-sets the payoff. If the pre-change
-//     trajectory never pays off (negative amortization), the
-//     fallback is the active term's REMAINING amortization (its
+//     rate then in effect and the new term's amortization (equal
+//     payment: derivePayment over the amortization; equal
+//     principal: balance / amortization months);
+//   - a RATE CHANGE (a segment starting): equal payment re-derives
+//     against the payoff the loan was already heading to — the
+//     pre-change trajectory (previous payment, previous rate, held
+//     constant) is extrapolated to its projected payoff month and
+//     the new payment amortizes the balance to that same month at
+//     the new rate, so a rate change moves the payment only through
+//     the rate itself and never re-sets the payoff. If the
+//     pre-change trajectory never pays off (negative amortization),
+//     the fallback is the active term's REMAINING amortization (its
 //     amortization minus the months already elapsed in the term,
 //     counted from the balance anchor for the anchor's term and
-//     from the term's start for later terms);
-//   - a LUMP SUM landing: the payment does NOT change. The lump sum
+//     from the term's start for later terms). Equal principal
+//     re-anchors instead: balance at the segment's start / the
+//     amortization months remaining at that point;
+//   - a LUMP SUM landing: the plan does NOT change. The lump sum
 //     deducts from the balance FIRST (in its month, before that
-//     month's interest) and the unchanged payment then pays the
-//     loan off sooner, for less total interest — how Canadian
-//     lenders treat a prepayment;
+//     month's interest) and the unchanged payment (or unchanged
+//     monthly principal) then pays the loan off sooner, for less
+//     total interest — how Canadian lenders treat a prepayment;
 //   - a PRIME CHANGE (a step in the tracked prime history) while a
-//     prime-spread segment governs: the payment is re-derived from
-//     the step month on, exactly like a rate change — the balance
-//     at that point, the new rate (that month's prime + spread) and
-//     the current trajectory's payoff month. This is the
-//     adjustable-rate replay: a variable payment tracks prime as
-//     it actually moved, month by month, instead of being priced
-//     at today's prime for the loan's whole life. Fixed and
-//     absolute segments never trigger it, and months beyond the
-//     last stored observation price at the latest known prime.
-// Between events the payment is constant, so the projection is a
+//     prime-spread segment governs: NOT an event. A variable plan's
+//     payment is set when the plan starts — priced off that month's
+//     prime — and does not move when prime moves; only the
+//     interest/principal split changes, because simulate() prices
+//     every month at that month's own prime (months beyond the
+//     last stored observation hold at the latest known prime).
+// Between events the plan is constant, so the projection is a
 // chain of simulate() runs, one per inter-event span, carrying the
 // balance across. The entered monthly payment
 // (paymentOverride) is an override that rules only inside the term
@@ -379,7 +409,8 @@ function monthIdxOf(dateStr) {
 // to automatic.
 //
 //   balance / balanceDate: the current-balance anchor (as simulate)
-//   terms:      [{ id, start_date, amortization_years }] any order
+//   terms:      [{ id, start_date, amortization_years,
+//               repayment_method }] any order
 //   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
 //               before the balance date is already reflected in the
 //               anchor balance and is ignored
@@ -388,8 +419,10 @@ function monthIdxOf(dateStr) {
 // anchor term carries no amortization and no override is entered
 // (the payment cannot be computed), or 'no_prime' when a prime-
 // spread segment exists but no prime rate is known. paymentUsed is
-// the monthly payment in effect at the anchor; paymentSource is
-// 'entered' (the override) or 'derived' (auto-computed).
+// the monthly payment in effect at the anchor (for an
+// equal-principal plan, its FIRST month's payment — the payments
+// decline from there); paymentSource is 'entered' (the override)
+// or 'derived' (auto-computed).
 export function buildSchedule({ balance, balanceDate, paymentOverride = null, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
   const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null, paymentSource: null };
   const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
@@ -455,6 +488,29 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     return { payment: derivePayment(balNow, rate, remaining / 12), source: 'derived' };
   };
 
+  // The repayment method governing months after state point S is
+  // the active term's: 'equal_principal' only when the term says
+  // so; anything else (including a term row from before the
+  // column existed) is the level-payment default.
+  const methodAt = (S) => {
+    const term = termAtMonth(S + 1);
+    return term && term.repayment_method === 'equal_principal' ? 'equal_principal' : 'equal_payment';
+  };
+
+  // The equal-principal plan at state point S: a fixed monthly
+  // principal = the balance at this point divided by the months of
+  // amortization the active term has left here (counted from the
+  // term's own epoch, exactly like computePayment's remaining).
+  // Each month then pays that principal plus its own interest, so
+  // the balance clears exactly at the amortization end.
+  const computePrincipal = (S, balNow) => {
+    const term = termAtMonth(S + 1);
+    if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
+    const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
+    if (remaining <= 0) return { principalPerMonth: round2(balNow), source: 'derived' }; // past the amortization: clear it in one month
+    return { principalPerMonth: round2(balNow / remaining), source: 'derived' };
+  };
+
   // The payment after a RATE CHANGE at state point S (a new segment
   // governs months from S + 1 on). Bank-standard recast: find the
   // payoff month the loan was already heading to — extrapolate the
@@ -467,9 +523,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // If the pre-change trajectory never pays off (negative
   // amortization, or beyond the projection cap), fall back to the
   // term's remaining amortization (computePayment).
-  // Also the recast for a PRIME CHANGE at S: the "new rate" is the
-  // governing segment priced at month S + 1's prime, the "previous
-  // rate" the same segment priced at month S's prime.
   const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
     if (overrideAt(S)) {
       return { payment: round2(paymentOverride), source: 'entered' };
@@ -490,19 +543,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       }
     }
     return computePayment(S, balNow);
-  };
-
-  // Does the boundary at S recast for a prime change? Only when the
-  // segment governing the months after S is priced off prime AND
-  // its effective rate actually moves between month S and S + 1
-  // (a step the spread floor could in principle mask). A fixed or
-  // absolute segment never recasts for prime.
-  const isPrimeRecast = (S) => {
-    const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
-    if (!seg || seg.rate_type !== 'variable' || seg.rate_mode !== 'prime_spread') return false;
-    const before = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S)), ymKeyOfIdx(S), primeForMonth);
-    const after = segmentRateForMonth(seg, ymKeyOfIdx(S + 1), primeForMonth);
-    return before !== null && after !== null && before !== after;
   };
 
   // Lump sums grouped by the state point they land on (the point
@@ -527,26 +567,20 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   }
   // Event state points after the anchor: term starts, segment
   // starts and lump-sum landings. (Anything at or before the anchor
-  // is already reflected in the opening state.) The three kinds are
-  // tracked separately because they treat the payment differently:
+  // is already reflected in the opening state.) The kinds are
+  // tracked separately because they treat the plan differently:
   // a term start re-derives it on the new amortization, a rate
-  // change recasts it against the current trajectory's payoff, and
-  // a lump sum leaves it unchanged.
+  // change recasts it (equal payment) or re-anchors it (equal
+  // principal), and a lump sum leaves it unchanged. Prime steps in
+  // the tracked history are NOT events: simulate() prices each
+  // month inside a span at that month's own prime, and the plan a
+  // variable segment started with stands until a real event above.
   const termStates = new Set();
   const segStates = new Set();
-  const primeStates = new Set();
   const eventStates = new Set();
   for (const t of sortedTerms) { const s = monthIdxOf(t.start_date) - 1; if (s > A) { termStates.add(s); eventStates.add(s); } }
   for (const sg of segments) { const s = monthIdxOf(sg.start_date) - 1; if (s > A) { segStates.add(s); eventStates.add(s); } }
   for (const s of lumpByState.keys()) eventStates.add(s);
-  // Prime steps (from the tracked history) are events too: a prime
-  // change recasts the payment of a prime-spread segment from the
-  // step month on. Steps at or before the anchor are already priced
-  // into the anchor derivation.
-  for (const mk of primeStepMonths(primeHistory)) {
-    const s = monthIdxOf(mk) - 1;
-    if (s > A) { primeStates.add(s); eventStates.add(s); }
-  }
   const boundaries = [...eventStates].sort((a, b) => a - b);
   boundaries.push(A + maxMonths);
 
@@ -573,41 +607,53 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
 
   let S = A;
   let chunkBalanceDate = balanceDate;
+  let lastPlan = null; // the running plan: { payment } or { principalPerMonth }
+  let anchorPlan = null;
   for (const nextS of boundaries) {
     if (bal <= 0 || S >= A + maxMonths) break;
+    // The plan for the span after S, per the governing term's
+    // repayment method — unless the entered payment overrides it
+    // (the override is a level payment whatever the method).
     let cp;
+    const principalPlan = methodAt(S) === 'equal_principal' && !overrideAt(S);
     if (S === A || termStates.has(S)) {
-      // The anchor, or a new term starting: derive the payment on
-      // the (new) term's amortization. A segment that starts with
-      // the term is the term's opening rate plan, not a mid-stream
+      // The anchor, or a new term starting: derive the plan on the
+      // (new) term's amortization. A segment that starts with the
+      // term is the term's opening rate plan, not a mid-stream
       // rate change.
-      cp = computePayment(S, bal);
+      cp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
     } else if (segStates.has(S)) {
-      // A rate change inside the running schedule.
-      cp = computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
-    } else if (primeStates.has(S) && isPrimeRecast(S)) {
-      // A prime change while a prime-spread segment governs: an
-      // adjustable-rate recast, same rule as a rate change.
-      cp = computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
+      // A rate change inside the running schedule: equal payment
+      // recasts against the trajectory's payoff; equal principal
+      // re-anchors the monthly principal on the balance and the
+      // amortization months left.
+      cp = principalPlan ? computePrincipal(S, bal) : computeRateChangePayment(S, bal, lastPayment, chunkBalanceDate);
     } else {
       // A lump-sum-only boundary: the balance was already reduced
-      // below; the payment carries over unchanged and the loan
-      // simply pays off sooner.
-      cp = { payment: lastPayment, source: paymentSource };
+      // below; the plan carries over unchanged (same payment, or
+      // same monthly principal) and the loan simply pays off sooner.
+      cp = lastPlan;
     }
     if (cp.error) {
       if (S === A) return { ...blocked, state: cp.error };
       // A later term without an amortization cannot recompute the
-      // payment: the previous payment carries over unchanged.
-      cp = { payment: lastPayment, source: paymentSource };
+      // plan: the previous plan carries over unchanged.
+      cp = lastPlan;
     }
-    if (S === A) { paymentUsed = cp.payment; paymentSource = cp.source; }
-    lastPayment = cp.payment;
+    if (S === A) {
+      anchorPlan = cp;
+      paymentSource = cp.source;
+      paymentUsed = cp.payment !== undefined ? cp.payment : null; // principal plan: filled from the first row below
+    }
+    lastPlan = cp;
+    if (cp.payment !== undefined) lastPayment = cp.payment;
     const span = Math.min(nextS, A + maxMonths) - S;
     if (span > 0) {
       const r = simulate({
-        balance: bal, balanceDate: chunkBalanceDate, payment: cp.payment, segments,
-        paymentDay: anchorDay, frequency, maxMonths: span, primeRate, primeHistory, region,
+        balance: bal, balanceDate: chunkBalanceDate,
+        payment: cp.payment !== undefined ? cp.payment : 0,
+        principalPerMonth: cp.principalPerMonth !== undefined ? cp.principalPerMonth : null,
+        segments, paymentDay: anchorDay, frequency, maxMonths: span, primeRate, primeHistory, region,
       });
       series.push(...r.series);
       totalInterest = round2(totalInterest + r.totalInterest);
@@ -615,6 +661,10 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       if (r.series.length) {
         bal = r.series[r.series.length - 1].balance;
         chunkBalanceDate = r.series[r.series.length - 1].date;
+        // For a later recast that needs "the previous payment", an
+        // equal-principal span's most recent actual payment is the
+        // closest stand-in (its payments decline month by month).
+        if (cp.principalPerMonth !== undefined) lastPayment = r.series[r.series.length - 1].payment;
       }
       if (r.payoffMonth) { payoffMonth = r.payoffMonth; break; }
     }
@@ -639,6 +689,12 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
         break;
       }
     }
+  }
+  // An equal-principal anchor plan has no single payment to report:
+  // its first month's payment (the highest — they decline from
+  // there) stands in as the payment in effect at the anchor.
+  if (paymentUsed === null && anchorPlan && anchorPlan.principalPerMonth !== undefined && series.length) {
+    paymentUsed = series[0].payment;
   }
   return {
     state: 'projected', series, totalInterest,

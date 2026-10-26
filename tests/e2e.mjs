@@ -1027,11 +1027,13 @@ try {
   // The user's real shape, replayed on the stub history: $1,350,000
   // dated 2024-12-17, Prime - 1, 25-year amortization, and NO
   // entered payment — the payment must come out of the model. It is
-  // derived at the start month's prime (Dec 2024: 5.45 -> 4.45%),
-  // each month prices at its own prime (Feb 5.20 -> 4.20%, Mar 4.95
-  // -> 3.95%, Sep 4.70 -> 3.70%, Nov 4.45 -> 3.45%), and the payment
-  // steps DOWN at each prime step (adjustable-rate replay) instead
-  // of being priced at today's prime for the whole loan.
+  // derived ONCE at the start month's prime (Dec 2024: 5.45 ->
+  // 4.45%) and then NEVER moves: his variable product is
+  // fixed-payment, so each month prices its interest at its own
+  // prime (Feb 5.20 -> 4.20%, Mar 4.95 -> 3.95%, Sep 4.70 -> 3.70%,
+  // Nov 4.45 -> 3.45%) and only the interest/principal split walks
+  // — prime is not priced at today's value for the whole loan, and
+  // it does not recast the payment either.
   r = await req('POST', '/api/properties', {
     address: '9 Replay Road, Victoria, BC', mortgage_balance: 1350000,
     mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17',
@@ -1049,19 +1051,18 @@ try {
       && replayRow('2025-01').rate === 4.45
       && replayRow('2025-01').interest === Math.round(1350000 * engineMonthlyRate(4.45) * 100) / 100,
     JSON.stringify({ used: replay.paymentUsed, first: replay.series && replay.series[0] }));
-  check('replay: every month prices at its own prime and the payment steps down at each step',
+  check('replay: every month prices at its own prime but the payment never steps (fixed-payment variable)',
     replayRow('2025-02').rate === 4.2 && replayRow('2025-03').rate === 3.95
       && replayRow('2025-09').rate === 3.7 && replayRow('2025-11').rate === 3.45
-      && replayRow('2025-02').payment < replay.paymentUsed
-      && replayRow('2025-03').payment < replayRow('2025-02').payment
-      && replayRow('2025-09').payment < replayRow('2025-03').payment
-      && replayRow('2025-11').payment < replayRow('2025-09').payment,
+      && replay.series.slice(0, -1).every((row) => row.payment === replay.paymentUsed)
+      && replayRow('2025-03').interest === Math.round(replayRow('2025-02').balance * engineMonthlyRate(3.95) * 100) / 100,
     JSON.stringify(['2025-01', '2025-02', '2025-03', '2025-09', '2025-11']
-      .map((m) => [m, replayRow(m).rate, replayRow(m).payment])));
-  check('replay: the response states the pricing assumption (history for the past, latest known for the future)',
+      .map((m) => [m, replayRow(m).rate, replayRow(m).payment, replayRow(m).interest])));
+  check('replay: the response states the pricing assumption (history for the past, latest known for the future, fixed payment)',
     typeof replay.primeAssumption === 'string'
       && replay.primeAssumption.includes('actual Bank of Canada prime history')
-      && replay.primeAssumption.includes('4.95%'),
+      && replay.primeAssumption.includes('4.95%')
+      && replay.primeAssumption.includes('does not change when prime moves'),
     JSON.stringify(replay.primeAssumption));
   await req('DELETE', `/api/properties/${pidReplay}`);
 
@@ -1127,7 +1128,7 @@ try {
     JSON.stringify({ used: projT1.paymentUsed, src: projT1.paymentSource }));
   // Projection equivalence, locked: the series equals the engine's
   // term schedule for the same inputs (same stub prime history), to
-  // the row — pricing every month at its own prime, recast included.
+  // the row — pricing every month at its own prime, payment fixed.
   const engineRun = engineSchedule({
     balance: 1350000, balanceDate: '2024-12-17',
     terms: [{ id: term1Id, start_date: '2024-12-17', amortization_years: 30 }],
@@ -1177,9 +1178,10 @@ try {
   // the running term, and at the renewal the benefit reappears as
   // a lower re-derived Term 2 payment.
   const projPreLump = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  // The lump lands in May 2025 — a month with no prime step in the
-  // stub history — so the payment around it must be exactly the
-  // running payment (no recast event confounds the comparison).
+  // The lump lands in May 2025, priced at March's prime step
+  // (4.95 - 1 = 3.95%) — the interest check below is hand-computed
+  // at that rate, and the payment around it must be exactly the
+  // running payment (prime moves never recast it either).
   r = await req('POST', `/api/properties/${termPid}/lump-sums`, { date: '2025-05-10', amount: 50000, note: 'Bonus' });
   check('lump sum created in the term active on its date',
     r.status === 201 && r.data.term_id === term1Id && r.data.amount === 50000, JSON.stringify(r.data));
@@ -1247,6 +1249,99 @@ try {
   r = await req('DELETE', `/api/properties/${termPid}/terms/${term1Id}`);
   check('the last remaining term cannot be deleted', r.status === 400, JSON.stringify(r.data));
   await req('DELETE', `/api/properties/${termPid}`);
+
+  // ---- Repayment method (equal principal) + plan preview ----
+  // The hand-computed fixture from the engine tests, end to end:
+  // $120,000 at 6% fixed, 10-year amortization. Equal principal:
+  // $1,000 of principal every month, first interest $592.63, first
+  // payment $1,592.63, payoff exactly 120 months out (2036-01).
+  r = await req('POST', '/api/properties', {
+    address: '77 Equal Principal Parade, Victoria, BC',
+    mortgage_balance: 120000, mortgage_balance_date: '2026-01-01', purchase_date: '2026-01-01',
+  });
+  const epPid = r.data.id;
+  const epTermId = r.data.terms[0].id;
+  check('a new term defaults to equal payment',
+    r.data.terms[0].repayment_method === 'equal_payment', JSON.stringify(r.data.terms[0]));
+  await req('PUT', `/api/properties/${epPid}`, { amortization_years: 10 });
+  await req('POST', `/api/properties/${epPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 });
+  r = await req('PUT', `/api/properties/${epPid}/terms/${epTermId}`, { repayment_method: 'bogus' });
+  check('an unknown repayment method is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${epPid}/terms/${epTermId}`, { repayment_method: 'equal_principal' });
+  check('the term takes the equal-principal method',
+    r.status === 200 && r.data.repayment_method === 'equal_principal', JSON.stringify(r.data.repayment_method));
+  const epProj = (await req('GET', `/api/properties/${epPid}/amortization`)).data;
+  check('equal principal end to end: $1,000 principal a month, declining payments, payoff at the amortization end',
+    epProj.ok === true && epProj.series.length === 120 && epProj.payoffMonth === '2036-01'
+      && epProj.series.every((row) => row.principal === 1000)
+      && epProj.series[0].interest === 592.63 && epProj.series[0].payment === 1592.63
+      && epProj.paymentUsed === 1592.63
+      && epProj.series.slice(0, 12).every((row, i, a) => i === 0 || row.payment < a[i - 1].payment),
+    JSON.stringify({ used: epProj.paymentUsed, payoff: epProj.payoffMonth, first: epProj.series && epProj.series[0] }));
+  r = await req('PUT', `/api/properties/${epPid}/terms/${epTermId}`, { repayment_method: 'equal_payment' });
+  const epBack = (await req('GET', `/api/properties/${epPid}/amortization`)).data;
+  check('switching back to equal payment restores one level payment',
+    r.status === 200 && epBack.ok === true
+      && Math.abs(epBack.paymentUsed - engineDerive(120000, 6, 10)) < 0.02
+      && epBack.series.slice(0, -1).every((row) => row.payment === epBack.paymentUsed),
+    JSON.stringify({ used: epBack.paymentUsed }));
+  await req('DELETE', `/api/properties/${epPid}`);
+
+  // Plan preview: a draft segment + the term's draft plan fields go
+  // in, the plan's first month in effect comes out — computed by
+  // the same engine, so it must equal the saved projection's row
+  // for that month to the cent.
+  r = await req('POST', '/api/properties', {
+    address: '78 Preview Place, Victoria, BC',
+    mortgage_balance: 120000, mortgage_balance_date: '2026-01-01', purchase_date: '2026-01-01',
+  });
+  const pvPid = r.data.id;
+  const pvTermId = r.data.terms[0].id;
+  await req('PUT', `/api/properties/${pvPid}`, { amortization_years: 10 });
+  const pvDraft = {
+    start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6,
+    term_id: pvTermId, repayment_method: 'equal_principal',
+  };
+  r = await req('POST', `/api/properties/${pvPid}/preview`, pvDraft);
+  check('preview: an equal-principal draft prices its first month (2026-02) before anything is saved',
+    r.status === 200 && r.data.ok === true && r.data.month === '2026-02' && r.data.rate === 6
+      && r.data.principal === 1000 && r.data.interest === 592.63 && r.data.payment === 1592.63
+      && r.data.balance === 119000,
+    JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${pvPid}`);
+  check('the preview wrote nothing (no segment, method untouched)',
+    r.data.segments.length === 0 && r.data.terms[0].repayment_method === 'equal_payment',
+    JSON.stringify({ segs: r.data.segments.length, method: r.data.terms[0].repayment_method }));
+  // Save exactly what was previewed: the projection's 2026-02 row
+  // must be the previewed month, field for field.
+  await req('POST', `/api/properties/${pvPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 });
+  await req('PUT', `/api/properties/${pvPid}/terms/${pvTermId}`, { repayment_method: 'equal_principal' });
+  const pvProj = (await req('GET', `/api/properties/${pvPid}/amortization`)).data;
+  const pvRow = pvProj.series.find((x) => x.month === '2026-02') || {};
+  check('the saved projection\u2019s first month equals the preview to the cent',
+    pvRow.payment === 1592.63 && pvRow.interest === 592.63 && pvRow.principal === 1000
+      && pvRow.balance === 119000 && pvRow.rate === 6,
+    JSON.stringify(pvRow));
+  // A changed draft re-prices live: same plan at 3% instead of 6%.
+  r = await req('POST', `/api/properties/${pvPid}/preview`, { ...pvDraft, annual_rate: 3 });
+  check('preview: editing the draft rate re-prices the first month (interest at 3%)',
+    r.data.ok === true && r.data.rate === 3
+      && r.data.interest === Math.round(120000 * engineMonthlyRate(3) * 100) / 100
+      && r.data.payment === Math.round((1000 + 120000 * engineMonthlyRate(3)) * 100) / 100,
+    JSON.stringify(r.data));
+  // A mid-stream draft (a rate change next year) previews ITS first
+  // month, not the projection's first month.
+  r = await req('POST', `/api/properties/${pvPid}/preview`, {
+    start_date: '2027-01-01', rate_type: 'fixed', annual_rate: 3,
+    term_id: pvTermId, repayment_method: 'equal_principal',
+  });
+  const pvProjNow = (await req('GET', `/api/properties/${pvPid}/amortization`)).data;
+  const decRow = pvProjNow.series.find((x) => x.month === '2026-12') || {};
+  check('preview: a future-dated draft previews its own first month at its own rate',
+    r.data.ok === true && r.data.month === '2027-01' && r.data.rate === 3 && r.data.principal === 1000
+      && r.data.interest === Math.round(decRow.balance * engineMonthlyRate(3) * 100) / 100,
+    JSON.stringify(r.data));
+  await req('DELETE', `/api/properties/${pvPid}`);
 
   // ---- Property photo gallery ----
   // Uploads land in property_photos (files under data/photos); the
@@ -2252,6 +2347,53 @@ try {
       check('the lump sum is recorded under Term 1',
         r.data.terms[0].lumpSums.length === 1 && r.data.terms[0].lumpSums[0].amount === 50000,
         JSON.stringify(r.data.terms[0].lumpSums));
+
+      // ---- Plan preview in the add-segment form ----
+      // The term form carries the repayment-method select; the
+      // add-segment form previews the drafted plan's first month
+      // live (server-computed) and re-prices as the spread is
+      // edited — nothing is saved by previewing.
+      const methodSel = await page.evaluate(() => {
+        const sel = document.querySelector('#termsWrap .term-block [data-term-form] [name=repayment_method]');
+        return sel ? sel.value : null;
+      });
+      check('the term form offers the repayment method (equal payment by default)',
+        methodSel === 'equal_payment', String(methodSel));
+      await page.evaluate(() => {
+        document.querySelector('#termsWrap .term-block [data-toggle-seg]').click();
+        const form = document.querySelector('#termsWrap .term-block [data-seg-form]');
+        const set = (name, value, evt) => {
+          const el = form.querySelector(`[name=${name}]`);
+          el.value = value;
+          el.dispatchEvent(new Event(evt, { bubbles: true }));
+        };
+        set('rate_type', 'variable', 'change');
+        set('rate_mode', 'prime_spread', 'change');
+        set('spread', '-1', 'input');
+      });
+      await wait(1100);
+      const previewText1 = await page.evaluate(() =>
+        document.querySelector('#termsWrap .term-block [data-seg-form] [data-plan-preview]').textContent);
+      check('the add-segment form previews the plan\u2019s first month (payment — interest, principal, at rate)',
+        previewText1.includes('Next month (') && previewText1.includes('payment $')
+          && previewText1.includes('interest $') && previewText1.includes('principal $')
+          && previewText1.includes('at 3.95%'),
+        previewText1);
+      await page.evaluate(() => {
+        const el = document.querySelector('#termsWrap .term-block [data-seg-form] [name=spread]');
+        el.value = '-2';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await wait(1100);
+      const previewText2 = await page.evaluate(() =>
+        document.querySelector('#termsWrap .term-block [data-seg-form] [data-plan-preview]').textContent);
+      check('editing the spread re-prices the preview live (Prime - 2 -> 2.95%, a different payment)',
+        previewText2.includes('at 2.95%') && previewText2 !== previewText1,
+        previewText2);
+      r = await req('GET', `/api/properties/${termUiPid}`);
+      check('previewing saved nothing (still the one original segment)',
+        r.data.segments.length === 1 && r.data.segments[0].spread === -1,
+        JSON.stringify(r.data.segments));
       await req('DELETE', `/api/properties/${termUiPid}`);
 
       // ---- Property panel: read-only metadata until Edit; photo carousel ----
