@@ -61,6 +61,19 @@ export function getRecentPrimeChanges(limit = 5) {
   return events.slice(-limit).reverse();
 }
 
+// The full step series, oldest first: the first stored observation,
+// every change point (the first date each new level was observed),
+// and the newest observation — everything a stepped chart of the
+// rate needs, at a fraction of the weekly series' size.
+export function getPrimeStepPoints() {
+  const rows = db.prepare('SELECT date, rate FROM prime_rates ORDER BY date ASC').all();
+  if (!rows.length) return [];
+  const events = rows.filter((r, i) => i === 0 || r.rate !== rows[i - 1].rate);
+  const last = rows[rows.length - 1];
+  if (events[events.length - 1].date !== last.date) events.push(last);
+  return events;
+}
+
 function fetchedToday() {
   const last = Number(getMeta('prime_last_success') || 0);
   return last > 0 && vancouverToday(new Date(last)) === vancouverToday();
@@ -150,6 +163,7 @@ export function primeInfo() {
     fresh: status.fresh,
     asOf: status.asOf,
     changes: getRecentPrimeChanges(5),
+    history: getPrimeStepPoints(),
     lastFetchedAt: getMeta('prime_last_success'),
     source: region.primeSource,
   };

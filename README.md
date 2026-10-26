@@ -229,7 +229,10 @@ with the new value. If the Bank of Canada is unreachable, the last
 known value is used instead, the API response flags it
 (`prime: { rate, asOf, fresh: false }`), and the page shows an amber
 warning naming the rate and date in use. A manual Refresh button
-sits in the Mortgage Terms & Rates modal. A prime-priced segment always
+sits in the Mortgage Terms & Rates modal. When the current term's
+plan in effect prices off prime, the modal also draws the tracked
+prime history as a stepped chart (from just before the plan began
+through today) in place of the banner's recent-changes text. A prime-priced segment always
 resolves against the latest stored prime, floored at 0%, and
 projections hold prime constant — the detail page states the value
 and its as-of date.

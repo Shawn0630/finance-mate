@@ -941,6 +941,14 @@ try {
     Array.isArray(r.data.changes) && r.data.changes.length === 5
       && r.data.changes[0].rate === 4.95 && r.data.changes[1].rate === 4.7 && r.data.changes[2].rate === 4.45,
     JSON.stringify(r.data.changes));
+  check('prime info carries the full step history for the chart (first observation, every change point, newest observation)',
+    Array.isArray(r.data.history) && r.data.history.length === 8
+      && r.data.history[0].date === '2024-12-11' && r.data.history[0].rate === 5.95
+      && r.data.history.some((h) => h.date === '2024-12-18' && h.rate === 5.45)
+      && r.data.history.some((h) => h.date === '2025-11-05' && h.rate === 4.45)
+      && r.data.history[r.data.history.length - 1].date === '2026-10-21'
+      && r.data.history[r.data.history.length - 1].rate === 4.95,
+    JSON.stringify(r.data.history));
 
   r = await req('GET', '/api/properties/1');
   check('legacy variable segment migrated as absolute, value intact',
@@ -2200,6 +2208,46 @@ try {
           && !metaGrid.prose.includes('A mortgage runs as a chain of terms')
           && !metaGrid.prose.includes('Monthly payment derived from the remaining amortization'),
         metaGrid.prose.slice(0, 200));
+      // Prime history chart: this fixture's plan in effect is a
+      // prime-spread variable segment, so the banner's "Recent: …"
+      // text gives way to the stepped chart. Its steps are the
+      // stored history's change points (read back from the API, so
+      // both sides walk the same series) and its last value is the
+      // current prime.
+      const primeNow = (await req('GET', '/api/prime')).data;
+      let primeUi = null;
+      for (let i = 0; i < 20; i++) {
+        primeUi = await page.evaluate(() => {
+          const wrap = document.querySelector('#primeChartWrap');
+          const canvas = document.querySelector('#primeChart');
+          const rect = canvas ? canvas.getBoundingClientRect() : null;
+          const c = window.__fmCharts.prime;
+          const ds = c ? c.data.datasets[0] : null;
+          return {
+            wrapHidden: !wrap || wrap.classList.contains('hidden'),
+            hasChart: !!c,
+            stepped: ds ? ds.stepped : null,
+            ys: ds ? [...new Set(ds.data.map((pt) => pt.y))].sort((a, b) => a - b) : [],
+            lastY: ds ? ds.data[ds.data.length - 1].y : null,
+            w: rect ? rect.width : 0,
+            h: rect ? rect.height : 0,
+            changes: document.querySelector('#primeChanges').textContent,
+            banner: document.querySelector('#primeBanner').textContent,
+          };
+        });
+        if (primeUi.hasChart) break;
+        await wait(300);
+      }
+      const histRates = [...new Set((primeNow.history || []).map((h) => h.rate))].sort((a, b) => a - b);
+      check('prime-spread plan: the modal draws the stepped prime history chart and the "Recent:" text is gone',
+        !primeUi.wrapHidden && primeUi.hasChart && primeUi.stepped === 'after'
+          && JSON.stringify(primeUi.ys) === JSON.stringify(histRates)
+          && primeUi.ys.includes(5.45) && primeUi.ys.includes(4.45)
+          && primeUi.lastY === primeNow.current.rate
+          && primeUi.changes === '' && primeUi.banner.startsWith('Bank of Canada prime:'),
+        JSON.stringify(primeUi));
+      check('the prime chart renders at a real size inside the open modal',
+        primeUi.w > 200 && primeUi.h > 100, JSON.stringify({ w: primeUi.w, h: primeUi.h }));
       const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('the NO_PAYMENT note beside chart A clears once amortization is in',
         !afterMsg.includes('add a monthly payment or remaining amortization'), afterMsg);
@@ -2318,6 +2366,32 @@ try {
           && enteredStat.meta.includes('2,500') && enteredStat.metaTag === 'entered',
         JSON.stringify(enteredStat));
       await req('DELETE', `/api/properties/${amortPid}`);
+
+      // A fixed plan in effect draws NO prime chart — the banner
+      // keeps its text form with the recent change points.
+      r = await req('POST', '/api/properties', {
+        address: '456 Fixed Test Court, Victoria, BC',
+        mortgage_balance: 500000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
+      });
+      const fixedPid = r.data.id;
+      await req('POST', `/api/properties/${fixedPid}/rates`, {
+        start_date: '2024-12-17', rate_type: 'fixed', annual_rate: 5,
+      });
+      await req('PUT', `/api/properties/${fixedPid}`, { amortization_years: 25 });
+      await page.goto(`http://ff.local/#property/${fixedPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
+      const fixedPrimeUi = await page.evaluate(() => ({
+        wrapHidden: document.querySelector('#primeChartWrap').classList.contains('hidden'),
+        hasChart: !!window.__fmCharts.prime,
+        changes: document.querySelector('#primeChanges').textContent,
+      }));
+      check('fixed plan: no prime chart in the modal, the banner keeps its "Recent:" text',
+        fixedPrimeUi.wrapHidden && !fixedPrimeUi.hasChart && fixedPrimeUi.changes.includes('Recent:'),
+        JSON.stringify(fixedPrimeUi));
+      await req('DELETE', `/api/properties/${fixedPid}`);
 
       // ---- Terms UI: build a renewal through the accordion ----
       // Same shape once more, driven entirely through the page this
