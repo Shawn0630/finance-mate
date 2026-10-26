@@ -153,6 +153,9 @@ label.btnlike:hover { background: #f0f4f9; }
 .head-stat { margin-left: 10px; }
 .head-stat-k { font-size: 11px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
 .head-stat-v { font-size: 21px; font-weight: 700; line-height: 1.2; }
+/* The calculated monthly payment inside a term card: read-only and
+   prominent — it is a computed figure, never an input. */
+.term-pay-v { font-size: 19px; font-weight: 700; line-height: 1.2; padding: 5px 0; }
 .head-stat-tag { font-size: 11px; font-weight: 400; color: #71808f; margin-left: 6px; }
 .hidden { display: none !important; }
 .term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }

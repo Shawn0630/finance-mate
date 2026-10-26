@@ -90,12 +90,12 @@ async function addProperty(body, rate, points) {
 // Two properties with plans and assessed history.
 await addProperty({
   address: '88 Chip Check Crescent, Victoria, BC',
-  mortgage_balance: 900000, mortgage_balance_date: '2026-10-01', mortgage_payment: 4200,
+  mortgage_balance: 900000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
   purchase_date: '2021-03-12', owners: ['Shawn', 'Jiaying'],
 }, 4.85, [{ year: 2024, value: 980000 }, { year: 2025, value: 1065000 }, { year: 2026, value: 1150000 }]);
 await addProperty({
   address: '1200 Government Street, Victoria, BC',
-  mortgage_balance: 380000, mortgage_balance_date: '2026-10-01', mortgage_payment: 1900,
+  mortgage_balance: 380000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
   purchase_date: '2022-07-01', owners: ['Shawn'],
 }, 3.2, [{ year: 2025, value: 520000 }, { year: 2026, value: 545000 }]);
 

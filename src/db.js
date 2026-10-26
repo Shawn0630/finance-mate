@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS properties (
   bca_extract_date TEXT,
   mortgage_balance REAL,
   mortgage_balance_date TEXT,         -- 'YYYY-MM-DD' the balance refers to
-  mortgage_payment REAL,              -- monthly payment; engine prefers this
+  mortgage_payment REAL,              -- DORMANT (entered-payment era): the payment is always calculated now; never read or written
   amortization_years REAL,            -- used to derive payment when unset
   lender TEXT,                        -- mortgage lender (bank), free text
   notes TEXT,
@@ -254,14 +254,19 @@ migrateOwners('other_assets');
 // opened with). Inside a term the rate can change (rate_segments,
 // each now owned by a term) and lump sums can land (lump_sums).
 // The property keeps the CURRENT balance anchor (mortgage_balance /
-// mortgage_balance_date). The payment schedule and the entered
-// payment live ON each term (payment_override / payment_frequency /
-// payment_day) — a renewal can change banks and schedule together —
-// and the term containing the balance anchor also carries it
-// (anchor_balance / anchor_date) when the anchor date falls inside
-// the term, after its start. The property's mortgage_payment /
+// mortgage_balance_date). The payment schedule lives ON each term
+// (payment_frequency / payment_day) — a renewal can change banks
+// and schedule together — and the term containing the balance
+// anchor also carries it (anchor_balance / anchor_date) when the
+// anchor date falls inside the term, after its start. The property's
 // payment_frequency / payment_day columns remain as mirrors of the
-// anchor term's values for older readers.
+// anchor term's values for older readers. The monthly payment is
+// ALWAYS calculated (from balance, rate plan and amortization) and
+// never entered: the payment_override column below and the
+// property's mortgage_payment column are DORMANT — kept only so
+// existing databases keep their shape; nothing reads or writes
+// them, and a value left over from the entered-payment era no
+// longer rules anything.
 db.exec(`
 CREATE TABLE IF NOT EXISTS mortgage_terms (
   id INTEGER PRIMARY KEY,
@@ -273,7 +278,7 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   opening_balance REAL,               -- balance the term opened with
   repayment_method TEXT NOT NULL DEFAULT 'equal_payment',  -- 'equal_payment' (level payment) | 'equal_principal' (fixed monthly principal)
   amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
-  payment_override REAL,              -- entered monthly payment ruling inside this term only; NULL = automatic
+  payment_override REAL,              -- DORMANT (entered-payment era): the payment is always calculated now; never read or written
   payment_frequency TEXT,             -- payment schedule for this term; NULL = fall back to the property mirror
   payment_day INTEGER,                -- deduction day 1..31 for this term; NULL = fall back
   anchor_balance REAL,                -- the property's balance anchor, when it lands inside this term after its start
@@ -361,18 +366,18 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
 // not already carry, so a value later edited (or deliberately
 // cleared-and-reset by the server's syncs) is never resurrected by
 // a restart. The property's frequency/day go to EVERY term (they
-// ruled globally before, so every span keeps its behavior); the
-// entered payment goes to the anchor term only (it ruled only
-// there). An anchor dated on or before its term's start folds
-// into the term's opening balance — where it already lives — so
-// no anchor columns are set for it; a later anchor lands on the
-// term as anchor_balance / anchor_date.
+// ruled globally before, so every span keeps its behavior). An
+// anchor dated on or before its term's start folds into the
+// term's opening balance — where it already lives — so no anchor
+// columns are set for it; a later anchor lands on the term as
+// anchor_balance / anchor_date. (The property's old entered
+// payment is deliberately NOT seeded anywhere: payments are
+// always calculated now, so it rules nothing.)
 {
   const props = db.prepare('SELECT * FROM properties').all();
   const termsOfProp = db.prepare('SELECT * FROM mortgage_terms WHERE property_id = ? ORDER BY start_date, id');
   const setFreq = db.prepare('UPDATE mortgage_terms SET payment_frequency = ? WHERE id = ? AND payment_frequency IS NULL');
   const setDay = db.prepare('UPDATE mortgage_terms SET payment_day = ? WHERE id = ? AND payment_day IS NULL');
-  const setOverride = db.prepare('UPDATE mortgage_terms SET payment_override = ? WHERE id = ? AND payment_override IS NULL');
   const setAnchor = db.prepare('UPDATE mortgage_terms SET anchor_balance = ?, anchor_date = ? WHERE id = ? AND anchor_date IS NULL');
   db.transaction(() => {
     for (const p of props) {
@@ -386,7 +391,6 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
       let anchorTerm = null;
       if (bd) for (const t of terms) if (t.start_date <= bd) anchorTerm = t;
       anchorTerm = anchorTerm || terms[0];
-      if (p.mortgage_payment > 0) setOverride.run(p.mortgage_payment, anchorTerm.id);
       if (bd && p.mortgage_balance != null && bd > anchorTerm.start_date) {
         setAnchor.run(p.mortgage_balance, bd, anchorTerm.id);
       }

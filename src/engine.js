@@ -403,12 +403,16 @@ function monthIdxOf(dateStr) {
 //     last stored observation hold at the latest known prime).
 // Between events the plan is constant, so the projection is a
 // chain of simulate() runs, one per inter-event span, carrying the
-// balance across. The entered monthly payment, the payment
-// frequency and the payment day are PER-TERM: each term may carry
-// its own payment_override / payment_frequency / payment_day, and
-// they rule only inside that term (the build-level paymentOverride
-// / frequency / paymentDay remain as the anchor term's / global
-// fallbacks for callers that still pass them that way). A term may
+// balance across. The payment frequency and the payment day are
+// PER-TERM: each term may carry its own payment_frequency /
+// payment_day, and they rule only inside that term (the build-level
+// frequency / paymentDay remain as the anchor term's / global
+// fallbacks for callers that still pass them that way). There is
+// NO entered payment anywhere: the monthly payment is always
+// computed from the balance, the rate in effect and the governing
+// term's amortization, per the rules above. (The mortgage_terms
+// table still carries a dormant payment_override column from the
+// era when a payment could be typed in; nothing reads it.) A term may
 // also record a balance anchor (anchor_balance as of anchor_date,
 // a date inside the term): at that month the running balance is
 // RESET to the recorded figure — a reconciliation point; the plan
@@ -416,23 +420,22 @@ function monthIdxOf(dateStr) {
 //
 //   balance / balanceDate: the current-balance anchor (as simulate)
 //   terms:      [{ id, start_date, amortization_years,
-//               repayment_method, payment_override,
+//               repayment_method,
 //               payment_frequency, payment_day, anchor_balance,
 //               anchor_date }] any order
 //   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
 //               before the balance date is already reflected in the
 //               anchor balance and is ignored
-// Returns simulate()'s shape plus { state, paymentUsed,
-// paymentSource }: state is 'projected', or 'no_payment' when the
-// anchor term carries no amortization and no override is entered
-// (the payment cannot be computed), or 'no_prime' when a prime-
-// spread segment exists but no prime rate is known. paymentUsed is
-// the monthly payment in effect at the anchor (for an
-// equal-principal plan, its FIRST month's payment — the payments
-// decline from there); paymentSource is 'entered' (the override)
-// or 'derived' (auto-computed).
-export function buildSchedule({ balance, balanceDate, paymentOverride = null, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
-  const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null, paymentSource: null };
+// Returns simulate()'s shape plus { state, paymentUsed }:
+// state is 'projected', or 'no_payment' when the anchor term
+// carries no amortization (the payment cannot be computed), or
+// 'no_prime' when a prime-spread segment exists but no prime rate
+// is known. paymentUsed is the monthly payment in effect at the
+// anchor (for an equal-principal plan, its FIRST month's payment —
+// the payments decline from there). The payment is always the
+// computed one; there is no entered-payment variant to report.
+export function buildSchedule({ balance, balanceDate, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
+  const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null };
   const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
   if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread')
     && !primeForMonth) {
@@ -462,19 +465,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // the anchor term counts from the balance anchor; a later term
   // counts from the state point just before its first payment month.
   const epochOf = (term) => (term === anchorTerm ? A : monthIdxOf(term.start_date) - 1);
-
-  // The entered payment ruling months after state point S, or
-  // null when the payment is automatic there. Each term carries
-  // its own override now, ruling only inside that term; the
-  // build-level paymentOverride remains as the anchor term's
-  // value for callers that still pass it that way — a term's own
-  // column wins over it.
-  const overrideAt = (S) => {
-    const term = termAtMonth(S + 1);
-    if (term && Number(term.payment_override) > 0) return round2(Number(term.payment_override));
-    if (paymentOverride > 0 && (!anchorTerm || !term || term.id === anchorTerm.id)) return round2(paymentOverride);
-    return null;
-  };
 
   // The payment schedule (frequency + deduction day) governing
   // months after state point S, from the active term. A term that
@@ -513,10 +503,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // is THAT month's prime from the tracked history, never today's.
   const computePayment = (S, balNow) => {
     const term = termAtMonth(S + 1);
-    const entered = overrideAt(S);
-    if (entered !== null) {
-      return { payment: entered, source: 'entered' };
-    }
     const rateMonth = S === A && term && monthIdxOf(term.start_date) === A
       ? ymKeyOfIdx(A)
       : ymKeyOfIdx(S + 1);
@@ -524,8 +510,8 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     if (rate === null) return { error: 'no_prime' };
     if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
-    if (remaining <= 0) return { payment: round2(balNow), source: 'derived' }; // past the amortization: clear it (simulate caps at balance + interest)
-    return { payment: derivePayment(balNow, rate, remaining / 12), source: 'derived' };
+    if (remaining <= 0) return { payment: round2(balNow) }; // past the amortization: clear it (simulate caps at balance + interest)
+    return { payment: derivePayment(balNow, rate, remaining / 12) };
   };
 
   // The repayment method governing months after state point S is
@@ -547,8 +533,8 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     const term = termAtMonth(S + 1);
     if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
-    if (remaining <= 0) return { principalPerMonth: round2(balNow), source: 'derived' }; // past the amortization: clear it in one month
-    return { principalPerMonth: round2(balNow / remaining), source: 'derived' };
+    if (remaining <= 0) return { principalPerMonth: round2(balNow) }; // past the amortization: clear it in one month
+    return { principalPerMonth: round2(balNow / remaining) };
   };
 
   // The payment after a RATE CHANGE at state point S (a new segment
@@ -564,10 +550,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   // amortization, or beyond the projection cap), fall back to the
   // term's remaining amortization (computePayment).
   const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
-    const entered = overrideAt(S);
-    if (entered !== null) {
-      return { payment: entered, source: 'entered' };
-    }
     const newRate = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S + 1)), ymKeyOfIdx(S + 1), primeForMonth);
     if (newRate === null) return { error: 'no_prime' };
     const prevSeg = segmentForMonth(segments, ymKeyOfIdx(S));
@@ -580,7 +562,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       });
       if (hypo.payoffMonth) {
         const monthsLeft = monthIdxOf(hypo.payoffMonth) - S;
-        if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12), source: 'derived' };
+        if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12) };
       }
     }
     return computePayment(S, balNow);
@@ -632,7 +614,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   let negativeAmortization = false;
   let payoffMonth = null;
   let paymentUsed = null;
-  let paymentSource = null;
   let lastPayment = null;
 
   if (initialLump) {
@@ -642,7 +623,7 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       return {
         ...blocked, state: cp.error === 'no_prime' ? 'no_prime' : 'projected',
         payoffMonth: initialLump.month,
-        paymentUsed: cp.error ? null : cp.payment, paymentSource: cp.error ? null : cp.source,
+        paymentUsed: cp.error ? null : cp.payment,
       };
     }
   }
@@ -663,10 +644,9 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
       if (bal <= 0) { payoffMonth = ymKeyOfIdx(S + 1); break; }
     }
     // The plan for the span after S, per the governing term's
-    // repayment method — unless the entered payment overrides it
-    // (the override is a level payment whatever the method).
+    // repayment method.
     let cp;
-    const principalPlan = methodAt(S) === 'equal_principal' && overrideAt(S) === null;
+    const principalPlan = methodAt(S) === 'equal_principal';
     if (S === A || termStates.has(S)) {
       // The anchor, or a new term starting: derive the plan on the
       // (new) term's amortization. A segment that starts with the
@@ -693,7 +673,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
     }
     if (S === A) {
       anchorPlan = cp;
-      paymentSource = cp.source;
       paymentUsed = cp.payment !== undefined ? cp.payment : null; // principal plan: filled from the first row below
     }
     lastPlan = cp;
@@ -750,6 +729,6 @@ export function buildSchedule({ balance, balanceDate, paymentOverride = null, te
   return {
     state: 'projected', series, totalInterest,
     payoffMonth: payoffMonth || (series.length && bal <= 0 ? series[series.length - 1].month : null),
-    negativeAmortization, paymentUsed, paymentSource,
+    negativeAmortization, paymentUsed,
   };
 }

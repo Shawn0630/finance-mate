@@ -134,6 +134,18 @@ try {
   const closed = await segState();
   console.log('seg form by default:', JSON.stringify(closed));
 
+  // The term card shows the CALCULATED monthly payment read-only
+  // ($1,350,000 at 3.95% over 30y = $6,381.36) and has NO payment
+  // input anywhere — the payment is never typed in.
+  const payFacts = await page.evaluate(() => ({
+    figure: document.querySelector('#termsWrap .term-block [data-term-payment]').textContent,
+    paymentInputs: document.querySelectorAll('#termsWrap [name=payment_override], #termsWrap [name=mortgage_payment]').length,
+    estStat: document.querySelector('#estPaymentValue').textContent,
+    meta: document.querySelector('#metaCurrentPayment').textContent,
+    tags: document.querySelectorAll('#estPaymentTag, #metaPaymentTag').length,
+  }));
+  console.log('term payment facts:', JSON.stringify(payFacts));
+
   const block1 = await page.evaluateHandle(() => document.querySelector('#termsWrap .term-block'));
   await block1.asElement().screenshot({ path: path.join(OUT, 'terms-card.png') });
   console.log('terms-card.png', fs.statSync(path.join(OUT, 'terms-card.png')).size);

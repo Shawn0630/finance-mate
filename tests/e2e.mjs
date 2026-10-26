@@ -359,7 +359,7 @@ try {
   // Property CRUD (fictional address and numbers only).
   r = await req('POST', '/api/properties', {
     address: '1234 Example Street, Victoria, BC',
-    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
     purchase_date: '2020-03-15',
   });
   check('create property', r.status === 201 && r.data.id > 0);
@@ -371,14 +371,18 @@ try {
   r = await req('PUT', `/api/properties/${pid}/rates/${segId}`, { annual_rate: 5.0 });
   check('edit rate segment', r.status === 200 && r.data.annual_rate === 5);
 
-  // Amortization must match the engine / hand calculation:
-  // month 1 interest $412.39, balance $99,812.39 (see tests/engine.test.mjs).
+  // Amortization must match the engine / hand calculation: the
+  // payment is the calculated one — derivePayment($100,000, 5%,
+  // 25y) = $581.60 — so month 1 interest is $412.39 and the
+  // balance $99,830.79 (see tests/engine.test.mjs).
   r = await req('GET', `/api/properties/${pid}/amortization`);
   const s0 = r.data.series && r.data.series[0];
   check('amortization ok', r.data.ok === true && !!s0);
   check('month 1 interest = 412.39', s0 && Math.abs(s0.interest - 412.39) <= 0.02, s0 && String(s0.interest));
-  check('month 1 balance = 99812.39', s0 && Math.abs(s0.balance - 99812.39) <= 0.02, s0 && String(s0.balance));
-  check('payment source is entered', r.data.paymentSource === 'entered' && r.data.paymentUsed === 600);
+  check('month 1 balance = 99830.79', s0 && Math.abs(s0.balance - 99830.79) <= 0.02, s0 && String(s0.balance));
+  check('the payment is calculated (581.60) and carries no source field',
+    r.data.paymentUsed === 581.60 && !('paymentSource' in r.data),
+    JSON.stringify({ used: r.data.paymentUsed, src: r.data.paymentSource }));
 
   // Manual assessed value, then the summary arithmetic.
   r = await req('PUT', `/api/properties/${pid}`, { assessed_value: 800000 });
@@ -502,13 +506,13 @@ try {
     r.data.assessedValue === 6532000 && r.data.assessedYear === 2026 && r.data.balance === 900000 && r.data.equity === 5632000,
     JSON.stringify(r.data));
 
-  // Rate-plan chain: a property with balance + payment but NO rate
+  // Rate-plan chain: a property with a balance but NO rate
   // segments gets no projection at all (never a hidden default rate);
   // adding a segment produces numbers that follow that segment, and
   // editing the segment's rate changes the numbers.
   r = await req('POST', '/api/properties', {
     address: '9 Rateplan Road, Victoria, BC',
-    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
     purchase_date: '2019-11-05',
   });
   check('create rate-plan chain property', r.status === 201);
@@ -573,7 +577,7 @@ try {
   // dates only — the interest amounts must not move when it changes.
   r = await req('POST', '/api/properties', {
     address: '24 Payday Place, Victoria, BC',
-    mortgage_balance: 100000, mortgage_balance_date: '2026-10-24', mortgage_payment: 600,
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-24', amortization_years: 25,
     purchase_date: '2020-01-01',
   });
   const pidPay = r.data.id;
@@ -612,13 +616,15 @@ try {
   check('delete payday property', r.status === 200);
 
   // Payment frequency: stored on the property, validated, and it
-  // drives the projection. Same loan as the engine anchors ($100,000
-  // at 5%, $600 monthly payment from 2026-10-01): monthly totals are
-  // the baseline; accelerated bi-weekly must pay off in 2047-01 with
-  // total interest 58641.44 (cross-checked in the engine tests).
+  // drives the projection. Same loan family as the engine anchors
+  // ($100,000 at 5% from 2026-10-01) with the payment CALCULATED
+  // from a 25-year amortization ($581.60): monthly totals are the
+  // baseline (total interest 74482.97); accelerated bi-weekly pays
+  // $290.80 per period, pays off in 2048-03 and costs 62395.46
+  // (both totals cross-checked against the engine directly).
   r = await req('POST', '/api/properties', {
     address: '3 Frequency Court, Victoria, BC',
-    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
     purchase_date: '2019-06-15',
   });
   const pidFreq = r.data.id;
@@ -627,7 +633,7 @@ try {
   });
   r = await req('GET', `/api/properties/${pidFreq}/amortization`);
   check('default frequency is monthly with the baseline totals',
-    r.data.frequency === 'monthly' && Math.abs(r.data.totalInterest - 69494.74) <= 0.02,
+    r.data.frequency === 'monthly' && Math.abs(r.data.totalInterest - 74482.97) <= 0.02,
     JSON.stringify({ f: r.data.frequency, t: r.data.totalInterest }));
   const monthlyTotal = r.data.totalInterest;
   const monthlyPayoff = r.data.payoffMonth;
@@ -639,10 +645,10 @@ try {
   r = await req('GET', `/api/properties/${pidFreq}`);
   check('payment frequency persisted', r.data.payment_frequency === 'accelerated_bi_weekly');
   r = await req('GET', `/api/properties/${pidFreq}/amortization`);
-  check('accelerated bi-weekly: $300 per period, less interest, earlier payoff',
-    r.data.frequency === 'accelerated_bi_weekly' && r.data.periodPayment === 300
-      && Math.abs(r.data.totalInterest - 58641.44) <= 0.02
-      && r.data.totalInterest < monthlyTotal && r.data.payoffMonth === '2047-01'
+  check('accelerated bi-weekly: $290.80 per period, less interest, earlier payoff',
+    r.data.frequency === 'accelerated_bi_weekly' && r.data.periodPayment === 290.80
+      && Math.abs(r.data.totalInterest - 62395.46) <= 0.02
+      && r.data.totalInterest < monthlyTotal && r.data.payoffMonth === '2048-03'
       && r.data.payoffMonth < monthlyPayoff && r.data.series[0].month === '2026-10',
     JSON.stringify({ p: r.data.periodPayment, t: r.data.totalInterest, po: r.data.payoffMonth }).slice(0, 160));
   r = await req('PUT', `/api/properties/${pidFreq}`, { payment_frequency: 'monthly' });
@@ -762,27 +768,27 @@ try {
   check('portfolio endpoint responds', portBefore && portBefore.totals && Array.isArray(portBefore.outstandingByMonth));
   r = await req('POST', '/api/properties', {
     address: '11 Portfolio Avenue, Victoria, BC',
-    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', mortgage_payment: 600,
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
     purchase_date: '2019-11-05',
   });
   const pidPA = r.data.id;
   await req('POST', `/api/properties/${pidPA}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
   r = await req('POST', '/api/properties', {
     address: '22 Portfolio Avenue, Victoria, BC',
-    mortgage_balance: 50000, mortgage_balance_date: '2026-10-01', mortgage_payment: 500,
+    mortgage_balance: 50000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
     purchase_date: '2020-05-20',
   });
   const pidPB = r.data.id;
   await req('POST', `/api/properties/${pidPB}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 3 });
   const amortA = (await req('GET', `/api/properties/${pidPA}/amortization`)).data;
   const amortB = (await req('GET', `/api/properties/${pidPB}/amortization`)).data;
-  check('portfolio fixtures project individually (A matches the 69494.74 anchor)',
-    amortA.ok && amortB.ok && Math.abs(amortA.totalInterest - 69494.74) <= 0.02,
+  check('portfolio fixtures project individually (A matches the 74482.97 anchor: $100k at 5%, payment calculated over 25y)',
+    amortA.ok && amortB.ok && Math.abs(amortA.totalInterest - 74482.97) <= 0.02,
     JSON.stringify({ a: amortA.totalInterest, b: amortB.totalInterest }));
   const port = (await req('GET', '/api/properties/portfolio')).data;
   check('portfolio totals = baseline + both properties',
     Math.abs(port.totals.outstanding - (portBefore.totals.outstanding + 150000)) <= 0.02
-      && Math.abs(port.totals.monthlyPayment - (portBefore.totals.monthlyPayment + 1100)) <= 0.02
+      && Math.abs(port.totals.monthlyPayment - (portBefore.totals.monthlyPayment + 818.22)) <= 0.02
       && Math.abs(port.totals.totalInterest - (portBefore.totals.totalInterest + amortA.totalInterest + amortB.totalInterest)) <= 0.05,
     JSON.stringify(port.totals));
   const sliceA = port.pie.outstanding.find((s) => s.id === pidPA);
@@ -819,7 +825,7 @@ try {
   // from its own start — never back-filled into earlier months.
   r = await req('POST', '/api/properties', {
     address: '33 Portfolio Avenue, Victoria, BC',
-    mortgage_balance: 20000, mortgage_balance_date: '2027-03-15', mortgage_payment: 300,
+    mortgage_balance: 20000, mortgage_balance_date: '2027-03-15', amortization_years: 25,
     purchase_date: '2027-03-15',
   });
   const pidPC = r.data.id;
@@ -841,8 +847,9 @@ try {
   // The portfolio must say WHY a property is missing from the
   // projected interest, in three distinct states. The fixture mirrors
   // a real first run: a balance and one variable prime-spread segment
-  // (2024-12-17, prime - 1), but NEITHER a monthly payment NOR an
-  // amortization — a rate plan alone cannot project (NO_PAYMENT).
+  // (2024-12-17, prime - 1), but NO amortization — a rate plan alone
+  // cannot project (NO_PAYMENT), because the payment is calculated
+  // from the amortization and there is nothing to calculate it from.
   const portStates0 = (await req('GET', '/api/properties/portfolio')).data;
   r = await req('POST', '/api/properties', {
     address: '44 State Test Crescent, Victoria, BC',
@@ -860,21 +867,21 @@ try {
     start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1,
   });
   const amortState = (await req('GET', `/api/properties/${pidState}/amortization`)).data;
-  check('a plan with neither payment nor amortization reports NO_PAYMENT',
+  check('a plan with no amortization reports NO_PAYMENT',
     !amortState.ok && amortState.code === 'NO_PAYMENT', JSON.stringify(amortState.code));
   portS = (await req('GET', '/api/properties/portfolio')).data;
   rowS = portS.properties.find((x) => x.id === pidState);
-  check('portfolio state: plan but no payment is no_payment, contributing no interest',
+  check('portfolio state: plan but no amortization is no_payment, contributing no interest',
     !!rowS && rowS.projState === 'no_payment'
       && portS.totals.planNoPaymentCount === (portStates0.totals.planNoPaymentCount || 0) + 1
       && portS.totals.interestFrom === portStates0.totals.interestFrom
       && Math.abs(portS.totals.totalInterest - portStates0.totals.totalInterest) <= 0.02,
     JSON.stringify({ state: rowS && rowS.projState, totals: portS.totals }));
-  await req('PUT', `/api/properties/${pidState}`, { mortgage_payment: 5000 });
+  await req('PUT', `/api/properties/${pidState}`, { amortization_years: 25 });
   const amortState2 = (await req('GET', `/api/properties/${pidState}/amortization`)).data;
   portS = (await req('GET', '/api/properties/portfolio')).data;
   rowS = portS.properties.find((x) => x.id === pidState);
-  check('portfolio state: adding a payment flips it to projected and its interest joins the total',
+  check('portfolio state: setting the amortization flips it to projected and its interest joins the total',
     !!rowS && rowS.projState === 'projected' && amortState2.ok === true
       && portS.totals.interestFrom === portStates0.totals.interestFrom + 1
       && Math.abs(portS.totals.totalInterest - (portStates0.totals.totalInterest + amortState2.totalInterest)) <= 0.05,
@@ -922,10 +929,9 @@ try {
   });
   await req('PUT', `/api/properties/${pidAmortOnly}`, { amortization_years: 30 });
   const amortOnly = (await req('GET', `/api/properties/${pidAmortOnly}/amortization`)).data;
-  check('amortization alone projects with a derived payment of $6,381.36',
-    amortOnly.ok === true && amortOnly.paymentSource === 'derived'
-      && Math.abs(amortOnly.paymentUsed - 6381.36) < 0.5,
-    JSON.stringify({ ok: amortOnly.ok, src: amortOnly.paymentSource, used: amortOnly.paymentUsed }));
+  check('amortization alone projects with a calculated payment of $6,381.36',
+    amortOnly.ok === true && Math.abs(amortOnly.paymentUsed - 6381.36) < 0.5,
+    JSON.stringify({ ok: amortOnly.ok, used: amortOnly.paymentUsed }));
   const portAmort = (await req('GET', '/api/properties/portfolio')).data;
   const rowAmort = portAmort.properties.find((x) => x.id === pidAmortOnly);
   check('amortization alone flips the portfolio state to projected',
@@ -957,7 +963,7 @@ try {
 
   r = await req('POST', '/api/properties', {
     address: '7 Prime Place, Victoria, BC', mortgage_balance: 100000,
-    mortgage_balance_date: '2026-10-01', mortgage_payment: 600, purchase_date: '2020-01-01',
+    mortgage_balance_date: '2026-10-01', amortization_years: 25, purchase_date: '2020-01-01',
   });
   const pidPrime = r.data.id;
   r = await req('POST', `/api/properties/${pidPrime}/rates`, { start_date: '2026-01-01', rate_type: 'variable', rate_mode: 'prime_spread' });
@@ -1053,8 +1059,8 @@ try {
   await req('PUT', `/api/properties/${pidReplay}`, { amortization_years: 25 });
   const replay = (await req('GET', `/api/properties/${pidReplay}/amortization`)).data;
   const replayRow = (m) => replay.series.find((x) => x.month === m) || {};
-  check('replay: the payment is derived at the start month\u2019s prime (4.45%), nothing entered',
-    replay.ok === true && replay.paymentSource === 'derived'
+  check('replay: the payment is calculated at the start month\u2019s prime (4.45%), nothing entered',
+    replay.ok === true
       && Math.abs(replay.paymentUsed - engineDerive(1350000, 4.45, 25)) < 0.02
       && replayRow('2025-01').rate === 4.45
       && replayRow('2025-01').interest === Math.round(1350000 * engineMonthlyRate(4.45) * 100) / 100,
@@ -1081,7 +1087,7 @@ try {
   await req('DELETE', `/api/properties/${r.data.id}`);
   await req('DELETE', `/api/properties/${pidPrime}`);
 
-  // ---- Mortgage terms: migration, renewal, lump sums, override ----
+  // ---- Mortgage terms: migration, renewal, lump sums ----
   // The legacy pre-seed (property '1 Legacy Lane': one old-shape
   // segment from 2025-01-01, no amortization, no lender) must have
   // been migrated into a Term 1 that mirrors the old model exactly.
@@ -1122,7 +1128,7 @@ try {
   check('a segment added without a term lands in Term 1',
     r.status === 201 && r.data.term_id === term1Id, JSON.stringify(r.data));
   r = await req('GET', `/api/properties/${termPid}/amortization`);
-  check('a term with no amortization and no entered payment is NO_PAYMENT',
+  check('a term with no amortization is NO_PAYMENT',
     r.data.ok === false && r.data.code === 'NO_PAYMENT', JSON.stringify(r.data.code));
   r = await req('PUT', `/api/properties/${termPid}`, { amortization_years: 30, lender: 'RBC' });
   check('property-level amortization + lender write through to the current term',
@@ -1130,10 +1136,10 @@ try {
       && r.data.terms[0].amortization_years === 30 && r.data.terms[0].lender === 'RBC',
     JSON.stringify({ lender: r.data.lender, term: r.data.terms && r.data.terms[0] }));
   const projT1 = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  check('the term projection derives its payment at the start month\u2019s prime (5.45 - 1 = 4.45%, 30y)',
-    projT1.ok === true && projT1.paymentSource === 'derived'
+  check('the term projection calculates its payment at the start month\u2019s prime (5.45 - 1 = 4.45%, 30y)',
+    projT1.ok === true
       && Math.abs(projT1.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5,
-    JSON.stringify({ used: projT1.paymentUsed, src: projT1.paymentSource }));
+    JSON.stringify({ used: projT1.paymentUsed }));
   // Projection equivalence, locked: the series equals the engine's
   // term schedule for the same inputs (same stub prime history), to
   // the row — pricing every month at its own prime, payment fixed.
@@ -1223,43 +1229,38 @@ try {
   check('deleting the lump sum restores the previous projection',
     r.status === 200 && JSON.stringify(projLumpGone.series) === JSON.stringify(projPreLump.series));
 
-  // The entered payment is an override inside the current term only.
-  await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: 7000 });
-  const projOv = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  check('an entered payment overrides the calculation inside the current term',
-    projOv.paymentSource === 'entered' && projOv.paymentUsed === 7000 && projOv.series[0].payment === 7000,
-    JSON.stringify({ used: projOv.paymentUsed, src: projOv.paymentSource }));
-  const novOv = projOv.series.find((x) => x.month === '2029-11');
-  const decOv = projOv.series.find((x) => x.month === '2029-12');
-  check('the override lapses at the renewal — Term 2\u2019s payment is auto-computed',
-    !!decOv && Math.abs(decOv.payment - engineDerive(novOv.balance, 3.95, 25)) < 0.02 && decOv.payment !== 7000,
-    JSON.stringify(decOv && decOv.payment));
-  await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: null });
-  const projAuto = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
-  check('clearing the entered payment returns to the auto calculation',
-    projAuto.paymentSource === 'derived' && Math.abs(projAuto.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5,
-    JSON.stringify({ used: projAuto.paymentUsed, src: projAuto.paymentSource }));
+  // The monthly payment cannot be entered anywhere — it is always
+  // calculated. Every write path that used to accept one refuses
+  // it with a 400 (a contract error, never silently swallowed),
+  // and the projection is the calculated one throughout.
+  r = await req('PUT', `/api/properties/${termPid}`, { mortgage_payment: 7000 });
+  check('entering a monthly payment on the property is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
+    JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', {
+    address: '1 No Payment Entry Road', mortgage_balance: 1000, purchase_date: '2020-01-01', mortgage_payment: 100,
+  });
+  check('creating a property with a monthly payment is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
+    JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${termPid}/terms`, { payment_override: 100 });
+  check('creating a term with a payment override is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
+    JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: 6500 });
+  check('editing a term with a payment override is refused (400)',
+    r.status === 400 && String(r.data.error || '').includes('calculated automatically'),
+    JSON.stringify(r.data));
+  const projCalc = (await req('GET', `/api/properties/${termPid}/amortization`)).data;
+  const novCalc = projCalc.series.find((x) => x.month === '2029-11');
+  const decCalc = projCalc.series.find((x) => x.month === '2029-12');
+  check('the projection stays the calculated one in both terms (Term 2 re-derived at the renewal)',
+    Math.abs(projCalc.paymentUsed - engineDerive(1350000, 4.45, 30)) < 0.5
+      && !!decCalc && !!novCalc && Math.abs(decCalc.payment - engineDerive(novCalc.balance, 3.95, 25)) < 0.02,
+    JSON.stringify({ used: projCalc.paymentUsed, dec: decCalc && decCalc.payment }));
 
   // ---- Per-term payment schedule + balance anchors ----
-  // The override, frequency and payment day live on each term now.
-  // Term 2 takes its own entered payment: it rules only inside
-  // Term 2, and the property-level payment mirror (which follows
-  // the ANCHOR term) is untouched by it.
-  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: 6500 });
-  check('term 2 accepts its own payment override', r.status === 200 && r.data.payment_override === 6500,
-    JSON.stringify(r.data).slice(0, 160));
-  r = await req('GET', `/api/properties/${termPid}/amortization`);
-  const dec29o = r.data.series.find((x) => x.month === '2029-12');
-  const nov29o = r.data.series.find((x) => x.month === '2029-11');
-  check('term 2\u2019s override rules only term 2 (term 1 months still derive)',
-    !!dec29o && dec29o.payment === 6500 && !!nov29o && nov29o.payment === r.data.paymentUsed,
-    JSON.stringify({ dec: dec29o && dec29o.payment, nov: nov29o && nov29o.payment, used: r.data.paymentUsed }));
-  r = await req('GET', `/api/properties/${termPid}`);
-  check('the property payment mirror still follows the anchor term (no override there)',
-    (r.data.mortgage_payment ?? null) === null && r.data.terms[1].payment_override === 6500,
-    JSON.stringify({ mirror: r.data.mortgage_payment, t2: r.data.terms[1].payment_override }));
-  r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_override: null });
-  check('term 2 override cleared', r.status === 200 && (r.data.payment_override ?? null) === null);
+  // The frequency and payment day live on each term now.
   r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_frequency: 'daily' });
   check('an unknown term payment frequency is a 400', r.status === 400, JSON.stringify(r.data));
   r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { anchor_balance: 100 });
@@ -1508,16 +1509,18 @@ try {
   // Every money field is a text input marked data-money; the shared
   // format/parse pair in app.js groups what the user sees and parses it
   // back before anything is sent, so the API still receives numbers.
-  // The principal / payment money fields live in the term cards
+  // The principal money fields live in the term cards
   // (client-rendered in the terms accordion): count the static page
   // and the rendered templates together. The principal pair's input
   // name switches between opening_balance and anchor_balance (the
   // term carrying the balance anchor edits the anchor values).
+  // There is NO payment money field any more — the monthly payment
+  // is calculated, never typed in.
   const appJsRes2 = await fetch(BASE + '/app.js', { headers: { Cookie: cookie } });
   const appJsText2 = await appJsRes2.text();
-  check('money inputs are marked data-money in the page',
+  check('money inputs are marked data-money in the page (and no payment input remains)',
     (pageHtml.match(/data-money/g) || []).length >= 4
-      && (appJsText2.match(/name="payment_override"[^>]*data-money/g) || []).length === 1
+      && !appJsText2.includes('name="payment_override"')
       && (appJsText2.match(/name="\$\{principalName\}"[^>]*data-money/g) || []).length === 1
       && appJsText2.includes("anchored ? 'anchor_balance' : 'opening_balance'"),
     String((pageHtml.match(/data-money/g) || []).length));
@@ -1627,17 +1630,19 @@ try {
       const editBalance = await fieldVal('[data-term-form] [name=opening_balance]');
       check('the term card opens with the grouped balance', editBalance === '1,350,000', String(editBalance));
 
-      // Paste a pre-grouped figure into the term's monthly payment
-      // override and save the term: it must reach the server as the
-      // plain number 2500.
-      await focusField('[data-term-form] [name=payment_override]');
+      // Paste a pre-grouped figure into the term's principal field
+      // and save the term: it must reach the server as the plain
+      // number 2500. (This paste used to target the monthly-payment
+      // field; that field is gone — the payment is calculated.)
+      await focusField('[data-term-form] [name=opening_balance]');
       await client.send('Input.insertText', { text: '2,500' });
-      const pastedPayment = await fieldVal('[data-term-form] [name=payment_override]');
-      check('pasted grouped payment displays grouped', pastedPayment === '2,500', String(pastedPayment));
+      const pastedPrincipal = await fieldVal('[data-term-form] [name=opening_balance]');
+      check('pasted grouped principal displays grouped', pastedPrincipal === '2,500', String(pastedPrincipal));
       await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
       await wait(1400);
       r = await req('GET', `/api/properties/${moneyPid}`);
-      check('pasted payment stored as the plain number 2500', r.data.mortgage_payment === 2500, JSON.stringify(r.data.mortgage_payment));
+      check('pasted principal stored as the plain number 2500',
+        r.data.terms[0].opening_balance === 2500, JSON.stringify(r.data.terms[0].opening_balance));
 
       // The manual assessed value on the same page opens grouped too,
       // and so does a value-history point opened for editing. Both are
@@ -1763,12 +1768,12 @@ try {
         !!ax && Math.abs(ax.max - td0) < 0.02 && Math.abs(ax.min - (td0 - 5)) < 0.05,
         JSON.stringify(ax && { min: ax.min, max: ax.max }));
 
-      // Give the fixture a rate plan + payment on a known balance
-      // date, reload, and the axis must follow each selected range:
+      // Give the fixture a rate plan + amortization on a known
+      // balance date, reload, and the axis must follow each selected range:
       // every month range is that look-back ending today (projection
       // clipped at today); All -> the exact data extent, no padded
       // decades either side.
-      await req('PUT', `/api/properties/${winPid}`, { mortgage_balance_date: '2025-01-15', mortgage_payment: 3000 });
+      await req('PUT', `/api/properties/${winPid}`, { mortgage_balance_date: '2025-01-15', amortization_years: 25 });
       await req('POST', `/api/properties/${winPid}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 });
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
@@ -2139,7 +2144,7 @@ try {
         JSON.stringify(stepCfg && stepCfg.pts));
       const combMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('detail chart A announces the missing payment beside the chart (NO_PAYMENT)',
-        combMsg.includes('add a monthly payment or remaining amortization'), combMsg);
+        combMsg.includes('set the remaining amortization'), combMsg);
       const stepLabels = await page.evaluate(() => window.__fmCharts.a.data.datasets.map((d) => d.label));
       check('with no payment there are no payment bars (projection absent, note shown)',
         !stepLabels.includes('Interest portion') && !stepLabels.includes('Principal portion'),
@@ -2199,7 +2204,7 @@ try {
         cardsText.includes('966 Step Test Place'), cardsText.slice(0, 120));
       const pfNotesText = await page.evaluate(() => document.querySelector('#pfNotes').textContent);
       check('portfolio notes name the missing payment for a planned-but-unprojected property',
-        pfNotesText.includes('add a monthly payment or remaining amortization to project'), pfNotesText);
+        pfNotesText.includes('set the remaining amortization on its term to project'), pfNotesText);
       const pfIntNote = await page.evaluate(() => document.querySelector('#pfInterestNote').textContent);
       check('portfolio interest note no longer hides the gap behind "with a rate plan"',
         !pfIntNote.includes('with a rate plan') && pfIntNote.includes('based on'), pfIntNote);
@@ -2234,7 +2239,10 @@ try {
       await wait(1600);
       const beforeMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('amortization UI fixture starts unprojected (NO_PAYMENT)',
-        beforeMsg.includes('add a monthly payment or remaining amortization'), beforeMsg);
+        beforeMsg.includes('set the remaining amortization'), beforeMsg);
+      const beforeStat = await page.evaluate(() => document.querySelector('#estPaymentValue').textContent);
+      check('with no projection yet the Estimated monthly payment stat shows —',
+        beforeStat === '—', String(beforeStat));
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
       await focusField('[data-term-form] [name=amortization_years]');
@@ -2244,10 +2252,9 @@ try {
       await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
       await wait(2000);
       const amortApi = (await req('GET', `/api/properties/${amortPid}/amortization`)).data;
-      check('endpoint derives the payment from the UI-entered amortization (3.95%, 30y)',
-        amortApi.ok === true && amortApi.paymentSource === 'derived'
-          && Math.abs(amortApi.paymentUsed - 6381.36) < 0.5,
-        JSON.stringify({ ok: amortApi.ok, src: amortApi.paymentSource, used: amortApi.paymentUsed }));
+      check('endpoint calculates the payment from the UI-entered amortization (3.95%, 30y)',
+        amortApi.ok === true && Math.abs(amortApi.paymentUsed - 6381.36) < 0.5,
+        JSON.stringify({ ok: amortApi.ok, used: amortApi.paymentUsed }));
       const estStat = await page.evaluate(() => {
         const stat = document.querySelector('#estPaymentStat');
         const head = document.querySelector('#projectionPanel .panel-head');
@@ -2256,12 +2263,12 @@ try {
           inHead: !!stat && !!head && head.contains(stat),
           text: v ? v.textContent : '',
           weight: v ? Number(getComputedStyle(v).fontWeight) : 0,
-          tagHidden: document.querySelector('#estPaymentTag').classList.contains('hidden'),
+          tagGone: !document.querySelector('#estPaymentTag'),
         };
       });
-      check('the projection head carries an Estimated monthly payment stat, bold, equal to the endpoint payment',
+      check('the projection head carries an Estimated monthly payment stat, bold, equal to the endpoint payment (no entered/auto tag)',
         estStat.inHead && Math.abs(parseFloat(estStat.text.replace(/[^0-9.]/g, '')) - amortApi.paymentUsed) < 0.5
-          && estStat.weight >= 600 && estStat.tagHidden,
+          && estStat.weight >= 600 && estStat.tagGone,
         JSON.stringify(estStat));
       const metaGrid = await page.evaluate(() => {
         const meta = document.querySelector('#mortgageMeta');
@@ -2272,7 +2279,7 @@ try {
           opening: document.querySelector('#metaOpeningPrincipal').textContent,
           current: document.querySelector('#metaCurrentPrincipal').textContent,
           payment: pay.textContent,
-          paymentTag: document.querySelector('#metaPaymentTag').textContent,
+          paymentTagGone: !document.querySelector('#metaPaymentTag'),
           paymentWeight: Number(getComputedStyle(pay).fontWeight),
           remaining: document.querySelector('#metaRemainingAmort').textContent,
           lender: document.querySelector('#metaCurrentLender').textContent,
@@ -2286,9 +2293,9 @@ try {
         JSON.stringify(metaGrid.labels) === JSON.stringify(['Opening principal ($)', 'Current Principal', 'Current Monthly Payment', 'Remaining amortization (years)', 'Current Lender'])
           && metaGrid.inputs === 0,
         JSON.stringify(metaGrid.labels));
-      check('modal metadata values derive from the terms and the projection (payment bold, tagged auto)',
+      check('modal metadata values derive from the terms and the projection (payment bold, no source tag)',
         metaGrid.opening.includes('1,350,000') && metaGrid.current.includes('1,350,000')
-          && metaGrid.payment.includes('6,381') && metaGrid.paymentTag === 'auto' && metaGrid.paymentWeight >= 600
+          && metaGrid.payment.includes('6,381') && metaGrid.paymentTagGone && metaGrid.paymentWeight >= 600
           && metaGrid.remaining === '30.0' && metaGrid.lender === 'Scotiabank',
         JSON.stringify(metaGrid));
       check('the property-level mortgage form is gone; lender/amortization live only in term forms',
@@ -2341,7 +2348,7 @@ try {
         primeUi.w > 200 && primeUi.h > 100, JSON.stringify({ w: primeUi.w, h: primeUi.h }));
       const afterMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('the NO_PAYMENT note beside chart A clears once amortization is in',
-        !afterMsg.includes('add a monthly payment or remaining amortization'), afterMsg);
+        !afterMsg.includes('set the remaining amortization'), afterMsg);
       // The split bars live in the merged chart now (the former
       // Chart B). This fixture's balance date is today, so inside
       // the default look-back window the projection is still in the
@@ -2426,7 +2433,7 @@ try {
         const modal = document.querySelector('#mortgageModal');
         const inside = (sel) => { const el = document.querySelector(sel); return !!el && modal.contains(el); };
         return {
-          all: inside('#mortgageMeta') && inside('#segmentRows') && inside('[data-term-form] [name=payment_override]') && inside('#termsWrap'),
+          all: inside('#mortgageMeta') && inside('#segmentRows') && inside('[data-term-form] [name=payment_frequency]') && inside('#termsWrap'),
           heading: modal.querySelector('h3').textContent.trim(),
           onPage: !!document.querySelector('#view-property #mortgageMeta'),
         };
@@ -2438,24 +2445,22 @@ try {
       const rowUi = portUi.properties.find((x) => x.id === amortPid);
       check('the UI-entered amortization flips the portfolio state to projected',
         !!rowUi && rowUi.projState === 'projected', JSON.stringify(rowUi && rowUi.projState));
-      // Entering an override in the term form flips the stat to
-      // the entered figure with its "entered" tag — in the
-      // projection head and in the modal metadata alike.
-      await focusField('[data-term-form] [name=payment_override]');
-      await page.keyboard.type('2500');
-      await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
-      await wait(2000);
-      const enteredStat = await page.evaluate(() => ({
-        value: document.querySelector('#estPaymentValue').textContent,
-        tag: document.querySelector('#estPaymentTag').textContent,
-        tagHidden: document.querySelector('#estPaymentTag').classList.contains('hidden'),
+      // There is no payment field to type into anywhere, and no
+      // entered/auto tag: the stat and the metadata show the
+      // calculated figure, plain. The term form carries the
+      // figure read-only instead of an input.
+      const noEntry = await page.evaluate(() => ({
+        paymentInputs: document.querySelectorAll('#mortgageModal [name=payment_override], #mortgageModal [name=mortgage_payment]').length,
+        estTag: !!document.querySelector('#estPaymentTag'),
+        metaTag: !!document.querySelector('#metaPaymentTag'),
+        termFigure: document.querySelector('[data-term-form] [data-term-payment]').textContent,
+        stat: document.querySelector('#estPaymentValue').textContent,
         meta: document.querySelector('#metaCurrentPayment').textContent,
-        metaTag: document.querySelector('#metaPaymentTag').textContent,
       }));
-      check('an entered payment shows in the stat with the entered tag',
-        enteredStat.value.includes('2,500') && !enteredStat.tagHidden && enteredStat.tag === 'entered'
-          && enteredStat.meta.includes('2,500') && enteredStat.metaTag === 'entered',
-        JSON.stringify(enteredStat));
+      check('no payment input and no entered/auto tag — the calculated figure shows in the stat, the metadata and the term card',
+        noEntry.paymentInputs === 0 && !noEntry.estTag && !noEntry.metaTag
+          && noEntry.termFigure.includes('6,381') && noEntry.stat.includes('6,381') && noEntry.meta.includes('6,381'),
+        JSON.stringify(noEntry));
       await req('DELETE', `/api/properties/${amortPid}`);
 
       // A fixed plan in effect draws NO prime chart — the banner
@@ -2514,8 +2519,9 @@ try {
         if (sumBefore.includes('RBC')) break;
         await wait(300);
       }
-      check('modal metadata names the current lender and the auto payment',
-        sumBefore.includes('RBC') && sumBefore.includes('auto') && sumBefore.includes('6,381'),
+      check('modal metadata names the current lender and the calculated payment (no auto/entered tag)',
+        sumBefore.includes('RBC') && sumBefore.includes('6,381')
+          && !sumBefore.includes('auto') && !sumBefore.includes('entered'),
         sumBefore);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
@@ -2553,11 +2559,13 @@ try {
             - (amortUi.series[idxB - 1].balance + amortUi.series[idxB].interest - amortUi.series[idxB].payment)) < 0.02,
         JSON.stringify(amortUi.series[idxB]));
       // Every term card carries the full field set — principal
-      // pair, payment override, frequency, day — and the old
+      // pair, frequency, day, and the calculated monthly payment
+      // as a read-only figure (NEVER a payment input) — and the old
       // standalone anchor form is gone from the page entirely.
       const fieldSets = await page.evaluate(() => ({
         forms: [...document.querySelectorAll('#termsWrap .term-block [data-term-form]')].map((f) => ({
-          override: !!f.querySelector('[name=payment_override]'),
+          paymentInput: !!f.querySelector('[name=payment_override], [name=mortgage_payment]'),
+          paymentFigure: !!f.querySelector('[data-term-payment]'),
           freq: !!f.querySelector('[name=payment_frequency]'),
           day: !!f.querySelector('[name=payment_day]'),
           principal: !!f.querySelector('[name=opening_balance], [name=anchor_balance]'),
@@ -2565,13 +2573,17 @@ try {
         })),
         anchorForms: document.querySelectorAll('[data-anchor-form]').length,
       }));
-      check('every term card carries the principal/payment/frequency/day field set (no separate anchor form)',
+      check('every term card carries the principal/frequency/day field set and a read-only payment figure — no payment input (no separate anchor form)',
         fieldSets.forms.length === 2
-          && fieldSets.forms.every((s) => s.override && s.freq && s.day && s.principal && s.principalDate)
+          && fieldSets.forms.every((s) => !s.paymentInput && s.paymentFigure && s.freq && s.day && s.principal && s.principalDate)
           && fieldSets.anchorForms === 0,
         JSON.stringify(fieldSets));
+      const termPayFig = await page.evaluate(() =>
+        document.querySelector('#termsWrap .term-block [data-term-payment]').textContent);
+      check('the current term card shows its calculated monthly payment read-only',
+        termPayFig.includes('6,381'), String(termPayFig));
       // One form, one Save per term card: the term's contract
-      // fields and its payment schedule (override / frequency /
+      // fields and its payment schedule (frequency /
       // day, and its anchor when it carries one) save together in
       // a single submit — there is no second Save button anywhere
       // in the card (the Add segment / Add lump sum buttons belong
@@ -2590,25 +2602,6 @@ try {
         saveCounts.length === 2
           && saveCounts.every((s) => s.termForms === 1 && s.submitsInForm === 1 && s.saveButtonsInCard === 1),
         JSON.stringify(saveCounts));
-      // Editing Term 2's override in its own card changes only
-      // Term 2's span; Term 1 keeps its derived payment. (Cleared
-      // again via the API so the lump-sum checks below run on the
-      // un-overridden schedule.)
-      await page.evaluate(() => {
-        const blocks = document.querySelectorAll('#termsWrap .term-block');
-        const form = blocks[blocks.length - 1].querySelector('[data-term-form]');
-        form.payment_override.value = '2000';
-        form.requestSubmit();
-      });
-      await wait(2200);
-      const amortT2o = (await req('GET', `/api/properties/${termUiPid}/amortization`)).data;
-      const t1RowO = amortT2o.series.find((x) => x.month === '2026-11');
-      const t2RowO = amortT2o.series.find((x) => x.month === t2Month);
-      check('editing Term 2\u2019s override in its own card changes only Term 2\u2019s span',
-        !!t2RowO && t2RowO.payment === 2000 && !!t1RowO && Math.abs(t1RowO.payment - amortUi.paymentUsed) < 0.02,
-        JSON.stringify({ t2: t2RowO && t2RowO.payment, t1: t1RowO && t1RowO.payment, used: amortUi.paymentUsed }));
-      const term2UiId = (await req('GET', `/api/properties/${termUiPid}`)).data.terms[1].id;
-      await req('PUT', `/api/properties/${termUiPid}/terms/${term2UiId}`, { payment_override: null });
       // Lump sum through Term 1's own form (amount typed bare, it
       // groups live like every money field).
       await page.evaluate(() => {

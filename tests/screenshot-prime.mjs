@@ -77,7 +77,7 @@ const propRes = await fetch(`http://127.0.0.1:${PORT}/api/properties`, {
   method: 'POST', headers: apiHeaders,
   body: JSON.stringify({
     address: '88 Prime Crescent, Victoria, BC',
-    mortgage_balance: 640000, mortgage_balance_date: '2026-10-01', mortgage_payment: 2950,
+    mortgage_balance: 640000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
     purchase_date: '2022-05-01', owners: ['Shawn', 'Jiaying'],
   }),
 });

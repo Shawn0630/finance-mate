@@ -604,7 +604,7 @@ async function loadPortfolio() {
     notes.push(`${t.noPlanCount} of ${t.propertyCount} ${propNoun} ${t.noPlanCount === 1 ? 'has' : 'have'} no rate plan — add rate segments on the property page to include ${t.noPlanCount === 1 ? 'it' : 'them'} in the projection.`);
   }
   if (t.planNoPaymentCount > 0) {
-    notes.push(`${t.planNoPaymentCount} of ${t.propertyCount} ${propNoun} ${t.planNoPaymentCount === 1 ? 'has' : 'have'} a rate plan but no projection — add a monthly payment or remaining amortization to project.`);
+    notes.push(`${t.planNoPaymentCount} of ${t.propertyCount} ${propNoun} ${t.planNoPaymentCount === 1 ? 'has' : 'have'} a rate plan but no projection — set the remaining amortization on its term to project.`);
   }
   if (t.planNoPrimeCount > 0) {
     notes.push(`${t.planNoPrimeCount} of ${t.propertyCount} ${propNoun} ${t.planNoPrimeCount === 1 ? 'is' : 'are'} priced off the prime rate, which is not on record yet — the projection starts once prime has been fetched.`);
@@ -1077,7 +1077,9 @@ function termLengthLabel(months) {
 // Modal-top metadata: five read-only figures, all derived from the
 // property and its terms — nothing here is an input. The editable
 // mortgage facts live in the terms themselves; each term's card
-// carries its own principal pair, payment override and schedule.
+// carries its own principal pair and payment schedule. The monthly
+// payment is always the calculated one — there is no entered
+// variant and no tag saying where it came from.
 function renderMortgageMeta() {
   const p = detailProperty;
   if (!p || !$('#mortgageMeta')) return;
@@ -1088,17 +1090,24 @@ function renderMortgageMeta() {
     first && first.opening_balance != null ? money(first.opening_balance) : '—';
   $('#metaCurrentPrincipal').textContent =
     p.mortgage_balance != null ? money(p.mortgage_balance) : '—';
-  const payEl = $('#metaCurrentPayment');
-  const tagEl = $('#metaPaymentTag');
-  if (chartMeta && chartMeta.paymentUsed != null) {
-    payEl.textContent = money(chartMeta.paymentUsed);
-    tagEl.textContent = chartMeta.paymentSource === 'entered' ? 'entered' : 'auto';
-    tagEl.classList.remove('hidden');
-  } else {
-    payEl.textContent = '—';
-    tagEl.textContent = '';
-    tagEl.classList.add('hidden');
-  }
+  $('#metaCurrentPayment').textContent =
+    chartMeta && chartMeta.paymentUsed != null ? money(chartMeta.paymentUsed) : '—';
+  // Each term card also shows its own calculated monthly payment
+  // read-only, beside its schedule fields: the payment of the
+  // first projected month falling inside that term's span (for an
+  // equal-principal term, its first — highest — month). A term
+  // whose span the projection does not reach, or no projection at
+  // all (no rate plan / no amortization yet), shows '—'.
+  document.querySelectorAll('[data-term-payment]').forEach((el) => {
+    const from = el.dataset.termPayment;
+    const to = el.dataset.termPaymentEnd;
+    let v = null;
+    if (chartMeta && chartMeta.series && chartMeta.series.length) {
+      const row = chartMeta.series.find((x) => x.month >= from && x.month <= to);
+      if (row) v = row.payment;
+    }
+    el.textContent = v != null ? money(v) : '—';
+  });
   // The engine counts the current term's amortization down from
   // the balance anchor (its epoch), so at the anchor the remaining
   // amortization is the term's amortization_years itself.
@@ -1166,8 +1175,9 @@ function renderTerms(p) {
     const open = openTermIds.has(t.id);
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
     // Every term card carries the same field set: its contract
-    // fields, its principal pair, its entered-payment override and
-    // its payment schedule. The principal pair — "Outstanding
+    // fields, its principal pair, its calculated monthly payment
+    // (read-only — it is never typed in) and its payment schedule.
+    // The principal pair — "Outstanding
     // principal" / "Principal as of" — binds the term's opening
     // balance / start date, EXCEPT on the term carrying the
     // property's balance anchor (anchor_date inside the term),
@@ -1209,7 +1219,7 @@ function renderTerms(p) {
             </select></div>
           </div>
           <div class="grid3">
-            <div><label>Monthly payment ($) — optional override</label><input name="payment_override" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(t.payment_override ?? ''))}"></div>
+            <div><label>Monthly payment ($)</label><div class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}">—</div></div>
             <div><label>Payment frequency</label><select name="payment_frequency">${freqOptionsHtml(freqKey)}</select></div>
             <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${t.payment_day ?? p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
           </div>
@@ -1349,14 +1359,13 @@ $('#termsWrap').addEventListener('submit', async (e) => {
   try {
     if (form.dataset.termForm) {
       const f = Object.fromEntries(new FormData(form).entries());
-      parseMoneyFields(f, ['opening_balance', 'anchor_balance', 'payment_override']);
+      parseMoneyFields(f, ['opening_balance', 'anchor_balance']);
       const body = {
         lender: f.lender,
         term_months: Number(f.term_months),
         amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
         repayment_method: f.repayment_method || 'equal_payment',
         payment_frequency: f.payment_frequency,
-        payment_override: f.payment_override === '' || f.payment_override == null ? null : f.payment_override,
       };
       // The principal pair binds the term's opening balance / start
       // date — or, on the term carrying the balance anchor, the
@@ -2047,20 +2056,13 @@ function renderEquity() {
 }
 
 // The projection panel head's dedicated stat: the monthly payment
-// the engine is currently using — derived from the balance, the
-// rate in effect and the remaining amortization, or the entered
-// override while one is in effect (tagged "entered").
+// the engine calculated — from the balance, the rate in effect
+// and the remaining amortization. It only exists once a rate plan
+// (and an amortization) does; before that it shows '—'.
 function renderEstPayment() {
   const v = $('#estPaymentValue');
   if (!v) return;
-  const tag = $('#estPaymentTag');
-  if (chartMeta && chartMeta.paymentUsed != null) {
-    v.textContent = money(chartMeta.paymentUsed);
-    tag.classList.toggle('hidden', chartMeta.paymentSource !== 'entered');
-  } else {
-    v.textContent = '—';
-    tag.classList.add('hidden');
-  }
+  v.textContent = chartMeta && chartMeta.paymentUsed != null ? money(chartMeta.paymentUsed) : '—';
 }
 
 function renderDetailCharts() {
@@ -2093,7 +2095,7 @@ function drawCombinedChart() {
     if (amortError && amortError.code === 'NO_RATE_PLAN') {
       showMsg(cmsg, 'warn', 'No projection yet — set up a rate plan: open “Mortgage Terms & Rates” (above) and add a rate segment, and the outstanding-principal line will be projected from it.');
     } else if (amortError && amortError.code === 'NO_PAYMENT') {
-      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — add a monthly payment or remaining amortization in “Mortgage Terms & Rates” (above) to project it.');
+      showMsg(cmsg, 'warn', 'The outstanding principal is not projected yet — set the remaining amortization in “Mortgage Terms & Rates” (above) to project it.');
     } else if (amortError) {
       showMsg(cmsg, 'warn', amortError.error);
     } else {
@@ -2275,7 +2277,12 @@ function drawCombinedChart() {
           position: 'right',
           display: barTotals.length > 0,
           min: 0,
-          ...(barMax > 0 ? { max: barMax * 1.1 } : {}),
+          // The ceiling rounds UP to a clean 500 step: the exact
+          // max becomes a tick label, and a calculated payment is
+          // never round — an unrounded ceiling (3198.833) prints a
+          // long decimal that widens this axis and can squeeze the
+          // x axis into skipping every other month tick.
+          ...(barMax > 0 ? { max: Math.ceil((barMax * 1.1) / 500) * 500 } : {}),
           grid: { drawOnChartArea: false },
           ticks: { callback: moneyTick }, title: { display: true, text: 'Payment ($)' },
         },
