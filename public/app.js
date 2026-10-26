@@ -1121,15 +1121,27 @@ function lumpRowsHtml(lumps) {
   return lumps.map((l) => `<div class="kv"><span class="k">${esc(l.date)}</span><span>${money(l.amount)}${l.note ? ` · ${esc(l.note)}` : ''}</span><button type="button" class="small danger" data-del-lump="${l.id}">Delete</button></div>`).join('');
 }
 
+// The add-segment form uses the same grid as every other form on
+// the site (label above input, one baseline per row) instead of a
+// flex toolbar — in a toolbar the inputs sized to content, the row
+// wrapped, and the Add segment button dropped below the inputs
+// with its label detached. It starts hidden; "+ Change rate"
+// toggles it open (see the termsWrap click handler).
 function segFormHtml(t) {
-  return `<form data-seg-form="${t.id}" class="toolbar hidden" style="align-items:flex-end">
-    <div><label>Start date</label><input type="date" name="start_date" required value="${esc(t.start_date)}"></div>
-    <div><label>Type</label><select name="rate_type"><option value="fixed">Fixed</option><option value="variable">Variable</option></select></div>
-    <div data-seg-mode class="hidden"><label>Pricing (variable)</label><select name="rate_mode"><option value="absolute">Absolute rate</option><option value="prime_spread">Prime + spread</option></select></div>
-    <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
-    <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div></div>
-    <button class="primary" type="submit">Add segment</button>
-    <div class="note" data-plan-preview style="flex-basis:100%;margin:2px 0 0"></div>
+  return `<form data-seg-form="${t.id}" class="hidden">
+    <div class="grid3">
+      <div><label>Start date</label><input type="date" name="start_date" required value="${esc(t.start_date)}"></div>
+      <div><label>Type</label><select name="rate_type"><option value="fixed">Fixed</option><option value="variable">Variable</option></select></div>
+      <div data-seg-mode class="hidden"><label>Pricing (variable)</label><select name="rate_mode"><option value="absolute">Absolute rate</option><option value="prime_spread">Prime + spread</option></select></div>
+    </div>
+    <div class="grid3">
+      <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
+      <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div></div>
+    </div>
+    <div class="toolbar">
+      <button class="primary" type="submit">Add segment</button>
+    </div>
+    <div class="note" data-plan-preview style="margin:2px 0 0"></div>
   </form>`;
 }
 
@@ -1208,7 +1220,7 @@ function renderTerms(p) {
           </div>
         </form>
         <h5>Rate segments in this term</h5>
-        <table>
+        <table class="seg-table">
           <thead><tr><th>Starts</th><th>Type</th><th class="num">Annual rate %</th><th></th></tr></thead>
           <tbody ${t.id === p.currentTermId ? 'id="segmentRows"' : ''}>${segRowsHtml(segs)}</tbody>
         </table>
@@ -1261,7 +1273,16 @@ $('#termsWrap').addEventListener('click', async (e) => {
   if (showSeg) {
     const block = showSeg.closest('[data-term-block]');
     const form = block && block.querySelector('[data-seg-form]');
-    if (form) { form.classList.remove('hidden'); syncSegForm(form); refreshPlanPreview(form); }
+    if (form) {
+      // A real toggle: closed by default, one click opens, the
+      // next closes. Either way the preview line starts blank —
+      // a stale message never survives a close / reopen.
+      const opening = form.classList.contains('hidden');
+      form.classList.toggle('hidden', !opening);
+      const preview = form.querySelector('[data-plan-preview]');
+      if (preview) preview.textContent = '';
+      if (opening) { syncSegForm(form); refreshPlanPreview(form); }
+    }
     return;
   }
   const showLump = e.target.closest('[data-toggle-lump]');
@@ -1669,6 +1690,14 @@ function refreshPlanPreview(form) {
     const block = form.closest('[data-term-block]');
     const termForm = block && block.querySelector('[data-term-form]');
     const f = Object.fromEntries(new FormData(form).entries());
+    // An incomplete draft (no rate / no spread entered yet) has
+    // nothing to preview: keep the line blank rather than
+    // surfacing the server's validation error for a form nobody
+    // has submitted — an error shows only after a real submit.
+    const draftIncomplete = (f.rate_type === 'variable' && f.rate_mode === 'prime_spread')
+      ? (f.spread === '' || f.spread == null)
+      : (f.annual_rate === '' || f.annual_rate == null);
+    if (draftIncomplete) { out.textContent = ''; return; }
     const body = {
       start_date: f.start_date,
       rate_type: f.rate_type,

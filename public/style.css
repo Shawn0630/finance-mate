@@ -161,4 +161,13 @@ label.btnlike:hover { background: #f0f4f9; }
 .term-head .term-title { font-weight: 650; }
 .term-body { padding: 4px 12px 12px; border-top: 1px solid #e6ecf2; }
 .term-body h5 { margin: 14px 0 6px; font-size: 12.5px; color: #33424f; }
+/* Rate-segment table in a term card: fixed layout keeps the
+   columns put whatever the rate text's length — the rate column's
+   header and values share one right edge (th.num / td.num), and
+   the Delete action sits at the row's end instead of floating. */
+table.seg-table { table-layout: fixed; }
+table.seg-table th:nth-child(1) { width: 22%; }
+table.seg-table th:nth-child(2) { width: 20%; }
+table.seg-table th:nth-child(4) { width: 84px; }
+table.seg-table td:last-child { text-align: right; }
 @media (max-width: 800px) { .summary-strip { grid-template-columns: 1fr 1fr; } .grid2, .grid3 { grid-template-columns: 1fr; } }
