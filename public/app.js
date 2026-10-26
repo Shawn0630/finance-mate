@@ -726,11 +726,9 @@ function drawPortfolioChart() {
       label: 'Assessed value (all properties)',
       data: assessedData,
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      // Points only — no connecting line. An assessed value is one
-      // number per assessment year, not a continuous quantity: any
-      // line between the years (smoothed or stepped) would invent
-      // the months in between.
-      showLine: false, pointRadius: 5, pointHoverRadius: 7,
+      // One point per assessment year, joined by straight line
+      // segments (tension 0 — no smoothing curve, no step).
+      showLine: true, tension: 0, pointRadius: 5, pointHoverRadius: 7,
     });
   }
   if (rows.length) {
@@ -1590,10 +1588,10 @@ function drawCombinedChart() {
       label: 'Assessed value',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
       borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
-      // Points only — no connecting line, like the portfolio chart:
-      // one value per assessment year, and any line (smoothed or
-      // stepped) would invent the months in between.
-      showLine: false, pointRadius: 5, pointHoverRadius: 7,
+      // One value per assessment year, joined by straight line
+      // segments like the portfolio chart (tension 0 — no smoothing
+      // curve, no step).
+      showLine: true, tension: 0, pointRadius: 5, pointHoverRadius: 7,
     });
   }
   if (chartMeta && fullSeries.length) {

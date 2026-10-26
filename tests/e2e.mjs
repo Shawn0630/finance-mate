@@ -1434,11 +1434,11 @@ try {
 
       // The user's real shape: five assessed years (2022-2026) and
       // one variable prime-spread segment, but NO monthly payment and
-      // NO amortization. The assessed values must render as points
-      // only — any connecting line (smoothed or stepped) invents the
-      // months between assessment years — the missing projection must
-      // be announced beside the chart, and after an edit on this page
-      // the portfolio must show fresh numbers without a reload.
+      // NO amortization. The assessed values must render as yearly
+      // points joined by straight line segments (no smoothing curve,
+      // no step), the missing projection must be announced beside
+      // the chart, and after an edit on this page the portfolio must
+      // show fresh numbers without a reload.
       r = await req('POST', '/api/properties', {
         address: '966 Step Test Place, Victoria, BC',
         mortgage_balance: 1350000, mortgage_balance_date: '2026-10-25', purchase_date: '2024-12-17',
@@ -1455,10 +1455,11 @@ try {
       await wait(1600);
       const stepCfg = await page.evaluate(() => {
         const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Assessed value');
-        return ds ? { showLine: ds.showLine, pts: ds.data } : null;
+        return ds ? { showLine: ds.showLine, tension: ds.tension, stepped: ds.stepped, pts: ds.data } : null;
       });
-      check('detail assessed values are points only (no connecting line)',
-        !!stepCfg && stepCfg.showLine === false, JSON.stringify(stepCfg && stepCfg.showLine));
+      check('detail assessed values are joined by straight lines (no curve, no step)',
+        !!stepCfg && stepCfg.showLine !== false && stepCfg.tension === 0 && !stepCfg.stepped,
+        JSON.stringify(stepCfg && { showLine: stepCfg.showLine, tension: stepCfg.tension, stepped: stepCfg.stepped }));
       check('detail assessed points are the five recorded years at their values',
         !!stepCfg && stepCfg.pts.length === 5
           && stepCfg.pts.every((p) => stepVals[p.x] === p.y),
@@ -1466,12 +1467,14 @@ try {
       const combMsg = await page.evaluate(() => document.querySelector('#combinedMsg').textContent);
       check('detail chart A announces the missing payment beside the chart (NO_PAYMENT)',
         combMsg.includes('add a monthly payment or remaining amortization'), combMsg);
-      // Pixel-level proof of points-only rendering: the canvas
+      // Pixel-level proof of the straight-line rendering: the canvas
       // column at x = 2025 (inside the chart area only, so the legend
       // swatch cannot interfere) must carry the 2025 marker at the
-      // 2025 value, and the column at mid-2025 (x = 2025.5) must be
-      // EMPTY of the assessed green — a connecting line (smoothed or
-      // stepped) would paint straight through it.
+      // 2025 value, and the column at mid-2025 (x = 2025.5) must carry
+      // the assessed green at the straight-line midpoint of the two
+      // years, (2,002,000 + 1,931,000) / 2 = 1,966,500 — a smoothed
+      // curve would bow away from it and a step would sit on one of
+      // the two year values instead.
       const scanAt = (xVal) => page.evaluate((xv) => {
         const c = window.__fmCharts.a;
         if (!c) return null;
@@ -1492,9 +1495,9 @@ try {
       const scanPt = await scanAt(2025);
       check('detail assessed marker sits at the 2025 value (2,002,000)',
         !!scanPt && scanPt.hits > 0 && Math.abs(scanPt.value - 2002000) < 10000, JSON.stringify(scanPt));
-      const scanGap = await scanAt(2025.5);
-      check('no assessed line connects the points (the mid-2025 column is empty)',
-        !!scanGap && scanGap.hits === 0, JSON.stringify(scanGap));
+      const scanMid = await scanAt(2025.5);
+      check('a straight line joins the points (mid-2025 reads the two years\u2019 average, 1,966,500)',
+        !!scanMid && scanMid.hits > 0 && Math.abs(scanMid.value - 1966500) < 10000, JSON.stringify(scanMid));
 
       // Edit a value point through THIS page's own form (the trend
       // form used to leave the assets cache untouched), then go back
@@ -1521,10 +1524,11 @@ try {
       const pfPtsCfg = await page.evaluate(() => {
         const c = window.__fmCharts.portfolio;
         const ds = c ? c.data.datasets.find((d) => d.label === 'Assessed value (all properties)') : null;
-        return ds ? { showLine: ds.showLine, n: ds.data.length } : null;
+        return ds ? { showLine: ds.showLine, tension: ds.tension, stepped: ds.stepped, n: ds.data.length } : null;
       });
-      check('portfolio assessed values are points only (no connecting line)',
-        !!pfPtsCfg && pfPtsCfg.showLine === false && pfPtsCfg.n >= 5, JSON.stringify(pfPtsCfg));
+      check('portfolio assessed values are joined by straight lines (no curve, no step)',
+        !!pfPtsCfg && pfPtsCfg.showLine !== false && pfPtsCfg.tension === 0 && !pfPtsCfg.stepped && pfPtsCfg.n >= 5,
+        JSON.stringify(pfPtsCfg));
 
       // ---- Amortization years in the Mortgage panel derive the payment ----
       // The user's exact shape again (balance + one prime-spread
