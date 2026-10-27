@@ -1730,13 +1730,17 @@ try {
   // and the rendered templates together. The principal pair's input
   // name switches between opening_balance and anchor_balance (the
   // term carrying the balance anchor edits the anchor values).
-  // The term's payment OVERRIDE is a money field like the others;
-  // there is still no PROPERTY-level payment field anywhere.
+  // The term's payment override is edited through the Monthly
+  // payment row's inline editor, whose input is a money field
+  // like the others — there is no standalone override input (and
+  // no "Monthly payment override" label) and still no
+  // PROPERTY-level payment field anywhere.
   const appJsRes2 = await fetch(BASE + '/app.js', { headers: { Cookie: cookie } });
   const appJsText2 = await appJsRes2.text();
-  check('money inputs are marked data-money in the page (and the term override is one of them)',
+  check('money inputs are marked data-money in the page (the payment-row editor is one of them; no standalone override field)',
     (pageHtml.match(/data-money/g) || []).length >= 4
       && (appJsText2.match(/name="payment_override"[^>]*data-money/g) || []).length === 1
+      && !appJsText2.includes('Monthly payment override')
       && !appJsText2.includes('name="mortgage_payment"')
       && (appJsText2.match(/name="\$\{principalName\}"[^>]*data-money/g) || []).length === 1
       && appJsText2.includes("anchored ? 'anchor_balance' : 'opening_balance'"),
@@ -3042,20 +3046,32 @@ try {
       // There is no PROPERTY-level payment field to type into, and
       // no entered/auto tag: with no override set on this fixture,
       // the stat, the metadata and the term card all show the
-      // calculated figure, plain (no strikethrough). The term form
-      // carries the figure read-only plus its override input.
-      const noEntry = await page.evaluate(() => ({
-        propertyPaymentInputs: document.querySelectorAll('#mortgageModal [name=mortgage_payment]').length,
-        overrideInputs: document.querySelectorAll('#mortgageModal [name=payment_override]').length,
-        struck: document.querySelectorAll('#mortgageModal [data-term-payment] s, #metaCurrentPayment s, #estPaymentValue s').length,
-        estTag: !!document.querySelector('#estPaymentTag'),
-        metaTag: !!document.querySelector('#metaPaymentTag'),
-        termFigure: document.querySelector('[data-term-form] [data-term-payment]').textContent,
-        stat: document.querySelector('#estPaymentValue').textContent,
-        meta: document.querySelector('#metaCurrentPayment').textContent,
-      }));
-      check('no property payment input and no entered/auto tag — the calculated figure shows plain in the stat, the metadata and the term card (override input present, empty)',
-        noEntry.propertyPaymentInputs === 0 && noEntry.overrideInputs >= 1 && noEntry.struck === 0 && !noEntry.estTag && !noEntry.metaTag
+      // calculated figure, plain (no strikethrough). The override
+      // has NO standalone input: the term form's Monthly payment
+      // row shows the figure with an Edit button, its editor
+      // input hidden in the same row, empty.
+      const noEntry = await page.evaluate(() => {
+        const payInput = document.querySelector('[data-term-form] [name=payment_override]');
+        const editBtn = document.querySelector('[data-term-form] [data-pay-edit]');
+        return {
+          propertyPaymentInputs: document.querySelectorAll('#mortgageModal [name=mortgage_payment]').length,
+          overrideInputs: document.querySelectorAll('#mortgageModal [name=payment_override]').length,
+          overrideLabels: [...document.querySelectorAll('#mortgageModal label')].filter((l) => l.textContent.includes('Monthly payment override')).length,
+          payInputHidden: !!payInput && payInput.classList.contains('hidden'),
+          payInputValue: payInput ? payInput.value : null,
+          editBtnShown: !!editBtn && !editBtn.classList.contains('hidden'),
+          struck: document.querySelectorAll('#mortgageModal [data-term-payment] s, #metaCurrentPayment s, #estPaymentValue s').length,
+          estTag: !!document.querySelector('#estPaymentTag'),
+          metaTag: !!document.querySelector('#metaPaymentTag'),
+          termFigure: document.querySelector('[data-term-form] [data-term-payment]').textContent,
+          stat: document.querySelector('#estPaymentValue').textContent,
+          meta: document.querySelector('#metaCurrentPayment').textContent,
+        };
+      });
+      check('no property payment input and no entered/auto tag — the calculated figure shows plain in the stat, the metadata and the term card (payment editor at rest: figure + Edit, input hidden and empty, no standalone override input)',
+        noEntry.propertyPaymentInputs === 0 && noEntry.overrideInputs >= 1 && noEntry.overrideLabels === 0
+          && noEntry.payInputHidden && noEntry.payInputValue === '' && noEntry.editBtnShown
+          && noEntry.struck === 0 && !noEntry.estTag && !noEntry.metaTag
           && noEntry.termFigure.includes('6,381') && noEntry.stat.includes('6,381') && noEntry.meta.includes('6,381'),
         JSON.stringify(noEntry));
       await req('DELETE', `/api/properties/${amortPid}`);
@@ -3234,13 +3250,17 @@ try {
             - (amortUi.series[idxB - 1].balance + amortUi.series[idxB].interest - amortUi.series[idxB].payment)) < 0.02,
         JSON.stringify(amortUi.series[idxB]));
       // Every term card carries the full field set — principal
-      // pair, frequency, day, the calculated monthly payment as
-      // a read-only figure and the payment override input (never
-      // a property-level payment input) — and the old standalone
+      // pair, frequency, day, and the calculated monthly payment
+      // as a read-only figure whose own row holds the override
+      // editor (Edit button + the payment_override input, in the
+      // payment row — never a standalone field, never a
+      // property-level payment input) — and the old standalone
       // anchor form is gone from the page entirely.
       const fieldSets = await page.evaluate(() => ({
         forms: [...document.querySelectorAll('#termsWrap .term-block [data-term-form]')].map((f) => ({
           overrideInput: !!f.querySelector('[name=payment_override]'),
+          overrideInPaymentRow: !!f.querySelector('.term-pay-row [name=payment_override]'),
+          payEditBtn: !!f.querySelector('.term-pay-row [data-pay-edit]'),
           propertyPaymentInput: !!f.querySelector('[name=mortgage_payment]'),
           paymentFigure: !!f.querySelector('[data-term-payment]'),
           freq: !!f.querySelector('[name=payment_frequency]'),
@@ -3250,9 +3270,9 @@ try {
         })),
         anchorForms: document.querySelectorAll('[data-anchor-form]').length,
       }));
-      check('every term card carries the principal/frequency/day field set, a read-only payment figure and the override input — no property payment input (no separate anchor form)',
+      check('every term card carries the principal/frequency/day field set, a read-only payment figure with its inline Edit in the payment row — no property payment input (no separate anchor form)',
         fieldSets.forms.length === 2
-          && fieldSets.forms.every((s) => s.overrideInput && !s.propertyPaymentInput && s.paymentFigure && s.freq && s.day && s.principal && s.principalDate)
+          && fieldSets.forms.every((s) => s.overrideInput && s.overrideInPaymentRow && s.payEditBtn && !s.propertyPaymentInput && s.paymentFigure && s.freq && s.day && s.principal && s.principalDate)
           && fieldSets.anchorForms === 0,
         JSON.stringify(fieldSets));
       const termPayFig = await page.evaluate(() =>
@@ -3566,13 +3586,16 @@ try {
 
       // ---- Payment override, driven through the UI ----
       // $1,350,000 at 3.95% fixed over 30y derives $6,381.36.
-      // Typing a $6,000 override into Term 1's form and saving
-      // must re-render every payment surface the same way: the
-      // used amount bold, the derived amount struck through
-      // beside it — term card figure, modal metadata, detail stat
-      // and the Properties card — and the projection must follow
-      // the override trajectory. Clearing the field restores the
-      // plain derived figure everywhere.
+      // The override is set by clicking Edit on the Monthly
+      // payment figure itself (there is no standalone override
+      // input): the figure becomes an input prefilled with the
+      // used payment; typing $6,000 and saving must re-render
+      // every payment surface the same way: the used amount bold,
+      // the derived amount struck through beside it — term card
+      // figure, modal metadata, detail stat and the Properties
+      // card — and the projection must follow the override
+      // trajectory. Clearing the editor restores the plain
+      // derived figure everywhere, and so does Reset + Save.
       r = await req('POST', '/api/properties', {
         address: '777 Override UI Avenue, Victoria, BC',
         mortgage_balance: 1350000, mortgage_balance_date: '2026-01-01', purchase_date: '2025-06-01', amortization_years: 30,
@@ -3586,7 +3609,33 @@ try {
           && !document.querySelector('#estPaymentValue s')));
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(800);
-      await focusField('[data-term-form] [name=payment_override]');
+      const payRowState = () => page.evaluate(() => {
+        const form = document.querySelector('[data-term-form]');
+        const input = form.querySelector('[name=payment_override]');
+        const view = form.querySelector('[data-term-payment]');
+        const ref = form.querySelector('[data-pay-derived-ref]');
+        const struck = ref ? ref.querySelector('s') : null;
+        return {
+          inputHidden: input.classList.contains('hidden'),
+          inputValue: input.value,
+          viewHidden: view.classList.contains('hidden'),
+          editHidden: form.querySelector('[data-pay-edit]').classList.contains('hidden'),
+          resetHidden: form.querySelector('[data-pay-reset]').classList.contains('hidden'),
+          refText: ref ? ref.textContent : null,
+          refStruck: struck ? struck.textContent : null,
+        };
+      });
+      const atRest = await payRowState();
+      check('the payment row rests as figure + Edit (editor input hidden, no override → no Reset)',
+        atRest.inputHidden && !atRest.viewHidden && !atRest.editHidden && atRest.resetHidden && atRest.inputValue === '',
+        JSON.stringify(atRest));
+      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await wait(200);
+      const editing = await payRowState();
+      check('Edit opens the inline editor in place: input prefilled with the used payment, the calculated figure muted beside it, still no Reset',
+        !editing.inputHidden && editing.viewHidden && editing.editHidden && editing.resetHidden
+          && editing.inputValue === '6,381.36' && editing.refText.includes('6,381') && editing.refStruck === null,
+        JSON.stringify(editing));
       await page.keyboard.type('6000');
       await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
       const tripleOf = (sel) => page.evaluate((s) => {
@@ -3663,13 +3712,21 @@ try {
       check('the Properties card shows the override payment with the derived struck through',
         !!cardPay && cardPay.text.includes('6,000') && cardPay.struckText === '$6,381',
         JSON.stringify(cardPay));
-      // Clear the override through the same form: figures return
-      // to the plain derived payment, strikethrough gone.
+      // Clear the override through the same editor: figures
+      // return to the plain derived payment, strikethrough gone.
+      // Opening the editor on the overridden term first: the
+      // input is prefilled with the used $6,000, the calculated
+      // figure stands struck through beside it and Reset shows.
       await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, ovUiPid);
       await wait(1500);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(800);
-      await focusField('[data-term-form] [name=payment_override]');
+      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await wait(200);
+      const editingOv = await payRowState();
+      check('on an overridden term the editor prefills the used payment, the calculated figure is struck through beside it, and Reset is offered',
+        !editingOv.inputHidden && editingOv.inputValue === '6,000' && editingOv.refStruck === '$6,381' && !editingOv.resetHidden,
+        JSON.stringify(editingOv));
       await page.keyboard.press('Backspace');
       await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
       check('clearing the override restores the plain derived figure (no strikethrough anywhere)',
@@ -3686,6 +3743,38 @@ try {
       check('after the UI clear, the API projection is the derived one again',
         ovUiCleared.paymentUsed === 6381.36 && ovUiCleared.paymentOverridden === false,
         JSON.stringify({ u: ovUiCleared.paymentUsed, o: ovUiCleared.paymentOverridden }));
+      // Reset path: set the override once more, then in the
+      // editor click Reset — the box returns to the calculated
+      // figure and saving clears the override (a figure equal to
+      // the calculated one IS the calculated one).
+      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await wait(200);
+      await page.keyboard.type('6000');
+      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
+      check('the override is set again for the Reset path',
+        await untilNode(async () => {
+          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          return !!t && t.used === '$6,000' && t.struckText === '$6,381';
+        }));
+      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await wait(200);
+      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-reset]').click());
+      await wait(200);
+      const afterReset = await payRowState();
+      check('Reset puts the calculated figure back in the editor box',
+        afterReset.inputValue === '6,381.36' && !afterReset.inputHidden,
+        JSON.stringify(afterReset));
+      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
+      check('saving after Reset clears the override (figure plain again, editor back at rest)',
+        await untilNode(async () => {
+          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          const st = await payRowState();
+          return !!t && t.text.includes('6,381') && t.struckText === null && st.inputHidden && st.inputValue === '';
+        }));
+      const ovUiReset = (await req('GET', `/api/properties/${ovUiPid}/amortization`)).data;
+      check('after Reset + Save the API projection is the derived one',
+        ovUiReset.paymentUsed === 6381.36 && ovUiReset.paymentOverridden === false,
+        JSON.stringify({ u: ovUiReset.paymentUsed, o: ovUiReset.paymentOverridden }));
       await req('DELETE', `/api/properties/${ovUiPid}`);
 
       // ---- Segment compounding, driven through the UI ----
@@ -3875,6 +3964,20 @@ try {
           && aiValues.segType === 'variable' && aiValues.segMode === 'prime_spread' && aiValues.segSpread === '-1'
           && aiValues.segCmp === 'monthly' && aiValues.segStart === '2024-12-17',
         JSON.stringify(aiValues));
+      // The extracted override lands in the Monthly payment
+      // row's inline editor: the row is in EDIT state (the input
+      // shown in place of the figure) without anyone clicking
+      // Edit.
+      const aiPayEdit = await page.evaluate(() => {
+        const form = document.querySelector('[data-term-form]');
+        return {
+          inputHidden: form.querySelector('[name=payment_override]').classList.contains('hidden'),
+          viewHidden: form.querySelector('[data-term-payment]').classList.contains('hidden'),
+        };
+      });
+      check('the extracted override opens the payment row’s inline editor (input shown in place of the figure)',
+        aiPayEdit.inputHidden === false && aiPayEdit.viewHidden === true,
+        JSON.stringify(aiPayEdit));
       check('flags sit on the filled term fields — and not on the kept lender',
         (await aiFlagOf('[data-term-form]', 'start_date')) === true
           && (await aiFlagOf('[data-term-form]', 'term_months')) === true
@@ -3906,10 +4009,11 @@ try {
       check('the segment saves with its Monthly chip',
         await untilNode(async () => (await chipText()) === 'Monthly'));
       const aiSaved = (await req('GET', `/api/properties/${aiPid}`)).data;
-      check('the persisted flags: term fields minus the hand-edited one; all segment fields',
+      check('the persisted flags: term fields minus the hand-edited one; all segment fields (and the AI override itself saved)',
         JSON.stringify([...aiSaved.terms[0].ai_fields].sort()) === JSON.stringify(['amortization_years', 'opening_balance', 'payment_override', 'start_date'])
-          && JSON.stringify([...aiSaved.segments[0].ai_fields].sort()) === JSON.stringify(['compounding', 'rate_mode', 'rate_type', 'spread', 'start_date']),
-        JSON.stringify({ t: aiSaved.terms[0].ai_fields, s: aiSaved.segments[0].ai_fields }));
+          && JSON.stringify([...aiSaved.segments[0].ai_fields].sort()) === JSON.stringify(['compounding', 'rate_mode', 'rate_type', 'spread', 'start_date'])
+          && aiSaved.terms[0].payment_override === 7207.1,
+        JSON.stringify({ t: aiSaved.terms[0].ai_fields, s: aiSaved.segments[0].ai_fields, po: aiSaved.terms[0].payment_override }));
       await page.reload({ waitUntil: 'load' });
       await wait(1800);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());

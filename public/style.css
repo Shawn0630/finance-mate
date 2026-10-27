@@ -177,10 +177,14 @@ label.btnlike:hover { background: #f0f4f9; }
 .head-stat { margin-left: 10px; }
 .head-stat-k { font-size: 11px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
 .head-stat-v { font-size: 21px; font-weight: 700; line-height: 1.2; }
-/* The monthly payment inside a term card: read-only and
-   prominent — the figure itself is computed (or overridden), it is
-   never typed into this element; the override has its own input. */
+/* The monthly payment inside a term card: prominent and, at rest,
+   read-only — the figure itself is computed (or overridden). Its
+   Edit button swaps the figure for the override input in place;
+   the row keeps the figure, the input and the Edit/Reset buttons
+   on one line. */
 .term-pay-v { font-size: 19px; font-weight: 700; line-height: 1.2; padding: 5px 0; }
+.term-pay-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pay-edit-input { width: 150px; }
 /* A payment rendered from its triple (paymentHtml in app.js): the
    used amount bold; beside it, when the term overrides the
    calculated payment, the derived amount struck through, muted. */

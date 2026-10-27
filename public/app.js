@@ -635,6 +635,10 @@ function fillOneInput(form, name, value) {
   input.dispatchEvent(new Event('change', { bubbles: true }));
   form._aiFilling = false;
   set.add(name);
+  // An extracted payment lands in the Monthly payment row's
+  // inline editor: reveal it in edit state (the ✨ flag renders
+  // on that row's label via renderAiFlags below).
+  if (name === 'payment_override') enterPayEdit(form, 'keep');
   return 'filled';
 }
 
@@ -776,6 +780,18 @@ function captureFormDrafts() {
 function restoreFormDrafts(stash) {
   const put = (form, draft) => {
     if (!form || !draft) return;
+    // The payment editor's fresh at-rest text (the stored
+    // override, or blank), snapshotted before the draft lands.
+    // The draft's editor value is judged by its SAVE OUTCOME
+    // (blank, or a figure equal to the calculated one, saves as
+    // no override; anything else saves as that override): when
+    // the outcome differs from the stored override, the draft
+    // carries a real unsaved payment edit and its edit state is
+    // restored with it — never silently folded away; when the
+    // outcome matches, the input is reset to mirror the stored
+    // override, so the form rests exactly as rendered.
+    const payInput = form.querySelector('[data-pay-edit-input]');
+    const freshPayText = payInput ? payInput.value : undefined;
     form._aiFilling = true;
     for (const [name, value] of Object.entries(draft.fields)) {
       const input = form.querySelector(`[name="${name}"]`);
@@ -789,6 +805,16 @@ function restoreFormDrafts(stash) {
     set.clear();
     draft.flags.forEach((n) => set.add(n));
     renderAiFlags(form);
+    if (payInput && draft.fields && 'payment_override' in draft.fields) {
+      const cents = (x) => (x === '' || x == null ? null : Math.round(Number(x) * 100));
+      const term = termOfForm(form);
+      const derived = cents(term ? term.paymentDerived : null);
+      const stored = cents(parseMoneyInput(freshPayText));
+      const v = cents(parseMoneyInput(payInput.value));
+      const draftOutcome = (v === null || v === derived) ? null : v;
+      if (draftOutcome !== stored) enterPayEdit(form, 'keep');
+      else payInput.value = freshPayText;
+    }
   };
   document.querySelectorAll('[data-term-form]').forEach((f) => put(f, stash.terms[f.dataset.termForm]));
   document.querySelectorAll('[data-seg-form]').forEach((f) => { put(f, stash.segs[f.dataset.segForm]); syncSegForm(f); });
@@ -1318,6 +1344,71 @@ function termLengthLabel(months) {
   return `${m} month${m === 1 ? '' : 's'}`;
 }
 
+// ------------------------------------------------ payment editor ---
+// The term form's Monthly payment is a read-only figure with an
+// Edit button: Edit swaps the figure for an input in place,
+// prefilled with the used payment, the calculated figure kept
+// beside it as the reference (struck through while an override
+// stands, muted otherwise). There is NO separate override field —
+// the input lives in the payment row, named payment_override, and
+// at rest it simply mirrors the stored override. On Save, a blank
+// input, or one equal to the calculated figure, clears the
+// override; any other positive figure becomes it. Reset (shown
+// only while an override stands) puts the calculated figure back
+// in the box, so saving after Reset clears the override too.
+function payEditEls(form) {
+  return {
+    input: form.querySelector('[data-pay-edit-input]'),
+    view: form.querySelector('[data-term-payment]'),
+    editBtn: form.querySelector('[data-pay-edit]'),
+    resetBtn: form.querySelector('[data-pay-reset]'),
+    ref: form.querySelector('[data-pay-derived-ref]'),
+  };
+}
+
+function termOfForm(form) {
+  const terms = (detailProperty && detailProperty.terms) || [];
+  return terms.find((t) => String(t.id) === String(form.dataset.termForm)) || null;
+}
+
+// The term form's submitted payment_override: the inline editor's
+// parsed value, mapped by the rule above (blank or equal to the
+// term's calculated payment → null; anything else passes through
+// for the server to validate).
+function paymentOverrideOut(form, parsed) {
+  if (parsed === '' || parsed == null) return null;
+  const term = termOfForm(form);
+  const derived = term ? term.paymentDerived : null;
+  if (derived != null && Math.round(Number(parsed) * 100) === Math.round(Number(derived) * 100)) return null;
+  return parsed;
+}
+
+// mode 'used': prefill from the term's current used payment (the
+// Edit button). mode 'keep': the input already holds the value to
+// show (an AI fill, a restored draft) — only reveal it.
+function enterPayEdit(form, mode = 'used') {
+  const els = payEditEls(form);
+  if (!els.input || !els.view) return;
+  const term = termOfForm(form);
+  if (mode === 'used' && term) {
+    // Programmatic prefill, no input/change events: opening the
+    // editor is not an edit — it must neither clear an AI flag
+    // nor re-price anything.
+    els.input.value = formatMoneyInput(term.paymentUsed ?? term.payment_override ?? '');
+  }
+  els.input.classList.remove('hidden');
+  els.view.classList.add('hidden');
+  if (els.editBtn) els.editBtn.classList.add('hidden');
+  if (els.resetBtn) els.resetBtn.classList.toggle('hidden', !(term && term.paymentOverridden));
+  if (els.ref) {
+    els.ref.innerHTML = term && term.paymentDerived != null
+      ? (term.paymentOverridden
+        ? `<s class="pay-derived">${money(term.paymentDerived)}</s>`
+        : `<span class="pay-derived">${money(term.paymentDerived)}</span>`)
+      : '';
+  }
+}
+
 // Modal-top metadata: five read-only figures, all derived from the
 // property and its terms — nothing here is an input. The editable
 // mortgage facts live in the terms themselves; each term's card
@@ -1432,8 +1523,10 @@ function renderTerms(p) {
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
     // Every term card carries the same field set: its contract
     // fields, its principal pair, its monthly payment figure
-    // (read-only, rendered from the term's payment triple), its
-    // optional payment override input and its payment schedule.
+    // (rendered from the term's payment triple, with an Edit
+    // button that turns the figure itself into the override
+    // input — there is no separate override field) and its
+    // payment schedule.
     // The principal pair — "Outstanding
     // principal" / "Principal as of" — binds the term's opening
     // balance / start date, EXCEPT on the term carrying the
@@ -1476,12 +1569,15 @@ function renderTerms(p) {
             </select></div>
           </div>
           <div class="grid3">
-            <div><label>Monthly payment ($)</label><div class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}" data-term-payment-for="${t.id}">—</div></div>
+            <div><label>Monthly payment ($)</label><div class="term-pay-row">
+              <span class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}" data-term-payment-for="${t.id}">—</span>
+              <input name="payment_override" type="text" inputmode="decimal" data-money class="pay-edit-input hidden" data-pay-edit-input value="${esc(formatMoneyInput(t.payment_override ?? ''))}">
+              <span data-pay-derived-ref></span>
+              <button type="button" class="small" data-pay-edit>Edit</button>
+              <button type="button" class="small hidden" data-pay-reset>Reset</button>
+            </div></div>
             <div><label>Payment frequency</label><select name="payment_frequency">${freqOptionsHtml(freqKey)}</select></div>
             <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${t.payment_day ?? p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
-          </div>
-          <div class="grid3">
-            <div><label>Monthly payment override ($)</label><input name="payment_override" type="text" inputmode="decimal" data-money value="${esc(formatMoneyInput(t.payment_override ?? ''))}"></div>
           </div>
           ${t.amortization_defaulted ? '<div class="note" style="margin-left:0">The 25-year amortization on this term is the migration default — set the real figure if it differs.</div>' : ''}
           <div class="toolbar">
@@ -1549,6 +1645,28 @@ $('#termsWrap').addEventListener('click', async (e) => {
   if (yearsBtn) {
     const form = yearsBtn.closest('form');
     if (form) form.term_months.value = Number(yearsBtn.dataset.termYears) * 12;
+    return;
+  }
+  const payEdit = e.target.closest('[data-pay-edit]');
+  if (payEdit) {
+    const form = payEdit.closest('[data-term-form]');
+    if (form) {
+      enterPayEdit(form, 'used');
+      const input = form.querySelector('[data-pay-edit-input]');
+      if (input) { input.focus(); input.select(); }
+    }
+    return;
+  }
+  const payReset = e.target.closest('[data-pay-reset]');
+  if (payReset) {
+    const form = payReset.closest('[data-term-form]');
+    const term = form && termOfForm(form);
+    const input = form && form.querySelector('[data-pay-edit-input]');
+    if (input && term) {
+      input.value = formatMoneyInput(term.paymentDerived ?? '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
     return;
   }
   const showSeg = e.target.closest('[data-toggle-seg]');
@@ -1645,9 +1763,13 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         amortization_years: f.amortization_years === '' || f.amortization_years == null ? null : Number(f.amortization_years),
         repayment_method: f.repayment_method || 'equal_payment',
         payment_frequency: f.payment_frequency,
-        // Blank clears the override (the calculated payment rules
-        // again); a number sets it.
-        payment_override: f.payment_override === '' || f.payment_override == null ? null : f.payment_override,
+        // The payment row's inline editor submits as
+        // payment_override: blank clears the override (the
+        // calculated payment rules again); a figure equal to the
+        // calculated payment IS the calculated payment, so it
+        // clears it too; any other figure is sent as the override
+        // (the server still refuses a non-positive one).
+        payment_override: paymentOverrideOut(form, f.payment_override),
         ai_fields: [...aiFlagSet(form)],
       };
       // The principal pair binds the term's opening balance / start
