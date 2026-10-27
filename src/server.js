@@ -16,7 +16,7 @@ import {
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
 import { handleAiFill, handleAiFillChat, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
-import { costsView, listCosts, validCostInput, upsertCost } from './costs.js';
+import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -1430,21 +1430,36 @@ app.put('/api/properties/:id/costs/:costId', requireApiAuth, (req, res) => {
   const row = db.prepare('SELECT * FROM property_costs WHERE id = ? AND property_id = ?').get(req.params.costId, p.id);
   if (!row) return res.status(404).json({ error: 'cost entry not found' });
   const b = req.body || {};
-  const v = validCostInput({
+  // Merge the figure fields as a pair: a request may carry new
+  // monthlyAmounts (the average is recomputed from them), a bare
+  // amount (an average given directly — any stored month detail is
+  // dropped), or neither (the stored figure rides along: the
+  // month detail when there is one, else the stored amount).
+  const merged = {
     year: b.year !== undefined ? b.year : row.year,
     category: b.category !== undefined ? b.category : row.category,
-    amount: b.amount !== undefined ? b.amount : row.amount,
     basis: b.basis !== undefined ? b.basis : row.basis,
     notes: b.notes !== undefined ? b.notes : row.notes,
-  });
+    amount: b.amount,
+    monthlyAmounts: b.monthlyAmounts,
+  };
+  if (merged.monthlyAmounts === undefined && merged.amount === undefined) {
+    const det = parseStoredMonthlyAmounts(row.monthly_amounts);
+    if (merged.basis === 'monthly' && det) merged.monthlyAmounts = det;
+    else merged.amount = row.amount;
+  }
+  const v = validCostInput(merged);
   if (v.error) return res.status(400).json({ error: v.error });
   // A hand edit makes the row manual again (the value-history
   // rule); re-saving the identical figures keeps its source.
   const changed = v.year !== row.year || v.category !== row.category
-    || v.amount !== row.amount || v.basis !== row.basis || v.notes !== row.notes;
+    || v.amount !== row.amount || v.basis !== row.basis || v.notes !== row.notes
+    || JSON.stringify(v.monthlyAmounts) !== JSON.stringify(parseStoredMonthlyAmounts(row.monthly_amounts));
   try {
-    db.prepare('UPDATE property_costs SET year=?, category=?, amount=?, basis=?, notes=?, source=?, updated_at=? WHERE id=?')
-      .run(v.year, v.category, v.amount, v.basis, v.notes, changed ? 'manual' : row.source, nowIso(), row.id);
+    db.prepare('UPDATE property_costs SET year=?, category=?, amount=?, basis=?, monthly_amounts=?, notes=?, source=?, updated_at=? WHERE id=?')
+      .run(v.year, v.category, v.amount, v.basis,
+        v.monthlyAmounts ? JSON.stringify(v.monthlyAmounts) : null,
+        v.notes, changed ? 'manual' : row.source, nowIso(), row.id);
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {
       return res.status(400).json({ error: `a ${v.category} entry for ${v.year} already exists` });

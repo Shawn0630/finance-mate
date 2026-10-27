@@ -1606,28 +1606,69 @@ try {
   r = await req('GET', '/api/properties/999999/costs');
   check('costs of a missing property are a 404', r.status === 404, JSON.stringify(r.data));
 
+  // ---- Property costs: monthly detail (API) ----
+  // A monthly entry may carry the months actually recorded; the
+  // stored amount is the average the SERVER computes from them —
+  // a client-sent amount alongside the months is not trusted.
+  r = await req('POST', '/api/properties', { address: '78 Monthly Detail Drive, Victoria, BC', purchase_date: '2024-01-01' });
+  const mdPid = r.data.id;
+  r = await req('POST', `/api/properties/${mdPid}/costs`, {
+    year: 2026, category: 'Electricity', basis: 'monthly', amount: 999, monthlyAmounts: { 1: 80, 2: 90, 3: 85 },
+  });
+  check('POST monthly with monthlyAmounts: stored amount is the computed average (85), months ride along',
+    r.status === 201 && !!costEntry(r.data, 'Electricity', 2026)
+      && costEntry(r.data, 'Electricity', 2026).amount === 85
+      && JSON.stringify(costEntry(r.data, 'Electricity', 2026).monthlyAmounts) === JSON.stringify({ '1': 80, '2': 90, '3': 85 })
+      && r.data.years.find((y) => y.year === 2026).cells.Electricity.annual === 1020
+      && JSON.stringify(r.data.years.find((y) => y.year === 2026).cells.Electricity.months.slice(0, 4)) === JSON.stringify([80, 90, 85, 85]),
+    JSON.stringify(r.data).slice(0, 400));
+  r = await req('POST', `/api/properties/${mdPid}/costs`, { year: 2026, category: 'Water', basis: 'monthly', monthlyAmounts: {} });
+  check('an empty monthlyAmounts map is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${mdPid}/costs`, { year: 2026, category: 'Water', basis: 'monthly', monthlyAmounts: { 13: 5 } });
+  check('an out-of-range month in monthlyAmounts is a 400', r.status === 400, JSON.stringify(r.data));
+  const mdElecId = costEntry(
+    (await req('GET', `/api/properties/${mdPid}/costs`)).data, 'Electricity', 2026).id;
+  r = await req('PUT', `/api/properties/${mdPid}/costs/${mdElecId}`, { monthlyAmounts: { 5: 130 } });
+  check('PUT with fresh monthlyAmounts replaces the months and recomputes the average (130)',
+    r.status === 200 && costEntry(r.data, 'Electricity', 2026).amount === 130
+      && JSON.stringify(costEntry(r.data, 'Electricity', 2026).monthlyAmounts) === JSON.stringify({ '5': 130 })
+      && r.data.latest.total === 1560,
+    JSON.stringify(r.data).slice(0, 300));
+  r = await req('PUT', `/api/properties/${mdPid}/costs/${mdElecId}`, { notes: 'hydro' });
+  check('PUT naming no figure keeps the stored months and average',
+    r.status === 200 && costEntry(r.data, 'Electricity', 2026).amount === 130
+      && JSON.stringify(costEntry(r.data, 'Electricity', 2026).monthlyAmounts) === JSON.stringify({ '5': 130 }),
+    JSON.stringify(r.data).slice(0, 300));
+  r = await req('POST', `/api/properties/${mdPid}/costs`, { year: 2025, category: 'Gas', amount: 60, basis: 'monthly' });
+  check('POST monthly with a bare amount keeps the legacy form (monthlyAmounts null, no detail)',
+    r.status === 201 && costEntry(r.data, 'Gas', 2025).amount === 60
+      && costEntry(r.data, 'Gas', 2025).monthlyAmounts === null,
+    JSON.stringify(r.data).slice(0, 300));
+  await req('DELETE', `/api/properties/${mdPid}`);
+
   // ---- AI fill chat (API): the multi-turn flow ----
   // Round 1: the model asks about the year and proposes the one
   // entry it is sure of — a monthly-basis electricity figure.
   // Round 2: with the answer and the draft in the history, it
   // completes the proposal. The chat itself writes nothing.
   fs.writeFileSync(aiStubFile, JSON.stringify({
-    reply: 'Which year are these electricity bills for? The 3 bills average $85/mo.',
-    proposed: [{ year: 2026, category: 'Electricity', amount: 85, basis: 'monthly' }],
+    reply: 'Which year are these electricity bills for? The 3 bills (Jan $80, Feb $90, Mar $85) average $85/mo.',
+    proposed: [{ year: 2026, category: 'Electricity', basis: 'monthly', monthlyAmounts: { 1: 80, 2: 90, 3: 85 } }],
     ready: false,
   }));
   const chat1 = await req('POST', '/api/ai/fill-chat', {
     propertyId: costPid, history: [], text: 'electricity bills', proposed: [],
   });
-  check('fill-chat round 1: asks a question and proposes the partial monthly entry',
+  check('fill-chat round 1: asks a question and proposes the monthly entry month by month',
     chat1.status === 200 && chat1.data.ready === false
       && chat1.data.proposed.length === 1 && chat1.data.proposed[0].basis === 'monthly'
-      && chat1.data.proposed[0].amount === 85,
+      && chat1.data.proposed[0].amount === 85
+      && JSON.stringify(chat1.data.proposed[0].monthlyAmounts) === JSON.stringify({ '1': 80, '2': 90, '3': 85 }),
     JSON.stringify(chat1.data).slice(0, 300));
   fs.writeFileSync(aiStubFile, JSON.stringify({
     reply: 'Recorded as 2026 figures.',
     proposed: [
-      { year: 2026, category: 'Electricity', amount: 85, basis: 'monthly' },
+      { year: 2026, category: 'Electricity', basis: 'monthly', monthlyAmounts: { 1: 80, 2: 90, 3: 85 } },
       { year: 2026, category: 'Property tax', amount: 5400, basis: 'annual' },
     ],
     ready: true,
@@ -5545,8 +5586,8 @@ try {
         }));
       await req('DELETE', `/api/properties/${aiPid}`);
 
-      // ---- Property costs: the inline table, both charts and
-      // the AI chat, driven through the UI ----
+      // ---- Property costs: one editable table per year, both
+      // charts and the AI chat, driven through the UI ----
       // Seeded: 2026 tax 5,400; 2025 tax 5,100 + water 480.
       r = await req('POST', '/api/properties', { address: '88 Costs UI Road, Victoria, BC', purchase_date: '2024-01-01' });
       const costUiPid = r.data.id;
@@ -5555,14 +5596,25 @@ try {
       await req('POST', `/api/properties/${costUiPid}/costs`, { year: 2025, category: 'Water', amount: 480 });
       await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, costUiPid);
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
-      check('the costs panel renders its entries with a subtotal row per year',
+      check('the costs panel renders ONE table per year, each with its own footer total',
         await until(() => {
-          const rows = document.querySelectorAll('#costsRows tr[data-cost-row]');
-          const subs = [...document.querySelectorAll('#costsRows tr.cost-subtotal')].map((t) => t.textContent);
-          return rows.length === 3
-            && subs.some((t) => t.includes('2026 total') && t.includes('5,400'))
-            && subs.some((t) => t.includes('2025 total') && t.includes('5,580'));
+          const blocks = [...document.querySelectorAll('#costsYears [data-cost-year-block]')];
+          const foot = (y) => {
+            const b = blocks.find((x) => x.dataset.costYearBlock === String(y));
+            return b && b.querySelector('tfoot') ? b.querySelector('tfoot').textContent : '';
+          };
+          return JSON.stringify(blocks.map((b) => b.dataset.costYearBlock)) === JSON.stringify(['2026', '2025'])
+            && document.querySelectorAll('#costsYears tr[data-cost-row]').length === 3
+            && foot(2026).includes('2026 total') && foot(2026).includes('5,400')
+            && foot(2025).includes('2025 total') && foot(2025).includes('5,580');
         }));
+      const topbarState = await page.evaluate(() => {
+        const a = document.querySelector('#addCostYearBtn').getBoundingClientRect();
+        const b = document.querySelector('[data-costs-ai-toggle]').getBoundingClientRect();
+        return { sameRow: Math.abs(a.top - b.top) < 2, aTop: a.top, bTop: b.top };
+      });
+      check('"+ Add year" and "✨ Fill with AI" share ONE row at the panel top',
+        topbarState.sameRow === true, JSON.stringify(topbarState));
       const costsHead = await page.evaluate(() => document.querySelector('#costsLatestTotal').textContent);
       check('the panel head shows the latest year total', costsHead.includes('2026') && costsHead.includes('5,400'), costsHead);
       const pieState = await page.evaluate(() => {
@@ -5636,37 +5688,110 @@ try {
       await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="year"]').click());
       await wait(400);
 
-      // Add a monthly-basis row through the inline table.
-      await page.evaluate(() => document.querySelector('#addCostRowBtn').click());
+      // "+ Add year" opens a fresh year block (2027 — the
+      // current year is taken, so the nearest unused one
+      // follows) with a blank edit row; the year is still an
+      // input there — retitle it 2024 and land its first row.
+      await page.evaluate(() => document.querySelector('#addCostYearBtn').click());
+      await wait(300);
+      const addYearState = await page.evaluate(() => {
+        const block = document.querySelector('[data-cost-year-block="2027"]');
+        return block ? {
+          hasYearInput: !!block.querySelector('[data-cost-year-input]'),
+          hasEditRow: !!block.querySelector('tr.cost-editing'),
+        } : null;
+      });
+      check('"+ Add year" opens a new year block (2027) with its year editable and a blank row',
+        !!addYearState && addYearState.hasYearInput && addYearState.hasEditRow,
+        JSON.stringify(addYearState));
+      await page.evaluate(() => {
+        const inp = document.querySelector('[data-cost-year-block="2027"] [data-cost-year-input]');
+        inp.value = '2024';
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+      });
       await wait(300);
       await page.evaluate(() => {
-        const row = document.querySelector('#costsRows tr.cost-editing');
-        row.querySelector('[name=year]').value = '2026';
+        const row = document.querySelector('[data-cost-year-block="2024"] tr.cost-editing');
+        row.querySelector('[name=category]').value = 'Property tax';
+        const amt = row.querySelector('[name=amount]');
+        amt.value = '4900';
+        amt.dispatchEvent(new Event('input', { bubbles: true }));
+        row.querySelector('[data-cost-save]').click();
+      });
+      check('the retitled 2024 block lands its first row and shows its own total (4,900)',
+        await untilNode(async () => {
+          const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
+          return v.entries.some((e) => e.year === 2024 && e.category === 'Property tax' && e.amount === 4900);
+        }) && await until(() => {
+          const b = document.querySelector('[data-cost-year-block="2024"]');
+          return !!b && !!b.querySelector('tfoot') && b.querySelector('tfoot').textContent.includes('4,900');
+        }));
+
+      // A monthly row through the 2026 table's OWN Add row:
+      // basis Monthly opens the 12-month grid — fill Jan/Feb/
+      // Mar only; the avg is computed, never typed.
+      await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] [data-cost-add-row]').click());
+      await wait(300);
+      await page.evaluate(() => {
+        const row = document.querySelector('[data-cost-year-block="2026"] tr.cost-editing');
         row.querySelector('[name=category]').value = 'Electricity';
         const basis = row.querySelector('[name=basis]');
         basis.value = 'monthly';
         basis.dispatchEvent(new Event('change', { bubbles: true }));
-        const amt = row.querySelector('[name=amount]');
-        amt.value = '85';
-        amt.dispatchEvent(new Event('input', { bubbles: true }));
+        const set = (m, v) => {
+          const inp = row.querySelector(`[data-month="${m}"]`);
+          inp.value = v;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+        };
+        set(1, '80'); set(2, '90'); set(3, '85');
       });
-      const costHint = await page.evaluate(() => document.querySelector('#costsRows tr.cost-editing .cost-year-hint').textContent);
-      check('a monthly row previews its annualized figure while editing (= $1,020 / yr)',
-        costHint.includes('1,020'), costHint);
-      await page.evaluate(() => document.querySelector('#costsRows tr.cost-editing [data-cost-save]').click());
-      check('the monthly row saves annualized with its avg annotation; the 2026 subtotal follows',
+      const monthNote = await page.evaluate(() =>
+        document.querySelector('[data-cost-year-block="2026"] tr.cost-editing .cost-amount-note').textContent);
+      check('the month grid previews the computed avg + year figure (avg $85.00/mo · = $1,020.00/yr · 3 months)',
+        monthNote.includes('avg $85.00/mo') && monthNote.includes('1,020') && monthNote.includes('3 months'),
+        monthNote);
+      await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] tr.cost-editing [data-cost-save]').click());
+      check('the monthly row saves: year figure + "avg $85.00/mo (3 months)"; the 2026 footer follows (6,420)',
         await until(() => {
-          const t = document.querySelector('#costsRows').textContent;
-          const sub = [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
-            .map((x) => x.textContent).find((x) => x.includes('2026 total'));
-          return t.includes('avg $85.00/mo') && !!sub && sub.includes('6,420');
+          const b = document.querySelector('[data-cost-year-block="2026"]');
+          return !!b && b.textContent.includes('avg $85.00/mo (3 months)')
+            && b.querySelector('tfoot').textContent.includes('6,420');
         }));
-      // A custom category through the Other… option.
-      await page.evaluate(() => document.querySelector('#addCostRowBtn').click());
+      check('the API stored the recorded months and the server-computed average',
+        await untilNode(async () => {
+          const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
+          const e = v.entries.find((x) => x.category === 'Electricity');
+          return !!e && e.amount === 85
+            && JSON.stringify(e.monthlyAmounts) === JSON.stringify({ '1': 80, '2': 90, '3': 85 });
+        }));
+      // By month with detail on record: actual months land at
+      // their amounts, the rest fill with the average.
+      await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="month"]').click());
+      await wait(600);
+      const comboDetail = await page.evaluate(() => {
+        const c = window.__fmCharts.costsCombo;
+        const elec = c.data.datasets.find((d) => d.label === 'Electricity');
+        const totals = c.data.datasets.find((d) => d.label === 'Total');
+        const at = c.data.labels.indexOf('2026-01');
+        return {
+          jan: elec.data[at], feb: elec.data[at + 1], mar: elec.data[at + 2], apr: elec.data[at + 3],
+          elecSum: elec.data.slice(at, at + 12).reduce((a, b) => a + b, 0),
+          totalSum: totals.data.slice(at, at + 12).reduce((a, b) => a + b, 0),
+        };
+      });
+      check('By month: Electricity 2026 shows Jan 80 / Feb 90 / Mar 85 actuals and Apr filled at the 85 avg',
+        !!comboDetail && comboDetail.jan === 80 && comboDetail.feb === 90
+          && comboDetail.mar === 85 && comboDetail.apr === 85
+          && Math.abs(comboDetail.elecSum - 1020) < 0.05 && Math.abs(comboDetail.totalSum - 6420) < 0.05,
+        JSON.stringify(comboDetail));
+      await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="year"]').click());
+      await wait(400);
+      // A custom category through the Other… option, added from
+      // the 2026 table's own Add row.
+      await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] [data-cost-add-row]').click());
       await wait(300);
       await page.evaluate(() => {
-        const row = document.querySelector('#costsRows tr.cost-editing');
-        row.querySelector('[name=year]').value = '2026';
+        const row = document.querySelector('[data-cost-year-block="2026"] tr.cost-editing');
         const sel = row.querySelector('[name=category]');
         sel.value = '__custom__';
         sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -5675,7 +5800,7 @@ try {
         amt.value = '300';
         amt.dispatchEvent(new Event('input', { bubbles: true }));
       });
-      await page.evaluate(() => document.querySelector('#costsRows tr.cost-editing [data-cost-save]').click());
+      await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] tr.cost-editing [data-cost-save]').click());
       check('Other… turns the type into a free-form name, stored as its own category',
         await untilNode(async () => {
           const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
@@ -5687,15 +5812,17 @@ try {
       await page.evaluate((id) => document.querySelector(`[data-cost-edit="${id}"]`).click(), waterEntry.id);
       await wait(300);
       await page.evaluate(() => {
-        const row = document.querySelector('#costsRows tr.cost-editing');
+        const row = document.querySelector('[data-cost-year-block="2025"] tr.cost-editing');
         const amt = row.querySelector('[name=amount]');
         amt.value = '500';
         amt.dispatchEvent(new Event('input', { bubbles: true }));
         row.querySelector('[data-cost-save]').click();
       });
-      check('editing a row in place updates the figure and the year subtotal (2025 -> 5,600)',
-        await until(() => [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
-          .some((x) => x.textContent.includes('2025 total') && x.textContent.includes('5,600'))));
+      check('editing a row in place updates the figure and its year footer (2025 -> 5,600)',
+        await until(() => {
+          const b = document.querySelector('[data-cost-year-block="2025"]');
+          return !!b && b.querySelector('tfoot').textContent.includes('5,600');
+        }));
       // Delete the gardening row (the page-wide dialog handler
       // registered earlier accepts the confirm).
       const gardenEntry = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
@@ -5707,14 +5834,61 @@ try {
           return !v.entries.some((e) => e.category === 'Gardening') && v.latest.total === 6420;
         }));
 
+      // The save race: while a save's reload is still in
+      // flight, an edit opened on ANOTHER row must survive the
+      // reload landing — the row AND what was typed into it.
+      // Costs writes are delayed 700ms; the Electricity row is
+      // saved untouched, and mid-flight the Water row is opened
+      // and typed into.
+      const elecIdForRace = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
+        .find((e) => e.category === 'Electricity').id;
+      await page.evaluate(() => {
+        window.__origFetch = window.fetch;
+        window.fetch = async (...args) => {
+          const method = (args[1] && args[1].method) || 'GET';
+          if (String(args[0]).includes('/costs') && method !== 'GET') {
+            await new Promise((r) => setTimeout(r, 700));
+          }
+          return window.__origFetch(...args);
+        };
+      });
+      await page.evaluate((id) => document.querySelector(`[data-cost-edit="${id}"]`).click(), elecIdForRace);
+      await wait(300);
+      await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] tr.cost-editing [data-cost-save]').click());
+      await wait(150); // the save is in flight now
+      await page.evaluate((id) => document.querySelector(`[data-cost-edit="${id}"]`).click(), waterEntry.id);
+      await wait(150);
+      await page.evaluate(() => {
+        const row = document.querySelector('[data-cost-year-block="2025"] tr.cost-editing');
+        const amt = row.querySelector('[name=amount]');
+        amt.value = '555';
+        amt.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await wait(1800); // the delayed save + its reload land here
+      const raceState = await page.evaluate(() => {
+        const row = document.querySelector('[data-cost-year-block="2025"] tr.cost-editing');
+        return row ? { editing: row.dataset.costEditrow, amount: row.querySelector('[name=amount]').value } : null;
+      });
+      await page.evaluate(() => { window.fetch = window.__origFetch; delete window.__origFetch; });
+      check('an edit opened while a save reload is in flight survives it — row and typed value alike',
+        !!raceState && raceState.editing === `id:${waterEntry.id}` && raceState.amount.includes('555'),
+        JSON.stringify(raceState));
+      await page.evaluate(() => document.querySelector('[data-cost-year-block="2025"] tr.cost-editing [data-cost-save]').click());
+      check('the surviving edit then saves normally (Water 555, 2025 total 5,655)',
+        await untilNode(async () => {
+          const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
+          const w = v.entries.find((e) => e.category === 'Water');
+          return !!w && w.amount === 555 && v.years.find((y) => y.year === 2025).total === 5655;
+        }));
+
       // ---- The AI costs chat through the UI: two rounds, then
       // Apply. Round 1 asks about the year with a partial
       // monthly proposal; round 2 completes it — including a
       // Property tax entry that conflicts with the recorded one
       // and must start unchecked.
       fs.writeFileSync(aiStubFile, JSON.stringify({
-        reply: 'Which year is the strata bill for? The bill shows $312/mo.',
-        proposed: [{ year: 2026, category: 'Strata fee', amount: 312, basis: 'monthly' }],
+        reply: 'Which year is the strata bill for? Jan–Mar show $312/mo each.',
+        proposed: [{ year: 2026, category: 'Strata fee', basis: 'monthly', monthlyAmounts: { 1: 312, 2: 312, 3: 312 } }],
         ready: false,
       }));
       await page.evaluate(() => document.querySelector('[data-costs-ai-toggle]').click());
@@ -5723,19 +5897,21 @@ try {
         document.querySelector('[data-costs-chat-text]').value = 'strata bill attached';
         document.querySelector('[data-costs-chat-send]').click();
       });
-      check('chat round 1: the question lands in the log and the partial proposal renders',
+      check('chat round 1: the question lands in the log and the proposal renders month by month',
         await until(() => {
           const log = document.querySelector('[data-costs-chat-log]');
           const rows = document.querySelectorAll('[data-proposed-row]');
           return log.textContent.includes('Which year is the strata bill for')
             && rows.length === 1 && rows[0].querySelector('[data-p-basis]').value === 'monthly'
-            && rows[0].querySelector('.p-annual').textContent.includes('3,744');
+            && (rows[0].querySelector('[data-p-month="1"]') || {}).value === '312'
+            && rows[0].querySelector('.p-annual').textContent.includes('3,744')
+            && rows[0].querySelector('.p-annual').textContent.includes('3 months');
         }));
       fs.writeFileSync(aiStubFile, JSON.stringify({
         reply: 'All set for 2026.',
         proposed: [
-          { year: 2026, category: 'Strata fee', amount: 312, basis: 'monthly' },
-          { year: 2026, category: 'Property tax', amount: 5400, basis: 'annual' },
+          { year: 2026, category: 'Strata fee', basis: 'monthly', monthlyAmounts: { 1: 312, 2: 312, 3: 312 } },
+          { year: 2026, category: 'Property tax', amount: 5600, basis: 'annual' },
         ],
         ready: true,
       }));
@@ -5743,29 +5919,35 @@ try {
         document.querySelector('[data-costs-chat-text]').value = '2026';
         document.querySelector('[data-costs-chat-send]').click();
       });
-      check('chat round 2: the completed proposal renders; the conflicting entry starts unchecked',
+      check('chat round 2: the conflict starts unchecked and shows old → new ($5,400.00 → $5,600.00)',
         await until(() => {
           const rows = document.querySelectorAll('[data-proposed-row]');
           if (rows.length !== 2) return false;
           const conflict = [...rows].find((x) => x.classList.contains('conflict'));
           const clean = [...rows].find((x) => !x.classList.contains('conflict'));
-          return !!conflict && !!clean
+          const diff = conflict ? conflict.querySelector('.conflict-diff') : null;
+          return !!conflict && !!clean && !!diff
             && conflict.querySelector('[data-p-category]').value === 'Property tax'
             && conflict.querySelector('[data-p-check]').checked === false
+            && diff.textContent.includes('5,400') && diff.textContent.includes('→') && diff.textContent.includes('5,600')
             && clean.querySelector('[data-p-check]').checked === true;
         }));
       await page.evaluate(() => document.querySelector('[data-costs-apply]').click());
-      check('Apply lands only the checked entries, with source ai; the conflict stays manual',
+      check('Apply lands only the checked entries — months included, source ai; the conflict stays manual',
         await untilNode(async () => {
           const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
           const strata = v.entries.find((e) => e.category === 'Strata fee');
           const tax = v.entries.find((e) => e.category === 'Property tax' && e.year === 2026);
           return !!strata && strata.source === 'ai' && strata.basis === 'monthly' && strata.amount === 312
+            && JSON.stringify(strata.monthlyAmounts) === JSON.stringify({ '1': 312, '2': 312, '3': 312 })
             && !!tax && tax.source === 'manual' && tax.amount === 5400;
         }));
-      check('after Apply the table shows the AI row and the 2026 subtotal is 10,164',
-        await until(() => [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
-          .some((x) => x.textContent.includes('2026 total') && x.textContent.includes('10,164'))));
+      check('after Apply the 2026 table shows the AI row and its footer total is 10,164',
+        await until(() => {
+          const b = document.querySelector('[data-cost-year-block="2026"]');
+          return !!b && b.textContent.includes('Strata fee')
+            && b.querySelector('tfoot').textContent.includes('10,164');
+        }));
 
       // ---- Property outline: the floating Docs-style section
       // index. It must overlay the page (position fixed), leave
@@ -6034,8 +6216,8 @@ try {
       await page3.goto(`http://ff.local/#property/${pid3}`, { waitUntil: 'networkidle0', timeout: 30000 });
       check('without an LLM the costs panel still renders its entries',
         !!(await until3(() => {
-          const rows = document.querySelectorAll('#costsRows tr[data-cost-row]');
-          return rows.length === 1 && document.querySelector('#costsRows').textContent.includes('4,200');
+          const rows = document.querySelectorAll('#costsYears tr[data-cost-row]');
+          return rows.length === 1 && document.querySelector('#costsYears').textContent.includes('4,200');
         })));
       await page3.evaluate(() => document.querySelector('[data-costs-ai-toggle]').click());
       await wait3(500);
@@ -6047,12 +6229,12 @@ try {
       check('the AI chat shows the setup guidance and Send stays disabled',
         guidance3.hidden === false && guidance3.text.includes('LLM_BASE_URL') && guidance3.sendDisabled === true,
         JSON.stringify(guidance3));
-      // The rest of the panel is unaffected: an entry still saves.
-      await page3.evaluate(() => document.querySelector('#addCostRowBtn').click());
+      // The rest of the panel is unaffected: an entry still saves
+      // (through the seeded 2026 table's own Add row).
+      await page3.evaluate(() => document.querySelector('[data-cost-year-block="2026"] [data-cost-add-row]').click());
       await wait3(300);
       await page3.evaluate(() => {
-        const row = document.querySelector('#costsRows tr.cost-editing');
-        row.querySelector('[name=year]').value = '2026';
+        const row = document.querySelector('#costsYears tr.cost-editing');
         row.querySelector('[name=category]').value = 'Water';
         const amt = row.querySelector('[name=amount]');
         amt.value = '480';
@@ -6060,7 +6242,7 @@ try {
         row.querySelector('[data-cost-save]').click();
       });
       check('entries still save with no LLM configured',
-        !!(await until3(() => document.querySelector('#costsRows').textContent.includes('Water'))));
+        !!(await until3(() => document.querySelector('#costsYears').textContent.includes('Water'))));
     } catch (err) {
       check('costs no-LLM browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

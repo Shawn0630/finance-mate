@@ -131,10 +131,14 @@ CREATE TABLE IF NOT EXISTS value_history (
 -- utilities, insurance…): one row per (year, category). The amount
 -- is stored in the basis it was recorded in: 'annual' = the year's
 -- total; 'monthly' = a monthly average, whose year total is the
--- average × 12. Every total, pivot and chart reads at the ANNUAL
--- figure (see src/costs.js). source is provenance only: 'manual'
--- rows were typed in, 'ai' rows landed through the AI fill chat's
--- Apply button.
+-- average × 12. A monthly row may also carry monthly_amounts — a
+-- JSON map of the months actually recorded ({"1": 312.5, …}); the
+-- stored amount is then the server-computed average of those
+-- months. Rows without it are averages given directly. Every
+-- total, pivot and chart reads at the ANNUAL figure (see
+-- src/costs.js). source is provenance only: 'manual' rows were
+-- typed in, 'ai' rows landed through the AI fill chat's Apply
+-- button.
 CREATE TABLE IF NOT EXISTS property_costs (
   id INTEGER PRIMARY KEY,
   property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
@@ -142,6 +146,7 @@ CREATE TABLE IF NOT EXISTS property_costs (
   category TEXT NOT NULL,
   amount REAL NOT NULL,
   basis TEXT NOT NULL DEFAULT 'annual',   -- 'annual' | 'monthly'
+  monthly_amounts TEXT,                   -- JSON {"1": n, …} for monthly rows with per-month detail
   notes TEXT,
   source TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'ai'
   created_at TEXT NOT NULL,
@@ -246,6 +251,16 @@ if (!propCols.includes('hs_id_address')) {
   }
   if (!histCols.includes('building_value')) {
     db.exec('ALTER TABLE value_history ADD COLUMN building_value REAL');
+  }
+}
+// property_costs: databases created before per-month detail have
+// no monthly_amounts column. Existing rows keep NULL (= an average
+// given directly, no month-by-month detail) — exactly how they
+// were always interpreted.
+{
+  const costCols = db.prepare('PRAGMA table_info(property_costs)').all().map((c) => c.name);
+  if (costCols.length && !costCols.includes('monthly_amounts')) {
+    db.exec('ALTER TABLE property_costs ADD COLUMN monthly_amounts TEXT');
   }
 }
 // rate_segments: databases created before prime-spread pricing have

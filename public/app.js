@@ -3282,24 +3282,32 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 
 // ------------------------------------------------------- property costs ---
 // A property's yearly running costs (property tax, strata,
-// utilities…). The panel's ONE input surface is the entries
-// table: rows edit in place (Save / Cancel on the dirty row),
-// "+ Add row" appends a blank one, every row deletes — there is
-// no separate add form and no pivot matrix. Amounts are stored
-// in their recorded basis: 'annual' = the year's total,
-// 'monthly' = a monthly average whose year total is ×12; the
-// year subtotal rows and both charts all work at the ANNUAL
-// figure (monthly rows show it with an "avg $X/mo" annotation,
-// so nobody does the ×12 in their head).
+// utilities…). The input surface is one inline-editable table
+// PER YEAR: each year block holds its own rows (Edit →
+// Save / Cancel in place, Delete on every row, its own
+// "+ Add row") with the year's total in its footer, and the
+// panel's top row pairs "+ Add year" with the AI fill toggle.
+// Amounts are stored in their recorded basis: 'annual' = the
+// year's total; 'monthly' = the recorded months are kept
+// (monthlyAmounts) and amount is their average — computed by
+// the SERVER, never typed in. A monthly row recorded before
+// per-month detail existed carries no months: it keeps its
+// given average and renders the same way. Year totals and both
+// charts all work at the ANNUAL figure (monthly rows show it
+// with an "avg $X/mo" annotation, so nobody does the ×12 in
+// their head).
 //
 // The two charts are display only: a per-year share pie (year
 // switchable) and a bar+line combo (category-stacked bars, the
 // total as a line) with a By year / By month granularity toggle.
-// By month is a run-rate view: monthly-basis categories land at
-// their average, annual-basis categories spread at annual ÷ 12.
-// A category keeps ONE color across both charts (this panel's
-// own fixed palette — dynamic categories cannot join the fixed
-// chart_colors series system).
+// By month, a monthly-basis category lands its recorded months
+// at their actual amounts and fills the months it does not
+// carry with its average; an annual-basis category spreads at
+// annual ÷ 12. The pivot ships the twelve figures per cell
+// (costMonthSeries, src/costs.js), so the chart just reads
+// them. A category keeps ONE color across both charts (this
+// panel's own fixed palette — dynamic categories cannot join
+// the fixed chart_colors series system).
 const COST_TYPE_PRESETS = ['Property tax', 'Strata fee', 'Water', 'Electricity', 'Gas', 'Home insurance'];
 const COST_TYPE_CUSTOM = '__custom__';
 const COST_COLORS = {
@@ -3316,7 +3324,8 @@ function costColor(category) {
 
 let costsData = null;      // last GET /costs view {entries, categories, years, latest}
 let costsLoadedFor = null; // property id the panel state belongs to
-let costsEditingId = null; // entry id in edit mode; 'new' = an unsaved row; null at rest
+let costsEditingKey = null; // null | 'id:<entry id>' | 'new:<year>' — the row in edit mode
+let costsExtraYears = [];   // years opened via "+ Add year" that hold no entries yet
 let costsPie = null;
 let costsCombo = null;
 let costsPieYear = null;
@@ -3328,7 +3337,8 @@ async function loadCostsImpl(id) {
   costsData = view;
   if (costsLoadedFor !== id) {
     costsLoadedFor = id;
-    costsEditingId = null;
+    costsEditingKey = null;
+    costsExtraYears = [];
     costsPieYear = null;
     resetCostsChat(id);
   }
@@ -3349,16 +3359,72 @@ function renderCosts() {
   $('#costCategoryOptions').innerHTML = [...COST_TYPE_PRESETS, ...costCustomCategories(), 'Other']
     .map((c) => `<option value="${esc(c)}">`).join('');
   renderCostsCharts();
-  renderCostsRows();
+  renderCostsYears();
   renderCostsProposed();
 }
 
-// ------------------------------------------------------------ costs table
+// ------------------------------------------------------- costs year tables
 function costAmountCell(e) {
   if (e.basis === 'monthly') {
-    return `${money2(Number(e.amount) * 12)}<div class="cost-mo-note">avg ${money2(e.amount)}/mo</div>`;
+    const n = e.monthlyAmounts ? Object.keys(e.monthlyAmounts).length : 0;
+    const note = n
+      ? `avg ${money2(e.amount)}/mo (${n} month${n === 1 ? '' : 's'})`
+      : `avg ${money2(e.amount)}/mo`;
+    return `${money2(Number(e.amount) * 12)}<div class="cost-mo-note">${note}</div>`;
   }
   return money2(e.amount);
+}
+
+// The 12-month detail grid a monthly row opens into: one small
+// input per month, filled only for the months on record. Values
+// are read back through the dataAttr the caller names
+// (data-month in the tables, data-p-month in the AI proposals).
+function costMonthsGridHtml(months, dataAttr = 'data-month') {
+  const cells = MONTH_NAMES.map((name, i) => {
+    const v = months && months[String(i + 1)] !== undefined && months[String(i + 1)] !== null
+      ? months[String(i + 1)] : '';
+    return `<label>${name}<input type="text" inputmode="decimal" data-money ${dataAttr}="${i + 1}" value="${v === '' ? '' : esc(formatMoneyInput(v))}"></label>`;
+  }).join('');
+  return `<div class="cost-months">${cells}</div>`;
+}
+
+// The values typed into the row currently in edit mode, read
+// straight from the DOM. renderCostsYears snapshots BEFORE it
+// rebuilds and feeds the values back into the rebuilt row, so a
+// data refresh (a save landing, an AI Apply) can never wipe an
+// edit the user opened — or typed into — while it was in flight.
+function snapshotCostEditRow() {
+  if (!costsEditingKey) return null;
+  const row = document.querySelector('#costsYears tr.cost-editing');
+  if (!row || row.dataset.costEditrow !== costsEditingKey) return null;
+  const months = {};
+  row.querySelectorAll('[data-month]').forEach((inp) => {
+    if (inp.value.trim() !== '') months[inp.dataset.month] = inp.value;
+  });
+  const q = (sel) => row.querySelector(sel);
+  return {
+    key: costsEditingKey,
+    category: q('[name=category]') ? q('[name=category]').value : '',
+    categoryCustom: q('[name=category_custom]') ? q('[name=category_custom]').value : '',
+    basis: q('[name=basis]') ? q('[name=basis]').value : 'annual',
+    amount: q('[name=amount]') ? q('[name=amount]').value : '',
+    months,
+  };
+}
+
+// The months typed into a row's detail grid: non-empty cells
+// only. A filled cell that does not parse is an error the
+// caller shows — silently dropping it would misstate the avg.
+function collectCostMonths(row, dataAttr = 'data-month') {
+  const map = {};
+  for (const inp of row.querySelectorAll(`[${dataAttr}]`)) {
+    if (inp.value.trim() === '') continue;
+    const v = parseMoneyInput(inp.value);
+    const m = Number(inp.dataset.month || inp.dataset.pMonth);
+    if (v === '' || v < 0) return { error: `${MONTH_NAMES[m - 1]}'s amount is not a valid number.` };
+    map[String(m)] = v;
+  }
+  return { map };
 }
 
 function costTypeSelectHtml(selected) {
@@ -3375,46 +3441,68 @@ function costTypeSelectHtml(selected) {
     + `<input type="text" class="cost-type-custom${showCustom ? '' : ' hidden'}" name="category_custom" placeholder="Category name" value="${showCustom ? esc(selected || '') : ''}">`;
 }
 
-function costEditRowHtml(entry) {
-  const isNew = !entry;
-  const e = entry || { year: (costsData.latest ? costsData.latest.year : new Date().getFullYear()), category: COST_TYPE_PRESETS[0], basis: 'annual', amount: '' };
-  return `<tr class="cost-editing" data-cost-editrow="${isNew ? 'new' : e.id}">
-    <td><input type="number" name="year" step="1" min="1900" max="2100" value="${e.year}"></td>
-    <td>${costTypeSelectHtml(e.category)}</td>
+function costEditRowHtml(entry, year, snap) {
+  const key = entry ? `id:${entry.id}` : `new:${year}`;
+  const fromSnap = snap && snap.key === key ? snap : null;
+  const category = fromSnap
+    ? (fromSnap.category === COST_TYPE_CUSTOM ? fromSnap.categoryCustom : fromSnap.category)
+    : (entry ? entry.category : COST_TYPE_PRESETS[0]);
+  const basis = fromSnap ? fromSnap.basis : (entry ? entry.basis : 'annual');
+  // The single amount field speaks ANNUAL figures: for a monthly
+  // entry it starts at the annualized total, so flipping the
+  // basis keeps the year's figure instead of inventing one.
+  const amountVal = fromSnap ? fromSnap.amount
+    : entry ? (entry.basis === 'monthly' ? Number(entry.amount) * 12 : entry.amount) : '';
+  const months = fromSnap ? fromSnap.months : (entry && entry.monthlyAmounts) || {};
+  // A monthly entry's stored average rides along as the save
+  // fallback: clearing the grid keeps the average and drops the
+  // detail, instead of making the row unsavable.
+  const avgAttr = entry && entry.basis === 'monthly'
+    ? ` data-cost-avg="${Number(entry.amount)}"` : '';
+  return `<tr class="cost-editing" data-cost-editrow="${key}" data-cost-year="${year}"${avgAttr}>
+    <td>${costTypeSelectHtml(category)}</td>
     <td><select name="basis">
-      <option value="annual"${e.basis === 'annual' ? ' selected' : ''}>Annual</option>
-      <option value="monthly"${e.basis === 'monthly' ? ' selected' : ''}>Monthly avg</option>
+      <option value="annual"${basis === 'annual' ? ' selected' : ''}>Annual</option>
+      <option value="monthly"${basis === 'monthly' ? ' selected' : ''}>Monthly</option>
     </select></td>
-    <td class="num"><input type="text" inputmode="decimal" data-money name="amount" value="${e.amount === '' ? '' : esc(formatMoneyInput(e.amount))}"> <span class="cost-year-hint"></span></td>
+    <td class="num"><input type="text" inputmode="decimal" data-money name="amount" value="${amountVal === '' || amountVal === null || amountVal === undefined ? '' : esc(formatMoneyInput(amountVal))}">
+      <div class="cost-months-wrap${basis === 'monthly' ? '' : ' hidden'}">${costMonthsGridHtml(months)}</div>
+      <div class="cost-amount-note"></div></td>
     <td style="white-space:nowrap">
       <button type="button" class="small primary" data-cost-save>Save</button>
       <button type="button" class="small" data-cost-cancel>Cancel</button>
     </td></tr>`;
 }
 
-function renderCostsRows() {
-  const tbody = $('#costsRows');
-  if (!costsData) { tbody.innerHTML = ''; return; }
-  const entries = [...costsData.entries].sort((a, b) => b.year - a.year || a.category.localeCompare(b.category));
-  const totalsByYear = new Map(costsData.years.map((y) => [y.year, y.total]));
-  const parts = [];
-  if (costsEditingId === 'new') parts.push(costEditRowHtml(null));
-  let lastYear = null;
-  const flushSubtotal = () => {
-    if (lastYear !== null && totalsByYear.has(lastYear)) {
-      parts.push(`<tr class="cost-subtotal"><td>${lastYear} total</td><td colspan="2"></td><td class="num">${money2(totalsByYear.get(lastYear))}</td><td></td></tr>`);
-    }
-  };
+function renderCostsYears() {
+  const host = $('#costsYears');
+  if (!costsData) { host.innerHTML = ''; return; }
+  const snap = snapshotCostEditRow();
+  const byYear = new Map();
+  for (const e of costsData.entries) {
+    if (!byYear.has(e.year)) byYear.set(e.year, []);
+    byYear.get(e.year).push(e);
+  }
+  for (const arr of byYear.values()) arr.sort((a, b) => a.category.localeCompare(b.category));
+  const totals = new Map(costsData.years.map((y) => [y.year, y.total]));
+  const years = [...new Set([...byYear.keys(), ...costsExtraYears])].sort((a, b) => b - a);
+  if (!years.length) {
+    host.innerHTML = '<p class="note" style="margin:0">No costs recorded yet.</p>';
+    return;
+  }
+  host.innerHTML = years.map((y) => costYearBlockHtml(y, byYear.get(y) || [], totals.get(y), snap)).join('');
+  wireCostEditRow();
+}
+
+function costYearBlockHtml(year, entries, total, snap) {
+  const rows = [];
   for (const e of entries) {
-    if (lastYear !== null && e.year !== lastYear) flushSubtotal();
-    lastYear = e.year;
-    if (costsEditingId === e.id) {
-      parts.push(costEditRowHtml(e));
+    if (costsEditingKey === `id:${e.id}`) {
+      rows.push(costEditRowHtml(e, year, snap));
     } else {
-      parts.push(`<tr data-cost-row="${e.id}">
-        <td>${e.year}</td>
+      rows.push(`<tr data-cost-row="${e.id}">
         <td>${esc(e.category)}${e.source === 'ai' ? ' <span class="badge">AI</span>' : ''}</td>
-        <td>${e.basis === 'monthly' ? 'Monthly avg' : 'Annual'}</td>
+        <td>${e.basis === 'monthly' ? 'Monthly' : 'Annual'}</td>
         <td class="num">${costAmountCell(e)}</td>
         <td style="white-space:nowrap">
           <button type="button" class="small" data-cost-edit="${e.id}">Edit</button>
@@ -3422,49 +3510,99 @@ function renderCostsRows() {
         </td></tr>`);
     }
   }
-  flushSubtotal();
-  if (!entries.length && costsEditingId !== 'new') {
-    parts.push('<tr><td colspan="5" class="note" style="margin:0">No costs recorded yet.</td></tr>');
+  if (costsEditingKey === `new:${year}`) rows.push(costEditRowHtml(null, year, snap));
+  if (!entries.length && costsEditingKey !== `new:${year}`) {
+    rows.push('<tr><td colspan="4" class="note" style="margin:0">No costs recorded yet.</td></tr>');
   }
-  tbody.innerHTML = parts.join('');
-  wireCostEditRow();
+  // A year holding no entries yet is still finding its number:
+  // its title is an input until the first entry lands.
+  const head = entries.length
+    ? `<span>${year}</span>`
+    : `<input type="number" data-cost-year-input step="1" min="1900" max="2100" value="${year}">`;
+  return `<div class="cost-year-block" data-cost-year-block="${year}">
+    <div class="cost-year-head">${head}</div>
+    <table class="costs-table">
+      <thead><tr><th>Type</th><th>Basis</th><th class="num">Amount</th><th></th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+      ${total !== undefined ? `<tfoot><tr class="cost-year-total"><td colspan="2">${year} total</td><td class="num">${money2(total)}</td><td></td></tr></tfoot>` : ''}
+    </table>
+    <div class="toolbar cost-year-toolbar" style="margin:0">
+      <button type="button" class="small" data-cost-add-row="${year}">+ Add row</button>
+    </div>
+  </div>`;
 }
 
 function wireCostEditRow() {
-  const row = $('#costsRows tr.cost-editing');
+  const row = document.querySelector('#costsYears tr.cost-editing');
   if (!row) return;
-  const amountInput = row.querySelector('[name=amount]');
-  wireMoneyInput(amountInput);
+  row.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   const sel = row.querySelector('[name=category]');
   const custom = row.querySelector('[name=category_custom]');
   sel.addEventListener('change', () => {
     custom.classList.toggle('hidden', sel.value !== COST_TYPE_CUSTOM);
     if (sel.value === COST_TYPE_CUSTOM) custom.focus();
   });
-  const hint = row.querySelector('.cost-year-hint');
   const basisSel = row.querySelector('[name=basis]');
-  const syncHint = () => {
-    const amt = parseMoneyInput(amountInput.value);
-    hint.textContent = basisSel.value === 'monthly' && amt !== '' ? `= ${money2(amt * 12)} / yr` : '';
+  const amountInput = row.querySelector('[name=amount]');
+  const monthsWrap = row.querySelector('.cost-months-wrap');
+  const note = row.querySelector('.cost-amount-note');
+  const syncNote = () => {
+    const monthly = basisSel.value === 'monthly';
+    amountInput.classList.toggle('hidden', monthly);
+    monthsWrap.classList.toggle('hidden', !monthly);
+    if (!monthly) { note.textContent = ''; return; }
+    const months = collectCostMonths(row);
+    if (months.error) { note.textContent = months.error; return; }
+    const vals = Object.values(months.map);
+    if (vals.length) {
+      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      note.textContent = `avg ${money2(avg)}/mo · = ${money2(avg * 12)}/yr · ${vals.length} month${vals.length === 1 ? '' : 's'}`;
+    } else if (row.dataset.costAvg) {
+      note.textContent = `avg ${money2(Number(row.dataset.costAvg))}/mo (no monthly detail)`;
+    } else {
+      note.textContent = '';
+    }
   };
-  amountInput.addEventListener('input', syncHint);
-  basisSel.addEventListener('change', syncHint);
-  syncHint();
+  amountInput.addEventListener('input', syncNote);
+  row.querySelectorAll('[data-month]').forEach((inp) => inp.addEventListener('input', syncNote));
+  basisSel.addEventListener('change', syncNote);
+  syncNote();
 }
 
-$('#costsRows').addEventListener('click', async (e) => {
+$('#costsYears').addEventListener('click', async (e) => {
   const editBtn = e.target.closest('[data-cost-edit]');
   const delBtn = e.target.closest('[data-cost-del]');
   const saveBtn = e.target.closest('[data-cost-save]');
   const cancelBtn = e.target.closest('[data-cost-cancel]');
+  const addRowBtn = e.target.closest('[data-cost-add-row]');
   if (editBtn) {
-    costsEditingId = Number(editBtn.dataset.costEdit);
-    renderCostsRows();
+    costsEditingKey = `id:${Number(editBtn.dataset.costEdit)}`;
+    renderCostsYears();
     return;
   }
   if (cancelBtn) {
-    costsEditingId = null;
-    renderCostsRows();
+    const row = e.target.closest('tr.cost-editing');
+    const key = row ? row.dataset.costEditrow : costsEditingKey;
+    costsEditingKey = null;
+    // Cancelling the only row of a just-added year abandons the
+    // year block too — it held nothing else.
+    if (key && key.startsWith('new:')) {
+      const y = Number(key.slice(4));
+      if (costsData && !costsData.entries.some((en) => en.year === y)) {
+        costsExtraYears = costsExtraYears.filter((yy) => yy !== y);
+      }
+    }
+    renderCostsYears();
+    return;
+  }
+  if (addRowBtn) {
+    const y = Number(addRowBtn.dataset.costAddRow);
+    if (costsEditingKey !== `new:${y}`) {
+      costsEditingKey = `new:${y}`;
+      renderCostsYears();
+    }
+    const row = document.querySelector('#costsYears tr.cost-editing');
+    if (row) row.querySelector('[name=category]').focus();
     return;
   }
   if (delBtn) {
@@ -3472,7 +3610,7 @@ $('#costsRows').addEventListener('click', async (e) => {
     if (!confirm('Delete this cost entry?')) return;
     try {
       await api(`/api/properties/${currentPropertyId}/costs/${id}`, { method: 'DELETE' });
-      if (costsEditingId === id) costsEditingId = null;
+      if (costsEditingKey === `id:${id}`) costsEditingKey = null;
       await loadCosts(currentPropertyId);
     } catch (err) { showMsg($('#costsMsg'), 'err', err.message); }
     return;
@@ -3480,27 +3618,52 @@ $('#costsRows').addEventListener('click', async (e) => {
   if (saveBtn) {
     const row = e.target.closest('tr.cost-editing');
     if (!row) return;
+    const key = row.dataset.costEditrow;
+    const block = row.closest('[data-cost-year-block]');
+    const yearInput = block.querySelector('[data-cost-year-input]');
+    const year = yearInput ? Number(yearInput.value) : Number(block.dataset.costYearBlock);
     const sel = row.querySelector('[name=category]');
     const category = sel.value === COST_TYPE_CUSTOM
       ? row.querySelector('[name=category_custom]').value.trim()
       : sel.value;
-    const body = {
-      year: Number(row.querySelector('[name=year]').value),
-      category,
-      basis: row.querySelector('[name=basis]').value,
-      amount: parseMoneyInput(row.querySelector('[name=amount]').value),
-    };
-    if (!Number.isInteger(body.year) || !body.category || body.amount === '') {
-      showMsg($('#costsMsg'), 'err', 'Year, type and amount are all required.');
+    const basis = row.querySelector('[name=basis]').value;
+    const body = { year, category, basis };
+    if (!Number.isInteger(year) || year < 1900 || year > 2100 || !category) {
+      showMsg($('#costsMsg'), 'err', 'Year and type are required.');
       return;
     }
+    if (basis === 'monthly') {
+      const months = collectCostMonths(row);
+      if (months.error) { showMsg($('#costsMsg'), 'err', months.error); return; }
+      if (Object.keys(months.map).length) body.monthlyAmounts = months.map;
+      else if (row.dataset.costAvg) body.amount = Number(row.dataset.costAvg);
+      else {
+        showMsg($('#costsMsg'), 'err', 'Fill in at least one month for a monthly entry.');
+        return;
+      }
+    } else {
+      body.amount = parseMoneyInput(row.querySelector('[name=amount]').value);
+      if (body.amount === '') {
+        showMsg($('#costsMsg'), 'err', 'An amount is required.');
+        return;
+      }
+    }
     try {
-      if (row.dataset.costEditrow === 'new') {
+      if (key.startsWith('new:')) {
         await api(`/api/properties/${currentPropertyId}/costs`, { method: 'POST', body });
       } else {
-        await api(`/api/properties/${currentPropertyId}/costs/${row.dataset.costEditrow}`, { method: 'PUT', body });
+        await api(`/api/properties/${currentPropertyId}/costs/${key.slice(3)}`, { method: 'PUT', body });
       }
-      costsEditingId = null;
+      // The save ends MY edit session only. If the user has since
+      // opened another row's edit, that session is theirs now:
+      // leave the key alone and the reload's render (snapshot in
+      // renderCostsYears) keeps their row — and its typed
+      // values — alive. Clearing unconditionally here used to
+      // wipe exactly that edit whenever the reload landed late.
+      if (costsEditingKey === key) costsEditingKey = null;
+      if (key.startsWith('new:')) {
+        costsExtraYears = costsExtraYears.filter((y) => y !== Number(key.slice(4)));
+      }
       $('#costsMsg').textContent = '';
       $('#costsMsg').className = 'msg';
       await loadCosts(currentPropertyId);
@@ -3508,12 +3671,37 @@ $('#costsRows').addEventListener('click', async (e) => {
   }
 });
 
-$('#addCostRowBtn').addEventListener('click', () => {
-  if (costsEditingId === 'new') return;
-  costsEditingId = 'new';
-  renderCostsRows();
-  const row = $('#costsRows tr.cost-editing');
-  if (row) row.querySelector('[name=year]').focus();
+// Renaming a not-yet-filled year: the block follows the input —
+// merging into an existing year when the number lands on one.
+$('#costsYears').addEventListener('change', (e) => {
+  const inp = e.target.closest('[data-cost-year-input]');
+  if (!inp) return;
+  const block = inp.closest('[data-cost-year-block]');
+  const oldYear = Number(block.dataset.costYearBlock);
+  const newYear = Number(inp.value);
+  if (!Number.isInteger(newYear) || newYear < 1900 || newYear > 2100 || newYear === oldYear) {
+    renderCostsYears();
+    return;
+  }
+  costsExtraYears = costsExtraYears.filter((y) => y !== oldYear);
+  const hasData = costsData && costsData.entries.some((en) => en.year === newYear);
+  if (!hasData && !costsExtraYears.includes(newYear)) costsExtraYears.push(newYear);
+  if (costsEditingKey === `new:${oldYear}`) costsEditingKey = `new:${newYear}`;
+  renderCostsYears();
+});
+
+$('#addCostYearBtn').addEventListener('click', () => {
+  const used = new Set([
+    ...(costsData ? costsData.entries.map((e) => e.year) : []),
+    ...costsExtraYears,
+  ]);
+  let y = new Date().getFullYear();
+  while (used.has(y)) y += 1;
+  costsExtraYears.push(y);
+  costsEditingKey = `new:${y}`;
+  renderCostsYears();
+  const inp = document.querySelector(`[data-cost-year-block="${y}"] [data-cost-year-input]`);
+  if (inp) { inp.focus(); inp.select(); }
 });
 
 // ----------------------------------------------------------- costs charts
@@ -3607,9 +3795,12 @@ function renderCostsCombo() {
   let perCat;
   let totals;
   if (costsGranularity === 'month') {
-    // Run-rate months: a monthly-basis category lands at its
-    // average; an annual-basis one spreads at annual ÷ 12. The
-    // twelve months of a recorded year sum back to its total.
+    // The pivot ships each cell's twelve month figures
+    // (costMonthSeries): a monthly-basis category lands its
+    // recorded months at their actual amounts and fills the
+    // months it does not carry with the average; an
+    // annual-basis one spreads at annual ÷ 12. The twelve
+    // months of a recorded year sum back to its total.
     labels = [];
     perCat = cats.map(() => []);
     totals = [];
@@ -3619,7 +3810,7 @@ function renderCostsCombo() {
         let tot = 0;
         cats.forEach((c, ci) => {
           const cell = cellOf(yv.year, c);
-          const v = cell ? (cell.basis === 'monthly' ? Number(cell.amount) : cell.annual / 12) : 0;
+          const v = cell ? cell.months[m - 1] : 0;
           perCat[ci].push(v);
           tot += v;
         });
@@ -3715,6 +3906,31 @@ function renderCostsChatLog(pendingText) {
 
 function costKeyOf(year, category) { return `${year}|${category}`; }
 
+// A one-line figure summary for a stored entry or a proposal —
+// the conflict preview speaks in these, old → new: an annual
+// figure reads "$5,400.00 (annual)"; a monthly one carries its
+// average, its month count when it has detail, and its year.
+function costEntrySummary(e) {
+  if (!e) return '';
+  if (e.basis === 'monthly') {
+    const n = e.monthlyAmounts ? Object.keys(e.monthlyAmounts).length : 0;
+    return `avg ${money2(e.amount)}/mo${n ? ` · ${n} month${n === 1 ? '' : 's'}` : ''} (${money2(Number(e.amount) * 12)}/yr)`;
+  }
+  return `${money2(e.amount)} (annual)`;
+}
+
+// The live annotation under a monthly proposal row: the average
+// of the months it carries (or its given average), its year
+// figure and the month count.
+function costMonthlySummaryText(p) {
+  const vals = p.monthlyAmounts ? Object.values(p.monthlyAmounts).map(Number) : [];
+  const avg = vals.length
+    ? vals.reduce((a, b) => a + b, 0) / vals.length
+    : (p.amount === '' || p.amount === null || p.amount === undefined ? null : Number(p.amount));
+  if (avg === null || !Number.isFinite(avg)) return '';
+  return `avg ${money2(avg)}/mo · = ${money2(avg * 12)}/yr${vals.length ? ` · ${vals.length} month${vals.length === 1 ? '' : 's'}` : ''}`;
+}
+
 function renderCostsProposed() {
   const host = document.querySelector('[data-costs-proposed]');
   if (!host) return;
@@ -3722,20 +3938,23 @@ function renderCostsProposed() {
   if (!proposed.length) { host.innerHTML = ''; return; }
   const existing = new Map((costsData ? costsData.entries : []).map((e) => [costKeyOf(e.year, e.category), e]));
   const rows = proposed.map((p, i) => {
-    const conflict = existing.has(costKeyOf(p.year, p.category));
-    const annual = p.basis === 'monthly' ? Number(p.amount) * 12 : Number(p.amount);
+    const old = existing.get(costKeyOf(p.year, p.category));
+    const conflict = !!old;
+    const hasMonths = p.basis === 'monthly' && p.monthlyAmounts && Object.keys(p.monthlyAmounts).length > 0;
     return `<div class="costs-proposed-row${conflict ? ' conflict' : ''}" data-proposed-row="${i}">
       <input type="checkbox" data-p-check${conflict ? '' : ' checked'}>
       <input type="number" data-p-year step="1" min="1900" max="2100" value="${p.year}">
       <input type="text" class="p-cat" data-p-category list="costCategoryOptions" value="${esc(p.category)}">
       <select data-p-basis>
         <option value="annual"${p.basis === 'annual' ? ' selected' : ''}>Annual</option>
-        <option value="monthly"${p.basis === 'monthly' ? ' selected' : ''}>Monthly avg</option>
+        <option value="monthly"${p.basis === 'monthly' ? ' selected' : ''}>Monthly</option>
       </select>
-      <input type="text" inputmode="decimal" data-money data-p-amount value="${esc(formatMoneyInput(p.amount))}">
-      <span class="p-annual">${p.basis === 'monthly' ? `= ${money2(annual)} / yr` : ''}</span>
+      ${hasMonths
+        ? `<span class="p-months">${costMonthsGridHtml(p.monthlyAmounts, 'data-p-month')}</span>`
+        : `<input type="text" inputmode="decimal" data-money data-p-amount value="${esc(formatMoneyInput(p.amount))}">`}
+      <span class="p-annual">${p.basis === 'monthly' ? esc(costMonthlySummaryText(p)) : ''}</span>
       <input type="text" class="p-notes" data-p-notes placeholder="Notes" value="${esc(p.notes || '')}">
-      ${conflict ? '<span class="conflict-tag">Already recorded — overwrites if checked</span>' : ''}
+      ${conflict ? `<span class="conflict-tag">Already recorded — overwrites if checked</span> <span class="conflict-diff">${esc(costEntrySummary(old))} → ${esc(costEntrySummary(p))}</span>` : ''}
       <button type="button" class="small danger" data-p-remove title="Remove">×</button>
     </div>`;
   }).join('');
@@ -3750,25 +3969,45 @@ function renderCostsProposed() {
     const sync = () => {
       const amt = parseMoneyInput(inp.value);
       const basis = row.querySelector('[data-p-basis]').value;
-      row.querySelector('.p-annual').textContent = basis === 'monthly' && amt !== '' ? `= ${money2(amt * 12)} / yr` : '';
+      row.querySelector('.p-annual').textContent = basis === 'monthly' && amt !== '' ? `avg ${money2(amt)}/mo · = ${money2(amt * 12)} / yr` : '';
     };
     inp.addEventListener('input', sync);
-    row.querySelector('[data-p-basis]').addEventListener('change', sync);
   });
+  host.querySelectorAll('[data-p-month]').forEach(wireMoneyInput);
 }
 
 // Read the proposed rows back out of their (editable) inputs.
+// A monthly row with a month grid reads its months (the amount
+// is their average — display only; the server recomputes it on
+// Apply); a monthly row without one reads its given average.
 function readCostsProposed() {
   const host = document.querySelector('[data-costs-proposed]');
   if (!host) return [];
-  return [...host.querySelectorAll('[data-proposed-row]')].map((row) => ({
-    checked: row.querySelector('[data-p-check]').checked,
-    year: Number(row.querySelector('[data-p-year]').value),
-    category: row.querySelector('[data-p-category]').value.trim(),
-    basis: row.querySelector('[data-p-basis]').value,
-    amount: parseMoneyInput(row.querySelector('[data-p-amount]').value),
-    notes: row.querySelector('[data-p-notes]').value.trim() || null,
-  }));
+  return [...host.querySelectorAll('[data-proposed-row]')].map((row) => {
+    const basis = row.querySelector('[data-p-basis]').value;
+    const monthInputs = row.querySelectorAll('[data-p-month]');
+    let monthlyAmounts = null;
+    let amount = '';
+    if (monthInputs.length) {
+      const months = collectCostMonths(row, 'data-p-month');
+      if (!months.error && Object.keys(months.map).length) {
+        monthlyAmounts = months.map;
+        const vals = Object.values(months.map);
+        amount = Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100;
+      }
+    } else {
+      amount = parseMoneyInput(row.querySelector('[data-p-amount]').value);
+    }
+    return {
+      checked: row.querySelector('[data-p-check]').checked,
+      year: Number(row.querySelector('[data-p-year]').value),
+      category: row.querySelector('[data-p-category]').value.trim(),
+      basis,
+      amount,
+      monthlyAmounts: basis === 'monthly' ? monthlyAmounts : null,
+      notes: row.querySelector('[data-p-notes]').value.trim() || null,
+    };
+  });
 }
 
 document.querySelector('[data-costs-proposed]').addEventListener('click', async (e) => {
@@ -3817,10 +4056,52 @@ document.querySelector('[data-costs-proposed]').addEventListener('click', async 
   }
 });
 
+// Flipping a proposal's basis converts its figure so the row
+// keeps meaning what it meant: an annual total becomes a
+// monthly average (÷ 12) and a monthly figure its year total
+// (× 12); month detail drops — the row falls back to the
+// given-average form. State round-trips through the DOM so the
+// user's other edits survive the re-render.
+document.querySelector('[data-costs-proposed]').addEventListener('change', (e) => {
+  const sel = e.target.closest('[data-p-basis]');
+  if (!sel) return;
+  const idx = Number(sel.closest('[data-proposed-row]').dataset.proposedRow);
+  const rows = readCostsProposed();
+  costsChatState.proposed = rows.map((r, i) => {
+    const { checked, ...rest } = r;
+    if (i !== idx) return rest;
+    // readCostsProposed reports the figure in the OLD basis's
+    // terms (an average for a months row, a total for annual):
+    // convert just this row into its new basis, detail dropped.
+    if (rest.amount !== '') {
+      rest.amount = rest.basis === 'annual'
+        ? Math.round(rest.amount * 12 * 100) / 100
+        : Math.round((rest.amount / 12) * 100) / 100;
+    }
+    rest.monthlyAmounts = null;
+    return rest;
+  });
+  renderCostsProposed();
+});
+
+// Typing in a proposal's month grid refreshes its avg / year
+// annotation live, like the table's edit rows.
+document.querySelector('[data-costs-proposed]').addEventListener('input', (e) => {
+  if (!e.target.closest('[data-p-month]')) return;
+  const row = e.target.closest('[data-proposed-row]');
+  const months = collectCostMonths(row, 'data-p-month');
+  const span = row.querySelector('.p-annual');
+  if (months.error) { span.textContent = months.error; return; }
+  const vals = Object.values(months.map);
+  span.textContent = vals.length
+    ? costMonthlySummaryText({ basis: 'monthly', monthlyAmounts: months.map, amount: '' })
+    : '';
+});
+
 {
   const wrap = $('#costsAiFill');
   const panel = wrap.querySelector('[data-costs-ai-panel]');
-  const toggle = wrap.querySelector('[data-costs-ai-toggle]');
+  const toggle = document.querySelector('[data-costs-ai-toggle]');
   const sendBtn = wrap.querySelector('[data-costs-chat-send]');
   const modelSel = wrap.querySelector('[data-costs-chat-model]');
   const guidance = wrap.querySelector('[data-costs-ai-guidance]');

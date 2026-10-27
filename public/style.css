@@ -257,11 +257,12 @@ label.btnlike:hover { background: #f0f4f9; }
 .chart-colors .cc-row.cc-highlight { background: #fdf3e0; border-radius: 6px; box-shadow: 0 0 0 2px #e8a33d; padding: 2px 6px; margin: -2px -6px; }
 .chart-colors input[type="color"] { width: 36px; height: 24px; padding: 0; border: 1px solid #c8d2dd; border-radius: 4px; background: none; cursor: pointer; }
 .hidden { display: none !important; }
-/* Property costs: chart slot, the inline-editable entries table
-   (per-year subtotal rows, the monthly-average annotation under
-   an annualized figure), and the AI fill chat (log, guidance,
-   proposal rows — a conflicting proposal is tinted and starts
-   unchecked). */
+/* Property costs: chart slot, the per-year inline-editable
+   tables (year title row, footer total per year, the
+   monthly-average annotation under an annualized figure, the
+   12-month detail grid a monthly row opens into), and the AI
+   fill chat (log, guidance, proposal rows — a conflicting
+   proposal is tinted, shows old → new and starts unchecked). */
 .costs-charts { display: flex; gap: 18px; flex-wrap: wrap; margin: 4px 0 10px; }
 .costs-pie-box { flex: 0 1 300px; min-width: 240px; }
 .costs-combo-box { flex: 1 1 430px; min-width: 300px; }
@@ -271,14 +272,23 @@ label.btnlike:hover { background: #f0f4f9; }
 .costs-chart-head .range-btns { margin-left: auto; }
 .chart-wrap.costs-pie { height: 230px; }
 .chart-wrap.costs-combo { height: 230px; }
-#costsTable td .cost-mo-note { font-size: 11px; color: #71808f; }
-#costsTable tr.cost-subtotal td { font-weight: 650; background: #f4f7fa; border-top: 1px solid #dde4ec; }
-#costsTable tr.cost-editing td { background: #fbfcfe; }
-#costsTable input[type="number"] { width: 96px; }
-#costsTable input[data-money] { width: 150px; }
-#costsTable select { width: auto; }
-#costsTable .cost-type-custom { width: 170px; margin-left: 6px; }
-#costsTable .cost-year-hint { font-size: 11px; color: #71808f; white-space: nowrap; }
+.cost-year-block { margin: 0 0 14px; }
+.cost-year-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 700; color: #22303c; margin: 0 0 2px; }
+.cost-year-head input[type="number"] { width: 96px; font-weight: 700; }
+.cost-year-head .cost-year-hint { font-size: 11px; font-weight: 400; color: #71808f; }
+table.costs-table { width: 100%; }
+.costs-table td .cost-mo-note { font-size: 11px; color: #71808f; }
+.costs-table tfoot tr.cost-year-total td { font-weight: 650; background: #f4f7fa; border-top: 1px solid #dde4ec; }
+.costs-table tr.cost-editing td { background: #fbfcfe; }
+.costs-table input[type="number"] { width: 96px; }
+.costs-table input[data-money] { width: 150px; }
+.costs-table select { width: auto; }
+.costs-table .cost-type-custom { width: 170px; margin-left: 6px; }
+.costs-table .cost-amount-note { font-size: 11px; color: #71808f; white-space: nowrap; }
+.cost-months { display: grid; grid-template-columns: repeat(6, minmax(72px, 1fr)); gap: 4px 8px; min-width: 480px; margin-top: 4px; }
+.cost-months label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #71808f; }
+.cost-months input[data-money] { width: 100%; min-width: 0; }
+.cost-year-toolbar { margin-top: 4px; }
 .costs-chat-log { border: 1px solid #dde4ec; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; max-height: 260px; overflow-y: auto; background: #fbfcfe; }
 .costs-chat-turn { margin: 6px 0; font-size: 13px; white-space: pre-wrap; }
 .costs-chat-turn .who { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: #71808f; display: block; }
@@ -293,6 +303,9 @@ label.btnlike:hover { background: #f0f4f9; }
 .costs-proposed-row .p-notes { flex: 1; min-width: 120px; }
 .costs-proposed-row .p-annual { font-size: 11px; color: #71808f; white-space: nowrap; }
 .costs-proposed-row .conflict-tag { font-size: 11px; color: #b03030; white-space: nowrap; }
+.costs-proposed-row .conflict-diff { font-size: 11px; color: #b03030; white-space: nowrap; }
+.costs-proposed-row .p-months { flex-basis: 100%; }
+.costs-proposed-row .p-months .cost-months { min-width: 0; }
 .term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }
 .term-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; text-align: left; background: #f6f9fc; border: none; border-radius: 0; padding: 10px 12px; font-size: 13.5px; }
 .term-head:hover { background: #eef3f9; }

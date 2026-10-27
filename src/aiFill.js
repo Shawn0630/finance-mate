@@ -440,11 +440,15 @@ export async function handleAiFill(input, deps = {}) {
 // source 'ai'. The conversation lives in the page session only.
 //
 // Response contract (the model replies with ONLY this JSON):
-//   {"reply": "…", "proposed": [{year, category, amount, basis, notes}], "ready": bool}
+//   {"reply": "…", "proposed": [{year, category, amount, basis, monthlyAmounts, notes}], "ready": bool}
 //
-// Basis rule: amount is stored in the basis it was recorded in —
-// 'annual' = the year's total (property tax); 'monthly' = a
-// monthly AVERAGE whose year total is the average × 12.
+// Basis rule: an entry is stored in the basis it was recorded
+// in — 'annual' = amount is the year's total (property tax);
+// 'monthly' = the entry carries the months actually recorded in
+// monthlyAmounts ({"1": 80, "3": 90}) and the app computes the
+// monthly average from them (year total = average × 12). A
+// monthly item with no per-month figures keeps the older form:
+// amount as an average given directly.
 
 export const COSTS_CHAT_HISTORY_TURNS = 20;
 export const COSTS_CHAT_TURN_CHARS = 12000;
@@ -454,7 +458,7 @@ const COSTS_CHAT_PROMPT = [
   'You help the user record one property\'s yearly running costs (property tax, strata fees,',
   'utilities, insurance and similar) from bills and notes they paste or attach.',
   'Reply with ONLY a JSON object of the form',
-  '{"reply": "...", "proposed": [{"year": 2025, "category": "Property tax", "amount": 4321, "basis": "annual", "notes": null}], "ready": false}',
+  '{"reply": "...", "proposed": [{"year": 2025, "category": "Property tax", "amount": 4321, "basis": "annual", "notes": null}, {"year": 2025, "category": "Electricity", "basis": "monthly", "monthlyAmounts": {"1": 80, "2": 90, "3": 85}, "notes": null}], "ready": false}',
   '— no prose outside the JSON, no code fences.',
   '',
   'The "proposed" array is the CURRENT DRAFT of new cost entries for this property: return the',
@@ -463,22 +467,27 @@ const COSTS_CHAT_PROMPT = [
   'correcting one of those.',
   'Each proposed item: year (the calendar year the cost belongs to), category (prefer exactly',
   'one of: Property tax, Strata fee, Water, Electricity, Gas, Home insurance, Other — a clearly',
-  'named different category is acceptable), amount (a plain number, no $ or commas), basis',
-  '("annual" or "monthly"), notes (short, or null).',
+  'named different category is acceptable), basis ("annual" or "monthly"), notes (short, or null).',
+  'An "annual" item carries amount (a plain number, no $ or commas) = the full year total.',
+  'A "monthly" item carries monthlyAmounts instead: an object with one entry per month you',
+  'have a figure for, keys "1".."12" (the month number) and that month\'s amount as the value.',
+  'Do not send an averaged amount for a monthly item when you have the individual months —',
+  'the app averages the months itself.',
   '',
   'BASIS — read carefully:',
   '- basis "annual": amount is the FULL YEAR total (e.g. an annual property-tax notice).',
-  '- basis "monthly": amount is a MONTHLY AVERAGE; the year total is the average × 12.',
-  '- Several months of the same bill: average them, propose basis "monthly" with the average,',
-  '  and say in "reply" how many months you used and the average you computed.',
-  '- Only one month given: use that month as the monthly average (basis "monthly") and say in',
+  '- basis "monthly": monthlyAmounts carries each recorded month\'s own bill; the app',
+  '  computes the monthly average from them and the year total is that average × 12.',
+  '- Several months of the same bill: put every month you were given into monthlyAmounts,',
+  '  and say in "reply" how many months you used and the average they make.',
+  '- Only one month given: monthlyAmounts with just that month (basis "monthly"), and say in',
   '  "reply" that the sample is a single month.',
-  '- A quarterly amount: convert it — either the annual total = quarterly × 4 (basis "annual")',
-  '  or the monthly average = quarterly ÷ 3 (basis "monthly") — and state the multiplier you',
-  '  used in "reply". The same applies to any other non-monthly, non-annual period: convert',
-  '  and state the multiplier.',
+  '- A quarterly amount: ALWAYS convert it to monthly figures — divide by 3 and put the',
+  '  equal monthly figure on each of the quarter\'s three months in monthlyAmounts — and',
+  '  state the conversion in "reply". The same applies to any other non-monthly, non-annual',
+  '  period: convert to the months it covers and state the multiplier you used.',
   '- When the user corrects the period of a draft item ("that was quarterly"), update that',
-  '  item\'s basis/amount accordingly and say what changed in "reply".',
+  '  item\'s basis/monthlyAmounts accordingly and say what changed in "reply".',
   '',
   'AMBIGUITY — never guess:',
   'If the year or period a figure covers, the category, or WHICH PROPERTY a bill belongs to is',
@@ -491,11 +500,20 @@ const COSTS_CHAT_PROMPT = [
   'is outstanding; otherwise false. Keep "reply" short and concrete.',
 ].join('\n');
 
+const COST_MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
 function fmtCostLine(r) {
-  const amt = Number(r.amount).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return r.basis === 'monthly'
-    ? `${r.year} · ${r.category} · avg $${amt}/mo (monthly basis)`
-    : `${r.year} · ${r.category} · $${amt} (annual)`;
+  const money = (n) => Number(n).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (r.basis === 'monthly') {
+    const det = r.monthlyAmounts;
+    if (det && typeof det === 'object' && Object.keys(det).length) {
+      const parts = Object.keys(det).sort((a, b) => Number(a) - Number(b))
+        .map((m) => `${COST_MONTH_SHORT[Number(m) - 1]} $${money(det[m])}`);
+      return `${r.year} · ${r.category} · monthly bills: ${parts.join(' · ')} (avg $${money(r.amount)}/mo)`;
+    }
+    return `${r.year} · ${r.category} · avg $${money(r.amount)}/mo (monthly basis)`;
+  }
+  return `${r.year} · ${r.category} · $${money(r.amount)} (annual)`;
 }
 
 // Keep the conversation the model sees bounded (the visualizer's
@@ -513,9 +531,27 @@ export function truncateChatHistory(history) {
   return turns.slice(-COSTS_CHAT_HISTORY_TURNS);
 }
 
+// Loose normalization of a model's monthlyAmounts: keep the
+// entries that are usable (month 1-12, a non-negative amount) and
+// drop the rest; null when nothing usable remains.
+function normMonthlyAmounts(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const m = normInt(k, 1, 12);
+    const n = normNum(v);
+    if (m == null || n == null || n < 0) continue;
+    out[String(m)] = Math.round(n * 100) / 100;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // Validate + normalize the model's proposed entries. Unknown
 // shapes, unusable years/amounts and blank categories drop out;
-// basis defaults to 'annual' unless it says 'monthly'.
+// basis defaults to 'annual' unless it says 'monthly'. A monthly
+// item with per-month figures has its amount recomputed as the
+// average of those months (the server recomputes it again on
+// Apply — this copy is what the preview shows).
 export function normalizeProposedCosts(raw) {
   if (!Array.isArray(raw)) return [];
   const out = [];
@@ -523,13 +559,20 @@ export function normalizeProposedCosts(raw) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     const year = normInt(item.year, 1900, 2100);
     const category = normStr(item.category, 80);
-    const amount = normNum(item.amount);
+    const basis = typeof item.basis === 'string' && item.basis.trim().toLowerCase() === 'monthly' ? 'monthly' : 'annual';
+    const monthlyAmounts = basis === 'monthly' ? normMonthlyAmounts(item.monthlyAmounts) : null;
+    let amount = normNum(item.amount);
+    if (monthlyAmounts) {
+      const vals = Object.values(monthlyAmounts);
+      amount = Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100;
+    }
     if (year == null || !category || amount == null || amount < 0) continue;
     out.push({
       year,
       category,
       amount,
-      basis: typeof item.basis === 'string' && item.basis.trim().toLowerCase() === 'monthly' ? 'monthly' : 'annual',
+      basis,
+      monthlyAmounts,
       notes: normStr(item.notes, 500),
     });
     if (out.length >= 50) break;
