@@ -1368,6 +1368,14 @@ function cleanTerm(c) {
     // clears it (the derived payment rules).
     payment_override: c.payment_override !== undefined && c.payment_override !== null && c.payment_override !== ''
       ? num(c.payment_override) : null,
+    // The date the term's payment was priced as of (the commitment
+    // letter's date): the term's INITIAL derivation prices a
+    // prime-spread segment at the prime in effect on this date
+    // instead of the start month's. Empty / null clears it (the
+    // payment derives at the term's start, as before). Accrual
+    // never reads it.
+    payment_pricing_date: c.payment_pricing_date !== undefined && c.payment_pricing_date !== null && c.payment_pricing_date !== ''
+      ? String(c.payment_pricing_date) : null,
     // The term's own payment schedule + balance anchor (see the
     // mortgage_terms columns); the anchor pair is set together or
     // not at all.
@@ -1394,6 +1402,9 @@ function cleanTerm(c) {
   }
   if (next.payment_override !== null && (!isFinite(next.payment_override) || next.payment_override <= 0)) {
     return { error: 'monthly payment override must be a number greater than 0' };
+  }
+  if (next.payment_pricing_date !== null && !isDateStr(next.payment_pricing_date)) {
+    return { error: 'payment pricing date must be a valid date (YYYY-MM-DD)' };
   }
   if (next.payment_frequency !== null && !FREQUENCY_KEYS.includes(next.payment_frequency)) {
     return {
@@ -1514,6 +1525,10 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
     payment_day: b.payment_day !== undefined ? b.payment_day
       : (prev ? prev.payment_day ?? null : null),
     payment_override: b.payment_override !== undefined ? b.payment_override : null,
+    // A payment pricing date does not carry over a renewal either:
+    // the new contract is priced on its own letter date, entered
+    // on the new term directly (or left blank).
+    payment_pricing_date: b.payment_pricing_date !== undefined ? b.payment_pricing_date : null,
     anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : null,
     anchor_date: b.anchor_date !== undefined ? b.anchor_date : null,
   };
@@ -1521,9 +1536,9 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const info = db
-    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
-    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
+    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, payment_pricing_date, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.payment_pricing_date, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
   syncTermMirror(getProperty(p.id));
   syncTermAnchor(getProperty(p.id));
   syncScheduleMirror(getProperty(p.id));
@@ -1547,14 +1562,15 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     payment_frequency: b.payment_frequency !== undefined ? b.payment_frequency : term.payment_frequency,
     payment_day: b.payment_day !== undefined ? b.payment_day : term.payment_day,
     payment_override: b.payment_override !== undefined ? b.payment_override : term.payment_override,
+    payment_pricing_date: b.payment_pricing_date !== undefined ? b.payment_pricing_date : term.payment_pricing_date,
     anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : term.anchor_balance,
     anchor_date: b.anchor_date !== undefined ? b.anchor_date : term.anchor_date,
   });
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const termAi = cleanAiFields(b, TERM_AI_FIELDS);
-  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
-    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
+  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, payment_pricing_date=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
+    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.payment_pricing_date, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
   // Editing the anchor pair on the term that carries it edits the
   // property's balance anchor itself — the two are one fact, stored
   // in both places: write the submitted pair through, then let the
@@ -1714,6 +1730,18 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
           return res.status(400).json({ error: 'monthly payment override must be a number greater than 0' });
         }
         owner.payment_override = po;
+      }
+    }
+    // The owner term's payment pricing date rides along too, so a
+    // preview computed beside an unsaved pricing-date edit derives
+    // the same figure the save will produce.
+    if (b.payment_pricing_date !== undefined) {
+      if (b.payment_pricing_date === null || b.payment_pricing_date === '') {
+        owner.payment_pricing_date = null;
+      } else if (!isDateStr(b.payment_pricing_date)) {
+        return res.status(400).json({ error: 'payment pricing date must be a valid date (YYYY-MM-DD)' });
+      } else {
+        owner.payment_pricing_date = String(b.payment_pricing_date);
       }
     }
   }

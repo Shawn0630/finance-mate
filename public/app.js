@@ -1391,15 +1391,13 @@ function payEditEls(form) {
 }
 
 // A form field's input: the form's own descendant — except the
-// payment editor's input, which lives in the pay block below.
+// payment row's inputs (the override editor and the Priced as of
+// date), which live in the pay block below the form.
 function fieldInputOf(form, name) {
   const own = form.querySelector(`[name="${name}"]`);
   if (own) return own;
-  if (name === 'payment_override') {
-    const pb = payBlockOfForm(form);
-    return pb ? pb.querySelector('[name="payment_override"]') : null;
-  }
-  return null;
+  const pb = payBlockOfForm(form);
+  return pb ? pb.querySelector(`[name="${name}"]`) : null;
 }
 
 function termOfForm(form) {
@@ -1639,6 +1637,7 @@ function renderTerms(p) {
             <button type="button" class="small" data-pay-edit>Edit</button>
             <button type="button" class="small hidden" data-pay-reset>Reset</button>
           </div></div>
+          <div><label>Priced as of</label><input name="payment_pricing_date" form="termForm${t.id}" type="date" value="${esc(t.payment_pricing_date || '')}"></div>
         </div>
       </div>
     </div>`;
@@ -1772,11 +1771,12 @@ $('#termsWrap').addEventListener('change', (e) => {
   const form = e.target.closest('[data-seg-form]');
   if (form) { syncSegForm(form); refreshPlanPreview(form); return; }
   // The term's plan fields (repayment method, amortization,
-  // payment override) re-price the preview of that term's draft
-  // segment. The payment editor sits in the pay block below the
-  // form, so its events resolve through the block too.
+  // payment override, pricing date) re-price the preview of that
+  // term's draft segment. The payment editor sits in the pay
+  // block below the form, so its events resolve through the
+  // block too.
   if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]'))
-    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
+    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years' || e.target.name === 'payment_override' || e.target.name === 'payment_pricing_date')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }
@@ -1784,7 +1784,7 @@ $('#termsWrap').addEventListener('change', (e) => {
 $('#termsWrap').addEventListener('input', (e) => {
   const form = e.target.closest('[data-seg-form]');
   if (form) { if (e.target.name === 'spread') syncSegForm(form); refreshPlanPreview(form); return; }
-  if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]')) && (e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
+  if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]')) && (e.target.name === 'amortization_years' || e.target.name === 'payment_override' || e.target.name === 'payment_pricing_date')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }
@@ -1810,6 +1810,10 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         // clears it too; any other figure is sent as the override
         // (the server still refuses a non-positive one).
         payment_override: paymentOverrideOut(form, f.payment_override),
+        // The payment row's Priced as of date (blank clears the
+        // pricing anchor; the payment then derives at the term's
+        // start, as before).
+        payment_pricing_date: f.payment_pricing_date ? f.payment_pricing_date : null,
         ai_fields: [...aiFlagSet(form)],
       };
       // The principal pair binds the term's opening balance / start
@@ -2150,6 +2154,11 @@ function refreshPlanPreview(form) {
     if (termForm && termForm.payment_override) {
       const po = parseMoneyInput(termForm.payment_override.value);
       body.payment_override = po === '' ? null : po;
+    }
+    // The term form's Priced as of date as currently edited (blank
+    // = no pricing anchor in the draft).
+    if (termForm && termForm.payment_pricing_date) {
+      body.payment_pricing_date = termForm.payment_pricing_date.value || null;
     }
     if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
       body.rate_mode = 'prime_spread';

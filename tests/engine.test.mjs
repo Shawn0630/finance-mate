@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeAtDateResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -561,6 +561,89 @@ test('buildSchedule compounding: the real RBC shape — monthly vs semi-annual b
   // the externally verified balances.
   assert.equal(bal(mk('monthly'), '2026-05'), 1298221.75);
   assert.equal(bal(mk('monthly'), '2026-09'), 1284262.85);
+});
+
+test('primeAtDateResolver: the prime in effect on a date is the last observation on or before it', () => {
+  const resolve = primeAtDateResolver([
+    { date: '2024-12-04', rate: 5.95 },
+    { date: '2024-12-18', rate: 5.45 },
+  ], null);
+  // Before the first observation: the earliest stored one.
+  assert.equal(resolve('2024-12-01'), 5.95);
+  // Between observations: the one already in effect.
+  assert.equal(resolve('2024-12-10'), 5.95);
+  assert.equal(resolve('2024-12-17'), 5.95);
+  // On / after an observation date: that observation.
+  assert.equal(resolve('2024-12-18'), 5.45);
+  assert.equal(resolve('2025-06-30'), 5.45);
+  // Scalar fallback and the empty case mirror the month resolver.
+  assert.equal(primeAtDateResolver(null, 4.95)('2024-12-10'), 4.95);
+  assert.equal(primeAtDateResolver([], null), null);
+});
+
+test('buildSchedule: a payment pricing date anchors the term’s initial derivation to that date’s prime — accrual untouched', () => {
+  // The user's real history, completed: RBC priced the payment
+  // on the commitment letter (prime 5.95, before the Dec 11 cut)
+  // and funded on Dec 17, after prime had already fallen to 5.45.
+  // A term priced as of 2024-12-10 therefore derives at
+  // 5.95 - 1 = 4.95% — the letter's $7,205.89 — while the same
+  // term with no pricing date derives at the start month's prime
+  // (5.45 - 1 = 4.45%) — $6,800.20. Fixture: $1,450,000 opening
+  // with the $100,000 month-1 lump folding it to $1,350,000,
+  // Prime - 1 monthly-compounded, 360 months.
+  const primeHistory = [
+    { date: '2024-12-04', rate: 5.95 }, { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-02-05', rate: 5.20 }, { date: '2025-03-19', rate: 4.95 },
+    { date: '2025-09-24', rate: 4.70 }, { date: '2025-11-05', rate: 4.45 },
+  ];
+  const base = {
+    balance: 1450000, balanceDate: '2024-12-17', primeHistory,
+    segments: [{ start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, compounding: 'monthly' }],
+    lumpSums: [{ date: '2024-12-20', amount: 100000 }],
+  };
+  const term = (extra) => [{ id: 1, start_date: '2024-12-17', amortization_years: 30, ...extra }];
+  const priced = buildSchedule({ ...base, terms: term({ payment_pricing_date: '2024-12-10' }) });
+  assert.equal(priced.paymentDerived, 7205.89);
+  assert.equal(priced.paymentUsed, 7205.89);
+  assert.equal(priced.termPayments[1].paymentDerived, 7205.89);
+  const blank = buildSchedule({ ...base, terms: term({}) });
+  assert.equal(blank.paymentDerived, 6800.2);
+  assert.equal(blank.paymentUsed, 6800.2);
+  // A pricing date AFTER the cut prices at the post-cut prime —
+  // the resolution is genuinely by date, not "any anchor = 5.95".
+  const after = buildSchedule({ ...base, terms: term({ payment_pricing_date: '2024-12-20' }) });
+  assert.equal(after.paymentDerived, 6800.2);
+  // Orthogonal with the override: the override still runs the
+  // term, the anchored figure stands as the derived beside it,
+  // and the trajectory is the externally verified one — every
+  // month's interest priced at that month's OWN prime (January
+  // 2025 charges 4.45%, not the letter's 4.95%), so the anchor
+  // demonstrably never reaches accrual.
+  const withOv = buildSchedule({ ...base, terms: term({ payment_pricing_date: '2024-12-10', payment_override: 7207.10 }) });
+  assert.equal(withOv.paymentUsed, 7207.1);
+  assert.equal(withOv.paymentDerived, 7205.89);
+  assert.equal(withOv.paymentOverridden, true);
+  assert.equal(withOv.series[0].rate, 4.45);
+  const bal = (r, m) => r.series.find((x) => x.month === m).balance;
+  assert.equal(bal(withOv, '2026-05'), 1298221.75);
+  assert.equal(bal(withOv, '2026-09'), 1284262.85);
+  // A fixed opening segment ignores the date entirely (nominal
+  // rate): with one, an anchored run equals the blank run to the
+  // row — which also proves a mid-term prime segment's recast,
+  // priced at the change point, never reads the anchor.
+  const fixedBase = {
+    balance: 100000, balanceDate: '2026-01-01',
+    segments: [
+      { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
+      { start_date: '2026-07-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 },
+    ],
+    primeHistory: [{ date: '2025-12-03', rate: 4.95 }, { date: '2026-08-05', rate: 4.45 }],
+  };
+  const fixedTerms = (extra) => [{ id: 1, start_date: '2026-01-01', amortization_years: 25, ...extra }];
+  const fixedPriced = buildSchedule({ ...fixedBase, terms: fixedTerms({ payment_pricing_date: '2024-12-10' }) });
+  const fixedBlank = buildSchedule({ ...fixedBase, terms: fixedTerms({}) });
+  assert.equal(JSON.stringify(fixedPriced.series), JSON.stringify(fixedBlank.series));
+  assert.equal(fixedPriced.paymentDerived, fixedBlank.paymentDerived);
 });
 
 test('buildSchedule compounding: each month prices under its own segment’s convention', () => {

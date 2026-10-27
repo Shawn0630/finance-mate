@@ -283,6 +283,7 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   repayment_method TEXT NOT NULL DEFAULT 'equal_payment',  -- 'equal_payment' (level payment) | 'equal_principal' (fixed monthly principal)
   amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
   payment_override REAL,              -- optional monthly payment override for this term; NULL = the calculated payment rules
+  payment_pricing_date TEXT,          -- 'YYYY-MM-DD' the term's payment was priced as of; NULL = priced at the term's start. Only the term's initial derivation reads it (prime in effect on that date); accrual never does
   payment_frequency TEXT,             -- payment schedule for this term; NULL = fall back to the property mirror
   payment_day INTEGER,                -- deduction day 1..31 for this term; NULL = fall back
   anchor_balance REAL,                -- the property's balance anchor, when it lands inside this term after its start
@@ -341,6 +342,10 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   // the property, so a migrated mortgage behaves exactly as before.
   if (termCols.length) {
     if (!termCols.includes('payment_override')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_override REAL');
+    // The payment pricing anchor: nullable, and NULL is the
+    // long-standing behaviour (derive at the term's start month),
+    // so existing rows need no backfill and no projection moves.
+    if (!termCols.includes('payment_pricing_date')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_pricing_date TEXT');
     if (!termCols.includes('payment_frequency')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_frequency TEXT');
     if (!termCols.includes('payment_day')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_day INTEGER');
     if (!termCols.includes('anchor_balance')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN anchor_balance REAL');

@@ -163,6 +163,42 @@ export function primeHistoryResolver(primeHistory, primeRate) {
   return null;
 }
 
+// A resolver for the prime rate in effect on a DATE ('YYYY-MM-DD'):
+// the last observation dated on or before it; a date before the
+// first observation uses the earliest stored one. Same history /
+// scalar fallback contract as primeHistoryResolver. This is the
+// lookup a payment PRICING anchor needs — a bank prices a term's
+// payment off the prime in effect on the day the commitment was
+// signed, which can predate the funding (and a prime move in
+// between), so the month-granular resolver above (month-END rule)
+// cannot express it.
+export function primeAtDateResolver(primeHistory, primeRate) {
+  if (Array.isArray(primeHistory)) {
+    const obs = primeHistory
+      .map((o) => ({ date: String(o && o.date), rate: Number(o && o.rate) }))
+      .filter((o) => /^\d{4}-\d{2}-\d{2}/.test(o.date) && isFinite(o.rate))
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    if (obs.length) {
+      return (dateStr) => {
+        const d = String(dateStr).slice(0, 10);
+        let lo = 0;
+        let hi = obs.length - 1;
+        let found = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (obs[mid].date <= d) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return found >= 0 ? obs[found].rate : obs[0].rate;
+      };
+    }
+  }
+  if (primeRate !== null && primeRate !== undefined && isFinite(Number(primeRate))) {
+    const v = Number(primeRate);
+    return () => v;
+  }
+  return null;
+}
+
 // Month keys whose priced prime differs from the previous month's —
 // the prime-CHANGE months. A step's first priced month is the month
 // of the observation that posts the new rate (see the resolver's
@@ -441,9 +477,14 @@ function monthIdxOf(dateStr) {
 //
 //   balance / balanceDate: the current-balance anchor (as simulate)
 //   terms:      [{ id, start_date, amortization_years,
-//               repayment_method,
+//               repayment_method, payment_pricing_date,
 //               payment_frequency, payment_day, anchor_balance,
-//               anchor_date }] any order
+//               anchor_date }] any order — payment_pricing_date is
+//               the optional date the term's payment was priced as
+//               of: the term's INITIAL derivation then prices a
+//               prime-spread segment at the prime in effect on
+//               that date instead of the start month's (see
+//               computePayment); accrual is unaffected.
 //   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
 //               before the balance date is already reflected in the
 //               anchor balance and is ignored
@@ -463,6 +504,7 @@ function monthIdxOf(dateStr) {
 export function buildSchedule({ balance, balanceDate, terms = [], segments = [], lumpSums = [], paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA' }) {
   const blocked = { series: [], totalInterest: 0, payoffMonth: null, negativeAmortization: false, paymentUsed: null, paymentDerived: null, paymentOverridden: false, termPayments: {} };
   const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
+  const primeAtDate = primeAtDateResolver(primeHistory, primeRate);
   if (segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread')
     && !primeForMonth) {
     return { ...blocked, state: 'no_prime' };
@@ -527,13 +569,32 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   // rate in effect when it starts); otherwise the first month the
   // payment applies to (S + 1). For a prime-spread segment the prime
   // is THAT month's prime from the tracked history, never today's.
-  const computePayment = (S, balNow) => {
+  // `usePricingDate` marks a term's INITIAL derivation (its start):
+  // when the term carries a payment_pricing_date, a prime-spread
+  // segment instead prices at the prime in effect on THAT date —
+  // banks price the payment when the commitment is signed, which
+  // can predate the funding and a prime move in between (the
+  // user's letter priced at prime 5.95 six days before a cut the
+  // Dec 17 funding already reflected). The anchor touches ONLY
+  // this derivation: fixed / absolute segments price at their
+  // nominal rate either way, mid-term rate-change recasts never
+  // read it (a rate change is a new pricing event), and interest
+  // accrual never sees it — every month still charges at its own
+  // month's prime.
+  const computePayment = (S, balNow, usePricingDate = false) => {
     const term = termAtMonth(S + 1);
     const rateMonth = S === A && term && monthIdxOf(term.start_date) === A
       ? ymKeyOfIdx(A)
       : ymKeyOfIdx(S + 1);
     const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
-    const rate = segmentRateForMonth(seg, rateMonth, primeForMonth);
+    let rate = segmentRateForMonth(seg, rateMonth, primeForMonth);
+    if (usePricingDate && term && term.payment_pricing_date
+      && seg && seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread') {
+      if (!primeAtDate) return { error: 'no_prime' };
+      const prime = primeAtDate(String(term.payment_pricing_date));
+      if (prime === null || prime === undefined || !isFinite(Number(prime))) return { error: 'no_prime' };
+      rate = Math.max(0, round2(Number(prime) + Number(seg.spread || 0)));
+    }
     if (rate === null) return { error: 'no_prime' };
     if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
@@ -638,6 +699,10 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
         if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12, newSeg ? newSeg.compounding : undefined) };
       }
     }
+    // The fallback derives the term's remaining-amortization
+    // payment at the CHANGE point's rate — deliberately WITHOUT
+    // the payment pricing date: a rate change is a new pricing
+    // event, priced when it happens, not when the term was signed.
     return computePayment(S, balNow);
   };
 
@@ -692,7 +757,7 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   if (initialLump) {
     bal = round2(bal - initialLump.total);
     if (bal <= 0) {
-      const derived = computePayment(A, round2(Number(balance)));
+      const derived = computePayment(A, round2(Number(balance)), true);
       const ovA = overrideAt(A);
       const usedFigure = ovA !== null ? ovA : (derived.error ? null : (derived.payment ?? null));
       const anchorT = termAtMonth(A + 1);
@@ -745,8 +810,9 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
       // The anchor, or a new term starting: derive the plan on the
       // (new) term's amortization. A segment that starts with the
       // term is the term's opening rate plan, not a mid-stream
-      // rate change.
-      derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
+      // rate change. This is the term's INITIAL derivation — the
+      // one place its payment pricing date (if any) applies.
+      derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal, true);
     } else if (segStates.has(S)) {
       // A rate change inside the running schedule: equal payment
       // recasts against the trajectory's payoff; equal principal
