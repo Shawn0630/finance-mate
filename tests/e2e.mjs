@@ -1924,10 +1924,14 @@ try {
       // must group live there — and the server must store the
       // plain number, as the term's opening and as the anchor
       // seeded from it.
+      const addSrc = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+      check('the Add Property intro paragraph is gone from the page source', !addSrc.includes('Just the essentials'));
       await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
       await page.evaluate(() => document.querySelector('#addPropertyBtn').click());
       await wait(500);
+      const addModalText = await page.evaluate(() => document.querySelector('#propertyModal').textContent);
+      check('the rendered Add Property modal carries no intro paragraph', !addModalText.includes('Just the essentials'));
       const addHasBalance = await page.evaluate(() => !!document.querySelector('#addPropForm [name=mortgage_balance]'));
       check('the Add Property form has no Outstanding principal field', addHasBalance === false);
       await focusField('#addPropForm .address-input');
