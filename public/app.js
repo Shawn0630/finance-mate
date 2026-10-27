@@ -390,11 +390,13 @@ async function loadAssets(force = false) {
       <div class="k">${b.label}</div><div class="v">${money(b.value)}</div><div class="n">${esc(b.note)}</div>
     </div>`).join('');
 
-  // Properties listing.
+  // Properties listing. Each card's cover is the same
+  // PhotoCarousel as the detail page, mounted over all the
+  // property's photos (autoplay, arrows, hover/viewport pause);
+  // a single photo is static and none shows the placeholder.
+  for (const c of cardCarousels) c.destroy();
+  cardCarousels.length = 0;
   $('#propertyCards').innerHTML = properties.map((p) => {
-    const photo = p.photos && p.photos.length
-      ? `<img src="${esc(p.photos[0].src)}" alt="">`
-      : 'No photo';
     const rate = p.currentRate
       ? `${p.currentRate.rate_type === 'fixed' ? 'Fixed' : 'Variable'} ${Number(p.currentRate.annual_rate).toFixed(2)}%`
       : 'No rate segments';
@@ -402,7 +404,7 @@ async function loadAssets(force = false) {
       ? `<span class="badge">BC Assessment${p.assessed_year ? ' ' + p.assessed_year : ''}</span>`
       : p.assessed_source === 'manual' ? '<span class="badge manual">Manual</span>' : '';
     return `<div class="card">
-      <div class="photo">${photo}</div>
+      <div class="photo" data-card-carousel="${p.id}"></div>
       <div class="body">
         <div class="addr">${esc(p.address)}${regionTagHtml(p.region)}</div>
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
@@ -413,6 +415,13 @@ async function loadAssets(force = false) {
         <div class="toolbar"><button onclick="location.hash='#property/${p.id}'">Details</button></div>
       </div></div>`;
   }).join('') || '<div class="note">No properties yet — use “Add property” above.</div>';
+  for (const p of properties) {
+    const el = document.querySelector(`[data-card-carousel="${p.id}"]`);
+    if (!el) continue;
+    const c = new PhotoCarousel(el, { imgClass: 'card-photo', emptyHtml: 'No photo' });
+    c.setPhotos(p.photos || [], 0);
+    cardCarousels.push(c);
+  }
   await loadPortfolio();
 
   // One listing table per other-asset category.
@@ -1456,6 +1465,10 @@ class PhotoCarousel {
     if (this.io) this.io.disconnect();
   }
 }
+
+// Live card-cover carousels on the Properties listing (destroyed
+// and rebuilt on every listing render).
+const cardCarousels = [];
 
 const detailCarousel = new PhotoCarousel($('#photoArea'), {
   emptyHtml: '<div class="detail-photo-empty photo-clickable" data-photo-add>No photos yet — click to add photos</div>',

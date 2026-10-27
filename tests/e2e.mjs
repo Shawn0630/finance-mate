@@ -3876,6 +3876,7 @@ try {
         check('prefers-reduced-motion disables autoplay', (await autoSrc()) === rmSrc);
         await page.emulateMediaFeatures([]);
       } catch { /* media emulation unavailable in this browser build */ }
+      await page.evaluate(() => { window.__fmPhotoDelay = 60000; }); // freeze card covers for the checks below
       await page.evaluate(() => { location.hash = '#assets/properties'; });
       await wait(2000);
       const cover = await page.evaluate(() => {
@@ -3894,6 +3895,68 @@ try {
       check('the Properties card carries the region flag tag beside its address',
         !!cardTag && cardTag.text === '🇨🇦' && cardTag.title === 'Canada (CA)',
         JSON.stringify(cardTag));
+      // Card-cover carousel (the same PhotoCarousel as the
+      // detail page): the 999 card holds two photos. Bring it
+      // into view, re-arm its timer at the short test delay via
+      // a manual click — the arrows work without navigating —
+      // and it then auto-advances on its own.
+      const cardSrc = () => page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('999 Money Test Terrace'));
+        const img = card && card.querySelector('.photo img');
+        return img ? img.getAttribute('src') : null;
+      });
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('999 Money Test Terrace'));
+        if (card) card.scrollIntoView({ block: 'center' });
+      });
+      await wait(600);
+      await page.evaluate(() => { window.__fmPhotoDelay = 400; });
+      const cs0 = await cardSrc();
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('999 Money Test Terrace'));
+        card.querySelector('[data-photo-nav="1"]').click();
+      });
+      await wait(300);
+      const cs1 = await cardSrc();
+      const stillList = await page.evaluate(() => location.hash === '#assets/properties'
+        && !document.querySelector('#view-assets').classList.contains('hidden'));
+      check('card cover arrow switches the photo without navigating away',
+        !!cs0 && !!cs1 && cs1 !== cs0 && stillList, JSON.stringify({ cs0, cs1, stillList }));
+      const pollCard = async (want, tries = 18) => {
+        for (let i = 0; i < tries; i++) { if (want(await cardSrc())) return true; await wait(200); }
+        return false;
+      };
+      check('the card cover auto-advances on its own', await pollCard((s) => s !== cs1));
+      // A single-photo card: no arrows, static. A fresh
+      // property with exactly one photo, then re-render the list.
+      r = await req('POST', '/api/properties', { address: '997 Single Photo Close', purchase_date: '2024-01-01' });
+      const singlePid = r.data.id;
+      await req('POST', `/api/properties/${singlePid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(2500);
+      const singleBits = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('997 Single Photo Close'));
+        if (card) card.scrollIntoView({ block: 'center' });
+        const img = card && card.querySelector('.photo img');
+        return {
+          src: img ? img.getAttribute('src') : null,
+          navs: card ? card.querySelectorAll('[data-photo-nav]').length : -1,
+        };
+      });
+      await wait(900);
+      const singleSrc2 = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes('997 Single Photo Close'));
+        const img = card && card.querySelector('.photo img');
+        return img ? img.getAttribute('src') : null;
+      });
+      check('a single-photo card shows no arrows and stays static',
+        !!singleBits.src && singleBits.navs === 0 && singleSrc2 === singleBits.src,
+        JSON.stringify({ singleBits, singleSrc2 }));
 
       // ---- Payment override, driven through the UI ----
       // $1,350,000 at 3.95% fixed over 30y derives $6,381.36.

@@ -26,8 +26,12 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px; }
 h2 { font-size: 16px; margin: 22px 0 10px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
 .card { background: #fff; border: 1px solid #dde4ec; border-radius: 10px; overflow: hidden; }
-.card .photo { height: 150px; background: #dbe4ee; display: flex; align-items: center; justify-content: center; color: #71808f; font-size: 13px; }
+.card .photo { height: 150px; background: #dbe4ee; display: flex; align-items: center; justify-content: center; color: #71808f; font-size: 13px; position: relative; overflow: hidden; }
 .card .photo img { width: 100%; height: 100%; object-fit: cover; }
+.card .photo .photo-carousel { position: absolute; inset: 0; }
+.card .photo img.card-photo { display: block; }
+.card .photo .carousel-nav { top: 50%; transform: translateY(-50%); }
+.card .photo .carousel-bar { display: none; }
 .card .body { padding: 12px 14px; }
 .card .addr { font-weight: 600; font-size: 15px; margin-bottom: 6px; }
 .kv { display: flex; justify-content: space-between; padding: 3px 0; color: #33424f; }
