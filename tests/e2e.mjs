@@ -5772,7 +5772,12 @@ try {
       // the content column exactly as wide as without it, list
       // the rendered sections in order, jump + highlight on
       // click, follow the scroll (scrollspy), and collapse to a
-      // round toggle on narrow viewports. ----
+      // round toggle on narrow viewports. Auto-hide: it starts
+      // hidden, fades in while the page scrolls, and back out a
+      // few seconds after scrolling stops — hovering it (or the
+      // open narrow card) holds it. The hide delay is shortened
+      // via window.__fmOutline so the suite never waits out the
+      // real 2.5s. ----
       await page.setViewport({ width: 1500, height: 900 });
       await wait(600);
       const outlineEntries = await page.evaluate(() =>
@@ -5781,6 +5786,31 @@ try {
         JSON.stringify(outlineEntries) === JSON.stringify(
           ['Property Details', 'Value & Mortgage Projection', 'Assessment History', 'Property Costs']),
         JSON.stringify(outlineEntries));
+      // The flows above scrolled this page plenty, so the outline
+      // may be awake right now. Shorten the hide delay, then judge
+      // the resting state once the countdown has run out. (No
+      // reload here: it would collapse the AI chat panel above,
+      // shorten the page, and the costs panel could no longer
+      // physically scroll into the band the jump checks assert.)
+      await page.evaluate(() => window.__fmOutline.setHideDelay(700));
+      check('the outline settles back to hidden at rest',
+        !!(await until(() => !document.querySelector('#propOutline').classList.contains('awake'))));
+      await wait(400); // let any fade-out transition settle
+      const hiddenFacts = await page.evaluate(() => {
+        const nav = document.querySelector('#propOutline');
+        const cs = getComputedStyle(nav);
+        const r = nav.getBoundingClientRect();
+        const under = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return {
+          awake: nav.classList.contains('awake'), visibility: cs.visibility,
+          opacity: cs.opacity, pointerEvents: cs.pointerEvents,
+          underInNav: !!under && nav.contains(under),
+        };
+      });
+      check('at rest the outline is fully hidden and lets clicks pass through',
+        !hiddenFacts.awake && hiddenFacts.visibility === 'hidden' && hiddenFacts.opacity === '0'
+          && hiddenFacts.pointerEvents === 'none' && !hiddenFacts.underInNav,
+        JSON.stringify(hiddenFacts));
       const navFacts = await page.evaluate(() => {
         const nav = document.querySelector('#propOutline');
         const main = document.querySelector('main');
@@ -5791,16 +5821,48 @@ try {
         return {
           position: getComputedStyle(nav).position,
           toggleDisplay: getComputedStyle(document.querySelector('#propOutlineToggle')).display,
-          cardVisible: getComputedStyle(document.querySelector('.prop-outline-card')).display !== 'none',
           withNav, withoutNav,
         };
       });
       check('the outline is a fixed floating card, toggle hidden on a wide viewport',
-        navFacts.position === 'fixed' && navFacts.cardVisible && navFacts.toggleDisplay === 'none',
+        navFacts.position === 'fixed' && navFacts.toggleDisplay === 'none',
         JSON.stringify(navFacts));
       check('the floating outline takes no layout width (content column identical with/without it)',
         Math.abs(navFacts.withNav - navFacts.withoutNav) < 0.6,
         JSON.stringify(navFacts));
+      await page.evaluate(() => window.scrollTo(0, 200));
+      check('scrolling fades the outline in',
+        !!(await until(() => {
+          const nav = document.querySelector('#propOutline');
+          return nav.classList.contains('awake') && getComputedStyle(nav).visibility === 'visible';
+        })));
+      check('the outline fades back out once scrolling has stopped',
+        !!(await until(() => {
+          const nav = document.querySelector('#propOutline');
+          return !nav.classList.contains('awake') && getComputedStyle(nav).visibility === 'hidden';
+        })));
+      // Hover holds it open past the hide delay; leaving releases it.
+      await page.evaluate(() => window.scrollBy(0, 40));
+      await until(() => document.querySelector('#propOutline').classList.contains('awake'));
+      const navBox = await page.evaluate(() => {
+        const r = document.querySelector('#propOutline').getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      });
+      await page.mouse.move(navBox.x, navBox.y);
+      await wait(1600); // > 2x the shortened 700ms hide delay
+      check('hovering the outline holds it open past the hide delay',
+        await page.evaluate(() => {
+          const nav = document.querySelector('#propOutline');
+          return nav.classList.contains('awake') && getComputedStyle(nav).visibility === 'visible';
+        }));
+      await page.mouse.move(navBox.x + 420, navBox.y);
+      check('moving the pointer away lets it hide again',
+        !!(await until(() => !document.querySelector('#propOutline').classList.contains('awake'))));
+      const wakeNav = async () => {
+        await page.evaluate(() => window.dispatchEvent(new Event('scroll')));
+        await until(() => document.querySelector('#propOutline').classList.contains('awake'));
+      };
+      await wakeNav();
       await page.evaluate(() => {
         [...document.querySelectorAll('#propOutlineList a')]
           .find((a) => a.textContent.includes('Property Costs')).click();
@@ -5822,6 +5884,7 @@ try {
           return !!a && a.textContent.includes('Property Details')
             && document.querySelector('#propertyOverview').getBoundingClientRect().top >= 40;
         })));
+      await wakeNav();
       await page.evaluate(() => {
         [...document.querySelectorAll('#propOutlineList a')]
           .find((a) => a.textContent.includes('Assessment History')).click();
@@ -5832,15 +5895,27 @@ try {
       await wait(400);
       await page.setViewport({ width: 700, height: 900 });
       await wait(500);
+      check('the outline is hidden at rest on a narrow viewport too',
+        !!(await until(() => !document.querySelector('#propOutline').classList.contains('awake'))));
       const narrowFacts = await page.evaluate(() => ({
         toggle: getComputedStyle(document.querySelector('#propOutlineToggle')).display,
         card: getComputedStyle(document.querySelector('.prop-outline-card')).display,
       }));
       check('on a narrow viewport the outline collapses to just the round toggle button',
         narrowFacts.toggle === 'flex' && narrowFacts.card === 'none', JSON.stringify(narrowFacts));
+      await page.evaluate(() => window.scrollTo(0, 300));
+      check('on a narrow viewport a scroll wakes the floating toggle',
+        !!(await until(() => {
+          const nav = document.querySelector('#propOutline');
+          return nav.classList.contains('awake') && getComputedStyle(nav).visibility === 'visible';
+        })));
       await page.evaluate(() => document.querySelector('#propOutlineToggle').click());
       check('tapping the toggle opens the entry card',
         !!(await until(() => getComputedStyle(document.querySelector('.prop-outline-card')).display !== 'none')));
+      await wait(1600); // > 2x the shortened hide delay
+      check('the opened card holds the outline open past the hide delay',
+        await page.evaluate(() => document.querySelector('#propOutline').classList.contains('awake')
+          && getComputedStyle(document.querySelector('.prop-outline-card')).display !== 'none'));
       await page.evaluate(() => {
         [...document.querySelectorAll('#propOutlineList a')]
           .find((a) => a.textContent.includes('Property Costs')).click();
@@ -5851,6 +5926,9 @@ try {
           return r.top >= 40 && r.top <= 110
             && !document.querySelector('#propOutline').classList.contains('open');
         })));
+      check('after the jump the outline auto-hides again on the narrow viewport',
+        !!(await until(() => !document.querySelector('#propOutline').classList.contains('awake'))));
+      await page.evaluate(() => window.__fmOutline.setHideDelay(2500));
       await page.setViewport({ width: 800, height: 600 });
       await req('DELETE', `/api/properties/${costUiPid}`);
     } catch (err) {

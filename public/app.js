@@ -1805,7 +1805,49 @@ $('#cancelPropEditBtn').addEventListener('click', () => {
 // on this page — it lives in a modal — so its entry rides along
 // with the projection panel and opens that modal instead of
 // scrolling. Scrollspy highlights the section in view.
+//
+// Auto-hide: the outline shows itself only while the page is
+// scrolling — hidden when the page opens, it fades in on scroll
+// and back out ~2.5s after scrolling stops. Holds pause the
+// countdown so it never vanishes from under the user: the pointer
+// hovering it ('hover'), keyboard focus inside it ('focus'), or
+// the narrow-screen card standing open ('open'). The delay lives
+// in a variable (window.__fmOutline lets tests shorten it instead
+// of waiting out the real one).
 let outlineTargets = [];
+let outlineHideMs = 2500;
+let outlineHideTimer = null;
+const outlineHolds = new Set();
+window.__fmOutline = { setHideDelay: (ms) => { outlineHideMs = ms; } };
+
+function outlineArmHide() {
+  clearTimeout(outlineHideTimer);
+  outlineHideTimer = null;
+  if (outlineHolds.size) return;
+  outlineHideTimer = setTimeout(() => {
+    outlineHideTimer = null;
+    const nav = $('#propOutline');
+    if (nav && !outlineHolds.size) nav.classList.remove('awake');
+  }, outlineHideMs);
+}
+
+function outlineWake() {
+  const nav = $('#propOutline');
+  if (!nav) return;
+  nav.classList.add('awake');
+  outlineArmHide();
+}
+
+function outlineHold(reason, on) {
+  if (on) {
+    outlineHolds.add(reason);
+    const nav = $('#propOutline');
+    if (nav) nav.classList.add('awake');
+  } else {
+    outlineHolds.delete(reason);
+  }
+  outlineArmHide();
+}
 
 function setOutlineActive(id) {
   document.querySelectorAll('#propOutlineList a[data-target]').forEach((a) =>
@@ -1831,11 +1873,19 @@ function updateOutlineSpy() {
 function closePropOutline() {
   $('#propOutline').classList.remove('open');
   $('#propOutlineToggle').setAttribute('aria-expanded', 'false');
+  outlineHold('open', false);
 }
 
 function buildPropOutline() {
   const list = $('#propOutlineList');
   if (!list) return;
+  // A freshly opened property starts with the outline hidden; it
+  // appears when the user starts scrolling.
+  const nav0 = $('#propOutline');
+  if (nav0) nav0.classList.remove('awake');
+  outlineHolds.clear();
+  clearTimeout(outlineHideTimer);
+  outlineHideTimer = null;
   list.innerHTML = '';
   outlineTargets = [];
   for (const sec of document.querySelectorAll('#view-property [data-outline]')) {
@@ -1871,12 +1921,25 @@ function buildPropOutline() {
 $('#propOutlineToggle').addEventListener('click', () => {
   const open = $('#propOutline').classList.toggle('open');
   $('#propOutlineToggle').setAttribute('aria-expanded', String(open));
+  outlineHold('open', open);
 });
 document.addEventListener('click', (e) => {
   const nav = $('#propOutline');
   if (nav && nav.classList.contains('open') && !nav.contains(e.target)) closePropOutline();
 });
-window.addEventListener('scroll', updateOutlineSpy, { passive: true });
+// Holds: hovering the outline or keeping keyboard focus inside it
+// pauses the auto-hide countdown; leaving releases it.
+const propOutlineNav = $('#propOutline');
+propOutlineNav.addEventListener('mouseenter', () => outlineHold('hover', true));
+propOutlineNav.addEventListener('mouseleave', () => outlineHold('hover', false));
+propOutlineNav.addEventListener('focusin', () => outlineHold('focus', true));
+propOutlineNav.addEventListener('focusout', (e) => {
+  if (!propOutlineNav.contains(e.relatedTarget)) outlineHold('focus', false);
+});
+window.addEventListener('scroll', () => {
+  updateOutlineSpy();
+  if (!$('#view-property').classList.contains('hidden')) outlineWake();
+}, { passive: true });
 
 async function loadPropertyDetailImpl(id) {
   const p = await api(`/api/properties/${id}`);
