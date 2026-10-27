@@ -1684,6 +1684,22 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
     .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
     .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
+  // A first term created already carrying an opening balance on a
+  // property with no balance anchor seeds the anchor from the
+  // pair, exactly as a term save does — otherwise the projection
+  // has no balance to run from until some later edit. (A renewal
+  // is never the earliest term, and an existing anchor is never
+  // overwritten.)
+  {
+    const fresh = getProperty(p.id);
+    if (fresh.mortgage_balance == null && t.opening_balance != null) {
+      const earliest = termsOf(p.id)[0];
+      if (earliest && earliest.id === Number(info.lastInsertRowid)) {
+        db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
+          .run(t.opening_balance, t.start_date, nowIso(), p.id);
+      }
+    }
+  }
   syncTermMirror(getProperty(p.id));
   syncTermAnchor(getProperty(p.id));
   syncScheduleMirror(getProperty(p.id));
@@ -1729,20 +1745,34 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
         .run(submittedBalance, submittedDate, nowIso(), p.id);
     }
   }
-  // A property added without a principal has no balance anchor at
-  // all: the first mortgage figure it ever gets is its earliest
-  // term's opening balance, entered in this same modal — seed the
-  // anchor from that pair (the pair the Add form used to seed at
-  // creation), so the mortgage can project from here. An existing
-  // anchor is never overwritten by this; it moves only through
-  // its own principal pair above.
+  // The earliest term's opening FIGURE and the property's
+  // balance anchor are one fact whenever the anchor is folded
+  // into that term (its date on or before the term's start — the
+  // placement rule syncTermAnchor applies): the card edits the
+  // figure as "Outstanding principal", while the projection runs
+  // entirely off the property anchor, so an opening-figure save
+  // must write the anchor figure through too, or the plan keeps
+  // running on the old balance. The anchor DATE is its own fact:
+  // it is seeded with the pair at the first save, but afterwards
+  // it moves only through the anchor pair (the write-through
+  // above) — a term-start edit never drags it; instead the
+  // placement sync re-seats the standing anchor on the term that
+  // now contains it, and the projection is unchanged by the move.
+  // A save through the anchor pair itself is handled above and
+  // excluded here, as is a save that never submitted the figure
+  // (a lender-only edit must not move an anchor).
   {
     const fresh = getProperty(p.id);
-    if (fresh.mortgage_balance == null && t.opening_balance != null) {
-      const earliest = termsOf(p.id)[0];
-      if (earliest && earliest.id === term.id) {
+    const earliest = termsOf(p.id)[0];
+    if (earliest && earliest.id === term.id && t.opening_balance != null
+      && b.anchor_balance === undefined && b.anchor_date === undefined) {
+      if (fresh.mortgage_balance == null) {
         db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
           .run(t.opening_balance, t.start_date, nowIso(), p.id);
+      } else if (b.opening_balance !== undefined
+        && p.mortgage_balance_date && p.mortgage_balance_date <= term.start_date) {
+        db.prepare('UPDATE properties SET mortgage_balance = ?, updated_at = ? WHERE id = ?')
+          .run(t.opening_balance, nowIso(), p.id);
       }
     }
   }

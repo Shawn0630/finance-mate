@@ -2212,6 +2212,418 @@ try {
       check('properties head: the button has the set 16px padding of space above it',
         headGeom.btnTopGap > 0 && Math.abs(headGeom.btnTopGap - 16) <= 3, JSON.stringify(headGeom));
 
+      // ------------------------------------------------- save sweep --
+      // The general rule: ANY field, once saved, must re-derive
+      // every figure it governs — nothing may be "stored while the
+      // plan still runs on the old value". Regression target (the
+      // user's Nash Drive report): Term 1 saved with an opening of
+      // 500,000 derived $2,666.87; editing the opening to 600,000
+      // updated OPENING PRINCIPAL in the modal head but CURRENT
+      // MONTHLY PAYMENT stayed $2,666.87 and CURRENT PRINCIPAL
+      // stayed on the 500k trajectory, because the term save wrote
+      // the term row only while the projection runs off the
+      // property balance anchor the pair is folded into. The sweep
+      // walks one property through every save path and asserts the
+      // governed figures follow — in both directions (what must
+      // change changes; what must not change, e.g. the payment
+      // across a lump sum, does not).
+      const sweepDialog = (d) => d.accept();
+      page.on('dialog', sweepDialog);
+      const sweepSet = (sel, val) => page.evaluate(([s, v]) => {
+        const el = document.querySelector(s);
+        el.value = v;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, [sel, val]);
+      const sweepMeta = () => page.evaluate(() => ({
+        opening: document.querySelector('#metaOpeningPrincipal').textContent,
+        payment: document.querySelector('#metaCurrentPayment').textContent,
+        principal: document.querySelector('#metaCurrentPrincipal').textContent,
+        lender: document.querySelector('#metaCurrentLender').textContent,
+      }));
+      const sweepNum = (s) => { const m = String(s).replace(/,/g, '').match(/-?\d+(\.\d+)?/); return m ? Number(m[0]) : NaN; };
+      const sweepFmt = (n) => Number(n).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      let sweepPid = null;
+      const sweepApi = async () => {
+        const p = (await req('GET', `/api/properties/${sweepPid}`)).data;
+        const a = (await req('GET', `/api/properties/${sweepPid}/amortization`)).data;
+        return { p, a };
+      };
+      const sweepUntilMeta = async (fn) => {
+        let m = null;
+        for (let i = 0; i < 32; i++) { m = await sweepMeta(); if (fn(m)) break; await wait(250); }
+        return m;
+      };
+      const sweepSaveTerm = async () => {
+        await page.evaluate(() => document.querySelector('[data-save-term]').click());
+        await wait(1700);
+      };
+      // Setup, the Nash shape: no principal at creation; Term 1
+      // filled in from the modal (CIBC, 2025-05-20, 60 months,
+      // 25y amortization, monthly on the 20th, opening 500,000),
+      // then its segment via the API (variable Prime − 0.85,
+      // monthly compounding, monthly accrual, locked 2025-05-20 —
+      // the stub history prices that lock at prime 4.95 → 4.10%).
+      r = await req('POST', '/api/properties', { address: '1 Save Sweep Close, Victoria, BC', purchase_date: '2025-05-20' });
+      sweepPid = r.data.id;
+      await page.goto(`http://ff.local/#property/${sweepPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
+      await sweepSet('[data-term-form] [name=lender]', 'CIBC');
+      await sweepSet('[data-term-form] [name=start_date]', '2025-05-20');
+      await focusField('[data-term-form] [name=opening_balance]');
+      await page.keyboard.type('500000');
+      await sweepSet('[data-term-form] [name=term_months]', '60');
+      await sweepSet('[data-term-form] [name=amortization_years]', '25');
+      await sweepSet('[data-term-form] [name=payment_day]', '20');
+      await sweepSaveTerm();
+      {
+        const { p } = await sweepApi();
+        await req('POST', `/api/properties/${sweepPid}/rates`, {
+          term_id: p.terms[0].id, start_date: '2025-05-20', rate_type: 'variable', rate_mode: 'prime_spread',
+          spread: -0.85, compounding: 'monthly', accrual: 'monthly', locked_on: '2025-05-20',
+        });
+      }
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(500);
+      const exp500 = engineDerive(500000, 4.10, 25, 'monthly');
+      const exp600 = engineDerive(600000, 4.10, 25, 'monthly');
+      check('sweep fixture prices as the user reported (500k @ 4.10% monthly / 25y = 2,666.87; 600k = 3,200.24)',
+        exp500 === 2666.87 && exp600 === 3200.24, JSON.stringify({ exp500, exp600 }));
+      let sweepState = await sweepApi();
+      let sweepM = await sweepMeta();
+      check('sweep: the 500k save derives the modal head (opening 500,000.00, payment 2,666.87, current principal on the 500k trajectory)',
+        sweepM.opening === '$500,000.00' && sweepNum(sweepM.payment) === exp500
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ m: sweepM, remaining: sweepState.p.remainingBalance }));
+      const heroSync = await page.evaluate(() => ({
+        remaining: document.querySelector('#detailRemainingBalance').textContent,
+        est: document.querySelector('#estPaymentValue').textContent,
+      }));
+      check('sweep: the detail hero agrees with the modal head after the 500k save',
+        heroSync.remaining === sweepM.principal && heroSync.est.includes('2,666.87'), JSON.stringify(heroSync));
+      const remaining500 = sweepState.p.remainingBalance;
+
+      // THE reported edit: opening 500,000 -> 600,000.
+      await focusField('[data-term-form] [name=opening_balance]');
+      await page.keyboard.type('600000');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === exp600);
+      check('sweep: editing the opening to 600,000 re-derives the payment (3,200.24, exact)',
+        sweepNum(sweepM.payment) === exp600 && sweepM.opening === '$600,000.00',
+        JSON.stringify({ payment: sweepM.payment, opening: sweepM.opening }));
+      check('sweep: the anchor itself moved to the edited pair (600,000 @ 2025-05-20) and Current Principal rides the new trajectory',
+        sweepState.p.mortgage_balance === 600000 && sweepState.p.mortgage_balance_date === '2025-05-20'
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005
+          && sweepState.p.remainingBalance !== remaining500,
+        JSON.stringify({ anchor: sweepState.p.mortgage_balance, remaining: sweepState.p.remainingBalance, was: remaining500 }));
+      const remaining600 = sweepState.p.remainingBalance;
+
+      // Lender: a display fact — it changes where it shows and
+      // moves nothing derived.
+      await sweepSet('[data-term-form] [name=lender]', 'TD');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: a lender edit renames the current lender and leaves the derived figures untouched',
+        sweepM.lender === 'TD' && sweepState.p.terms[0].lender === 'TD'
+          && sweepNum(sweepM.payment) === exp600 && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ lender: sweepM.lender, payment: sweepM.payment }));
+
+      // Principal as of (the term's start): a contract fact —
+      // the head line follows it, but the balance anchor is its
+      // own fact and does NOT move with the term start (it
+      // re-seats, and the projection is unchanged by the move).
+      await sweepSet('[data-term-form] [name=start_date]', '2025-06-20');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      const headMoved = await page.evaluate(() => document.querySelector('.term-head').textContent);
+      check('sweep: moving the term start moves the head line and leaves the anchor and the plan exactly as they were',
+        headMoved.includes('2025-06-20 → 2030-06-19')
+          && sweepState.p.mortgage_balance === 600000 && sweepState.p.mortgage_balance_date === '2025-05-20'
+          && sweepNum(sweepM.payment) === exp600 && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ head: headMoved.replace(/\s+/g, ' ').slice(0, 120), bd: sweepState.p.mortgage_balance_date, remaining: sweepState.p.remainingBalance }));
+      await sweepSet('[data-term-form] [name=start_date]', '2025-05-20');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      const headBack = await page.evaluate(() => document.querySelector('.term-head').textContent);
+      check('sweep: moving the term start back restores the head line, the plan never having moved',
+        headBack.includes('2025-05-20 → 2030-05-19')
+          && sweepState.p.mortgage_balance_date === '2025-05-20' && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ bd: sweepState.p.mortgage_balance_date, remaining: sweepState.p.remainingBalance }));
+      // A partial API save that never submits the pair must not
+      // move the anchor (the write-through is pair-scoped).
+      {
+        const termId = sweepState.p.terms[0].id;
+        await req('PUT', `/api/properties/${sweepPid}/terms/${termId}`, { lender: 'CIBC' });
+        const after = (await req('GET', `/api/properties/${sweepPid}`)).data;
+        check('sweep: a pair-less term save (lender only) leaves the anchor exactly where it was',
+          after.mortgage_balance === 600000 && after.mortgage_balance_date === '2025-05-20',
+          JSON.stringify({ b: after.mortgage_balance, bd: after.mortgage_balance_date }));
+        await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+        await wait(1500);
+        await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+        await wait(500);
+      }
+
+      // Term length: governs the term's end date (its display
+      // surface), not the payment (the amortization does that).
+      await sweepSet('[data-term-form] [name=term_months]', '36');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      const head36 = await page.evaluate(() => document.querySelector('.term-head').textContent);
+      check('sweep: term length moves the term end date and leaves the payment alone',
+        head36.includes('2028-05-19') && sweepNum(sweepM.payment) === exp600 && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ head: head36.replace(/\s+/g, ' ').slice(0, 120), payment: sweepM.payment }));
+      await sweepSet('[data-term-form] [name=term_months]', '60');
+      await sweepSaveTerm();
+      const head60 = await page.evaluate(() => document.querySelector('.term-head').textContent);
+      check('sweep: restoring the term length restores the end date',
+        head60.includes('2030-05-19'), head60.replace(/\s+/g, ' ').slice(0, 120));
+
+      // Amortization: the payment's own input — down-payment
+      // figure must follow it out and back.
+      const expAmort30 = engineDerive(600000, 4.10, 30, 'monthly');
+      await sweepSet('[data-term-form] [name=amortization_years]', '30');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === expAmort30);
+      check('sweep: lengthening the amortization re-derives the payment (and the current principal follows the slower trajectory)',
+        sweepNum(sweepM.payment) === expAmort30 && expAmort30 !== exp600
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, want: expAmort30 }));
+      const remainingAmort30 = sweepState.p.remainingBalance;
+      await sweepSet('[data-term-form] [name=amortization_years]', '25');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === exp600);
+      check('sweep: restoring the amortization restores the payment and the trajectory',
+        sweepNum(sweepM.payment) === exp600 && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ payment: sweepM.payment, remaining: sweepState.p.remainingBalance }));
+
+      // Repayment method: equal principal re-anchors the plan —
+      // the first (highest) payment and a faster paydown.
+      await sweepSet('[data-term-form] [name=repayment_method]', 'equal_principal');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => Math.abs(sweepNum(m.payment) - sweepState.p.paymentUsed) < 0.005);
+      check('sweep: equal principal re-derives the payment (the term’s first month) and pays down faster',
+        Math.abs(sweepNum(sweepM.payment) - sweepState.p.paymentUsed) < 0.005
+          && sweepNum(sweepM.payment) !== exp600
+          && sweepState.p.remainingBalance < remaining600
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, used: sweepState.p.paymentUsed, remaining: sweepState.p.remainingBalance }));
+      await sweepSet('[data-term-form] [name=repayment_method]', 'equal_payment');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      check('sweep: restoring equal payment restores the payment and the trajectory',
+        sweepState.p.remainingBalance === remaining600 && sweepState.p.paymentUsed === exp600,
+        JSON.stringify({ remaining: sweepState.p.remainingBalance, used: sweepState.p.paymentUsed }));
+
+      // Payment day: under a monthly frequency with monthly
+      // accrual it governs no figure (it anchors the day-stepped
+      // frequencies and daily-accrual period boundaries) — the
+      // save must persist it and disturb nothing.
+      await sweepSet('[data-term-form] [name=payment_day]', '15');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: a payment-day edit persists and leaves the monthly plan untouched',
+        sweepState.p.terms[0].payment_day === 15 && sweepNum(sweepM.payment) === exp600
+          && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ day: sweepState.p.terms[0].payment_day, payment: sweepM.payment }));
+
+      // Payment frequency: the cadence itself. The engine derives
+      // the monthly figure and splits it into per-period amounts,
+      // so the monthly-equivalent headline genuinely stands —
+      // what re-derives is the trajectory (weekly payments land
+      // sooner, so the balance runs lower), and returning to
+      // monthly must restore it exactly.
+      await sweepSet('[data-term-form] [name=payment_frequency]', 'weekly');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => Math.abs(sweepNum(m.payment) - sweepState.p.paymentUsed) < 0.005);
+      check('sweep: switching to weekly re-derives the trajectory (the monthly-equivalent figure stands, the balance runs lower)',
+        sweepState.p.terms[0].payment_frequency === 'weekly'
+          && Math.abs(sweepNum(sweepM.payment) - sweepState.p.paymentUsed) < 0.005
+          && sweepState.p.remainingBalance !== remaining600
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, used: sweepState.p.paymentUsed, remaining: sweepState.p.remainingBalance }));
+      await sweepSet('[data-term-form] [name=payment_frequency]', 'monthly');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === exp600);
+      check('sweep: switching back to monthly restores the payment and the trajectory',
+        sweepNum(sweepM.payment) === exp600 && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ payment: sweepM.payment, remaining: sweepState.p.remainingBalance }));
+
+      // Payment override: a term-form fact entered through the
+      // payment row — set it and every surface runs on it, with
+      // the derived figure struck through beside it; clearing it
+      // (Reset puts the derived figure back in the box) restores
+      // the derived plan.
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
+      await wait(300);
+      await focusField('[data-pay-edit-input]');
+      await page.keyboard.type('3500');
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: a payment override runs the plan (used 3,500.00, derived 3,200.24 struck through)',
+        sweepState.p.paymentOverridden === true && sweepState.p.paymentUsed === 3500
+          && sweepM.payment.includes('$3,500.00') && sweepM.payment.includes('$3,200.24'),
+        JSON.stringify({ m: sweepM.payment, used: sweepState.p.paymentUsed }));
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
+      await wait(300);
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-reset]').click());
+      await wait(200);
+      await sweepSaveTerm();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === exp600);
+      check('sweep: clearing the override restores the derived payment everywhere',
+        sweepState.p.paymentOverridden === false && sweepNum(sweepM.payment) === exp600
+          && sweepState.p.remainingBalance === remaining600,
+        JSON.stringify({ m: sweepM.payment, overridden: sweepState.p.paymentOverridden }));
+
+      // Segments, edited through the segment form. The term's one
+      // segment is the sweep's pricing engine: spread, then
+      // compounding, then the pricing lock, then accrual.
+      const sweepSegId = sweepState.p.segments[0].id;
+      const sweepEditSeg = async () => {
+        await page.evaluate((id) => document.querySelector(`button[data-edit-seg="${id}"]`).click(), sweepSegId);
+        await wait(500);
+      };
+      const sweepSaveSeg = async () => {
+        await page.evaluate(() => document.querySelector('[data-seg-form] [data-seg-submit]').click());
+        await wait(1700);
+      };
+      const expSpread = engineDerive(600000, 4.20, 25, 'monthly');
+      await sweepEditSeg();
+      await sweepSet('[data-seg-form] [name=spread]', '-0.75');
+      await sweepSaveSeg();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === expSpread);
+      check('sweep: a spread edit re-prices the derivation (Prime − 0.75 locked at 4.95 → 4.20%)',
+        sweepNum(sweepM.payment) === expSpread && expSpread !== exp600
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, want: expSpread }));
+      const expSemi = engineDerive(600000, 4.20, 25, 'semi_annual');
+      await sweepEditSeg();
+      await sweepSet('[data-seg-form] [name=compounding]', 'semi_annual');
+      await sweepSaveSeg();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === expSemi);
+      check('sweep: a compounding edit re-derives the payment in the new convention',
+        sweepNum(sweepM.payment) === expSemi && expSemi !== expSpread
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, want: expSemi }));
+      const expLock2 = engineDerive(600000, 3.70, 25, 'monthly');
+      await sweepEditSeg();
+      await sweepSet('[data-seg-form] [name=compounding]', 'monthly');
+      await sweepSet('[data-seg-form] [name=locked_on]', '2025-12-01');
+      await sweepSaveSeg();
+      sweepState = await sweepApi();
+      sweepM = await sweepUntilMeta((m) => sweepNum(m.payment) === expLock2);
+      check('sweep: moving the pricing lock re-derives at the locked date’s prime (2025-12-01 → 4.45 − 0.75 = 3.70%)',
+        sweepNum(sweepM.payment) === expLock2
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, want: expLock2 }));
+      const remainingSegBase = sweepState.p.remainingBalance;
+      await sweepEditSeg();
+      await sweepSet('[data-seg-form] [name=accrual]', 'daily');
+      await sweepSaveSeg();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: an accrual edit leaves the derived payment alone and moves the trajectory (daily interest)',
+        sweepNum(sweepM.payment) === expLock2 && sweepState.p.remainingBalance !== remainingSegBase
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005,
+        JSON.stringify({ payment: sweepM.payment, remaining: sweepState.p.remainingBalance, was: remainingSegBase }));
+      const remainingDaily = sweepState.p.remainingBalance;
+      // A second segment landing mid-term recasts the plan from
+      // its start: the current principal moves and the schedule
+      // reprices from that month, while the anchor-time payment
+      // (before the segment starts) is genuinely not its to move.
+      await page.evaluate(() => document.querySelector('[data-toggle-seg]').click());
+      await wait(500);
+      // The add form reopens with the last edit's values still in
+      // it (drafts ride across the reload by design), so EVERY
+      // field of the new segment is set explicitly — otherwise
+      // the "new" fixed segment would silently inherit the
+      // variable prime-spread values from the edit before it.
+      await sweepSet('[data-seg-form] [name=start_date]', '2026-01-01');
+      await sweepSet('[data-seg-form] [name=rate_type]', 'fixed');
+      await sweepSet('[data-seg-form] [name=annual_rate]', '5');
+      await sweepSet('[data-seg-form] [name=compounding]', 'monthly');
+      await sweepSet('[data-seg-form] [name=accrual]', 'monthly');
+      await sweepSaveSeg();
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      const rowJun25 = sweepState.a.series.find((x) => x.month === '2025-06');
+      const rowJun26 = sweepState.a.series.find((x) => x.month === '2026-06');
+      check('sweep: a mid-term segment recasts the schedule from its start and moves the current principal',
+        sweepState.p.remainingBalance !== remainingDaily
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005
+          && sweepNum(sweepM.payment) === expLock2
+          && rowJun25 && rowJun26 && rowJun26.payment !== rowJun25.payment,
+        JSON.stringify({ remaining: sweepState.p.remainingBalance, p25: rowJun25 && rowJun25.payment, p26: rowJun26 && rowJun26.payment }));
+      const sweepSeg2 = sweepState.p.segments.find((s) => s.id !== sweepSegId);
+      await page.evaluate((id) => document.querySelector(`button[data-del-seg="${id}"]`).click(), sweepSeg2.id);
+      await wait(1700);
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: deleting the segment restores the single-segment trajectory exactly',
+        sweepState.p.remainingBalance === remainingDaily && sweepNum(sweepM.payment) === expLock2,
+        JSON.stringify({ remaining: sweepState.p.remainingBalance, was: remainingDaily }));
+
+      // Lump sums: the payment must NOT move (the user's settled
+      // rule) — the balance and the payoff do.
+      const lumpBefore = await sweepApi();
+      await page.evaluate(() => document.querySelector('[data-toggle-lump]').click());
+      await wait(400);
+      await sweepSet('[data-lump-form] [name=date]', '2026-01-20');
+      await focusField('[data-lump-form] [name=amount]');
+      await page.keyboard.type('10000');
+      await page.evaluate(() => document.querySelector('[data-lump-form] [type=submit]').click());
+      await wait(1700);
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: a lump sum leaves the payment unchanged and pulls the balance and payoff in',
+        sweepNum(sweepM.payment) === expLock2
+          && sweepState.p.remainingBalance < lumpBefore.p.remainingBalance - 9000
+          && Math.abs(sweepNum(sweepM.principal) - sweepState.p.remainingBalance) < 0.005
+          && sweepState.a.payoffMonth <= lumpBefore.a.payoffMonth,
+        JSON.stringify({ payment: sweepM.payment, remaining: sweepState.p.remainingBalance, was: lumpBefore.p.remainingBalance, payoff: sweepState.a.payoffMonth, wasPayoff: lumpBefore.a.payoffMonth }));
+      const sweepLumpId = sweepState.p.lumpSums[0].id;
+      await page.evaluate((id) => document.querySelector(`[data-del-lump="${id}"]`).click(), sweepLumpId);
+      await wait(1700);
+      sweepState = await sweepApi();
+      sweepM = await sweepMeta();
+      check('sweep: deleting the lump sum restores the balance exactly, payment still unchanged',
+        sweepState.p.remainingBalance === lumpBefore.p.remainingBalance && sweepNum(sweepM.payment) === expLock2,
+        JSON.stringify({ remaining: sweepState.p.remainingBalance, was: lumpBefore.p.remainingBalance }));
+      page.off('dialog', sweepDialog);
+
+      // The overview follows the same saves (the list reloads
+      // dirty after any of them): the sweep property's card shows
+      // the final remaining balance and payment.
+      await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(2500);
+      const sweepCard = await page.evaluate((addr) => {
+        const card = [...document.querySelectorAll('#propertyCards .card')]
+          .find((c) => c.textContent.includes(addr));
+        return card ? card.textContent.replace(/\s+/g, ' ') : null;
+      }, 'Save Sweep Close');
+      check('sweep: the overview card shows the final derived figures for the swept property',
+        !!sweepCard && sweepCard.includes(sweepFmt(sweepState.p.remainingBalance))
+          && sweepCard.includes(sweepFmt(sweepState.p.paymentUsed)),
+        JSON.stringify({ card: sweepCard && sweepCard.slice(0, 200), remaining: sweepFmt(sweepState.p.remainingBalance), payment: sweepFmt(sweepState.p.paymentUsed) }));
+
       // Assessed-history window: the range is a start/end month
       // pair (the default 5-year preset fills Nov 2021-Oct 2026).
       // A property with 8 years on record (2019-2026) draws the 5
