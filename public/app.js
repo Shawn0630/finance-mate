@@ -1369,41 +1369,133 @@ window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, p
 // ------------------------------------------------------------ photos ---
 // The detail page's gallery: a carousel over the property's photos
 // (uploads, plus a legacy external URL entry when one is still on the
-// record). Clicking the photo area — or "Add photos" — opens the file
-// picker; uploads append to the gallery. Any photo can be removed;
-// the first photo is the Properties card cover.
+// record). The VIEW shows the carousel alone — main photo, prev/next
+// arrows and the n / N count. Photo MANAGEMENT (the thumbnail strip,
+// Add photos, Remove this photo) lives in the Property Details Edit
+// form (see renderPhotoManage); uploads and removals there still take
+// effect at once through the photos endpoints. The first photo is
+// the Properties card cover.
 let photoIndex = 0;
+
+// One photo carousel implementation, shared by the detail page
+// (mounted below) and the Properties cards: main photo, prev/next
+// arrows and an n / N count, plus autoplay — advance every ~4s
+// with wrap-around; a manual step resets the timer; hovering, a
+// hidden tab or an off-screen mount pauses it (Intersection-
+// Observer); prefers-reduced-motion disables it; a single photo
+// (or none) never plays. The delay reads window.__fmPhotoDelay
+// when a test sets it.
+const PHOTO_AUTOPLAY_MS = 4000;
+class PhotoCarousel {
+  constructor(root, opts = {}) {
+    this.root = root;
+    this.opts = opts;
+    this.photos = [];
+    this.index = 0;
+    this.timer = null;
+    this.hover = false;
+    this.inView = true;
+    root.addEventListener('click', (e) => {
+      const nav = e.target.closest('[data-photo-nav]');
+      if (nav) { this.step(Number(nav.dataset.photoNav)); return; }
+      if (e.target.closest('[data-photo-add]') && this.opts.onAdd) this.opts.onAdd();
+    });
+    root.addEventListener('mouseenter', () => { this.hover = true; });
+    root.addEventListener('mouseleave', () => { this.hover = false; });
+    if (typeof IntersectionObserver !== 'undefined') {
+      this.io = new IntersectionObserver((es) => { this.inView = es[0].isIntersecting; });
+      this.io.observe(root);
+    }
+  }
+  setPhotos(photos, index = 0) {
+    this.photos = photos || [];
+    this.index = Math.min(Math.max(0, index), Math.max(0, this.photos.length - 1));
+    this.render();
+    this.syncTimer();
+  }
+  step(delta) {
+    if (this.photos.length < 2) return;
+    this.setIndex((this.index + delta + this.photos.length) % this.photos.length);
+  }
+  setIndex(i) {
+    if (i < 0 || i >= this.photos.length || i === this.index) { this.syncTimer(); return; }
+    this.index = i;
+    this.render();
+    this.syncTimer();
+    if (this.opts.onIndex) this.opts.onIndex(i);
+  }
+  render() {
+    const photos = this.photos;
+    if (!photos.length) {
+      this.root.innerHTML = this.opts.emptyHtml || '';
+      return;
+    }
+    const cur = photos[this.index];
+    this.root.innerHTML = `<div class="photo-carousel">
+      <img class="${this.opts.imgClass || 'detail-photo'}" src="${esc(cur.src)}" alt="">
+      ${photos.length > 1 ? `
+        <button type="button" class="carousel-nav prev" data-photo-nav="-1" aria-label="Previous photo">&#8249;</button>
+        <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>` : ''}
+      <div class="carousel-bar">
+        <span class="carousel-count">${this.index + 1} / ${photos.length}</span>
+      </div>
+    </div>`;
+  }
+  syncTimer() {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.photos.length < 2) return;
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const delay = Number(window.__fmPhotoDelay) > 0 ? Number(window.__fmPhotoDelay) : PHOTO_AUTOPLAY_MS;
+    this.timer = setInterval(() => {
+      if (document.hidden || this.hover || !this.inView) return;
+      this.step(1);
+    }, delay);
+  }
+  destroy() {
+    if (this.timer) clearInterval(this.timer);
+    if (this.io) this.io.disconnect();
+  }
+}
+
+const detailCarousel = new PhotoCarousel($('#photoArea'), {
+  emptyHtml: '<div class="detail-photo-empty photo-clickable" data-photo-add>No photos yet — click to add photos</div>',
+  onAdd: () => $('#photoFiles').click(),
+  onIndex: (i) => { photoIndex = i; renderPhotoManage(detailProperty); },
+});
 
 function renderPhotos(p) {
   const photos = (p && p.photos) || [];
   if (photoIndex >= photos.length) photoIndex = Math.max(0, photos.length - 1);
   if (photoIndex < 0) photoIndex = 0;
-  const area = $('#photoArea');
-  if (!photos.length) {
-    area.innerHTML = '<div class="detail-photo-empty photo-clickable" data-photo-add>No photos yet — click to add photos</div>';
-    return;
-  }
-  const cur = photos[photoIndex];
-  area.innerHTML = `<div class="photo-carousel">
-      <img class="detail-photo photo-clickable" data-photo-add src="${esc(cur.src)}" alt="">
-      ${photos.length > 1 ? `
-        <button type="button" class="carousel-nav prev" data-photo-nav="-1" aria-label="Previous photo">&#8249;</button>
-        <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>
-        <div class="photo-thumbs">${photos.map((ph, i) => `<button type="button" class="thumb${i === photoIndex ? ' active' : ''}" data-photo-dot="${i}" aria-label="Photo ${i + 1}"><img src="${esc(ph.src)}" alt=""></button>`).join('')}</div>` : ''}
-      <div class="carousel-bar">
-        <span class="carousel-count">${photoIndex + 1} / ${photos.length}</span>
-        <span style="flex:1"></span>
-        <button type="button" class="small" data-photo-add-btn>Add photos</button>
-        <button type="button" class="small danger" data-photo-remove>Remove this photo</button>
-      </div>
-    </div>`;
+  detailCarousel.setPhotos(photos, photoIndex);
+  renderPhotoManage(p);
 }
 
 function stepPhoto(delta) {
-  const photos = (detailProperty && detailProperty.photos) || [];
-  if (photos.length < 2) return;
-  photoIndex = (photoIndex + delta + photos.length) % photos.length;
-  renderPhotos(detailProperty);
+  detailCarousel.step(delta);
+}
+
+// The Edit form's photo management: the thumbnail strip (a click
+// selects that photo in the carousel, as before), Add photos and
+// Remove this photo — the actions the view used to carry, now
+// behind Edit. Nothing waits for the form's Save: uploads and
+// removals apply immediately, exactly as they did from the view.
+function renderPhotoManage(p) {
+  const host = $('#photoManage');
+  if (!host) return;
+  const photos = (p && p.photos) || [];
+  if (!photos.length) {
+    host.innerHTML = '<div class="toolbar"><button type="button" class="small" data-photo-add-btn>Add photos</button></div>';
+    return;
+  }
+  const idx = Math.min(Math.max(0, photoIndex), photos.length - 1);
+  host.innerHTML = `
+    <div class="photo-thumbs">${photos.map((ph, i) => `<button type="button" class="thumb${i === idx ? ' active' : ''}" data-photo-dot="${i}" aria-label="Photo ${i + 1}"><img src="${esc(ph.src)}" alt=""></button>`).join('')}</div>
+    <div class="toolbar">
+      <span class="carousel-count">${idx + 1} / ${photos.length}</span>
+      <button type="button" class="small" data-photo-add-btn>Add photos</button>
+      <button type="button" class="small danger" data-photo-remove>Remove this photo</button>
+    </div>`;
 }
 
 async function removeCurrentPhoto() {
@@ -1420,15 +1512,11 @@ async function removeCurrentPhoto() {
   } catch (err) { showMsg($('#detailMsg'), 'err', err.message); }
 }
 
-$('#photoArea').addEventListener('click', (e) => {
-  const nav = e.target.closest('[data-photo-nav]');
-  if (nav) { stepPhoto(Number(nav.dataset.photoNav)); return; }
+$('#photoManage').addEventListener('click', (e) => {
   const dot = e.target.closest('[data-photo-dot]');
-  if (dot) { photoIndex = Number(dot.dataset.photoDot); renderPhotos(detailProperty); return; }
+  if (dot) { detailCarousel.setIndex(Number(dot.dataset.photoDot)); return; }
   if (e.target.closest('[data-photo-remove]')) { removeCurrentPhoto(); return; }
-  if (e.target.closest('[data-photo-add-btn]') || e.target.closest('[data-photo-add]')) {
-    $('#photoFiles').click();
-  }
+  if (e.target.closest('[data-photo-add-btn]')) { $('#photoFiles').click(); }
 });
 
 function fileToBase64(file) {

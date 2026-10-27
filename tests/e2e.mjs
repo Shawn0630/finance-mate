@@ -3746,24 +3746,64 @@ try {
         afterCancel.includes('2019-03-04') && !afterCancel.includes('2000-01-01'), afterCancel.slice(0, 160));
       r = await req('GET', `/api/properties/${moneyPid}`);
       check('Cancel wrote nothing to the server', r.data.purchase_date === '2019-03-04', JSON.stringify(r.data.purchase_date));
-      // Carousel: two uploads (via the API), switch, remove one, and
-      // the Properties card cover follows the first remaining photo.
+      // Carousel: two uploads (via the API). The VIEW shows the
+      // carousel alone (main photo + arrows + count — no thumbnail
+      // strip, no Add/Remove buttons); photo management lives in
+      // the Edit form. Autoplay is frozen for the deterministic
+      // steps via a long test delay, then exercised on its own
+      // below with a short one.
       const TINY = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
       await req('POST', `/api/properties/${moneyPid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
       r = await req('POST', `/api/properties/${moneyPid}/photos`, { dataBase64: TINY, contentType: 'image/png' });
       check('two photos uploaded for the carousel checks', r.data.photos.length === 2, JSON.stringify(r.data.photos));
       const [ph1, ph2] = r.data.photos;
+      await page.evaluateOnNewDocument(() => { window.__fmPhotoDelay = 60000; });
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
-      check('gallery renders one thumbnail per photo',
-        await until(() => document.querySelectorAll('#photoArea .photo-thumbs .thumb').length === 2));
+      await wait(1200);
+      const viewBits = await page.evaluate(() => ({
+        thumbs: document.querySelectorAll('#photoArea .photo-thumbs').length,
+        dots: document.querySelectorAll('#photoArea [data-photo-dot]').length,
+        addBtn: !!document.querySelector('#photoArea [data-photo-add-btn]'),
+        removeBtn: !!document.querySelector('#photoArea [data-photo-remove]'),
+        hasNav: !!document.querySelector('#photoArea [data-photo-nav="1"]'),
+        count: (document.querySelector('#photoArea .carousel-count') || {}).textContent || '',
+      }));
+      check('view state: the carousel stands alone — arrows and count, no thumbnail strip, no Add/Remove buttons',
+        viewBits.thumbs === 0 && viewBits.dots === 0 && !viewBits.addBtn && !viewBits.removeBtn
+          && viewBits.hasNav && viewBits.count.trim() === '1 / 2',
+        JSON.stringify(viewBits));
       const carSrc1 = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
       check('gallery starts on the first photo', carSrc1 === ph1.src, String(carSrc1));
       await page.evaluate(() => document.querySelector('#photoArea [data-photo-nav="1"]').click());
       await wait(300);
       const carSrc2 = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
       check('next arrow switches to the second photo', carSrc2 === ph2.src && carSrc2 !== carSrc1, String(carSrc2));
-      await page.evaluate(() => document.querySelector('#photoArea [data-photo-remove]').click());
-      check('removing the shown photo leaves a one-photo gallery',
+      // Open Edit: the management area is there — the thumbnail
+      // strip, Add photos and Remove this photo.
+      await page.evaluate(() => document.querySelector('#editPropBtn').click());
+      await wait(400);
+      const mgmtBits = await page.evaluate(() => ({
+        thumbs: document.querySelectorAll('#photoManage .photo-thumbs .thumb').length,
+        addBtn: !!document.querySelector('#photoManage [data-photo-add-btn]'),
+        removeBtn: !!document.querySelector('#photoManage [data-photo-remove]'),
+        formVisible: !document.querySelector('#propForm').classList.contains('hidden'),
+      }));
+      check('Edit state: the photo management area shows the thumbnail strip plus Add/Remove',
+        mgmtBits.formVisible && mgmtBits.thumbs === 2 && mgmtBits.addBtn && mgmtBits.removeBtn,
+        JSON.stringify(mgmtBits));
+      // A thumbnail click selects that photo in the carousel (the
+      // carousel currently shows the second photo already; pick
+      // the first thumbnail to see it switch back).
+      await page.evaluate(() => document.querySelectorAll('#photoManage .photo-thumbs .thumb')[0].click());
+      await wait(300);
+      const carSrcBack = await page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
+      check('clicking the first thumbnail shows the first photo again', carSrcBack === ph1.src, String(carSrcBack));
+      await page.evaluate(() => document.querySelectorAll('#photoManage .photo-thumbs .thumb')[1].click());
+      await wait(300);
+      // Remove the currently shown photo (the second) from Edit:
+      // it applies at once, without the form's Save.
+      await page.evaluate(() => document.querySelector('#photoManage [data-photo-remove]').click());
+      check('removing from Edit leaves a one-photo gallery',
         await until(() => {
           const c = document.querySelector('#photoArea .carousel-count');
           return c && c.textContent.trim() === '1 / 1' && !document.querySelector('#photoArea .photo-thumbs');
@@ -3771,6 +3811,71 @@ try {
       r = await req('GET', `/api/properties/${moneyPid}`);
       check('the removal persisted (one photo left, the first one)',
         r.data.photos.length === 1 && r.data.photos[0].id === ph1.id, JSON.stringify(r.data.photos));
+      // Upload one more from the Edit form's Add photos (through
+      // the file input; it too applies at once).
+      const tmpPng = path.join(os.tmpdir(), `ff-e2e-photo-${Date.now()}.png`);
+      fs.writeFileSync(tmpPng, Buffer.from(TINY, 'base64'));
+      const fileInput = await page.$('#photoFiles');
+      await fileInput.uploadFile(tmpPng);
+      check('uploading from Edit adds the photo at once',
+        await until(() => document.querySelectorAll('#photoManage .photo-thumbs .thumb').length === 2));
+      r = await req('GET', `/api/properties/${moneyPid}`);
+      check('the Edit upload persisted (two photos again)', r.data.photos.length === 2, JSON.stringify(r.data.photos.length));
+      await page.evaluate(() => document.querySelector('#cancelPropEditBtn').click());
+      await wait(300);
+      // Autoplay: a short test delay and a fresh load — the
+      // carousel advances on its own, wraps at the end, yields
+      // to a manual click (its timer resets), and pauses on
+      // hover and on a hidden tab.
+      await page.evaluateOnNewDocument(() => { window.__fmPhotoDelay = 400; });
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(500);
+      const autoSrc = () => page.evaluate(() => document.querySelector('#photoArea img.detail-photo').getAttribute('src'));
+      const pollSrc = async (want, tries = 18) => {
+        for (let i = 0; i < tries; i++) {
+          if (want(await autoSrc())) return true;
+          await wait(200);
+        }
+        return false;
+      };
+      const auto0 = await autoSrc();
+      check('autoplay advances to the next photo on its own', await pollSrc((s) => s !== auto0));
+      check('autoplay wraps back to the first photo', await pollSrc((s) => s === auto0));
+      const beforeManual = await autoSrc();
+      await page.evaluate(() => document.querySelector('#photoArea [data-photo-nav="1"]').click());
+      await wait(120);
+      const manualSrc = await autoSrc();
+      check('a manual arrow click switches the photo', manualSrc !== beforeManual);
+      await wait(250); // still inside the reset delay window (400ms)
+      check('the manual choice is not immediately overridden by autoplay', (await autoSrc()) === manualSrc);
+      const box = await page.evaluate(() => {
+        const r = document.querySelector('#photoArea .photo-carousel').getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + 40 };
+      });
+      await page.mouse.move(box.x, box.y);
+      const hoverSrc = await autoSrc();
+      await wait(1000);
+      check('hovering the carousel pauses autoplay', (await autoSrc()) === hoverSrc);
+      await page.mouse.move(5, 5);
+      check('moving the mouse away resumes autoplay', await pollSrc((s) => s !== hoverSrc));
+      try {
+        if (typeof page.emulateVisibilityState === 'function') {
+          await page.emulateVisibilityState('hidden');
+          const hidSrc = await autoSrc();
+          await wait(1000);
+          check('a hidden tab pauses autoplay', (await autoSrc()) === hidSrc);
+          await page.emulateVisibilityState('visible');
+        }
+      } catch { /* visibility emulation unavailable in this browser build */ }
+      try {
+        await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+        await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+        await wait(500);
+        const rmSrc = await autoSrc();
+        await wait(1100);
+        check('prefers-reduced-motion disables autoplay', (await autoSrc()) === rmSrc);
+        await page.emulateMediaFeatures([]);
+      } catch { /* media emulation unavailable in this browser build */ }
       await page.evaluate(() => { location.hash = '#assets/properties'; });
       await wait(2000);
       const cover = await page.evaluate(() => {
