@@ -3934,6 +3934,32 @@ try {
       check('the Edit upload persisted (two photos again)', r.data.photos.length === 2, JSON.stringify(r.data.photos.length));
       await page.evaluate(() => document.querySelector('#cancelPropEditBtn').click());
       await wait(300);
+      // No-flash switch (regression for the old innerHTML
+      // rebuild, which destroyed the old <img> and inserted a
+      // fresh one that painted blank and collapsed the box until
+      // it loaded): every slide is resident and preloaded before
+      // any switch, the stage box never changes height across a
+      // switch, and the node that becomes visible is the SAME
+      // node that was preloaded — no destroy/rebuild.
+      const flashBits = await page.evaluate(async () => {
+        const stage = document.querySelector('#photoArea .photo-stage');
+        const slides = [...document.querySelectorAll('#photoArea img.slide')];
+        const h0 = stage.getBoundingClientRect().height;
+        const target = slides[1];
+        document.querySelector('#photoArea [data-photo-nav="1"]').click();
+        await new Promise((r) => setTimeout(r, 350));
+        const active = document.querySelector('#photoArea img.slide.active');
+        return {
+          nSlides: slides.length,
+          allPreloaded: slides.every((i) => i.complete && i.naturalWidth > 0),
+          h0, h1: stage.getBoundingClientRect().height,
+          sameNode: active === target,
+          activeComplete: !!active && active.complete && active.naturalWidth > 0,
+        };
+      });
+      check('carousel switch never flashes: slides resident + preloaded, stage height constant, the visible slide is the preloaded node itself',
+        flashBits.nSlides === 2 && flashBits.allPreloaded && flashBits.h0 === flashBits.h1 && flashBits.sameNode && flashBits.activeComplete,
+        JSON.stringify(flashBits));
       // Autoplay: a short test delay and a fresh load — the
       // carousel advances on its own, wraps at the end, yields
       // to a manual click (its timer resets), and pauses on

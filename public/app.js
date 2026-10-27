@@ -1405,6 +1405,9 @@ class PhotoCarousel {
     this.opts = opts;
     this.photos = [];
     this.index = 0;
+    this.desired = 0;
+    this.slideEls = [];
+    this.gen = 0;
     this.timer = null;
     this.hover = false;
     this.inView = true;
@@ -1423,36 +1426,76 @@ class PhotoCarousel {
   setPhotos(photos, index = 0) {
     this.photos = photos || [];
     this.index = Math.min(Math.max(0, index), Math.max(0, this.photos.length - 1));
+    this.desired = this.index;
     this.render();
+    this.requestShow(this.index, false);
     this.syncTimer();
   }
   step(delta) {
     if (this.photos.length < 2) return;
-    this.setIndex((this.index + delta + this.photos.length) % this.photos.length);
+    this.setIndex((this.desired + delta + this.photos.length) % this.photos.length);
   }
   setIndex(i) {
-    if (i < 0 || i >= this.photos.length || i === this.index) { this.syncTimer(); return; }
-    this.index = i;
-    this.render();
+    if (i < 0 || i >= this.photos.length) { this.syncTimer(); return; }
+    this.desired = i;
+    this.requestShow(i, i !== this.index);
     this.syncTimer();
-    if (this.opts.onIndex) this.opts.onIndex(i);
   }
+  // Slides are built ONCE per photo set and stay in the DOM: every
+  // photo starts loading (and decoding) immediately, a switch is a
+  // class flip between resident slides, and it only happens once
+  // the target slide is loaded + decoded — the outgoing slide stays
+  // visible until then, so a switch can never paint an empty frame
+  // (the pre-fix render() destroyed the old <img> and inserted a
+  // fresh one, which flashed blank and, with no reserved height,
+  // collapsed the box until the new photo arrived).
   render() {
+    this.gen++;
     const photos = this.photos;
+    this.slideEls = [];
     if (!photos.length) {
       this.root.innerHTML = this.opts.emptyHtml || '';
       return;
     }
-    const cur = photos[this.index];
+    const imgClass = this.opts.imgClass || 'detail-photo';
     this.root.innerHTML = `<div class="photo-carousel">
-      <img class="${this.opts.imgClass || 'detail-photo'}" src="${esc(cur.src)}" alt="">
-      ${photos.length > 1 ? `
-        <button type="button" class="carousel-nav prev" data-photo-nav="-1" aria-label="Previous photo">&#8249;</button>
-        <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>` : ''}
+      <div class="photo-stage">
+        ${photos.map((p) => `<img class="slide ${imgClass}" src="${esc(p.src)}" alt="">`).join('')}
+        ${photos.length > 1 ? `
+          <button type="button" class="carousel-nav prev" data-photo-nav="-1" aria-label="Previous photo">&#8249;</button>
+          <button type="button" class="carousel-nav next" data-photo-nav="1" aria-label="Next photo">&#8250;</button>` : ''}
+      </div>
       <div class="carousel-bar">
-        <span class="carousel-count">${this.index + 1} / ${photos.length}</span>
+        <span class="carousel-count"></span>
       </div>
     </div>`;
+    this.slideEls = [...this.root.querySelectorAll('img.slide')];
+    for (const img of this.slideEls) if (img.decode) img.decode().catch(() => {});
+  }
+  slideReady(i) {
+    const img = this.slideEls[i];
+    return !!img && img.complete && img.naturalWidth > 0;
+  }
+  requestShow(i, notify) {
+    const gen = this.gen;
+    if (this.slideReady(i)) { this.flip(i, notify); return; }
+    const img = this.slideEls[i];
+    if (!img) return;
+    const done = () => { if (this.gen === gen && this.desired === i) this.flip(i, notify); };
+    if (img.decode) img.decode().then(done).catch(done);
+    else img.addEventListener('load', done, { once: true });
+  }
+  flip(i, notify) {
+    this.index = i;
+    const stage = this.root.querySelector('.photo-stage');
+    this.slideEls.forEach((img, k) => img.classList.toggle('active', k === i));
+    // Keep the active slide first in the stage so a plain
+    // querySelector('img.<class>') reads the visible photo.
+    const active = this.slideEls[i];
+    if (stage && active && stage.firstElementChild !== active) stage.insertBefore(active, stage.firstElementChild);
+    const count = this.root.querySelector('.carousel-count');
+    if (count) count.textContent = `${i + 1} / ${this.photos.length}`;
+    if (notify && this.opts.onIndex) this.opts.onIndex(i);
   }
   syncTimer() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
