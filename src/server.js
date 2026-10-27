@@ -874,10 +874,18 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       projState,
       projectedInterest,
       latestAssessed,
+      // Equity, the app's one definition: the latest assessed
+      // value minus the current remaining balance (the same
+      // outstanding figure above — a property with no mortgage
+      // counts a balance of 0). Null without an assessed value:
+      // such properties are excluded from the total, never
+      // counted as zero-equity.
+      equity: latestAssessed != null ? r2(latestAssessed - outstandingNow) : null,
     });
   }
 
   const totalOutstanding = r2(perProperty.reduce((s, x) => s + x.outstanding, 0));
+  const equityCount = perProperty.filter((x) => x.equity !== null).length;
   const totalAssessed = r2(perProperty.reduce((s, x) => s + (x.latestAssessed || 0), 0));
   const slices = (pick, total) => perProperty
     .filter((x) => pick(x) > 0 && total > 0)
@@ -934,6 +942,9 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
       propertyCount: perProperty.length,
       paymentKnownCount: perProperty.filter((x) => x.paymentKnown).length,
       assessedTotal: totalAssessed,
+      equity: equityCount ? r2(perProperty.reduce((s, x) => s + (x.equity || 0), 0)) : null,
+      equityCount,
+      equityExcluded: perProperty.length - equityCount,
     },
     properties: perProperty,
     pie: {

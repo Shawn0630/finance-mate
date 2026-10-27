@@ -1518,6 +1518,38 @@ try {
     JSON.stringify({ i: acMonthly.series[0] && acMonthly.series[0].interest, d: acMonthly.paymentDerived, dd: acDaily.paymentDerived }));
   await req('DELETE', `/api/properties/${acPid}`);
 
+  // ---- Equity (API) ----
+  // One definition app-wide: equity = latest assessed value -
+  // current remaining balance; a property with no mortgage
+  // counts a balance of 0. The anchor fixture mirrors the
+  // user's real figures: assessed 1,931,000 with a remaining
+  // balance of 1,280,775 (an unprojected anchor — no rate plan —
+  // so the remaining balance IS the anchor) -> equity 650,225.
+  r = await req('POST', '/api/properties', {
+    address: '2985 Equity Anchor Way, Coquitlam, BC',
+    mortgage_balance: 1280775, mortgage_balance_date: '2026-10-01', purchase_date: '2024-12-17',
+    assessed_value: 1931000, assessed_year: 2026,
+  });
+  const eqPid = r.data.id;
+  r = await req('GET', `/api/properties/${eqPid}/equity`);
+  check('equity endpoint: 1,931,000 - 1,280,775 = 650,225',
+    r.data.equity === 650225 && r.data.balance === 1280775 && r.data.assessedValue === 1931000,
+    JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', { address: '1 No Assessed Lane, Victoria, BC', purchase_date: '2024-01-01' });
+  const eqBarePid = r.data.id;
+  const pfEq = (await req('GET', '/api/properties/portfolio')).data;
+  const pfEqRow = pfEq.properties.find((x) => x.id === eqPid);
+  const pfBareRow = pfEq.properties.find((x) => x.id === eqBarePid);
+  check('portfolio per-property equity carries the same figure; a property without an assessed value has null equity',
+    !!pfEqRow && pfEqRow.equity === 650225 && !!pfBareRow && pfBareRow.equity === null,
+    JSON.stringify({ eq: pfEqRow && pfEqRow.equity, bare: pfBareRow && pfBareRow.equity }));
+  check('portfolio totals: equity is the sum over assessed properties only, exclusions counted',
+    Math.abs(pfEq.totals.equity - pfEq.properties.reduce((s, x) => s + (x.equity || 0), 0)) < 0.005
+      && pfEq.totals.equityExcluded === pfEq.properties.filter((x) => x.equity === null).length
+      && pfEq.totals.equityCount + pfEq.totals.equityExcluded === pfEq.totals.propertyCount
+      && pfEq.totals.equity >= 650225,
+    JSON.stringify(pfEq.totals));
+
   // ---- AI Fill (API) ----
   // The stubbed model answers with the RBC commitment-letter
   // fields in raw document shapes; the endpoint must normalize
@@ -2108,6 +2140,51 @@ try {
       }
       check('the detail payment stat shows the derived figure after the fill-in', nbStatOk);
       await req('DELETE', `/api/properties/${pidNoBal}`);
+
+      // Equity displays: the detail page's third headline stat
+      // and the overview's Total equity card. The anchor property
+      // (created in the API section above): assessed 1,931,000,
+      // remaining 1,280,775 -> Current equity $650,225.
+      await page.goto(`http://ff.local/#property/${eqPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1800);
+      const eqStats = await page.evaluate(() => ({
+        assessed: document.querySelector('#detailAssessedValue').textContent,
+        remaining: document.querySelector('#detailRemainingBalance').textContent,
+        equity: document.querySelector('#detailCurrentEquity').textContent,
+      }));
+      check('detail headline stats: Assessed $1,931,000, Remaining $1,280,775, Current equity $650,225',
+        eqStats.assessed === '$1,931,000' && eqStats.remaining === '$1,280,775' && eqStats.equity === '$650,225',
+        JSON.stringify(eqStats));
+      await page.goto(`http://ff.local/#property/${eqBarePid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1800);
+      const eqBare = await page.evaluate(() => ({
+        assessed: document.querySelector('#detailAssessedValue').textContent,
+        equity: document.querySelector('#detailCurrentEquity').textContent,
+      }));
+      check('a property without an assessed value shows — for Current equity',
+        eqBare.assessed === '—' && eqBare.equity === '—', JSON.stringify(eqBare));
+      // The overview card: left of Total outstanding principal,
+      // showing the portfolio total equity from the API.
+      const pfNow = (await req('GET', '/api/properties/portfolio')).data;
+      await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(2500);
+      const eqCard = await page.evaluate(() => {
+        const eq = document.querySelector('#pfEquity');
+        const out = document.querySelector('#pfOutstanding');
+        const er = eq ? eq.getBoundingClientRect() : null;
+        const orr = out ? out.getBoundingClientRect() : null;
+        return {
+          text: eq ? eq.textContent : null,
+          leftOf: !!(er && orr && er.left < orr.left),
+          notes: document.querySelector('#pfNotes').textContent,
+        };
+      });
+      const fmtTotal = Number(pfNow.totals.equity).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+      check('overview: the Total equity card sits left of Total outstanding principal and shows the portfolio total',
+        eqCard.leftOf && eqCard.text === fmtTotal,
+        JSON.stringify({ card: eqCard.text, want: fmtTotal, leftOf: eqCard.leftOf }));
+      check('overview footnote notes the properties Total equity excludes (no assessed value)',
+        eqCard.notes.includes('Total equity excludes'), eqCard.notes.slice(0, 200));
 
       // Assessed-history window: the range is a start/end month
       // pair (the default 5-year preset fills Nov 2021-Oct 2026).

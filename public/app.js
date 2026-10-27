@@ -898,6 +898,7 @@ async function loadPortfolio() {
   }
   block.classList.remove('hidden');
   const t = portfolioData.totals;
+  $('#pfEquity').textContent = t.equity != null ? money(t.equity) : '—';
   $('#pfOutstanding').textContent = money(t.outstanding);
   $('#pfPayment').textContent = money(t.monthlyPayment);
   $('#pfInterest').textContent = money(t.totalInterest);
@@ -923,6 +924,9 @@ async function loadPortfolio() {
   }
   if (t.paymentKnownCount < t.propertyCount) {
     notes.push(`Monthly payment counts ${t.paymentKnownCount} of ${t.propertyCount} properties — the rest have no payment on file and count as $0.`);
+  }
+  if (t.equityExcluded > 0) {
+    notes.push(`Total equity excludes ${t.equityExcluded} of ${t.propertyCount} ${propNoun} without an assessed value.`);
   }
   if (portfolioData.assessmentRefresh && portfolioData.assessmentRefresh.staleIds.length) {
     notes.push('One or more assessed values could not be refreshed from BC Assessment just now — showing the last known values.');
@@ -1566,17 +1570,23 @@ $('#photoFiles').addEventListener('change', async (e) => {
 // (re)filled from the loaded property on every load and every Edit, so
 // a cancelled edit never lingers in the inputs.
 function renderPropView(p) {
-  // The details lead with two headline figures — the assessed value
-  // (re-based on the latest history point when the trend loads, as
-  // the equity readout reads it) and TODAY's remaining balance
-  // (the projection's balance at the current month, not the anchor
-  // the loan started from) — over
+  // The details lead with three headline figures — the assessed
+  // value (re-based on the latest history point when the trend
+  // loads, as the equity readout reads it), TODAY's remaining
+  // balance (the projection's balance at the current month, not
+  // the anchor the loan started from) and the current equity
+  // (assessed minus remaining; a property with no mortgage on
+  // record owes nothing, so its equity is the full assessed
+  // value) — over
   // exactly three rows: address (with the region flag tag), owners,
   // purchase date. Nothing else lives here by the user's ruling:
   // no notes / assessment-year / lender rows, no prose lines.
   $('#detailAssessedValue').textContent = p.assessed_value != null ? money(p.assessed_value) : '—';
   const remaining = p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance;
   $('#detailRemainingBalance').textContent = remaining != null ? money(remaining) : '—';
+  $('#detailCurrentEquity').textContent = p.assessed_value != null
+    ? money(p.assessed_value - (remaining != null ? remaining : 0))
+    : '—';
   const rows = [
     ['Address', `${esc(p.address || '—')}${regionTagHtml(p.region)}`, true],
     ['Owners', p.owners && p.owners.length ? ownerChipsHtml(p.owners) : '—', true],
@@ -2714,6 +2724,13 @@ async function loadTrend(id) {
     $('#detailAssessedValue').textContent = latest
       ? money(latest.value)
       : (detailProperty.assessed_value != null ? money(detailProperty.assessed_value) : '—');
+    // The equity stat follows the re-based assessed figure.
+    const assessedNow = latest ? latest.value : detailProperty.assessed_value;
+    const remainingNow = detailProperty.remainingBalance != null
+      ? detailProperty.remainingBalance : detailProperty.mortgage_balance;
+    $('#detailCurrentEquity').textContent = assessedNow != null
+      ? money(assessedNow - (remainingNow != null ? remainingNow : 0))
+      : '—';
   }
   // The Land / Building columns exist only while at least one
   // year carries a split; split years show both figures, the
