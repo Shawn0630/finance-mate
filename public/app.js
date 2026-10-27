@@ -594,10 +594,12 @@ function labelFor(el) {
 
 function renderAiFlags(form) {
   form.querySelectorAll('.ai-flag').forEach((el) => el.remove());
+  const pb = payBlockOfForm(form);
+  if (pb) pb.querySelectorAll('.ai-flag').forEach((el) => el.remove());
   const set = aiFlagSets.get(form);
   if (!set) return;
   for (const name of set) {
-    const input = form.querySelector(`[name="${name}"]`);
+    const input = fieldInputOf(form, name);
     let label = input ? labelFor(input) : null;
     if (!label && name === 'owners') {
       const picker = form.querySelector('.owner-picker');
@@ -616,7 +618,7 @@ function renderAiFlags(form) {
 function clearAiFlagOnEdit(e) {
   const t = e.target;
   if (!t || !t.name) return;
-  const form = t.closest('form');
+  const form = t.form || t.closest('form');
   if (!form || form._aiFilling) return;
   const set = aiFlagSets.get(form);
   if (set && set.delete(t.name)) renderAiFlags(form);
@@ -625,7 +627,7 @@ document.addEventListener('input', clearAiFlagOnEdit);
 document.addEventListener('change', clearAiFlagOnEdit);
 
 function fillOneInput(form, name, value) {
-  const input = form.querySelector(`[name="${name}"]`);
+  const input = fieldInputOf(form, name);
   if (!input) return 'missing';
   const set = aiFlagSet(form);
   if (input.value !== '' && input.value != null && !set.has(name)) return 'kept';
@@ -768,6 +770,10 @@ function captureFormDrafts() {
   const grab = (form) => {
     const fields = {};
     form.querySelectorAll('input[name], select[name], textarea[name]').forEach((i) => { fields[i.name] = i.value; });
+    // The payment editor's input lives in the pay block below
+    // the form, not inside it: fold its value in by name.
+    const pb = payBlockOfForm(form);
+    if (pb) pb.querySelectorAll('input[name]').forEach((i) => { fields[i.name] = i.value; });
     return { fields, flags: [...(aiFlagSets.get(form) || [])] };
   };
   const terms = {};
@@ -790,11 +796,11 @@ function restoreFormDrafts(stash) {
     // restored with it — never silently folded away; when the
     // outcome matches, the input is reset to mirror the stored
     // override, so the form rests exactly as rendered.
-    const payInput = form.querySelector('[data-pay-edit-input]');
+    const payInput = payEditEls(form).input;
     const freshPayText = payInput ? payInput.value : undefined;
     form._aiFilling = true;
     for (const [name, value] of Object.entries(draft.fields)) {
-      const input = form.querySelector(`[name="${name}"]`);
+      const input = fieldInputOf(form, name);
       if (!input) continue;
       input.value = value;
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1345,25 +1351,55 @@ function termLengthLabel(months) {
 }
 
 // ------------------------------------------------ payment editor ---
-// The term form's Monthly payment is a read-only figure with an
-// Edit button: Edit swaps the figure for an input in place,
-// prefilled with the used payment, the calculated figure kept
-// beside it as the reference (struck through while an override
-// stands, muted otherwise). There is NO separate override field —
-// the input lives in the payment row, named payment_override, and
-// at rest it simply mirrors the stored override. On Save, a blank
-// input, or one equal to the calculated figure, clears the
-// override; any other positive figure becomes it. Reset (shown
-// only while an override stands) puts the calculated figure back
-// in the box, so saving after Reset clears the override too.
+// The term's Monthly payment is a read-only figure with an Edit
+// button: Edit swaps the figure for an input in place, prefilled
+// with the used payment, the calculated figure kept beside it as
+// the reference (struck through while an override stands, muted
+// otherwise). There is NO separate override field — the input
+// lives in the payment row, named payment_override, and at rest
+// it simply mirrors the stored override. On Save, a blank input,
+// or one equal to the calculated figure, clears the override; any
+// other positive figure becomes it. Reset (shown only while an
+// override stands) puts the calculated figure back in the box, so
+// saving after Reset clears the override too.
+// The payment row CLOSES the term card — below the rate segments
+// and the lump sums, because the figure is the RESULT of those
+// inputs — so it is not a descendant of the term <form>: its
+// input belongs to the form through the HTML form attribute
+// (FormData, the form's named access and the server submit all
+// see it the same). Lookups for the row therefore scope to its
+// pay block inside the term block, never to the form element.
+function payBlockOfForm(form) {
+  if (!form || !form.dataset || form.dataset.termForm == null) return null;
+  const block = form.closest('[data-term-block]');
+  return block ? block.querySelector('[data-pay-block]') : null;
+}
+
+function termFormOfPayBlock(block) {
+  return block ? document.querySelector(`[data-term-form="${block.dataset.payBlock}"]`) : null;
+}
+
 function payEditEls(form) {
+  const scope = payBlockOfForm(form) || form;
   return {
-    input: form.querySelector('[data-pay-edit-input]'),
-    view: form.querySelector('[data-term-payment]'),
-    editBtn: form.querySelector('[data-pay-edit]'),
-    resetBtn: form.querySelector('[data-pay-reset]'),
-    ref: form.querySelector('[data-pay-derived-ref]'),
+    input: scope.querySelector('[data-pay-edit-input]'),
+    view: scope.querySelector('[data-term-payment]'),
+    editBtn: scope.querySelector('[data-pay-edit]'),
+    resetBtn: scope.querySelector('[data-pay-reset]'),
+    ref: scope.querySelector('[data-pay-derived-ref]'),
   };
+}
+
+// A form field's input: the form's own descendant — except the
+// payment editor's input, which lives in the pay block below.
+function fieldInputOf(form, name) {
+  const own = form.querySelector(`[name="${name}"]`);
+  if (own) return own;
+  if (name === 'payment_override') {
+    const pb = payBlockOfForm(form);
+    return pb ? pb.querySelector('[name="payment_override"]') : null;
+  }
+  return null;
 }
 
 function termOfForm(form) {
@@ -1433,7 +1469,7 @@ function renderMortgageMeta() {
       : (p.mortgage_balance != null ? money(p.mortgage_balance) : '—');
   $('#metaCurrentPayment').innerHTML = paymentHtml(chartMeta);
   // Each term card also shows its own monthly payment read-only,
-  // beside its schedule fields: the payment its span opens with,
+  // in the payment row closing the card: the payment its span opens with,
   // from the term's own triple in the property payload (for an
   // equal-principal term, its first — highest — month). A term
   // the projection does not reach, or no projection at all (no
@@ -1522,11 +1558,12 @@ function renderTerms(p) {
     const open = openTermIds.has(t.id);
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
     // Every term card carries the same field set: its contract
-    // fields, its principal pair, its monthly payment figure
-    // (rendered from the term's payment triple, with an Edit
-    // button that turns the figure itself into the override
-    // input — there is no separate override field) and its
-    // payment schedule.
+    // fields, its principal pair, its payment schedule — and,
+    // closing the card below the rate segments and the lump
+    // sums, its monthly payment figure (rendered from the
+    // term's payment triple, with an Edit button that turns the
+    // figure itself into the override input — there is no
+    // separate override field).
     // The principal pair — "Outstanding
     // principal" / "Principal as of" — binds the term's opening
     // balance / start date, EXCEPT on the term carrying the
@@ -1551,7 +1588,7 @@ function renderTerms(p) {
         <span data-term-arrow>${open ? '▾' : '▸'}</span>
       </button>
       <div class="term-body${open ? '' : ' hidden'}">
-        <form data-term-form="${t.id}">
+        <form data-term-form="${t.id}" id="termForm${t.id}">
           <div class="grid3">
             <div><label>Lender (bank)</label><input name="lender" list="lenderOptions" value="${esc(t.lender || '')}" autocomplete="off"></div>
             <div><label>Principal as of</label><input name="${principalDateName}" type="date" value="${esc(anchored ? t.anchor_date : t.start_date)}" required></div>
@@ -1569,13 +1606,6 @@ function renderTerms(p) {
             </select></div>
           </div>
           <div class="grid3">
-            <div><label>Monthly payment ($)</label><div class="term-pay-row">
-              <span class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}" data-term-payment-for="${t.id}">—</span>
-              <input name="payment_override" type="text" inputmode="decimal" data-money class="pay-edit-input hidden" data-pay-edit-input value="${esc(formatMoneyInput(t.payment_override ?? ''))}">
-              <span data-pay-derived-ref></span>
-              <button type="button" class="small" data-pay-edit>Edit</button>
-              <button type="button" class="small hidden" data-pay-reset>Reset</button>
-            </div></div>
             <div><label>Payment frequency</label><select name="payment_frequency">${freqOptionsHtml(freqKey)}</select></div>
             <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${t.payment_day ?? p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
           </div>
@@ -1601,6 +1631,15 @@ function renderTerms(p) {
           <div><label>Note</label><input type="text" name="note"></div>
           <button class="primary" type="submit">Add lump sum</button>
         </form>
+        <div class="grid3" data-pay-block="${t.id}" style="margin-top:12px">
+          <div><label>Monthly payment ($)</label><div class="term-pay-row">
+            <span class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}" data-term-payment-for="${t.id}">—</span>
+            <input name="payment_override" form="termForm${t.id}" type="text" inputmode="decimal" data-money class="pay-edit-input hidden" data-pay-edit-input value="${esc(formatMoneyInput(t.payment_override ?? ''))}">
+            <span data-pay-derived-ref></span>
+            <button type="button" class="small" data-pay-edit>Edit</button>
+            <button type="button" class="small hidden" data-pay-reset>Reset</button>
+          </div></div>
+        </div>
       </div>
     </div>`;
   }).join('') || '<div class="note" style="margin-left:0">No terms yet.</div>';
@@ -1649,19 +1688,19 @@ $('#termsWrap').addEventListener('click', async (e) => {
   }
   const payEdit = e.target.closest('[data-pay-edit]');
   if (payEdit) {
-    const form = payEdit.closest('[data-term-form]');
+    const form = termFormOfPayBlock(payEdit.closest('[data-pay-block]'));
     if (form) {
       enterPayEdit(form, 'used');
-      const input = form.querySelector('[data-pay-edit-input]');
+      const input = payEditEls(form).input;
       if (input) { input.focus(); input.select(); }
     }
     return;
   }
   const payReset = e.target.closest('[data-pay-reset]');
   if (payReset) {
-    const form = payReset.closest('[data-term-form]');
+    const form = termFormOfPayBlock(payReset.closest('[data-pay-block]'));
     const term = form && termOfForm(form);
-    const input = form && form.querySelector('[data-pay-edit-input]');
+    const input = form && payEditEls(form).input;
     if (input && term) {
       input.value = formatMoneyInput(term.paymentDerived ?? '');
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1734,8 +1773,9 @@ $('#termsWrap').addEventListener('change', (e) => {
   if (form) { syncSegForm(form); refreshPlanPreview(form); return; }
   // The term's plan fields (repayment method, amortization,
   // payment override) re-price the preview of that term's draft
-  // segment.
-  if (e.target.closest('[data-term-form]')
+  // segment. The payment editor sits in the pay block below the
+  // form, so its events resolve through the block too.
+  if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]'))
     && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
@@ -1744,7 +1784,7 @@ $('#termsWrap').addEventListener('change', (e) => {
 $('#termsWrap').addEventListener('input', (e) => {
   const form = e.target.closest('[data-seg-form]');
   if (form) { if (e.target.name === 'spread') syncSegForm(form); refreshPlanPreview(form); return; }
-  if (e.target.closest('[data-term-form]') && (e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
+  if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]')) && (e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }

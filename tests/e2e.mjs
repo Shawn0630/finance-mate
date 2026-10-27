@@ -3051,8 +3051,8 @@ try {
       // row shows the figure with an Edit button, its editor
       // input hidden in the same row, empty.
       const noEntry = await page.evaluate(() => {
-        const payInput = document.querySelector('[data-term-form] [name=payment_override]');
-        const editBtn = document.querySelector('[data-term-form] [data-pay-edit]');
+        const payInput = document.querySelector('[data-pay-block] [name=payment_override]');
+        const editBtn = document.querySelector('[data-pay-block] [data-pay-edit]');
         return {
           propertyPaymentInputs: document.querySelectorAll('#mortgageModal [name=mortgage_payment]').length,
           overrideInputs: document.querySelectorAll('#mortgageModal [name=payment_override]').length,
@@ -3063,7 +3063,7 @@ try {
           struck: document.querySelectorAll('#mortgageModal [data-term-payment] s, #metaCurrentPayment s, #estPaymentValue s').length,
           estTag: !!document.querySelector('#estPaymentTag'),
           metaTag: !!document.querySelector('#metaPaymentTag'),
-          termFigure: document.querySelector('[data-term-form] [data-term-payment]').textContent,
+          termFigure: document.querySelector('[data-pay-block] [data-term-payment]').textContent,
           stat: document.querySelector('#estPaymentValue').textContent,
           meta: document.querySelector('#metaCurrentPayment').textContent,
         };
@@ -3254,27 +3254,51 @@ try {
       // as a read-only figure whose own row holds the override
       // editor (Edit button + the payment_override input, in the
       // payment row — never a standalone field, never a
-      // property-level payment input) — and the old standalone
-      // anchor form is gone from the page entirely.
+      // property-level payment input). The payment row closes
+      // the card (below the segments and the lump sums), so its
+      // editor lives in the card's pay block, associated with
+      // the term form rather than nested inside it — and the old
+      // standalone anchor form is gone from the page entirely.
       const fieldSets = await page.evaluate(() => ({
-        forms: [...document.querySelectorAll('#termsWrap .term-block [data-term-form]')].map((f) => ({
-          overrideInput: !!f.querySelector('[name=payment_override]'),
-          overrideInPaymentRow: !!f.querySelector('.term-pay-row [name=payment_override]'),
-          payEditBtn: !!f.querySelector('.term-pay-row [data-pay-edit]'),
-          propertyPaymentInput: !!f.querySelector('[name=mortgage_payment]'),
-          paymentFigure: !!f.querySelector('[data-term-payment]'),
-          freq: !!f.querySelector('[name=payment_frequency]'),
-          day: !!f.querySelector('[name=payment_day]'),
-          principal: !!f.querySelector('[name=opening_balance], [name=anchor_balance]'),
-          principalDate: !!f.querySelector('[name=start_date], [name=anchor_date]'),
-        })),
+        forms: [...document.querySelectorAll('#termsWrap .term-block [data-term-form]')].map((f) => {
+          const pb = f.closest('.term-block').querySelector('[data-pay-block]');
+          return {
+            overrideInput: !!pb && !!pb.querySelector('[name=payment_override]'),
+            overrideInPaymentRow: !!pb && !!pb.querySelector('.term-pay-row [name=payment_override]'),
+            payEditBtn: !!pb && !!pb.querySelector('.term-pay-row [data-pay-edit]'),
+            propertyPaymentInput: !!f.querySelector('[name=mortgage_payment]'),
+            paymentFigure: !!pb && !!pb.querySelector('[data-term-payment]'),
+            freq: !!f.querySelector('[name=payment_frequency]'),
+            day: !!f.querySelector('[name=payment_day]'),
+            principal: !!f.querySelector('[name=opening_balance], [name=anchor_balance]'),
+            principalDate: !!f.querySelector('[name=start_date], [name=anchor_date]'),
+          };
+        }),
         anchorForms: document.querySelectorAll('[data-anchor-form]').length,
       }));
-      check('every term card carries the principal/frequency/day field set, a read-only payment figure with its inline Edit in the payment row — no property payment input (no separate anchor form)',
+      check('every term card carries the principal/frequency/day field set, a read-only payment figure with its inline Edit in the payment row closing the card — no property payment input (no separate anchor form)',
         fieldSets.forms.length === 2
           && fieldSets.forms.every((s) => s.overrideInput && s.overrideInPaymentRow && s.payEditBtn && !s.propertyPaymentInput && s.paymentFigure && s.freq && s.day && s.principal && s.principalDate)
           && fieldSets.anchorForms === 0,
         JSON.stringify(fieldSets));
+      // The payment figure is the RESULT of the rate plan: its
+      // row comes after the segments table and the lump sums in
+      // the card's document order.
+      const payOrder = await page.evaluate(() => {
+        const block = document.querySelector('#termsWrap .term-block');
+        const pay = block.querySelector('[data-pay-block]');
+        const segTable = block.querySelector('.seg-table');
+        const lumpForm = block.querySelector('[data-lump-form]');
+        const FOLLOWS = Node.DOCUMENT_POSITION_FOLLOWING;
+        return {
+          pay: !!pay,
+          afterSeg: !!pay && !!segTable && (segTable.compareDocumentPosition(pay) & FOLLOWS) !== 0,
+          afterLump: !!pay && !!lumpForm && (lumpForm.compareDocumentPosition(pay) & FOLLOWS) !== 0,
+        };
+      });
+      check('the Monthly payment row closes the term card — it sits below the rate segments and the lump sums',
+        payOrder.pay && payOrder.afterSeg && payOrder.afterLump,
+        JSON.stringify(payOrder));
       const termPayFig = await page.evaluate(() =>
         document.querySelector('#termsWrap .term-block [data-term-payment]').textContent);
       check('the current term card shows its calculated monthly payment read-only',
@@ -3610,17 +3634,17 @@ try {
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(800);
       const payRowState = () => page.evaluate(() => {
-        const form = document.querySelector('[data-term-form]');
-        const input = form.querySelector('[name=payment_override]');
-        const view = form.querySelector('[data-term-payment]');
-        const ref = form.querySelector('[data-pay-derived-ref]');
+        const row = document.querySelector('[data-pay-block]');
+        const input = row.querySelector('[name=payment_override]');
+        const view = row.querySelector('[data-term-payment]');
+        const ref = row.querySelector('[data-pay-derived-ref]');
         const struck = ref ? ref.querySelector('s') : null;
         return {
           inputHidden: input.classList.contains('hidden'),
           inputValue: input.value,
           viewHidden: view.classList.contains('hidden'),
-          editHidden: form.querySelector('[data-pay-edit]').classList.contains('hidden'),
-          resetHidden: form.querySelector('[data-pay-reset]').classList.contains('hidden'),
+          editHidden: row.querySelector('[data-pay-edit]').classList.contains('hidden'),
+          resetHidden: row.querySelector('[data-pay-reset]').classList.contains('hidden'),
           refText: ref ? ref.textContent : null,
           refStruck: struck ? struck.textContent : null,
         };
@@ -3629,7 +3653,7 @@ try {
       check('the payment row rests as figure + Edit (editor input hidden, no override → no Reset)',
         atRest.inputHidden && !atRest.viewHidden && !atRest.editHidden && atRest.resetHidden && atRest.inputValue === '',
         JSON.stringify(atRest));
-      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
       await wait(200);
       const editing = await payRowState();
       check('Edit opens the inline editor in place: input prefilled with the used payment, the calculated figure muted beside it, still no Reset',
@@ -3655,7 +3679,7 @@ try {
       };
       check('override saved in the term form: the term card figure shows $6,000 bold with $6,381 struck through',
         await untilNode(async () => {
-          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          const t = await tripleOf('[data-pay-block] [data-term-payment]');
           return !!t && t.used === '$6,000' && t.struckText === '$6,381' && String(t.struckStyle).includes('line-through');
         }));
       const metaTriple = await tripleOf('#metaCurrentPayment');
@@ -3721,7 +3745,7 @@ try {
       await wait(1500);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(800);
-      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
       await wait(200);
       const editingOv = await payRowState();
       check('on an overridden term the editor prefills the used payment, the calculated figure is struck through beside it, and Reset is offered',
@@ -3731,7 +3755,7 @@ try {
       await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
       check('clearing the override restores the plain derived figure (no strikethrough anywhere)',
         await untilNode(async () => {
-          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          const t = await tripleOf('[data-pay-block] [data-term-payment]');
           const m = await tripleOf('#metaCurrentPayment');
           const s = await tripleOf('#estPaymentValue');
           return !!t && !!m && !!s
@@ -3747,18 +3771,18 @@ try {
       // editor click Reset — the box returns to the calculated
       // figure and saving clears the override (a figure equal to
       // the calculated one IS the calculated one).
-      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
       await wait(200);
       await page.keyboard.type('6000');
       await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
       check('the override is set again for the Reset path',
         await untilNode(async () => {
-          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          const t = await tripleOf('[data-pay-block] [data-term-payment]');
           return !!t && t.used === '$6,000' && t.struckText === '$6,381';
         }));
-      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-edit]').click());
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
       await wait(200);
-      await page.evaluate(() => document.querySelector('[data-term-form] [data-pay-reset]').click());
+      await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-reset]').click());
       await wait(200);
       const afterReset = await payRowState();
       check('Reset puts the calculated figure back in the editor box',
@@ -3767,7 +3791,7 @@ try {
       await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
       check('saving after Reset clears the override (figure plain again, editor back at rest)',
         await untilNode(async () => {
-          const t = await tripleOf('[data-term-form] [data-term-payment]');
+          const t = await tripleOf('[data-pay-block] [data-term-payment]');
           const st = await payRowState();
           return !!t && t.text.includes('6,381') && t.struckText === null && st.inputHidden && st.inputValue === '';
         }));
@@ -3904,7 +3928,10 @@ try {
       const aiFlagOf = (formSel, name) => page.evaluate((sel, n) => {
         const form = document.querySelector(sel);
         if (!form) return null;
-        const input = form.querySelector(`[name="${n}"]`);
+        // The payment editor's input lives in the card's pay
+        // block (below the form), not inside the form element.
+        const input = form.querySelector(`[name="${n}"]`)
+          || (form.closest('.term-block') || document).querySelector(`[data-pay-block] [name="${n}"]`);
         if (!input) return null;
         let host = input.parentElement;
         while (host) {
@@ -3950,7 +3977,8 @@ try {
       const aiValues = await page.evaluate(() => {
         const form = document.querySelector('[data-term-form]');
         const seg = document.querySelector('[data-seg-form]');
-        const v = (f, n) => f.querySelector(`[name="${n}"]`).value;
+        const v = (f, n) => (f.querySelector(`[name="${n}"]`)
+          || f.closest('.term-block').querySelector(`[data-pay-block] [name="${n}"]`)).value;
         return {
           lender: v(form, 'lender'), start: v(form, 'start_date'), months: v(form, 'term_months'),
           amort: v(form, 'amortization_years'), opening: v(form, 'opening_balance'), override: v(form, 'payment_override'),
@@ -3969,10 +3997,10 @@ try {
       // shown in place of the figure) without anyone clicking
       // Edit.
       const aiPayEdit = await page.evaluate(() => {
-        const form = document.querySelector('[data-term-form]');
+        const row = document.querySelector('[data-pay-block]');
         return {
-          inputHidden: form.querySelector('[name=payment_override]').classList.contains('hidden'),
-          viewHidden: form.querySelector('[data-term-payment]').classList.contains('hidden'),
+          inputHidden: row.querySelector('[name=payment_override]').classList.contains('hidden'),
+          viewHidden: row.querySelector('[data-term-payment]').classList.contains('hidden'),
         };
       });
       check('the extracted override opens the payment row’s inline editor (input shown in place of the figure)',
