@@ -4,6 +4,17 @@ const money = (n) =>
   n === null || n === undefined || n === ''
     ? '—'
     : Number(n).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+// Schedule-derived money (payments, interest/principal splits,
+// balances, equity, projection totals) always renders to the cent:
+// the engine computes in cents end to end, and rounding each cell
+// to whole dollars for display made rows disagree with their own
+// Total and hid real differences against bank figures. Valuations
+// (assessed values, history points) and entered asset values stay
+// on money() — they are whole-dollar by nature.
+const money2 = (n) =>
+  n === null || n === undefined || n === ''
+    ? '—'
+    : Number(n).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -18,9 +29,9 @@ const esc = (s) =>
 function paymentHtml(t) {
   if (!t || t.paymentUsed === null || t.paymentUsed === undefined) return '—';
   if (t.paymentOverridden && t.paymentDerived !== null && t.paymentDerived !== undefined) {
-    return `<span class="pay-used">${money(t.paymentUsed)}</span> <s class="pay-derived">${money(t.paymentDerived)}</s>`;
+    return `<span class="pay-used">${money2(t.paymentUsed)}</span> <s class="pay-derived">${money2(t.paymentDerived)}</s>`;
   }
-  return money(t.paymentUsed);
+  return money2(t.paymentUsed);
 }
 
 // --------------------------------------------------------- money inputs --
@@ -366,10 +377,10 @@ async function loadAssets(force = false) {
 
   // Overview: totals + per-category breakdown cards.
   $('#sumProperty').textContent = money(summary.propertyValue);
-  $('#sumMortgage').textContent = money(summary.mortgageBalance);
+  $('#sumMortgage').textContent = money2(summary.mortgageBalance);
   $('#sumOther').textContent = money(summary.otherAssets);
   const net = $('#sumNet');
-  net.textContent = money(summary.netWorth);
+  net.textContent = money2(summary.netWorth);
   net.classList.toggle('negative', summary.netWorth < 0);
   const byCategory = {};
   for (const a of assets) {
@@ -378,7 +389,7 @@ async function loadAssets(force = false) {
     byCategory[a.category].total += Number(a.value || 0);
   }
   const breakdown = [
-    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · principal ${money(summary.mortgageBalance)}` },
+    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · principal ${money2(summary.mortgageBalance)}` },
     ...ASSET_SECTIONS.filter((s) => s.category).map((s) => ({
       key: s.key, label: s.label,
       value: (byCategory[s.category] || { total: 0 }).total,
@@ -408,7 +419,7 @@ async function loadAssets(force = false) {
       <div class="body">
         <div class="addr">${esc(p.address)}${regionTagHtml(p.region)}</div>
         <div class="kv"><span class="k">Assessed value</span><span>${money(p.assessed_value)} ${src}</span></div>
-        <div class="kv"><span class="k">Outstanding principal</span><span>${money(p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance)}</span></div>
+        <div class="kv"><span class="k">Outstanding principal</span><span>${money2(p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance)}</span></div>
         <div class="kv"><span class="k">Monthly payment</span><span>${paymentHtml(p)}</span></div>
         <div class="kv"><span class="k">Current rate</span><span>${rate}</span></div>
         ${p.owners && p.owners.length ? `<div class="kv"><span class="k">Owners</span><span>${ownerChipsHtml(p.owners)}</span></div>` : ''}
@@ -898,10 +909,10 @@ async function loadPortfolio() {
   }
   block.classList.remove('hidden');
   const t = portfolioData.totals;
-  $('#pfEquity').textContent = t.equity != null ? money(t.equity) : '—';
-  $('#pfOutstanding').textContent = money(t.outstanding);
-  $('#pfPayment').textContent = money(t.monthlyPayment);
-  $('#pfInterest').textContent = money(t.totalInterest);
+  $('#pfEquity').textContent = t.equity != null ? money2(t.equity) : '—';
+  $('#pfOutstanding').textContent = money2(t.outstanding);
+  $('#pfPayment').textContent = money2(t.monthlyPayment);
+  $('#pfInterest').textContent = money2(t.totalInterest);
   $('#pfInterestNote').textContent = t.interestFrom < t.propertyCount
     ? `based on ${t.interestFrom} of ${t.propertyCount} properties`
     : `based on all ${t.propertyCount} properties`;
@@ -1195,7 +1206,7 @@ function drawPortfolioPie() {
           callbacks: {
             label: (item) => {
               const s = slices[item.dataIndex];
-              return ` ${s.shortLabel}: ${money(s.value)} (${s.pct}%)`;
+              return ` ${s.shortLabel}: ${money2(s.value)} (${s.pct}%)`;
             },
           },
         },
@@ -1324,12 +1335,12 @@ function drawPortfolioChart() {
           },
           callbacks: {
             title: (items) => formatYearTick(items[0].parsed.x),
-            label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}`,
+            label: (item) => ` ${item.dataset.label}: ${item.dataset.key === 'assessed' ? money(item.parsed.y) : money2(item.parsed.y)}`,
             footer: (items) => {
               const bars = items.filter((i) => i.dataset.stack === 'outstanding');
               if (!bars.length) return '';
               const total = bars.reduce((s, i) => s + (i.parsed.y || 0), 0);
-              return `Total outstanding: ${money(total)}`;
+              return `Total outstanding: ${money2(total)}`;
             },
           },
         },
@@ -1626,9 +1637,9 @@ function renderPropView(p) {
   // no notes / assessment-year / lender rows, no prose lines.
   $('#detailAssessedValue').textContent = p.assessed_value != null ? money(p.assessed_value) : '—';
   const remaining = p.remainingBalance != null ? p.remainingBalance : p.mortgage_balance;
-  $('#detailRemainingBalance').textContent = remaining != null ? money(remaining) : '—';
+  $('#detailRemainingBalance').textContent = remaining != null ? money2(remaining) : '—';
   $('#detailCurrentEquity').textContent = p.assessed_value != null
-    ? money(p.assessed_value - (remaining != null ? remaining : 0))
+    ? money2(p.assessed_value - (remaining != null ? remaining : 0))
     : '—';
   const rows = [
     ['Address', `${esc(p.address || '—')}${regionTagHtml(p.region)}`, true],
@@ -1818,8 +1829,8 @@ function enterPayEdit(form, mode = 'used') {
   if (els.ref) {
     els.ref.innerHTML = term && term.paymentDerived != null
       ? (term.paymentOverridden
-        ? `<s class="pay-derived">${money(term.paymentDerived)}</s>`
-        : `<span class="pay-derived">${money(term.paymentDerived)}</span>`)
+        ? `<s class="pay-derived">${money2(term.paymentDerived)}</s>`
+        : `<span class="pay-derived">${money2(term.paymentDerived)}</span>`)
       : '';
   }
 }
@@ -1838,14 +1849,14 @@ function renderMortgageMeta() {
   const first = terms[0] || null;
   const cur = terms.find((t) => t.id === p.currentTermId) || null;
   $('#metaOpeningPrincipal').textContent =
-    first && first.opening_balance != null ? money(first.opening_balance) : '—';
+    first && first.opening_balance != null ? money2(first.opening_balance) : '—';
   // Current Principal is what is still owed TODAY — the
   // projection's balance at the current month, served as
   // remainingBalance — not the anchor the loan started from.
   // The anchor is only the fallback for an unprojectable mortgage.
   $('#metaCurrentPrincipal').textContent =
-    p.remainingBalance != null ? money(p.remainingBalance)
-      : (p.mortgage_balance != null ? money(p.mortgage_balance) : '—');
+    p.remainingBalance != null ? money2(p.remainingBalance)
+      : (p.mortgage_balance != null ? money2(p.mortgage_balance) : '—');
   $('#metaCurrentPayment').innerHTML = paymentHtml(chartMeta);
   // Each term card also shows its own monthly payment read-only,
   // in the payment row closing the card: the payment its span opens with,
@@ -1888,7 +1899,7 @@ function segRowsHtml(segs) {
 
 function lumpRowsHtml(lumps) {
   if (!lumps.length) return '<div class="note" style="margin:0">No lump sums in this term.</div>';
-  return lumps.map((l) => `<div class="kv"><span class="k">${esc(l.date)}</span><span>${money(l.amount)}${l.note ? ` · ${esc(l.note)}` : ''}</span><button type="button" class="small danger" data-del-lump="${l.id}">Delete</button></div>`).join('');
+  return lumps.map((l) => `<div class="kv"><span class="k">${esc(l.date)}</span><span>${money2(l.amount)}${l.note ? ` · ${esc(l.note)}` : ''}</span><button type="button" class="small danger" data-del-lump="${l.id}">Delete</button></div>`).join('');
 }
 
 // The segment form uses the same grid as every other form on
@@ -2041,7 +2052,7 @@ function renderTerms(p) {
         <span>${esc(t.start_date)} → ${esc(t.end_date)}</span>
         <span>${termLengthLabel(t.term_months)}</span>
         <span>Amortization: ${t.amortization_years != null ? `${esc(t.amortization_years)} years` : 'not set'}</span>
-        <span>Opened at ${money(t.opening_balance)}</span>
+        <span>Opened at ${money2(t.opening_balance)}</span>
         <span style="flex:1"></span>
         <span data-term-arrow>${open ? '▾' : '▸'}</span>
       </button>
@@ -2664,7 +2675,7 @@ function refreshPlanPreview(form) {
       const r = await api(`/api/properties/${currentPropertyId}/preview`, { method: 'POST', body });
       if (!form.isConnected) return;
       if (r.ok) {
-        out.innerHTML = `Next month (${r.month}): payment ${paymentHtml({ paymentUsed: r.payment, paymentDerived: r.paymentDerived, paymentOverridden: r.paymentOverridden })} — interest ${money(r.interest)}, principal ${money(r.principal)}, at ${Number(r.rate).toFixed(2)}%`;
+        out.innerHTML = `Next month (${r.month}): payment ${paymentHtml({ paymentUsed: r.payment, paymentDerived: r.paymentDerived, paymentOverridden: r.paymentOverridden })} — interest ${money2(r.interest)}, principal ${money2(r.principal)}, at ${Number(r.rate).toFixed(2)}%`;
       } else {
         out.textContent = r.error || '';
       }
@@ -2772,7 +2783,7 @@ async function loadTrend(id) {
     const remainingNow = detailProperty.remainingBalance != null
       ? detailProperty.remainingBalance : detailProperty.mortgage_balance;
     $('#detailCurrentEquity').textContent = assessedNow != null
-      ? money(assessedNow - (remainingNow != null ? remainingNow : 0))
+      ? money2(assessedNow - (remainingNow != null ? remainingNow : 0))
       : '—';
   }
   // The Land / Building columns exist only while at least one
@@ -2839,7 +2850,7 @@ const historyBarLabelPlugin = {
           if (meta && meta.data && meta.data[i]) top = meta.data[i];
         }
       }
-      if (top) c.fillText(money(total), top.x, top.y - 4);
+      if (top) c.fillText(money2(total), top.x, top.y - 4);
     });
     c.restore();
   },
@@ -3264,11 +3275,11 @@ function renderEquity() {
   if (a.assessedValue !== null && a.balance !== null) {
     // A bare figure, by the user's ruling — no derivation sentence
     // trailing it ("— latest assessed value … minus outstanding …").
-    el.textContent = `Current equity: ${money(a.equity)}`;
+    el.textContent = `Current equity: ${money2(a.equity)}`;
   } else if (a.assessedValue !== null) {
     el.textContent = `Latest assessed value: ${money(a.assessedValue)}${a.assessedYear ? ` (${a.assessedYear})` : ''}. Add the outstanding principal in “Mortgage Terms & Rates” to see the equity.`;
   } else if (a.balance !== null) {
-    el.textContent = `Outstanding principal: ${money(a.balance)}. Fetch the assessed value from BC Assessment (in “Assessment History”) to see the equity.`;
+    el.textContent = `Outstanding principal: ${money2(a.balance)}. Fetch the assessed value from BC Assessment (in “Assessment History”) to see the equity.`;
   } else {
     el.textContent = 'Equity appears here once an assessed value and an outstanding principal is on record.';
   }
@@ -3471,13 +3482,13 @@ function drawCombinedChart() {
         tooltip: {
           callbacks: {
             title: (items) => formatYearTick(items[0].parsed.x),
-            label: (item) => ` ${item.dataset.label}: ${money(item.parsed.y)}${item.dataset.yAxisID === 'y1' ? ' (payment axis)' : ' (value axis)'}`,
+            label: (item) => ` ${item.dataset.label}: ${item.dataset.key === 'assessed' ? money(item.parsed.y) : money2(item.parsed.y)}${item.dataset.yAxisID === 'y1' ? ' (payment axis)' : ' (value axis)'}`,
             footer: (items) => {
               const it = items[0];
               if (!it || it.dataset.stack !== 'payment') return '';
               const bars = it.chart.data.datasets.filter((d) => d.stack === 'payment');
               const total = bars.reduce((s, d) => s + (d.data[it.dataIndex] ? d.data[it.dataIndex].y : 0), 0);
-              return barsBasis === 'yearly' ? `Total payments that year: ${money(total)}` : `Total payment: ${money(total)}`;
+              return barsBasis === 'yearly' ? `Total payments that year: ${money2(total)}` : `Total payment: ${money2(total)}`;
             },
           },
         },
@@ -3564,10 +3575,10 @@ function renderSchedule() {
   const pageRows = rows.filter((r) => String(r.month).slice(0, 4) === scheduleYear);
   tbody.innerHTML = pageRows.map((r) => `<tr>
     <td>${monthLabel(r.month)}</td>
-    <td class="num">${money(r.payment)}</td>
-    <td class="num">${money(r.principal)}</td>
-    <td class="num">${money(r.interest)}</td>
-    <td class="num">${money(r.balance)}</td></tr>`).join('');
+    <td class="num">${money2(r.payment)}</td>
+    <td class="num">${money2(r.principal)}</td>
+    <td class="num">${money2(r.interest)}</td>
+    <td class="num">${money2(r.balance)}</td></tr>`).join('');
   const sel = $('#scheduleYearSelect');
   sel.innerHTML = years.map((y) => `<option value="${y}"${y === scheduleYear ? ' selected' : ''}>${y}</option>`).join('');
   const idx = years.indexOf(scheduleYear);
@@ -3583,10 +3594,10 @@ function renderSchedule() {
   }
   totalRow.classList.remove('hidden');
   totalRow.innerHTML = `<td>${esc(label)}</td>
-    <td class="num sum-payment" data-value="${sum('payment')}">${money(sum('payment'))}</td>
-    <td class="num sum-principal" data-value="${sum('principal')}">${money(sum('principal'))}</td>
-    <td class="num sum-interest" data-value="${sum('interest')}">${money(sum('interest'))}</td>
-    <td class="num">${money(last.balance)}</td>`;
+    <td class="num sum-payment" data-value="${sum('payment')}">${money2(sum('payment'))}</td>
+    <td class="num sum-principal" data-value="${sum('principal')}">${money2(sum('principal'))}</td>
+    <td class="num sum-interest" data-value="${sum('interest')}">${money2(sum('interest'))}</td>
+    <td class="num">${money2(last.balance)}</td>`;
 }
 
 function stepScheduleYear(delta) {

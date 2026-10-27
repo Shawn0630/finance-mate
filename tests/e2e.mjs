@@ -2152,8 +2152,8 @@ try {
         remaining: document.querySelector('#detailRemainingBalance').textContent,
         equity: document.querySelector('#detailCurrentEquity').textContent,
       }));
-      check('detail headline stats: Assessed $1,931,000, Remaining $1,280,775, Current equity $650,225',
-        eqStats.assessed === '$1,931,000' && eqStats.remaining === '$1,280,775' && eqStats.equity === '$650,225',
+      check('detail headline stats: Assessed $1,931,000, Remaining $1,280,775.00, Current equity $650,225.00 (balances render to the cent, assessed stays whole)',
+        eqStats.assessed === '$1,931,000' && eqStats.remaining === '$1,280,775.00' && eqStats.equity === '$650,225.00',
         JSON.stringify(eqStats));
       await page.goto(`http://ff.local/#property/${eqBarePid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1800);
@@ -2179,7 +2179,7 @@ try {
           notes: document.querySelector('#pfNotes').textContent,
         };
       });
-      const fmtTotal = Number(pfNow.totals.equity).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+      const fmtTotal = Number(pfNow.totals.equity).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
       check('overview: the Total equity card sits left of Total outstanding principal and shows the portfolio total',
         eqCard.leftOf && eqCard.text === fmtTotal,
         JSON.stringify({ card: eqCard.text, want: fmtTotal, leftOf: eqCard.leftOf }));
@@ -3405,7 +3405,7 @@ try {
         String(remMeta));
       const remEqText = await page.evaluate(() => document.querySelector('#equitySummary').textContent);
       check('detail equity line is the bare figure (assessed minus remaining, no derivation tail)',
-        remEqText.trim() === `Current equity: $${groupNum(1931000 - remAmort.remainingBalance)}`,
+        remEqText.trim() === `Current equity: $${Number(1931000 - remAmort.remainingBalance).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
         remEqText);
       await page.evaluate(() => document.querySelector('#mortgageModal [data-close-modal]').click());
       await wait(300);
@@ -3783,12 +3783,13 @@ try {
       const propNow = (await req('GET', `/api/properties/${moneyPid}`)).data;
       const latestPt = vhNow.points && vhNow.points.length ? vhNow.points[vhNow.points.length - 1] : null;
       const fmt$ = (n) => '$' + Number(n).toLocaleString('en-CA', { maximumFractionDigits: 0 });
+      const fmt$2 = (n) => '$' + Number(n).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const expAssessed = latestPt ? latestPt.value : propNow.assessed_value;
       const expRemaining = propNow.remainingBalance != null ? propNow.remainingBalance : propNow.mortgage_balance;
       check('details carry exactly the two headline figures over Address / Owners / Purchase date',
         detailsBits.labels.join('|') === 'Address|Owners|Purchase date'
           && detailsBits.assessed === fmt$(expAssessed)
-          && detailsBits.remaining === fmt$(expRemaining),
+          && detailsBits.remaining === fmt$2(expRemaining),
         JSON.stringify({ detailsBits, expAssessed, expRemaining }));
       check('details carry no Notes / Assessment year / Lender rows and no prose lines',
         !detailsBits.viewText.includes('Notes') && !detailsBits.viewText.includes('Assessment year')
@@ -4164,19 +4165,19 @@ try {
         for (let i = 0; i < tries; i++) { if (await fn()) return true; await wait(300); }
         return false;
       };
-      check('override saved in the term form: the term card figure shows $6,000 bold with $6,381 struck through',
+      check('override saved in the term form: the term card figure shows $6,000.00 bold with $6,381.36 struck through',
         await untilNode(async () => {
           const t = await tripleOf('[data-pay-block] [data-term-payment]');
-          return !!t && t.used === '$6,000' && t.struckText === '$6,381' && String(t.struckStyle).includes('line-through');
+          return !!t && t.used === '$6,000.00' && t.struckText === '$6,381.36' && String(t.struckStyle).includes('line-through');
         }));
       const metaTriple = await tripleOf('#metaCurrentPayment');
       check('the modal metadata Current Monthly Payment shows the same override rendering',
-        !!metaTriple && metaTriple.used === '$6,000' && metaTriple.struckText === '$6,381'
+        !!metaTriple && metaTriple.used === '$6,000.00' && metaTriple.struckText === '$6,381.36'
           && String(metaTriple.struckStyle).includes('line-through'),
         JSON.stringify(metaTriple));
       const statTriple = await tripleOf('#estPaymentValue');
       check('the detail stat Estimated monthly payment shows the same override rendering',
-        !!statTriple && statTriple.used === '$6,000' && statTriple.struckText === '$6,381'
+        !!statTriple && statTriple.used === '$6,000.00' && statTriple.struckText === '$6,381.36'
           && String(statTriple.struckStyle).includes('line-through'),
         JSON.stringify(statTriple));
       const ovUiProj = (await req('GET', `/api/properties/${ovUiPid}/amortization`)).data;
@@ -4221,7 +4222,7 @@ try {
         return { text: kv ? kv.textContent : null, struckText: struck ? struck.textContent : null };
       });
       check('the Properties card shows the override payment with the derived struck through',
-        !!cardPay && cardPay.text.includes('6,000') && cardPay.struckText === '$6,381',
+        !!cardPay && cardPay.text.includes('6,000') && cardPay.struckText === '$6,381.36',
         JSON.stringify(cardPay));
       // Clear the override through the same editor: figures
       // return to the plain derived payment, strikethrough gone.
@@ -4236,7 +4237,7 @@ try {
       await wait(200);
       const editingOv = await payRowState();
       check('on an overridden term the editor prefills the used payment, the calculated figure is struck through beside it, and Reset is offered',
-        !editingOv.inputHidden && editingOv.inputValue === '6,000' && editingOv.refStruck === '$6,381' && !editingOv.resetHidden,
+        !editingOv.inputHidden && editingOv.inputValue === '6,000' && editingOv.refStruck === '$6,381.36' && !editingOv.resetHidden,
         JSON.stringify(editingOv));
       await page.keyboard.press('Backspace');
       await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
@@ -4265,7 +4266,7 @@ try {
       check('the override is set again for the Reset path',
         await untilNode(async () => {
           const t = await tripleOf('[data-pay-block] [data-term-payment]');
-          return !!t && t.used === '$6,000' && t.struckText === '$6,381';
+          return !!t && t.used === '$6,000.00' && t.struckText === '$6,381.36';
         }));
       await page.evaluate(() => document.querySelector('[data-pay-block] [data-pay-edit]').click());
       await wait(200);
@@ -4442,10 +4443,10 @@ try {
         input.dispatchEvent(new Event('change', { bubbles: true }));
       });
       await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
-      check('setting Locked on to the letter date re-derives the figure to $7,206 after Save',
+      check('setting Locked on to the letter date re-derives the figure to $7,205.89 after Save',
         await untilNode(async () => {
           const s = await page.evaluate(() => document.querySelector('[data-term-payment]').textContent);
-          return s.includes('7,206');
+          return s.includes('7,205.89');
         }));
       const pdUiProj = (await req('GET', `/api/properties/${pdUiPid}/amortization`)).data;
       check('the UI-saved lock drives the API derivation (7,205.89)',
