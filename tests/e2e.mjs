@@ -2187,10 +2187,12 @@ try {
         eqCard.notes.includes('Total equity excludes'), eqCard.notes.slice(0, 200));
       // Properties head row: the title and the + Add property
       // button align with the Portfolio panel's content edges
-      // (panel border 1px + padding 16px = a 17px inset), and the
+      // (panel border 1px + padding 16px = a 17px inset), the
       // button gets the head's set 16px padding of air above it
-      // instead of sitting squeezed against the subnav.
-      const headGeom = await page.evaluate(() => {
+      // instead of sitting squeezed against the subnav, and the
+      // row leaves the same 16px below it before the Portfolio
+      // panel instead of sitting flush on the panel.
+      const measureHeadGeom = () => page.evaluate(() => {
         const head = document.querySelector('#section-properties .section-head');
         const title = head.querySelector('h2');
         const btn = document.querySelector('#addPropertyBtn');
@@ -2203,14 +2205,31 @@ try {
           titleLeftDelta: Math.abs(tr.left - (pr.left + 17)),
           btnRightDelta: Math.abs(br.right - (pr.right - 17)),
           btnTopGap: br.top - hr.top,
+          btnPanelGap: pr.top - br.bottom,
         };
       });
+      const headGeom = await measureHeadGeom();
       check('properties head: title left edge aligns with the Portfolio panel content left edge',
         headGeom.titleLeftDelta <= 3, JSON.stringify(headGeom));
       check('properties head: Add property button right edge aligns with the panel content right edge',
         headGeom.btnRightDelta <= 3, JSON.stringify(headGeom));
       check('properties head: the button has the set 16px padding of space above it',
         headGeom.btnTopGap > 0 && Math.abs(headGeom.btnTopGap - 16) <= 3, JSON.stringify(headGeom));
+      check('properties head: the button leaves the set 16px gap above the Portfolio panel (not flush)',
+        Math.abs(headGeom.btnPanelGap - 16) <= 3, JSON.stringify(headGeom));
+      // Same geometry at ~975 CSS px wide (close to the user's
+      // window): the insets and gaps are padding-driven, so they
+      // must hold at desktop width too, not just the test viewport.
+      await page.setViewport({ width: 975, height: 800 });
+      await wait(200);
+      const headGeomWide = await measureHeadGeom();
+      await page.setViewport({ width: 800, height: 600 });
+      await wait(200);
+      check('properties head @975px: title/button still align with the panel content edges',
+        headGeomWide.titleLeftDelta <= 3 && headGeomWide.btnRightDelta <= 3, JSON.stringify(headGeomWide));
+      check('properties head @975px: 16px above the button and 16px between the button and the panel',
+        Math.abs(headGeomWide.btnTopGap - 16) <= 3 && Math.abs(headGeomWide.btnPanelGap - 16) <= 3,
+        JSON.stringify(headGeomWide));
 
       // ------------------------------------------------- save sweep --
       // The general rule: ANY field, once saved, must re-derive

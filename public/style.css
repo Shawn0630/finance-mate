@@ -169,9 +169,12 @@ td.num, th.num { text-align: right; }
 /* Properties list head: inset to the Portfolio panel's content edges
    (the panel's 1px border + 16px padding) so the title and the
    + Add property button line up with the panel content below, and
-   give the row a panel-scale 16px of air above it (the h2's own top
-   margin yields to the padding so the gap is exactly the padding). */
-#section-properties .section-head { padding: 16px 17px 0; }
+   give the row a panel-scale 16px of air above AND below it — the
+   bottom 16 matches the gap the Portfolio panel itself leaves
+   below it on this page (its 16px margin), so the row never sits
+   flush on the panel (the h2's own top margin yields to the
+   padding so the top gap is exactly the padding). */
+#section-properties .section-head { padding: 16px 17px; }
 #section-properties .section-head h2 { margin-top: 0; }
 .breakdown-card { cursor: pointer; padding: 16px; }
 .breakdown-card:hover { border-color: #1668c4; }
