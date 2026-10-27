@@ -5726,6 +5726,7 @@ try {
       if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
       rr.end();
     });
+    const waitD = (ms) => new Promise((res) => setTimeout(res, ms));
     let pfGate = null; // null | 'hold'
     const held = [];
     const adminCookieD = await loginAs('admin', 'admin');
@@ -5797,24 +5798,38 @@ try {
       const pollState = async (pred, tries = 40) => {
         for (let i = 0; i < tries; i++) {
           try { const s = await loadState(); if (pred(s)) return s; } catch {}
-          await wait(200);
+          await waitD(200);
         }
         return null;
       };
 
-      // Fast path: an ordinary load finishes inside the delay —
-      // the veil never appears and the counter settles at 0.
+      // Fast path: a hub refetch that completes inside the 200ms
+      // delay never shows the veil. (A full navigation of this
+      // suite's 20+-property fixture legitimately takes longer —
+      // the veil showing there is correct — so the fast case is
+      // measured on a single gated refetch through the pf range
+      // button's real loadPortfolio path, released after ~60ms.)
       await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
-      await wait(1200);
-      const fastSeen = await page.evaluate(() => window.__veilSeen);
-      const fastState = await loadState();
-      const fastChart = await page.evaluate(() => {
+      const navSettled = await pollState((s) => s.count === 0 && s.visible === false, 40);
+      const navChart = await page.evaluate(() => {
         const c = window.__fmCharts.portfolio;
         return c ? c.data.datasets.map((d) => d.key) : null;
       });
-      check('fast refetch never shows the loading veil (delayed show) and the counter settles',
-        fastSeen === false && fastState.count === 0 && !!fastChart && fastChart.includes('equity'),
-        JSON.stringify({ fastSeen, fastState, fastChart }));
+      check('the properties view settles with the counter at 0 and the chart drawn',
+        !!navSettled && !!navChart && navChart.includes('equity'),
+        JSON.stringify({ navSettled, navChart }));
+      pfGate = 'hold';
+      await page.evaluate(() => { window.__veilSeen = false; });
+      await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="12"]').click());
+      await waitD(60);
+      const heldN = held.length;
+      await releaseHeld(false);
+      pfGate = null;
+      const fastSettled = await pollState((s) => s.count === 0, 40);
+      const fastSeen = await page.evaluate(() => window.__veilSeen);
+      check('a refetch completing inside the delay never shows the veil (anti-flash)',
+        heldN >= 1 && !!fastSettled && fastSeen === false,
+        JSON.stringify({ heldN, fastSettled, fastSeen }));
 
       // Slow path: hold the portfolio response — the veil
       // appears, the redraw completes once it is released, and
@@ -5851,7 +5866,7 @@ try {
           return b && !b.classList.contains('hidden') && b.textContent.includes('portfolio stub failure')
             ? b.textContent : null;
         });
-        if (!errBanner) await wait(200);
+        if (!errBanner) await waitD(200);
       }
       check('a failed refetch lifts the veil and leaves the error visible in the global banner',
         !!errState && !!errBanner, JSON.stringify({ errState, errBanner }));
