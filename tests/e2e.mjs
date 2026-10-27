@@ -5766,6 +5766,92 @@ try {
       check('after Apply the table shows the AI row and the 2026 subtotal is 10,164',
         await until(() => [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
           .some((x) => x.textContent.includes('2026 total') && x.textContent.includes('10,164'))));
+
+      // ---- Property outline: the floating Docs-style section
+      // index. It must overlay the page (position fixed), leave
+      // the content column exactly as wide as without it, list
+      // the rendered sections in order, jump + highlight on
+      // click, follow the scroll (scrollspy), and collapse to a
+      // round toggle on narrow viewports. ----
+      await page.setViewport({ width: 1500, height: 900 });
+      await wait(600);
+      const outlineEntries = await page.evaluate(() =>
+        [...document.querySelectorAll('#propOutlineList a')].map((a) => a.textContent.trim()));
+      check('the outline lists the page’s sections in order (history rides with the projection)',
+        JSON.stringify(outlineEntries) === JSON.stringify(
+          ['Property Details', 'Value & Mortgage Projection', 'Assessment History', 'Property Costs']),
+        JSON.stringify(outlineEntries));
+      const navFacts = await page.evaluate(() => {
+        const nav = document.querySelector('#propOutline');
+        const main = document.querySelector('main');
+        const withNav = main.getBoundingClientRect().width;
+        nav.style.display = 'none';
+        const withoutNav = main.getBoundingClientRect().width;
+        nav.style.display = '';
+        return {
+          position: getComputedStyle(nav).position,
+          toggleDisplay: getComputedStyle(document.querySelector('#propOutlineToggle')).display,
+          cardVisible: getComputedStyle(document.querySelector('.prop-outline-card')).display !== 'none',
+          withNav, withoutNav,
+        };
+      });
+      check('the outline is a fixed floating card, toggle hidden on a wide viewport',
+        navFacts.position === 'fixed' && navFacts.cardVisible && navFacts.toggleDisplay === 'none',
+        JSON.stringify(navFacts));
+      check('the floating outline takes no layout width (content column identical with/without it)',
+        Math.abs(navFacts.withNav - navFacts.withoutNav) < 0.6,
+        JSON.stringify(navFacts));
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#propOutlineList a')]
+          .find((a) => a.textContent.includes('Property Costs')).click();
+      });
+      check('clicking the Property Costs entry scrolls the costs panel under the topbar',
+        !!(await until(() => {
+          const r = document.querySelector('#costsPanel').getBoundingClientRect();
+          return r.top >= 40 && r.top <= 110;
+        })));
+      check('the clicked entry carries the active highlight',
+        await page.evaluate(() => {
+          const a = document.querySelector('#propOutlineList a.active');
+          return !!a && a.textContent.includes('Property Costs');
+        }));
+      await page.evaluate(() => window.scrollTo(0, 0));
+      check('scrolling back to the top moves the highlight to Property Details (scrollspy)',
+        !!(await until(() => {
+          const a = document.querySelector('#propOutlineList a.active');
+          return !!a && a.textContent.includes('Property Details')
+            && document.querySelector('#propertyOverview').getBoundingClientRect().top >= 40;
+        })));
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#propOutlineList a')]
+          .find((a) => a.textContent.includes('Assessment History')).click();
+      });
+      check('the Assessment History entry opens the history modal',
+        !!(await until(() => !document.querySelector('#historyModal').classList.contains('hidden'))));
+      await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
+      await wait(400);
+      await page.setViewport({ width: 700, height: 900 });
+      await wait(500);
+      const narrowFacts = await page.evaluate(() => ({
+        toggle: getComputedStyle(document.querySelector('#propOutlineToggle')).display,
+        card: getComputedStyle(document.querySelector('.prop-outline-card')).display,
+      }));
+      check('on a narrow viewport the outline collapses to just the round toggle button',
+        narrowFacts.toggle === 'flex' && narrowFacts.card === 'none', JSON.stringify(narrowFacts));
+      await page.evaluate(() => document.querySelector('#propOutlineToggle').click());
+      check('tapping the toggle opens the entry card',
+        !!(await until(() => getComputedStyle(document.querySelector('.prop-outline-card')).display !== 'none')));
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#propOutlineList a')]
+          .find((a) => a.textContent.includes('Property Costs')).click();
+      });
+      check('from the opened card an entry still jumps — and the card closes behind it',
+        !!(await until(() => {
+          const r = document.querySelector('#costsPanel').getBoundingClientRect();
+          return r.top >= 40 && r.top <= 110
+            && !document.querySelector('#propOutline').classList.contains('open');
+        })));
+      await page.setViewport({ width: 800, height: 600 });
       await req('DELETE', `/api/properties/${costUiPid}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.

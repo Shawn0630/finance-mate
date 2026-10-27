@@ -316,3 +316,25 @@ table.seg-table td:last-child { text-align: right; }
 .loading-spinner { width: 44px; height: 44px; border-radius: 50%; border: 4px solid rgba(22, 104, 196, .22); border-top-color: #1668c4; animation: fm-spin .8s linear infinite; }
 @keyframes fm-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .loading-spinner { animation-duration: 2.4s; } }
+
+/* Property detail outline: a Google Docs-style section index that
+   FLOATS over the page's left edge (position: fixed) — the content
+   column keeps its full width and no panel layout makes room for
+   it. Pure text entries, tight leading; the current section (via
+   scrollspy in app.js) is bold with a colour bar on its left.
+   Jump targets clear the sticky topbar via scroll-margin. On
+   narrow viewports the card collapses to a round toggle button
+   and only opens on tap. */
+#view-property [data-outline] { scroll-margin-top: 68px; }
+.prop-outline { position: fixed; left: 14px; top: 50%; transform: translateY(-50%); z-index: 40; }
+.prop-outline-card { width: 182px; background: rgba(255, 255, 255, .97); border: 1px solid #dde4ec; border-radius: 12px; box-shadow: 0 10px 30px rgba(16, 32, 48, .18); padding: 8px 0; }
+.prop-outline-list { list-style: none; margin: 0; padding: 0; }
+.prop-outline-list a { display: block; padding: 6px 14px 6px 13px; border-left: 3px solid transparent; color: #44576a; text-decoration: none; font-size: 13px; line-height: 1.35; cursor: pointer; }
+.prop-outline-list a:hover { background: #f0f4f8; }
+.prop-outline-list a.active { color: #16222e; font-weight: 600; border-left-color: #1668c4; background: #eef4fa; }
+.prop-outline-toggle { display: none; width: 44px; height: 44px; border-radius: 50%; border: 1px solid #dde4ec; background: rgba(255, 255, 255, .97); box-shadow: 0 8px 22px rgba(16, 32, 48, .22); color: #33424f; font-size: 18px; line-height: 1; cursor: pointer; align-items: center; justify-content: center; }
+@media (max-width: 900px) {
+  .prop-outline-toggle { display: flex; }
+  .prop-outline-card { display: none; margin-top: 8px; }
+  .prop-outline.open .prop-outline-card { display: block; }
+}

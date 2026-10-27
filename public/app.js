@@ -1797,6 +1797,87 @@ $('#cancelPropEditBtn').addEventListener('click', () => {
   setPropEditing(false);
 });
 
+// ------------------------------------------------- page outline ---
+// Floating Google Docs-style section index for the property
+// detail page. Entries are built from the panels that actually
+// rendered (each carries data-outline), so a missing section
+// yields no entry. "Assessment History" has no panel of its own
+// on this page — it lives in a modal — so its entry rides along
+// with the projection panel and opens that modal instead of
+// scrolling. Scrollspy highlights the section in view.
+let outlineTargets = [];
+
+function setOutlineActive(id) {
+  document.querySelectorAll('#propOutlineList a[data-target]').forEach((a) =>
+    a.classList.toggle('active', a.dataset.target === id));
+}
+
+function updateOutlineSpy() {
+  if (!outlineTargets.length) return;
+  if ($('#view-property').classList.contains('hidden')) return;
+  const LINE = 84; // the sticky topbar (52px) + breathing room
+  let current = outlineTargets[0];
+  for (const t of outlineTargets) {
+    if (t.el.getBoundingClientRect().top <= LINE) current = t;
+  }
+  // At the very bottom the last section's top may never cross the
+  // line — it is the current one all the same.
+  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) {
+    current = outlineTargets[outlineTargets.length - 1];
+  }
+  if (current) setOutlineActive(current.id);
+}
+
+function closePropOutline() {
+  $('#propOutline').classList.remove('open');
+  $('#propOutlineToggle').setAttribute('aria-expanded', 'false');
+}
+
+function buildPropOutline() {
+  const list = $('#propOutlineList');
+  if (!list) return;
+  list.innerHTML = '';
+  outlineTargets = [];
+  for (const sec of document.querySelectorAll('#view-property [data-outline]')) {
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.textContent = sec.dataset.outline;
+    a.dataset.target = sec.id;
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      setOutlineActive(sec.id);
+      closePropOutline();
+    });
+    li.appendChild(a);
+    list.appendChild(li);
+    outlineTargets.push({ id: sec.id, el: sec });
+    if (sec.id === 'projectionPanel' && $('#openHistoryBtn')) {
+      const hli = document.createElement('li');
+      const ha = document.createElement('a');
+      ha.textContent = 'Assessment History';
+      ha.addEventListener('click', (e) => {
+        e.preventDefault();
+        closePropOutline();
+        $('#openHistoryBtn').click();
+      });
+      hli.appendChild(ha);
+      list.appendChild(hli);
+    }
+  }
+  updateOutlineSpy();
+}
+
+$('#propOutlineToggle').addEventListener('click', () => {
+  const open = $('#propOutline').classList.toggle('open');
+  $('#propOutlineToggle').setAttribute('aria-expanded', String(open));
+});
+document.addEventListener('click', (e) => {
+  const nav = $('#propOutline');
+  if (nav && nav.classList.contains('open') && !nav.contains(e.target)) closePropOutline();
+});
+window.addEventListener('scroll', updateOutlineSpy, { passive: true });
+
 async function loadPropertyDetailImpl(id) {
   const p = await api(`/api/properties/${id}`);
   detailProperty = p;
@@ -1805,6 +1886,7 @@ async function loadPropertyDetailImpl(id) {
   renderPropView(p);
   fillPropForm(p);
   setPropEditing(false);
+  buildPropOutline();
 
   // No source/status prose anywhere: where a value came from is
   // visible in the Assessment History chart and table (each point
