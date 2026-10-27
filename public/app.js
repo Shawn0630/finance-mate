@@ -993,6 +993,7 @@ const CHART_SERIES = {
   portfolio: [
     { key: 'assessed', label: 'Assessed value (all properties)', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
     { key: 'outstanding', label: 'Total outstanding principal', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+    { key: 'equity', label: 'Total equity', bg: '#7c3aed', border: '#7c3aed', bgAlpha: null },
   ],
 };
 let chartColorPrefs = {};
@@ -1287,6 +1288,20 @@ function drawPortfolioChart() {
       ...seriesColors('portfolio', chartSeriesDef('portfolio', 'outstanding')),
       tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
     });
+    const equityByMonth = new Map((portfolioData.equityByMonth || []).map((e) => [e.month, e.value]));
+    const equityData = rows
+      .filter((m) => equityByMonth.get(m.month) != null)
+      .map((m) => ({ x: ymDecimal(m.month), y: equityByMonth.get(m.month) }));
+    if (equityData.length) {
+      datasets.push({
+        type: 'line',
+        key: 'equity',
+        label: 'Total equity',
+        data: equityData,
+        ...seriesColors('portfolio', chartSeriesDef('portfolio', 'equity')),
+        tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
+      });
+    }
     portfolioData.properties.forEach((p, i) => {
       datasets.push({
         type: 'bar',

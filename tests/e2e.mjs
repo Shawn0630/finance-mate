@@ -2892,6 +2892,29 @@ try {
         return c ? { min: c.scales.y.min, max: c.scales.y.max } : null;
       });
       check('portfolio y axis starts at 0', !!pfY && pfY.min === 0, JSON.stringify(pfY));
+      // Total equity line: the endpoint's equityByMonth is the
+      // carry-forward assessed total in force minus the total
+      // outstanding on the same month grid, and the chart plots
+      // exactly those values as its 'equity' dataset.
+      const eqApi = pfApi.data.equityByMonth || [];
+      const assessedInForce = (y) => { let v = null; for (const rw of pfApi.data.assessedByYear) { if (rw.year <= y) v = rw.total; else break; } return v; };
+      const eqIdentityOk = eqApi.length > 0 && eqApi.every((e) => {
+        const a = assessedInForce(Number(e.month.slice(0, 4)));
+        const out = (pfApi.data.outstandingByMonth.find((m) => m.month === e.month) || {}).total;
+        return a === null ? e.value === null : Math.abs(e.value - (Math.round((a - out) * 100) / 100)) < 0.005;
+      });
+      const eqDs = await page.evaluate(() => {
+        const c = window.__fmCharts.portfolio;
+        const ds = c ? c.data.datasets.find((d) => d.key === 'equity') : null;
+        return ds ? { label: ds.label, pts: ds.data } : null;
+      });
+      const eqLastPt = eqDs && eqDs.pts.length ? eqDs.pts[eqDs.pts.length - 1] : null;
+      const eqLastMonth = eqLastPt ? `${Math.floor(eqLastPt.x)}-${String(Math.round((eqLastPt.x - Math.floor(eqLastPt.x)) * 12) + 1).padStart(2, '0')}` : null;
+      const eqApiAtLast = eqLastMonth ? (eqApi.find((e) => e.month === eqLastMonth) || {}).value : null;
+      check('portfolio chart carries a Total equity line equal to assessed (carry-forward) minus outstanding at every month',
+        !!eqDs && eqDs.label === 'Total equity' && eqIdentityOk
+          && !!eqLastPt && eqApiAtLast != null && Math.abs(eqLastPt.y - eqApiAtLast) < 0.005,
+        JSON.stringify({ identityOk: eqIdentityOk, chartLast: eqLastPt, apiAtLast: eqApiAtLast, lastMonth: eqLastMonth }));
       await page.evaluate(() => document.querySelector('#pfRangeBtns button[data-months="12"]').click());
       await wait(600);
       const pf1Pts = await pfPts();
@@ -5593,6 +5616,23 @@ try {
         return ds ? ds.borderColor : null;
       });
       check('recoloring from the right-click-opened panel applies live', pfRecolored === '#0a5c2e', String(pfRecolored));
+      // Total equity takes part like every other series: the
+      // legend toggles it and the Colors panel recolors it.
+      const pfEqPt = await legendPoint('portfolio', 'equity');
+      check('the portfolio legend exposes a Total equity item to click', !!pfEqPt, JSON.stringify(pfEqPt));
+      await page.mouse.click(pfEqPt.x, pfEqPt.y);
+      check('left-clicking the portfolio Total equity item hides the series',
+        await waitLegend('portfolio', 'equity', { visible: false, hidden: true }));
+      const pfEqPt2 = await legendPoint('portfolio', 'equity');
+      await page.mouse.click(pfEqPt2.x, pfEqPt2.y);
+      check('clicking Total equity again restores it',
+        await waitLegend('portfolio', 'equity', { visible: true, hidden: false }));
+      await setColor('portfolio', 'equity', '#5b21b6');
+      const pfEqColor = await page.evaluate(() => {
+        const ds = window.__fmCharts.portfolio.data.datasets.find((d) => d.key === 'equity');
+        return ds ? ds.borderColor : null;
+      });
+      check('recoloring Total equity applies live', pfEqColor === '#5b21b6', String(pfEqColor));
       await req('DELETE', `/api/properties/${colorPid}`);
     } catch (err) {
       check('chart colors browser flow runs to completion', false, String((err && err.message) || err));

@@ -929,6 +929,20 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     return { month, total: r2(total), byProperty };
   });
 
+  // Total equity by month, on the outstanding grid: the
+  // carry-forward assessed total in force that month minus the
+  // total outstanding that month — the card's definition extended
+  // over time. A property joins the outstanding total only from
+  // its first projected month (before that it counts as 0 owed);
+  // months before the first assessed year on record have no
+  // assessed total in force and carry a null equity.
+  const equityByMonth = outstandingByMonth.map(({ month, total }) => {
+    const y = Number(month.slice(0, 4));
+    let assessed = null;
+    for (const row of assessedByYear) { if (row.year <= y) assessed = row.total; else break; }
+    return { month, value: assessed === null ? null : r2(assessed - total) };
+  });
+
   res.json({
     totals: {
       outstanding: totalOutstanding,
@@ -953,6 +967,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     },
     assessedByYear,
     outstandingByMonth,
+    equityByMonth,
     prime: primeStatus(),
     assessmentRefresh: {
       staleIds: props.filter((p) => bcaRefreshStatus(p).stale).map((p) => p.id),
