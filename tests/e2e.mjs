@@ -1328,6 +1328,53 @@ try {
     JSON.stringify({ u: ovCleared.paymentUsed, o: ovCleared.paymentOverridden }));
   await req('DELETE', `/api/properties/${ovPid}`);
 
+  // ---- Segment compounding (API) ----
+  // Each segment carries its own compounding convention:
+  // 'semi_annual' (the default — every pre-existing segment) or
+  // 'monthly'. Interest and payment derivation both price under
+  // the segment's own convention.
+  r = await req('POST', '/api/properties', {
+    address: '11 Compounding Crescent, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-01-01', purchase_date: '2025-06-01', amortization_years: 25,
+  });
+  const cmpPid = r.data.id;
+  r = await req('POST', `/api/properties/${cmpPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5, compounding: 'weekly' });
+  check('an invalid compounding value is a 400',
+    r.status === 400 && String(r.data.error || '').includes('compounding'), JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${cmpPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('a segment created without compounding defaults to semi_annual (the serializer carries it)',
+    r.status === 201 && r.data.compounding === 'semi_annual', JSON.stringify(r.data));
+  const cmpSegId = r.data.id;
+  const cmpBase = (await req('GET', `/api/properties/${cmpPid}/amortization`)).data;
+  check('compounding fixture baseline: semi-annual interest 412.39 and derived payment 581.60',
+    cmpBase.series[0].interest === 412.39 && cmpBase.paymentUsed === 581.6,
+    JSON.stringify({ i: cmpBase.series[0].interest, p: cmpBase.paymentUsed }));
+  r = await req('PUT', `/api/properties/${cmpPid}/rates/${cmpSegId}`, { compounding: 'monthly' });
+  check('a segment compounding write succeeds (200) and the serializer carries monthly',
+    r.status === 200 && r.data.compounding === 'monthly', JSON.stringify(r.data));
+  const cmpMonthly = (await req('GET', `/api/properties/${cmpPid}/amortization`)).data;
+  check('the projection reprices monthly: first interest 416.67 (100,000 x 5%/12), derived payment follows the convention',
+    cmpMonthly.series[0].interest === 416.67
+      && cmpMonthly.paymentUsed === engineDerive(100000, 5, 25, 'monthly')
+      && cmpMonthly.paymentUsed !== cmpBase.paymentUsed,
+    JSON.stringify({ i: cmpMonthly.series[0].interest, p: cmpMonthly.paymentUsed }));
+  const cmpProp = (await req('GET', `/api/properties/${cmpPid}`)).data;
+  check('the property payload segment carries the compounding',
+    cmpProp.segments[0].compounding === 'monthly', JSON.stringify(cmpProp.segments[0]));
+  r = await req('PUT', `/api/properties/${cmpPid}/rates/${cmpSegId}`, { compounding: 'semi_annual' });
+  const cmpBack = (await req('GET', `/api/properties/${cmpPid}/amortization`)).data;
+  check('flipping back to semi_annual restores the baseline projection to the row',
+    r.status === 200 && JSON.stringify(cmpBack.series) === JSON.stringify(cmpBase.series)
+      && cmpBack.paymentUsed === cmpBase.paymentUsed,
+    JSON.stringify({ p: cmpBack.paymentUsed }));
+  r = await req('POST', `/api/properties/${cmpPid}/preview`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5, compounding: 'monthly' });
+  check('a preview draft prices under its own compounding (monthly interest 416.67) while the saved segment stays semi-annual',
+    r.data.ok === true && r.data.interest === 416.67, JSON.stringify(r.data));
+  const cmpAfterPreview = (await req('GET', `/api/properties/${cmpPid}`)).data;
+  check('the preview wrote nothing (saved segment still semi_annual)',
+    cmpAfterPreview.segments[0].compounding === 'semi_annual', JSON.stringify(cmpAfterPreview.segments[0]));
+  await req('DELETE', `/api/properties/${cmpPid}`);
+
   // ---- Per-term payment schedule + balance anchors ----
   // The frequency and payment day live on each term now.
   r = await req('PUT', `/api/properties/${termPid}/terms/${term2Id}`, { payment_frequency: 'daily' });
@@ -3540,6 +3587,95 @@ try {
         ovUiCleared.paymentUsed === 6381.36 && ovUiCleared.paymentOverridden === false,
         JSON.stringify({ u: ovUiCleared.paymentUsed, o: ovUiCleared.paymentOverridden }));
       await req('DELETE', `/api/properties/${ovUiPid}`);
+
+      // ---- Segment compounding, driven through the UI ----
+      // A Prime - 1 segment on $1,350,000 (balance dated
+      // 2025-12-01, so the first projected months price at the
+      // stub history's pinned 4.45 → 3.45%): added as Semi-annual,
+      // deleted and re-added as Monthly — the segment row chip,
+      // the first month's interest and the derived payment all
+      // follow the convention; switching back restores the semi
+      // figures.
+      r = await req('POST', '/api/properties', {
+        address: '888 Compounding UI Road, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2025-12-01', purchase_date: '2025-06-01', amortization_years: 30,
+      });
+      const cmpUiPid = r.data.id;
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, cmpUiPid);
+      await wait(1500);
+      const ensureMortgageModal = async () => {
+        const open = await page.evaluate(() => !document.querySelector('#mortgageModal').classList.contains('hidden'));
+        if (!open) { await page.evaluate(() => document.querySelector('#openMortgageBtn').click()); await wait(800); }
+      };
+      const chipText = () => page.evaluate(() => {
+        const chip = document.querySelector('.seg-table .badge.cmp');
+        return chip ? chip.textContent : null;
+      });
+      const fillSegForm = async (compounding) => {
+        await page.evaluate(() => document.querySelector('[data-toggle-seg]').click());
+        await wait(400);
+        await page.evaluate((cmp) => {
+          const form = document.querySelector('[data-seg-form]');
+          form.start_date.value = '2025-12-01';
+          const type = form.querySelector('[name=rate_type]');
+          type.value = 'variable';
+          type.dispatchEvent(new Event('change', { bubbles: true }));
+          const mode = form.querySelector('[name=rate_mode]');
+          mode.value = 'prime_spread';
+          mode.dispatchEvent(new Event('change', { bubbles: true }));
+          const spread = form.querySelector('[name=spread]');
+          spread.value = '-1';
+          spread.dispatchEvent(new Event('input', { bubbles: true }));
+          const sel = form.querySelector('[name=compounding]');
+          sel.value = cmp;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }, compounding);
+      };
+      await ensureMortgageModal();
+      await fillSegForm('semi_annual');
+      await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
+      check('segment added via the UI carries the Semi-annual chip',
+        await untilNode(async () => (await chipText()) === 'Semi-annual'));
+      const cmpSemiProj = (await req('GET', `/api/properties/${cmpUiPid}/amortization`)).data;
+      check('the semi-annual projection prices the first month at the semi-annual monthly rate',
+        Math.abs(cmpSemiProj.series[0].interest - Math.round(1350000 * engineMonthlyRate(3.45) * 100) / 100) < 0.02
+          && cmpSemiProj.paymentUsed === engineDerive(1350000, 3.45, 30),
+        JSON.stringify({ i: cmpSemiProj.series[0].interest, p: cmpSemiProj.paymentUsed }));
+      // Switch to Monthly: delete the segment and re-add it with
+      // the Monthly compounding selected.
+      await page.evaluate(() => document.querySelector('[data-del-seg]').click());
+      check('the segment deletes through the UI',
+        await untilNode(async () => (await chipText()) === null));
+      await ensureMortgageModal();
+      await fillSegForm('monthly');
+      check('the live preview follows the compounding select (monthly interest shows before saving)',
+        await until(() => {
+          const out = document.querySelector('[data-plan-preview]');
+          return !!out && out.textContent.includes('3,881');
+        }));
+      await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
+      check('the re-added segment carries the Monthly chip',
+        await untilNode(async () => (await chipText()) === 'Monthly'));
+      const cmpMonthlyProj = (await req('GET', `/api/properties/${cmpUiPid}/amortization`)).data;
+      check('the monthly projection: first interest is exactly 1,350,000 x 3.45%/12 = 3,881.25 and the derived payment follows',
+        cmpMonthlyProj.series[0].interest === 3881.25
+          && cmpMonthlyProj.paymentUsed === engineDerive(1350000, 3.45, 30, 'monthly')
+          && cmpMonthlyProj.paymentUsed !== cmpSemiProj.paymentUsed,
+        JSON.stringify({ i: cmpMonthlyProj.series[0].interest, p: cmpMonthlyProj.paymentUsed }));
+      // Switch back to Semi-annual: figures restore.
+      await page.evaluate(() => document.querySelector('[data-del-seg]').click());
+      await untilNode(async () => (await chipText()) === null);
+      await ensureMortgageModal();
+      await fillSegForm('semi_annual');
+      await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
+      check('the segment switched back carries the Semi-annual chip',
+        await untilNode(async () => (await chipText()) === 'Semi-annual'));
+      const cmpBackProj = (await req('GET', `/api/properties/${cmpUiPid}/amortization`)).data;
+      check('switching back restores the semi-annual projection to the row',
+        JSON.stringify(cmpBackProj.series) === JSON.stringify(cmpSemiProj.series)
+          && cmpBackProj.paymentUsed === cmpSemiProj.paymentUsed,
+        JSON.stringify({ p: cmpBackProj.paymentUsed }));
+      await req('DELETE', `/api/properties/${cmpUiPid}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

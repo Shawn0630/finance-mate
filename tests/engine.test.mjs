@@ -512,6 +512,81 @@ test('buildSchedule: an override beats the equal-principal method (the term runs
   assert.deepEqual(r.series, kernel.series);
 });
 
+test('periodicRate: monthly compounding converts at the payment frequency', () => {
+  // (1 + r/12)^(12/N) - 1; for N = 12 exactly r/12.
+  assert.ok(close(periodicRate(5, 12, 'CA', 'monthly') * 100, 5 / 12, 1e-9), periodicRate(5, 12, 'CA', 'monthly'));
+  assert.ok(close(periodicRate(5, 26, 'CA', 'monthly'), Math.pow(1 + 0.05 / 12, 12 / 26) - 1, 1e-12));
+  // The default (and an explicit 'semi_annual') stays the
+  // long-standing convention, to the last digit.
+  assert.equal(periodicRate(5, 12, 'CA'), periodicRate(5, 12, 'CA', 'semi_annual'));
+  assert.equal(periodicRate(5, 26, 'CA'), periodicRate(5, 26, 'CA', 'semi_annual'));
+  assert.ok(close(monthlyRate(5, 'monthly') * 100, 5 / 12, 1e-9), monthlyRate(5, 'monthly'));
+});
+
+test('derivePayment: monthly compounding anchor — $1.35M at 4.95% over 360 months = $7,205.89', () => {
+  // The commitment-letter arithmetic: letter-date rate 4.95%,
+  // monthly compounding, 360 months.
+  assert.equal(derivePayment(1350000, 4.95, 30, 'monthly'), 7205.89);
+  // The semi-annual default derives a different figure ($7,164.57).
+  assert.equal(derivePayment(1350000, 4.95, 30), 7164.57);
+  assert.equal(derivePayment(1350000, 4.95, 30, 'semi_annual'), 7164.57);
+});
+
+test('buildSchedule compounding: the real RBC shape — monthly vs semi-annual balances to the cent', () => {
+  // His real mortgage: $1,350,000 from 2024-12-17, Prime - 1
+  // (BoC V80691311, month-end pricing; the weekly series lags
+  // each cut by days, so January and October 2025 still price at
+  // the pre-cut prime), payment override $7,207.10. The rate
+  // ladder is therefore 4.45 / 4.20 / 3.95 (Mar-Aug) / 3.70
+  // (Sep-Oct) / 3.45 (Nov on).
+  const primeHistory = [
+    { date: '2024-12-18', rate: 5.45 }, { date: '2025-02-05', rate: 5.20 },
+    { date: '2025-03-19', rate: 4.95 }, { date: '2025-09-24', rate: 4.70 },
+    { date: '2025-11-05', rate: 4.45 },
+  ];
+  const mk = (compounding) => buildSchedule({
+    balance: 1350000, balanceDate: '2024-12-17', primeHistory,
+    terms: [{ id: 1, start_date: '2024-12-17', amortization_years: 30, payment_override: 7207.10 }],
+    segments: [{ id: 1, start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, ...(compounding ? { compounding } : {}) }],
+  });
+  const bal = (r, m) => r.series.find((x) => x.month === m).balance;
+  // Semi-annual — the long-standing default. Omitting the field
+  // and naming it agree to the cent (zero migration regression).
+  assert.equal(bal(mk(), '2026-05'), 1297655.44);
+  assert.equal(bal(mk(), '2026-09'), 1283583.82);
+  assert.equal(bal(mk('semi_annual'), '2026-05'), 1297655.44);
+  assert.equal(bal(mk('semi_annual'), '2026-09'), 1283583.82);
+  // Monthly compounding — his contract's convention ("calculated
+  // not in advance, at the same frequency as your payments"):
+  // the externally verified balances.
+  assert.equal(bal(mk('monthly'), '2026-05'), 1298221.75);
+  assert.equal(bal(mk('monthly'), '2026-09'), 1284262.85);
+});
+
+test('buildSchedule compounding: each month prices under its own segment’s convention', () => {
+  // 6% fixed semi-annual, then the same 6% as a monthly-compounded
+  // segment from 2026-03: February charges the semi-annual monthly
+  // rate, March charges exactly 6%/12 — and the March recast
+  // derives under the NEW segment's convention.
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
+    { start_date: '2026-03-01', rate_type: 'fixed', annual_rate: 6, compounding: 'monthly' },
+  ];
+  const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments });
+  const feb = r.series[0];
+  const mar = r.series[1];
+  assert.equal(feb.interest, 493.86); // hand anchor: 6% semi-annual monthly rate
+  assert.equal(mar.interest, 499.27); // round2(99,854.05 x 6% / 12)
+  assert.equal(mar.interest, Math.round(feb.balance * 0.005 * 100) / 100);
+  // The recast payment is the monthly-compounding derivation
+  // against the extrapolated payoff (299 months out), not the
+  // semi-annual one ($639.81).
+  assert.equal(mar.payment, derivePayment(feb.balance, 6, 299 / 12, 'monthly'));
+  assert.equal(mar.payment, 644.29);
+  assert.notEqual(mar.payment, derivePayment(feb.balance, 6, 299 / 12, 'semi_annual'));
+});
+
 test('buildSchedule: no amortization is a named no_payment state', () => {
   const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
   const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: null }];

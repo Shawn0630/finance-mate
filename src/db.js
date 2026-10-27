@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS rate_segments (
   annual_rate REAL,                   -- nominal annual %; NULL for prime-spread segments
   rate_mode TEXT,                     -- 'absolute' | 'prime_spread' (variable only)
   spread REAL,                        -- prime_spread only: percentage points vs prime (e.g. -1 = Prime - 1)
+  compounding TEXT NOT NULL DEFAULT 'semi_annual',  -- 'semi_annual' | 'monthly': how this segment's nominal rate compounds
   created_at TEXT NOT NULL
 );
 -- Prime lending rate history, fetched from the region's prime
@@ -304,6 +305,12 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   if (segCols.length && !segCols.includes('term_id')) {
     db.exec('ALTER TABLE rate_segments ADD COLUMN term_id INTEGER REFERENCES mortgage_terms(id) ON DELETE SET NULL');
     db.exec('CREATE INDEX IF NOT EXISTS idx_segments_term ON rate_segments(term_id)');
+  }
+  // Per-segment compounding: every existing segment was priced
+  // semi-annually (the only convention the engine had), so the
+  // column lands with that default and no projection moves.
+  if (segCols.length && !segCols.includes('compounding')) {
+    db.exec("ALTER TABLE rate_segments ADD COLUMN compounding TEXT NOT NULL DEFAULT 'semi_annual'");
   }
   // Terms from before repayment methods existed are level-payment
   // plans — the only shape the engine had — so the column lands

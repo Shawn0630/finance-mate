@@ -310,6 +310,7 @@ function segmentView(seg) {
   return {
     ...seg,
     rate_mode: seg.rate_mode || 'absolute',
+    compounding: seg.compounding || 'semi_annual',
     effective_rate: segmentAnnualRate(seg, prime ? prime.rate : null),
   };
 }
@@ -1186,10 +1187,15 @@ function cleanSegment(b, base) {
     rate_mode: b.rate_mode !== undefined ? b.rate_mode : base?.rate_mode || 'absolute',
     annual_rate: b.annual_rate !== undefined ? num(b.annual_rate) : base?.annual_rate ?? null,
     spread: b.spread !== undefined ? num(b.spread) : base?.spread ?? null,
+    // How the segment's nominal rate compounds: 'semi_annual'
+    // (the Canadian standard, and every existing segment) or
+    // 'monthly' (compounded at the payment frequency).
+    compounding: b.compounding !== undefined ? b.compounding : base?.compounding || 'semi_annual',
   };
   if (!next.start_date) return { error: 'start_date is required' };
   if (!['fixed', 'variable'].includes(next.rate_type)) return { error: 'rate_type must be fixed or variable' };
   if (!['absolute', 'prime_spread'].includes(next.rate_mode)) return { error: 'rate_mode must be absolute or prime_spread' };
+  if (!['semi_annual', 'monthly'].includes(next.compounding)) return { error: "compounding must be 'semi_annual' or 'monthly'" };
   if (next.rate_type === 'fixed') { next.rate_mode = 'absolute'; next.spread = null; }
   if (next.rate_mode === 'prime_spread') {
     if (next.rate_type !== 'variable') return { error: 'prime-based pricing is only for variable segments' };
@@ -1233,8 +1239,8 @@ app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
   const info = db
-    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, nowIso());
+    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, nowIso());
   res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
 });
 
@@ -1247,8 +1253,8 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   const owner = segmentTermId(p, req.body || {}, seg);
   if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
-  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=? WHERE id=?')
-    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, seg.id);
+  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=? WHERE id=?')
+    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, seg.id);
   res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
 });
 
@@ -1585,6 +1591,7 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
     id: 0, property_id: p.id, term_id: null, created_at: nowIso(),
     start_date: draft.start_date, rate_type: draft.rate_type,
     rate_mode: draft.rate_mode, annual_rate: draft.annual_rate, spread: draft.spread,
+    compounding: draft.compounding,
   });
   segments.sort((a, z) => (a.start_date < z.start_date ? -1 : a.start_date > z.start_date ? 1 : a.id - z.id));
   // The term the draft belongs to (the one named, else the one in

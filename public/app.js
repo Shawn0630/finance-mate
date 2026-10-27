@@ -1119,7 +1119,7 @@ function segRowsHtml(segs) {
     return `<tr>
     <td>${esc(s.start_date)}</td>
     <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}</td>
-    <td class="num">${rateCell}</td>
+    <td class="num">${rateCell} <span class="badge cmp">${s.compounding === 'monthly' ? 'Monthly' : 'Semi-annual'}</span></td>
     <td><button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`;
   }).join('')
     || '<tr><td colspan="4" class="note" style="margin:0">No segments in this term yet — add one with "+ Change rate".</td></tr>';
@@ -1146,6 +1146,7 @@ function segFormHtml(t) {
     <div class="grid3">
       <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
       <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div></div>
+      <div><label>Compounding</label><select name="compounding"><option value="semi_annual">Semi-annual</option><option value="monthly">Monthly</option></select></div>
     </div>
     <div class="toolbar">
       <button class="primary" type="submit">Add segment</button>
@@ -1406,7 +1407,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
       showMsg($('#mortgageMsg'), 'ok', 'Term saved.');
     } else if (form.dataset.segForm) {
       const f = Object.fromEntries(new FormData(form).entries());
-      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm) };
+      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm), compounding: f.compounding || 'semi_annual' };
       if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
         body.rate_mode = 'prime_spread';
         body.spread = f.spread === '' ? null : Number(f.spread);
@@ -1705,6 +1706,7 @@ function refreshPlanPreview(form) {
       start_date: f.start_date,
       rate_type: f.rate_type,
       term_id: Number(form.dataset.segForm),
+      compounding: f.compounding || 'semi_annual',
       repayment_method: termForm ? termForm.repayment_method.value : 'equal_payment',
       amortization_years: termForm && termForm.amortization_years.value !== ''
         ? Number(termForm.amortization_years.value) : null,

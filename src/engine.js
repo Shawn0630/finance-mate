@@ -2,28 +2,36 @@
 //
 // The interest convention itself is region-specific and comes from
 // the region implementation (src/regions/): for Canada a quoted
-// annual rate is nominal with semi-annual compounding, so the
-// equivalent monthly rate is
+// annual rate is nominal with semi-annual compounding by default,
+// so the equivalent monthly rate is
 //   i = (1 + r/2)^(1/6) - 1        (r = annual rate as a fraction)
-// Fixed and variable segments use the same formula. A variable
+// A segment whose contract compounds at the payment frequency
+// instead (segment.compounding = 'monthly') converts with
+// i = r/12; each month is priced under the convention of the
+// segment in effect in that month, and payment derivation uses
+// the convention of the segment in effect at derivation time.
+// Fixed and variable segments alike carry the choice. A variable
 // segment priced off prime resolves MONTH BY MONTH against the
 // tracked prime history (src/prime.js): each projected month pays
 // the prime in effect in that month, and only months beyond the
 // last stored observation hold at the latest known prime.
 import { getRegion } from './regions/index.js';
 
-export function monthlyRate(annualRatePct) {
-  return getRegion('CA').periodRate(annualRatePct, 12);
+export function monthlyRate(annualRatePct, compounding) {
+  return getRegion('CA').periodRate(annualRatePct, 12, compounding);
 }
 
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 // --------------------------------------------------------- payment frequency --
 // The six Canadian mortgage payment frequencies. The rate per
-// payment period comes from the region implementation (Canada:
-//   i = (1 + r/2)^(2/N) - 1        (N = periods per year)
-// — nominal with semi-annual compounding. For monthly (N = 12)
-// that is exactly monthlyRate() above.
+// payment period comes from the region implementation, under the
+// compounding convention of the segment in effect in that period
+// (segment.compounding — Canada: nominal with semi-annual
+// compounding by default, i = (1 + r/2)^(2/N) - 1; 'monthly'
+// compounds at the payment frequency instead, i = (1 + r/12)^(12/N)
+// - 1). For monthly (N = 12) the semi-annual form is exactly
+// monthlyRate() above.
 // stepDays > 0 marks the day-stepped schedules (weekly / bi-weekly);
 // monthly and semi-monthly step by calendar months instead.
 export const FREQUENCIES = {
@@ -36,8 +44,8 @@ export const FREQUENCIES = {
 };
 export const FREQUENCY_KEYS = Object.keys(FREQUENCIES);
 
-export function periodicRate(annualRatePct, periodsPerYear, regionCode = 'CA') {
-  return getRegion(regionCode).periodRate(annualRatePct, periodsPerYear);
+export function periodicRate(annualRatePct, periodsPerYear, regionCode = 'CA', compounding) {
+  return getRegion(regionCode).periodRate(annualRatePct, periodsPerYear, compounding);
 }
 
 // The stored payment is a MONTHLY amount; the per-period amount follows
@@ -189,11 +197,14 @@ export function segmentRateForMonth(seg, monthKey, primeForMonth) {
 }
 
 // Derive a monthly payment from a balance, an annual rate and a remaining
-// amortization in years:  P = B * i / (1 - (1 + i)^-n)
-export function derivePayment(balance, annualRatePct, years) {
+// amortization in years:  P = B * i / (1 - (1 + i)^-n). The monthly
+// rate i follows the rate's compounding convention ('semi_annual'
+// unless the segment says 'monthly') — a payment is always derived
+// in the same convention the interest will be charged in.
+export function derivePayment(balance, annualRatePct, years, compounding) {
   const n = Math.round(Number(years) * 12);
   if (!(n > 0) || !(balance > 0)) return 0;
-  const i = monthlyRate(annualRatePct);
+  const i = monthlyRate(annualRatePct, compounding);
   if (i <= 0) return round2(balance / n);
   return round2((balance * i) / (1 - Math.pow(1 + i, -n)));
 }
@@ -211,7 +222,11 @@ export function derivePayment(balance, annualRatePct, years) {
 //                 plus the interest on the balance at that period's
 //                 own rate, so the total payment declines month by
 //                 month as the balance falls.
-//   segments:     [{ start_date, rate_type, annual_rate }] sorted by start
+//   segments:     [{ start_date, rate_type, annual_rate,
+//                 compounding }] sorted by start; a segment's
+//                 compounding ('semi_annual' default, or
+//                 'monthly') converts its rate in every period it
+//                 governs (see the region's periodRate).
 //   paymentDay:   optional 1..31, the day of the month the payment is
 //                 deducted. For monthly / semi-monthly it ANCHORS each
 //                 node's `date`; the interest math never depends on it.
@@ -264,7 +279,9 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
     const seg = segmentForMonth(segments, monthKey);
     const annualRate = segmentRateForMonth(seg, monthKey, primeForMonth);
     if (annualRate === null) throw new Error('a prime-based segment cannot be projected without a prime rate');
-    const i = periodicRate(annualRate, f.periodsPerYear, region);
+    // The period's interest converts under THIS segment's own
+    // compounding convention (semi-annual unless it says monthly).
+    const i = periodicRate(annualRate, f.periodsPerYear, region, seg ? seg.compounding : undefined);
     const interest = round2(bal * i);
     let principal;
     let paid;
@@ -515,12 +532,15 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
     const rateMonth = S === A && term && monthIdxOf(term.start_date) === A
       ? ymKeyOfIdx(A)
       : ymKeyOfIdx(S + 1);
-    const rate = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S + 1)), rateMonth, primeForMonth);
+    const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
+    const rate = segmentRateForMonth(seg, rateMonth, primeForMonth);
     if (rate === null) return { error: 'no_prime' };
     if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
     if (remaining <= 0) return { payment: round2(balNow) }; // past the amortization: clear it (simulate caps at balance + interest)
-    return { payment: derivePayment(balNow, rate, remaining / 12) };
+    // Derived in the segment's own compounding convention — the
+    // same one its interest will be charged in.
+    return { payment: derivePayment(balNow, rate, remaining / 12, seg ? seg.compounding : undefined) };
   };
 
   // The repayment method governing months after state point S is
@@ -599,19 +619,23 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   // amortization, or beyond the projection cap), fall back to the
   // term's remaining amortization (computePayment).
   const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
-    const newRate = segmentRateForMonth(segmentForMonth(segments, ymKeyOfIdx(S + 1)), ymKeyOfIdx(S + 1), primeForMonth);
+    const newSeg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
+    const newRate = segmentRateForMonth(newSeg, ymKeyOfIdx(S + 1), primeForMonth);
     if (newRate === null) return { error: 'no_prime' };
     const prevSeg = segmentForMonth(segments, ymKeyOfIdx(S));
     const prevRate = segmentRateForMonth(prevSeg, ymKeyOfIdx(S), primeForMonth);
     if (prevRate !== null && lastPayment > 0) {
+      // The pre-change trajectory is extrapolated under the OLD
+      // segment's compounding; the recast payment is derived
+      // under the NEW segment's.
       const hypo = simulate({
         balance: balNow, balanceDate: balanceDateAtS, payment: lastPayment,
-        segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: prevRate }],
+        segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: prevRate, compounding: prevSeg ? prevSeg.compounding : undefined }],
         paymentDay: scheduleAt(S).paymentDay, frequency: scheduleAt(S).frequency, maxMonths: A + maxMonths - S, primeRate, region,
       });
       if (hypo.payoffMonth) {
         const monthsLeft = monthIdxOf(hypo.payoffMonth) - S;
-        if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12) };
+        if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12, newSeg ? newSeg.compounding : undefined) };
       }
     }
     return computePayment(S, balNow);

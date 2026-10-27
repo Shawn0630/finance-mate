@@ -24,11 +24,19 @@ export const code = 'CA';
 export const label = 'Canada';
 
 // Per-period rate for a nominal annual rate (in %) over
-// periodsPerYear payment periods: i = (1 + r/2)^(2/N) - 1.
-// For N = 12 this is the familiar Canadian monthly rate.
-export function periodRate(annualRatePct, periodsPerYear) {
+// periodsPerYear payment periods, under the rate's compounding
+// convention (a per-segment fact — the contract states it):
+//   - 'semi_annual' (the Canadian standard, the default): the
+//     nominal rate compounds semi-annually, i = (1 + r/2)^(2/N) - 1.
+//     For N = 12 this is the familiar Canadian monthly rate.
+//   - 'monthly': the nominal rate compounds at the payment
+//     frequency ("calculated not in advance, at the same frequency
+//     as your payments" — e.g. RBC variable-rate contracts),
+//     i = (1 + r/12)^(12/N) - 1; for N = 12 that is simply r/12.
+export function periodRate(annualRatePct, periodsPerYear, compounding = 'semi_annual') {
   const r = Number(annualRatePct) / 100;
   if (!isFinite(r) || r <= 0) return 0;
+  if (compounding === 'monthly') return Math.pow(1 + r / 12, 12 / periodsPerYear) - 1;
   return Math.pow(1 + r / 2, 2 / periodsPerYear) - 1;
 }
 
