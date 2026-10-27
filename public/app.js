@@ -366,9 +366,100 @@ let assetsLoaded = false;
 // are cached after their first load, and without the dirty mark a
 // user who edits on the detail page comes back to totals and charts
 // that predate the edit until a manual reload.
+// ------------------------------------------------------------- loading ---
+// One global loading veil for re-renders: every hub load (assets +
+// portfolio, property detail and its chart/trend/equity sub-loads,
+// asset detail, admin) runs inside withLoading, so a slow refetch
+// never leaves the interface half-updated — a full-screen blurred
+// veil with a spinner covers the redraw. Counting: overlapping
+// loads nest and the veil lifts only when the last one finishes,
+// on success AND on failure — a failed load shows its error in
+// #globalError and rethrows, exactly as un-wrapped callers
+// expect. Anti-flash: the veil appears only when work outlasts
+// 200ms, and once shown it stays at least 200ms, so fast redraws
+// never see it (the same flash class the carousel fix removed).
+const Loading = (() => {
+  const SHOW_AFTER_MS = 200;
+  const MIN_VISIBLE_MS = 200;
+  let count = 0;
+  let showTimer = null;
+  let shownAt = 0;
+  const el = () => document.getElementById('globalLoading');
+  function paint() {
+    const e = el();
+    if (!e) return;
+    if (count > 0) {
+      if (!shownAt && !showTimer) {
+        showTimer = setTimeout(() => {
+          showTimer = null;
+          if (count > 0) {
+            shownAt = Date.now();
+            e.classList.remove('hidden');
+            e.setAttribute('aria-busy', 'true');
+          }
+        }, SHOW_AFTER_MS);
+      }
+    } else {
+      if (showTimer) { clearTimeout(showTimer); showTimer = null; }
+      if (shownAt) {
+        const hide = () => {
+          shownAt = 0;
+          const n = el();
+          if (n && count === 0) {
+            n.classList.add('hidden');
+            n.removeAttribute('aria-busy');
+          }
+        };
+        const wait = MIN_VISIBLE_MS - (Date.now() - shownAt);
+        if (wait > 0) setTimeout(hide, wait); else hide();
+      }
+    }
+  }
+  return {
+    begin() { count++; paint(); },
+    end() { count = Math.max(0, count - 1); paint(); },
+    state() { const e = el(); return { count, visible: !!e && !e.classList.contains('hidden') }; },
+  };
+})();
+window.__fmLoading = Loading;
+
+function showGlobalError(err) {
+  const b = document.getElementById('globalError');
+  if (!b) return;
+  b.textContent = err && err.message ? err.message : String(err);
+  b.classList.remove('hidden');
+}
+function clearGlobalError() {
+  const b = document.getElementById('globalError');
+  if (b) { b.classList.add('hidden'); b.textContent = ''; }
+}
+
+async function withLoading(fn) {
+  Loading.begin();
+  try {
+    const r = await fn();
+    clearGlobalError();
+    return r;
+  } catch (err) {
+    showGlobalError(err);
+    throw err;
+  } finally {
+    Loading.end();
+  }
+}
+
+async function loadAssets(force = false) { return withLoading(() => loadAssetsImpl(force)); }
+async function loadPortfolio() { return withLoading(() => loadPortfolioImpl()); }
+async function loadPropertyDetail(id) { return withLoading(() => loadPropertyDetailImpl(id)); }
+async function loadAssetDetail(id) { return withLoading(() => loadAssetDetailImpl(id)); }
+async function loadAdmin() { return withLoading(() => loadAdminImpl()); }
+async function loadChart(id) { return withLoading(() => loadChartImpl(id)); }
+async function loadTrend(id) { return withLoading(() => loadTrendImpl(id)); }
+async function loadEquity(id) { return withLoading(() => loadEquityImpl(id)); }
+
 function markAssetsDirty() { assetsLoaded = false; }
 
-async function loadAssets(force = false) {
+async function loadAssetsImpl(force = false) {
   if (assetsLoaded && !force) return;
   assetsLoaded = true;
   const [summary, properties, assets] = await Promise.all([
@@ -517,7 +608,7 @@ async function deleteAsset(id) {
 window.deleteAsset = deleteAsset;
 
 // ------------------------------------------------------------ asset detail ---
-async function loadAssetDetail(id) {
+async function loadAssetDetailImpl(id) {
   let a;
   try { a = await api('/api/assets/' + id); }
   catch { $('#assetDetailTitle').textContent = 'Asset not found'; $('#assetDetailBody').innerHTML = ''; return; }
@@ -899,7 +990,7 @@ function renderPrimeWarning(el, status) {
   }
 }
 
-async function loadPortfolio() {
+async function loadPortfolioImpl() {
   const block = $('#portfolioBlock');
   portfolioData = await api('/api/properties/portfolio');
   renderPrimeWarning($('#pfPrimeWarning'), portfolioData && portfolioData.prime);
@@ -1705,7 +1796,7 @@ $('#cancelPropEditBtn').addEventListener('click', () => {
   setPropEditing(false);
 });
 
-async function loadPropertyDetail(id) {
+async function loadPropertyDetailImpl(id) {
   const p = await api(`/api/properties/${id}`);
   detailProperty = p;
   photoIndex = 0;
@@ -2783,7 +2874,7 @@ $('#deletePropertyBtn').addEventListener('click', async () => {
 let trendPoints = [];
 let trendEditingId = null;
 
-async function loadTrend(id) {
+async function loadTrendImpl(id) {
   const r = await api(`/api/properties/${id}/value-history`);
   trendPoints = r.points;
   // The details panel's headline assessed figure follows the same
@@ -3053,7 +3144,7 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 // The projection only ever comes from the user's own rate plan (segments);
 // with no plan the API reports NO_RATE_PLAN and the projection stays
 // absent with a prompt instead of a made-up line.
-async function loadChart(id) {
+async function loadChartImpl(id) {
   scheduleYear = null; // a new property's schedule opens on its default page
   const r = await api(`/api/properties/${id}/amortization`);
   if (!r.ok) {
@@ -3068,7 +3159,7 @@ async function loadChart(id) {
   renderDetailCharts();
 }
 
-async function loadEquity(id) {
+async function loadEquityImpl(id) {
   equityData = await api(`/api/properties/${id}/equity`);
   renderEquity();
 }
@@ -3793,7 +3884,7 @@ async function refreshAvatarConsumers(changedUserId) {
   loadAdmin();
 }
 
-async function loadAdmin() {
+async function loadAdminImpl() {
   const msg = $('#adminMsg');
   let users;
   try { users = await api('/api/admin/users'); }

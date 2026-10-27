@@ -23,6 +23,7 @@
   <button id="logoutBtn" class="small">Sign out</button>
 </header>
 <main>
+  <div id="globalError" class="msg err hidden" role="alert"></div>
   <!-- ============================== Assets ============================== -->
   <section id="view-assets" class="hidden">
     <nav class="subnav" id="assetsNav">
@@ -353,6 +354,10 @@
         <button type="button" id="trendCancelBtn" class="hidden">Cancel edit</button>
       </form>
   </div>
+</div>
+
+<div id="globalLoading" class="loading-veil hidden" role="status" aria-label="Loading">
+  <div class="loading-spinner" aria-hidden="true"></div>
 </div>
 
 <script src="/app.js"></script>
