@@ -660,15 +660,21 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   if (b.mortgage_payment !== undefined) {
     return res.status(400).json({ error: 'the monthly payment is calculated automatically and cannot be entered' });
   }
-  // Adding a property takes just the essentials (address + outstanding
-  // balance; owner optional). The balance is the CURRENT balance, so its
-  // date defaults to today unless one is supplied. Everything else
-  // (payment, amortization, segments, notes, photo) is filled in later
-  // on the detail page.
+  // Adding a property takes just the essentials (address +
+  // purchase date; owner optional). The outstanding principal is
+  // OPTIONAL: with one, the balance is the CURRENT balance, so its
+  // date defaults to today unless one is supplied, and it seeds
+  // the balance anchor exactly as before; without one the
+  // property is added with no mortgage anchor at all (Term 1
+  // opens empty) and the mortgage is filled in later from the
+  // detail page's Mortgage modal. A balance date supplied on its
+  // own seeds nothing — the anchor is the pair or neither.
   const balance = num(b.mortgage_balance);
-  if (balance === null || balance < 0) {
-    return res.status(400).json({ error: 'outstanding principal is required' });
+  if (balance !== null && balance < 0) {
+    return res.status(400).json({ error: 'outstanding principal must be a number >= 0' });
   }
+  const balanceDate = balance === null ? null
+    : (b.mortgage_balance_date || new Date().toISOString().slice(0, 10));
   // Purchase date is required when adding (the column itself stays
   // nullable for properties recorded before it existed). It is NOT the
   // balance date: the balance date defaults to today (current balance),
@@ -709,7 +715,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       num(b.assessed_year),
       b.assessed_value != null ? 'manual' : null,
       balance,
-      b.mortgage_balance_date || new Date().toISOString().slice(0, 10),
+      balanceDate,
       amortYears,
       b.lender ? String(b.lender).trim() || null : null,
       b.notes || null,
@@ -730,7 +736,10 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   // the amortization / lender given at add time (either may be
   // filled in later — until the term has an amortization, the
   // projection reports NO_PAYMENT; the payment itself is always
-  // calculated, never entered).
+  // calculated, never entered). With no principal given, the term
+  // opens empty (NULL balance, starting today) and the anchor
+  // arrives when the term's opening balance is first saved (see
+  // the term PUT handler).
   db.prepare(
     `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
@@ -1685,6 +1694,23 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     if (submittedBalance != null && submittedDate) {
       db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
         .run(submittedBalance, submittedDate, nowIso(), p.id);
+    }
+  }
+  // A property added without a principal has no balance anchor at
+  // all: the first mortgage figure it ever gets is its earliest
+  // term's opening balance, entered in this same modal — seed the
+  // anchor from that pair (the pair the Add form used to seed at
+  // creation), so the mortgage can project from here. An existing
+  // anchor is never overwritten by this; it moves only through
+  // its own principal pair above.
+  {
+    const fresh = getProperty(p.id);
+    if (fresh.mortgage_balance == null && t.opening_balance != null) {
+      const earliest = termsOf(p.id)[0];
+      if (earliest && earliest.id === term.id) {
+        db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
+          .run(t.opening_balance, t.start_date, nowIso(), p.id);
+      }
     }
   }
   syncTermAnchor(getProperty(p.id));

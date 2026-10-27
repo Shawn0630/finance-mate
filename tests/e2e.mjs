@@ -551,8 +551,35 @@ try {
   // to fill in, and with no rate plan yet the projection is the
   // NO_RATE_PLAN prompt state. Purchase date is required at add time
   // (the column itself stays nullable for older rows).
+  // The outstanding principal itself is OPTIONAL: a request with
+  // no balance at all is rejected only for the still-missing
+  // purchase date, never for the principal.
   r = await req('POST', '/api/properties', { address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'] });
-  check('add without balance rejected', r.status === 400 && String(r.data.error || '').includes('principal'), JSON.stringify(r.data));
+  check('add without balance is not rejected for the principal (the missing purchase date is what blocks it)',
+    r.status === 400 && String(r.data.error || '') === 'purchase date is required', JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', {
+    address: '8 No Principal Lane, Victoria, BC', owners: ['Shawn'], purchase_date: '2021-05-14',
+  });
+  check('add without balance succeeds: no anchor, no balance date, Term 1 opens empty',
+    r.status === 201 && r.data.mortgage_balance === null && r.data.mortgage_balance_date === null
+      && r.data.terms[0].opening_balance === null,
+    JSON.stringify({ b: r.data.mortgage_balance, bd: r.data.mortgage_balance_date, open: r.data.terms[0] && r.data.terms[0].opening_balance }));
+  const pidNoBal = r.data.id;
+  r = await req('POST', '/api/properties', {
+    address: '9 Date Only Lane, Victoria, BC', purchase_date: '2021-05-14', mortgage_balance_date: '2020-01-01',
+  });
+  check('a balance date on its own seeds no anchor (balance and date both stay null)',
+    r.status === 201 && r.data.mortgage_balance === null && r.data.mortgage_balance_date === null,
+    JSON.stringify({ b: r.data.mortgage_balance, bd: r.data.mortgage_balance_date }));
+  const pidDateOnly = r.data.id;
+  r = await req('POST', '/api/properties', {
+    address: '10 Negative Lane, Victoria, BC', purchase_date: '2021-05-14', mortgage_balance: -5,
+  });
+  check('a negative principal is still rejected', r.status === 400 && String(r.data.error || '').includes('principal'), JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${pidNoBal}/amortization`);
+  check('a balance-less property reports no outstanding principal (a named state, not a crash)',
+    r.data.ok === false && String(r.data.error || '').includes('no outstanding principal'), JSON.stringify(r.data).slice(0, 160));
+  await req('DELETE', `/api/properties/${pidDateOnly}`);
   r = await req('POST', '/api/properties', {
     address: '7 Slim Lane, Victoria, BC', owners: ['Shawn'], mortgage_balance: 123456,
   });
@@ -1890,18 +1917,21 @@ try {
       const fieldVal = (sel) => page.evaluate((s) => { const el = document.querySelector(s); return el ? el.value : null; }, sel);
       const focusField = (sel) => page.evaluate((s) => { const el = document.querySelector(s); el.focus(); if (el.select) el.select(); }, sel);
 
-      // Add a property typing a bare number: it must group live, and
-      // the server must store the plain number.
+      // Add a property through the form: it carries NO principal
+      // field anymore (the mortgage is filled in later), so the
+      // property lands with no balance. The principal is then
+      // typed into the term card's principal field — a bare number
+      // must group live there — and the server must store the
+      // plain number, as the term's opening and as the anchor
+      // seeded from it.
       await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
       await page.evaluate(() => document.querySelector('#addPropertyBtn').click());
       await wait(500);
+      const addHasBalance = await page.evaluate(() => !!document.querySelector('#addPropForm [name=mortgage_balance]'));
+      check('the Add Property form has no Outstanding principal field', addHasBalance === false);
       await focusField('#addPropForm .address-input');
       await page.keyboard.type('999 Money Test Terrace, Victoria, BC');
-      await focusField('#addPropForm [name=mortgage_balance]');
-      await page.keyboard.type('1350000');
-      const typedBalance = await fieldVal('#addPropForm [name=mortgage_balance]');
-      check('add-property balance groups while typing (1350000 -> 1,350,000)', typedBalance === '1,350,000', String(typedBalance));
       await page.evaluate(() => {
         const d = document.querySelector('#addPropForm [name=purchase_date]');
         d.value = '2024-12-17';
@@ -1911,17 +1941,30 @@ try {
       await wait(2500);
       r = await req('GET', '/api/properties');
       const moneyProp = (r.data || []).find((p) => p.address.includes('Money Test Terrace'));
-      check('typed grouped balance stored as the plain number 1350000',
-        !!moneyProp && moneyProp.mortgage_balance === 1350000, JSON.stringify(moneyProp && moneyProp.mortgage_balance));
+      check('added without a principal: the property exists with no balance anchor',
+        !!moneyProp && moneyProp.mortgage_balance === null, JSON.stringify(moneyProp && moneyProp.mortgage_balance));
       const moneyPid = moneyProp.id;
 
-      // Reopening the record: the modal's read-only metadata shows
-      // the grouped current principal, and the current term's card
-      // (which carries the principal pair) opens grouped too.
+      // Fill the mortgage in from the Mortgage modal: typing a
+      // bare number into Term 1's principal field groups it live.
       await page.goto(`http://ff.local/#property/${moneyPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(500);
+      await focusField('[data-term-form] [name=opening_balance]');
+      await page.keyboard.type('1350000');
+      const typedBalance = await fieldVal('[data-term-form] [name=opening_balance]');
+      check('term-card principal groups while typing (1350000 -> 1,350,000)', typedBalance === '1,350,000', String(typedBalance));
+      await page.evaluate(() => document.querySelector('[data-save-term]').click());
+      await wait(1400);
+      r = await req('GET', `/api/properties/${moneyPid}`);
+      check('typed grouped principal stored plain: Term 1 opening 1350000 and the anchor seeded from it',
+        r.data.terms[0].opening_balance === 1350000 && r.data.mortgage_balance === 1350000,
+        JSON.stringify({ open: r.data.terms[0].opening_balance, anchor: r.data.mortgage_balance }));
+
+      // The modal's read-only metadata shows the grouped current
+      // principal, and the current term's card (which carries the
+      // principal pair) opens grouped too.
       const metaPrincipal = await page.evaluate(() => document.querySelector('#metaCurrentPrincipal').textContent);
       check('modal metadata shows the grouped current principal', metaPrincipal.includes('1,350,000'), String(metaPrincipal));
       const editBalance = await fieldVal('[data-term-form] [name=opening_balance]');
@@ -1980,27 +2023,53 @@ try {
       const editAsset = await fieldVal('#assetForm [name=value]');
       check('asset edit opens with the grouped value', editAsset === '750,000', String(editAsset));
 
-      // And a pasted pre-grouped balance on the add-property form is
-      // stored as the plain number.
-      await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
-      await wait(900);
-      await page.evaluate(() => document.querySelector('#addPropertyBtn').click());
-      await wait(500);
-      await focusField('#addPropForm .address-input');
-      await page.keyboard.type('998 Money Test Terrace, Victoria, BC');
-      await focusField('#addPropForm [name=mortgage_balance]');
-      await client.send('Input.insertText', { text: '1,350,000' });
-      await page.evaluate(() => {
-        const d = document.querySelector('#addPropForm [name=purchase_date]');
-        d.value = '2024-12-17';
-        d.dispatchEvent(new Event('change', { bubbles: true }));
+      // A property added without a principal (the API section's
+      // pidNoBal): its detail page renders the empty states, and
+      // the mortgage filled in from the Mortgage modal makes the
+      // projection run.
+      await page.goto(`http://ff.local/#property/${pidNoBal}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const nbView = await page.evaluate(() => {
+        const stats = document.querySelector('#propView').textContent;
+        return {
+          remaining: document.querySelector('#detailRemainingBalance').textContent,
+          hasNaN: stats.includes('NaN') || stats.includes('undefined'),
+        };
       });
-      await page.evaluate(() => document.querySelector('#addPropForm [type=submit]').click());
-      await wait(2500);
-      r = await req('GET', '/api/properties');
-      const pastedProp = (r.data || []).find((p) => p.address.includes('998 Money Test Terrace'));
-      check('pasted grouped balance stored as the plain number 1350000',
-        !!pastedProp && pastedProp.mortgage_balance === 1350000, JSON.stringify(pastedProp && pastedProp.mortgage_balance));
+      check('balance-less detail renders the empty remaining balance (—, no NaN/undefined)',
+        nbView.remaining === '—' && !nbView.hasNaN, JSON.stringify(nbView));
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(600);
+      await focusField('[data-term-form] [name=opening_balance]');
+      await page.keyboard.type('900000');
+      await page.evaluate(() => {
+        const a = document.querySelector('[data-term-form] [name=amortization_years]');
+        a.value = '25';
+        a.dispatchEvent(new Event('input', { bubbles: true }));
+        a.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector('[data-save-term]').click());
+      await wait(1400);
+      r = await req('GET', `/api/properties/${pidNoBal}`);
+      check('the modal save seeds the anchor from Term 1’s opening (900000)',
+        r.data.mortgage_balance === 900000 && r.data.terms[0].opening_balance === 900000,
+        JSON.stringify({ b: r.data.mortgage_balance, open: r.data.terms[0].opening_balance }));
+      await req('POST', `/api/properties/${pidNoBal}/rates`, { start_date: r.data.terms[0].start_date, rate_type: 'fixed', annual_rate: 5 });
+      r = await req('GET', `/api/properties/${pidNoBal}/amortization`);
+      const nbDerived = engineDerive(900000, 5, 25);
+      check('with a rate segment added, the filled-in mortgage projects (payment derived from 900,000 at 5% over 25y)',
+        r.data.ok === true && r.data.paymentDerived === nbDerived,
+        JSON.stringify({ ok: r.data.ok, d: r.data.paymentDerived, want: nbDerived }));
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      const nbGrouped = nbDerived.toLocaleString('en-CA', { maximumFractionDigits: 0 });
+      let nbStatOk = false;
+      for (let i = 0; i < 24 && !nbStatOk; i++) {
+        nbStatOk = await page.evaluate((g) => document.querySelector('#estPaymentValue').textContent.includes(g), nbGrouped);
+        if (!nbStatOk) await wait(250);
+      }
+      check('the detail payment stat shows the derived figure after the fill-in', nbStatOk);
+      await req('DELETE', `/api/properties/${pidNoBal}`);
 
       // Assessed-history window: the range is a start/end month
       // pair (the default 5-year preset fills Nov 2021-Oct 2026).
