@@ -4027,6 +4027,65 @@ try {
       check('carousel switch never flashes: slides resident + preloaded, stage height constant, the visible slide is the preloaded node itself',
         flashBits.nSlides === 2 && flashBits.allPreloaded && flashBits.h0 === flashBits.h1 && flashBits.sameNode && flashBits.activeComplete,
         JSON.stringify(flashBits));
+      // Layout: the photo fills the overview panel's full height
+      // (no dead white space under it), the n / N counter rides on
+      // the photo as an overlay chip, and the detail column spreads
+      // its meta rows over the same height.
+      const fillBits = await page.evaluate(() => {
+        const R = (el) => (el ? el.getBoundingClientRect() : null);
+        const stage = document.querySelector('#photoArea .photo-stage');
+        const area = document.getElementById('photoArea');
+        const det = document.querySelector('#propertyOverview .overview-details');
+        const view = document.getElementById('propView');
+        const bar = document.querySelector('#photoArea .carousel-bar');
+        const chip = document.querySelector('#photoArea .carousel-count');
+        const stats = document.querySelector('#propView .detail-stats');
+        const rows = [...document.querySelectorAll('#propViewBody tr')];
+        const sr = R(stage); const ar = R(area); const dr = R(det); const vr = R(view);
+        const cr = R(chip); const str = R(stats);
+        const rr = rows.map(R);
+        return {
+          stageH: sr && sr.height, areaH: ar && ar.height, detH: dr && dr.height,
+          stageBottom: sr && sr.bottom, areaBottom: ar && ar.bottom,
+          barPos: bar ? getComputedStyle(bar).position : null,
+          chipInStage: !!(sr && cr && cr.top >= sr.top - 1 && cr.bottom <= sr.bottom + 1
+            && Math.abs((cr.left + cr.right) / 2 - (sr.left + sr.right) / 2) < 4),
+          statsBottom: str && str.bottom,
+          firstRowTop: rr.length ? rr[0].top : null,
+          lastRowBottom: rr.length ? rr[rr.length - 1].bottom : null,
+          viewBottom: vr && vr.bottom,
+          rowsSpread: rr.length > 1 && rr.every((r, i) => i === 0 || r.top >= rr[i - 1].bottom - 1),
+        };
+      });
+      check('detail layout: the photo stage fills the panel height (no dead space under the photo)',
+        fillBits.stageH >= 260 && Math.abs(fillBits.stageH - fillBits.areaH) < 3
+          && Math.abs(fillBits.stageBottom - fillBits.areaBottom) < 2
+          && Math.abs(fillBits.detH - fillBits.areaH) < 3,
+        JSON.stringify(fillBits));
+      check('detail layout: the n / N counter is a chip overlaid on the photo, not a line under it',
+        fillBits.barPos === 'absolute' && fillBits.chipInStage,
+        JSON.stringify(fillBits));
+      check('detail layout: the meta rows spread over the full detail-column height',
+        fillBits.rowsSpread && Math.abs(fillBits.lastRowBottom - fillBits.viewBottom) < 3
+          && fillBits.firstRowTop >= fillBits.statsBottom - 2,
+        JSON.stringify(fillBits));
+      // Edit mode: the form is the taller column — the photo
+      // stretches to match it too.
+      await page.evaluate(() => document.querySelector('#editPropBtn').click());
+      await wait(400);
+      const editFill = await page.evaluate(() => {
+        const stage = document.querySelector('#photoArea .photo-stage');
+        const det = document.querySelector('#propertyOverview .overview-details');
+        return {
+          stageH: stage ? stage.getBoundingClientRect().height : 0,
+          detH: det ? det.getBoundingClientRect().height : 0,
+        };
+      });
+      check('detail layout: in Edit mode the photo stretches to the taller form column',
+        editFill.stageH > fillBits.stageH + 40 && Math.abs(editFill.stageH - editFill.detH) < 4,
+        JSON.stringify(editFill));
+      await page.evaluate(() => document.querySelector('#cancelPropEditBtn').click());
+      await wait(300);
       // Autoplay: a short test delay and a fresh load — the
       // carousel advances on its own, wraps at the end, yields
       // to a manual click (its timer resets), and pauses on

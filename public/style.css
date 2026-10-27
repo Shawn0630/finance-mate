@@ -78,9 +78,42 @@ td.num, th.num { text-align: right; }
 .placeholder { background: #fff; border: 1px dashed #c9d2dc; border-radius: 10px; padding: 42px 20px; text-align: center; color: #71808f; }
 /* Property overview: one panel, details left / photo carousel
    right; stacks on narrow screens. */
-.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: stretch; }
 @media (max-width: 760px) { .overview-grid { grid-template-columns: 1fr; } }
 .detail-stats { display: flex; gap: 28px; flex-wrap: wrap; margin: 2px 0 10px; }
+/* Detail variant of the merged overview panel: both columns fill
+   the panel's full height (the grid stretches them to the taller
+   one) so the panel carries no dead white space — the photo stage
+   grows past its old 300px cap, and the detail column spreads its
+   meta rows over the same height. The n / N counter rides on the
+   photo as a chip instead of taking a line under it. Scoped to the
+   detail panel (#photoArea / #propView); the card-cover carousel
+   variant is untouched. */
+.overview-details { display: flex; flex-direction: column; }
+#propView { display: flex; flex-direction: column; flex: 1; }
+#propView .detail-table { flex: 1; display: flex; flex-direction: column; }
+#propView .detail-table tbody { display: flex; flex-direction: column; flex: 1; }
+#propView .detail-table tr { display: flex; flex: 1; }
+#propView .detail-table td { display: flex; align-items: center; }
+#propView .detail-table td:first-child { flex: 0 0 190px; }
+#propView .detail-table td:last-child { flex: 1; min-width: 0; }
+.overview-photos { display: flex; }
+#photoArea { display: flex; flex: 1; min-width: 0; }
+#photoArea .photo-carousel { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+#photoArea .photo-stage { flex: 1; min-height: 260px; aspect-ratio: auto; max-height: none; }
+#photoArea .detail-photo-empty { flex: 1; height: auto; min-height: 260px; }
+#photoArea .carousel-bar { position: absolute; left: 0; right: 0; bottom: 12px; margin: 0; justify-content: center; pointer-events: none; z-index: 2; }
+#photoArea .carousel-count { background: rgba(22, 34, 46, .55); color: #fff; padding: 2px 10px; border-radius: 999px; line-height: 1.6; }
+/* A single photo needs no counter chip (the count element stays
+   in the DOM — only the chip is hidden). */
+#photoArea .photo-carousel:not(:has(.photo-stage img.slide ~ img.slide)) .carousel-bar { display: none; }
+/* Stacked (narrow): the photo goes back to a fixed 3/2 box instead
+   of filling a column height. Kept after the rules above so it
+   wins the cascade at equal specificity. */
+@media (max-width: 760px) {
+  #photoArea .photo-stage { flex: none; width: 100%; height: auto; aspect-ratio: 3 / 2; max-height: 300px; min-height: 0; }
+  #photoArea .detail-photo-empty { flex: none; height: 170px; min-height: 0; }
+}
 .region-tag { font-size: 15px; line-height: 1; vertical-align: -2px; margin-left: 6px; cursor: default; }
 .photo-stage { position: relative; overflow: hidden; background: #dbe4ee; border-radius: 10px; aspect-ratio: 3 / 2; max-height: 300px; }
 .photo-stage img.slide { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity .18s ease; }
