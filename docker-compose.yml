@@ -3,6 +3,12 @@ services:
     build: .
     ports:
       - "9200:9200"
+    # The project-root .env (gitignored — see .env.example) carries
+    # runtime configuration such as the AI Fill LLM key; optional,
+    # the app runs without it.
+    env_file:
+      - path: .env
+        required: false
     environment:
       PORT: "9200"
       DATA_DIR: /app/data

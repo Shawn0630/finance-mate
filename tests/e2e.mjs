@@ -253,9 +253,15 @@ const hsStub = http.createServer((req, res) => {
 await new Promise((r) => hsStub.listen(0, '127.0.0.1', r));
 const hsStubBase = `http://127.0.0.1:${hsStub.address().port}`;
 
+// AI Fill test seam: the app reads LLM_STUB_RESPONSE_FILE on
+// every extraction, so the suite points it at a file it rewrites
+// per case — no real key, no network.
+const aiStubFile = path.join(dataDir, 'ai-stub.json');
+fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
+
 const server = spawn('node', ['src/server.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase },
+  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase, LLM_STUB_RESPONSE_FILE: aiStubFile, LLM_MODELS: 'stub-a,stub-b', LLM_MODEL: 'stub-a' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
@@ -1374,6 +1380,100 @@ try {
   check('the preview wrote nothing (saved segment still semi_annual)',
     cmpAfterPreview.segments[0].compounding === 'semi_annual', JSON.stringify(cmpAfterPreview.segments[0]));
   await req('DELETE', `/api/properties/${cmpPid}`);
+
+  // ---- AI Fill (API) ----
+  // The stubbed model answers with the RBC commitment-letter
+  // fields in raw document shapes; the endpoint must normalize
+  // them, expand the segment "kind" vocabulary into the segment
+  // form's fields, and drop unknown keys. Extraction writes
+  // nothing by itself.
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    fields: {
+      lender: 'RBC', start_date: 'Dec 17, 2024', term_months: 60, amortization_years: 30,
+      opening_balance: '$1,350,000', payment_override: 7207.10,
+      segment_kind: 'prime_spread', spread: -1, segment_compounding: 'monthly',
+      segment_start_date: '2024-12-17', not_a_field: 'drop me',
+    },
+  }));
+  r = await req('POST', '/api/ai/fill', { context: 'term', text: 'RBC commitment letter' });
+  check('AI fill returns the commitment fields normalized (kind expanded, unknown keys dropped)',
+    r.status === 200 && r.data.fields.lender === 'RBC' && r.data.fields.start_date === '2024-12-17'
+      && r.data.fields.term_months === 60 && r.data.fields.amortization_years === 30
+      && r.data.fields.opening_balance === 1350000 && r.data.fields.payment_override === 7207.1
+      && r.data.fields.segment_rate_type === 'variable' && r.data.fields.segment_rate_mode === 'prime_spread'
+      && r.data.fields.segment_spread === -1 && r.data.fields.segment_compounding === 'monthly'
+      && r.data.fields.segment_start_date === '2024-12-17' && !('not_a_field' in r.data.fields),
+    JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill', { context: 'bogus', text: 'x' });
+  check('AI fill rejects an unknown context (400)', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill', { context: 'term' });
+  check('AI fill requires text or a file (400)', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill', { context: 'term', file: { name: 'a.txt', type: 'text/plain', data: 'aGk=' } });
+  check('AI fill rejects a non-image/PDF attachment (400)', r.status === 400, JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ fields: { lender: 'RBC' } }));
+  r = await req('POST', '/api/ai/fill', { context: 'term', text: 'letter' });
+  check('the stub file is re-read per call (the next extraction sees the new response)',
+    r.status === 200 && JSON.stringify(r.data.fields) === JSON.stringify({ lender: 'RBC' }), JSON.stringify(r.data));
+  // ---- AI Fill model selection (API) ----
+  // The server runs with LLM_MODELS=stub-a,stub-b and
+  // LLM_MODEL=stub-a. The stub answers per model name, so the
+  // response proves which model a fill ran with; the choice
+  // persists server-side (app setting) as the next default.
+  r = await req('GET', '/api/ai/config');
+  check('AI config lists the env models with LLM_MODEL as the default',
+    r.status === 200 && r.data.configured === true
+      && JSON.stringify(r.data.models) === JSON.stringify(['stub-a', 'stub-b'])
+      && r.data.model === 'stub-a', JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    models: { 'stub-a': { fields: { lender: 'Bank A' } }, 'stub-b': { fields: { lender: 'Bank B' } } },
+  }));
+  r = await req('POST', '/api/ai/fill', { context: 'term', text: 'letter', model: 'stub-c' });
+  check('a model outside the configured list is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill', { context: 'term', text: 'letter', model: 'stub-b' });
+  check('a fill with model stub-b runs with stub-b (per-model stub response)',
+    r.status === 200 && r.data.fields.lender === 'Bank B' && r.data.model === 'stub-b', JSON.stringify(r.data));
+  r = await req('GET', '/api/ai/config');
+  check('the chosen model persisted server-side as the new default',
+    r.status === 200 && r.data.model === 'stub-b', JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill', { context: 'term', text: 'letter' });
+  check('a fill without a model uses the persisted choice',
+    r.status === 200 && r.data.fields.lender === 'Bank B' && r.data.model === 'stub-b', JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
+  // Unconfigured: a second server with no LLM env at all answers
+  // 503 with the configuration guidance.
+  {
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-e2e-nollm-'));
+    const port2 = PORT + 700;
+    const server2 = spawn('node', ['src/server.js'], {
+      cwd: path.resolve(import.meta.dirname, '..'),
+      env: { PATH: process.env.PATH, DATA_DIR: dir2, PORT: String(port2) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    try {
+      let cookie2 = '';
+      for (let i = 0; i < 50 && !cookie2; i++) {
+        try {
+          const login = await fetch(`http://127.0.0.1:${port2}/api/login`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'admin', password: 'admin' }),
+          });
+          if (login.ok) cookie2 = (login.headers.get('set-cookie') || '').split(';')[0];
+        } catch { /* not up yet */ }
+        if (!cookie2) await new Promise((res2) => setTimeout(res2, 200));
+      }
+      const resp = await fetch(`http://127.0.0.1:${port2}/api/ai/fill`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie2 },
+        body: JSON.stringify({ context: 'term', text: 'x' }),
+      });
+      const body2 = await resp.json();
+      check('without LLM configuration the endpoint is a 503 naming the missing setup',
+        resp.status === 503 && String(body2.error || '').includes('LLM_API_KEY'),
+        JSON.stringify({ status: resp.status, body: body2 }));
+    } finally {
+      server2.kill();
+      fs.rmSync(dir2, { recursive: true, force: true });
+    }
+  }
 
   // ---- Per-term payment schedule + balance anchors ----
   // The frequency and payment day live on each term now.
@@ -3676,6 +3776,202 @@ try {
           && cmpBackProj.paymentUsed === cmpSemiProj.paymentUsed,
         JSON.stringify({ p: cmpBackProj.paymentUsed }));
       await req('DELETE', `/api/properties/${cmpUiPid}`);
+
+      // ---- AI Fill, driven through the UI ----
+      // The stubbed model returns the RBC commitment-letter
+      // fields. The lender is hand-filled first (extraction must
+      // keep it); the other term inputs are blanked so the fill
+      // has somewhere to land. Expectations: the panel summarizes
+      // "Filled 10 fields · 1 kept", flags sit only on the filled
+      // fields, a hand edit clears its flag, and after saving the
+      // term AND the segment, a full page reload re-renders the
+      // surviving flags (term form + segment row).
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        fields: {
+          lender: 'RBC', start_date: '2024-12-17', term_months: 60, amortization_years: 30,
+          opening_balance: 1350000, payment_override: 7207.10,
+          segment_rate_type: 'variable', segment_rate_mode: 'prime_spread', segment_spread: -1,
+          segment_compounding: 'monthly', segment_start_date: '2024-12-17',
+        },
+      }));
+      r = await req('POST', '/api/properties', {
+        address: '12 AI Fill Avenue, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-01', amortization_years: 25,
+      });
+      const aiPid = r.data.id;
+      // Navigate by hash + a forced reload (a hash assignment or
+      // a fragment-only goto can leave a stale page up when the
+      // id was recycled from a just-deleted property), then wait
+      // until THIS property's term form is rendered.
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, aiPid);
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('the AI property detail renders its own term form',
+        await untilNode(async () => page.evaluate(() => {
+          const i = document.querySelector('[data-term-form] [name=start_date]');
+          return !!i && i.value === '2024-12-17';
+        })));
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      const aiFlagOf = (formSel, name) => page.evaluate((sel, n) => {
+        const form = document.querySelector(sel);
+        if (!form) return null;
+        const input = form.querySelector(`[name="${n}"]`);
+        if (!input) return null;
+        let host = input.parentElement;
+        while (host) {
+          const l = [...host.children].find((c) => c.tagName === 'LABEL');
+          if (l) return l.querySelector('.ai-flag') != null;
+          host = host.parentElement;
+        }
+        return null;
+      }, formSel, name);
+      await page.evaluate(() => {
+        const form = document.querySelector('[data-term-form]');
+        const seg = document.querySelector('[data-seg-form]');
+        const set = (f, name, value) => {
+          const input = f.querySelector(`[name="${name}"]`);
+          input.value = value;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        };
+        set(form, 'lender', 'TD Bank'); // hand-filled: extraction must keep it
+        set(form, 'start_date', '');
+        set(form, 'term_months', '');
+        set(form, 'amortization_years', '');
+        set(form, 'opening_balance', '');
+        // The segment form blanked too (its selects and defaulted
+        // start date otherwise count as already-filled and are
+        // kept, per the write rule).
+        set(seg, 'start_date', '');
+        set(seg, 'rate_type', '');
+        set(seg, 'rate_mode', '');
+        set(seg, 'compounding', '');
+      });
+      await page.evaluate(() => document.querySelector('[data-term-form] [data-ai-toggle]').click());
+      await wait(300);
+      await page.evaluate(() => {
+        document.querySelector('[data-term-form] [data-ai-text]').value = 'RBC commitment letter';
+        document.querySelector('[data-term-form] [data-ai-extract]').click();
+      });
+      check('the panel summarizes the fill: 10 filled, the hand-filled lender kept',
+        await until(() => {
+          const s = document.querySelector('[data-term-form] [data-ai-summary]');
+          return !!s && s.textContent.includes('Filled 10 fields') && s.textContent.includes('1 kept');
+        }));
+      const aiValues = await page.evaluate(() => {
+        const form = document.querySelector('[data-term-form]');
+        const seg = document.querySelector('[data-seg-form]');
+        const v = (f, n) => f.querySelector(`[name="${n}"]`).value;
+        return {
+          lender: v(form, 'lender'), start: v(form, 'start_date'), months: v(form, 'term_months'),
+          amort: v(form, 'amortization_years'), opening: v(form, 'opening_balance'), override: v(form, 'payment_override'),
+          segType: v(seg, 'rate_type'), segMode: v(seg, 'rate_mode'), segSpread: v(seg, 'spread'),
+          segCmp: v(seg, 'compounding'), segStart: v(seg, 'start_date'),
+        };
+      });
+      check('the inputs hold the extracted values (money grouped), the kept lender untouched',
+        aiValues.lender === 'TD Bank' && aiValues.start === '2024-12-17' && aiValues.months === '60'
+          && aiValues.amort === '30' && aiValues.opening === '1,350,000' && aiValues.override === '7,207.1'
+          && aiValues.segType === 'variable' && aiValues.segMode === 'prime_spread' && aiValues.segSpread === '-1'
+          && aiValues.segCmp === 'monthly' && aiValues.segStart === '2024-12-17',
+        JSON.stringify(aiValues));
+      check('flags sit on the filled term fields — and not on the kept lender',
+        (await aiFlagOf('[data-term-form]', 'start_date')) === true
+          && (await aiFlagOf('[data-term-form]', 'term_months')) === true
+          && (await aiFlagOf('[data-term-form]', 'amortization_years')) === true
+          && (await aiFlagOf('[data-term-form]', 'opening_balance')) === true
+          && (await aiFlagOf('[data-term-form]', 'payment_override')) === true
+          && (await aiFlagOf('[data-term-form]', 'lender')) === false);
+      check('flags sit on the filled segment fields',
+        (await aiFlagOf('[data-seg-form]', 'start_date')) === true
+          && (await aiFlagOf('[data-seg-form]', 'rate_type')) === true
+          && (await aiFlagOf('[data-seg-form]', 'compounding')) === true
+          && (await aiFlagOf('[data-seg-form]', 'spread')) === true);
+      // A hand edit clears that field's flag at once.
+      await page.evaluate(() => {
+        const input = document.querySelector('[data-term-form] [name=term_months]');
+        input.value = '72';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      check('a hand edit clears the edited field’s flag (the rest stay)',
+        (await aiFlagOf('[data-term-form]', 'term_months')) === false
+          && (await aiFlagOf('[data-term-form]', 'start_date')) === true);
+      // Save the term, then the segment (the segment draft rides
+      // across the term save's reload), then verify persistence.
+      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
+      await wait(1500);
+      await page.evaluate(() => document.querySelector('[data-toggle-seg]').click());
+      await wait(400);
+      await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
+      check('the segment saves with its Monthly chip',
+        await untilNode(async () => (await chipText()) === 'Monthly'));
+      const aiSaved = (await req('GET', `/api/properties/${aiPid}`)).data;
+      check('the persisted flags: term fields minus the hand-edited one; all segment fields',
+        JSON.stringify([...aiSaved.terms[0].ai_fields].sort()) === JSON.stringify(['amortization_years', 'opening_balance', 'payment_override', 'start_date'])
+          && JSON.stringify([...aiSaved.segments[0].ai_fields].sort()) === JSON.stringify(['compounding', 'rate_mode', 'rate_type', 'spread', 'start_date']),
+        JSON.stringify({ t: aiSaved.terms[0].ai_fields, s: aiSaved.segments[0].ai_fields }));
+      await page.reload({ waitUntil: 'load' });
+      await wait(1800);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      check('after a full reload the surviving term flags re-render (edited + kept fields unflagged)',
+        (await aiFlagOf('[data-term-form]', 'start_date')) === true
+          && (await aiFlagOf('[data-term-form]', 'amortization_years')) === true
+          && (await aiFlagOf('[data-term-form]', 'opening_balance')) === true
+          && (await aiFlagOf('[data-term-form]', 'payment_override')) === true
+          && (await aiFlagOf('[data-term-form]', 'term_months')) === false
+          && (await aiFlagOf('[data-term-form]', 'lender')) === false);
+      const aiRowFlags = await page.evaluate(() => {
+        const row = document.querySelector('.seg-table tbody tr');
+        return row ? row.querySelectorAll('.ai-flag').length : 0;
+      });
+      check('after the reload the segment row carries its AI flags',
+        aiRowFlags >= 3, JSON.stringify({ flags: aiRowFlags }));
+      // Model picker: the stub answers per model name, so the
+      // filled lender proves which model ran; the choice persists
+      // server-side and the reloaded panel still shows it.
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        models: { 'stub-a': { fields: { lender: 'Bank A' } }, 'stub-b': { fields: { lender: 'Bank B' } } },
+      }));
+      const runModelFill = async (model) => {
+        await page.evaluate((m) => {
+          const form = document.querySelector('[data-term-form]');
+          const lender = form.querySelector('[name=lender]');
+          lender.value = '';
+          lender.dispatchEvent(new Event('input', { bubbles: true }));
+          const panel = form.querySelector('[data-ai-panel]');
+          if (panel.classList.contains('hidden')) form.querySelector('[data-ai-toggle]').click();
+          form.querySelector('[data-ai-model]').value = m;
+          form.querySelector('[data-ai-text]').value = 'letter';
+          form.querySelector('[data-ai-extract]').click();
+        }, model);
+        return until(() => {
+          const input = document.querySelector('[data-term-form] [name=lender]');
+          return !!input && input.value.startsWith('Bank ');
+        });
+      };
+      check('the panel’s model dropdown lists the configured models',
+        await until(() => {
+          const sel = document.querySelector('[data-term-form] [data-ai-model]');
+          return !!sel && sel.options.length === 2;
+        }));
+      const fillA = await runModelFill('stub-a');
+      const lenderA = await page.evaluate(() => document.querySelector('[data-term-form] [name=lender]').value);
+      const fillB = await runModelFill('stub-b');
+      const lenderB = await page.evaluate(() => document.querySelector('[data-term-form] [name=lender]').value);
+      check('switching the dropdown switches the model a fill runs with',
+        fillA && lenderA === 'Bank A' && fillB && lenderB === 'Bank B',
+        JSON.stringify({ lenderA, lenderB }));
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1500);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      check('after a reload the model dropdown still shows the persisted choice',
+        await until(() => {
+          const sel = document.querySelector('[data-term-form] [data-ai-model]');
+          return !!sel && sel.value === 'stub-b';
+        }));
+      await req('DELETE', `/api/properties/${aiPid}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

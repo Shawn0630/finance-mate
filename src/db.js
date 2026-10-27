@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS properties (
   amortization_years REAL,            -- used to derive payment when unset
   lender TEXT,                        -- mortgage lender (bank), free text
   notes TEXT,
+  ai_fields TEXT,                     -- JSON array of field names carrying the "filled by AI" flag
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS rate_segments (
   rate_mode TEXT,                     -- 'absolute' | 'prime_spread' (variable only)
   spread REAL,                        -- prime_spread only: percentage points vs prime (e.g. -1 = Prime - 1)
   compounding TEXT NOT NULL DEFAULT 'semi_annual',  -- 'semi_annual' | 'monthly': how this segment's nominal rate compounds
+  ai_fields TEXT,                     -- JSON array of field names carrying the "filled by AI" flag
   created_at TEXT NOT NULL
 );
 -- Prime lending rate history, fetched from the region's prime
@@ -285,6 +287,7 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   payment_day INTEGER,                -- deduction day 1..31 for this term; NULL = fall back
   anchor_balance REAL,                -- the property's balance anchor, when it lands inside this term after its start
   anchor_date TEXT,                   -- 'YYYY-MM-DD' of that anchor; both anchor columns are set together or neither
+  ai_fields TEXT,                     -- JSON array of field names carrying the "filled by AI" flag
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -312,12 +315,26 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   if (segCols.length && !segCols.includes('compounding')) {
     db.exec("ALTER TABLE rate_segments ADD COLUMN compounding TEXT NOT NULL DEFAULT 'semi_annual'");
   }
+  // AI Fill provenance: a JSON array of the field names currently
+  // carrying the "filled by AI" flag, per form (properties /
+  // mortgage_terms) and per rate segment. Display metadata only —
+  // extraction itself never writes business data.
+  const propCols = db.prepare('PRAGMA table_info(properties)').all().map((c) => c.name);
+  if (propCols.length && !propCols.includes('ai_fields')) {
+    db.exec('ALTER TABLE properties ADD COLUMN ai_fields TEXT');
+  }
+  if (segCols.length && !segCols.includes('ai_fields')) {
+    db.exec('ALTER TABLE rate_segments ADD COLUMN ai_fields TEXT');
+  }
   // Terms from before repayment methods existed are level-payment
   // plans — the only shape the engine had — so the column lands
   // with that default and their projections do not move.
   const termCols = db.prepare('PRAGMA table_info(mortgage_terms)').all().map((c) => c.name);
   if (termCols.length && !termCols.includes('repayment_method')) {
     db.exec("ALTER TABLE mortgage_terms ADD COLUMN repayment_method TEXT NOT NULL DEFAULT 'equal_payment'");
+  }
+  if (termCols.length && !termCols.includes('ai_fields')) {
+    db.exec('ALTER TABLE mortgage_terms ADD COLUMN ai_fields TEXT');
   }
   // Per-term payment schedule + balance anchors: the columns land
   // nullable and the backfill after the Term-1 pass seeds them from

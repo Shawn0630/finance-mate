@@ -1,6 +1,7 @@
 // Finance Mate — server. Express + SQLite, no build step.
 // Modules this round: Assets (properties / mortgages / other assets).
 // Spending, Planning and Tax are placeholder pages in the UI for now.
+import './env.js'; // .env fallback values first, before anything reads the env
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,6 +15,7 @@ import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
+import { handleAiFill, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -107,6 +109,55 @@ const adminUsername = () => process.env.SEED_ADMIN_USER || 'admin';
 // Owner candidates with their avatars: every user EXCEPT admin. The
 // admin account signs in to manage the app; it is never an owner
 // candidate and never appears in the owner pickers.
+// ------------------------------------------------------------- AI fill --
+// Extract form field values from pasted text / an attached photo
+// or PDF. Extraction NEVER writes to the database: it returns
+// normalized candidate values and the user saves with the form's
+// own Save. LLM config comes from the server env (see
+// .env.example); unconfigured → 503 with guidance. Owner names
+// from the model are mapped to real usernames (admin excluded —
+// the same rule the owner picker enforces).
+// The user's model choice for AI Fill is an app-level setting
+// (app_meta), shared by every panel: the last model a fill ran
+// with is the default for the next one.
+const AI_FILL_MODEL_KEY = 'ai_fill_model';
+const getAiFillModel = () => {
+  const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get(AI_FILL_MODEL_KEY);
+  return row ? row.value : null;
+};
+const setAiFillModel = (model) => {
+  db.prepare('INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run(AI_FILL_MODEL_KEY, model);
+};
+const effectiveAiModel = () => {
+  const models = llmModels();
+  const persisted = getAiFillModel();
+  return persisted && models.includes(persisted) ? persisted : llmDefaultModel();
+};
+
+app.get('/api/ai/config', requireApiAuth, (req, res) => {
+  res.json({
+    configured: llmConfigured(),
+    models: llmModels(),
+    model: effectiveAiModel(),
+  });
+});
+
+app.post('/api/ai/fill', requireApiAuth, async (req, res) => {
+  const { status, body } = await handleAiFill(req.body || {}, {
+    model: getAiFillModel(),
+    mapOwners: (names) => {
+      const known = db.prepare('SELECT username FROM users WHERE username != ?').all(adminUsername()).map((u) => u.username);
+      const byLower = new Map(known.map((u) => [u.toLowerCase(), u]));
+      return names.map((n) => byLower.get(String(n).trim().toLowerCase())).filter(Boolean);
+    },
+  });
+  // A fill that names a model and succeeds makes it the app
+  // default for the next fill (the user's persisted choice).
+  if (status === 200 && req.body && req.body.model) setAiFillModel(String(req.body.model).trim());
+  res.status(status).json(body);
+});
+
 app.get('/api/users', requireApiAuth, (req, res) => {
   const rows = db
     .prepare('SELECT * FROM users WHERE username != ? ORDER BY id')
@@ -301,6 +352,32 @@ function currentSegment(segments) {
   return segmentForMonth(segments, today);
 }
 
+// AI Fill provenance: the ai_fields column holds a JSON array of
+// field names carrying the "filled by AI" flag. Serializers serve
+// the parsed array; writes accept an array filtered to the form's
+// real fields (unknown names dropped). Display metadata only.
+const PROPERTY_AI_FIELDS = ['address', 'notes', 'assessed_value', 'assessed_year', 'purchase_date', 'mortgage_balance', 'owners'];
+const TERM_AI_FIELDS = ['lender', 'start_date', 'term_months', 'amortization_years', 'opening_balance', 'payment_frequency', 'repayment_method', 'payment_override'];
+const SEGMENT_AI_FIELDS = ['start_date', 'rate_type', 'rate_mode', 'annual_rate', 'spread', 'compounding'];
+
+function parseAiFields(v) {
+  try {
+    const a = JSON.parse(v || '[]');
+    return Array.isArray(a) ? a.filter((x) => typeof x === 'string') : [];
+  } catch { return []; }
+}
+
+// Cleaned ai_fields for a write: null when the body does not carry
+// the key (leave the stored value alone), otherwise the filtered
+// array (possibly empty — the user cleared every flag).
+function cleanAiFields(body, allowed) {
+  if (!body || body.ai_fields === undefined) return null;
+  if (!Array.isArray(body.ai_fields)) return [];
+  return [...new Set(body.ai_fields.filter((x) => allowed.includes(x)))];
+}
+
+const aiFieldsJson = (arr) => (arr && arr.length ? JSON.stringify(arr) : null);
+
 // A segment as the API serves it: with its pricing mode normalized
 // (rows from before prime pricing read as 'absolute') and the rate
 // it effectively carries right now (prime-spread segments resolve
@@ -311,6 +388,7 @@ function segmentView(seg) {
     ...seg,
     rate_mode: seg.rate_mode || 'absolute',
     compounding: seg.compounding || 'semi_annual',
+    ai_fields: parseAiFields(seg.ai_fields),
     effective_rate: segmentAnnualRate(seg, prime ? prime.rate : null),
   };
 }
@@ -444,6 +522,7 @@ function termView(t, segments, lumpSums, payMap) {
   const pay = (payMap && payMap[t.id]) || null;
   return {
     ...t,
+    ai_fields: parseAiFields(t.ai_fields),
     end_date: termEndDate(t),
     paymentDerived: pay ? pay.paymentDerived : null,
     paymentUsed: pay ? pay.paymentUsed : null,
@@ -478,6 +557,7 @@ function propertyView(p) {
     : { balance: p.mortgage_balance ?? null, month: null };
   return {
     ...p,
+    ai_fields: parseAiFields(p.ai_fields),
     // The lender and remaining amortization are term facts now;
     // serve the current term's values under the long-standing field
     // names so existing consumers keep working unchanged.
@@ -571,8 +651,8 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
     .prepare(
       `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
          mortgage_balance, mortgage_balance_date, amortization_years, lender,
-         notes, bca_id, bca_matched_address, owners, purchase_date, region, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         notes, bca_id, bca_matched_address, owners, purchase_date, region, ai_fields, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       String(b.address).trim(),
@@ -591,6 +671,7 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
       JSON.stringify(own.value ?? []),
       b.purchase_date,
       'CA',
+      aiFieldsJson(cleanAiFields(b, PROPERTY_AI_FIELDS)),
       nowIso(),
       nowIso()
     );
@@ -909,6 +990,8 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     if (own.error) return res.status(400).json({ error: own.error });
     next.owners = own.value;
   }
+  const propAi = cleanAiFields(b, PROPERTY_AI_FIELDS);
+  next.ai_fields = propAi === null ? (p.ai_fields ?? null) : aiFieldsJson(propAi);
   if (!next.address) return res.status(400).json({ error: 'address is required' });
   // Editing the assessed value by hand marks it as a manual value.
   if (b.assessed_value !== undefined && num(b.assessed_value) !== p.assessed_value) next.assessed_source = 'manual';
@@ -916,13 +999,13 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
     `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
        assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
        mortgage_balance_date=?, amortization_years=?, lender=?, notes=?,
-       owners=?, purchase_date=?, payment_day=?, payment_frequency=?, region=?, updated_at=? WHERE id=?`
+       owners=?, purchase_date=?, payment_day=?, payment_frequency=?, region=?, ai_fields=?, updated_at=? WHERE id=?`
   ).run(
     next.address, next.bca_id, next.bca_matched_address, next.photo_url,
     next.assessed_value, next.assessed_year, next.assessed_source,
     next.mortgage_balance, next.mortgage_balance_date,
     next.amortization_years, next.lender, next.notes, JSON.stringify(next.owners), next.purchase_date,
-    next.payment_day, next.payment_frequency, next.region, nowIso(), p.id
+    next.payment_day, next.payment_frequency, next.region, next.ai_fields, nowIso(), p.id
   );
   // Lender and remaining amortization live on the current term
   // now: the Mortgage form still edits them at property level, so
@@ -1239,8 +1322,8 @@ app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
   const info = db
-    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, nowIso());
+    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
   res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
 });
 
@@ -1253,8 +1336,9 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   const owner = segmentTermId(p, req.body || {}, seg);
   if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
-  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=? WHERE id=?')
-    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, seg.id);
+  const segAi = cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS);
+  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, ai_fields=? WHERE id=?')
+    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
   res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
 });
 
@@ -1437,9 +1521,9 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const info = db
-    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
-    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, nowIso(), nowIso());
+    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
   syncTermMirror(getProperty(p.id));
   syncTermAnchor(getProperty(p.id));
   syncScheduleMirror(getProperty(p.id));
@@ -1468,8 +1552,9 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
   });
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
-  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, updated_at=? WHERE id=?')
-    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, nowIso(), term.id);
+  const termAi = cleanAiFields(b, TERM_AI_FIELDS);
+  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
+    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
   // Editing the anchor pair on the term that carries it edits the
   // property's balance anchor itself — the two are one fact, stored
   // in both places: write the submitted pair through, then let the

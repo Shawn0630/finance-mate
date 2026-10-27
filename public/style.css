@@ -186,6 +186,14 @@ label.btnlike:hover { background: #f0f4f9; }
    calculated payment, the derived amount struck through, muted. */
 .pay-used { font-weight: 700; }
 .pay-derived { color: #8a94a6; font-weight: 400; }
+
+/* AI Fill ("Filled by AI" flags + the extract panel) */
+.ai-flag { color: #1668c4; font-size: 11px; margin-left: 4px; }
+.ai-fill { margin-bottom: 10px; }
+.ai-fill-bar { display: flex; align-items: center; gap: 10px; }
+.ai-panel { margin-top: 8px; }
+.ai-panel-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.ai-panel-row input[type="file"] { border: none; padding: 0; width: auto; flex: 1; }
 .head-stat-tag { font-size: 11px; font-weight: 400; color: #71808f; margin-left: 6px; }
 .hidden { display: none !important; }
 .term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }

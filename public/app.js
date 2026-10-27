@@ -538,6 +538,7 @@ $('#addPropForm').addEventListener('submit', async (e) => {
   parseMoneyFields(f, ['mortgage_balance']);
   if (addSuggest.state.id) f.bca_id = addSuggest.state.id;
   f.owners = addPropOwnerPicker.get();
+  f.ai_fields = [...aiFlagSet(e.target)];
   const msg = $('#addPropMsg');
   try {
     const p = await api('/api/properties', { method: 'POST', body: f });
@@ -556,6 +557,253 @@ $('#addPropForm').addEventListener('submit', async (e) => {
     showMsg($('#sectionMsg'), r.ok ? 'ok' : 'warn', note);
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
+
+// ------------------------------------------------------------- AI fill ---
+// "✨ Fill with AI" on the property and term forms: paste text or
+// attach a photo / PDF, the server extracts candidate values
+// (POST /api/ai/fill — extraction itself never saves), and the
+// values land in the form's inputs through the normal input /
+// change events, so money formatting, the live preview and the
+// segment-form sync all react as if typed.
+//
+// Write rule: a field the user already filled by hand (non-empty,
+// no AI flag) is NEVER overwritten — it is counted as "kept" in
+// the panel summary. Filled fields carry a ✨ flag by their label;
+// editing a flagged field by hand removes its flag at once. The
+// flags ride along on the form's own Save (ai_fields) and are
+// re-rendered from the server on load. A term form's panel also
+// fills the term's add-segment form (segment_* keys).
+const aiFlagSets = new WeakMap();
+
+function aiFlagSet(form) {
+  let s = aiFlagSets.get(form);
+  if (!s) { s = new Set(); aiFlagSets.set(form, s); }
+  return s;
+}
+
+function labelFor(el) {
+  let host = el.parentElement;
+  while (host) {
+    const label = [...host.children].find((c) => c.tagName === 'LABEL');
+    if (label) return label;
+    if (host.tagName === 'FORM' || host.tagName === 'BODY') return null;
+    host = host.parentElement;
+  }
+  return null;
+}
+
+function renderAiFlags(form) {
+  form.querySelectorAll('.ai-flag').forEach((el) => el.remove());
+  const set = aiFlagSets.get(form);
+  if (!set) return;
+  for (const name of set) {
+    const input = form.querySelector(`[name="${name}"]`);
+    let label = input ? labelFor(input) : null;
+    if (!label && name === 'owners') {
+      const picker = form.querySelector('.owner-picker');
+      if (picker) label = labelFor(picker);
+    }
+    if (!label) continue;
+    const s = document.createElement('span');
+    s.className = 'ai-flag';
+    s.title = 'Filled by AI';
+    s.textContent = '✨';
+    label.appendChild(s);
+  }
+}
+
+// A hand edit to a flagged field clears its flag immediately.
+function clearAiFlagOnEdit(e) {
+  const t = e.target;
+  if (!t || !t.name) return;
+  const form = t.closest('form');
+  if (!form || form._aiFilling) return;
+  const set = aiFlagSets.get(form);
+  if (set && set.delete(t.name)) renderAiFlags(form);
+}
+document.addEventListener('input', clearAiFlagOnEdit);
+document.addEventListener('change', clearAiFlagOnEdit);
+
+function fillOneInput(form, name, value) {
+  const input = form.querySelector(`[name="${name}"]`);
+  if (!input) return 'missing';
+  const set = aiFlagSet(form);
+  if (input.value !== '' && input.value != null && !set.has(name)) return 'kept';
+  form._aiFilling = true;
+  input.value = value;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  form._aiFilling = false;
+  set.add(name);
+  return 'filled';
+}
+
+function applyAiFields(form, fields, extras = {}) {
+  let filled = 0;
+  let kept = 0;
+  const tally = (r) => { if (r === 'filled') filled += 1; else if (r === 'kept') kept += 1; };
+  for (const [key, value] of Object.entries(fields || {})) {
+    if (key === 'owners' && extras.ownersPicker) {
+      const set = aiFlagSet(form);
+      if (extras.ownersPicker.get().length && !set.has('owners')) { kept += 1; continue; }
+      form._aiFilling = true;
+      extras.ownersPicker.set(value);
+      form._aiFilling = false;
+      set.add('owners');
+      filled += 1;
+      continue;
+    }
+    if (key.startsWith('segment_') && extras.segForm) {
+      tally(fillOneInput(extras.segForm, key.slice('segment_'.length), value));
+      continue;
+    }
+    tally(fillOneInput(form, key, value));
+  }
+  renderAiFlags(form);
+  if (extras.segForm) renderAiFlags(extras.segForm);
+  return { filled, kept };
+}
+
+// The server's AI configuration (configured models + the
+// persisted choice), shared by every Fill panel.
+let aiConfigCache = null;
+async function loadAiConfig() {
+  if (!aiConfigCache) {
+    try { aiConfigCache = await api('/api/ai/config'); }
+    catch { aiConfigCache = { configured: false, models: [], model: null }; }
+  }
+  return aiConfigCache;
+}
+
+function attachAiFill(form, context, extras = {}) {
+  if (!form || form.dataset.aiFillWired) return;
+  form.dataset.aiFillWired = '1';
+  const wrap = document.createElement('div');
+  wrap.className = 'ai-fill';
+  wrap.innerHTML = `
+    <div class="ai-fill-bar">
+      <button type="button" class="small" data-ai-toggle>✨ Fill with AI</button>
+      <span class="note hidden" data-ai-summary style="margin:0"></span>
+    </div>
+    <div class="ai-panel hidden" data-ai-panel>
+      <textarea rows="4" data-ai-text placeholder="Paste text from a document, or describe the values…"></textarea>
+      <div class="ai-panel-row">
+        <input type="file" accept="image/*,application/pdf" data-ai-file>
+        <select data-ai-model title="Model" style="width:auto;flex:0 1 auto"></select>
+        <button type="button" class="primary small" data-ai-extract>Extract</button>
+      </div>
+      <div class="msg" data-ai-msg></div>
+    </div>`;
+  form.prepend(wrap);
+  const panel = wrap.querySelector('[data-ai-panel]');
+  const summary = wrap.querySelector('[data-ai-summary]');
+  const msg = wrap.querySelector('[data-ai-msg]');
+  const extractBtn = wrap.querySelector('[data-ai-extract]');
+  const modelSel = wrap.querySelector('[data-ai-model]');
+  loadAiConfig().then((cfg) => {
+    const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
+    modelSel.innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    if (cfg.model) modelSel.value = cfg.model;
+  });
+  wrap.querySelector('[data-ai-toggle]').addEventListener('click', () => panel.classList.toggle('hidden'));
+  extractBtn.addEventListener('click', async () => {
+    const text = wrap.querySelector('[data-ai-text]').value.trim();
+    const fileInput = wrap.querySelector('[data-ai-file]');
+    const file = fileInput.files && fileInput.files[0];
+    msg.textContent = '';
+    msg.className = 'msg';
+    if (!text && !file) { showMsg(msg, 'err', 'Paste text or attach a photo / PDF first.'); return; }
+    extractBtn.disabled = true;
+    extractBtn.textContent = 'Extracting…';
+    try {
+      const body = { context };
+      if (modelSel.value) body.model = modelSel.value;
+      if (text) body.text = text;
+      if (file) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        body.file = { name: file.name, type: file.type, data: String(dataUrl).split(',')[1] || '' };
+      }
+      const r = await api('/api/ai/fill', { method: 'POST', body });
+      if (body.model && aiConfigCache) aiConfigCache.model = body.model;
+      const { filled, kept } = applyAiFields(form, r.fields || {}, extras);
+      summary.textContent = `Filled ${filled} field${filled === 1 ? '' : 's'}${kept ? ` · ${kept} kept` : ''}`;
+      summary.classList.remove('hidden');
+      panel.classList.add('hidden');
+    } catch (err) {
+      showMsg(msg, 'err', err.message);
+    } finally {
+      extractBtn.disabled = false;
+      extractBtn.textContent = 'Extract';
+    }
+  });
+}
+
+// Hand changes in an owner picker clear the owners flag, like
+// hand edits in an input do.
+function wireOwnersFlagClear(form, pickerRoot) {
+  if (!pickerRoot) return;
+  pickerRoot.addEventListener('click', () => {
+    if (form._aiFilling) return;
+    const set = aiFlagSets.get(form);
+    if (set && set.delete('owners')) renderAiFlags(form);
+  });
+}
+
+// Saving one of the mortgage modal's forms reloads the detail
+// view, which rebuilds every form from the server — unsaved
+// drafts in the OTHER forms (above all, AI-filled ones awaiting
+// their own Save) would be lost. The term / segment saves
+// therefore reload through this helper, which carries every term
+// and segment form's draft values + AI flags across the rebuild.
+function captureFormDrafts() {
+  const grab = (form) => {
+    const fields = {};
+    form.querySelectorAll('input[name], select[name], textarea[name]').forEach((i) => { fields[i.name] = i.value; });
+    return { fields, flags: [...(aiFlagSets.get(form) || [])] };
+  };
+  const terms = {};
+  const segs = {};
+  document.querySelectorAll('[data-term-form]').forEach((f) => { terms[f.dataset.termForm] = grab(f); });
+  document.querySelectorAll('[data-seg-form]').forEach((f) => { segs[f.dataset.segForm] = grab(f); });
+  return { terms, segs };
+}
+
+function restoreFormDrafts(stash) {
+  const put = (form, draft) => {
+    if (!form || !draft) return;
+    form._aiFilling = true;
+    for (const [name, value] of Object.entries(draft.fields)) {
+      const input = form.querySelector(`[name="${name}"]`);
+      if (!input) continue;
+      input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    form._aiFilling = false;
+    const set = aiFlagSet(form);
+    set.clear();
+    draft.flags.forEach((n) => set.add(n));
+    renderAiFlags(form);
+  };
+  document.querySelectorAll('[data-term-form]').forEach((f) => put(f, stash.terms[f.dataset.termForm]));
+  document.querySelectorAll('[data-seg-form]').forEach((f) => { put(f, stash.segs[f.dataset.segForm]); syncSegForm(f); });
+}
+
+async function reloadDetailKeepingDrafts() {
+  const stash = captureFormDrafts();
+  await loadPropertyDetail(currentPropertyId);
+  restoreFormDrafts(stash);
+}
+
+attachAiFill($('#addPropForm'), 'property', { ownersPicker: addPropOwnerPicker });
+attachAiFill($('#propForm'), 'property', { ownersPicker: propOwnerPicker });
+wireOwnersFlagClear($('#addPropForm'), $('#addPropOwnerPicker'));
+wireOwnersFlagClear($('#propForm'), $('#propOwnerPicker'));
 
 // ---------------------------------------------------------- property detail ---
 // --------------------------------------------------------------- portfolio --
@@ -988,6 +1236,10 @@ function fillPropForm(p) {
   setMoneyValue(pf.assessed_value, p.assessed_value);
   pf.assessed_year.value = p.assessed_year ?? '';
   pf.purchase_date.value = p.purchase_date || '';
+  const flags = aiFlagSet(pf);
+  flags.clear();
+  (p.ai_fields || []).forEach((n) => flags.add(n));
+  renderAiFlags(pf);
 }
 
 function setPropEditing(on) {
@@ -1116,10 +1368,13 @@ function segRowsHtml(segs) {
     const rateCell = s.rate_type === 'variable' && s.rate_mode === 'prime_spread'
       ? `<a href="#" data-prime-link data-seg-start="${esc(s.start_date)}">${esc(segmentRateText(s))}</a>`
       : esc(segmentRateText(s));
+    // AI Fill flags ride on the segment row (see its ai_fields).
+    const flag = (names) => (s.ai_fields || []).some((f) => names.includes(f))
+      ? ' <span class="ai-flag" title="Filled by AI">✨</span>' : '';
     return `<tr>
-    <td>${esc(s.start_date)}</td>
-    <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}</td>
-    <td class="num">${rateCell} <span class="badge cmp">${s.compounding === 'monthly' ? 'Monthly' : 'Semi-annual'}</span></td>
+    <td>${esc(s.start_date)}${flag(['start_date'])}</td>
+    <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}${flag(['rate_type'])}</td>
+    <td class="num">${rateCell}${flag(['rate_mode', 'annual_rate', 'spread'])} <span class="badge cmp">${s.compounding === 'monthly' ? 'Monthly' : 'Semi-annual'}</span>${flag(['compounding'])}</td>
     <td><button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`;
   }).join('')
     || '<tr><td colspan="4" class="note" style="margin:0">No segments in this term yet — add one with "+ Change rate".</td></tr>';
@@ -1255,6 +1510,18 @@ function renderTerms(p) {
   }).join('') || '<div class="note" style="margin-left:0">No terms yet.</div>';
   wrap.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   wrap.querySelectorAll('[data-seg-form]').forEach(syncSegForm);
+  // AI Fill: one panel per term form (it also fills that term's
+  // add-segment form), with the persisted flags re-rendered.
+  wrap.querySelectorAll('[data-term-form]').forEach((f) => {
+    const t = terms.find((x) => String(x.id) === f.dataset.termForm);
+    const block = f.closest('.term-block');
+    attachAiFill(f, 'term', { segForm: block ? block.querySelector('[data-seg-form]') : null });
+    if (t) {
+      const flags = aiFlagSet(f);
+      (t.ai_fields || []).forEach((n) => flags.add(n));
+      renderAiFlags(f);
+    }
+  });
 }
 
 async function deleteSegment(segId) {
@@ -1381,6 +1648,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         // Blank clears the override (the calculated payment rules
         // again); a number sets it.
         payment_override: f.payment_override === '' || f.payment_override == null ? null : f.payment_override,
+        ai_fields: [...aiFlagSet(form)],
       };
       // The principal pair binds the term's opening balance / start
       // date — or, on the term carrying the balance anchor, the
@@ -1407,7 +1675,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
       showMsg($('#mortgageMsg'), 'ok', 'Term saved.');
     } else if (form.dataset.segForm) {
       const f = Object.fromEntries(new FormData(form).entries());
-      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm), compounding: f.compounding || 'semi_annual' };
+      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm), compounding: f.compounding || 'semi_annual', ai_fields: [...aiFlagSet(form)] };
       if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
         body.rate_mode = 'prime_spread';
         body.spread = f.spread === '' ? null : Number(f.spread);
@@ -1430,7 +1698,10 @@ $('#termsWrap').addEventListener('submit', async (e) => {
     } else {
       return;
     }
-    loadPropertyDetail(currentPropertyId);
+    // Term / segment saves preserve the sibling forms' unsaved
+    // drafts (AI-filled values above all) across the reload.
+    if (form.dataset.termForm || form.dataset.segForm) await reloadDetailKeepingDrafts();
+    else loadPropertyDetail(currentPropertyId);
   } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
@@ -1450,6 +1721,7 @@ $('#propForm').addEventListener('submit', async (e) => {
   parseMoneyFields(f, ['assessed_value']);
   f.bca_id = propSuggest.state.id || null;
   f.owners = propOwnerPicker.get();
+  f.ai_fields = [...aiFlagSet(e.target)];
   try {
     await api(`/api/properties/${currentPropertyId}`, { method: 'PUT', body: f });
     markAssetsDirty();
