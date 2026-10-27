@@ -332,12 +332,14 @@
     </div>
     <div class="msg" id="trendMsg"></div>
       <table>
-        <thead><tr><th>Year</th><th class="num">Assessed value</th><th>Source</th><th>Notes</th><th></th></tr></thead>
+        <thead id="trendHead"><tr><th>Year</th><th class="num">Assessed value</th><th>Source</th><th>Notes</th><th></th></tr></thead>
         <tbody id="trendRows"></tbody>
       </table>
       <form id="trendForm" class="toolbar" style="align-items:flex-end">
         <div><label>Year</label><input type="number" name="year" step="1" min="1900" max="2100" required style="width:110px"></div>
         <div><label>Assessed value ($)</label><input type="text" inputmode="decimal" data-money name="value" required style="width:160px"></div>
+        <div><label>Land ($)</label><input type="text" inputmode="decimal" data-money name="land_value" style="width:140px"></div>
+        <div><label>Building ($)</label><input type="text" inputmode="decimal" data-money name="building_value" style="width:140px"></div>
         <div><label>Notes</label><input type="text" name="notes" style="width:180px"></div>
         <button class="primary" type="submit" id="trendSubmitBtn">Add point</button>
         <button type="button" id="trendCancelBtn" class="hidden">Cancel edit</button>

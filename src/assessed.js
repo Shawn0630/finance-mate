@@ -74,12 +74,17 @@ export function applyBcaFetchResult(propertyId, r) {
     nowIso(), r.matchedAddress, r.extractDate, nowIso(), propertyId
   );
   if (r.assessedValue != null && r.assessedYear) {
+    // The current roll carries the year's land / building split:
+    // it lands on the history point too, so the Assessment History
+    // chart can stack this year like the HouseSigma years.
     db.prepare(
-      `INSERT INTO value_history (property_id, year, value, source, created_at, updated_at)
-       VALUES (?, ?, ?, 'auto', ?, ?)
+      `INSERT INTO value_history (property_id, year, value, source, land_value, building_value, created_at, updated_at)
+       VALUES (?, ?, ?, 'auto', ?, ?, ?, ?)
        ON CONFLICT(property_id, year) DO UPDATE SET
-         value = excluded.value, source = 'auto', updated_at = excluded.updated_at`
-    ).run(propertyId, r.assessedYear, r.assessedValue, nowIso(), nowIso());
+         value = excluded.value, source = 'auto',
+         land_value = excluded.land_value, building_value = excluded.building_value,
+         updated_at = excluded.updated_at`
+    ).run(propertyId, r.assessedYear, r.assessedValue, r.landValue ?? null, r.buildingValue ?? null, nowIso(), nowIso());
   }
 }
 
@@ -161,14 +166,24 @@ export function importHistoryPoints(propertyId, points) {
     for (const pt of points) {
       const src = existing.get(pt.year);
       if (!src) {
+        // HouseSigma's payload carries each year's land / building
+        // split (land_int / building_int, parsed by fetchHistory):
+        // store it with the total. A year whose payload has no
+        // split stores NULL — never an invented one.
         db.prepare(
-          `INSERT INTO value_history (property_id, year, value, source, created_at, updated_at)
-           VALUES (?, ?, ?, 'housesigma', ?, ?)`
-        ).run(propertyId, pt.year, pt.total, ts, ts);
+          `INSERT INTO value_history (property_id, year, value, source, land_value, building_value, created_at, updated_at)
+           VALUES (?, ?, ?, 'housesigma', ?, ?, ?, ?)`
+        ).run(propertyId, pt.year, pt.total, pt.land ?? null, pt.building ?? null, ts, ts);
         added.push(pt.year);
       } else if (src === 'housesigma') {
-        db.prepare('UPDATE value_history SET value = ?, updated_at = ? WHERE property_id = ? AND year = ?')
-          .run(pt.total, ts, propertyId, pt.year);
+        // A re-pull refreshes HouseSigma's own points, split
+        // included (COALESCE: a payload without a split leaves
+        // the stored one standing rather than wiping it).
+        db.prepare(
+          `UPDATE value_history SET value = ?, land_value = COALESCE(?, land_value),
+             building_value = COALESCE(?, building_value), updated_at = ?
+           WHERE property_id = ? AND year = ?`
+        ).run(pt.total, pt.land ?? null, pt.building ?? null, ts, propertyId, pt.year);
         updated.push(pt.year);
       } else {
         skipped.push({ year: pt.year, kept: src });

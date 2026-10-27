@@ -2395,15 +2395,21 @@ async function loadTrend(id) {
       ? money(latest.value)
       : (detailProperty.assessed_value != null ? money(detailProperty.assessed_value) : '—');
   }
+  // The Land / Building columns exist only while at least one
+  // year carries a split; split years show both figures, the
+  // rest an em dash.
+  const hasSplit = trendPoints.some((pt) => pt.land_value != null && pt.building_value != null);
+  $('#trendHead').innerHTML = `<tr><th>Year</th><th class="num">Assessed value</th>${hasSplit ? '<th class="num">Land</th><th class="num">Building</th>' : ''}<th>Source</th><th>Notes</th><th></th></tr>`;
   const rows = trendPoints.map((pt) => `<tr>
     <td>${pt.year}</td><td class="num">${money(pt.value)}</td>
+    ${hasSplit ? `<td class="num">${pt.land_value != null ? money(pt.land_value) : '—'}</td><td class="num">${pt.building_value != null ? money(pt.building_value) : '—'}</td>` : ''}
     <td>${pt.source === 'auto' ? '<span class="badge">BC Assessment</span>' : pt.source === 'housesigma' ? '<span class="badge">HouseSigma</span>' : '<span class="badge manual">Manual</span>'}</td>
     <td>${esc(pt.notes || '')}</td>
     <td style="white-space:nowrap">
       <button class="small" onclick="editTrendPoint(${pt.id})">Edit</button>
       <button class="small danger" onclick="deleteTrendPoint(${pt.id})">Delete</button>
     </td></tr>`).join('');
-  $('#trendRows').innerHTML = rows || '<tr><td colspan="5" class="note" style="margin:0">No history points yet.</td></tr>';
+  $('#trendRows').innerHTML = rows || `<tr><td colspan="${hasSplit ? 7 : 5}" class="note" style="margin:0">No history points yet.</td></tr>`;
   renderHistoryChart();
   renderTrendSummary();
   renderDetailCharts();
@@ -2411,10 +2417,12 @@ async function loadTrend(id) {
 }
 
 // ---- Assessed history chart (the Assessment History modal) ----
-// The modal's top is the history itself as bars: one bar per
-// recorded year, oldest first, the amount written on top of each
-// bar. The tooltip names the point's source — and its land /
-// building split when the point carries one. Built only while
+// The modal's top is the history itself as bars: one stack per
+// recorded year, oldest first, the year's total written on top.
+// A year whose point carries a land / building split stacks Land
+// under Building; a year without one is a single Total bar. The
+// tooltip names the point's source and, for split years, the
+// Land / Building / Total breakdown. Built only while
 // the modal is open (a canvas sized against a hidden layout would
 // come out wrong), redrawn whenever the points change under it
 // (fetch / pull / add / edit / delete all funnel through
@@ -2428,67 +2436,113 @@ function destroyHistoryChart() {
 
 const TREND_SOURCE_LABELS = { auto: 'BC Assessment', housesigma: 'HouseSigma', manual: 'Manual' };
 
-// The amount on top of each bar, in the site's assessed green.
+// The year's total on top of each bar (stack), in the site's
+// assessed green: the topmost non-zero segment of the stack
+// carries it.
 const historyBarLabelPlugin = {
   id: 'historyBarLabels',
   afterDatasetsDraw(chart) {
-    const meta = chart.getDatasetMeta(0);
-    if (!meta || !meta.data) return;
     const c = chart.ctx;
     c.save();
     c.font = '700 11px system-ui, sans-serif';
     c.fillStyle = '#20573a';
     c.textAlign = 'center';
-    meta.data.forEach((bar, i) => {
-      c.fillText(money(chart.data.datasets[0].data[i]), bar.x, bar.y - 4);
+    chart.data.labels.forEach((_, i) => {
+      let total = 0;
+      let top = null;
+      for (let d = chart.data.datasets.length - 1; d >= 0; d--) {
+        const v = chart.data.datasets[d].data[i];
+        if (!v) continue;
+        total += v;
+        if (!top) {
+          const meta = chart.getDatasetMeta(d);
+          if (meta && meta.data && meta.data[i]) top = meta.data[i];
+        }
+      }
+      if (top) c.fillText(money(total), top.x, top.y - 4);
     });
     c.restore();
   },
 };
+
+// A point carries a split only when BOTH figures stand.
+const hasSplitPt = (pt) => pt.land_value != null && pt.building_value != null;
 
 function renderHistoryChart() {
   const modal = $('#historyModal');
   if (!modal || modal.classList.contains('hidden')) return;
   if (!trendPoints.length) { destroyHistoryChart(); return; }
   const pts = [...trendPoints].sort((a, b) => a.year - b.year);
+  const anySplit = pts.some(hasSplitPt);
+  const anyTotalOnly = pts.some((pt) => !hasSplitPt(pt));
   destroyHistoryChart();
   historyChart = new Chart($('#historyChart'), {
     type: 'bar',
     data: {
       labels: pts.map((pt) => String(pt.year)),
-      datasets: [{
-        label: 'Assessed value',
-        data: pts.map((pt) => pt.value),
-        pointMeta: pts,
-        backgroundColor: 'rgba(46, 125, 79, 0.75)',
-        borderColor: '#2e7d4f',
-        borderWidth: 1,
-        maxBarThickness: 90,
-      }],
+      // One stack per year: a split year is Land (bottom) +
+      // Building (top); a year without a split is a single Total
+      // bar in the assessed green the chart has always used. The
+      // datasets are keyed by series name, never by position.
+      datasets: [
+        {
+          key: 'land', label: 'Land', stack: 'assessed',
+          data: pts.map((pt) => (hasSplitPt(pt) ? pt.land_value : 0)),
+          pointMeta: pts,
+          backgroundColor: 'rgba(230, 126, 34, 0.8)', borderColor: '#e67e22',
+          borderWidth: 1, maxBarThickness: 90,
+        },
+        {
+          key: 'building', label: 'Building', stack: 'assessed',
+          data: pts.map((pt) => (hasSplitPt(pt) ? pt.building_value : 0)),
+          pointMeta: pts,
+          backgroundColor: 'rgba(22, 104, 196, 0.8)', borderColor: '#1668c4',
+          borderWidth: 1, maxBarThickness: 90,
+        },
+        {
+          key: 'total', label: 'Total', stack: 'assessed',
+          data: pts.map((pt) => (hasSplitPt(pt) ? 0 : pt.value)),
+          pointMeta: pts,
+          backgroundColor: 'rgba(46, 125, 79, 0.75)', borderColor: '#2e7d4f',
+          borderWidth: 1, maxBarThickness: 90,
+        },
+      ],
     },
     plugins: [historyBarLabelPlugin],
     options: {
       responsive: true, maintainAspectRatio: false,
       layout: { padding: { top: 16 } }, // headroom for the bar-top amounts
       plugins: {
-        legend: { display: false },
+        // The legend names the stack's parts; a series with no
+        // bar in any year is filtered out of it, and with no
+        // split years at all the legend stays hidden (the chart
+        // reads as plain total bars, as before).
+        legend: {
+          display: anySplit,
+          labels: {
+            filter: (item, data) => {
+              const key = data.datasets[item.datasetIndex].key;
+              return key === 'total' ? anyTotalOnly : anySplit;
+            },
+          },
+        },
         tooltip: {
           callbacks: {
             title: (items) => `Assessed value — ${items[0].label}`,
             label: (item) => {
               const pt = item.dataset.pointMeta[item.dataIndex];
-              const lines = [` ${money(item.parsed.y)}`, ` Source: ${TREND_SOURCE_LABELS[pt.source] || pt.source}`];
-              if (pt.land_value != null && pt.building_value != null) {
-                lines.push(` Land ${money(pt.land_value)} + building ${money(pt.building_value)}`);
+              const src = ` Source: ${TREND_SOURCE_LABELS[pt.source] || pt.source}`;
+              if (hasSplitPt(pt)) {
+                return [` Land ${money(pt.land_value)}`, ` Building ${money(pt.building_value)}`, ` Total ${money(pt.value)}`, src];
               }
-              return lines;
+              return [` Total ${money(pt.value)}`, src];
             },
           },
         },
       },
       scales: {
-        x: { grid: { display: false } },
-        y: { beginAtZero: true, ticks: { callback: (v) => moneyTick(v) } },
+        x: { stacked: true, grid: { display: false } },
+        y: { stacked: true, beginAtZero: true, ticks: { callback: (v) => moneyTick(v) } },
       },
     },
   });
@@ -2536,6 +2590,8 @@ function editTrendPoint(pointId) {
   const f = $('#trendForm');
   f.year.value = pt.year;
   setMoneyValue(f.value, pt.value);
+  setMoneyValue(f.land_value, pt.land_value ?? '');
+  setMoneyValue(f.building_value, pt.building_value ?? '');
   f.notes.value = pt.notes || '';
   $('#trendSubmitBtn').textContent = 'Save point';
   $('#trendCancelBtn').classList.remove('hidden');
@@ -2551,10 +2607,21 @@ async function deleteTrendPoint(pointId) {
 }
 window.deleteTrendPoint = deleteTrendPoint;
 
+// With both split figures filled, the year's total is their
+// sum — the value field follows as they are typed (the server
+// applies the same rule on save).
+$('#trendForm').addEventListener('input', (e) => {
+  if (e.target.name !== 'land_value' && e.target.name !== 'building_value') return;
+  const f = e.target.form;
+  const land = parseMoneyInput(f.land_value.value);
+  const building = parseMoneyInput(f.building_value.value);
+  if (land !== '' && building !== '') setMoneyValue(f.value, land + building);
+});
+
 $('#trendForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
-  parseMoneyFields(f, ['value']);
+  parseMoneyFields(f, ['value', 'land_value', 'building_value']);
   try {
     if (trendEditingId) {
       await api(`/api/properties/${currentPropertyId}/value-history/${trendEditingId}`, { method: 'PUT', body: f });

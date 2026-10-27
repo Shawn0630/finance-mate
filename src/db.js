@@ -103,6 +103,13 @@ CREATE TABLE IF NOT EXISTS value_history (
   value REAL NOT NULL,
   source TEXT NOT NULL DEFAULT 'manual',   -- 'auto' | 'manual' | 'housesigma'
   notes TEXT,
+  -- The land / building split of the year's assessed value, when
+  -- the source carries one (BC Assessment's current roll and
+  -- HouseSigma's history both do). NULL on points whose source
+  -- has no split — the Assessment History chart stacks the split
+  -- years and draws the rest as single total bars.
+  land_value REAL,
+  building_value REAL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (property_id, year)
@@ -192,6 +199,19 @@ if (!propCols.includes('hs_id_address')) {
   // skip the address locate step.
   db.exec('ALTER TABLE properties ADD COLUMN hs_id_address TEXT');
   db.exec('ALTER TABLE properties ADD COLUMN hs_id_listing TEXT');
+}
+// value_history: the land / building split columns (see the table
+// comment). Existing points predate the split and stay NULL — no
+// source is invented for them; a re-pull / re-fetch fills the
+// years its payload actually carries a split for.
+{
+  const histCols = db.prepare('PRAGMA table_info(value_history)').all().map((c) => c.name);
+  if (!histCols.includes('land_value')) {
+    db.exec('ALTER TABLE value_history ADD COLUMN land_value REAL');
+  }
+  if (!histCols.includes('building_value')) {
+    db.exec('ALTER TABLE value_history ADD COLUMN building_value REAL');
+  }
 }
 // rate_segments: databases created before prime-spread pricing have
 // annual_rate NOT NULL and no rate_mode / spread columns. Prime

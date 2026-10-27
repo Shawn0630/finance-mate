@@ -1210,6 +1210,26 @@ function validYearValue(b) {
   return { year, value };
 }
 
+// A point's optional land / building split: the two travel
+// together (both given or both blank), and when both are given
+// the point's value IS their sum. `present` false means the body
+// carries neither key (a PUT then leaves the stored split alone);
+// present with nulls means both were blank (the split clears).
+function cleanSplit(b) {
+  const hasLand = b.land_value !== undefined;
+  const hasBuilding = b.building_value !== undefined;
+  if (!hasLand && !hasBuilding) return { present: false, land: null, building: null };
+  const land = num(b.land_value);
+  const building = num(b.building_value);
+  if ((land === null) !== (building === null)) {
+    return { error: 'land_value and building_value must be given together' };
+  }
+  if (land !== null && (land < 0 || building < 0)) {
+    return { error: 'land_value and building_value must be numbers >= 0' };
+  }
+  return { present: true, land, building };
+}
+
 app.get('/api/properties/:id/value-history', requireApiAuth, (req, res) => {
   if (!getProperty(req.params.id)) return res.status(404).json({ error: 'property not found' });
   res.json(historyView(req.params.id));
@@ -1218,14 +1238,25 @@ app.get('/api/properties/:id/value-history', requireApiAuth, (req, res) => {
 app.post('/api/properties/:id/value-history', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
-  const v = validYearValue(req.body || {});
+  const sp = cleanSplit(req.body || {});
+  if (sp.error) return res.status(400).json({ error: sp.error });
+  // Both split figures given: the year's total is their sum (the
+  // sum stands in for the value in validation too — a split-only
+  // entry needs no separate value).
+  const v = validYearValue(sp.present && sp.land !== null
+    ? { year: (req.body || {}).year, value: sp.land + sp.building }
+    : (req.body || {}));
   if (v.error) return res.status(400).json({ error: v.error });
+  const value = v.value;
   db.prepare(
-    `INSERT INTO value_history (property_id, year, value, source, notes, created_at, updated_at)
-     VALUES (?, ?, ?, 'manual', ?, ?, ?)
+    `INSERT INTO value_history (property_id, year, value, source, notes, land_value, building_value, created_at, updated_at)
+     VALUES (?, ?, ?, 'manual', ?, ?, ?, ?, ?)
      ON CONFLICT(property_id, year) DO UPDATE SET
-       value = excluded.value, source = 'manual', notes = excluded.notes, updated_at = excluded.updated_at`
-  ).run(p.id, v.year, v.value, (req.body || {}).notes || null, nowIso(), nowIso());
+       value = excluded.value, source = 'manual', notes = excluded.notes,
+       land_value = excluded.land_value, building_value = excluded.building_value,
+       updated_at = excluded.updated_at`
+  ).run(p.id, v.year, value, (req.body || {}).notes || null,
+    sp.present ? sp.land : null, sp.present ? sp.building : null, nowIso(), nowIso());
   res.status(201).json(historyView(p.id));
 });
 
@@ -1237,11 +1268,23 @@ app.put('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, res)
   const b = req.body || {};
   const v = validYearValue({ year: b.year !== undefined ? b.year : pt.year, value: b.value !== undefined ? b.value : pt.value });
   if (v.error) return res.status(400).json({ error: v.error });
+  const sp = cleanSplit(b);
+  if (sp.error) return res.status(400).json({ error: sp.error });
+  // The split merges over the stored point; when both figures
+  // stand, the value follows their sum.
+  let value = v.value;
+  let land = pt.land_value;
+  let building = pt.building_value;
+  if (sp.present) {
+    land = sp.land;
+    building = sp.building;
+    if (land !== null) value = land + building;
+  }
   // Hand-editing a value turns the point into a manual one.
-  const source = b.value !== undefined && Number(b.value) !== pt.value ? 'manual' : pt.source;
+  const source = value !== pt.value ? 'manual' : pt.source;
   try {
-    db.prepare('UPDATE value_history SET year=?, value=?, source=?, notes=?, updated_at=? WHERE id=?')
-      .run(v.year, v.value, source, b.notes !== undefined ? b.notes || null : pt.notes, nowIso(), pt.id);
+    db.prepare('UPDATE value_history SET year=?, value=?, source=?, notes=?, land_value=?, building_value=?, updated_at=? WHERE id=?')
+      .run(v.year, value, source, b.notes !== undefined ? b.notes || null : pt.notes, land, building, nowIso(), pt.id);
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return res.status(400).json({ error: `a point for ${v.year} already exists` });
     throw e;

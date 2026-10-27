@@ -3616,7 +3616,10 @@ try {
           metaGone: !document.querySelector('#assessmentMetaView') && !document.querySelector('#hsPullNote')
             && !document.querySelector('#assessmentMeta'),
           labels: c ? c.data.labels : null,
-          values: c ? c.data.datasets[0].data : null,
+          // A year's bar total is the sum over the stacked
+          // datasets (Land + Building for a split year, the Total
+          // dataset for a total-only one).
+          values: c ? c.data.labels.map((_, i) => c.data.datasets.reduce((sum, ds) => sum + (ds.data[i] || 0), 0)) : null,
           sources: c ? c.data.datasets[0].pointMeta.map((p) => p.source) : null,
           canvasW: rect.width, canvasH: rect.height,
         };
@@ -3625,7 +3628,7 @@ try {
         !histBits.text.includes('Source: BC Assessment') && !histBits.text.includes('HouseSigma history:')
           && histBits.metaGone,
         histBits.text.slice(0, 200));
-      check('the Assessment History modal tops out with the history bar chart (one bar per point, ascending years)',
+      check('the Assessment History modal tops out with the history bar chart (one stack per point, ascending years)',
         !!histBits.values && histBits.values.length === vhNow.points.length
           && histBits.values.every((v, i) => v === vhNow.points[i].value)
           && histBits.labels.every((l, i) => l === String(vhNow.points[i].year))
@@ -4447,6 +4450,10 @@ try {
     !!hsHist && hsHist.points.every((p) => p.source === 'housesigma'));
   check('pulled values match the HouseSigma payload (2022 = 1,730,000, 2026 = 1,931,000)',
     !!hsHist && ptOf(hsHist, 2022).value === 1730000 && ptOf(hsHist, 2026).value === 1931000);
+  check('pulled points carry the payload\u2019s land / building split (2022 = 1,306,000 / 424,000; 2026 = 1,503,000 / 428,000)',
+    !!hsHist && ptOf(hsHist, 2022).land_value === 1306000 && ptOf(hsHist, 2022).building_value === 424000
+      && ptOf(hsHist, 2026).land_value === 1503000 && ptOf(hsHist, 2026).building_value === 428000,
+    JSON.stringify(hsHist ? hsHist.points : []));
   check('the detail call carried the located ids',
     !!hsLastDetailParams && hsLastDetailParams.id_address === 'HS-ADDR-1' && hsLastDetailParams.id_listing === 'HS-LIST-1',
     JSON.stringify(hsLastDetailParams));
@@ -4465,6 +4472,22 @@ try {
   check('re-pull reports the manual year as skipped',
     (r.data.skipped || []).some((s) => s.year === 2024 && s.kept === 'manual'), JSON.stringify(r.data.skipped));
   check('re-pull added no duplicate points', r.data.history.points.length === 5);
+  check('the manual 2024 point carries no split (its entry had none)',
+    ptOf(r.data.history, 2024).land_value == null && ptOf(r.data.history, 2024).building_value == null,
+    JSON.stringify(ptOf(r.data.history, 2024)));
+  // A re-pull refreshes HouseSigma's own splits in place: shift
+  // the stub's 2023 land figure and the stored point follows.
+  hsHistoryChristina.find((h) => h.year === 2023).land_int = 1400000;
+  r = await req('POST', `/api/properties/${pidHs}/pull-history`);
+  check('re-pull refreshes a HouseSigma point\u2019s split (2023 land 1,456,000 -> 1,400,000)',
+    r.data.ok === true && ptOf(r.data.history, 2023).land_value === 1400000
+      && ptOf(r.data.history, 2023).building_value === 447000,
+    JSON.stringify(ptOf(r.data.history, 2023)));
+  hsHistoryChristina.find((h) => h.year === 2023).land_int = 1456000;
+  r = await req('POST', `/api/properties/${pidHs}/pull-history`);
+  check('stub restored and re-pulled (2023 land back to 1,456,000)',
+    r.data.ok === true && ptOf(r.data.history, 2023).land_value === 1456000,
+    JSON.stringify(ptOf(r.data.history, 2023)));
 
   // BC Assessment ('auto') beats HouseSigma for the same year; a
   // year HouseSigma has and BCA does not is filled in.
@@ -4485,6 +4508,42 @@ try {
     ptOf(r.data.history, 2026).value === 6532000 && ptOf(r.data.history, 2026).source === 'auto');
   check('HouseSigma 2025 point stands (6,100,000, housesigma)',
     ptOf(r.data.history, 2025).value === 6100000 && ptOf(r.data.history, 2025).source === 'housesigma');
+  check('the BCA fetch stored the current year\u2019s split on its point (2026 = 4,666,000 / 1,866,000)',
+    ptOf(r.data.history, 2026).land_value === 4666000 && ptOf(r.data.history, 2026).building_value === 1866000,
+    JSON.stringify(ptOf(r.data.history, 2026)));
+  check('the HouseSigma 2025 point carries its split (4,050,000 / 2,050,000)',
+    ptOf(r.data.history, 2025).land_value === 4050000 && ptOf(r.data.history, 2025).building_value === 2050000,
+    JSON.stringify(ptOf(r.data.history, 2025)));
+
+  // Manual points: Land + Building both given -> the year's total
+  // is their sum and the split is stored; a total-only entry
+  // leaves the split empty; a one-sided split is a 400; a PUT
+  // with both figures re-sums the value.
+  r = await req('POST', '/api/properties', {
+    address: '555 Split Lane, Coquitlam, BC', mortgage_balance: 100000, purchase_date: '2024-01-01',
+  });
+  const pidSplit = r.data.id;
+  r = await req('POST', `/api/properties/${pidSplit}/value-history`, { year: 2021, land_value: 1200000, building_value: 400000 });
+  check('manual point with Land + Building: value is their sum (1,600,000), split stored',
+    r.status === 201 && ptOf(r.data, 2021).value === 1600000
+      && ptOf(r.data, 2021).land_value === 1200000 && ptOf(r.data, 2021).building_value === 400000
+      && ptOf(r.data, 2021).source === 'manual',
+    JSON.stringify(ptOf(r.data, 2021)));
+  r = await req('POST', `/api/properties/${pidSplit}/value-history`, { year: 2020, value: 900000 });
+  check('manual total-only point: split stays empty',
+    r.status === 201 && ptOf(r.data, 2020).value === 900000
+      && ptOf(r.data, 2020).land_value == null && ptOf(r.data, 2020).building_value == null,
+    JSON.stringify(ptOf(r.data, 2020)));
+  r = await req('POST', `/api/properties/${pidSplit}/value-history`, { year: 2019, value: 500000, land_value: 500000 });
+  check('a one-sided split is rejected (400)',
+    r.status === 400 && /given together/.test(r.data.error || ''), JSON.stringify(r.data));
+  const pt2020 = ptOf(r.data, 2020) || (await req('GET', `/api/properties/${pidSplit}/value-history`)).data.points.find((p) => p.year === 2020);
+  r = await req('PUT', `/api/properties/${pidSplit}/value-history/${pt2020.id}`, { land_value: 700000, building_value: 250000 });
+  check('PUT with both split figures re-sums the value (900,000 -> 950,000)',
+    r.status === 200 && ptOf(r.data, 2020).value === 950000
+      && ptOf(r.data, 2020).land_value === 700000 && ptOf(r.data, 2020).building_value === 250000,
+    JSON.stringify(ptOf(r.data, 2020)));
+  await req('DELETE', `/api/properties/${pidSplit}`);
 
   // Fetch-on-read: a never-fetched property with a BCA id refreshes
   // itself when its detail is loaded — through the by-id channel —
@@ -4565,6 +4624,12 @@ try {
     r = await req('DELETE', `/api/properties/${pidHist}/value-history/${pt2023.id}`);
     check('history-modal fixture: 2023 point removed (4 points left)',
       !!r.data.points && r.data.points.length === 4, JSON.stringify(r.data.points && r.data.points.length));
+    // A manual total-only year joins the split HouseSigma years:
+    // the chart must stack the split years and draw 2021 as one
+    // Total bar, the table shows its Land / Building as —.
+    r = await req('POST', `/api/properties/${pidHist}/value-history`, { year: 2021, value: 1600000 });
+    check('history-modal fixture: total-only 2021 point added (5 points)',
+      r.status === 201 && r.data.points.length === 5, JSON.stringify(r.data.points && r.data.points.length));
 
     const forwardH = (rq) => new Promise((resolve, reject) => {
       const rr = http.request(
@@ -4630,6 +4695,21 @@ try {
         const c = window.__fmCharts.history;
         const canvas = modal.querySelector('#historyChart');
         const rect = canvas ? canvas.getBoundingClientRect() : { width: 0, height: 0 };
+        const byKey = {};
+        if (c) for (const ds of c.data.datasets) byKey[ds.key] = ds;
+        const tipFor = (key, year) => {
+          const ds = byKey[key];
+          const i = c.data.labels.indexOf(year);
+          const out = c.options.plugins.tooltip.callbacks.label({
+            dataIndex: i, datasetIndex: c.data.datasets.indexOf(ds), dataset: ds,
+            parsed: { y: ds.data[i] },
+          });
+          return Array.isArray(out) ? out.join(' | ') : String(out);
+        };
+        const legendTexts = c && c.legend ? c.legend.legendItems.map((it) => it.text) : [];
+        const headCells = [...modal.querySelectorAll('#trendHead th')].map((th) => th.textContent.trim());
+        const row2021 = [...modal.querySelectorAll('#trendRows tr')]
+          .find((tr) => tr.cells[0] && tr.cells[0].textContent.trim() === '2021');
         return {
           text: modal.textContent,
           metaGone: !modal.querySelector('#assessmentMetaView') && !modal.querySelector('#hsPullNote'),
@@ -4638,12 +4718,42 @@ try {
           canvasW: rect.width, canvasH: rect.height,
           chartAboveButtons: canvas.getBoundingClientRect().top
             < document.querySelector('#fetchBcaBtn').getBoundingClientRect().top,
+          stacks: c ? c.data.datasets.map((ds) => ds.stack) : null,
+          land: byKey.land ? byKey.land.data : null,
+          building: byKey.building ? byKey.building.data : null,
+          total: byKey.total ? byKey.total.data : null,
+          legendTexts,
+          tipSplit: c ? tipFor('land', '2022') : null,
+          tipTotalOnly: c ? tipFor('total', '2021') : null,
+          headCells,
+          row2021: row2021 ? row2021.textContent : null,
         };
       });
-      check('history modal opens on the bar chart (4 bars, chart above the buttons, real size)',
-        before.bars === 4 && before.labels.join(',') === '2022,2024,2025,2026'
+      check('history modal opens on the bar chart (5 bars, chart above the buttons, real size)',
+        before.bars === 5 && before.labels.join(',') === '2021,2022,2024,2025,2026'
           && before.chartAboveButtons && before.canvasW > 0 && before.canvasH >= 150,
         JSON.stringify(before));
+      check('the chart stacks Land + Building for split years and a single Total bar for the total-only year, all in one stack',
+        JSON.stringify(before.land) === JSON.stringify([0, 1306000, 1504000, 1557000, 1503000])
+          && JSON.stringify(before.building) === JSON.stringify([0, 424000, 451000, 445000, 428000])
+          && JSON.stringify(before.total) === JSON.stringify([1600000, 0, 0, 0, 0])
+          && before.stacks.every((s) => s === 'assessed'),
+        JSON.stringify({ land: before.land, building: before.building, total: before.total, stacks: before.stacks }));
+      check('the legend names Land / Building / Total while both kinds of years exist',
+        before.legendTexts.includes('Land') && before.legendTexts.includes('Building')
+          && before.legendTexts.includes('Total'),
+        JSON.stringify(before.legendTexts));
+      check('tooltips: a split year breaks down Land / Building / Total; a total-only year shows Total only',
+        before.tipSplit.includes('Land') && before.tipSplit.includes('1,306,000')
+          && before.tipSplit.includes('Building') && before.tipSplit.includes('424,000')
+          && before.tipSplit.includes('Total') && before.tipSplit.includes('1,730,000')
+          && before.tipTotalOnly.includes('Total') && before.tipTotalOnly.includes('1,600,000')
+          && !before.tipTotalOnly.includes('Land'),
+        JSON.stringify({ split: before.tipSplit, totalOnly: before.tipTotalOnly }));
+      check('the history table gains Land / Building columns (the total-only year shows —)',
+        before.headCells.includes('Land') && before.headCells.includes('Building')
+          && !!before.row2021 && before.row2021.includes('—'),
+        JSON.stringify({ head: before.headCells, row2021: before.row2021 }));
       check('history modal carries no BCA source line and no HouseSigma status line',
         !before.text.includes('Source: BC Assessment') && !before.text.includes('HouseSigma history:')
           && before.metaGone,
@@ -4653,27 +4763,31 @@ try {
       await page.evaluate(() => document.querySelector('#pullHistoryBtn').click());
       const grown = await until(() => {
         const c = window.__fmCharts.history;
-        return c && c.data.datasets[0].data.length === 5 ? true : null;
+        return c && c.data.datasets[0].data.length === 6 ? true : null;
       });
-      check('in-modal HouseSigma pull grows the chart to 5 bars', !!grown);
+      check('in-modal HouseSigma pull grows the chart to 6 bars', !!grown);
       const after = await page.evaluate(() => {
         const c = window.__fmCharts.history;
         const i = c.data.labels.indexOf('2023');
+        const land = c.data.datasets.find((ds) => ds.key === 'land');
+        const building = c.data.datasets.find((ds) => ds.key === 'building');
         const cb = c.options.plugins.tooltip.callbacks.label;
         const tip = cb({
-          dataIndex: i, datasetIndex: 0, dataset: c.data.datasets[0],
-          parsed: { y: c.data.datasets[0].data[i] },
+          dataIndex: i, datasetIndex: c.data.datasets.indexOf(land), dataset: land,
+          parsed: { y: land.data[i] },
         });
         return {
-          value2023: c.data.datasets[0].data[i],
-          src2023: c.data.datasets[0].pointMeta[i].source,
+          land2023: land.data[i],
+          building2023: building.data[i],
+          src2023: land.pointMeta[i].source,
           tip: Array.isArray(tip) ? tip.join(' | ') : String(tip),
           msg: document.querySelector('#historyMsg').textContent,
         };
       });
-      check('the pulled 2023 bar is a HouseSigma point in the chart data and its tooltip',
-        after.value2023 === 1903000 && after.src2023 === 'housesigma'
-          && after.tip.includes('HouseSigma') && after.tip.includes('1,903,000'),
+      check('the pulled 2023 year stacks as a HouseSigma split (Land 1,456,000 + Building 447,000 = 1,903,000 in its tooltip)',
+        after.land2023 === 1456000 && after.building2023 === 447000 && after.src2023 === 'housesigma'
+          && after.tip.includes('HouseSigma') && after.tip.includes('1,903,000')
+          && after.tip.includes('Land') && after.tip.includes('Building'),
         JSON.stringify(after));
       check('a successful pull writes no status sentence (the chart is the report)',
         !after.msg.includes('Pulled from HouseSigma') && !after.msg.includes('up to date'),
