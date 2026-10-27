@@ -982,6 +982,7 @@ const CHART_SERIES = {
   hero: [
     { key: 'assessed', label: 'Assessed value', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
     { key: 'outstanding', label: 'Outstanding principal', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+    { key: 'equity', label: 'Current equity', bg: '#7c3aed', border: '#7c3aed', bgAlpha: null },
     { key: 'interest', label: 'Interest portion', bg: '#d97706', border: '#d97706', bgAlpha: null },
     { key: 'principal', label: 'Principal portion', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
   ],
@@ -3393,6 +3394,45 @@ function drawCombinedChart() {
         ...seriesColors('hero', chartSeriesDef('hero', 'outstanding')),
         tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2, order: 1,
       });
+      // Current equity: at every outstanding point, the assessed
+      // line's own value minus the outstanding balance — on the
+      // chart it is exactly the vertical distance between the
+      // green and blue lines. The assessed line is read by
+      // straight-segment interpolation between its year points
+      // over the FULL history (not just the shown window), held
+      // at its last value past the final point — the carry the
+      // panel's Current equity figure uses; before the first
+      // assessed point there is no line and no equity point.
+      if (trendPoints.length) {
+        const ap = [...trendPoints].sort((a, b) => a.year - b.year);
+        const assessedAt = (x) => {
+          if (x < ap[0].year) return null;
+          for (let i = 0; i < ap.length; i++) {
+            if (x <= ap[i].year) {
+              if (i === 0) return ap[0].value;
+              const a = ap[i - 1]; const b = ap[i];
+              return a.value + (b.value - a.value) * ((x - a.year) / (b.year - a.year));
+            }
+          }
+          return ap[ap.length - 1].value;
+        };
+        const eqPts = [];
+        for (const p of pts) {
+          const a = assessedAt(p.x);
+          if (a !== null) eqPts.push({ x: p.x, y: Math.round((a - p.y) * 100) / 100 });
+        }
+        if (eqPts.length) {
+          datasets.push({
+            type: 'line',
+            key: 'equity',
+            label: 'Current equity',
+            yAxisID: 'y',
+            data: eqPts,
+            ...seriesColors('hero', chartSeriesDef('hero', 'equity')),
+            tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2, order: 1,
+          });
+        }
+      }
     }
   }
   // The axis is exactly the selected month range — never the

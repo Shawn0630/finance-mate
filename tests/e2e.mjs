@@ -2290,6 +2290,49 @@ try {
           && outXs.every((x) => x >= ymDecA(rp.start) - 0.001 && x < ymDecA(rp.end) + 1 / 12 + 0.001)
           && Math.abs(outXs[outXs.length - 1] - ymDecA(rp.end)) < 0.001,
         JSON.stringify(outXs && { n: outXs.length, last: outXs[outXs.length - 1] }));
+      // Current equity line: at every outstanding point it equals
+      // the assessed line's own interpolated value (this fixture's
+      // history is known exactly: 2019-2026, +$50k a year) minus
+      // the outstanding balance, and at the latest point it equals
+      // the panel's Current equity figure to the cent.
+      const eqHero = await page.evaluate(() => {
+        const c = window.__fmCharts.a;
+        const get = (k) => c.data.datasets.find((d) => d.key === k);
+        const eq = get('equity'); const out = get('outstanding');
+        return {
+          has: !!eq, label: eq ? eq.label : null,
+          eqPts: eq ? eq.data : null, outPts: out ? out.data : null,
+          panel: document.querySelector('#detailCurrentEquity').textContent,
+        };
+      });
+      const assessedAtH = (x) => {
+        const ap = [];
+        for (let y = 2019; y <= 2026; y++) ap.push({ x: y, y: 1000000 + (y - 2019) * 50000 });
+        if (x < ap[0].x) return null;
+        for (let i = 0; i < ap.length; i++) {
+          if (x <= ap[i].x) {
+            if (i === 0) return ap[0].y;
+            const a = ap[i - 1]; const b = ap[i];
+            return a.y + (b.y - a.y) * ((x - a.x) / (b.x - a.x));
+          }
+        }
+        return ap[ap.length - 1].y;
+      };
+      let eqHeroOk = !!eqHero.has && eqHero.label === 'Current equity'
+        && Array.isArray(eqHero.eqPts) && eqHero.eqPts.length > 0
+        && eqHero.eqPts.length === eqHero.outPts.length;
+      if (eqHeroOk) {
+        for (let i = 0; i < eqHero.eqPts.length; i++) {
+          const p = eqHero.eqPts[i]; const o = eqHero.outPts[i];
+          const a = assessedAtH(p.x);
+          if (Math.abs(p.x - o.x) > 1e-9 || a === null || Math.abs(p.y - (a - o.y)) > 0.011) { eqHeroOk = false; break; }
+        }
+      }
+      const eqHeroLast = eqHero.eqPts ? eqHero.eqPts[eqHero.eqPts.length - 1] : null;
+      const panelEqVal = Number(String(eqHero.panel).replace(/[^0-9.\-]/g, ''));
+      check('hero chart carries a Current equity line (assessed line minus outstanding at every point; latest point equals the panel figure)',
+        eqHeroOk && !!eqHeroLast && Math.abs(eqHeroLast.y - panelEqVal) < 0.011,
+        JSON.stringify({ ok: eqHeroOk, last: eqHeroLast, panel: eqHero.panel }));
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="24"]').click());
       await wait(600);
       ax = await axisA();
@@ -5563,6 +5606,23 @@ try {
         return ev.defaultPrevented;
       });
       check('a right click on a legend item suppresses the browser context menu', ctxPrevented === true);
+      // Hero: Current equity toggles from the legend and recolors
+      // from the panel like every other hero series.
+      const heroEqPt = await legendPoint('a', 'equity');
+      check('the hero legend exposes a Current equity item to click', !!heroEqPt, JSON.stringify(heroEqPt));
+      await page.mouse.click(heroEqPt.x, heroEqPt.y);
+      check('left-clicking the Current equity legend item hides the series',
+        await waitLegend('a', 'equity', { visible: false, hidden: true }));
+      const heroEqPt2 = await legendPoint('a', 'equity');
+      await page.mouse.click(heroEqPt2.x, heroEqPt2.y);
+      check('clicking Current equity again restores it',
+        await waitLegend('a', 'equity', { visible: true, hidden: false }));
+      await setColor('hero', 'equity', '#5b21b6');
+      const heroEqColor = await page.evaluate(() => {
+        const ds = window.__fmCharts.a.data.datasets.find((d) => d.key === 'equity');
+        return ds ? ds.borderColor : null;
+      });
+      check('recoloring Current equity applies live', heroEqColor === '#5b21b6', String(heroEqColor));
       // History: left-click Land off and back on; right-click
       // Building opens its panel on the Building row.
       await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
