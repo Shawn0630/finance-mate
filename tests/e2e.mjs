@@ -2185,6 +2185,32 @@ try {
         JSON.stringify({ card: eqCard.text, want: fmtTotal, leftOf: eqCard.leftOf }));
       check('overview footnote notes the properties Total equity excludes (no assessed value)',
         eqCard.notes.includes('Total equity excludes'), eqCard.notes.slice(0, 200));
+      // Properties head row: the title and the + Add property
+      // button align with the Portfolio panel's content edges
+      // (panel border 1px + padding 16px = a 17px inset), and the
+      // button gets the head's set 16px padding of air above it
+      // instead of sitting squeezed against the subnav.
+      const headGeom = await page.evaluate(() => {
+        const head = document.querySelector('#section-properties .section-head');
+        const title = head.querySelector('h2');
+        const btn = document.querySelector('#addPropertyBtn');
+        const panel = document.querySelector('#portfolioBlock');
+        const hr = head.getBoundingClientRect();
+        const tr = title.getBoundingClientRect();
+        const br = btn.getBoundingClientRect();
+        const pr = panel.getBoundingClientRect();
+        return {
+          titleLeftDelta: Math.abs(tr.left - (pr.left + 17)),
+          btnRightDelta: Math.abs(br.right - (pr.right - 17)),
+          btnTopGap: br.top - hr.top,
+        };
+      });
+      check('properties head: title left edge aligns with the Portfolio panel content left edge',
+        headGeom.titleLeftDelta <= 3, JSON.stringify(headGeom));
+      check('properties head: Add property button right edge aligns with the panel content right edge',
+        headGeom.btnRightDelta <= 3, JSON.stringify(headGeom));
+      check('properties head: the button has the set 16px padding of space above it',
+        headGeom.btnTopGap > 0 && Math.abs(headGeom.btnTopGap - 16) <= 3, JSON.stringify(headGeom));
 
       // Assessed-history window: the range is a start/end month
       // pair (the default 5-year preset fills Nov 2021-Oct 2026).
