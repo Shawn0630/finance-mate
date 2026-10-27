@@ -1558,8 +1558,8 @@ function payEditEls(form) {
 }
 
 // A form field's input: the form's own descendant — except the
-// payment row's inputs (the override editor and the Priced as of
-// date), which live in the pay block below the form.
+// payment row's override editor, which lives in the pay block
+// below the form.
 function fieldInputOf(form, name) {
   const own = form.querySelector(`[name="${name}"]`);
   if (own) return own;
@@ -1666,7 +1666,7 @@ function segRowsHtml(segs) {
     return `<tr>
     <td>${esc(s.start_date)}${flag(['start_date'])}</td>
     <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}${flag(['rate_type'])}</td>
-    <td class="num">${rateCell}${flag(['rate_mode', 'annual_rate', 'spread'])} <span class="badge cmp">${s.compounding === 'monthly' ? 'Monthly' : 'Semi-annual'}</span>${flag(['compounding'])}</td>
+    <td class="num">${rateCell}${flag(['rate_mode', 'annual_rate', 'spread'])} <span class="badge cmp">${s.compounding === 'monthly' ? 'Monthly' : 'Semi-annual'}</span>${flag(['compounding'])}${s.locked_on && s.rate_mode === 'prime_spread' ? ` <span class="badge lock">Locked ${esc(s.locked_on)}</span>` : ''}</td>
     <td><button type="button" class="small" data-edit-seg="${s.id}">Edit</button> <button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`;
   }).join('')
     || '<tr><td colspan="4" class="note" style="margin:0">No segments in this term yet — add one with "+ Change rate".</td></tr>';
@@ -1696,7 +1696,7 @@ function segFormHtml(t) {
     </div>
     <div class="grid3">
       <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
-      <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div></div>
+      <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div><label style="margin-top:6px">Locked on</label><input type="date" name="locked_on"></div>
       <div><label>Compounding</label><select name="compounding"><option value="semi_annual">Semi-annual</option><option value="monthly">Monthly</option></select></div>
     </div>
     <div class="toolbar">
@@ -1749,6 +1749,7 @@ function enterSegEditMode(form, seg) {
   form.rate_mode.value = seg.rate_mode || 'absolute';
   form.annual_rate.value = seg.annual_rate ?? '';
   form.spread.value = seg.spread ?? '';
+  form.locked_on.value = seg.locked_on || '';
   form.compounding.value = seg.compounding || 'semi_annual';
   form._aiFilling = false;
   syncSegForm(form);
@@ -1877,7 +1878,6 @@ function renderTerms(p) {
             <button type="button" class="small" data-pay-edit>Edit</button>
             <button type="button" class="small hidden" data-pay-reset>Reset</button>
           </div></div>
-          <div><label>Priced as of</label><input name="payment_pricing_date" form="termForm${t.id}" type="date" value="${esc(t.payment_pricing_date || '')}"></div>
         </div>
         <div class="toolbar" style="margin-top:12px">
           <button class="primary" type="submit" form="termForm${t.id}" data-save-term="${t.id}">${esc(saveTermLabel(freqKey))}</button>
@@ -2039,12 +2039,11 @@ $('#termsWrap').addEventListener('change', (e) => {
   const form = e.target.closest('[data-seg-form]');
   if (form) { syncSegForm(form); refreshPlanPreview(form); return; }
   // The term's plan fields (repayment method, amortization,
-  // payment override, pricing date) re-price the preview of that
-  // term's draft segment. The payment editor sits in the pay
-  // block below the form, so its events resolve through the
-  // block too.
+  // payment override) re-price the preview of that term's draft
+  // segment. The payment editor sits in the pay block below the
+  // form, so its events resolve through the block too.
   if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]'))
-    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years' || e.target.name === 'payment_override' || e.target.name === 'payment_pricing_date')) {
+    && (e.target.name === 'repayment_method' || e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }
@@ -2052,7 +2051,7 @@ $('#termsWrap').addEventListener('change', (e) => {
 $('#termsWrap').addEventListener('input', (e) => {
   const form = e.target.closest('[data-seg-form]');
   if (form) { if (e.target.name === 'spread') syncSegForm(form); refreshPlanPreview(form); return; }
-  if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]')) && (e.target.name === 'amortization_years' || e.target.name === 'payment_override' || e.target.name === 'payment_pricing_date')) {
+  if ((e.target.closest('[data-term-form]') || e.target.closest('[data-pay-block]')) && (e.target.name === 'amortization_years' || e.target.name === 'payment_override')) {
     const seg = segFormOfBlock(e.target);
     if (seg && !seg.classList.contains('hidden')) refreshPlanPreview(seg);
   }
@@ -2078,10 +2077,6 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         // clears it too; any other figure is sent as the override
         // (the server still refuses a non-positive one).
         payment_override: paymentOverrideOut(form, f.payment_override),
-        // The payment row's Priced as of date (blank clears the
-        // pricing anchor; the payment then derives at the term's
-        // start, as before).
-        payment_pricing_date: f.payment_pricing_date ? f.payment_pricing_date : null,
         ai_fields: [...aiFlagSet(form)],
       };
       // The principal pair binds the term's opening balance / start
@@ -2113,9 +2108,13 @@ $('#termsWrap').addEventListener('submit', async (e) => {
       if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
         body.rate_mode = 'prime_spread';
         body.spread = f.spread === '' ? null : Number(f.spread);
+        // The segment's pricing lock (blank clears it; the
+        // payment then derives at the derivation month's prime).
+        body.locked_on = f.locked_on ? f.locked_on : null;
       } else {
         body.rate_mode = 'absolute';
         body.annual_rate = f.annual_rate;
+        body.locked_on = null;
       }
       // Edit mode updates the loaded segment in place (same id);
       // add mode creates a new one. A saved edit returns the
@@ -2434,17 +2433,16 @@ function refreshPlanPreview(form) {
       const po = parseMoneyInput(termForm.payment_override.value);
       body.payment_override = po === '' ? null : po;
     }
-    // The term form's Priced as of date as currently edited (blank
-    // = no pricing anchor in the draft).
-    if (termForm && termForm.payment_pricing_date) {
-      body.payment_pricing_date = termForm.payment_pricing_date.value || null;
-    }
     if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
       body.rate_mode = 'prime_spread';
       body.spread = f.spread === '' ? null : Number(f.spread);
+      // The draft segment's Locked on date as currently edited
+      // (blank = no pricing lock in the draft).
+      body.locked_on = f.locked_on ? f.locked_on : null;
     } else {
       body.rate_mode = 'absolute';
       body.annual_rate = f.annual_rate === '' ? null : Number(f.annual_rate);
+      body.locked_on = null;
     }
     try {
       const r = await api(`/api/properties/${currentPropertyId}/preview`, { method: 'POST', body });

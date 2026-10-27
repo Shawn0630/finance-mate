@@ -565,8 +565,12 @@ function syncTermAnchor(p) {
 // does not reach the term (or cannot run at all).
 function termView(t, segments, lumpSums, payMap) {
   const pay = (payMap && payMap[t.id]) || null;
+  // payment_pricing_date is retired — the pricing anchor lives on
+  // the governing segment as locked_on now — so the dormant column
+  // is never served.
+  const { payment_pricing_date: _retired, ...row } = t;
   return {
-    ...t,
+    ...row,
     ai_fields: parseAiFields(t.ai_fields),
     end_date: termEndDate(t),
     paymentDerived: pay ? pay.paymentDerived : null,
@@ -1362,12 +1366,21 @@ function cleanSegment(b, base) {
     // (the Canadian standard, and every existing segment) or
     // 'monthly' (compounded at the payment frequency).
     compounding: b.compounding !== undefined ? b.compounding : base?.compounding || 'semi_annual',
+    // The date this segment's rate was locked (priced) on. Only
+    // meaningful for variable prime_spread segments — anything
+    // else is forced to null below, since a written-down rate has
+    // no pricing date. Derivations governed by the segment price
+    // prime as of this date; accrual never reads it.
+    locked_on: b.locked_on !== undefined
+      ? (b.locked_on === '' || b.locked_on === null ? null : String(b.locked_on))
+      : (base?.locked_on ?? null),
   };
   if (!next.start_date) return { error: 'start_date is required' };
   if (!['fixed', 'variable'].includes(next.rate_type)) return { error: 'rate_type must be fixed or variable' };
   if (!['absolute', 'prime_spread'].includes(next.rate_mode)) return { error: 'rate_mode must be absolute or prime_spread' };
   if (!['semi_annual', 'monthly'].includes(next.compounding)) return { error: "compounding must be 'semi_annual' or 'monthly'" };
-  if (next.rate_type === 'fixed') { next.rate_mode = 'absolute'; next.spread = null; }
+  if (next.locked_on !== null && !isDateStr(next.locked_on)) return { error: 'locked on date must be a valid date (YYYY-MM-DD)' };
+  if (next.rate_type === 'fixed') { next.rate_mode = 'absolute'; next.spread = null; next.locked_on = null; }
   if (next.rate_mode === 'prime_spread') {
     if (next.rate_type !== 'variable') return { error: 'prime-based pricing is only for variable segments' };
     if (next.spread === null || !isFinite(next.spread) || next.spread < -10 || next.spread > 10) {
@@ -1376,6 +1389,7 @@ function cleanSegment(b, base) {
     next.annual_rate = null;
   } else {
     next.spread = null;
+    next.locked_on = null;
     if (next.annual_rate === null || next.annual_rate < 0) return { error: 'annual_rate must be a number >= 0' };
   }
   return { value: next };
@@ -1423,8 +1437,8 @@ app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
   }
   const info = db
-    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
+    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, locked_on, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.locked_on, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
   res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
 });
 
@@ -1441,8 +1455,8 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
   }
   const segAi = cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS);
-  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, ai_fields=? WHERE id=?')
-    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
+  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, locked_on=?, ai_fields=? WHERE id=?')
+    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.locked_on, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
   res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
 });
 
@@ -1472,14 +1486,6 @@ function cleanTerm(c) {
     // clears it (the derived payment rules).
     payment_override: c.payment_override !== undefined && c.payment_override !== null && c.payment_override !== ''
       ? num(c.payment_override) : null,
-    // The date the term's payment was priced as of (the commitment
-    // letter's date): the term's INITIAL derivation prices a
-    // prime-spread segment at the prime in effect on this date
-    // instead of the start month's. Empty / null clears it (the
-    // payment derives at the term's start, as before). Accrual
-    // never reads it.
-    payment_pricing_date: c.payment_pricing_date !== undefined && c.payment_pricing_date !== null && c.payment_pricing_date !== ''
-      ? String(c.payment_pricing_date) : null,
     // The term's own payment schedule + balance anchor (see the
     // mortgage_terms columns); the anchor pair is set together or
     // not at all.
@@ -1506,9 +1512,6 @@ function cleanTerm(c) {
   }
   if (next.payment_override !== null && (!isFinite(next.payment_override) || next.payment_override <= 0)) {
     return { error: 'monthly payment override must be a number greater than 0' };
-  }
-  if (next.payment_pricing_date !== null && !isDateStr(next.payment_pricing_date)) {
-    return { error: 'payment pricing date must be a valid date (YYYY-MM-DD)' };
   }
   if (next.payment_frequency !== null && !FREQUENCY_KEYS.includes(next.payment_frequency)) {
     return {
@@ -1629,10 +1632,6 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
     payment_day: b.payment_day !== undefined ? b.payment_day
       : (prev ? prev.payment_day ?? null : null),
     payment_override: b.payment_override !== undefined ? b.payment_override : null,
-    // A payment pricing date does not carry over a renewal either:
-    // the new contract is priced on its own letter date, entered
-    // on the new term directly (or left blank).
-    payment_pricing_date: b.payment_pricing_date !== undefined ? b.payment_pricing_date : null,
     anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : null,
     anchor_date: b.anchor_date !== undefined ? b.anchor_date : null,
   };
@@ -1640,9 +1639,9 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const info = db
-    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, payment_pricing_date, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
-    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.payment_pricing_date, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
+    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
   syncTermMirror(getProperty(p.id));
   syncTermAnchor(getProperty(p.id));
   syncScheduleMirror(getProperty(p.id));
@@ -1666,15 +1665,14 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     payment_frequency: b.payment_frequency !== undefined ? b.payment_frequency : term.payment_frequency,
     payment_day: b.payment_day !== undefined ? b.payment_day : term.payment_day,
     payment_override: b.payment_override !== undefined ? b.payment_override : term.payment_override,
-    payment_pricing_date: b.payment_pricing_date !== undefined ? b.payment_pricing_date : term.payment_pricing_date,
     anchor_balance: b.anchor_balance !== undefined ? b.anchor_balance : term.anchor_balance,
     anchor_date: b.anchor_date !== undefined ? b.anchor_date : term.anchor_date,
   });
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const termAi = cleanAiFields(b, TERM_AI_FIELDS);
-  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, payment_pricing_date=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
-    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.payment_pricing_date, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
+  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
+    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
   // Editing the anchor pair on the term that carries it edits the
   // property's balance anchor itself — the two are one fact, stored
   // in both places: write the submitted pair through, then let the
@@ -1796,7 +1794,7 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
     id: 0, property_id: p.id, term_id: null, created_at: nowIso(),
     start_date: draft.start_date, rate_type: draft.rate_type,
     rate_mode: draft.rate_mode, annual_rate: draft.annual_rate, spread: draft.spread,
-    compounding: draft.compounding,
+    compounding: draft.compounding, locked_on: draft.locked_on,
   });
   segments.sort((a, z) => (a.start_date < z.start_date ? -1 : a.start_date > z.start_date ? 1 : a.id - z.id));
   // The term the draft belongs to (the one named, else the one in
@@ -1836,18 +1834,10 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
         owner.payment_override = po;
       }
     }
-    // The owner term's payment pricing date rides along too, so a
-    // preview computed beside an unsaved pricing-date edit derives
-    // the same figure the save will produce.
-    if (b.payment_pricing_date !== undefined) {
-      if (b.payment_pricing_date === null || b.payment_pricing_date === '') {
-        owner.payment_pricing_date = null;
-      } else if (!isDateStr(b.payment_pricing_date)) {
-        return res.status(400).json({ error: 'payment pricing date must be a valid date (YYYY-MM-DD)' });
-      } else {
-        owner.payment_pricing_date = String(b.payment_pricing_date);
-      }
-    }
+    // The draft segment's own locked_on (parsed by cleanSegment
+    // above) prices the preview's derivations, so a preview
+    // computed beside an unsaved Locked on edit derives the same
+    // figure the save will produce.
   }
   const prime = getCurrentPrime();
   const { frequency, paymentDay } = termScheduleOf(p, terms);

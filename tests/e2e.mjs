@@ -1381,67 +1381,80 @@ try {
     cmpAfterPreview.segments[0].compounding === 'semi_annual', JSON.stringify(cmpAfterPreview.segments[0]));
   await req('DELETE', `/api/properties/${cmpPid}`);
 
-  // ---- Term payment pricing date (API) ----
-  // A term may name the date its payment was priced as of: the
-  // INITIAL derivation then prices a prime-spread segment at the
-  // prime in effect on that date. His real shape: $1,450,000
-  // opening with the $100,000 month-1 lump folding it to
-  // $1,350,000, Prime - 1 monthly-compounded, 30y. Blank derives
-  // at the start month's prime (Dec 2024 month-end 5.45 -> 4.45%)
-  // = $6,800.20; priced as of 2024-12-10 (prime still 5.95 ->
-  // 4.95%) = the commitment letter's $7,205.89. Accrual never
-  // reads the anchor: the override trajectory stays the verified
-  // one (2026-05 $1,298,221.75 / 2026-09 $1,284,262.85).
+  // ---- Segment Locked on (API) ----
+  // The pricing anchor is a property of the RATE: a prime-spread
+  // segment may carry locked_on, the date its rate was locked,
+  // and derivations the segment governs price prime as of that
+  // date. His real shape: $1,450,000 opening with the $100,000
+  // month-1 lump folding it to $1,350,000, Prime - 1
+  // monthly-compounded, 30y. Blank derives at the start month's
+  // prime (Dec 2024 month-end 5.45 -> 4.45%) = $6,800.20; a
+  // segment locked on 2024-12-10 (prime still 5.95 -> 4.95%) =
+  // the commitment letter's $7,205.89. Accrual never reads the
+  // lock: the override trajectory stays the verified one
+  // (2026-05 $1,298,221.75 / 2026-09 $1,284,262.85). The retired
+  // term-level pricing date is gone from term payloads entirely
+  // and ignored on write.
   r = await req('POST', '/api/properties', {
     address: '12 Pricing Date Place, Victoria, BC',
     mortgage_balance: 1450000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17', amortization_years: 30,
   });
   const pdPid = r.data.id;
   const pdTermId = r.data.terms[0].id;
-  await req('POST', `/api/properties/${pdPid}/rates`, {
+  const pdSeg = await req('POST', `/api/properties/${pdPid}/rates`, {
     start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, compounding: 'monthly',
   });
+  const pdSegId = pdSeg.data.id;
   await req('POST', `/api/properties/${pdPid}/lump-sums`, { date: '2024-12-20', amount: 100000 });
   const pdBlank = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
-  check('pricing date blank: the payment derives at the start month\u2019s prime (4.45%, monthly) = 6,800.20 and the term carries no pricing date',
+  check('locked on blank: the payment derives at the start month’s prime (4.45%, monthly) = 6,800.20, the segment carries no lock and the term payload has no pricing-date field',
     pdBlank.paymentDerived === 6800.2 && pdBlank.paymentUsed === 6800.2
-      && (r.data.terms[0].payment_pricing_date ?? null) === null,
-    JSON.stringify({ d: pdBlank.paymentDerived, stored: r.data.terms[0].payment_pricing_date }));
-  r = await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_pricing_date: '2024-13-40' });
-  check('an invalid pricing date is a 400', r.status === 400 && String(r.data.error || '').includes('pricing date'),
+      && (pdSeg.data.locked_on ?? null) === null
+      && !('payment_pricing_date' in r.data.terms[0]),
+    JSON.stringify({ d: pdBlank.paymentDerived, stored: pdSeg.data.locked_on }));
+  r = await req('PUT', `/api/properties/${pdPid}/rates/${pdSegId}`, { locked_on: '2024-13-40' });
+  check('an invalid locked on date is a 400', r.status === 400 && String(r.data.error || '').includes('locked on'),
     JSON.stringify(r.data));
-  r = await req('POST', `/api/properties/${pdPid}/terms`, { payment_pricing_date: '2024-02-30' });
-  check('creating a term with an invalid pricing date is a 400 too',
-    r.status === 400 && String(r.data.error || '').includes('pricing date'), JSON.stringify(r.data));
-  r = await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_pricing_date: '2024-12-10' });
-  check('the pricing-date write succeeds (200), echoes on the term and re-derives the payment at that date\u2019s prime (4.95%) = 7,205.89',
-    r.status === 200 && r.data.payment_pricing_date === '2024-12-10'
-      && r.data.paymentDerived === 7205.89 && r.data.paymentUsed === 7205.89 && r.data.paymentOverridden === false,
-    JSON.stringify({ stored: r.data.payment_pricing_date, d: r.data.paymentDerived, u: r.data.paymentUsed }));
-  const pdAnchored = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
-  check('the projection derives 7,205.89 with the anchor set (and the first month still charges at the real 4.45%)',
-    pdAnchored.paymentDerived === 7205.89 && pdAnchored.series[0].rate === 4.45,
-    JSON.stringify({ d: pdAnchored.paymentDerived, rate: pdAnchored.series[0] && pdAnchored.series[0].rate }));
+  r = await req('POST', `/api/properties/${pdPid}/rates`, { start_date: '2025-06-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, locked_on: '2024-02-30' });
+  check('creating a segment with an invalid locked on date is a 400 too',
+    r.status === 400 && String(r.data.error || '').includes('locked on'), JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${pdPid}/rates/${pdSegId}`, { locked_on: '2024-12-10' });
+  const pdLockedProj = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
+  check('setting locked_on succeeds (200), echoes on the segment and re-derives the payment at that date’s prime (4.95%) = 7,205.89',
+    r.status === 200 && r.data.locked_on === '2024-12-10'
+      && pdLockedProj.paymentDerived === 7205.89 && pdLockedProj.paymentUsed === 7205.89 && pdLockedProj.paymentOverridden === false,
+    JSON.stringify({ stored: r.data.locked_on, d: pdLockedProj.paymentDerived, u: pdLockedProj.paymentUsed }));
+  check('the projection derives 7,205.89 with the lock set (and the first month still charges at the real 4.45%)',
+    pdLockedProj.paymentDerived === 7205.89 && pdLockedProj.series[0].rate === 4.45,
+    JSON.stringify({ d: pdLockedProj.paymentDerived, rate: pdLockedProj.series[0] && pdLockedProj.series[0].rate }));
   r = await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_override: 7207.10 });
   const pdOv = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
   const pdBal = (m) => (pdOv.series.find((x) => x.month === m) || {}).balance;
-  check('anchor + override: used 7,207.10, anchored derived 7,205.89 beside it, trajectory the verified one',
+  check('lock + override: used 7,207.10, locked derived 7,205.89 beside it, trajectory the verified one',
     r.status === 200 && pdOv.paymentUsed === 7207.1 && pdOv.paymentDerived === 7205.89 && pdOv.paymentOverridden === true
       && pdBal('2026-05') === 1298221.75 && pdBal('2026-09') === 1284262.85,
     JSON.stringify({ u: pdOv.paymentUsed, d: pdOv.paymentDerived, may: pdBal('2026-05'), sep: pdBal('2026-09') }));
-  r = await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_pricing_date: '2024-12-20' });
-  check('a pricing date after the cut prices at the post-cut prime (derived back to 6,800.20) — resolution is by date',
-    r.status === 200 && r.data.paymentDerived === 6800.2 && r.data.paymentUsed === 7207.1,
-    JSON.stringify({ d: r.data.paymentDerived, u: r.data.paymentUsed }));
-  r = await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_pricing_date: null, payment_override: null });
+  r = await req('PUT', `/api/properties/${pdPid}/rates/${pdSegId}`, { locked_on: '2024-12-20' });
+  const pdAfterProj = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
+  check('a lock date after the cut prices at the post-cut prime (derived back to 6,800.20) — resolution is by date',
+    r.status === 200 && pdAfterProj.paymentDerived === 6800.2 && pdAfterProj.paymentUsed === 7207.1,
+    JSON.stringify({ d: pdAfterProj.paymentDerived, u: pdAfterProj.paymentUsed }));
+  r = await req('PUT', `/api/properties/${pdPid}/rates/${pdSegId}`, { locked_on: null });
+  await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_override: null });
   const pdCleared = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
-  check('clearing the pricing date restores the blank derivation to the cent',
-    r.status === 200 && r.data.payment_pricing_date === null
+  check('clearing the lock restores the blank derivation to the cent',
+    r.status === 200 && r.data.locked_on === null
       && pdCleared.paymentDerived === 6800.2 && JSON.stringify(pdCleared.series) === JSON.stringify(pdBlank.series),
     JSON.stringify({ d: pdCleared.paymentDerived }));
   const pdProp = (await req('GET', `/api/properties/${pdPid}`)).data;
-  check('the property payload echoes the (cleared) pricing date on the term',
-    (pdProp.terms[0].payment_pricing_date ?? null) === null, JSON.stringify(pdProp.terms[0].payment_pricing_date));
+  check('the property payload echoes the (cleared) lock on the segment and no pricing-date field on the term',
+    (pdProp.segments[0].locked_on ?? null) === null && !('payment_pricing_date' in pdProp.terms[0]),
+    JSON.stringify({ seg: pdProp.segments[0].locked_on }));
+  r = await req('PUT', `/api/properties/${pdPid}/terms/${pdTermId}`, { payment_pricing_date: '2024-12-10' });
+  const pdIgnored = (await req('GET', `/api/properties/${pdPid}/amortization`)).data;
+  check('the retired term-level pricing date is ignored on write (200, never echoed, derivation unchanged)',
+    r.status === 200 && !('payment_pricing_date' in r.data) && pdIgnored.paymentDerived === 6800.2,
+    JSON.stringify({ d: pdIgnored.paymentDerived }));
   await req('DELETE', `/api/properties/${pdPid}`);
 
   // ---- AI Fill (API) ----
@@ -3986,13 +3999,15 @@ try {
         JSON.stringify({ p: cmpBackProj.paymentUsed }));
       await req('DELETE', `/api/properties/${cmpUiPid}`);
 
-      // ---- Payment pricing date, driven through the UI ----
-      // His real shape (the API section's fixture): the pay
-      // block's Priced as of input starts blank and the figure is
-      // the funding-day derivation $6,800; setting it to the
-      // letter date (2024-12-10) and saving re-derives the figure
-      // to $7,206; clearing restores $6,800. The saved value
-      // echoes in the input after the save reload.
+      // ---- Segment Locked on, driven through the UI ----
+      // His real shape (the API section's fixture): the segment
+      // starts with no lock and the figure is the funding-day
+      // derivation $6,800; the pay block no longer carries any
+      // pricing-date input — the lock lives on the segment.
+      // Setting Locked on to the letter date (2024-12-10) in the
+      // segment's edit form and saving re-derives the figure to
+      // $7,206; clearing restores $6,800. The saved value echoes
+      // in the edit form after the save reload.
       r = await req('POST', '/api/properties', {
         address: '14 Pricing Date UI Road, Victoria, BC',
         mortgage_balance: 1450000, mortgage_balance_date: '2024-12-17', purchase_date: '2024-12-17', amortization_years: 30,
@@ -4010,50 +4025,78 @@ try {
       await wait(800);
       await page.goto(`http://ff.local/#property/${pdUiPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
-      check('pricing-date UI fixture: the detail stat shows the blank derivation $6,800',
+      check('locked-on UI fixture: the detail stat shows the blank derivation $6,800',
         await until(() => document.querySelector('#estPaymentValue').textContent.includes('6,800')));
       await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
       await wait(800);
-      const pdState = () => page.evaluate(() => {
+      const pdBlock = await page.evaluate(() => {
         const block = document.querySelector('[data-pay-block]');
-        const input = block.querySelector('[name=payment_pricing_date]');
-        const label = input.closest('div').querySelector('label');
         return {
-          value: input.value,
-          label: label ? label.textContent : null,
+          hasPricingInput: !!block.querySelector('[name=payment_pricing_date]'),
           figure: block.querySelector('[data-term-payment]').textContent,
         };
       });
-      const pdRest = await pdState();
-      check('the pay block carries a blank Priced as of date input beside the Monthly payment row',
-        pdRest.value === '' && pdRest.label === 'Priced as of' && pdRest.figure.includes('6,800'),
-        JSON.stringify(pdRest));
+      check('the pay block carries no pricing-date input anymore (the lock moved to the segment)',
+        pdBlock.hasPricingInput === false && pdBlock.figure.includes('6,800'),
+        JSON.stringify(pdBlock));
+      const pdSegState = () => page.evaluate(() => {
+        const form = document.querySelector('[data-seg-form]');
+        const input = form.querySelector('[name=locked_on]');
+        const cell = form.querySelector('[data-seg-spread]');
+        const label = input ? [...form.querySelectorAll('label')].find((l) => l.textContent === 'Locked on') : null;
+        return {
+          value: input ? input.value : null,
+          cellHidden: cell ? cell.classList.contains('hidden') : null,
+          hasLabel: !!label,
+          editSeg: form.dataset.editSeg || null,
+        };
+      });
+      await page.evaluate(() => document.querySelector('[data-edit-seg]').click());
+      await wait(500);
+      const pdSegRest = await pdSegState();
+      check('editing the prime-spread segment shows a blank Locked on date input in the (visible) spread cell',
+        pdSegRest.value === '' && pdSegRest.cellHidden === false && pdSegRest.hasLabel && !!pdSegRest.editSeg,
+        JSON.stringify(pdSegRest));
       await page.evaluate(() => {
-        const input = document.querySelector('[data-pay-block] [name=payment_pricing_date]');
+        const input = document.querySelector('[data-seg-form] [name=locked_on]');
         input.value = '2024-12-10';
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
       });
-      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
-      check('setting Priced as of to the letter date re-derives the figure to $7,206 after Save',
+      await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
+      check('setting Locked on to the letter date re-derives the figure to $7,206 after Save',
         await untilNode(async () => {
-          const s = await pdState();
-          return s.figure.includes('7,206') && s.value === '2024-12-10';
+          const s = await page.evaluate(() => document.querySelector('[data-term-payment]').textContent);
+          return s.includes('7,206');
         }));
       const pdUiProj = (await req('GET', `/api/properties/${pdUiPid}/amortization`)).data;
-      check('the UI-saved pricing date drives the API derivation (7,205.89)',
+      check('the UI-saved lock drives the API derivation (7,205.89)',
         pdUiProj.paymentDerived === 7205.89, JSON.stringify({ d: pdUiProj.paymentDerived }));
+      const pdUiProp = (await req('GET', `/api/properties/${pdUiPid}`)).data;
+      check('the lock is stored on the segment (echoed in the payload, with its row badge)',
+        pdUiProp.segments[0].locked_on === '2024-12-10', JSON.stringify(pdUiProp.segments[0]));
+      const pdBadge = await page.evaluate(() => {
+        const row = document.querySelector('#segmentRows tr');
+        return row ? row.textContent : '';
+      });
+      check('the segment row shows the Locked badge with the date',
+        pdBadge.includes('Locked 2024-12-10'), String(pdBadge));
+      await page.evaluate(() => document.querySelector('[data-edit-seg]').click());
+      await wait(500);
+      const pdSegSaved = await pdSegState();
+      check('reopening the segment edit shows the saved Locked on date',
+        pdSegSaved.value === '2024-12-10', JSON.stringify(pdSegSaved));
       await page.evaluate(() => {
-        const input = document.querySelector('[data-pay-block] [name=payment_pricing_date]');
+        const input = document.querySelector('[data-seg-form] [name=locked_on]');
         input.value = '';
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
       });
-      await page.evaluate(() => document.querySelector('[data-term-form]').requestSubmit());
-      check('clearing Priced as of restores the $6,800 figure after Save',
+      await page.evaluate(() => document.querySelector('[data-seg-form]').requestSubmit());
+      check('clearing Locked on restores the $6,800 figure after Save',
         await untilNode(async () => {
-          const s = await pdState();
-          return s.figure.includes('6,800') && s.value === '';
+          const s = await page.evaluate(() => document.querySelector('[data-term-payment]').textContent);
+          return s.includes('6,800');
         }));
       await req('DELETE', `/api/properties/${pdUiPid}`);
 

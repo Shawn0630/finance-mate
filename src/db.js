@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS rate_segments (
   rate_mode TEXT,                     -- 'absolute' | 'prime_spread' (variable only)
   spread REAL,                        -- prime_spread only: percentage points vs prime (e.g. -1 = Prime - 1)
   compounding TEXT NOT NULL DEFAULT 'semi_annual',  -- 'semi_annual' | 'monthly': how this segment's nominal rate compounds
+  locked_on TEXT,                     -- 'YYYY-MM-DD' the date this segment's rate was locked (priced) on; only variable prime_spread segments carry one — derivations governed by the segment price prime as of this date; accrual never reads it
   ai_fields TEXT,                     -- JSON array of field names carrying the "filled by AI" flag
   created_at TEXT NOT NULL
 );
@@ -314,7 +315,7 @@ CREATE TABLE IF NOT EXISTS mortgage_terms (
   repayment_method TEXT NOT NULL DEFAULT 'equal_payment',  -- 'equal_payment' (level payment) | 'equal_principal' (fixed monthly principal)
   amortization_defaulted INTEGER NOT NULL DEFAULT 0,  -- 1 = amortization came from the migration default (25y)
   payment_override REAL,              -- optional monthly payment override for this term; NULL = the calculated payment rules
-  payment_pricing_date TEXT,          -- 'YYYY-MM-DD' the term's payment was priced as of; NULL = priced at the term's start. Only the term's initial derivation reads it (prime in effect on that date); accrual never does
+  payment_pricing_date TEXT,          -- RETIRED: the pricing anchor moved to the governing segment's locked_on (a property of the rate, not of the payment). Kept dormant so existing databases keep their shape; nothing reads or writes it, and stored values were migrated to the term's first segment's locked_on
   payment_frequency TEXT,             -- payment schedule for this term; NULL = fall back to the property mirror
   payment_day INTEGER,                -- deduction day 1..31 for this term; NULL = fall back
   anchor_balance REAL,                -- the property's balance anchor, when it lands inside this term after its start
@@ -347,6 +348,14 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   if (segCols.length && !segCols.includes('compounding')) {
     db.exec("ALTER TABLE rate_segments ADD COLUMN compounding TEXT NOT NULL DEFAULT 'semi_annual'");
   }
+  // Per-segment pricing lock (locked_on): the date a prime-spread
+  // segment's rate was locked on. Existing segments carry no lock —
+  // NULL is the long-standing behaviour (derivations price at the
+  // derivation month) — so the column lands empty, apart from the
+  // one-way move of retired term pricing dates further below.
+  if (segCols.length && !segCols.includes('locked_on')) {
+    db.exec('ALTER TABLE rate_segments ADD COLUMN locked_on TEXT');
+  }
   // AI Fill provenance: a JSON array of the field names currently
   // carrying the "filled by AI" flag, per form (properties /
   // mortgage_terms) and per rate segment. Display metadata only —
@@ -373,9 +382,10 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   // the property, so a migrated mortgage behaves exactly as before.
   if (termCols.length) {
     if (!termCols.includes('payment_override')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_override REAL');
-    // The payment pricing anchor: nullable, and NULL is the
-    // long-standing behaviour (derive at the term's start month),
-    // so existing rows need no backfill and no projection moves.
+    // The retired term-level payment pricing anchor (see the
+    // CREATE TABLE note): the column may still land on databases
+    // that predate it, so the one-way locked_on move below finds
+    // the shape it expects; nothing else touches it.
     if (!termCols.includes('payment_pricing_date')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_pricing_date TEXT');
     if (!termCols.includes('payment_frequency')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_frequency TEXT');
     if (!termCols.includes('payment_day')) db.exec('ALTER TABLE mortgage_terms ADD COLUMN payment_day INTEGER');
@@ -457,6 +467,30 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
       }
     }
   })();
+}
+// One-way move of the retired term-level pricing anchor: a term's
+// payment_pricing_date, when one was set, becomes its FIRST
+// segment's locked_on — the anchor is a property of the rate that
+// was locked, not of the payment. The term column is cleared as
+// each value moves, so the move runs exactly once and a locked_on
+// later edited by hand is never overwritten by a restart. A first
+// segment already carrying a locked_on keeps it (the segment's own
+// value wins); a term with no segments simply drops its date (the
+// engine no longer reads the term field anywhere).
+{
+  const dated = db.prepare('SELECT id, payment_pricing_date FROM mortgage_terms WHERE payment_pricing_date IS NOT NULL').all();
+  if (dated.length) {
+    const firstSeg = db.prepare('SELECT id, locked_on FROM rate_segments WHERE term_id = ? ORDER BY start_date, id LIMIT 1');
+    const setLock = db.prepare('UPDATE rate_segments SET locked_on = ? WHERE id = ?');
+    const clear = db.prepare('UPDATE mortgage_terms SET payment_pricing_date = NULL WHERE id = ?');
+    db.transaction(() => {
+      for (const t of dated) {
+        const seg = firstSeg.get(t.id);
+        if (seg && seg.locked_on == null) setLock.run(t.payment_pricing_date, seg.id);
+        clear.run(t.id);
+      }
+    })();
+  }
 }
 
 export function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {

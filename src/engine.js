@@ -477,14 +477,14 @@ function monthIdxOf(dateStr) {
 //
 //   balance / balanceDate: the current-balance anchor (as simulate)
 //   terms:      [{ id, start_date, amortization_years,
-//               repayment_method, payment_pricing_date,
-//               payment_frequency, payment_day, anchor_balance,
-//               anchor_date }] any order — payment_pricing_date is
-//               the optional date the term's payment was priced as
-//               of: the term's INITIAL derivation then prices a
-//               prime-spread segment at the prime in effect on
-//               that date instead of the start month's (see
-//               computePayment); accrual is unaffected.
+//               repayment_method, payment_frequency, payment_day,
+//               anchor_balance, anchor_date }] any order
+//   segments:   any order — a variable prime_spread segment may
+//               carry locked_on, the date its rate was locked
+//               (priced) on: every derivation the segment governs
+//               then prices prime as of that date instead of the
+//               derivation month's (see computePayment); accrual
+//               is unaffected.
 //   lumpSums:   [{ date, amount }] any order; a lump sum dated on or
 //               before the balance date is already reflected in the
 //               anchor balance and is ignored
@@ -560,6 +560,19 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
     if (L > A) anchorByState.set(L - 1, round2(ab));
   }
 
+  // The derivation rate of a prime-spread segment carrying a
+  // locked_on date: the prime in effect on that date plus the
+  // segment's spread. undefined when the segment carries no lock
+  // (the caller prices at the derivation month instead); null when
+  // a lock exists but no prime is known for it.
+  const lockedRateFor = (seg) => {
+    if (!seg || seg.rate_type !== 'variable' || seg.rate_mode !== 'prime_spread' || !seg.locked_on) return undefined;
+    if (!primeAtDate) return null;
+    const prime = primeAtDate(String(seg.locked_on));
+    if (prime === null || prime === undefined || !isFinite(Number(prime))) return null;
+    return Math.max(0, round2(Number(prime) + Number(seg.spread || 0)));
+  };
+
   // The monthly payment in effect for months after state point S,
   // computed from the balance at S against the active term's
   // REMAINING amortization — the anchor / term-start derivation.
@@ -569,32 +582,28 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   // rate in effect when it starts); otherwise the first month the
   // payment applies to (S + 1). For a prime-spread segment the prime
   // is THAT month's prime from the tracked history, never today's.
-  // `usePricingDate` marks a term's INITIAL derivation (its start):
-  // when the term carries a payment_pricing_date, a prime-spread
-  // segment instead prices at the prime in effect on THAT date —
-  // banks price the payment when the commitment is signed, which
-  // can predate the funding and a prime move in between (the
-  // user's letter priced at prime 5.95 six days before a cut the
-  // Dec 17 funding already reflected). The anchor touches ONLY
-  // this derivation: fixed / absolute segments price at their
-  // nominal rate either way, mid-term rate-change recasts never
-  // read it (a rate change is a new pricing event), and interest
-  // accrual never sees it — every month still charges at its own
-  // month's prime.
-  const computePayment = (S, balNow, usePricingDate = false) => {
+  // A prime-spread segment may instead carry a locked_on date —
+  // the day its rate was locked (priced): banks price the payment
+  // when the commitment is signed, which can predate the funding
+  // and a prime move in between (the user's letter priced at prime
+  // 5.95 six days before a cut the Dec 17 funding already
+  // reflected). Every derivation the segment governs then prices
+  // at the prime in effect on the locked_on date: a term's initial
+  // derivation via its first segment, a mid-term recast via the
+  // incoming segment. The lock touches ONLY derivations: fixed /
+  // absolute segments price at their nominal rate either way, and
+  // interest accrual never sees it — every month still charges at
+  // its own month's prime.
+  const computePayment = (S, balNow) => {
     const term = termAtMonth(S + 1);
     const rateMonth = S === A && term && monthIdxOf(term.start_date) === A
       ? ymKeyOfIdx(A)
       : ymKeyOfIdx(S + 1);
     const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
     let rate = segmentRateForMonth(seg, rateMonth, primeForMonth);
-    if (usePricingDate && term && term.payment_pricing_date
-      && seg && seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread') {
-      if (!primeAtDate) return { error: 'no_prime' };
-      const prime = primeAtDate(String(term.payment_pricing_date));
-      if (prime === null || prime === undefined || !isFinite(Number(prime))) return { error: 'no_prime' };
-      rate = Math.max(0, round2(Number(prime) + Number(seg.spread || 0)));
-    }
+    const locked = lockedRateFor(seg);
+    if (locked === null) return { error: 'no_prime' };
+    if (locked !== undefined) rate = locked;
     if (rate === null) return { error: 'no_prime' };
     if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
     const remaining = Math.round(Number(term.amortization_years) * 12) - (S - epochOf(term));
@@ -681,7 +690,14 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   // term's remaining amortization (computePayment).
   const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
     const newSeg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
-    const newRate = segmentRateForMonth(newSeg, ymKeyOfIdx(S + 1), primeForMonth);
+    let newRate = segmentRateForMonth(newSeg, ymKeyOfIdx(S + 1), primeForMonth);
+    // The incoming segment's own lock prices the recast when it
+    // carries one — the lock belongs to the rate, so a segment
+    // that takes effect mid-term derives at its locked prime just
+    // as a term's first segment does at the term's start.
+    const lockedNew = lockedRateFor(newSeg);
+    if (lockedNew === null) return { error: 'no_prime' };
+    if (lockedNew !== undefined) newRate = lockedNew;
     if (newRate === null) return { error: 'no_prime' };
     const prevSeg = segmentForMonth(segments, ymKeyOfIdx(S));
     const prevRate = segmentRateForMonth(prevSeg, ymKeyOfIdx(S), primeForMonth);
@@ -700,9 +716,11 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
       }
     }
     // The fallback derives the term's remaining-amortization
-    // payment at the CHANGE point's rate — deliberately WITHOUT
-    // the payment pricing date: a rate change is a new pricing
-    // event, priced when it happens, not when the term was signed.
+    // payment under the NEW segment — priced exactly like the
+    // recast above, including the new segment's locked_on when it
+    // carries one (computePayment reads the governing segment):
+    // the lock belongs to the rate, not to the event that
+    // triggered the derivation.
     return computePayment(S, balNow);
   };
 
@@ -757,7 +775,7 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   if (initialLump) {
     bal = round2(bal - initialLump.total);
     if (bal <= 0) {
-      const derived = computePayment(A, round2(Number(balance)), true);
+      const derived = computePayment(A, round2(Number(balance)));
       const ovA = overrideAt(A);
       const usedFigure = ovA !== null ? ovA : (derived.error ? null : (derived.payment ?? null));
       const anchorT = termAtMonth(A + 1);
@@ -810,9 +828,10 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
       // The anchor, or a new term starting: derive the plan on the
       // (new) term's amortization. A segment that starts with the
       // term is the term's opening rate plan, not a mid-stream
-      // rate change. This is the term's INITIAL derivation — the
-      // one place its payment pricing date (if any) applies.
-      derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal, true);
+      // rate change. This is the term's INITIAL derivation — it
+      // prices at the first segment's locked_on when it carries
+      // one (computePayment reads the governing segment).
+      derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
     } else if (segStates.has(S)) {
       // A rate change inside the running schedule: equal payment
       // recasts against the trajectory's payoff; equal principal
