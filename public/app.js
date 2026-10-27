@@ -1980,7 +1980,12 @@ $('#termsWrap').addEventListener('click', async (e) => {
     openPrimeModal(primeLink.dataset.segStart);
     return;
   }
-  const editSeg = e.target.closest('[data-edit-seg]');
+  // The selector names the Edit BUTTON, never the bare
+  // attribute: in edit mode the segment FORM itself carries
+  // data-edit-seg (its mode state), and a bare [data-edit-seg]
+  // match would catch every click inside the form — Cancel
+  // above all — and re-enter edit mode instead.
+  const editSeg = e.target.closest('button[data-edit-seg]');
   if (editSeg) {
     const block = editSeg.closest('[data-term-block]');
     const form = block && block.querySelector('[data-seg-form]');

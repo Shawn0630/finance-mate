@@ -4141,11 +4141,15 @@ try {
         cmp.dispatchEvent(new Event('change', { bubbles: true }));
         form.requestSubmit();
       });
-      check('the edited segment re-renders in place (Monthly chip, 2.45% rate)',
+      // The row's rate text shows the segment formula and what
+      // it resolves to at the CURRENT prime (stub latest 4.95,
+      // so Prime - 2 reads 2.95) — the projection figure, priced
+      // at the start month's prime, is asserted separately.
+      check('the edited segment re-renders in place (Monthly chip, Prime - 2.00% (now 2.95%))',
         await untilNode(async () => page.evaluate(() => {
           const chip = document.querySelector('.seg-table .badge.cmp');
           const row = document.querySelector('.seg-table tbody tr');
-          return !!chip && chip.textContent === 'Monthly' && !!row && row.textContent.includes('2.45');
+          return !!chip && chip.textContent === 'Monthly' && !!row && row.textContent.includes('Prime − 2.00%') && row.textContent.includes('2.95');
         })));
       const segEditAfter = (await req('GET', `/api/properties/${segEditPid}`)).data;
       check('the save updated the same segment (count and id unchanged, new spread + compounding)',
@@ -4166,7 +4170,20 @@ try {
         const spread = form.querySelector('[name=spread]');
         spread.value = '-0.5';
         spread.dispatchEvent(new Event('input', { bubbles: true }));
-        form.querySelector('[data-seg-cancel-edit]').click();
+        // A click INSIDE the form (into another field) must not
+        // reset the in-progress edit — regression: the form
+        // itself carries data-edit-seg in edit mode, and a bare
+        // attribute match in the click delegate once re-entered
+        // edit mode (re-prefilling) on any form-internal click.
+        form.querySelector('[name=start_date]').click();
+      });
+      await wait(200);
+      const segMidState = await segFormState();
+      check('clicking inside the edit form keeps the in-progress edit (spread still -0.5, still editing)',
+        segMidState.editSeg === String(segEditId) && segMidState.spread === '-0.5',
+        JSON.stringify(segMidState));
+      await page.evaluate(() => {
+        document.querySelector('[data-seg-form]').querySelector('[data-seg-cancel-edit]').click();
       });
       await wait(300);
       const segCancelState = await segFormState();
@@ -4195,10 +4212,13 @@ try {
         rate.dispatchEvent(new Event('input', { bubbles: true }));
         form.requestSubmit();
       });
-      check('a fresh segment adds through the UI after the delete (add mode, new id)',
+      // (No id-novelty assertion: SQLite may hand the deleted
+      // row's id to the next insert. The fresh segment is the
+      // fixed 5% one, in place of the deleted prime-spread.)
+      check('a fresh segment adds through the UI after the delete (add mode)',
         await untilNode(async () => {
           const d = (await req('GET', `/api/properties/${segEditPid}`)).data;
-          return d.segments.length === 1 && d.segments[0].id !== segEditId && d.segments[0].annual_rate === 5;
+          return d.segments.length === 1 && d.segments[0].rate_type === 'fixed' && d.segments[0].annual_rate === 5;
         }));
       await req('DELETE', `/api/properties/${segEditPid}`);
 
