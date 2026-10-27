@@ -90,6 +90,51 @@ app.get('/api/me', requireApiAuth, (req, res) => {
   res.json(userView(u));
 });
 
+// ---------------------------------------------------------- preferences ---
+// Per-user preferences (user_preferences table): the API only ever
+// reads or writes the SESSION user's own rows. One key so far:
+// 'chart_colors' — { chartId: { seriesKey: '#rrggbb' } }, the
+// user's colors for the multi-series charts. Unknown chart /
+// series keys are stored as given and simply never match a
+// series again (the client ignores them); color VALUES are
+// validated strictly, anything but #rrggbb is a 400.
+const PREFERENCE_KEYS = ['chart_colors'];
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+function validChartColors(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  for (const series of Object.values(v)) {
+    if (!series || typeof series !== 'object' || Array.isArray(series)) return false;
+    for (const color of Object.values(series)) {
+      if (typeof color !== 'string' || !HEX_COLOR_RE.test(color)) return false;
+    }
+  }
+  return true;
+}
+
+app.get('/api/preferences', requireApiAuth, (req, res) => {
+  const rows = db.prepare('SELECT key, value FROM user_preferences WHERE user_id = ?').all(req.user.id);
+  const preferences = {};
+  for (const r of rows) {
+    try { preferences[r.key] = JSON.parse(r.value); } catch { /* a corrupt row reads as unset */ }
+  }
+  res.json({ preferences });
+});
+
+app.put('/api/preferences/:key', requireApiAuth, (req, res) => {
+  const key = req.params.key;
+  if (!PREFERENCE_KEYS.includes(key)) return res.status(400).json({ error: `unknown preference key "${key}"` });
+  const value = (req.body || {}).value;
+  if (key === 'chart_colors' && !validChartColors(value)) {
+    return res.status(400).json({ error: 'chart_colors must map chart ids to series keys to #rrggbb colors' });
+  }
+  db.prepare(
+    `INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(req.user.id, key, JSON.stringify(value), nowIso());
+  res.json({ ok: true });
+});
+
 // The public shape of a user wherever the UI shows one (top bar, owner
 // chips, admin list): username + avatar. The users table is the single
 // source for avatar data — nothing copies it onto properties or assets.

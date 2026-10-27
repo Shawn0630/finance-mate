@@ -941,6 +941,157 @@ function redrawPortfolioIfCollapsed() {
   drawPortfolioChart();
 }
 
+// ---------------------------------------------------------- chart colors ---
+// The multi-series charts (the detail page's hero chart, the
+// Assessment History chart, the portfolio combined chart) let the
+// user recolor each series. The choices are a per-user preference
+// (server key 'chart_colors': { chartId: { seriesKey: '#rrggbb' } }),
+// fetched at sign-in and stored in the DB; a series with no stored
+// color uses its default — the defaults below are exactly the
+// colors the charts have always used. Series are keyed by their
+// semantic name, never by dataset index, so a stored color keeps
+// matching its series if a chart's datasets are reordered or one
+// is added/removed (a stored key that no longer exists is simply
+// never read). Single-series charts (prime, the portfolio pie)
+// are not recolorable.
+const CHART_SERIES = {
+  hero: [
+    { key: 'assessed', label: 'Assessed value', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
+    { key: 'outstanding', label: 'Outstanding principal', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+    { key: 'interest', label: 'Interest portion', bg: '#d97706', border: '#d97706', bgAlpha: null },
+    { key: 'principal', label: 'Principal portion', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
+  ],
+  history: [
+    { key: 'land', label: 'Land', bg: 'rgba(230, 126, 34, 0.8)', border: '#e67e22', bgAlpha: 0.8 },
+    { key: 'building', label: 'Building', bg: 'rgba(22, 104, 196, 0.8)', border: '#1668c4', bgAlpha: 0.8 },
+    { key: 'total', label: 'Total', bg: 'rgba(46, 125, 79, 0.75)', border: '#2e7d4f', bgAlpha: 0.75 },
+  ],
+  portfolio: [
+    { key: 'assessed', label: 'Assessed value (all properties)', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
+    { key: 'outstanding', label: 'Total outstanding principal', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+  ],
+};
+let chartColorPrefs = {};
+
+async function loadChartColorPrefs() {
+  try {
+    const r = await api('/api/preferences');
+    chartColorPrefs = (r.preferences && r.preferences.chart_colors) || {};
+  } catch { chartColorPrefs = {}; }
+}
+
+const chartSeriesDef = (chartId, key) => (CHART_SERIES[chartId] || []).find((d) => d.key === key) || null;
+
+function portfolioPropDef(p, i) {
+  return { key: `prop_${p.id}`, label: p.shortLabel, bg: PF_COLORS[i % PF_COLORS.length], border: null, bgAlpha: null };
+}
+
+function portfolioSeriesDefs() {
+  const defs = [...CHART_SERIES.portfolio];
+  if (portfolioData) portfolioData.properties.forEach((p, i) => defs.push(portfolioPropDef(p, i)));
+  return defs;
+}
+
+function seriesDefFor(chartId, key) {
+  return chartId === 'portfolio'
+    ? portfolioSeriesDefs().find((d) => d.key === key) || null
+    : chartSeriesDef(chartId, key);
+}
+
+function hexToRgba(hex, alpha) {
+  const n = parseInt(String(hex).slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+// The colors a series draws with: no stored color -> the defaults
+// verbatim; a stored hex -> the border takes it whole and the
+// fill takes it at the series' own fill alpha.
+function seriesColors(chartId, def) {
+  if (!def) return {};
+  const custom = chartColorPrefs[chartId] ? chartColorPrefs[chartId][def.key] : null;
+  if (!custom) return { backgroundColor: def.bg, borderColor: def.border };
+  return {
+    backgroundColor: def.bgAlpha == null ? custom : hexToRgba(custom, def.bgAlpha),
+    borderColor: def.border ? custom : def.bg,
+  };
+}
+
+let chartColorSaveTimer = null;
+function saveChartColorPrefs(immediate = false) {
+  clearTimeout(chartColorSaveTimer);
+  const put = () => {
+    api('/api/preferences/chart_colors', { method: 'PUT', body: { value: chartColorPrefs } }).catch(() => {});
+  };
+  if (immediate) put();
+  else chartColorSaveTimer = setTimeout(put, 400);
+}
+
+const LIVE_CHARTS = { hero: () => chartA, history: () => historyChart, portfolio: () => portfolioLineChart };
+
+// Recolor the live chart instance in place (the builders also
+// read the same preferences when a chart is rebuilt).
+function applyChartColors(chartId) {
+  const get = LIVE_CHARTS[chartId];
+  const chart = get ? get() : null;
+  if (!chart) return;
+  for (const ds of chart.data.datasets) {
+    if (!ds.key) continue;
+    const def = seriesDefFor(chartId, ds.key);
+    if (!def) continue;
+    const c = seriesColors(chartId, def);
+    ds.backgroundColor = c.backgroundColor;
+    if (def.border) ds.borderColor = c.borderColor;
+  }
+  chart.update('none');
+}
+
+// One row per series: its name, a native color input holding the
+// current color, and one Reset for the whole chart.
+function buildColorsPanel(chartId) {
+  const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
+  if (!panel) return;
+  const defs = chartId === 'portfolio' ? portfolioSeriesDefs() : (CHART_SERIES[chartId] || []);
+  panel.innerHTML = defs.map((def) => {
+    const current = (chartColorPrefs[chartId] && chartColorPrefs[chartId][def.key]) || def.border || def.bg;
+    return `<span class="cc-row"><span>${esc(def.label)}</span><input type="color" data-color-input="${esc(def.key)}" value="${esc(current)}"></span>`;
+  }).join('') + '<button type="button" class="small" data-colors-reset>Reset</button>';
+}
+
+document.addEventListener('click', (e) => {
+  const toggle = e.target.closest('[data-colors-toggle]');
+  if (toggle) {
+    const panel = document.querySelector(`[data-colors-panel="${toggle.dataset.colorsToggle}"]`);
+    if (!panel) return;
+    if (panel.classList.contains('hidden')) { buildColorsPanel(toggle.dataset.colorsToggle); panel.classList.remove('hidden'); }
+    else panel.classList.add('hidden');
+    return;
+  }
+  const reset = e.target.closest('[data-colors-reset]');
+  if (reset) {
+    const panel = reset.closest('[data-colors-panel]');
+    if (!panel) return;
+    const chartId = panel.dataset.colorsPanel;
+    delete chartColorPrefs[chartId];
+    saveChartColorPrefs(true);
+    applyChartColors(chartId);
+    buildColorsPanel(chartId);
+  }
+});
+document.addEventListener('input', (e) => {
+  const input = e.target.closest ? e.target.closest('[data-color-input]') : null;
+  if (!input) return;
+  const panel = input.closest('[data-colors-panel]');
+  if (!panel) return;
+  const chartId = panel.dataset.colorsPanel;
+  if (!chartColorPrefs[chartId]) chartColorPrefs[chartId] = {};
+  chartColorPrefs[chartId][input.dataset.colorInput] = input.value;
+  applyChartColors(chartId);
+  saveChartColorPrefs(false);
+});
+document.addEventListener('change', (e) => {
+  if (e.target.closest && e.target.closest('[data-color-input]')) saveChartColorPrefs(true);
+});
+
 function drawPortfolioPie() {
   const ctx = $('#portfolioPie');
   if (!ctx || !portfolioData) return;
@@ -1034,9 +1185,10 @@ function drawPortfolioChart() {
   if (assessedData.length) {
     datasets.push({
       type: 'line',
+      key: 'assessed',
       label: 'Assessed value (all properties)',
       data: assessedData,
-      borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
+      ...seriesColors('portfolio', chartSeriesDef('portfolio', 'assessed')),
       // One point per assessment year, joined by straight line
       // segments (tension 0 — no smoothing curve, no step).
       showLine: true, tension: 0, pointRadius: 5, pointHoverRadius: 7,
@@ -1045,17 +1197,19 @@ function drawPortfolioChart() {
   if (rows.length) {
     datasets.push({
       type: 'line',
+      key: 'outstanding',
       label: 'Total outstanding principal',
       data: rows.map((m) => ({ x: ymDecimal(m.month), y: m.total })),
-      borderColor: '#1668c4', backgroundColor: '#1668c4',
+      ...seriesColors('portfolio', chartSeriesDef('portfolio', 'outstanding')),
       tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2,
     });
     portfolioData.properties.forEach((p, i) => {
       datasets.push({
         type: 'bar',
+        key: `prop_${p.id}`,
         label: p.shortLabel,
         data: rows.map((m) => ({ x: ymDecimal(m.month), y: m.byProperty[p.id] ?? null })),
-        backgroundColor: PF_COLORS[i % PF_COLORS.length],
+        backgroundColor: seriesColors('portfolio', portfolioPropDef(p, i)).backgroundColor,
         stack: 'outstanding',
         maxBarThickness: 16,
       });
@@ -2489,21 +2643,21 @@ function renderHistoryChart() {
           key: 'land', label: 'Land', stack: 'assessed',
           data: pts.map((pt) => (hasSplitPt(pt) ? pt.land_value : 0)),
           pointMeta: pts,
-          backgroundColor: 'rgba(230, 126, 34, 0.8)', borderColor: '#e67e22',
+          ...seriesColors('history', chartSeriesDef('history', 'land')),
           borderWidth: 1, maxBarThickness: 90,
         },
         {
           key: 'building', label: 'Building', stack: 'assessed',
           data: pts.map((pt) => (hasSplitPt(pt) ? pt.building_value : 0)),
           pointMeta: pts,
-          backgroundColor: 'rgba(22, 104, 196, 0.8)', borderColor: '#1668c4',
+          ...seriesColors('history', chartSeriesDef('history', 'building')),
           borderWidth: 1, maxBarThickness: 90,
         },
         {
           key: 'total', label: 'Total', stack: 'assessed',
           data: pts.map((pt) => (hasSplitPt(pt) ? 0 : pt.value)),
           pointMeta: pts,
-          backgroundColor: 'rgba(46, 125, 79, 0.75)', borderColor: '#2e7d4f',
+          ...seriesColors('history', chartSeriesDef('history', 'total')),
           borderWidth: 1, maxBarThickness: 90,
         },
       ],
@@ -2960,10 +3114,11 @@ function drawCombinedChart() {
       : trendPoints;
     datasets.push({
       type: 'line',
+      key: 'assessed',
       label: 'Assessed value',
       yAxisID: 'y',
       data: shown.map((pt) => ({ x: pt.year, y: pt.value })),
-      borderColor: '#2e7d4f', backgroundColor: '#2e7d4f',
+      ...seriesColors('hero', chartSeriesDef('hero', 'assessed')),
       // One value per assessment year, joined by straight line
       // segments like the portfolio chart (tension 0 — no smoothing
       // curve, no step).
@@ -2979,10 +3134,11 @@ function drawCombinedChart() {
     if (pts.length) {
       datasets.push({
         type: 'line',
+        key: 'outstanding',
         label: 'Outstanding principal',
         yAxisID: 'y',
         data: pts,
-        borderColor: '#1668c4', backgroundColor: '#1668c4',
+        ...seriesColors('hero', chartSeriesDef('hero', 'outstanding')),
         tension: 0.15, pointRadius: 0, pointHoverRadius: 5, borderWidth: 2, order: 1,
       });
     }
@@ -3028,18 +3184,20 @@ function drawCombinedChart() {
       // names a stack — the bars do, the lines don't).
       datasets.push({
         type: 'bar',
+        key: 'interest',
         label: 'Interest portion',
         yAxisID: 'y1',
         data: pts.map((p) => ({ x: p.x, y: p.interest })),
-        backgroundColor: '#d97706', borderColor: '#d97706',
+        ...seriesColors('hero', chartSeriesDef('hero', 'interest')),
         stack: 'payment', borderWidth: 1, order: 2,
       });
       datasets.push({
         type: 'bar',
+        key: 'principal',
         label: 'Principal portion',
         yAxisID: 'y1',
         data: pts.map((p) => ({ x: p.x, y: p.principal })),
-        backgroundColor: '#2e7d4f', borderColor: '#2e7d4f',
+        ...seriesColors('hero', chartSeriesDef('hero', 'principal')),
         stack: 'payment', borderWidth: 1, order: 2,
       });
     }
@@ -3432,6 +3590,7 @@ $('#logoutBtn').addEventListener('click', async () => {
     if (me.isAdmin) $('#adminNavLink').classList.remove('hidden');
   } catch { /* api() already redirected */ }
   await loadOwnerUsers();
+  await loadChartColorPrefs();
   ownerPickers.forEach((p) => p.refresh());
   route();
 })();

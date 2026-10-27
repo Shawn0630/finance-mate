@@ -78,8 +78,10 @@
               <button data-months="60" class="active">5 years</button>
               <button data-months="120">10 years</button>
               <button data-months="0">All</button>
+              <button type="button" data-colors-toggle="portfolio">Colors</button>
             </div>
             <div class="chart-wrap"><canvas id="portfolioChart"></canvas></div>
+            <div class="chart-colors hidden" data-colors-panel="portfolio"></div>
           </div>
         </div>
         <div class="note" id="pfNotes" style="margin-left:0"></div>
@@ -170,7 +172,9 @@
         <div class="spacer"></div>
         <button type="button" id="openMortgageBtn">Mortgage Terms &amp; Rates</button>
         <button type="button" id="openHistoryBtn">Assessment History</button>
+        <button type="button" class="small" data-colors-toggle="hero">Colors</button>
       </div>
+      <div class="chart-colors hidden" data-colors-panel="hero"></div>
       <div class="toolbar range-btns" id="rangeBtns">
         <button data-months="12">1 year</button>
         <button data-months="24">2 years</button>
@@ -329,7 +333,9 @@
     <div class="toolbar">
       <button type="button" id="fetchBcaBtn">Fetch from BC Assessment</button>
       <button type="button" id="pullHistoryBtn">Pull history from HouseSigma</button>
+      <button type="button" class="small" data-colors-toggle="history">Colors</button>
     </div>
+    <div class="chart-colors hidden" data-colors-panel="history"></div>
     <div class="msg" id="trendMsg"></div>
       <table>
         <thead id="trendHead"><tr><th>Year</th><th class="num">Assessed value</th><th>Source</th><th>Notes</th><th></th></tr></thead>

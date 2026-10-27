@@ -198,7 +198,11 @@ label.btnlike:hover { background: #f0f4f9; }
 .ai-panel { margin-top: 8px; }
 .ai-panel-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
 .ai-panel-row input[type="file"] { border: none; padding: 0; width: auto; flex: 1; }
-.head-stat-tag { font-size: 11px; font-weight: 400; color: #71808f; margin-left: 6px; }
+.head-stat-tag { font-size: 11px; font-weight: 400; color: #71808f; margin-left: 6px }
+/* Per-chart series color pickers (Colors panels). */
+.chart-colors { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; margin: 8px 0; font-size: 13px; }
+.chart-colors .cc-row { display: inline-flex; gap: 6px; align-items: center; }
+.chart-colors input[type="color"] { width: 36px; height: 24px; padding: 0; border: 1px solid #c8d2dd; border-radius: 4px; background: none; cursor: pointer; }
 .hidden { display: none !important; }
 .term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }
 .term-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; text-align: left; background: #f6f9fc; border: none; border-radius: 0; padding: 10px 12px; font-size: 13.5px; }

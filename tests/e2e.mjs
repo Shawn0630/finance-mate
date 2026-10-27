@@ -4807,6 +4807,224 @@ try {
     }
   }
 
+  // ---------------------------------------------------------------
+  // Chart colors: per-user preferences in the DB. API level first:
+  // validation, round-trip, and isolation between users.
+  r = await req('GET', '/api/preferences');
+  check('preferences start empty for the admin user',
+    r.status === 200 && !('chart_colors' in (r.data.preferences || {})), JSON.stringify(r.data));
+  r = await req('PUT', '/api/preferences/chart_colors', { value: { hero: { assessed: '#123456' } } });
+  check('storing a chart color succeeds', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+  r = await req('GET', '/api/preferences');
+  check('the stored color reads back',
+    !!r.data.preferences && !!r.data.preferences.chart_colors
+      && r.data.preferences.chart_colors.hero.assessed === '#123456',
+    JSON.stringify(r.data.preferences));
+  for (const bad of ['#12345', 'red', '#1234567', 42]) {
+    r = await req('PUT', '/api/preferences/chart_colors', { value: { hero: { assessed: bad } } });
+    check(`an invalid color is a 400 (${JSON.stringify(bad)})`, r.status === 400, JSON.stringify(r.data));
+  }
+  r = await req('PUT', '/api/preferences/chart_colors', { value: ['#123456'] });
+  check('a non-object chart_colors value is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', '/api/preferences/bogus_key', { value: {} });
+  check('an unknown preference key is a 400', r.status === 400, JSON.stringify(r.data));
+  const loginAs = async (username, password) => {
+    const res = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    return res.headers.get('set-cookie').split(';')[0];
+  };
+  const shawnCookie = await loginAs('Shawn', 'Shawn');
+  const prefsOf = async (ck) => (await (await fetch(BASE + '/api/preferences', { headers: { Cookie: ck } })).json()).preferences || {};
+  check('another user sees none of the admin\u2019s chart colors (isolation)',
+    !('chart_colors' in (await prefsOf(shawnCookie))), JSON.stringify(await prefsOf(shawnCookie)));
+  await fetch(BASE + '/api/preferences/chart_colors', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: shawnCookie },
+    body: JSON.stringify({ value: { hero: { assessed: '#abcdef' } } }),
+  });
+  check('the second user stores his own color without touching the admin\u2019s',
+    (await prefsOf(shawnCookie)).chart_colors.hero.assessed === '#abcdef'
+      && (await req('GET', '/api/preferences')).data.preferences.chart_colors.hero.assessed === '#123456');
+  // Clear both users' colors: the browser flow below starts from
+  // defaults on both accounts.
+  await req('PUT', '/api/preferences/chart_colors', { value: {} });
+  await fetch(BASE + '/api/preferences/chart_colors', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: shawnCookie },
+    body: JSON.stringify({ value: {} }),
+  });
+
+  // Chart colors in the browser: recolor the hero chart and the
+  // history chart live, see the colors survive a reload (DB), and
+  // Reset returns to the defaults; the second user sees defaults.
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('chart colors browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    r = await req('POST', '/api/properties', {
+      address: '31 Colors Crescent, Victoria, BC',
+      mortgage_balance: 1350000, mortgage_balance_date: '2025-12-01', purchase_date: '2025-06-01', amortization_years: 30,
+    });
+    const colorPid = r.data.id;
+    await req('POST', `/api/properties/${colorPid}/rates`, {
+      start_date: '2025-12-01', rate_type: 'fixed', annual_rate: 5,
+    });
+    await req('POST', `/api/properties/${colorPid}/value-history`, { year: 2025, land_value: 900000, building_value: 300000 });
+    await req('POST', `/api/properties/${colorPid}/value-history`, { year: 2024, value: 1100000 });
+
+    const forwardC = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const adminCookieC = await loginAs('admin', 'admin');
+    const browserC = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      const page = await browserC.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardC({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      const setSession = async (ck) => {
+        const [name, value] = ck.split('=');
+        await client.send('Network.setCookie', { name, value, domain: 'ff.local', path: '/', httpOnly: true });
+      };
+      await setSession(adminCookieC);
+      const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+      const pollEq = async (get, want, tries = 48) => {
+        for (let i = 0; i < tries; i++) {
+          try { if ((await get()) === want) return true; } catch {}
+          await wait(250);
+        }
+        return false;
+      };
+      const heroColor = (key) => page.evaluate((k) => {
+        const c = window.__fmCharts.a;
+        const ds = c && c.data.datasets.find((d) => d.key === k);
+        return ds ? ds.borderColor : null;
+      }, key);
+      const setColor = (panelId, key, hex) => page.evaluate((p, k, h) => {
+        const input = document.querySelector(`[data-colors-panel="${p}"] [data-color-input="${k}"]`);
+        input.value = h;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }, panelId, key, hex);
+
+      await page.goto(`http://ff.local/#property/${colorPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      check('hero chart starts on the default assessed color',
+        await pollEq(() => heroColor('assessed'), '#2e7d4f'));
+      await page.evaluate(() => document.querySelector('[data-colors-toggle="hero"]').click());
+      await wait(300);
+      const heroPanel = await page.evaluate(() => {
+        const panel = document.querySelector('[data-colors-panel="hero"]');
+        return {
+          shown: !panel.classList.contains('hidden'),
+          rows: [...panel.querySelectorAll('[data-color-input]')].map((i) => i.dataset.colorInput),
+          hasReset: !!panel.querySelector('[data-colors-reset]'),
+        };
+      });
+      check('the hero Colors panel lists one picker per series plus a Reset',
+        heroPanel.shown && heroPanel.hasReset
+          && ['assessed', 'outstanding', 'interest', 'principal'].every((k) => heroPanel.rows.includes(k)),
+        JSON.stringify(heroPanel));
+      await setColor('hero', 'assessed', '#123456');
+      check('recoloring applies to the live chart at once',
+        (await heroColor('assessed')) === '#123456', await heroColor('assessed'));
+      let stored = null;
+      for (let i = 0; i < 30; i++) {
+        const p = (await req('GET', '/api/preferences')).data.preferences;
+        if (p && p.chart_colors && p.chart_colors.hero && p.chart_colors.hero.assessed === '#123456') { stored = p; break; }
+        await wait(300);
+      }
+      check('the new color is stored in the user\u2019s preferences', !!stored, JSON.stringify(stored));
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('after a reload the hero chart still uses the stored color',
+        await pollEq(() => heroColor('assessed'), '#123456'));
+
+      // History chart: Land takes the custom hex (border whole,
+      // fill at the series alpha), and it survives a modal
+      // close / reopen (the chart rebuilds from the preference).
+      await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
+      await wait(600);
+      await page.evaluate(() => document.querySelector('[data-colors-toggle="history"]').click());
+      await wait(300);
+      await setColor('history', 'land', '#654321');
+      const histLand = await page.evaluate(() => {
+        const c = window.__fmCharts.history;
+        const ds = c && c.data.datasets.find((d) => d.key === 'land');
+        return ds ? { border: ds.borderColor, bg: ds.backgroundColor } : null;
+      });
+      check('the history Land series recolors live (border #654321, fill at its alpha)',
+        !!histLand && histLand.border === '#654321' && histLand.bg === 'rgba(101, 67, 33, 0.8)',
+        JSON.stringify(histLand));
+      await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
+      await wait(400);
+      await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
+      await wait(600);
+      const histLand2 = await page.evaluate(() => {
+        const c = window.__fmCharts.history;
+        const ds = c && c.data.datasets.find((d) => d.key === 'land');
+        return ds ? ds.borderColor : null;
+      });
+      check('reopening the history modal keeps the stored Land color', histLand2 === '#654321', String(histLand2));
+      await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
+      await wait(400);
+
+      // Reset: the hero chart returns to defaults and the stored
+      // hero entry is gone.
+      await page.evaluate(() => document.querySelector('[data-colors-toggle="hero"]').click());
+      await wait(300);
+      await page.evaluate(() => document.querySelector('[data-colors-panel="hero"] [data-colors-reset]').click());
+      await wait(600);
+      check('Reset restores the default hero color on the live chart',
+        (await heroColor('assessed')) === '#2e7d4f', await heroColor('assessed'));
+      const prefsAfterReset = (await req('GET', '/api/preferences')).data.preferences;
+      check('Reset removes the chart\u2019s stored colors',
+        !!prefsAfterReset && !!prefsAfterReset.chart_colors && !('hero' in prefsAfterReset.chart_colors),
+        JSON.stringify(prefsAfterReset));
+
+      // Isolation in the browser: the second user (whose stored
+      // colors were cleared above) sees the defaults even though
+      // the admin has a stored history color.
+      await setSession(shawnCookie);
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('the second user sees the default hero color (per-user isolation)',
+        await pollEq(() => heroColor('assessed'), '#2e7d4f'));
+      await req('DELETE', `/api/properties/${colorPid}`);
+    } catch (err) {
+      check('chart colors browser flow runs to completion', false, String((err && err.message) || err));
+    } finally {
+      await browserC.close();
+    }
+  }
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above

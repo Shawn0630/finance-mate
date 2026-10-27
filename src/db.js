@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS app_meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+-- Per-user preferences, keyed by name; value is JSON text. One
+-- row per (user, key) — e.g. 'chart_colors' holds the user's
+-- per-series chart colors. Strictly the owner's own rows are
+-- ever read or written (the API scopes by the session user).
+CREATE TABLE IF NOT EXISTS user_preferences (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, key)
+);
 CREATE INDEX IF NOT EXISTS idx_segments_property ON rate_segments(property_id, start_date);
 CREATE TABLE IF NOT EXISTS other_assets (
   id INTEGER PRIMARY KEY,
