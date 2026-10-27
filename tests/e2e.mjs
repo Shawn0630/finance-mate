@@ -1922,7 +1922,7 @@ try {
       await client.send('Input.insertText', { text: '2,500' });
       const pastedPrincipal = await fieldVal('[data-term-form] [name=opening_balance]');
       check('pasted grouped principal displays grouped', pastedPrincipal === '2,500', String(pastedPrincipal));
-      await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
+      await page.evaluate(() => document.querySelector('[data-save-term]').click());
       await wait(1400);
       r = await req('GET', `/api/properties/${moneyPid}`);
       check('pasted principal stored as the plain number 2500',
@@ -2856,7 +2856,7 @@ try {
       await page.keyboard.type('30');
       await focusField('[data-term-form] [name=lender]');
       await page.keyboard.type('Scotiabank');
-      await page.evaluate(() => document.querySelector('[data-term-form] [type=submit]').click());
+      await page.evaluate(() => document.querySelector('[data-save-term]').click());
       await wait(2000);
       const amortApi = (await req('GET', `/api/properties/${amortPid}/amortization`)).data;
       check('endpoint calculates the payment from the UI-entered amortization (3.95%, 30y)',
@@ -3346,21 +3346,28 @@ try {
         JSON.stringify(fieldSets));
       // The payment figure is the RESULT of the rate plan: its
       // row comes after the segments table and the lump sums in
-      // the card's document order.
+      // the card's document order — and the card's Save button
+      // closes the card below the payment row (the segments
+      // block sits above the Save, never below it).
       const payOrder = await page.evaluate(() => {
         const block = document.querySelector('#termsWrap .term-block');
         const pay = block.querySelector('[data-pay-block]');
         const segTable = block.querySelector('.seg-table');
+        const segForm = block.querySelector('[data-seg-form]');
         const lumpForm = block.querySelector('[data-lump-form]');
+        const saveBtn = block.querySelector('[data-save-term]');
         const FOLLOWS = Node.DOCUMENT_POSITION_FOLLOWING;
+        const follows = (a, b) => !!a && !!b && (a.compareDocumentPosition(b) & FOLLOWS) !== 0;
         return {
           pay: !!pay,
-          afterSeg: !!pay && !!segTable && (segTable.compareDocumentPosition(pay) & FOLLOWS) !== 0,
-          afterLump: !!pay && !!lumpForm && (lumpForm.compareDocumentPosition(pay) & FOLLOWS) !== 0,
+          afterSeg: follows(segTable, pay),
+          afterLump: follows(lumpForm, pay),
+          segBeforeSave: follows(segTable, saveBtn) && follows(segForm, saveBtn),
+          saveAfterPay: follows(pay, saveBtn),
         };
       });
-      check('the Monthly payment row closes the term card — it sits below the rate segments and the lump sums',
-        payOrder.pay && payOrder.afterSeg && payOrder.afterLump,
+      check('the Monthly payment row sits below the rate segments and the lump sums, and the Save button closes the card below it',
+        payOrder.pay && payOrder.afterSeg && payOrder.afterLump && payOrder.segBeforeSave && payOrder.saveAfterPay,
         JSON.stringify(payOrder));
       const termPayFig = await page.evaluate(() =>
         document.querySelector('#termsWrap .term-block [data-term-payment]').textContent);
@@ -3371,21 +3378,44 @@ try {
       // day, and its anchor when it carries one) save together in
       // a single submit — there is no second Save button anywhere
       // in the card (the Add segment / Add lump sum buttons belong
-      // to their own hidden creation forms, not to the term).
+      // to their own hidden creation forms, not to the term). The
+      // Save button itself lives below the payment row, outside
+      // the <form>, bound back to it by the HTML form attribute,
+      // and its label names the payment in the term's frequency.
       const saveCounts = await page.evaluate(() => [...document.querySelectorAll('#termsWrap .term-block')].map((block) => {
         const forms = block.querySelectorAll('[data-term-form]');
         const form = forms[0];
+        const saveBtn = block.querySelector('[data-save-term]');
         return {
           termForms: forms.length,
-          submitsInForm: form ? form.querySelectorAll('button[type=submit]').length : 0,
+          submitsInForm: form ? form.querySelectorAll('button[type=submit]').length : -1,
           saveButtonsInCard: [...block.querySelectorAll('button[type=submit]')]
             .filter((b) => b.textContent.trim().startsWith('Save')).length,
+          saveLabel: saveBtn ? saveBtn.textContent.trim() : null,
+          saveFormAttr: saveBtn ? saveBtn.getAttribute('form') : null,
+          formId: form ? form.id : null,
         };
       }));
-      check('each term card is one form with exactly one Save button',
+      check('each term card is one form with exactly one Save button — below the payment row, outside the form, bound by its form attribute, labelled by frequency',
         saveCounts.length === 2
-          && saveCounts.every((s) => s.termForms === 1 && s.submitsInForm === 1 && s.saveButtonsInCard === 1),
+          && saveCounts.every((s) => s.termForms === 1 && s.submitsInForm === 0 && s.saveButtonsInCard === 1
+            && s.saveLabel === 'Save & calculate monthly payment' && s.saveFormAttr === s.formId),
         JSON.stringify(saveCounts));
+      // The label follows the frequency select live.
+      await page.evaluate(() => {
+        const sel = document.querySelector('#termsWrap .term-block [data-term-form] [name=payment_frequency]');
+        sel.value = 'bi_weekly';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      const saveLabelBw = await page.evaluate(() =>
+        document.querySelector('#termsWrap .term-block [data-save-term]').textContent.trim());
+      check('changing the frequency select re-labels the Save button (Save & calculate bi-weekly payment)',
+        saveLabelBw === 'Save & calculate bi-weekly payment', saveLabelBw);
+      await page.evaluate(() => {
+        const sel = document.querySelector('#termsWrap .term-block [data-term-form] [name=payment_frequency]');
+        sel.value = 'monthly';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
       // Lump sum through Term 1's own form (amount typed bare, it
       // groups live like every money field).
       await page.evaluate(() => {
@@ -4023,6 +4053,151 @@ try {
           return s.figure.includes('6,800') && s.value === '';
         }));
       await req('DELETE', `/api/properties/${pdUiPid}`);
+
+      // ---- Segment editing, driven through the UI ----
+      // One Prime - 1 semi-annual segment on $1,350,000 (balance
+      // dated 2025-12-01; the stub prime pins 4.45, so the segment
+      // runs at 3.45%). Its row's Edit button loads it into the
+      // segment form prefilled and in edit mode; changing the
+      // spread to -2 and the compounding to Monthly and saving
+      // updates the SAME segment (count and id unchanged) and the
+      // projection follows; Cancel drops back to add mode without
+      // touching the segment; delete + add still work afterwards.
+      r = await req('POST', '/api/properties', {
+        address: '21 Segment Edit Road, Victoria, BC',
+        mortgage_balance: 1350000, mortgage_balance_date: '2025-12-01', purchase_date: '2025-06-01', amortization_years: 30,
+      });
+      const segEditPid = r.data.id;
+      await req('POST', `/api/properties/${segEditPid}/rates`, {
+        start_date: '2025-12-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, compounding: 'semi_annual',
+      });
+      const segEditBefore = (await req('GET', `/api/properties/${segEditPid}`)).data;
+      const segEditId = segEditBefore.segments[0].id;
+      const segBaseProj = (await req('GET', `/api/properties/${segEditPid}/amortization`)).data;
+      check('segment-edit fixture: one semi-annual Prime - 1 segment, derived payment at 3.45%',
+        segEditBefore.segments.length === 1 && segBaseProj.paymentUsed === engineDerive(1350000, 3.45, 30),
+        JSON.stringify({ n: segEditBefore.segments.length, p: segBaseProj.paymentUsed }));
+      // Same-term start_date uniqueness, API level: a second
+      // segment on the same start in the same term is a 400, on
+      // add and on edit alike (an edit excludes itself).
+      r = await req('POST', `/api/properties/${segEditPid}/rates`, {
+        start_date: '2025-12-01', rate_type: 'fixed', annual_rate: 5,
+      });
+      check('adding a second segment on the same start date in the same term is rejected (400)',
+        r.status === 400, JSON.stringify(r.data));
+      r = await req('POST', `/api/properties/${segEditPid}/rates`, {
+        start_date: '2027-01-01', rate_type: 'fixed', annual_rate: 5,
+      });
+      check('a segment on a different start date adds fine', r.status === 201, JSON.stringify(r.data));
+      const segEditOther = r.data.id;
+      r = await req('PUT', `/api/properties/${segEditPid}/rates/${segEditOther}`, { start_date: '2025-12-01' });
+      check('editing a segment onto a taken start date is rejected (400)',
+        r.status === 400, JSON.stringify(r.data));
+      r = await req('PUT', `/api/properties/${segEditPid}/rates/${segEditOther}`, { annual_rate: 5.5 });
+      check('editing a segment while keeping its own start date passes (itself excluded)',
+        r.status === 200 && r.data.annual_rate === 5.5, JSON.stringify(r.data));
+      await req('DELETE', `/api/properties/${segEditPid}/rates/${segEditOther}`);
+      // Detour + full goto, as in the pricing-date section (id
+      // reuse makes bare hash jumps unreliable).
+      await page.evaluate(() => { location.hash = '#assets/properties'; });
+      await wait(800);
+      await page.goto(`http://ff.local/#property/${segEditPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(1600);
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      const segFormState = () => page.evaluate(() => {
+        const form = document.querySelector('[data-seg-form]');
+        const submit = form.querySelector('[data-seg-submit]');
+        const cancel = form.querySelector('[data-seg-cancel-edit]');
+        return {
+          hidden: form.classList.contains('hidden'),
+          editSeg: form.dataset.editSeg || null,
+          submitLabel: submit ? submit.textContent.trim() : null,
+          cancelHidden: cancel ? cancel.classList.contains('hidden') : null,
+          start: form.start_date.value, type: form.rate_type.value, mode: form.rate_mode.value,
+          spread: form.spread.value, compounding: form.compounding.value,
+        };
+      });
+      await page.evaluate(() => document.querySelector('[data-edit-seg]').click());
+      await wait(400);
+      const segEditState = await segFormState();
+      check('Edit opens the segment form prefilled, in edit mode (Save segment + Cancel edit)',
+        segEditState.hidden === false && segEditState.editSeg === String(segEditId)
+          && segEditState.submitLabel === 'Save segment' && segEditState.cancelHidden === false
+          && segEditState.start === '2025-12-01' && segEditState.type === 'variable'
+          && segEditState.mode === 'prime_spread' && segEditState.spread === '-1'
+          && segEditState.compounding === 'semi_annual',
+        JSON.stringify(segEditState));
+      await page.evaluate(() => {
+        const form = document.querySelector('[data-seg-form]');
+        const spread = form.querySelector('[name=spread]');
+        spread.value = '-2';
+        spread.dispatchEvent(new Event('input', { bubbles: true }));
+        const cmp = form.querySelector('[name=compounding]');
+        cmp.value = 'monthly';
+        cmp.dispatchEvent(new Event('change', { bubbles: true }));
+        form.requestSubmit();
+      });
+      check('the edited segment re-renders in place (Monthly chip, 2.45% rate)',
+        await untilNode(async () => page.evaluate(() => {
+          const chip = document.querySelector('.seg-table .badge.cmp');
+          const row = document.querySelector('.seg-table tbody tr');
+          return !!chip && chip.textContent === 'Monthly' && !!row && row.textContent.includes('2.45');
+        })));
+      const segEditAfter = (await req('GET', `/api/properties/${segEditPid}`)).data;
+      check('the save updated the same segment (count and id unchanged, new spread + compounding)',
+        segEditAfter.segments.length === 1 && segEditAfter.segments[0].id === segEditId
+          && segEditAfter.segments[0].spread === -2 && segEditAfter.segments[0].compounding === 'monthly',
+        JSON.stringify(segEditAfter.segments));
+      const segEditProj = (await req('GET', `/api/properties/${segEditPid}/amortization`)).data;
+      check('the projection follows the edited segment (Prime - 2 at monthly compounding)',
+        segEditProj.paymentUsed === engineDerive(1350000, 2.45, 30, 'monthly')
+          && segEditProj.paymentUsed !== segBaseProj.paymentUsed,
+        JSON.stringify({ p: segEditProj.paymentUsed, base: segBaseProj.paymentUsed }));
+      // Cancel: an edit abandoned mid-way changes nothing and
+      // the form returns to add mode.
+      await page.evaluate(() => document.querySelector('[data-edit-seg]').click());
+      await wait(400);
+      await page.evaluate(() => {
+        const form = document.querySelector('[data-seg-form]');
+        const spread = form.querySelector('[name=spread]');
+        spread.value = '-0.5';
+        spread.dispatchEvent(new Event('input', { bubbles: true }));
+        form.querySelector('[data-seg-cancel-edit]').click();
+      });
+      await wait(300);
+      const segCancelState = await segFormState();
+      check('Cancel edit hides the form and returns it to add mode',
+        segCancelState.hidden === true && segCancelState.editSeg === null
+          && segCancelState.submitLabel === 'Add segment' && segCancelState.cancelHidden === true,
+        JSON.stringify(segCancelState));
+      const segAfterCancel = (await req('GET', `/api/properties/${segEditPid}`)).data;
+      check('the cancelled edit saved nothing (spread still -2)',
+        segAfterCancel.segments.length === 1 && segAfterCancel.segments[0].spread === -2,
+        JSON.stringify(segAfterCancel.segments));
+      // Delete + add regression through the UI.
+      await page.evaluate(() => document.querySelector('[data-del-seg]').click());
+      check('the edited segment deletes through the UI',
+        await untilNode(async () => page.evaluate(() => !document.querySelector('.seg-table .badge.cmp'))));
+      await page.evaluate(() => document.querySelector('[data-toggle-seg]').click());
+      await wait(400);
+      await page.evaluate(() => {
+        const form = document.querySelector('[data-seg-form]');
+        form.start_date.value = '2025-12-01';
+        const type = form.querySelector('[name=rate_type]');
+        type.value = 'fixed';
+        type.dispatchEvent(new Event('change', { bubbles: true }));
+        const rate = form.querySelector('[name=annual_rate]');
+        rate.value = '5';
+        rate.dispatchEvent(new Event('input', { bubbles: true }));
+        form.requestSubmit();
+      });
+      check('a fresh segment adds through the UI after the delete (add mode, new id)',
+        await untilNode(async () => {
+          const d = (await req('GET', `/api/properties/${segEditPid}`)).data;
+          return d.segments.length === 1 && d.segments[0].id !== segEditId && d.segments[0].annual_rate === 5;
+        }));
+      await req('DELETE', `/api/properties/${segEditPid}`);
 
       // ---- AI Fill, driven through the UI ----
       // The stubbed model returns the RBC commitment-letter

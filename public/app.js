@@ -572,7 +572,7 @@ $('#addPropForm').addEventListener('submit', async (e) => {
 // editing a flagged field by hand removes its flag at once. The
 // flags ride along on the form's own Save (ai_fields) and are
 // re-rendered from the server on load. A term form's panel also
-// fills the term's add-segment form (segment_* keys).
+// fills the term's segment form (segment_* keys).
 const aiFlagSets = new WeakMap();
 
 function aiFlagSet(form) {
@@ -779,7 +779,14 @@ function captureFormDrafts() {
   const terms = {};
   const segs = {};
   document.querySelectorAll('[data-term-form]').forEach((f) => { terms[f.dataset.termForm] = grab(f); });
-  document.querySelectorAll('[data-seg-form]').forEach((f) => { segs[f.dataset.segForm] = grab(f); });
+  document.querySelectorAll('[data-seg-form]').forEach((f) => {
+    const d = grab(f);
+    // A segment form mid-edit carries its mode with the draft:
+    // without it, the restored form would submit the edit as an
+    // Add and duplicate the segment.
+    d.editSeg = f.dataset.editSeg || null;
+    segs[f.dataset.segForm] = d;
+  });
   return { terms, segs };
 }
 
@@ -823,7 +830,13 @@ function restoreFormDrafts(stash) {
     }
   };
   document.querySelectorAll('[data-term-form]').forEach((f) => put(f, stash.terms[f.dataset.termForm]));
-  document.querySelectorAll('[data-seg-form]').forEach((f) => { put(f, stash.segs[f.dataset.segForm]); syncSegForm(f); });
+  document.querySelectorAll('[data-seg-form]').forEach((f) => {
+    const d = stash.segs[f.dataset.segForm];
+    put(f, d);
+    syncSegForm(f);
+    if (d && d.editSeg) f.dataset.editSeg = d.editSeg; else delete f.dataset.editSeg;
+    reflectSegEditMode(f);
+  });
 }
 
 async function reloadDetailKeepingDrafts() {
@@ -1500,7 +1513,7 @@ function segRowsHtml(segs) {
     <td>${esc(s.start_date)}${flag(['start_date'])}</td>
     <td>${s.rate_type === 'fixed' ? '<span class="badge">Fixed</span>' : '<span class="badge var">Variable</span>'}${flag(['rate_type'])}</td>
     <td class="num">${rateCell}${flag(['rate_mode', 'annual_rate', 'spread'])} <span class="badge cmp">${s.compounding === 'monthly' ? 'Monthly' : 'Semi-annual'}</span>${flag(['compounding'])}</td>
-    <td><button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`;
+    <td><button type="button" class="small" data-edit-seg="${s.id}">Edit</button> <button type="button" class="small danger" data-del-seg="${s.id}">Delete</button></td></tr>`;
   }).join('')
     || '<tr><td colspan="4" class="note" style="margin:0">No segments in this term yet — add one with "+ Change rate".</td></tr>';
 }
@@ -1510,12 +1523,16 @@ function lumpRowsHtml(lumps) {
   return lumps.map((l) => `<div class="kv"><span class="k">${esc(l.date)}</span><span>${money(l.amount)}${l.note ? ` · ${esc(l.note)}` : ''}</span><button type="button" class="small danger" data-del-lump="${l.id}">Delete</button></div>`).join('');
 }
 
-// The add-segment form uses the same grid as every other form on
+// The segment form uses the same grid as every other form on
 // the site (label above input, one baseline per row) instead of a
 // flex toolbar — in a toolbar the inputs sized to content, the row
 // wrapped, and the Add segment button dropped below the inputs
 // with its label detached. It starts hidden; "+ Change rate"
-// toggles it open (see the termsWrap click handler).
+// toggles it open (see the termsWrap click handler). The same
+// form edits an existing segment: a row's Edit button loads the
+// segment into it and switches it to edit mode (see
+// enterSegEditMode) — the submit then reads "Save segment" and a
+// Cancel button (edit mode only) drops back to add mode.
 function segFormHtml(t) {
   return `<form data-seg-form="${t.id}" class="hidden">
     <div class="grid3">
@@ -1529,10 +1546,80 @@ function segFormHtml(t) {
       <div><label>Compounding</label><select name="compounding"><option value="semi_annual">Semi-annual</option><option value="monthly">Monthly</option></select></div>
     </div>
     <div class="toolbar">
-      <button class="primary" type="submit">Add segment</button>
+      <button class="primary" type="submit" data-seg-submit>Add segment</button>
+      <button type="button" class="small hidden" data-seg-cancel-edit>Cancel edit</button>
     </div>
     <div class="note" data-plan-preview style="margin:2px 0 0"></div>
   </form>`;
+}
+
+// ------------------------------------------------ segment editing ---
+// A segment row's Edit button loads the segment into its term's
+// segment form and switches the form to edit mode (the form's
+// dataset.editSeg carries the segment id): submitting then
+// updates that segment in place (PUT, same id) instead of adding
+// a new one, and Cancel returns the form to add mode. The
+// segment's AI flags ride along — entering edit mode seeds the
+// form's flag set from the segment's stored ai_fields, and the
+// usual rule applies from there (a hand edit clears that
+// field's flag; the surviving set is what the save sends back).
+function segmentById(id) {
+  const p = detailProperty || {};
+  const all = [...(p.segments || [])];
+  for (const t of p.terms || []) {
+    for (const s of t.segments || []) {
+      if (!all.some((x) => x.id === s.id)) all.push(s);
+    }
+  }
+  return all.find((s) => String(s.id) === String(id)) || null;
+}
+
+// The submit label + Cancel visibility follow the form's mode.
+function reflectSegEditMode(form) {
+  const editing = !!form.dataset.editSeg;
+  const submit = form.querySelector('[data-seg-submit]');
+  if (submit) submit.textContent = editing ? 'Save segment' : 'Add segment';
+  const cancel = form.querySelector('[data-seg-cancel-edit]');
+  if (cancel) cancel.classList.toggle('hidden', !editing);
+}
+
+function enterSegEditMode(form, seg) {
+  form.dataset.editSeg = String(seg.id);
+  // Programmatic prefill: values are set without dispatching
+  // input/change events and with the _aiFilling guard up, so
+  // loading the segment neither clears its AI flags nor counts
+  // as a hand edit.
+  form._aiFilling = true;
+  form.start_date.value = seg.start_date || '';
+  form.rate_type.value = seg.rate_type || 'fixed';
+  form.rate_mode.value = seg.rate_mode || 'absolute';
+  form.annual_rate.value = seg.annual_rate ?? '';
+  form.spread.value = seg.spread ?? '';
+  form.compounding.value = seg.compounding || 'semi_annual';
+  form._aiFilling = false;
+  syncSegForm(form);
+  const set = aiFlagSet(form);
+  set.clear();
+  (seg.ai_fields || []).forEach((n) => set.add(n));
+  renderAiFlags(form);
+  reflectSegEditMode(form);
+  form.classList.remove('hidden');
+  refreshPlanPreview(form);
+}
+
+function exitSegEditMode(form) {
+  delete form.dataset.editSeg;
+  reflectSegEditMode(form);
+}
+
+// The term form's Save button label names the payment it
+// calculates, in the term's payment frequency: "Save & calculate
+// monthly payment", "Save & calculate accelerated bi-weekly
+// payment", ... — the FREQUENCY_LABELS entry lowercased. The
+// label follows the frequency select live (see the termsWrap
+// change handler).
+function saveTermLabel(freqKey) {
+  return `Save & calculate ${(FREQUENCY_LABELS[freqKey] || 'Monthly').toLowerCase()} payment`;
 }
 
 // The frequency options for a term's payment-schedule select.
@@ -1557,11 +1644,14 @@ function renderTerms(p) {
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
     // Every term card carries the same field set: its contract
     // fields, its principal pair, its payment schedule — and,
-    // closing the card below the rate segments and the lump
-    // sums, its monthly payment figure (rendered from the
+    // below the rate segments and the lump sums, its monthly
+    // payment figure (rendered from the
     // term's payment triple, with an Edit button that turns the
     // figure itself into the override input — there is no
-    // separate override field).
+    // separate override field). The card's one Save button
+    // closes the card below the payment row: it sits outside
+    // the term <form> and submits it through the HTML form
+    // attribute, like the payment row's own inputs.
     // The principal pair — "Outstanding
     // principal" / "Principal as of" — binds the term's opening
     // balance / start date, EXCEPT on the term carrying the
@@ -1608,10 +1698,6 @@ function renderTerms(p) {
             <div><label>Payment day</label><input type="number" name="payment_day" min="1" max="31" step="1" placeholder="e.g. 1" value="${t.payment_day ?? p.payment_day ?? ''}" style="width:110px"${stepped ? ' disabled' : ''}></div>
           </div>
           ${t.amortization_defaulted ? '<div class="note" style="margin-left:0">The 25-year amortization on this term is the migration default — set the real figure if it differs.</div>' : ''}
-          <div class="toolbar">
-            <button class="primary" type="submit">Save term</button>
-            ${terms.length > 1 ? `<button type="button" class="small danger" data-del-term="${t.id}">Delete term</button>` : ''}
-          </div>
         </form>
         <h5>Rate segments in this term</h5>
         <table class="seg-table">
@@ -1639,13 +1725,17 @@ function renderTerms(p) {
           </div></div>
           <div><label>Priced as of</label><input name="payment_pricing_date" form="termForm${t.id}" type="date" value="${esc(t.payment_pricing_date || '')}"></div>
         </div>
+        <div class="toolbar" style="margin-top:12px">
+          <button class="primary" type="submit" form="termForm${t.id}" data-save-term="${t.id}">${esc(saveTermLabel(freqKey))}</button>
+          ${terms.length > 1 ? `<button type="button" class="small danger" data-del-term="${t.id}">Delete term</button>` : ''}
+        </div>
       </div>
     </div>`;
   }).join('') || '<div class="note" style="margin-left:0">No terms yet.</div>';
   wrap.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   wrap.querySelectorAll('[data-seg-form]').forEach(syncSegForm);
   // AI Fill: one panel per term form (it also fills that term's
-  // add-segment form), with the persisted flags re-rendered.
+  // segment form), with the persisted flags re-rendered.
   wrap.querySelectorAll('[data-term-form]').forEach((f) => {
     const t = terms.find((x) => String(x.id) === f.dataset.termForm);
     const block = f.closest('.term-block');
@@ -1736,6 +1826,20 @@ $('#termsWrap').addEventListener('click', async (e) => {
     openPrimeModal(primeLink.dataset.segStart);
     return;
   }
+  const editSeg = e.target.closest('[data-edit-seg]');
+  if (editSeg) {
+    const block = editSeg.closest('[data-term-block]');
+    const form = block && block.querySelector('[data-seg-form]');
+    const seg = segmentById(editSeg.dataset.editSeg);
+    if (form && seg) enterSegEditMode(form, seg);
+    return;
+  }
+  const cancelSegEdit = e.target.closest('[data-seg-cancel-edit]');
+  if (cancelSegEdit) {
+    const form = cancelSegEdit.closest('[data-seg-form]');
+    if (form) { exitSegEditMode(form); form.classList.add('hidden'); }
+    return;
+  }
   const delSeg = e.target.closest('[data-del-seg]');
   if (delSeg) { deleteSegment(Number(delSeg.dataset.delSeg)); return; }
   const delLump = e.target.closest('[data-del-lump]');
@@ -1766,6 +1870,11 @@ $('#termsWrap').addEventListener('change', (e) => {
     // The payment day only applies to the monthly / semi-monthly
     // schedules; the day-stepped frequencies disable the input.
     termFormEl.payment_day.disabled = DAY_STEPPED_FREQUENCIES.includes(e.target.value);
+    // The Save button's label names the payment in the newly
+    // picked frequency.
+    const block = termFormEl.closest('[data-term-block]');
+    const saveBtn = block && block.querySelector('[data-save-term]');
+    if (saveBtn) saveBtn.textContent = saveTermLabel(e.target.value);
     return;
   }
   const form = e.target.closest('[data-seg-form]');
@@ -1849,9 +1958,20 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         body.rate_mode = 'absolute';
         body.annual_rate = f.annual_rate;
       }
-      await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
-      markAssetsDirty();
-      showMsg($('#mortgageMsg'), 'ok', 'Rate segment added.');
+      // Edit mode updates the loaded segment in place (same id);
+      // add mode creates a new one. A saved edit returns the
+      // form to add mode (before the reload below snapshots the
+      // drafts, so the mode does not ride back in).
+      if (form.dataset.editSeg) {
+        await api(`/api/properties/${currentPropertyId}/rates/${form.dataset.editSeg}`, { method: 'PUT', body });
+        exitSegEditMode(form);
+        markAssetsDirty();
+        showMsg($('#mortgageMsg'), 'ok', 'Rate segment saved.');
+      } else {
+        await api(`/api/properties/${currentPropertyId}/rates`, { method: 'POST', body });
+        markAssetsDirty();
+        showMsg($('#mortgageMsg'), 'ok', 'Rate segment added.');
+      }
     } else if (form.dataset.lumpForm) {
       const f = Object.fromEntries(new FormData(form).entries());
       parseMoneyFields(f, ['amount']);
@@ -2080,7 +2200,7 @@ $('#primeRefreshBtn').addEventListener('click', async () => {
   } catch (err) { showMsg($('#mortgageMsg'), 'err', err.message); }
 });
 
-// A term's add-segment form: Variable reveals the pricing mode;
+// A term's segment form: Variable reveals the pricing mode;
 // Prime + spread swaps the absolute-rate input for a spread input
 // with a live preview against the tracked prime. One instance per
 // term, scoped by the form's own fields (see renderTerms).
@@ -2112,7 +2232,7 @@ function refreshSegPreviews() {
 }
 
 // Live plan preview: while a rate plan is being drafted in a term's
-// add-segment form, the server runs the draft through the same
+// segment form, the server runs the draft through the same
 // schedule engine as the saved projection and returns the plan's
 // first month in effect — payment, interest, principal and the rate
 // — so the figures can be checked BEFORE anything is saved.
@@ -2181,7 +2301,7 @@ function refreshPlanPreview(form) {
   }, 300));
 }
 
-// A term block's open add-segment form, if any (previews refresh
+// A term block's open segment form, if any (previews refresh
 // when the term's own plan fields change too).
 function segFormOfBlock(el) {
   const block = el && el.closest('[data-term-block]');

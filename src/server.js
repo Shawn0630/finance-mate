@@ -1313,6 +1313,16 @@ function segmentTermId(p, body, base) {
   return { value: (owner || terms[0]).id };
 }
 
+// Two segments of one term may not share a start date — the
+// timeline would be ambiguous about which segment prices that
+// month. Enforced on add and on edit alike; an edit excludes
+// the segment itself.
+function segmentStartTaken(propertyId, termId, startDate, exceptId) {
+  return !!db.prepare(
+    'SELECT id FROM rate_segments WHERE property_id = ? AND term_id IS ? AND start_date = ? AND id <> ?'
+  ).get(propertyId, termId, startDate, exceptId || -1);
+}
+
 app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -1321,6 +1331,9 @@ app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   const owner = segmentTermId(p, req.body || {}, null);
   if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
+  if (segmentStartTaken(p.id, owner.value, s.start_date, null)) {
+    return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
+  }
   const info = db
     .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
@@ -1336,6 +1349,9 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
   const owner = segmentTermId(p, req.body || {}, seg);
   if (owner.error) return res.status(400).json({ error: owner.error });
   const s = clean.value;
+  if (segmentStartTaken(p.id, owner.value, s.start_date, seg.id)) {
+    return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
+  }
   const segAi = cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS);
   db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, ai_fields=? WHERE id=?')
     .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
