@@ -202,6 +202,8 @@ label.btnlike:hover { background: #f0f4f9; }
 /* Per-chart series color pickers (Colors panels). */
 .chart-colors { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; margin: 8px 0; font-size: 13px; }
 .chart-colors .cc-row { display: inline-flex; gap: 6px; align-items: center; }
+/* The row of the series right-clicked in the legend. */
+.chart-colors .cc-row.cc-highlight { background: #fdf3e0; border-radius: 6px; box-shadow: 0 0 0 2px #e8a33d; padding: 2px 6px; margin: -2px -6px; }
 .chart-colors input[type="color"] { width: 36px; height: 24px; padding: 0; border: 1px solid #c8d2dd; border-radius: 4px; background: none; cursor: pointer; }
 .hidden { display: none !important; }
 .term-block { border: 1px solid #dde4ec; border-radius: 10px; margin: 10px 0; overflow: hidden; }

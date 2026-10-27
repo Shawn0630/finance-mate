@@ -1046,14 +1046,17 @@ function applyChartColors(chartId) {
 }
 
 // One row per series: its name, a native color input holding the
-// current color, and one Reset for the whole chart.
+// current color, and one Reset for the whole chart. The row of
+// the series last right-clicked in the legend (see the legend
+// gestures below) renders highlighted.
 function buildColorsPanel(chartId) {
   const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
   if (!panel) return;
   const defs = chartId === 'portfolio' ? portfolioSeriesDefs() : (CHART_SERIES[chartId] || []);
   panel.innerHTML = defs.map((def) => {
     const current = (chartColorPrefs[chartId] && chartColorPrefs[chartId][def.key]) || def.border || def.bg;
-    return `<span class="cc-row"><span>${esc(def.label)}</span><input type="color" data-color-input="${esc(def.key)}" value="${esc(current)}"></span>`;
+    const hl = legendHighlightKey[chartId] === def.key ? ' cc-highlight' : '';
+    return `<span class="cc-row${hl}"><span>${esc(def.label)}</span><input type="color" data-color-input="${esc(def.key)}" value="${esc(current)}"></span>`;
   }).join('') + '<button type="button" class="small" data-colors-reset>Reset</button>';
 }
 
@@ -1091,6 +1094,63 @@ document.addEventListener('input', (e) => {
 document.addEventListener('change', (e) => {
   if (e.target.closest && e.target.closest('[data-color-input]')) saveChartColorPrefs(true);
 });
+
+// ------------------------------------------------ legend gestures ---
+// On the three recolorable charts the legend is interactive. A
+// LEFT click on a legend item toggles that series' visibility —
+// Chart.js' default legend behavior, which no chart here
+// overrides; the item takes the legend's struck-through hidden
+// style. Visibility is view state only: it is never stored (the
+// preferences hold colors and nothing else). A RIGHT click on a
+// legend item opens that chart's Colors panel with the clicked
+// series' row highlighted, and suppresses the browser's context
+// menu; the Colors button stays for touch, which has no right
+// click. All three charts behave identically.
+const legendHighlightKey = {}; // chartId -> series key last right-clicked
+
+function openColorsPanel(chartId, focusKey) {
+  const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
+  if (!panel) return;
+  if (focusKey != null) legendHighlightKey[chartId] = focusKey;
+  buildColorsPanel(chartId);
+  panel.classList.remove('hidden');
+}
+
+// The legend item under a mouse event on the chart's canvas, or
+// null. Chart.js lays the legend out in the canvas' own CSS-pixel
+// space — the same space as the event's offset within the canvas
+// box — so the hit boxes can be tested directly.
+function legendItemAt(chart, e) {
+  const legend = chart && chart.legend;
+  if (!legend || !legend.legendItems || !legend.legendHitBoxes) return null;
+  const rect = chart.canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  for (let i = 0; i < legend.legendHitBoxes.length; i++) {
+    const b = legend.legendHitBoxes[i];
+    if (b && x >= b.left && x <= b.left + b.width && y >= b.top && y <= b.top + b.height) {
+      return legend.legendItems[i] || null;
+    }
+  }
+  return null;
+}
+
+function wireLegendContextMenu(chartId, canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  canvas.addEventListener('contextmenu', (e) => {
+    const get = LIVE_CHARTS[chartId];
+    const chart = get ? get() : null;
+    const item = chart && legendItemAt(chart, e);
+    if (!item) return;
+    e.preventDefault();
+    const ds = chart.data.datasets[item.datasetIndex];
+    openColorsPanel(chartId, ds && ds.key != null ? ds.key : null);
+  });
+}
+wireLegendContextMenu('hero', 'combinedChart');
+wireLegendContextMenu('history', 'historyChart');
+wireLegendContextMenu('portfolio', 'portfolioChart');
 
 function drawPortfolioPie() {
   const ctx = $('#portfolioPie');
