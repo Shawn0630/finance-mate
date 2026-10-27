@@ -353,7 +353,7 @@ export function parseModelJson(text) {
 
 // ------------------------------------------------------------ endpoint
 
-function validateFile(file) {
+export function validateFile(file) {
   if (!file || typeof file !== 'object' || Array.isArray(file)) {
     return { status: 400, error: 'file must be an object with name, type and data (base64).' };
   }
@@ -427,4 +427,213 @@ export async function handleAiFill(input, deps = {}) {
     else delete fields.owners;
   }
   return { status: 200, body: { fields, model } };
+}
+
+// ------------------------------------------------- property costs chat
+// The multi-turn sibling of AI Fill, for the Property costs
+// panel. Unlike the one-shot form fill, this is a CONVERSATION:
+// the model proposes cost entries, asks a follow-up whenever a
+// year / period / category / property attribution is ambiguous
+// (it must never guess), and revises the draft as the user
+// answers. Nothing is written by the chat itself — the panel
+// applies the confirmed proposal through the costs POST with
+// source 'ai'. The conversation lives in the page session only.
+//
+// Response contract (the model replies with ONLY this JSON):
+//   {"reply": "…", "proposed": [{year, category, amount, basis, notes}], "ready": bool}
+//
+// Basis rule: amount is stored in the basis it was recorded in —
+// 'annual' = the year's total (property tax); 'monthly' = a
+// monthly AVERAGE whose year total is the average × 12.
+
+export const COSTS_CHAT_HISTORY_TURNS = 20;
+export const COSTS_CHAT_TURN_CHARS = 12000;
+export const MAX_CHAT_FILES = 5;
+
+const COSTS_CHAT_PROMPT = [
+  'You help the user record one property\'s yearly running costs (property tax, strata fees,',
+  'utilities, insurance and similar) from bills and notes they paste or attach.',
+  'Reply with ONLY a JSON object of the form',
+  '{"reply": "...", "proposed": [{"year": 2025, "category": "Property tax", "amount": 4321, "basis": "annual", "notes": null}], "ready": false}',
+  '— no prose outside the JSON, no code fences.',
+  '',
+  'The "proposed" array is the CURRENT DRAFT of new cost entries for this property: return the',
+  'whole draft every time (the entries you extracted plus any the user confirmed or corrected),',
+  'never entries that are already recorded (they are listed for you) unless the user is',
+  'correcting one of those.',
+  'Each proposed item: year (the calendar year the cost belongs to), category (prefer exactly',
+  'one of: Property tax, Strata fee, Water, Electricity, Gas, Home insurance, Other — a clearly',
+  'named different category is acceptable), amount (a plain number, no $ or commas), basis',
+  '("annual" or "monthly"), notes (short, or null).',
+  '',
+  'BASIS — read carefully:',
+  '- basis "annual": amount is the FULL YEAR total (e.g. an annual property-tax notice).',
+  '- basis "monthly": amount is a MONTHLY AVERAGE; the year total is the average × 12.',
+  '- Several months of the same bill: average them, propose basis "monthly" with the average,',
+  '  and say in "reply" how many months you used and the average you computed.',
+  '- Only one month given: use that month as the monthly average (basis "monthly") and say in',
+  '  "reply" that the sample is a single month.',
+  '- A quarterly amount: convert it — either the annual total = quarterly × 4 (basis "annual")',
+  '  or the monthly average = quarterly ÷ 3 (basis "monthly") — and state the multiplier you',
+  '  used in "reply". The same applies to any other non-monthly, non-annual period: convert',
+  '  and state the multiplier.',
+  '- When the user corrects the period of a draft item ("that was quarterly"), update that',
+  '  item\'s basis/amount accordingly and say what changed in "reply".',
+  '',
+  'AMBIGUITY — never guess:',
+  'If the year or period a figure covers, the category, or WHICH PROPERTY a bill belongs to is',
+  'unclear in any way, do NOT propose the item yet: ask one focused question in "reply" and',
+  'leave the item out of "proposed" (or keep it out until answered). Typical traps: a bill',
+  'with no year on it; a figure that could be monthly, quarterly or annual; a strata fee that',
+  'could belong to a different property.',
+  '',
+  '"ready" is true only when the draft covers everything the user provided and no question',
+  'is outstanding; otherwise false. Keep "reply" short and concrete.',
+].join('\n');
+
+function fmtCostLine(r) {
+  const amt = Number(r.amount).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return r.basis === 'monthly'
+    ? `${r.year} · ${r.category} · avg $${amt}/mo (monthly basis)`
+    : `${r.year} · ${r.category} · $${amt} (annual)`;
+}
+
+// Keep the conversation the model sees bounded (the visualizer's
+// assistant uses the same order of limits): the last N turns,
+// each turn's text capped. Only user/assistant turns pass.
+export function truncateChatHistory(history) {
+  if (!Array.isArray(history)) return [];
+  const turns = [];
+  for (const t of history) {
+    if (!t || typeof t !== 'object') continue;
+    if (t.role !== 'user' && t.role !== 'assistant') continue;
+    if (typeof t.content !== 'string' || !t.content.trim()) continue;
+    turns.push({ role: t.role, content: t.content.slice(0, COSTS_CHAT_TURN_CHARS) });
+  }
+  return turns.slice(-COSTS_CHAT_HISTORY_TURNS);
+}
+
+// Validate + normalize the model's proposed entries. Unknown
+// shapes, unusable years/amounts and blank categories drop out;
+// basis defaults to 'annual' unless it says 'monthly'.
+export function normalizeProposedCosts(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const year = normInt(item.year, 1900, 2100);
+    const category = normStr(item.category, 80);
+    const amount = normNum(item.amount);
+    if (year == null || !category || amount == null || amount < 0) continue;
+    out.push({
+      year,
+      category,
+      amount,
+      basis: typeof item.basis === 'string' && item.basis.trim().toLowerCase() === 'monthly' ? 'monthly' : 'annual',
+      notes: normStr(item.notes, 500),
+    });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+export function buildCostsChatMessages({ property, existing, draft, history, text, files }) {
+  const context = [
+    `Property: ${property && property.address ? property.address : '(unknown address)'}`,
+    'Already recorded for this property (do not re-propose these unless the user is correcting one):',
+    ...(existing && existing.length ? existing.map((r) => `- ${fmtCostLine(r)}`) : ['- (none)']),
+    'Current draft proposals (the user may correct these):',
+    ...(draft && draft.length ? draft.map((r) => `- ${fmtCostLine(r)}`) : ['- (none yet)']),
+  ].join('\n');
+  const content = [{ type: 'text', text: (text && text.trim()) || 'Please review the attached document(s).' }];
+  for (const f of files || []) {
+    if (f.type.startsWith('image/')) {
+      content.push({ type: 'image_url', image_url: { url: `data:${f.type};base64,${f.data}` } });
+    } else if (f.type === 'application/pdf') {
+      const extracted = extractPdfText(f.bytes);
+      content.push({
+        type: 'text',
+        text: extracted ? `Document text (${f.name || 'attachment'}):\n${extracted.slice(0, 20000)}` : `A PDF (${f.name || 'attachment'}) was attached, but no text could be extracted from it.`,
+      });
+    }
+  }
+  return [
+    { role: 'system', content: `${COSTS_CHAT_PROMPT}\n\n${context}` },
+    ...truncateChatHistory(history),
+    { role: 'user', content },
+  ];
+}
+
+// The fill-chat endpoint as a pure-ish function (same deps /
+// error conventions as handleAiFill): validates input, checks
+// configuration, calls the model, normalizes. The caller
+// supplies the property and its recorded costs as deps. The chat
+// itself writes nothing.
+export async function handleAiFillChat(input, deps = {}) {
+  const env = deps.env || process.env;
+  const call = deps.callLlm || callLlm;
+  const { propertyId, history, text, files, proposed } = input || {};
+  if (!Number.isInteger(Number(propertyId)) || Number(propertyId) <= 0) {
+    return { status: 400, body: { error: 'propertyId is required.' } };
+  }
+  if (!deps.property) return { status: 404, body: { error: 'property not found' } };
+  if (!llmConfigured(env)) {
+    return {
+      status: 503,
+      body: { error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' },
+    };
+  }
+  const models = llmModels(env);
+  let model = null;
+  if (input && input.model != null && String(input.model).trim() !== '') {
+    model = String(input.model).trim();
+    if (!models.includes(model)) {
+      return { status: 400, body: { error: `model "${model}" is not in the configured model list` } };
+    }
+  } else if (deps.model && models.includes(deps.model)) {
+    model = deps.model;
+  } else {
+    model = llmDefaultModel(env);
+  }
+  let fileInfos = [];
+  if (files != null) {
+    if (!Array.isArray(files)) return { status: 400, body: { error: 'files must be an array.' } };
+    if (files.length > MAX_CHAT_FILES) {
+      return { status: 400, body: { error: `Attach at most ${MAX_CHAT_FILES} files per message.` } };
+    }
+    for (const f of files) {
+      const v = validateFile(f);
+      if (v.error) return { status: v.status, body: { error: v.error } };
+      fileInfos.push(v);
+    }
+  }
+  const hasText = typeof text === 'string' && text.trim().length > 0;
+  if (!hasText && !fileInfos.length) {
+    return { status: 400, body: { error: 'Write a message or attach a document first.' } };
+  }
+  let rawText;
+  try {
+    rawText = await call(buildCostsChatMessages({
+      property: deps.property,
+      existing: deps.existing || [],
+      draft: normalizeProposedCosts(proposed),
+      history, text: hasText ? text : '', files: fileInfos,
+    }), env, model);
+  } catch {
+    return { status: 502, body: { error: 'The AI service could not complete the chat.' } };
+  }
+  const parsed = parseModelJson(rawText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed.reply === undefined && parsed.proposed === undefined)) {
+    return { status: 502, body: { error: 'The AI response could not be read.' } };
+  }
+  return {
+    status: 200,
+    body: {
+      reply: typeof parsed.reply === 'string' ? parsed.reply.slice(0, 4000) : '',
+      proposed: normalizeProposedCosts(parsed.proposed),
+      ready: parsed.ready === true,
+      model,
+    },
+  };
 }

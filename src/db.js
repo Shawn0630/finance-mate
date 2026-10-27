@@ -127,6 +127,28 @@ CREATE TABLE IF NOT EXISTS value_history (
   updated_at TEXT NOT NULL,
   UNIQUE (property_id, year)
 );
+-- A property's yearly running costs (property tax, strata fees,
+-- utilities, insurance…): one row per (year, category). The amount
+-- is stored in the basis it was recorded in: 'annual' = the year's
+-- total; 'monthly' = a monthly average, whose year total is the
+-- average × 12. Every total, pivot and chart reads at the ANNUAL
+-- figure (see src/costs.js). source is provenance only: 'manual'
+-- rows were typed in, 'ai' rows landed through the AI fill chat's
+-- Apply button.
+CREATE TABLE IF NOT EXISTS property_costs (
+  id INTEGER PRIMARY KEY,
+  property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  category TEXT NOT NULL,
+  amount REAL NOT NULL,
+  basis TEXT NOT NULL DEFAULT 'annual',   -- 'annual' | 'monthly'
+  notes TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'ai'
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (property_id, year, category)
+);
+CREATE INDEX IF NOT EXISTS idx_property_costs ON property_costs(property_id, year);
 -- A property's uploaded photos, in display order: the gallery the
 -- detail page shows as a carousel; the first row is the Properties
 -- card cover. Files live in PHOTOS_DIR; the row stores only the name.

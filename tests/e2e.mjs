@@ -1550,6 +1550,108 @@ try {
       && pfEq.totals.equity >= 650225,
     JSON.stringify(pfEq.totals));
 
+  // ---- Property costs (API) ----
+  // Yearly running costs: one row per (year, category), stored
+  // in its recorded basis — a 'monthly' entry holds the monthly
+  // average and counts ×12 in every annual figure the pivot
+  // returns (cells, year totals, latest).
+  r = await req('POST', '/api/properties', { address: '77 Costs Court, Victoria, BC', purchase_date: '2024-01-01' });
+  const costPid = r.data.id;
+  r = await req('POST', `/api/properties/${costPid}/costs`, { year: 2026, category: 'Property tax', amount: 5400 });
+  const costEntry = (view, cat, year) => (view.entries || []).find((e) => e.category === cat && e.year === year);
+  check('create an annual cost entry (201, source manual by default)',
+    r.status === 201 && !!costEntry(r.data, 'Property tax', 2026)
+      && costEntry(r.data, 'Property tax', 2026).basis === 'annual'
+      && costEntry(r.data, 'Property tax', 2026).source === 'manual',
+    JSON.stringify(r.data).slice(0, 300));
+  r = await req('POST', `/api/properties/${costPid}/costs`, { year: 2026, category: 'Electricity', amount: 85, basis: 'monthly' });
+  check('create a monthly-basis entry (the stored amount is the monthly average)',
+    r.status === 201 && !!costEntry(r.data, 'Electricity', 2026)
+      && costEntry(r.data, 'Electricity', 2026).amount === 85,
+    JSON.stringify(r.data).slice(0, 300));
+  const costElecId = costEntry(r.data, 'Electricity', 2026).id;
+  r = await req('POST', `/api/properties/${costPid}/costs`, { year: 2025, category: 'Property tax', amount: 5100 });
+  r = await req('GET', `/api/properties/${costPid}/costs`);
+  check('the pivot annualizes monthly entries (85 × 12) in cells, totals and latest',
+    r.status === 200 && r.data.entries.length === 3
+      && r.data.latest.year === 2026 && r.data.latest.total === 6420
+      && r.data.years.find((y) => y.year === 2026).cells.Electricity.annual === 1020
+      && r.data.years.find((y) => y.year === 2025).total === 5100,
+    JSON.stringify(r.data).slice(0, 400));
+  r = await req('POST', `/api/properties/${costPid}/costs`, { year: 2026, category: 'Electricity', amount: 90, basis: 'monthly' });
+  check('POST on an existing (year, category) upserts instead of duplicating',
+    r.status === 201 && r.data.entries.length === 3
+      && costEntry(r.data, 'Electricity', 2026).amount === 90
+      && r.data.latest.total === 6480,
+    JSON.stringify(r.data).slice(0, 300));
+  r = await req('PUT', `/api/properties/${costPid}/costs/${costElecId}`, { category: 'Property tax' });
+  check('PUT onto a colliding (year, category) is a 400 naming the clash',
+    r.status === 400 && String(r.data.error || '').includes('already exists'), JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${costPid}/costs/${costElecId}`, { amount: 95 });
+  check('PUT edits the amount (basis kept), the year total follows',
+    r.status === 200 && costEntry(r.data, 'Electricity', 2026).amount === 95
+      && costEntry(r.data, 'Electricity', 2026).basis === 'monthly'
+      && r.data.latest.total === 6540,
+    JSON.stringify(r.data).slice(0, 300));
+  r = await req('POST', `/api/properties/${costPid}/costs`, { year: 2026, category: 'Water', amount: -5 });
+  check('a negative amount is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/properties/${costPid}/costs`, { year: 2026, category: 'Water', amount: 5, basis: 'weekly' });
+  check('an unknown basis is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('DELETE', `/api/properties/${costPid}/costs/${costElecId}`);
+  check('DELETE removes the entry and the total drops back',
+    r.status === 200 && r.data.entries.length === 2 && r.data.latest.total === 5400,
+    JSON.stringify(r.data).slice(0, 300));
+  r = await req('DELETE', `/api/properties/${costPid}/costs/${costElecId}`);
+  check('deleting a missing entry is a 404', r.status === 404, JSON.stringify(r.data));
+  r = await req('GET', '/api/properties/999999/costs');
+  check('costs of a missing property are a 404', r.status === 404, JSON.stringify(r.data));
+
+  // ---- AI fill chat (API): the multi-turn flow ----
+  // Round 1: the model asks about the year and proposes the one
+  // entry it is sure of — a monthly-basis electricity figure.
+  // Round 2: with the answer and the draft in the history, it
+  // completes the proposal. The chat itself writes nothing.
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Which year are these electricity bills for? The 3 bills average $85/mo.',
+    proposed: [{ year: 2026, category: 'Electricity', amount: 85, basis: 'monthly' }],
+    ready: false,
+  }));
+  const chat1 = await req('POST', '/api/ai/fill-chat', {
+    propertyId: costPid, history: [], text: 'electricity bills', proposed: [],
+  });
+  check('fill-chat round 1: asks a question and proposes the partial monthly entry',
+    chat1.status === 200 && chat1.data.ready === false
+      && chat1.data.proposed.length === 1 && chat1.data.proposed[0].basis === 'monthly'
+      && chat1.data.proposed[0].amount === 85,
+    JSON.stringify(chat1.data).slice(0, 300));
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Recorded as 2026 figures.',
+    proposed: [
+      { year: 2026, category: 'Electricity', amount: 85, basis: 'monthly' },
+      { year: 2026, category: 'Property tax', amount: 5400, basis: 'annual' },
+    ],
+    ready: true,
+  }));
+  const chat2 = await req('POST', '/api/ai/fill-chat', {
+    propertyId: costPid,
+    history: [
+      { role: 'user', content: 'electricity bills' },
+      { role: 'assistant', content: chat1.data.reply },
+    ],
+    text: '2026', proposed: chat1.data.proposed,
+  });
+  check('fill-chat round 2: the completed proposal comes back ready',
+    chat2.status === 200 && chat2.data.ready === true && chat2.data.proposed.length === 2,
+    JSON.stringify(chat2.data).slice(0, 300));
+  r = await req('GET', `/api/properties/${costPid}/costs`);
+  check('the chat wrote nothing by itself (only Apply lands entries)',
+    r.data.entries.length === 2 && !costEntry(r.data, 'Electricity', 2026),
+    JSON.stringify(r.data.entries.map((e) => e.category)));
+  r = await req('POST', '/api/ai/fill-chat', { propertyId: 999999, text: 'x' });
+  check('fill-chat for a missing property is a 404', r.status === 404, JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill-chat', { propertyId: costPid });
+  check('fill-chat with no message and no files is a 400', r.status === 400, JSON.stringify(r.data));
+
   // ---- AI Fill (API) ----
   // The stubbed model answers with the RBC commitment-letter
   // fields in raw document shapes; the endpoint must normalize
@@ -2830,7 +2932,9 @@ try {
         const ints = c.data.datasets.find((d) => d.label === 'Interest portion');
         const prins = c.data.datasets.find((d) => d.label === 'Principal portion');
         return {
-          canvasCount: document.querySelectorAll('#view-property canvas').length,
+          // Scoped to the projection panel: the costs panel
+          // further down the page has charts of its own.
+          canvasCount: document.querySelectorAll('#projectionPanel canvas').length,
           hasMonthlyCanvas: !!document.querySelector('#monthlyChart'),
           labels: c.data.datasets.map((d) => d.label),
           yMin: c.scales.y.min, yMax: c.scales.y.max,
@@ -2860,7 +2964,7 @@ try {
       };
       const exp60 = await rowsIn();
       let bi = await barInfo();
-      check('detail page has exactly one chart canvas (the merged chart)',
+      check('the projection is exactly one chart canvas (the merged chart)',
         !!bi && bi.canvasCount === 1 && bi.hasMonthlyCanvas === false,
         JSON.stringify(bi && { n: bi.canvasCount, monthly: bi.hasMonthlyCanvas }));
       check('merged chart draws all four datasets (2 lines + 2 bar portions)',
@@ -5440,12 +5544,365 @@ try {
           return !!sel && sel.value === 'stub-b';
         }));
       await req('DELETE', `/api/properties/${aiPid}`);
+
+      // ---- Property costs: the inline table, both charts and
+      // the AI chat, driven through the UI ----
+      // Seeded: 2026 tax 5,400; 2025 tax 5,100 + water 480.
+      r = await req('POST', '/api/properties', { address: '88 Costs UI Road, Victoria, BC', purchase_date: '2024-01-01' });
+      const costUiPid = r.data.id;
+      await req('POST', `/api/properties/${costUiPid}/costs`, { year: 2026, category: 'Property tax', amount: 5400 });
+      await req('POST', `/api/properties/${costUiPid}/costs`, { year: 2025, category: 'Property tax', amount: 5100 });
+      await req('POST', `/api/properties/${costUiPid}/costs`, { year: 2025, category: 'Water', amount: 480 });
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, costUiPid);
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('the costs panel renders its entries with a subtotal row per year',
+        await until(() => {
+          const rows = document.querySelectorAll('#costsRows tr[data-cost-row]');
+          const subs = [...document.querySelectorAll('#costsRows tr.cost-subtotal')].map((t) => t.textContent);
+          return rows.length === 3
+            && subs.some((t) => t.includes('2026 total') && t.includes('5,400'))
+            && subs.some((t) => t.includes('2025 total') && t.includes('5,580'));
+        }));
+      const costsHead = await page.evaluate(() => document.querySelector('#costsLatestTotal').textContent);
+      check('the panel head shows the latest year total', costsHead.includes('2026') && costsHead.includes('5,400'), costsHead);
+      const pieState = await page.evaluate(() => {
+        const c = window.__fmCharts.costsPie;
+        return c ? { labels: c.data.labels, data: c.data.datasets[0].data } : null;
+      });
+      check('the pie defaults to the latest year, slices = that year’s category totals',
+        !!pieState && JSON.stringify(pieState.labels) === JSON.stringify(['Property tax']) && pieState.data[0] === 5400,
+        JSON.stringify(pieState));
+      await page.evaluate(() => {
+        const s = document.querySelector('#costsPieYear');
+        s.value = '2025';
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await wait(500);
+      const pie2025 = await page.evaluate(() => {
+        const c = window.__fmCharts.costsPie;
+        return c ? { labels: c.data.labels, data: c.data.datasets[0].data } : null;
+      });
+      check('switching the pie year re-slices to that year (5,100 tax + 480 water)',
+        !!pie2025 && pie2025.labels.includes('Water')
+          && Math.abs(pie2025.data.reduce((a, b) => a + b, 0) - 5580) < 0.001,
+        JSON.stringify(pie2025));
+      const colorMatch = await page.evaluate(() => {
+        const pie = window.__fmCharts.costsPie;
+        const combo = window.__fmCharts.costsCombo;
+        const pieMap = {};
+        pie.data.labels.forEach((l, i) => { pieMap[l] = pie.data.datasets[0].backgroundColor[i]; });
+        const comboMap = {};
+        combo.data.datasets.filter((d) => d.type === 'bar').forEach((d) => { comboMap[d.label] = d.backgroundColor; });
+        return Object.keys(pieMap).length > 0 && Object.keys(pieMap).every((k) => comboMap[k] === pieMap[k]);
+      });
+      check('a category keeps the same color in the pie and in the combo bars', colorMatch === true);
+      const comboYear = await page.evaluate(() => {
+        const c = window.__fmCharts.costsCombo;
+        if (!c) return null;
+        const totals = c.data.datasets.find((d) => d.label === 'Total');
+        const bars = c.data.datasets.filter((d) => d.type === 'bar');
+        return {
+          labels: c.data.labels, totals: totals && totals.data,
+          barSums: c.data.labels.map((_, i) => bars.reduce((s, d) => s + d.data[i], 0)),
+        };
+      });
+      check('the combo By year: each stacked bar sums to the year total the line carries',
+        !!comboYear && JSON.stringify(comboYear.labels) === JSON.stringify(['2025', '2026'])
+          && comboYear.barSums[0] === 5580 && comboYear.barSums[1] === 5400
+          && comboYear.totals[0] === 5580 && comboYear.totals[1] === 5400,
+        JSON.stringify(comboYear));
+      // Granularity switching re-renders from the loaded view —
+      // count /costs requests to prove nothing is refetched.
+      await page.evaluate(() => {
+        window.__costsFetches = 0;
+        const orig = window.fetch;
+        window.fetch = (...args) => {
+          if (String(args[0]).includes('/costs')) window.__costsFetches++;
+          return orig(...args);
+        };
+      });
+      await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="month"]').click());
+      await wait(600);
+      const comboMonth = await page.evaluate(() => {
+        const c = window.__fmCharts.costsCombo;
+        const totals = c.data.datasets.find((d) => d.label === 'Total');
+        return { n: c.data.labels.length, first: c.data.labels[0], totals: totals.data, fetches: window.__costsFetches };
+      });
+      check('By month: 24 run-rate months whose 2025 twelve sum back to the year total, with no refetch',
+        !!comboMonth && comboMonth.n === 24 && comboMonth.first === '2025-01'
+          && Math.abs(comboMonth.totals.slice(0, 12).reduce((a, b) => a + b, 0) - 5580) < 0.05
+          && comboMonth.fetches === 0,
+        JSON.stringify(comboMonth));
+      await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="year"]').click());
+      await wait(400);
+
+      // Add a monthly-basis row through the inline table.
+      await page.evaluate(() => document.querySelector('#addCostRowBtn').click());
+      await wait(300);
+      await page.evaluate(() => {
+        const row = document.querySelector('#costsRows tr.cost-editing');
+        row.querySelector('[name=year]').value = '2026';
+        row.querySelector('[name=category]').value = 'Electricity';
+        const basis = row.querySelector('[name=basis]');
+        basis.value = 'monthly';
+        basis.dispatchEvent(new Event('change', { bubbles: true }));
+        const amt = row.querySelector('[name=amount]');
+        amt.value = '85';
+        amt.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const costHint = await page.evaluate(() => document.querySelector('#costsRows tr.cost-editing .cost-year-hint').textContent);
+      check('a monthly row previews its annualized figure while editing (= $1,020 / yr)',
+        costHint.includes('1,020'), costHint);
+      await page.evaluate(() => document.querySelector('#costsRows tr.cost-editing [data-cost-save]').click());
+      check('the monthly row saves annualized with its avg annotation; the 2026 subtotal follows',
+        await until(() => {
+          const t = document.querySelector('#costsRows').textContent;
+          const sub = [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
+            .map((x) => x.textContent).find((x) => x.includes('2026 total'));
+          return t.includes('avg $85.00/mo') && !!sub && sub.includes('6,420');
+        }));
+      // A custom category through the Other… option.
+      await page.evaluate(() => document.querySelector('#addCostRowBtn').click());
+      await wait(300);
+      await page.evaluate(() => {
+        const row = document.querySelector('#costsRows tr.cost-editing');
+        row.querySelector('[name=year]').value = '2026';
+        const sel = row.querySelector('[name=category]');
+        sel.value = '__custom__';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        row.querySelector('[name=category_custom]').value = 'Gardening';
+        const amt = row.querySelector('[name=amount]');
+        amt.value = '300';
+        amt.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector('#costsRows tr.cost-editing [data-cost-save]').click());
+      check('Other… turns the type into a free-form name, stored as its own category',
+        await untilNode(async () => {
+          const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
+          return v.entries.some((e) => e.category === 'Gardening' && e.amount === 300);
+        }));
+      // Edit the water row in place: 480 -> 500.
+      const waterEntry = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
+        .find((e) => e.category === 'Water');
+      await page.evaluate((id) => document.querySelector(`[data-cost-edit="${id}"]`).click(), waterEntry.id);
+      await wait(300);
+      await page.evaluate(() => {
+        const row = document.querySelector('#costsRows tr.cost-editing');
+        const amt = row.querySelector('[name=amount]');
+        amt.value = '500';
+        amt.dispatchEvent(new Event('input', { bubbles: true }));
+        row.querySelector('[data-cost-save]').click();
+      });
+      check('editing a row in place updates the figure and the year subtotal (2025 -> 5,600)',
+        await until(() => [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
+          .some((x) => x.textContent.includes('2025 total') && x.textContent.includes('5,600'))));
+      // Delete the gardening row (the page-wide dialog handler
+      // registered earlier accepts the confirm).
+      const gardenEntry = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
+        .find((e) => e.category === 'Gardening');
+      await page.evaluate((id) => document.querySelector(`[data-cost-del="${id}"]`).click(), gardenEntry.id);
+      check('deleting a row removes it and the totals drop back',
+        await untilNode(async () => {
+          const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
+          return !v.entries.some((e) => e.category === 'Gardening') && v.latest.total === 6420;
+        }));
+
+      // ---- The AI costs chat through the UI: two rounds, then
+      // Apply. Round 1 asks about the year with a partial
+      // monthly proposal; round 2 completes it — including a
+      // Property tax entry that conflicts with the recorded one
+      // and must start unchecked.
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'Which year is the strata bill for? The bill shows $312/mo.',
+        proposed: [{ year: 2026, category: 'Strata fee', amount: 312, basis: 'monthly' }],
+        ready: false,
+      }));
+      await page.evaluate(() => document.querySelector('[data-costs-ai-toggle]').click());
+      await wait(400);
+      await page.evaluate(() => {
+        document.querySelector('[data-costs-chat-text]').value = 'strata bill attached';
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('chat round 1: the question lands in the log and the partial proposal renders',
+        await until(() => {
+          const log = document.querySelector('[data-costs-chat-log]');
+          const rows = document.querySelectorAll('[data-proposed-row]');
+          return log.textContent.includes('Which year is the strata bill for')
+            && rows.length === 1 && rows[0].querySelector('[data-p-basis]').value === 'monthly'
+            && rows[0].querySelector('.p-annual').textContent.includes('3,744');
+        }));
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'All set for 2026.',
+        proposed: [
+          { year: 2026, category: 'Strata fee', amount: 312, basis: 'monthly' },
+          { year: 2026, category: 'Property tax', amount: 5400, basis: 'annual' },
+        ],
+        ready: true,
+      }));
+      await page.evaluate(() => {
+        document.querySelector('[data-costs-chat-text]').value = '2026';
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('chat round 2: the completed proposal renders; the conflicting entry starts unchecked',
+        await until(() => {
+          const rows = document.querySelectorAll('[data-proposed-row]');
+          if (rows.length !== 2) return false;
+          const conflict = [...rows].find((x) => x.classList.contains('conflict'));
+          const clean = [...rows].find((x) => !x.classList.contains('conflict'));
+          return !!conflict && !!clean
+            && conflict.querySelector('[data-p-category]').value === 'Property tax'
+            && conflict.querySelector('[data-p-check]').checked === false
+            && clean.querySelector('[data-p-check]').checked === true;
+        }));
+      await page.evaluate(() => document.querySelector('[data-costs-apply]').click());
+      check('Apply lands only the checked entries, with source ai; the conflict stays manual',
+        await untilNode(async () => {
+          const v = (await req('GET', `/api/properties/${costUiPid}/costs`)).data;
+          const strata = v.entries.find((e) => e.category === 'Strata fee');
+          const tax = v.entries.find((e) => e.category === 'Property tax' && e.year === 2026);
+          return !!strata && strata.source === 'ai' && strata.basis === 'monthly' && strata.amount === 312
+            && !!tax && tax.source === 'manual' && tax.amount === 5400;
+        }));
+      check('after Apply the table shows the AI row and the 2026 subtotal is 10,164',
+        await until(() => [...document.querySelectorAll('#costsRows tr.cost-subtotal')]
+          .some((x) => x.textContent.includes('2026 total') && x.textContent.includes('10,164'))));
+      await req('DELETE', `/api/properties/${costUiPid}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));
     }
     } finally {
       await browser.close();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Property costs with NO LLM configured: the panel still works
+  // (table renders, entries save) and the AI chat shows the setup
+  // guidance with Send disabled. A third server, no LLM env.
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('costs no-LLM browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-e2e-costs-nollm-'));
+    const port3 = PORT + 702;
+    const server3 = spawn('node', ['src/server.js'], {
+      cwd: path.resolve(import.meta.dirname, '..'),
+      env: { PATH: process.env.PATH, DATA_DIR: dir3, PORT: String(port3) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const browser3 = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      let cookie3 = '';
+      for (let i = 0; i < 50 && !cookie3; i++) {
+        try {
+          const login = await fetch(`http://127.0.0.1:${port3}/api/login`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'admin', password: 'admin' }),
+          });
+          if (login.ok) cookie3 = (login.headers.get('set-cookie') || '').split(';')[0];
+        } catch { /* not up yet */ }
+        if (!cookie3) await new Promise((res3) => setTimeout(res3, 200));
+      }
+      const req3 = async (method, urlPath, body) => {
+        const resp = await fetch(`http://127.0.0.1:${port3}${urlPath}`, {
+          method,
+          headers: { 'Content-Type': 'application/json', Cookie: cookie3 },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        return { status: resp.status, data: await resp.json().catch(() => null) };
+      };
+      const prop3 = await req3('POST', '/api/properties', { address: '5 No LLM Lane, Victoria, BC', purchase_date: '2024-01-01' });
+      const pid3 = prop3.data.id;
+      await req3('POST', `/api/properties/${pid3}/costs`, { year: 2026, category: 'Property tax', amount: 4200 });
+      const chat503b = await req3('POST', '/api/ai/fill-chat', { propertyId: pid3, text: 'x' });
+      check('fill-chat 503 names the missing LLM setup',
+        chat503b.status === 503 && String(chat503b.data.error || '').includes('LLM_BASE_URL'),
+        JSON.stringify(chat503b).slice(0, 200));
+      const forward3 = (rq) => new Promise((resolve, reject) => {
+        const rr = http.request(
+          { host: '127.0.0.1', port: port3, path: rq.url, method: rq.method, headers: rq.headers },
+          (resp) => {
+            const chunks = [];
+            resp.on('data', (c) => chunks.push(c));
+            resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+          }
+        );
+        rr.on('error', reject);
+        if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+        rr.end();
+      });
+      const page3 = await browser3.newPage();
+      const client3 = await page3.target().createCDPSession();
+      await client3.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client3.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client3.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forward3({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client3.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client3.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client3.send('Network.setCookie', {
+        name: 'ff_session', value: cookie3.split('=')[1], domain: 'ff.local', path: '/', httpOnly: true,
+      });
+      const wait3 = (ms) => new Promise((res3) => setTimeout(res3, ms));
+      const until3 = async (fn, tries = 40) => {
+        for (let i = 0; i < tries; i++) {
+          try { const v = await page3.evaluate(fn); if (v) return v; } catch {}
+          await wait3(250);
+        }
+        return null;
+      };
+      await page3.goto(`http://ff.local/#property/${pid3}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      check('without an LLM the costs panel still renders its entries',
+        !!(await until3(() => {
+          const rows = document.querySelectorAll('#costsRows tr[data-cost-row]');
+          return rows.length === 1 && document.querySelector('#costsRows').textContent.includes('4,200');
+        })));
+      await page3.evaluate(() => document.querySelector('[data-costs-ai-toggle]').click());
+      await wait3(500);
+      const guidance3 = await page3.evaluate(() => {
+        const g = document.querySelector('[data-costs-ai-guidance]');
+        const send = document.querySelector('[data-costs-chat-send]');
+        return { hidden: g.classList.contains('hidden'), text: g.textContent, sendDisabled: send.disabled };
+      });
+      check('the AI chat shows the setup guidance and Send stays disabled',
+        guidance3.hidden === false && guidance3.text.includes('LLM_BASE_URL') && guidance3.sendDisabled === true,
+        JSON.stringify(guidance3));
+      // The rest of the panel is unaffected: an entry still saves.
+      await page3.evaluate(() => document.querySelector('#addCostRowBtn').click());
+      await wait3(300);
+      await page3.evaluate(() => {
+        const row = document.querySelector('#costsRows tr.cost-editing');
+        row.querySelector('[name=year]').value = '2026';
+        row.querySelector('[name=category]').value = 'Water';
+        const amt = row.querySelector('[name=amount]');
+        amt.value = '480';
+        amt.dispatchEvent(new Event('input', { bubbles: true }));
+        row.querySelector('[data-cost-save]').click();
+      });
+      check('entries still save with no LLM configured',
+        !!(await until3(() => document.querySelector('#costsRows').textContent.includes('Water'))));
+    } catch (err) {
+      check('costs no-LLM browser flow runs to completion', false, String((err && err.message) || err));
+    } finally {
+      await browser3.close();
+      server3.kill();
+      fs.rmSync(dir3, { recursive: true, force: true });
     }
   }
 

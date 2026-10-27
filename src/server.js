@@ -15,7 +15,8 @@ import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
-import { handleAiFill, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
+import { handleAiFill, handleAiFillChat, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
+import { costsView, listCosts, validCostInput, upsertCost } from './costs.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -200,6 +201,25 @@ app.post('/api/ai/fill', requireApiAuth, async (req, res) => {
   // A fill that names a model and succeeds makes it the app
   // default for the next fill (the user's persisted choice).
   if (status === 200 && req.body && req.body.model) setAiFillModel(String(req.body.model).trim());
+  res.status(status).json(body);
+});
+
+// The Property costs panel's AI chat: a multi-turn conversation
+// (see aiFill.js). The chat extracts and proposes; it writes
+// nothing — the panel applies the confirmed proposal through the
+// costs POST with source 'ai'. The property and its recorded
+// costs ride along as context so the model can ask instead of
+// guess (and never re-proposes what is already on record).
+app.post('/api/ai/fill-chat', requireApiAuth, async (req, res) => {
+  const b = req.body || {};
+  const pid = Number(b.propertyId);
+  const property = Number.isInteger(pid) && pid > 0 ? getProperty(pid) : null;
+  const { status, body } = await handleAiFillChat(b, {
+    model: getAiFillModel(),
+    property: property ? { id: property.id, address: property.address } : null,
+    existing: property ? listCosts(db, property.id) : [],
+  });
+  if (status === 200 && b.model) setAiFillModel(String(b.model).trim());
   res.status(status).json(body);
 });
 
@@ -1381,6 +1401,63 @@ app.delete('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, r
   const info = db.prepare('DELETE FROM value_history WHERE id = ? AND property_id = ?').run(req.params.pointId, req.params.id);
   if (!info.changes) return res.status(404).json({ error: 'history point not found' });
   res.json(historyView(req.params.id));
+});
+
+// -------------------------------------------------------- property costs ---
+// A property's yearly running costs (src/costs.js): one row per
+// (year, category), the amount stored in its recorded basis
+// ('annual' = the year's total; 'monthly' = a monthly average).
+// The view pivots by year at the ANNUAL figure — totals and the
+// chart never mix bases. Manual entries and AI-applied entries
+// land through the same POST; the body names its source.
+app.get('/api/properties/:id/costs', requireApiAuth, (req, res) => {
+  if (!getProperty(req.params.id)) return res.status(404).json({ error: 'property not found' });
+  res.json(costsView(db, req.params.id));
+});
+
+app.post('/api/properties/:id/costs', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const v = validCostInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  upsertCost(db, p.id, v, (req.body || {}).source === 'ai' ? 'ai' : 'manual', nowIso());
+  res.status(201).json(costsView(db, p.id));
+});
+
+app.put('/api/properties/:id/costs/:costId', requireApiAuth, (req, res) => {
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const row = db.prepare('SELECT * FROM property_costs WHERE id = ? AND property_id = ?').get(req.params.costId, p.id);
+  if (!row) return res.status(404).json({ error: 'cost entry not found' });
+  const b = req.body || {};
+  const v = validCostInput({
+    year: b.year !== undefined ? b.year : row.year,
+    category: b.category !== undefined ? b.category : row.category,
+    amount: b.amount !== undefined ? b.amount : row.amount,
+    basis: b.basis !== undefined ? b.basis : row.basis,
+    notes: b.notes !== undefined ? b.notes : row.notes,
+  });
+  if (v.error) return res.status(400).json({ error: v.error });
+  // A hand edit makes the row manual again (the value-history
+  // rule); re-saving the identical figures keeps its source.
+  const changed = v.year !== row.year || v.category !== row.category
+    || v.amount !== row.amount || v.basis !== row.basis || v.notes !== row.notes;
+  try {
+    db.prepare('UPDATE property_costs SET year=?, category=?, amount=?, basis=?, notes=?, source=?, updated_at=? WHERE id=?')
+      .run(v.year, v.category, v.amount, v.basis, v.notes, changed ? 'manual' : row.source, nowIso(), row.id);
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) {
+      return res.status(400).json({ error: `a ${v.category} entry for ${v.year} already exists` });
+    }
+    throw e;
+  }
+  res.json(costsView(db, p.id));
+});
+
+app.delete('/api/properties/:id/costs/:costId', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM property_costs WHERE id = ? AND property_id = ?').run(req.params.costId, req.params.id);
+  if (!info.changes) return res.status(404).json({ error: 'cost entry not found' });
+  res.json(costsView(db, req.params.id));
 });
 
 // ---------------------------------------------------------- rate segments ---

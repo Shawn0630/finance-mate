@@ -455,6 +455,7 @@ async function loadAssetDetail(id) { return withLoading(() => loadAssetDetailImp
 async function loadAdmin() { return withLoading(() => loadAdminImpl()); }
 async function loadChart(id) { return withLoading(() => loadChartImpl(id)); }
 async function loadTrend(id) { return withLoading(() => loadTrendImpl(id)); }
+async function loadCosts(id) { return withLoading(() => loadCostsImpl(id)); }
 async function loadEquity(id) { return withLoading(() => loadEquityImpl(id)); }
 
 function markAssetsDirty() { assetsLoaded = false; }
@@ -1816,6 +1817,7 @@ async function loadPropertyDetailImpl(id) {
   loadChart(id);
   loadTrend(id);
   loadEquity(id);
+  loadCosts(id);
 }
 
 // How a segment's rate reads in the list: absolute segments show
@@ -3132,6 +3134,606 @@ $('#trendForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg($('#trendMsg'), 'err', err.message); }
 });
 $('#trendCancelBtn').addEventListener('click', resetTrendForm);
+
+// ------------------------------------------------------- property costs ---
+// A property's yearly running costs (property tax, strata,
+// utilities…). The panel's ONE input surface is the entries
+// table: rows edit in place (Save / Cancel on the dirty row),
+// "+ Add row" appends a blank one, every row deletes — there is
+// no separate add form and no pivot matrix. Amounts are stored
+// in their recorded basis: 'annual' = the year's total,
+// 'monthly' = a monthly average whose year total is ×12; the
+// year subtotal rows and both charts all work at the ANNUAL
+// figure (monthly rows show it with an "avg $X/mo" annotation,
+// so nobody does the ×12 in their head).
+//
+// The two charts are display only: a per-year share pie (year
+// switchable) and a bar+line combo (category-stacked bars, the
+// total as a line) with a By year / By month granularity toggle.
+// By month is a run-rate view: monthly-basis categories land at
+// their average, annual-basis categories spread at annual ÷ 12.
+// A category keeps ONE color across both charts (this panel's
+// own fixed palette — dynamic categories cannot join the fixed
+// chart_colors series system).
+const COST_TYPE_PRESETS = ['Property tax', 'Strata fee', 'Water', 'Electricity', 'Gas', 'Home insurance'];
+const COST_TYPE_CUSTOM = '__custom__';
+const COST_COLORS = {
+  'Property tax': '#1668c4', 'Strata fee': '#7c3aed', Water: '#00838f',
+  Electricity: '#e67e22', Gas: '#c2185b', 'Home insurance': '#2e7d4f', Other: '#607d8b',
+};
+const COST_COLOR_POOL = ['#8d6e00', '#5d4037', '#283593', '#00695c', '#ad1457', '#4527a0', '#558b2f', '#6a1b9a', '#37474f', '#9e9d24'];
+function costColor(category) {
+  if (COST_COLORS[category]) return COST_COLORS[category];
+  let h = 0;
+  for (const c of String(category)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return COST_COLOR_POOL[h % COST_COLOR_POOL.length];
+}
+
+let costsData = null;      // last GET /costs view {entries, categories, years, latest}
+let costsLoadedFor = null; // property id the panel state belongs to
+let costsEditingId = null; // entry id in edit mode; 'new' = an unsaved row; null at rest
+let costsPie = null;
+let costsCombo = null;
+let costsPieYear = null;
+let costsPieCenter = null; // {year, total} the doughnut's center text
+let costsGranularity = 'year';
+
+async function loadCostsImpl(id) {
+  const view = await api(`/api/properties/${id}/costs`);
+  costsData = view;
+  if (costsLoadedFor !== id) {
+    costsLoadedFor = id;
+    costsEditingId = null;
+    costsPieYear = null;
+    resetCostsChat(id);
+  }
+  renderCosts();
+}
+
+function costCustomCategories() {
+  const seen = new Set((costsData ? costsData.entries : []).map((e) => e.category));
+  return [...seen].filter((c) => !COST_TYPE_PRESETS.includes(c)).sort((a, b) => a.localeCompare(b));
+}
+
+function renderCosts() {
+  if (!costsData) return;
+  const latest = costsData.latest;
+  $('#costsLatestTotal').textContent = latest ? `${latest.year} total: ${money2(latest.total)}` : '';
+  // The category datalist (the AI proposal rows' category input):
+  // presets + recorded customs, so a name is never re-invented.
+  $('#costCategoryOptions').innerHTML = [...COST_TYPE_PRESETS, ...costCustomCategories(), 'Other']
+    .map((c) => `<option value="${esc(c)}">`).join('');
+  renderCostsCharts();
+  renderCostsRows();
+  renderCostsProposed();
+}
+
+// ------------------------------------------------------------ costs table
+function costAmountCell(e) {
+  if (e.basis === 'monthly') {
+    return `${money2(Number(e.amount) * 12)}<div class="cost-mo-note">avg ${money2(e.amount)}/mo</div>`;
+  }
+  return money2(e.amount);
+}
+
+function costTypeSelectHtml(selected) {
+  const customs = costCustomCategories();
+  const isPreset = COST_TYPE_PRESETS.includes(selected);
+  const isCustomListed = customs.includes(selected);
+  const opts = [
+    ...COST_TYPE_PRESETS.map((c) => `<option value="${esc(c)}"${c === selected ? ' selected' : ''}>${esc(c)}</option>`),
+    ...customs.map((c) => `<option value="${esc(c)}"${c === selected ? ' selected' : ''}>${esc(c)}</option>`),
+    `<option value="${COST_TYPE_CUSTOM}"${!isPreset && !isCustomListed && selected ? ' selected' : ''}>Other…</option>`,
+  ].join('');
+  const showCustom = !isPreset && !isCustomListed;
+  return `<select name="category">${opts}</select>`
+    + `<input type="text" class="cost-type-custom${showCustom ? '' : ' hidden'}" name="category_custom" placeholder="Category name" value="${showCustom ? esc(selected || '') : ''}">`;
+}
+
+function costEditRowHtml(entry) {
+  const isNew = !entry;
+  const e = entry || { year: (costsData.latest ? costsData.latest.year : new Date().getFullYear()), category: COST_TYPE_PRESETS[0], basis: 'annual', amount: '' };
+  return `<tr class="cost-editing" data-cost-editrow="${isNew ? 'new' : e.id}">
+    <td><input type="number" name="year" step="1" min="1900" max="2100" value="${e.year}"></td>
+    <td>${costTypeSelectHtml(e.category)}</td>
+    <td><select name="basis">
+      <option value="annual"${e.basis === 'annual' ? ' selected' : ''}>Annual</option>
+      <option value="monthly"${e.basis === 'monthly' ? ' selected' : ''}>Monthly avg</option>
+    </select></td>
+    <td class="num"><input type="text" inputmode="decimal" data-money name="amount" value="${e.amount === '' ? '' : esc(formatMoneyInput(e.amount))}"> <span class="cost-year-hint"></span></td>
+    <td style="white-space:nowrap">
+      <button type="button" class="small primary" data-cost-save>Save</button>
+      <button type="button" class="small" data-cost-cancel>Cancel</button>
+    </td></tr>`;
+}
+
+function renderCostsRows() {
+  const tbody = $('#costsRows');
+  if (!costsData) { tbody.innerHTML = ''; return; }
+  const entries = [...costsData.entries].sort((a, b) => b.year - a.year || a.category.localeCompare(b.category));
+  const totalsByYear = new Map(costsData.years.map((y) => [y.year, y.total]));
+  const parts = [];
+  if (costsEditingId === 'new') parts.push(costEditRowHtml(null));
+  let lastYear = null;
+  const flushSubtotal = () => {
+    if (lastYear !== null && totalsByYear.has(lastYear)) {
+      parts.push(`<tr class="cost-subtotal"><td>${lastYear} total</td><td colspan="2"></td><td class="num">${money2(totalsByYear.get(lastYear))}</td><td></td></tr>`);
+    }
+  };
+  for (const e of entries) {
+    if (lastYear !== null && e.year !== lastYear) flushSubtotal();
+    lastYear = e.year;
+    if (costsEditingId === e.id) {
+      parts.push(costEditRowHtml(e));
+    } else {
+      parts.push(`<tr data-cost-row="${e.id}">
+        <td>${e.year}</td>
+        <td>${esc(e.category)}${e.source === 'ai' ? ' <span class="badge">AI</span>' : ''}</td>
+        <td>${e.basis === 'monthly' ? 'Monthly avg' : 'Annual'}</td>
+        <td class="num">${costAmountCell(e)}</td>
+        <td style="white-space:nowrap">
+          <button type="button" class="small" data-cost-edit="${e.id}">Edit</button>
+          <button type="button" class="small danger" data-cost-del="${e.id}">Delete</button>
+        </td></tr>`);
+    }
+  }
+  flushSubtotal();
+  if (!entries.length && costsEditingId !== 'new') {
+    parts.push('<tr><td colspan="5" class="note" style="margin:0">No costs recorded yet.</td></tr>');
+  }
+  tbody.innerHTML = parts.join('');
+  wireCostEditRow();
+}
+
+function wireCostEditRow() {
+  const row = $('#costsRows tr.cost-editing');
+  if (!row) return;
+  const amountInput = row.querySelector('[name=amount]');
+  wireMoneyInput(amountInput);
+  const sel = row.querySelector('[name=category]');
+  const custom = row.querySelector('[name=category_custom]');
+  sel.addEventListener('change', () => {
+    custom.classList.toggle('hidden', sel.value !== COST_TYPE_CUSTOM);
+    if (sel.value === COST_TYPE_CUSTOM) custom.focus();
+  });
+  const hint = row.querySelector('.cost-year-hint');
+  const basisSel = row.querySelector('[name=basis]');
+  const syncHint = () => {
+    const amt = parseMoneyInput(amountInput.value);
+    hint.textContent = basisSel.value === 'monthly' && amt !== '' ? `= ${money2(amt * 12)} / yr` : '';
+  };
+  amountInput.addEventListener('input', syncHint);
+  basisSel.addEventListener('change', syncHint);
+  syncHint();
+}
+
+$('#costsRows').addEventListener('click', async (e) => {
+  const editBtn = e.target.closest('[data-cost-edit]');
+  const delBtn = e.target.closest('[data-cost-del]');
+  const saveBtn = e.target.closest('[data-cost-save]');
+  const cancelBtn = e.target.closest('[data-cost-cancel]');
+  if (editBtn) {
+    costsEditingId = Number(editBtn.dataset.costEdit);
+    renderCostsRows();
+    return;
+  }
+  if (cancelBtn) {
+    costsEditingId = null;
+    renderCostsRows();
+    return;
+  }
+  if (delBtn) {
+    const id = Number(delBtn.dataset.costDel);
+    if (!confirm('Delete this cost entry?')) return;
+    try {
+      await api(`/api/properties/${currentPropertyId}/costs/${id}`, { method: 'DELETE' });
+      if (costsEditingId === id) costsEditingId = null;
+      await loadCosts(currentPropertyId);
+    } catch (err) { showMsg($('#costsMsg'), 'err', err.message); }
+    return;
+  }
+  if (saveBtn) {
+    const row = e.target.closest('tr.cost-editing');
+    if (!row) return;
+    const sel = row.querySelector('[name=category]');
+    const category = sel.value === COST_TYPE_CUSTOM
+      ? row.querySelector('[name=category_custom]').value.trim()
+      : sel.value;
+    const body = {
+      year: Number(row.querySelector('[name=year]').value),
+      category,
+      basis: row.querySelector('[name=basis]').value,
+      amount: parseMoneyInput(row.querySelector('[name=amount]').value),
+    };
+    if (!Number.isInteger(body.year) || !body.category || body.amount === '') {
+      showMsg($('#costsMsg'), 'err', 'Year, type and amount are all required.');
+      return;
+    }
+    try {
+      if (row.dataset.costEditrow === 'new') {
+        await api(`/api/properties/${currentPropertyId}/costs`, { method: 'POST', body });
+      } else {
+        await api(`/api/properties/${currentPropertyId}/costs/${row.dataset.costEditrow}`, { method: 'PUT', body });
+      }
+      costsEditingId = null;
+      $('#costsMsg').textContent = '';
+      $('#costsMsg').className = 'msg';
+      await loadCosts(currentPropertyId);
+    } catch (err) { showMsg($('#costsMsg'), 'err', err.message); }
+  }
+});
+
+$('#addCostRowBtn').addEventListener('click', () => {
+  if (costsEditingId === 'new') return;
+  costsEditingId = 'new';
+  renderCostsRows();
+  const row = $('#costsRows tr.cost-editing');
+  if (row) row.querySelector('[name=year]').focus();
+});
+
+// ----------------------------------------------------------- costs charts
+function destroyCostsCharts() {
+  if (costsPie) { costsPie.destroy(); costsPie = null; }
+  if (costsCombo) { costsCombo.destroy(); costsCombo = null; }
+  window.__fmCharts = window.__fmCharts || {};
+  window.__fmCharts.costsPie = null;
+  window.__fmCharts.costsCombo = null;
+}
+
+// The year's total in the doughnut's hole.
+const costsPieCenterPlugin = {
+  id: 'costsPieCenter',
+  afterDraw(chart) {
+    if (!costsPieCenter || chart !== costsPie) return;
+    const area = chart.chartArea;
+    const x = (area.left + area.right) / 2;
+    const y = (area.top + area.bottom) / 2;
+    const c = chart.ctx;
+    c.save();
+    c.textAlign = 'center';
+    c.fillStyle = '#71808f';
+    c.font = '11px system-ui, sans-serif';
+    c.fillText(String(costsPieCenter.year), x, y - 4);
+    c.fillStyle = '#22303c';
+    c.font = '700 14px system-ui, sans-serif';
+    c.fillText(money2(costsPieCenter.total), x, y + 14);
+    c.restore();
+  },
+};
+
+function renderCostsCharts() {
+  const wrap = $('#costsCharts');
+  const has = costsData && costsData.entries.length > 0;
+  if (!has) { wrap.classList.add('hidden'); destroyCostsCharts(); return; }
+  wrap.classList.remove('hidden');
+  renderCostsPie();
+  renderCostsCombo();
+}
+
+function renderCostsPie() {
+  const yearsDesc = costsData.years;
+  if (!yearsDesc.some((y) => y.year === costsPieYear)) costsPieYear = yearsDesc[0].year;
+  const sel = $('#costsPieYear');
+  sel.innerHTML = yearsDesc.map((y) => `<option value="${y.year}">${y.year}</option>`).join('');
+  sel.value = String(costsPieYear);
+  const yv = yearsDesc.find((y) => y.year === costsPieYear);
+  const cats = costsData.categories.filter((c) => yv.cells[c]);
+  costsPieCenter = { year: yv.year, total: yv.total };
+  if (costsPie) costsPie.destroy();
+  costsPie = new Chart($('#costsPieChart'), {
+    type: 'doughnut',
+    data: {
+      labels: cats,
+      datasets: [{
+        data: cats.map((c) => yv.cells[c].annual),
+        backgroundColor: cats.map((c) => costColor(c)),
+        borderColor: '#fff', borderWidth: 1,
+      }],
+    },
+    plugins: [costsPieCenterPlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '58%',
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            label: (item) => {
+              const total = item.dataset.data.reduce((a, b) => a + b, 0);
+              const pct = total ? ((item.parsed / total) * 100).toFixed(1) : '0.0';
+              return ` ${item.label}: ${money2(item.parsed)} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+  window.__fmCharts = window.__fmCharts || {};
+  window.__fmCharts.costsPie = costsPie;
+}
+
+function renderCostsCombo() {
+  const cats = costsData.categories;
+  const yearsAsc = [...costsData.years].sort((a, b) => a.year - b.year);
+  const cellOf = (year, c) => {
+    const yv = yearsAsc.find((y) => y.year === year);
+    return yv && yv.cells[c] ? yv.cells[c] : null;
+  };
+  let labels;
+  let perCat;
+  let totals;
+  if (costsGranularity === 'month') {
+    // Run-rate months: a monthly-basis category lands at its
+    // average; an annual-basis one spreads at annual ÷ 12. The
+    // twelve months of a recorded year sum back to its total.
+    labels = [];
+    perCat = cats.map(() => []);
+    totals = [];
+    for (const yv of yearsAsc) {
+      for (let m = 1; m <= 12; m++) {
+        labels.push(`${yv.year}-${String(m).padStart(2, '0')}`);
+        let tot = 0;
+        cats.forEach((c, ci) => {
+          const cell = cellOf(yv.year, c);
+          const v = cell ? (cell.basis === 'monthly' ? Number(cell.amount) : cell.annual / 12) : 0;
+          perCat[ci].push(v);
+          tot += v;
+        });
+        totals.push(tot);
+      }
+    }
+  } else {
+    labels = yearsAsc.map((y) => String(y.year));
+    perCat = cats.map((c) => yearsAsc.map((y) => (y.cells[c] ? y.cells[c].annual : 0)));
+    totals = yearsAsc.map((y) => y.total);
+  }
+  if (costsCombo) costsCombo.destroy();
+  costsCombo = new Chart($('#costsComboChart'), {
+    data: {
+      labels,
+      datasets: [
+        ...cats.map((c, ci) => ({
+          type: 'bar', label: c, stack: 'costs', data: perCat[ci],
+          backgroundColor: costColor(c), borderColor: costColor(c), borderWidth: 1, maxBarThickness: 56,
+        })),
+        {
+          type: 'line', label: 'Total', stack: 'total-line', data: totals,
+          borderColor: '#263238', backgroundColor: '#263238', pointRadius: 2, tension: 0,
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { boxWidth: 12 } },
+        tooltip: { callbacks: { label: (item) => ` ${item.dataset.label}: ${money2(item.parsed.y)}` } },
+      },
+      scales: {
+        x: { stacked: true, grid: { display: false } },
+        y: { stacked: true, beginAtZero: true, ticks: { callback: (v) => moneyTick(v) } },
+      },
+    },
+  });
+  window.__fmCharts = window.__fmCharts || {};
+  window.__fmCharts.costsCombo = costsCombo;
+}
+
+$('#costsPieYear').addEventListener('change', (e) => {
+  costsPieYear = Number(e.target.value);
+  renderCostsPie();
+});
+
+$('#costsGranularity').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-gran]');
+  if (!btn || btn.dataset.gran === costsGranularity) return;
+  costsGranularity = btn.dataset.gran;
+  $('#costsGranularity').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+  renderCostsCombo(); // re-render from the loaded view — no refetch
+});
+
+// --------------------------------------------------------- costs AI chat
+// A conversation, not a one-shot fill: the model proposes
+// entries and asks whenever a year / period / category /
+// property is ambiguous; only Apply writes (through the costs
+// POST, source 'ai'). The conversation lives in this page
+// session only — switching properties resets it.
+let costsChatState = { turns: [], proposed: [] };
+let costsChatPropertyId = null;
+
+function resetCostsChat(propertyId) {
+  costsChatState = { turns: [], proposed: [] };
+  costsChatPropertyId = propertyId;
+  const log = document.querySelector('[data-costs-chat-log]');
+  if (log) { log.innerHTML = ''; log.classList.add('hidden'); }
+  const ta = document.querySelector('[data-costs-chat-text]');
+  if (ta) ta.value = '';
+  const msg = document.querySelector('[data-costs-chat-msg]');
+  if (msg) { msg.textContent = ''; msg.className = 'msg'; }
+  const sum = document.querySelector('[data-costs-ai-summary]');
+  if (sum) { sum.textContent = ''; sum.classList.add('hidden'); }
+  renderCostsProposed();
+}
+
+function costsChatLogHtml() {
+  return costsChatState.turns.map((t) => `<div class="costs-chat-turn ${t.role}">
+    <span class="who">${t.role === 'user' ? 'You' : 'AI'}</span>${esc(t.content)}</div>`).join('');
+}
+
+function renderCostsChatLog(pendingText) {
+  const log = document.querySelector('[data-costs-chat-log]');
+  if (!log) return;
+  const has = costsChatState.turns.length > 0 || pendingText;
+  log.classList.toggle('hidden', !has);
+  log.innerHTML = costsChatLogHtml()
+    + (pendingText ? `<div class="costs-chat-turn user pending"><span class="who">You</span>${esc(pendingText)}</div>` : '');
+  log.scrollTop = log.scrollHeight;
+}
+
+function costKeyOf(year, category) { return `${year}|${category}`; }
+
+function renderCostsProposed() {
+  const host = document.querySelector('[data-costs-proposed]');
+  if (!host) return;
+  const proposed = costsChatState.proposed;
+  if (!proposed.length) { host.innerHTML = ''; return; }
+  const existing = new Map((costsData ? costsData.entries : []).map((e) => [costKeyOf(e.year, e.category), e]));
+  const rows = proposed.map((p, i) => {
+    const conflict = existing.has(costKeyOf(p.year, p.category));
+    const annual = p.basis === 'monthly' ? Number(p.amount) * 12 : Number(p.amount);
+    return `<div class="costs-proposed-row${conflict ? ' conflict' : ''}" data-proposed-row="${i}">
+      <input type="checkbox" data-p-check${conflict ? '' : ' checked'}>
+      <input type="number" data-p-year step="1" min="1900" max="2100" value="${p.year}">
+      <input type="text" class="p-cat" data-p-category list="costCategoryOptions" value="${esc(p.category)}">
+      <select data-p-basis>
+        <option value="annual"${p.basis === 'annual' ? ' selected' : ''}>Annual</option>
+        <option value="monthly"${p.basis === 'monthly' ? ' selected' : ''}>Monthly avg</option>
+      </select>
+      <input type="text" inputmode="decimal" data-money data-p-amount value="${esc(formatMoneyInput(p.amount))}">
+      <span class="p-annual">${p.basis === 'monthly' ? `= ${money2(annual)} / yr` : ''}</span>
+      <input type="text" class="p-notes" data-p-notes placeholder="Notes" value="${esc(p.notes || '')}">
+      ${conflict ? '<span class="conflict-tag">Already recorded — overwrites if checked</span>' : ''}
+      <button type="button" class="small danger" data-p-remove title="Remove">×</button>
+    </div>`;
+  }).join('');
+  host.innerHTML = `<div class="costs-proposed"><h5>Proposed entries — review, then Apply</h5>${rows}
+    <div class="toolbar" style="margin-top:6px">
+      <button type="button" class="primary small" data-costs-apply>Apply selected</button>
+      <button type="button" class="small" data-costs-discard>Discard</button>
+    </div></div>`;
+  host.querySelectorAll('[data-p-amount]').forEach((inp) => {
+    wireMoneyInput(inp);
+    const row = inp.closest('[data-proposed-row]');
+    const sync = () => {
+      const amt = parseMoneyInput(inp.value);
+      const basis = row.querySelector('[data-p-basis]').value;
+      row.querySelector('.p-annual').textContent = basis === 'monthly' && amt !== '' ? `= ${money2(amt * 12)} / yr` : '';
+    };
+    inp.addEventListener('input', sync);
+    row.querySelector('[data-p-basis]').addEventListener('change', sync);
+  });
+}
+
+// Read the proposed rows back out of their (editable) inputs.
+function readCostsProposed() {
+  const host = document.querySelector('[data-costs-proposed]');
+  if (!host) return [];
+  return [...host.querySelectorAll('[data-proposed-row]')].map((row) => ({
+    checked: row.querySelector('[data-p-check]').checked,
+    year: Number(row.querySelector('[data-p-year]').value),
+    category: row.querySelector('[data-p-category]').value.trim(),
+    basis: row.querySelector('[data-p-basis]').value,
+    amount: parseMoneyInput(row.querySelector('[data-p-amount]').value),
+    notes: row.querySelector('[data-p-notes]').value.trim() || null,
+  }));
+}
+
+document.querySelector('[data-costs-proposed]').addEventListener('click', async (e) => {
+  if (e.target.closest('[data-p-remove]')) {
+    const row = e.target.closest('[data-proposed-row]');
+    costsChatState.proposed = readCostsProposed()
+      .filter((_, i) => i !== Number(row.dataset.proposedRow))
+      .map(({ checked, ...rest }) => rest);
+    renderCostsProposed();
+    return;
+  }
+  if (e.target.closest('[data-costs-discard]')) {
+    costsChatState.proposed = [];
+    renderCostsProposed();
+    return;
+  }
+  if (!e.target.closest('[data-costs-apply]')) return;
+  const msg = document.querySelector('[data-costs-chat-msg]');
+  const rows = readCostsProposed();
+  const chosen = rows.filter((r) => r.checked);
+  if (!chosen.length) { showMsg(msg, 'err', 'Nothing is selected to apply.'); return; }
+  for (const r of chosen) {
+    if (!Number.isInteger(r.year) || !r.category || r.amount === '') {
+      showMsg(msg, 'err', 'A selected entry is missing its year, type or amount.');
+      return;
+    }
+  }
+  const applyBtn = e.target.closest('[data-costs-apply]');
+  applyBtn.disabled = true;
+  try {
+    for (const r of chosen) {
+      const { checked, ...entry } = r;
+      await api(`/api/properties/${currentPropertyId}/costs`, { method: 'POST', body: { ...entry, source: 'ai' } });
+    }
+    costsChatState.proposed = rows.filter((r) => !r.checked).map(({ checked, ...rest }) => rest);
+    costsChatState.turns.push({ role: 'assistant', content: `Applied ${chosen.length} ${chosen.length === 1 ? 'entry' : 'entries'}.` });
+    renderCostsChatLog();
+    const sum = document.querySelector('[data-costs-ai-summary]');
+    sum.textContent = `Applied ${chosen.length} ${chosen.length === 1 ? 'entry' : 'entries'}`;
+    sum.classList.remove('hidden');
+    await loadCosts(currentPropertyId);
+  } catch (err) {
+    showMsg(msg, 'err', err.message);
+  } finally {
+    applyBtn.disabled = false;
+  }
+});
+
+{
+  const wrap = $('#costsAiFill');
+  const panel = wrap.querySelector('[data-costs-ai-panel]');
+  const toggle = wrap.querySelector('[data-costs-ai-toggle]');
+  const sendBtn = wrap.querySelector('[data-costs-chat-send]');
+  const modelSel = wrap.querySelector('[data-costs-chat-model]');
+  const guidance = wrap.querySelector('[data-costs-ai-guidance]');
+  const msg = wrap.querySelector('[data-costs-chat-msg]');
+  loadAiConfig().then((cfg) => {
+    const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
+    modelSel.innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    if (cfg.model) modelSel.value = cfg.model;
+    if (!cfg.configured) {
+      guidance.textContent = 'AI is not configured on the server. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.';
+      guidance.classList.remove('hidden');
+      sendBtn.disabled = true;
+    }
+  });
+  toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
+  sendBtn.addEventListener('click', async () => {
+    const ta = wrap.querySelector('[data-costs-chat-text]');
+    const fileInput = wrap.querySelector('[data-costs-chat-files]');
+    const text = ta.value.trim();
+    const files = fileInput.files ? [...fileInput.files] : [];
+    if (!text && !files.length) { showMsg(msg, 'err', 'Write a message or attach a document first.'); return; }
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Sending…';
+    renderCostsChatLog(text || '(attached documents)');
+    try {
+      const body = {
+        propertyId: currentPropertyId,
+        history: costsChatState.turns,
+        proposed: readCostsProposed().map(({ checked, ...rest }) => rest),
+      };
+      if (modelSel.value) body.model = modelSel.value;
+      if (text) body.text = text;
+      if (files.length) {
+        body.files = await Promise.all(files.map((f) => new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve({ name: f.name, type: f.type, data: String(reader.result).split(',')[1] || '' });
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        })));
+      }
+      const r = await api('/api/ai/fill-chat', { method: 'POST', body });
+      if (body.model && aiConfigCache) aiConfigCache.model = body.model;
+      costsChatState.turns.push({ role: 'user', content: text || '(attached documents)' });
+      if (r.reply) costsChatState.turns.push({ role: 'assistant', content: r.reply });
+      costsChatState.proposed = r.proposed || [];
+      ta.value = '';
+      fileInput.value = '';
+      renderCostsChatLog();
+      renderCostsProposed();
+    } catch (err) {
+      renderCostsChatLog();
+      showMsg(msg, 'err', err.message);
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+    }
+  });
+}
 
 // ------------------------------------------------------------------ charts --
 // ONE merged chart on the detail page: assessed value (yearly history

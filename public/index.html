@@ -211,6 +211,66 @@
         <tfoot><tr id="scheduleTotalRow" class="hidden"></tr></tfoot>
       </table>
     </div>
+
+    <!-- Property costs: the property's yearly running costs
+         (tax, strata, utilities…). ONE inline-editable table is
+         the input surface — rows edit in place, "+ Add row" adds
+         a blank one; the stacked chart below it is display only.
+         Amounts are stored in their recorded basis (annual total
+         or monthly average); totals and the chart annualize. -->
+    <div class="panel" id="costsPanel">
+      <div class="panel-head">
+        <h3>Property costs</h3>
+        <div class="spacer"></div>
+        <span class="note" id="costsLatestTotal" style="margin:0"></span>
+      </div>
+      <div class="costs-charts hidden" id="costsCharts">
+        <div class="costs-pie-box">
+          <div class="costs-chart-head">
+            <span class="costs-chart-title">Spending by year</span>
+            <select id="costsPieYear" aria-label="Pie chart year"></select>
+          </div>
+          <div class="chart-wrap costs-pie"><canvas id="costsPieChart"></canvas></div>
+        </div>
+        <div class="costs-combo-box">
+          <div class="costs-chart-head">
+            <span class="costs-chart-title">Costs over time</span>
+            <div class="toolbar range-btns" id="costsGranularity" style="margin:0">
+              <button type="button" data-gran="year" class="active">By year</button>
+              <button type="button" data-gran="month">By month</button>
+            </div>
+          </div>
+          <div class="chart-wrap costs-combo"><canvas id="costsComboChart"></canvas></div>
+        </div>
+      </div>
+      <table id="costsTable">
+        <thead><tr><th>Year</th><th>Type</th><th>Basis</th><th class="num">Amount</th><th></th></tr></thead>
+        <tbody id="costsRows"></tbody>
+      </table>
+      <div class="toolbar" style="margin-top:8px">
+        <button type="button" class="small" id="addCostRowBtn">+ Add row</button>
+      </div>
+      <div class="msg" id="costsMsg"></div>
+      <datalist id="costCategoryOptions"></datalist>
+      <div class="ai-fill" id="costsAiFill">
+        <div class="ai-fill-bar">
+          <button type="button" class="small" data-costs-ai-toggle>✨ Fill with AI</button>
+          <span class="note hidden" data-costs-ai-summary style="margin:0"></span>
+        </div>
+        <div class="ai-panel hidden" data-costs-ai-panel>
+          <div class="note hidden" data-costs-ai-guidance style="margin:0 0 8px"></div>
+          <div class="costs-chat-log hidden" data-costs-chat-log></div>
+          <textarea rows="3" data-costs-chat-text placeholder="Paste a bill or a few months of one, or answer the AI's question…"></textarea>
+          <div class="ai-panel-row">
+            <input type="file" accept="image/*,application/pdf" multiple data-costs-chat-files>
+            <select data-costs-chat-model title="Model" style="width:auto;flex:0 1 auto"></select>
+            <button type="button" class="primary small" data-costs-chat-send>Send</button>
+          </div>
+          <div data-costs-proposed></div>
+          <div class="msg" data-costs-chat-msg></div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <!-- ============================== Admin ============================== -->
