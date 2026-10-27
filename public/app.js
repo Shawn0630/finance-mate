@@ -1858,7 +1858,7 @@ function segFormHtml(t) {
     <div class="grid3">
       <div data-seg-rate><label>Annual rate %</label><input type="number" name="annual_rate" step="0.01" min="0"></div>
       <div data-seg-spread class="hidden"><label>Spread vs prime (%)</label><input type="number" name="spread" step="0.05"><div class="note" data-seg-preview style="margin:2px 0 0"></div><label style="margin-top:6px">Locked on</label><input type="date" name="locked_on"></div>
-      <div><label>Compounding</label><select name="compounding"><option value="semi_annual">Semi-annual</option><option value="monthly">Monthly</option></select></div>
+      <div><label>Compounding</label><select name="compounding"><option value="semi_annual">Semi-annual</option><option value="monthly">Monthly</option></select><label style="margin-top:6px">Accrual</label><select name="accrual"><option value="monthly">Monthly</option><option value="daily">Daily (actual days)</option></select></div>
     </div>
     <div class="toolbar">
       <button class="primary" type="submit" data-seg-submit>Add segment</button>
@@ -1912,6 +1912,7 @@ function enterSegEditMode(form, seg) {
   form.spread.value = seg.spread ?? '';
   form.locked_on.value = seg.locked_on || '';
   form.compounding.value = seg.compounding || 'semi_annual';
+  form.accrual.value = seg.accrual || 'monthly';
   form._aiFilling = false;
   syncSegForm(form);
   const set = aiFlagSet(form);
@@ -2265,7 +2266,7 @@ $('#termsWrap').addEventListener('submit', async (e) => {
       showMsg($('#mortgageMsg'), 'ok', 'Term saved.');
     } else if (form.dataset.segForm) {
       const f = Object.fromEntries(new FormData(form).entries());
-      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm), compounding: f.compounding || 'semi_annual', ai_fields: [...aiFlagSet(form)] };
+      const body = { start_date: f.start_date, rate_type: f.rate_type, term_id: Number(form.dataset.segForm), compounding: f.compounding || 'semi_annual', accrual: f.accrual || 'monthly', ai_fields: [...aiFlagSet(form)] };
       if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
         body.rate_mode = 'prime_spread';
         body.spread = f.spread === '' ? null : Number(f.spread);
@@ -2584,6 +2585,7 @@ function refreshPlanPreview(form) {
       rate_type: f.rate_type,
       term_id: Number(form.dataset.segForm),
       compounding: f.compounding || 'semi_annual',
+      accrual: f.accrual || 'monthly',
       repayment_method: termForm ? termForm.repayment_method.value : 'equal_payment',
       amortization_years: termForm && termForm.amortization_years.value !== ''
         ? Number(termForm.amortization_years.value) : null,

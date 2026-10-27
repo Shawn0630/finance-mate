@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeAtDateResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeAtDateResolver, primeDailyResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -1078,4 +1078,89 @@ test('remainingBalanceAt: the user shape reproduces his Oct 2026 remaining balan
   const sep = remainingBalanceAt(r.series, '2026-09', 1350000, r.payoffMonth);
   const octRow = r.series.find((x) => x.month === '2026-10');
   assert.ok(close(sep.balance - rem.balance, octRow.principal, 0.02));
+});
+
+test('primeDailyResolver: steps land on effective dates (first observation minus 6 days), not observation dates', () => {
+  const primeHistory = [
+    { date: '2024-12-04', rate: 5.95 }, { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-02-05', rate: 5.20 }, { date: '2025-03-19', rate: 4.95 },
+    { date: '2025-09-24', rate: 4.70 }, { date: '2025-11-05', rate: 4.45 },
+  ];
+  const resolve = primeDailyResolver(primeHistory, null);
+  assert.equal(resolve('2024-12-11'), 5.95); // the Dec 11 cut is not effective yet
+  assert.equal(resolve('2024-12-12'), 5.45); // prime moves the day after the announcement
+  assert.equal(resolve('2025-01-29'), 5.45);
+  assert.equal(resolve('2025-01-30'), 5.20);
+  assert.equal(resolve('2025-03-12'), 5.20);
+  assert.equal(resolve('2025-03-13'), 4.95);
+  assert.equal(resolve('2025-09-17'), 4.95);
+  assert.equal(resolve('2025-09-18'), 4.70);
+  assert.equal(resolve('2025-10-29'), 4.70);
+  assert.equal(resolve('2025-10-30'), 4.45);
+  // Before the first step the earliest rate holds; scalar fallback
+  // and the empty case mirror the other resolvers.
+  assert.equal(resolve('2024-01-01'), 5.95);
+  assert.equal(primeDailyResolver(null, 4.95)('2030-01-01'), 4.95);
+  assert.equal(primeDailyResolver([], null), null);
+});
+
+test('daily accrual: the real RBC loan tracks the bank statement balances within $35', () => {
+  // The user's real parameters: $1,350,000 from 2024-12-17,
+  // Prime - 1 monthly-compounded, payment override $7,207.10.
+  // Bank statement balances after the May / September / October
+  // 2026 payments: $1,298,865.69 / $1,285,077.63 / $1,281,514.52.
+  // Monthly accrual misses them by -643.94 / -814.78 / -766.51;
+  // daily accrual (period interest = period-start balance x the
+  // sum of each day's annual rate / 365 over (prevPayDate,
+  // payDate], prime stepping on its effective dates) lands
+  // within $35 on all three — a one-time ~$31 level difference
+  // (settlement-day boundaries around the origination
+  // prepayment), NOT something to chase to zero.
+  const primeHistory = [
+    { date: '2024-12-04', rate: 5.95 }, { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-02-05', rate: 5.20 }, { date: '2025-03-19', rate: 4.95 },
+    { date: '2025-09-24', rate: 4.70 }, { date: '2025-11-05', rate: 4.45 },
+  ];
+  const mk = (accrual) => buildSchedule({
+    balance: 1350000, balanceDate: '2024-12-17', primeHistory,
+    terms: [{ id: 1, start_date: '2024-12-17', amortization_years: 30, payment_override: 7207.10 }],
+    segments: [{ id: 1, start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, compounding: 'monthly', ...(accrual ? { accrual } : {}) }],
+  });
+  const bal = (r, m) => r.series.find((x) => x.month === m).balance;
+  const BANK = { '2026-05': 1298865.69, '2026-09': 1285077.63, '2026-10': 1281514.52 };
+  const daily = mk('daily');
+  for (const m of Object.keys(BANK)) {
+    const residual = bal(daily, m) - BANK[m];
+    assert.ok(Math.abs(residual) <= 35, `${m}: daily residual ${residual} within $35 of the bank`);
+  }
+  assert.equal(bal(daily, '2026-05'), 1298835.02); // -30.67
+  assert.equal(bal(daily, '2026-09'), 1285046.59); // -31.04
+  assert.equal(bal(daily, '2026-10'), 1281483.39); // -31.13
+  // The default (monthly) accrual is untouched to the cent.
+  const monthly = mk('monthly');
+  assert.equal(bal(monthly, '2026-05'), 1298221.75); // -643.94
+  assert.equal(bal(monthly, '2026-09'), 1284262.85); // -814.78
+  assert.equal(bal(monthly, '2026-10'), 1280748.01); // -766.51
+  assert.equal(bal(mk(), '2026-10'), 1280748.01); // omitted field = monthly
+  // Payment derivation never reads the accrual choice: the
+  // locked-on anchors stand with a daily segment too.
+  const locked = buildSchedule({
+    balance: 1450000, balanceDate: '2024-12-17', primeHistory,
+    terms: [{ id: 1, start_date: '2024-12-17', amortization_years: 30 }],
+    segments: [{ id: 1, start_date: '2024-12-17', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1, compounding: 'monthly', accrual: 'daily', locked_on: '2024-12-10' }],
+    lumpSums: [{ id: 1, date: '2024-12-20', amount: 100000 }],
+  });
+  assert.equal(locked.paymentDerived, 7205.89);
+});
+
+test('daily accrual on a fixed segment: the nominal rate over the actual days, no compounding conversion', () => {
+  // $100,000 at 3.65% fixed: a 31-day period accrues exactly
+  // $10/day = $310.00 daily; monthly accrual converts instead
+  // (3.65/12 -> $304.17).
+  const mk = (accrual) => simulate({
+    balance: 100000, balanceDate: '2026-01-15', payment: 2000,
+    segments: [{ start_date: '2026-01-15', rate_type: 'fixed', annual_rate: 3.65, compounding: 'monthly', accrual }],
+  });
+  assert.equal(mk('daily').series[0].interest, 310.00);
+  assert.equal(mk('monthly').series[0].interest, 304.17);
 });

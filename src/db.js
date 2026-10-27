@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS rate_segments (
   rate_mode TEXT,                     -- 'absolute' | 'prime_spread' (variable only)
   spread REAL,                        -- prime_spread only: percentage points vs prime (e.g. -1 = Prime - 1)
   compounding TEXT NOT NULL DEFAULT 'semi_annual',  -- 'semi_annual' | 'monthly': how this segment's nominal rate compounds
+  accrual TEXT NOT NULL DEFAULT 'monthly',  -- 'monthly' | 'daily': interest accrues per period (converted rate) or per actual day
   locked_on TEXT,                     -- 'YYYY-MM-DD' the date this segment's rate was locked (priced) on; only variable prime_spread segments carry one — derivations governed by the segment price prime as of this date; accrual never reads it
   ai_fields TEXT,                     -- JSON array of field names carrying the "filled by AI" flag
   created_at TEXT NOT NULL
@@ -347,6 +348,13 @@ CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date
   // column lands with that default and no projection moves.
   if (segCols.length && !segCols.includes('compounding')) {
     db.exec("ALTER TABLE rate_segments ADD COLUMN compounding TEXT NOT NULL DEFAULT 'semi_annual'");
+  }
+  // Per-segment accrual: every existing segment accrued monthly
+  // (the period's converted rate on the period-start balance);
+  // 'daily' accrues the nominal annual rate day by day over the
+  // period's actual days instead.
+  if (segCols.length && !segCols.includes('accrual')) {
+    db.exec("ALTER TABLE rate_segments ADD COLUMN accrual TEXT NOT NULL DEFAULT 'monthly'");
   }
   // Per-segment pricing lock (locked_on): the date a prime-spread
   // segment's rate was locked on. Existing segments carry no lock —

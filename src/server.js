@@ -433,6 +433,7 @@ function segmentView(seg) {
     ...seg,
     rate_mode: seg.rate_mode || 'absolute',
     compounding: seg.compounding || 'semi_annual',
+    accrual: seg.accrual || 'monthly',
     ai_fields: parseAiFields(seg.ai_fields),
     effective_rate: segmentAnnualRate(seg, prime ? prime.rate : null),
   };
@@ -1375,6 +1376,11 @@ function cleanSegment(b, base) {
     // (the Canadian standard, and every existing segment) or
     // 'monthly' (compounded at the payment frequency).
     compounding: b.compounding !== undefined ? b.compounding : base?.compounding || 'semi_annual',
+    // How the segment's interest accrues: 'monthly' (the period's
+    // converted rate — every existing segment) or 'daily' (the
+    // nominal annual rate summed day by day over the period's
+    // actual days).
+    accrual: b.accrual !== undefined ? b.accrual : base?.accrual || 'monthly',
     // The date this segment's rate was locked (priced) on. Only
     // meaningful for variable prime_spread segments — anything
     // else is forced to null below, since a written-down rate has
@@ -1388,6 +1394,7 @@ function cleanSegment(b, base) {
   if (!['fixed', 'variable'].includes(next.rate_type)) return { error: 'rate_type must be fixed or variable' };
   if (!['absolute', 'prime_spread'].includes(next.rate_mode)) return { error: 'rate_mode must be absolute or prime_spread' };
   if (!['semi_annual', 'monthly'].includes(next.compounding)) return { error: "compounding must be 'semi_annual' or 'monthly'" };
+  if (!['monthly', 'daily'].includes(next.accrual)) return { error: "accrual must be 'monthly' or 'daily'" };
   if (next.locked_on !== null && !isDateStr(next.locked_on)) return { error: 'locked on date must be a valid date (YYYY-MM-DD)' };
   if (next.rate_type === 'fixed') { next.rate_mode = 'absolute'; next.spread = null; next.locked_on = null; }
   if (next.rate_mode === 'prime_spread') {
@@ -1446,8 +1453,8 @@ app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
   }
   const info = db
-    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, locked_on, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.locked_on, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
+    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, accrual, locked_on, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.accrual, s.locked_on, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
   res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
 });
 
@@ -1464,8 +1471,8 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
   }
   const segAi = cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS);
-  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, locked_on=?, ai_fields=? WHERE id=?')
-    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.locked_on, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
+  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, accrual=?, locked_on=?, ai_fields=? WHERE id=?')
+    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.accrual, s.locked_on, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
   res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
 });
 
@@ -1820,7 +1827,7 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
     id: 0, property_id: p.id, term_id: null, created_at: nowIso(),
     start_date: draft.start_date, rate_type: draft.rate_type,
     rate_mode: draft.rate_mode, annual_rate: draft.annual_rate, spread: draft.spread,
-    compounding: draft.compounding, locked_on: draft.locked_on,
+    compounding: draft.compounding, accrual: draft.accrual, locked_on: draft.locked_on,
   });
   segments.sort((a, z) => (a.start_date < z.start_date ? -1 : a.start_date > z.start_date ? 1 : a.id - z.id));
   // The term the draft belongs to (the one named, else the one in

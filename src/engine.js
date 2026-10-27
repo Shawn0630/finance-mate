@@ -199,6 +199,56 @@ export function primeAtDateResolver(primeHistory, primeRate) {
   return null;
 }
 
+// A resolver for the prime rate in effect on a DATE, for DAILY
+// accrual: prime steps on the day it takes EFFECT, not on the day
+// the weekly Valet series posts it. The observations are weekly
+// (Wednesdays) and lag the move: prime changes the day after a
+// Bank of Canada announcement (also a Wednesday), so the first
+// observation carrying the new rate is the NEXT Wednesday's —
+// 7 days after the announcement, 6 after the effective date. A
+// rate change therefore steps on (its first observation's date
+// − 6 days); when two observations sit closer than a week apart
+// that arithmetic would overshoot, so the observation date
+// itself is the step day. On the app's stored history this
+// yields the true effective dates (2024-12-12, 2025-01-30,
+// 2025-03-13, 2025-09-18, 2025-10-30, …). Before the first step,
+// the earliest rate holds; after the last, the latest. Same
+// history / scalar fallback contract as the other resolvers.
+export function primeDailyResolver(primeHistory, primeRate) {
+  const DAY_MS = 86400000;
+  const shiftDate = (dateStr, days) => {
+    const d = new Date(Date.parse(`${dateStr}T00:00:00Z`) + days * DAY_MS);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  };
+  if (Array.isArray(primeHistory)) {
+    const obs = primeHistory
+      .map((o) => ({ date: String(o && o.date), rate: Number(o && o.rate) }))
+      .filter((o) => /^\d{4}-\d{2}-\d{2}/.test(o.date) && isFinite(o.rate))
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    if (obs.length) {
+      const steps = [{ date: obs[0].date, rate: obs[0].rate }];
+      for (let i = 1; i < obs.length; i++) {
+        if (obs[i].rate === obs[i - 1].rate) continue;
+        const gap = Math.round((Date.parse(obs[i].date) - Date.parse(obs[i - 1].date)) / DAY_MS);
+        steps.push({ date: gap >= 7 ? shiftDate(obs[i].date, -6) : obs[i].date, rate: obs[i].rate });
+      }
+      return (dateStr) => {
+        const d = String(dateStr).slice(0, 10);
+        let found = 0;
+        for (let i = 1; i < steps.length; i++) {
+          if (steps[i].date <= d) found = i; else break;
+        }
+        return steps[found].rate;
+      };
+    }
+  }
+  if (primeRate !== null && primeRate !== undefined && isFinite(Number(primeRate))) {
+    const v = Number(primeRate);
+    return () => v;
+  }
+  return null;
+}
+
 // Month keys whose priced prime differs from the previous month's —
 // the prime-CHANGE months. A step's first priced month is the month
 // of the observation that posts the new rate (see the resolver's
@@ -262,7 +312,13 @@ export function derivePayment(balance, annualRatePct, years, compounding) {
 //                 compounding }] sorted by start; a segment's
 //                 compounding ('semi_annual' default, or
 //                 'monthly') converts its rate in every period it
-//                 governs (see the region's periodRate).
+//                 governs (see the region's periodRate). A segment
+//                 with accrual 'daily' instead accrues its nominal
+//                 annual rate day by day over each period's actual
+//                 days ((previous payment date, payment date]),
+//                 prime-spread segments stepping at prime's
+//                 effective dates (primeDailyResolver); payment
+//                 derivation is unaffected by the choice.
 //   paymentDay:   optional 1..31, the day of the month the payment is
 //                 deducted. For monthly / semi-monthly it ANCHORS each
 //                 node's `date`; the interest math never depends on it.
@@ -292,6 +348,7 @@ export function derivePayment(balance, annualRatePct, years, compounding) {
 // month's last period, and date is that last period's date.
 export function simulate({ balance, balanceDate, payment, segments, paymentDay = null, frequency = 'monthly', maxMonths = 600, primeRate = null, primeHistory = null, region = 'CA', principalPerMonth = null }) {
   const primeForMonth = primeHistoryResolver(primeHistory, primeRate);
+  const primeForDay = primeDailyResolver(primeHistory, primeRate);
   const f = FREQUENCIES[frequency] || FREQUENCIES.monthly;
   const freqKey = FREQUENCIES[frequency] ? frequency : 'monthly';
   const perPeriod = periodPaymentFor(payment, freqKey);
@@ -308,6 +365,40 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
   let totalInterest = 0;
   let negativeAmortization = false;
   let row = null;
+  // The previous period's payment date — a daily-accrual period
+  // covers the days (prevDate, dateStr].
+  let prevDate = String(balanceDate).slice(0, 10);
+
+  // One period's interest under DAILY accrual: the period-start
+  // balance times the sum over the period's days (prevDate,
+  // dateStr] of that day's annual rate / 365. A prime-spread
+  // segment prices each day at THAT day's effective prime plus
+  // its spread (primeForDay — steps land on their effective
+  // dates, not the weekly observation dates); absolute and
+  // fixed segments carry their nominal rate every day, with no
+  // compounding conversion on this path.
+  function dailyInterest(seg, fromDate, toDate) {
+    const DAY_MS = 86400000;
+    const t0 = Date.parse(`${fromDate}T00:00:00Z`);
+    const t1 = Date.parse(`${toDate}T00:00:00Z`);
+    if (!(t1 > t0)) return 0;
+    const spreadMode = seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread';
+    if (spreadMode && !primeForDay) throw new Error('a prime-based segment cannot be projected without a prime rate');
+    const nominal = Number(seg.annual_rate) || 0;
+    let sum = 0;
+    for (let t = t0 + DAY_MS; t <= t1; t += DAY_MS) {
+      let rate = nominal;
+      if (spreadMode) {
+        const d = new Date(t);
+        const ds = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+        const prime = primeForDay(ds);
+        if (prime === null || prime === undefined || !isFinite(Number(prime))) throw new Error('a prime-based segment cannot be projected without a prime rate');
+        rate = Math.max(0, round2(Number(prime) + Number(seg.spread || 0)));
+      }
+      sum += rate / 365;
+    }
+    return round2(bal * (sum / 100));
+  }
 
   // Apply one payment period in month `monthKey` ('YYYY-MM') whose
   // display date is `dateStr`, folding it into the monthly output rows.
@@ -316,9 +407,13 @@ export function simulate({ balance, balanceDate, payment, segments, paymentDay =
     const annualRate = segmentRateForMonth(seg, monthKey, primeForMonth);
     if (annualRate === null) throw new Error('a prime-based segment cannot be projected without a prime rate');
     // The period's interest converts under THIS segment's own
-    // compounding convention (semi-annual unless it says monthly).
-    const i = periodicRate(annualRate, f.periodsPerYear, region, seg ? seg.compounding : undefined);
-    const interest = round2(bal * i);
+    // compounding convention (semi-annual unless it says monthly)
+    // — unless the segment accrues daily, in which case the
+    // nominal rate accrues over the period's actual days.
+    const interest = seg && seg.accrual === 'daily'
+      ? dailyInterest(seg, prevDate, dateStr)
+      : round2(bal * periodicRate(annualRate, f.periodsPerYear, region, seg ? seg.compounding : undefined));
+    prevDate = dateStr;
     let principal;
     let paid;
     if (principalMode) {

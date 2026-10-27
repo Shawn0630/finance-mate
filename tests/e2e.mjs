@@ -1484,6 +1484,40 @@ try {
     JSON.stringify({ d: pdIgnored.paymentDerived }));
   await req('DELETE', `/api/properties/${pdPid}`);
 
+  // ---- Segment accrual (API) ----
+  // accrual: 'monthly' (the default — the period's converted
+  // rate; every existing segment) or 'daily' (the nominal annual
+  // rate summed over the period's actual days). Validation and
+  // echo mirror compounding. $100,000 at 3.65% fixed from
+  // 2026-01-15: the first period (Jan 15, Feb 15] is 31 days —
+  // $310.00 daily vs $304.17 monthly-compounded.
+  r = await req('POST', '/api/properties', {
+    address: '14 Accrual Avenue, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-01-15', purchase_date: '2026-01-15', amortization_years: 25,
+  });
+  const acPid = r.data.id;
+  r = await req('POST', `/api/properties/${acPid}/rates`, { start_date: '2026-01-15', rate_type: 'fixed', annual_rate: 3.65, compounding: 'monthly' });
+  check('a segment created without accrual reads monthly', r.status === 201 && r.data.accrual === 'monthly',
+    JSON.stringify(r.data.accrual));
+  const acSegId = r.data.id;
+  r = await req('POST', `/api/properties/${acPid}/rates`, { start_date: '2026-06-15', rate_type: 'fixed', annual_rate: 3.65, accrual: 'weekly' });
+  check('an invalid accrual is a 400', r.status === 400 && String(r.data.error || '').includes('accrual'),
+    JSON.stringify(r.data));
+  r = await req('PUT', `/api/properties/${acPid}/rates/${acSegId}`, { accrual: 'daily' });
+  check('setting accrual=daily succeeds (200) and echoes on the segment',
+    r.status === 200 && r.data.accrual === 'daily', JSON.stringify(r.data.accrual));
+  const acDaily = (await req('GET', `/api/properties/${acPid}/amortization`)).data;
+  check('daily accrual charges the first period at the nominal rate over its 31 days ($310.00)',
+    acDaily.series.length > 0 && acDaily.series[0].interest === 310,
+    JSON.stringify(acDaily.series[0] && acDaily.series[0].interest));
+  r = await req('PUT', `/api/properties/${acPid}/rates/${acSegId}`, { accrual: 'monthly' });
+  const acMonthly = (await req('GET', `/api/properties/${acPid}/amortization`)).data;
+  check('back to monthly accrual the first period converts as before ($304.17), derivation unchanged',
+    r.status === 200 && acMonthly.series[0].interest === 304.17
+      && acMonthly.paymentDerived === acDaily.paymentDerived,
+    JSON.stringify({ i: acMonthly.series[0] && acMonthly.series[0].interest, d: acMonthly.paymentDerived, dd: acDaily.paymentDerived }));
+  await req('DELETE', `/api/properties/${acPid}`);
+
   // ---- AI Fill (API) ----
   // The stubbed model answers with the RBC commitment-letter
   // fields in raw document shapes; the endpoint must normalize
