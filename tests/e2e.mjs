@@ -1720,8 +1720,8 @@ try {
   check('AI fill rejects an unknown context (400)', r.status === 400, JSON.stringify(r.data));
   r = await req('POST', '/api/ai/fill', { context: 'term' });
   check('AI fill requires text or a file (400)', r.status === 400, JSON.stringify(r.data));
-  r = await req('POST', '/api/ai/fill', { context: 'term', file: { name: 'a.txt', type: 'text/plain', data: 'aGk=' } });
-  check('AI fill rejects a non-image/PDF attachment (400)', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/ai/fill', { context: 'term', file: { name: 'a.docx', type: 'application/msword', data: 'aGk=' } });
+  check('AI fill rejects a non-image/PDF/text attachment (400)', r.status === 400, JSON.stringify(r.data));
   fs.writeFileSync(aiStubFile, JSON.stringify({ fields: { lender: 'RBC' } }));
   r = await req('POST', '/api/ai/fill', { context: 'term', text: 'letter' });
   check('the stub file is re-read per call (the next extraction sees the new response)',
@@ -5586,8 +5586,9 @@ try {
         }));
       await req('DELETE', `/api/properties/${aiPid}`);
 
-      // ---- Property costs: one editable table per year, both
-      // charts and the AI chat, driven through the UI ----
+      // ---- Property costs: ONE table for the year the panel
+      // selector is on, both charts and the AI chat, driven
+      // through the UI ----
       // Seeded: 2026 tax 5,400; 2025 tax 5,100 + water 480.
       r = await req('POST', '/api/properties', { address: '88 Costs UI Road, Victoria, BC', purchase_date: '2024-01-01' });
       const costUiPid = r.data.id;
@@ -5596,25 +5597,54 @@ try {
       await req('POST', `/api/properties/${costUiPid}/costs`, { year: 2025, category: 'Water', amount: 480 });
       await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, costUiPid);
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
-      check('the costs panel renders ONE table per year, each with its own footer total',
+      // Helpers for the flows below: put the panel selector on
+      // a year (the table, pie and By month view all follow).
+      const selectCostYear = async (y) => {
+        await page.evaluate((yy) => {
+          const s = document.querySelector('#costsYearSel');
+          s.value = String(yy);
+          s.dispatchEvent(new Event('change', { bubbles: true }));
+        }, y);
+        await wait(350);
+      };
+      check('the costs panel renders ONE table — the selected year (latest by default) with its footer total',
         await until(() => {
           const blocks = [...document.querySelectorAll('#costsYears [data-cost-year-block]')];
-          const foot = (y) => {
-            const b = blocks.find((x) => x.dataset.costYearBlock === String(y));
-            return b && b.querySelector('tfoot') ? b.querySelector('tfoot').textContent : '';
-          };
-          return JSON.stringify(blocks.map((b) => b.dataset.costYearBlock)) === JSON.stringify(['2026', '2025'])
-            && document.querySelectorAll('#costsYears tr[data-cost-row]').length === 3
-            && foot(2026).includes('2026 total') && foot(2026).includes('5,400')
-            && foot(2025).includes('2025 total') && foot(2025).includes('5,580');
+          const sel = document.querySelector('#costsYearSel');
+          const b = blocks[0];
+          return blocks.length === 1 && !!sel && sel.value === '2026' && !!b
+            && b.dataset.costYearBlock === '2026'
+            && b.querySelectorAll('tr[data-cost-row]').length === 1
+            && b.querySelector('tfoot').textContent.includes('2026 total')
+            && b.querySelector('tfoot').textContent.includes('5,400');
         }));
+      check('view mode is a clean read-only table: no row buttons, no "+ Add row", no "+ Add year"',
+        await page.evaluate(() => {
+          return document.querySelector('#addCostYearBtn').classList.contains('hidden')
+            && document.querySelector('#costsEditToggleBtn').textContent === 'Edit'
+            && !document.querySelector('#costsYears [data-cost-add-row]')
+            && !document.querySelector('#costsYears [data-cost-edit]')
+            && !document.querySelector('#costsYears [data-cost-del]');
+        }));
+      await page.evaluate(() => document.querySelector('#costsEditToggleBtn').click());
+      await wait(300);
       const topbarState = await page.evaluate(() => {
-        const a = document.querySelector('#addCostYearBtn').getBoundingClientRect();
-        const b = document.querySelector('[data-costs-ai-toggle]').getBoundingClientRect();
-        return { sameRow: Math.abs(a.top - b.top) < 2, aTop: a.top, bTop: b.top };
+        // Centers, not tops: the <select> is a few px taller
+        // than the buttons, so centered row-mates differ in top.
+        const centers = ['#costsYearSel', '#addCostYearBtn', '[data-costs-ai-toggle]', '#costsEditToggleBtn']
+          .map((s) => { const r = document.querySelector(s).getBoundingClientRect(); return r.top + r.height / 2; });
+        return {
+          sameRow: Math.max(...centers) - Math.min(...centers) < 3,
+          editLabel: document.querySelector('#costsEditToggleBtn').textContent,
+          addYearShown: !document.querySelector('#addCostYearBtn').classList.contains('hidden'),
+          hasAddRow: !!document.querySelector('#costsYears [data-cost-add-row]'),
+          hasRowBtns: !!document.querySelector('#costsYears [data-cost-edit]'),
+        };
       });
-      check('"+ Add year" and "✨ Fill with AI" share ONE row at the panel top',
-        topbarState.sameRow === true, JSON.stringify(topbarState));
+      check('edit mode: the selector, "+ Add year", "✨ Fill with AI" and Done share ONE row; Add row and row buttons appear',
+        topbarState.sameRow === true && topbarState.editLabel === 'Done'
+          && topbarState.addYearShown && topbarState.hasAddRow && topbarState.hasRowBtns,
+        JSON.stringify(topbarState));
       const costsHead = await page.evaluate(() => document.querySelector('#costsLatestTotal').textContent);
       check('the panel head shows the latest year total', costsHead.includes('2026') && costsHead.includes('5,400'), costsHead);
       const pieState = await page.evaluate(() => {
@@ -5624,20 +5654,24 @@ try {
       check('the pie defaults to the latest year, slices = that year’s category totals',
         !!pieState && JSON.stringify(pieState.labels) === JSON.stringify(['Property tax']) && pieState.data[0] === 5400,
         JSON.stringify(pieState));
-      await page.evaluate(() => {
-        const s = document.querySelector('#costsPieYear');
-        s.value = '2025';
-        s.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      await wait(500);
+      await selectCostYear(2025);
       const pie2025 = await page.evaluate(() => {
         const c = window.__fmCharts.costsPie;
         return c ? { labels: c.data.labels, data: c.data.datasets[0].data } : null;
       });
-      check('switching the pie year re-slices to that year (5,100 tax + 480 water)',
+      check('switching the year selector re-slices the pie to that year (5,100 tax + 480 water)',
         !!pie2025 && pie2025.labels.includes('Water')
           && Math.abs(pie2025.data.reduce((a, b) => a + b, 0) - 5580) < 0.001,
         JSON.stringify(pie2025));
+      check('the same switch swaps the entries table to 2025 only (2 rows, footer 5,580)',
+        await page.evaluate(() => {
+          const blocks = [...document.querySelectorAll('#costsYears [data-cost-year-block]')];
+          const b = blocks[0];
+          return blocks.length === 1 && !!b && b.dataset.costYearBlock === '2025'
+            && b.querySelectorAll('tr[data-cost-row]').length === 2
+            && b.querySelector('tfoot').textContent.includes('2025 total')
+            && b.querySelector('tfoot').textContent.includes('5,580');
+        }));
       const colorMatch = await page.evaluate(() => {
         const pie = window.__fmCharts.costsPie;
         const combo = window.__fmCharts.costsCombo;
@@ -5680,9 +5714,9 @@ try {
         const totals = c.data.datasets.find((d) => d.label === 'Total');
         return { n: c.data.labels.length, first: c.data.labels[0], totals: totals.data, fetches: window.__costsFetches };
       });
-      check('By month: 24 run-rate months whose 2025 twelve sum back to the year total, with no refetch',
-        !!comboMonth && comboMonth.n === 24 && comboMonth.first === '2025-01'
-          && Math.abs(comboMonth.totals.slice(0, 12).reduce((a, b) => a + b, 0) - 5580) < 0.05
+      check('By month follows the selected year (2025): its 12 run-rate months sum back to the year total, with no refetch',
+        !!comboMonth && comboMonth.n === 12 && comboMonth.first === '2025-01'
+          && Math.abs(comboMonth.totals.reduce((a, b) => a + b, 0) - 5580) < 0.05
           && comboMonth.fetches === 0,
         JSON.stringify(comboMonth));
       await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="year"]').click());
@@ -5699,10 +5733,13 @@ try {
         return block ? {
           hasYearInput: !!block.querySelector('[data-cost-year-input]'),
           hasEditRow: !!block.querySelector('tr.cost-editing'),
+          selValue: document.querySelector('#costsYearSel').value,
+          blocks: document.querySelectorAll('#costsYears [data-cost-year-block]').length,
         } : null;
       });
-      check('"+ Add year" opens a new year block (2027) with its year editable and a blank row',
-        !!addYearState && addYearState.hasYearInput && addYearState.hasEditRow,
+      check('"+ Add year" opens a new year (2027), selects it, with its year editable and a blank row',
+        !!addYearState && addYearState.hasYearInput && addYearState.hasEditRow
+          && addYearState.selValue === '2027' && addYearState.blocks === 1,
         JSON.stringify(addYearState));
       await page.evaluate(() => {
         const inp = document.querySelector('[data-cost-year-block="2027"] [data-cost-year-input]');
@@ -5730,6 +5767,7 @@ try {
       // A monthly row through the 2026 table's OWN Add row:
       // basis Monthly opens the 12-month grid — fill Jan/Feb/
       // Mar only; the avg is computed, never typed.
+      await selectCostYear(2026);
       await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] [data-cost-add-row]').click());
       await wait(300);
       await page.evaluate(() => {
@@ -5809,6 +5847,7 @@ try {
       // Edit the water row in place: 480 -> 500.
       const waterEntry = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
         .find((e) => e.category === 'Water');
+      await selectCostYear(2025);
       await page.evaluate((id) => document.querySelector(`[data-cost-edit="${id}"]`).click(), waterEntry.id);
       await wait(300);
       await page.evaluate(() => {
@@ -5827,6 +5866,7 @@ try {
       // registered earlier accepts the confirm).
       const gardenEntry = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
         .find((e) => e.category === 'Gardening');
+      await selectCostYear(2026);
       await page.evaluate((id) => document.querySelector(`[data-cost-del="${id}"]`).click(), gardenEntry.id);
       check('deleting a row removes it and the totals drop back',
         await untilNode(async () => {
@@ -5856,6 +5896,16 @@ try {
       await wait(300);
       await page.evaluate(() => document.querySelector('[data-cost-year-block="2026"] tr.cost-editing [data-cost-save]').click());
       await wait(150); // the save is in flight now
+      // Mid-flight the user switches the year selector to 2025
+      // and opens the Water row there — the switch renders the
+      // 2025 table (snapshotting the in-flight row's session),
+      // and the Water edit must still survive the reload.
+      await page.evaluate(() => {
+        const s = document.querySelector('#costsYearSel');
+        s.value = '2025';
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await wait(100);
       await page.evaluate((id) => document.querySelector(`[data-cost-edit="${id}"]`).click(), waterEntry.id);
       await wait(150);
       await page.evaluate(() => {
@@ -5942,11 +5992,167 @@ try {
             && JSON.stringify(strata.monthlyAmounts) === JSON.stringify({ '1': 312, '2': 312, '3': 312 })
             && !!tax && tax.source === 'manual' && tax.amount === 5400;
         }));
+      await selectCostYear(2026);
       check('after Apply the 2026 table shows the AI row and its footer total is 10,164',
         await until(() => {
           const b = document.querySelector('[data-cost-year-block="2026"]');
           return !!b && b.textContent.includes('Strata fee')
             && b.querySelector('tfoot').textContent.includes('10,164');
+        }));
+
+      // Clear session: the conversation empties (turns and any
+      // unapplied proposals), recorded entries are untouched,
+      // the button hides while the session is empty, and a
+      // fresh conversation starts right away.
+      check('Clear session is offered while the chat holds content',
+        await page.evaluate(() => !document.querySelector('[data-costs-chat-clear]').classList.contains('hidden')));
+      await page.evaluate(() => document.querySelector('[data-costs-chat-clear]').click());
+      await wait(300);
+      check('Clear session empties the log and hides itself; the recorded entries stay',
+        await page.evaluate(() => {
+          const log = document.querySelector('[data-costs-chat-log]');
+          const b = document.querySelector('[data-cost-year-block="2026"]');
+          return log.classList.contains('hidden') && log.textContent.trim() === ''
+            && document.querySelectorAll('[data-proposed-row]').length === 0
+            && document.querySelector('[data-costs-chat-clear]').classList.contains('hidden')
+            && !!b && b.textContent.includes('Strata fee');
+        }));
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'Fresh start — what shall I record?',
+        proposed: [],
+        ready: false,
+      }));
+      await page.evaluate(() => {
+        document.querySelector('[data-costs-chat-text]').value = 'hello again';
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('a new conversation starts immediately after clearing',
+        await until(() => document.querySelector('[data-costs-chat-log]').textContent.includes('Fresh start')));
+
+      // The error line reports the LAST action only: an
+      // oversized attachment errors, a later successful round
+      // clears it, and Clear session clears it too. Picked and
+      // pasted files share one chip queue above the textarea.
+      const queueViaInput = (name, type, parts) => page.evaluate((n, t, p) => {
+        const dt = new DataTransfer();
+        dt.items.add(new File(p, n, { type: t }));
+        const input = document.querySelector('[data-costs-chat-files]');
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }, name, type, parts);
+      fs.writeFileSync(aiStubFile, JSON.stringify({ reply: 'Got it.', proposed: [], ready: false }));
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.items.add(new File([new Uint8Array(11 * 1024 * 1024)], 'big.pdf', { type: 'application/pdf' }));
+        const input = document.querySelector('[data-costs-chat-files]');
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await wait(200);
+      check('a picked file lands in the chip queue', await page.evaluate(() => {
+        const q = document.querySelector('[data-costs-chat-queue]');
+        return !q.classList.contains('hidden') && q.textContent.includes('big.pdf');
+      }));
+      await page.evaluate(() => document.querySelector('[data-costs-chat-send]').click());
+      check('an oversized attachment shows the size error',
+        await until(() => document.querySelector('[data-costs-chat-msg]').textContent.includes('too large')));
+      await page.evaluate(() => {
+        document.querySelector('[data-costs-chat-queue-remove]').click();
+        document.querySelector('[data-costs-chat-text]').value = 'hello';
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('a successful round clears the earlier error',
+        await until(() => document.querySelector('[data-costs-chat-log]').textContent.includes('Got it.')
+          && document.querySelector('[data-costs-chat-msg]').textContent.trim() === ''));
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.items.add(new File([new Uint8Array(11 * 1024 * 1024)], 'big.pdf', { type: 'application/pdf' }));
+        const input = document.querySelector('[data-costs-chat-files]');
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('the size error returns on a new oversized send',
+        await until(() => document.querySelector('[data-costs-chat-msg]').textContent.includes('too large')));
+      await page.evaluate(() => document.querySelector('[data-costs-chat-clear]').click());
+      await wait(300);
+      check('Clear session clears the error and the queued file too', await page.evaluate(() => {
+        const q = document.querySelector('[data-costs-chat-queue]');
+        return document.querySelector('[data-costs-chat-msg]').textContent.trim() === ''
+          && q.classList.contains('hidden') && q.textContent.trim() === '';
+      }));
+
+      // CSV: queued like any attachment; the model reads it as
+      // text (receipt is asserted in the unit tests) and its
+      // proposal renders. An over-long text file truncates
+      // server-side and still rounds fine.
+      await queueViaInput('bills.csv', 'text/csv', ['month,amount\n2025-01,80\n2025-02,90\n2025-03,85\n']);
+      await wait(200);
+      check('a CSV lands in the same chip queue', await page.evaluate(() =>
+        document.querySelector('[data-costs-chat-queue]').textContent.includes('bills.csv')));
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'Got the water bills.',
+        proposed: [{ year: 2025, category: 'Water', basis: 'monthly', monthlyAmounts: { 1: 80, 2: 90, 3: 85 } }],
+        ready: true,
+      }));
+      await page.evaluate(() => {
+        document.querySelector('[data-costs-chat-text]').value = 'water bills attached';
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('the CSV round returns its proposal and empties the queue',
+        await until(() => {
+          const row = document.querySelector('[data-proposed-row] [data-p-category]');
+          const q = document.querySelector('[data-costs-chat-queue]');
+          return !!row && row.value === 'Water' && q.classList.contains('hidden');
+        }));
+      await page.evaluate(() => document.querySelector('[data-costs-discard]').click());
+      await wait(200);
+      fs.writeFileSync(aiStubFile, JSON.stringify({ reply: 'Got it.', proposed: [], ready: false }));
+      await queueViaInput('long.txt', 'text/plain', ['x'.repeat(60000)]);
+      await page.evaluate(() => document.querySelector('[data-costs-chat-send]').click());
+      check('an over-long text file truncates without an error',
+        await until(() => document.querySelector('[data-costs-chat-log]').textContent.includes('Got it.')
+          && document.querySelector('[data-costs-chat-msg]').textContent.trim() === ''
+          && document.querySelector('[data-costs-chat-queue]').classList.contains('hidden')));
+
+      // Paste: an image on the clipboard queues as a chip and
+      // sends with the round; a text-only paste is untouched.
+      fs.writeFileSync(aiStubFile, JSON.stringify({ reply: 'Paste received.', proposed: [], ready: false }));
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], 'shot.png', { type: 'image/png' }));
+        document.querySelector('[data-costs-chat-text]')
+          .dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      });
+      await wait(200);
+      check('pasting an image queues it as a chip', await page.evaluate(() =>
+        document.querySelector('[data-costs-chat-queue]').textContent.includes('shot.png')));
+      await page.evaluate(() => {
+        document.querySelector('[data-costs-chat-text]').value = 'see attached';
+        document.querySelector('[data-costs-chat-send]').click();
+      });
+      check('the pasted image sends with the round and the queue empties',
+        await until(() => document.querySelector('[data-costs-chat-log]').textContent.includes('Paste received.')
+          && document.querySelector('[data-costs-chat-queue]').classList.contains('hidden')));
+      check('a text-only paste is not intercepted and queues nothing', await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', 'plain words');
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        const notPrevented = document.querySelector('[data-costs-chat-text]').dispatchEvent(ev);
+        return notPrevented && document.querySelector('[data-costs-chat-queue]').classList.contains('hidden');
+      }));
+
+      // Done: the table returns to its clean read-only view.
+      await page.evaluate(() => document.querySelector('#costsEditToggleBtn').click());
+      await wait(300);
+      check('Done returns the table to a clean read-only view (no row buttons, no Add row, no Add year)',
+        await page.evaluate(() => {
+          return document.querySelector('#costsEditToggleBtn').textContent === 'Edit'
+            && document.querySelector('#addCostYearBtn').classList.contains('hidden')
+            && !document.querySelector('#costsYears [data-cost-add-row]')
+            && !document.querySelector('#costsYears [data-cost-edit]')
+            && !document.querySelector('#costsYears [data-cost-del]')
+            && !!document.querySelector('#costsYears [data-cost-year-block]');
         }));
 
       // ---- Property outline: the floating Docs-style section
@@ -6018,6 +6224,13 @@ try {
           const nav = document.querySelector('#propOutline');
           return nav.classList.contains('awake') && getComputedStyle(nav).visibility === 'visible';
         })));
+      check('awake and unhovered, the outline rests translucent (about 85%) so the page shows through softly',
+        !!(await until(() => {
+          const nav = document.querySelector('#propOutline');
+          if (!nav.classList.contains('awake')) return false;
+          const o = parseFloat(getComputedStyle(nav).opacity);
+          return o > 0.8 && o < 0.9;
+        }, 8)));
       check('the outline fades back out once scrolling has stopped',
         !!(await until(() => {
           const nav = document.querySelector('#propOutline');
@@ -6037,6 +6250,8 @@ try {
           const nav = document.querySelector('#propOutline');
           return nav.classList.contains('awake') && getComputedStyle(nav).visibility === 'visible';
         }));
+      check('hovered, the outline is fully opaque (solid when it is being read)',
+        await page.evaluate(() => getComputedStyle(document.querySelector('#propOutline')).opacity === '1'));
       await page.mouse.move(navBox.x + 420, navBox.y);
       check('moving the pointer away lets it hide again',
         !!(await until(() => !document.querySelector('#propOutline').classList.contains('awake'))));
@@ -6230,7 +6445,9 @@ try {
         guidance3.hidden === false && guidance3.text.includes('LLM_BASE_URL') && guidance3.sendDisabled === true,
         JSON.stringify(guidance3));
       // The rest of the panel is unaffected: an entry still saves
-      // (through the seeded 2026 table's own Add row).
+      // (through the seeded 2026 table's own Add row, in edit mode).
+      await page3.evaluate(() => document.querySelector('#costsEditToggleBtn').click());
+      await wait3(300);
       await page3.evaluate(() => document.querySelector('[data-cost-year-block="2026"] [data-cost-add-row]').click());
       await wait3(300);
       await page3.evaluate(() => {
@@ -6681,9 +6898,11 @@ try {
     body: JSON.stringify({ value: {} }),
   });
 
-  // Chart colors in the browser: recolor the hero chart and the
-  // history chart live, see the colors survive a reload (DB), and
-  // Reset returns to the defaults; the second user sees defaults.
+  // Chart colors in the browser: the legend-opened panel stages
+  // edits — they preview live but only Save stores them (an
+  // unsaved close discards); a saved color survives a reload
+  // (DB), Reset + Save returns to the defaults, and the second
+  // user sees defaults.
   if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
     console.log('chart colors browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
@@ -6763,11 +6982,33 @@ try {
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
       }, panelId, key, hex);
+      // A chart's Colors panel opens from its legend only: a
+      // (synthetic) right click on the series' legend item —
+      // the same contextmenu the app's canvas listener handles.
+      const rightClickLegend = (chartKey, seriesKey) => page.evaluate((ck, sk) => {
+        const c = window.__fmCharts[ck];
+        if (!c || !c.legend) return false;
+        const i = c.legend.legendItems.findIndex((it) => {
+          const ds = c.data.datasets[it.datasetIndex];
+          return ds && ds.key === sk;
+        });
+        if (i < 0) return false;
+        const b = c.legend.legendHitBoxes[i];
+        const r = c.canvas.getBoundingClientRect();
+        const ev = new MouseEvent('contextmenu', {
+          bubbles: true, cancelable: true,
+          clientX: r.left + b.left + b.width / 2, clientY: r.top + b.top + b.height / 2,
+        });
+        c.canvas.dispatchEvent(ev);
+        return ev.defaultPrevented;
+      }, chartKey, seriesKey);
 
       await page.goto(`http://ff.local/#property/${colorPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       check('hero chart starts on the default assessed color',
         await pollEq(() => heroColor('assessed'), '#2e7d4f'));
-      await page.evaluate(() => document.querySelector('[data-colors-toggle="hero"]').click());
+      check('no chart header carries a Colors button anymore (the legend right click is the only way in)',
+        (await page.evaluate(() => document.querySelectorAll('[data-colors-toggle]').length)) === 0);
+      await rightClickLegend('a', 'assessed');
       await wait(300);
       const heroPanel = await page.evaluate(() => {
         const panel = document.querySelector('[data-colors-panel="hero"]');
@@ -6775,15 +7016,20 @@ try {
           shown: !panel.classList.contains('hidden'),
           rows: [...panel.querySelectorAll('[data-color-input]')].map((i) => i.dataset.colorInput),
           hasReset: !!panel.querySelector('[data-colors-reset]'),
+          hasSave: !!panel.querySelector('[data-colors-save]'),
         };
       });
-      check('the hero Colors panel lists one picker per series plus a Reset',
-        heroPanel.shown && heroPanel.hasReset
+      check('the hero Colors panel (opened by right-clicking the legend) lists one picker per series plus Reset and Save',
+        heroPanel.shown && heroPanel.hasReset && heroPanel.hasSave
           && ['assessed', 'outstanding', 'interest', 'principal'].every((k) => heroPanel.rows.includes(k)),
         JSON.stringify(heroPanel));
       await setColor('hero', 'assessed', '#123456');
-      check('recoloring applies to the live chart at once',
+      check('recoloring previews on the live chart at once (staged, not yet saved)',
         (await heroColor('assessed')) === '#123456', await heroColor('assessed'));
+      await page.evaluate(() => document.querySelector('[data-colors-panel="hero"] [data-colors-save]').click());
+      await wait(300);
+      check('Save closes the panel',
+        await page.evaluate(() => document.querySelector('[data-colors-panel="hero"]').classList.contains('hidden')));
       let stored = null;
       for (let i = 0; i < 30; i++) {
         const p = (await req('GET', '/api/preferences')).data.preferences;
@@ -6795,12 +7041,35 @@ try {
       check('after a reload the hero chart still uses the stored color',
         await pollEq(() => heroColor('assessed'), '#123456'));
 
+      // Discard: reopen the panel, change the color, then close
+      // WITHOUT Save (Esc) — the chart falls back to the stored
+      // color and a reopened panel loads that stored color, not
+      // the discarded one.
+      await rightClickLegend('a', 'assessed');
+      await wait(300);
+      await setColor('hero', 'assessed', '#ff0000');
+      check('an unsaved change still previews live',
+        (await heroColor('assessed')) === '#ff0000', await heroColor('assessed'));
+      await page.keyboard.press('Escape');
+      await wait(400);
+      check('closing the panel without Save discards the change (chart back to the stored color, panel hidden)',
+        (await heroColor('assessed')) === '#123456'
+          && await page.evaluate(() => document.querySelector('[data-colors-panel="hero"]').classList.contains('hidden')),
+        await heroColor('assessed'));
+      await rightClickLegend('a', 'assessed');
+      await wait(300);
+      const reopenedInput = await page.evaluate(() =>
+        document.querySelector('[data-colors-panel="hero"] [data-color-input="assessed"]').value);
+      check('a reopened panel loads the stored color, not the discarded one',
+        reopenedInput === '#123456', reopenedInput);
+
       // History chart: Land takes the custom hex (border whole,
-      // fill at the series alpha), and it survives a modal
-      // close / reopen (the chart rebuilds from the preference).
+      // fill at the series alpha); Save stores it, and it
+      // survives a modal close / reopen (the chart rebuilds
+      // from the preference).
       await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
       await wait(600);
-      await page.evaluate(() => document.querySelector('[data-colors-toggle="history"]').click());
+      await rightClickLegend('history', 'land');
       await wait(300);
       await setColor('history', 'land', '#654321');
       const histLand = await page.evaluate(() => {
@@ -6811,6 +7080,8 @@ try {
       check('the history Land series recolors live (border #654321, fill at its alpha)',
         !!histLand && histLand.border === '#654321' && histLand.bg === 'rgba(101, 67, 33, 0.8)',
         JSON.stringify(histLand));
+      await page.evaluate(() => document.querySelector('[data-colors-panel="history"] [data-colors-save]').click());
+      await wait(300);
       await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
       await wait(400);
       await page.evaluate(() => document.querySelector('#openHistoryBtn').click());
@@ -6824,16 +7095,21 @@ try {
       await page.evaluate(() => document.querySelector('#historyModal [data-close-modal]').click());
       await wait(400);
 
-      // Reset: the hero chart returns to defaults and the stored
-      // hero entry is gone.
-      await page.evaluate(() => document.querySelector('[data-colors-toggle="hero"]').click());
+      // Reset: staged like any edit — the live chart previews
+      // the defaults at once, and only Reset + Save removes the
+      // stored hero entry.
+      await rightClickLegend('a', 'assessed');
       await wait(300);
       await page.evaluate(() => document.querySelector('[data-colors-panel="hero"] [data-colors-reset]').click());
+      await wait(400);
+      check('Reset stages the defaults — the live chart previews them before any save',
+        (await heroColor('assessed')) === '#2e7d4f', await heroColor('assessed'));
+      await page.evaluate(() => document.querySelector('[data-colors-panel="hero"] [data-colors-save]').click());
       await wait(600);
-      check('Reset restores the default hero color on the live chart',
+      check('after Reset + Save the live chart is on the default color',
         (await heroColor('assessed')) === '#2e7d4f', await heroColor('assessed'));
       const prefsAfterReset = (await req('GET', '/api/preferences')).data.preferences;
-      check('Reset removes the chart\u2019s stored colors',
+      check('Reset + Save removes the chart\u2019s stored colors',
         !!prefsAfterReset && !!prefsAfterReset.chart_colors && !('hero' in prefsAfterReset.chart_colors),
         JSON.stringify(prefsAfterReset));
 

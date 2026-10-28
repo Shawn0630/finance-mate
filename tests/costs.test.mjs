@@ -14,6 +14,7 @@ import {
 } from '../src/costs.js';
 import {
   handleAiFillChat, truncateChatHistory, normalizeProposedCosts, buildCostsChatMessages,
+  handleAiFill, validateFile, TEXT_FILE_MAX_CHARS,
 } from '../src/aiFill.js';
 
 const E = (year, category, amount, basis = 'annual', extra = {}) => ({
@@ -358,4 +359,91 @@ test('handleAiFillChat: status contract — 400 / 404 / 503 / 502', async () => 
   const junk = await handleAiFillChat({ propertyId: 5, text: 'a' },
     { ...deps, callLlm: async () => 'not json at all' });
   assert.equal(junk.status, 502);
+});
+
+// ------------------------------------------------------ text attachments
+// CSV / TXT files are read as UTF-8 text and ride into the
+// prompt as a named text block (never an image part); text
+// past ~50 KB is truncated with a note at the block's tail.
+const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+const CSV_TEXT = 'month,amount\n2025-01,80\n2025-02,90\n2025-03,85\n';
+
+test('validateFile: CSV/TXT accepted as text; other types still rejected', () => {
+  const csv = validateFile({ name: 'bills.csv', type: 'text/csv', data: b64(CSV_TEXT) });
+  assert.equal(csv.error, undefined);
+  assert.equal(csv.text, CSV_TEXT);
+  assert.equal(csv.truncated, false);
+  // Extension alone is enough (some browsers send no useful type).
+  const txt = validateFile({ name: 'notes.txt', type: '', data: b64('hello') });
+  assert.equal(txt.error, undefined);
+  assert.equal(txt.text, 'hello');
+  const bad = validateFile({ name: 'a.docx', type: 'application/msword', data: b64('x') });
+  assert.equal(bad.status, 400);
+  assert.match(bad.error, /\.csv \/ \.txt/);
+  // The 10 MB cap still applies to text files.
+  const big = validateFile({ name: 'big.csv', type: 'text/csv', data: Buffer.alloc(11 * 1024 * 1024, 97).toString('base64') });
+  assert.equal(big.status, 413);
+});
+
+test('fill-chat: a CSV reaches the model as a named text block, not an image part', async () => {
+  const seen = [];
+  const callLlm = async (messages) => {
+    seen.push(messages);
+    return '{"reply":"Got the water bills.","proposed":[{"year":2025,"category":"Water","basis":"monthly","monthlyAmounts":{"1":80,"2":90,"3":85}}],"ready":true}';
+  };
+  const r = await handleAiFillChat(
+    { propertyId: 5, history: [], text: 'water bills', files: [{ name: 'bills.csv', type: 'text/csv', data: b64(CSV_TEXT) }] },
+    { env: CONFIGURED, callLlm, property: PROPERTY, existing: [] });
+  assert.equal(r.status, 200);
+  const user = seen[0][seen[0].length - 1];
+  const texts = user.content.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
+  assert.match(texts, /File "bills\.csv":/);
+  assert.match(texts, /2025-02,90/);
+  assert.equal(user.content.some((p) => p.type === 'image_url'), false);
+});
+
+test('fill-chat: a CSV and an image in one message both reach the model', async () => {
+  const seen = [];
+  const callLlm = async (messages) => { seen.push(messages); return '{"reply":"ok","proposed":[],"ready":false}'; };
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64');
+  const r = await handleAiFillChat(
+    {
+      propertyId: 5, history: [], text: '',
+      files: [
+        { name: 'bills.csv', type: 'text/csv', data: b64(CSV_TEXT) },
+        { name: 'shot.png', type: 'image/png', data: png },
+      ],
+    },
+    { env: CONFIGURED, callLlm, property: PROPERTY, existing: [] });
+  assert.equal(r.status, 200);
+  const user = seen[0][seen[0].length - 1];
+  assert.equal(user.content.filter((p) => p.type === 'image_url').length, 1);
+  assert.match(user.content.map((p) => p.text || '').join('\n'), /2025-03,85/);
+});
+
+test('fill-chat: an over-long text file is truncated at ~50 KB with a note, not an error', async () => {
+  const seen = [];
+  const callLlm = async (messages) => { seen.push(messages); return '{"reply":"ok","proposed":[],"ready":false}'; };
+  const long = 'x'.repeat(TEXT_FILE_MAX_CHARS + 5000);
+  const r = await handleAiFillChat(
+    { propertyId: 5, history: [], text: '', files: [{ name: 'long.txt', type: 'text/plain', data: b64(long) }] },
+    { env: CONFIGURED, callLlm, property: PROPERTY, existing: [] });
+  assert.equal(r.status, 200);
+  const user = seen[0][seen[0].length - 1];
+  const block = user.content.map((p) => p.text || '').join('\n');
+  assert.match(block, /truncated/);
+  assert.ok(block.length < TEXT_FILE_MAX_CHARS + 500, `block was ${block.length} chars`);
+});
+
+test('one-shot AI Fill shares the pipeline: a CSV file fills from its text', async () => {
+  const seen = [];
+  const callLlm = async (messages) => { seen.push(messages); return '{"fields":{"lender":"RBC"}}'; };
+  const r = await handleAiFill(
+    { context: 'term', text: '', file: { name: 'terms.csv', type: 'text/csv', data: b64('lender,RBC\n') } },
+    { env: CONFIGURED, callLlm });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.fields.lender, 'RBC');
+  const user = seen[0][seen[0].length - 1];
+  assert.match(user.content.map((p) => p.text || '').join('\n'), /lender,RBC/);
+  assert.equal(user.content.some((p) => p.type === 'image_url'), false);
 });

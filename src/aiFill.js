@@ -81,11 +81,24 @@ const FORM_SPECS = {
   ].join('\n'),
 };
 
+// A text attachment (CSV / TXT) rides into the prompt as a
+// named text block — never as an image part — capped at ~50 KB
+// of text so a huge export cannot blow up the context; the
+// block's tail says so when it was cut.
+export const TEXT_FILE_MAX_CHARS = 50 * 1024;
+
+export function textFileBlock(f) {
+  return `File "${f.name || 'attachment'}":\n${f.text}`
+    + (f.truncated ? '\n[Note: this file was truncated — only the first ~50 KB is shown.]' : '');
+}
+
 export function buildMessages(context, text, fileInfo) {
   const content = [{ type: 'text', text: (text && text.trim()) || 'Extract the fields from the attached document.' }];
   if (fileInfo) {
     if (fileInfo.type.startsWith('image/')) {
       content.push({ type: 'image_url', image_url: { url: `data:${fileInfo.type};base64,${fileInfo.data}` } });
+    } else if (fileInfo.text != null) {
+      content.push({ type: 'text', text: textFileBlock(fileInfo) });
     } else if (fileInfo.type === 'application/pdf') {
       const extracted = extractPdfText(fileInfo.bytes);
       content.push({
@@ -358,14 +371,25 @@ export function validateFile(file) {
     return { status: 400, error: 'file must be an object with name, type and data (base64).' };
   }
   const type = String(file.type || '');
-  if (!type.startsWith('image/') && type !== 'application/pdf') {
-    return { status: 400, error: 'Attachments must be an image or a PDF.' };
+  const name = String(file.name || '');
+  // Text attachments are recognized by MIME type OR by the
+  // .csv / .txt extension (some browsers report neither a useful
+  // type for CSVs); they are decoded as UTF-8 text below.
+  const isText = type === 'text/csv' || type === 'text/plain' || /\.(csv|txt)$/i.test(name);
+  if (!isText && !type.startsWith('image/') && type !== 'application/pdf') {
+    return { status: 400, error: 'Attachments must be an image, a PDF, or a text file (.csv / .txt).' };
   }
   if (typeof file.data !== 'string' || !file.data) return { status: 400, error: 'file data is missing.' };
   const bytes = Buffer.from(file.data, 'base64');
   if (!bytes.length) return { status: 400, error: 'file is empty.' };
   if (bytes.length > MAX_FILE_BYTES) return { status: 413, error: 'Attachment is too large (max 10 MB).' };
-  return { type, bytes, data: file.data, name: String(file.name || '') };
+  const out = { type, bytes, data: file.data, name };
+  if (isText) {
+    const full = bytes.toString('utf8');
+    out.text = full.slice(0, TEXT_FILE_MAX_CHARS);
+    out.truncated = full.length > TEXT_FILE_MAX_CHARS;
+  }
+  return out;
 }
 
 // The whole endpoint as a pure-ish function (deps injectable for
@@ -592,6 +616,8 @@ export function buildCostsChatMessages({ property, existing, draft, history, tex
   for (const f of files || []) {
     if (f.type.startsWith('image/')) {
       content.push({ type: 'image_url', image_url: { url: `data:${f.type};base64,${f.data}` } });
+    } else if (f.text != null) {
+      content.push({ type: 'text', text: textFileBlock(f) });
     } else if (f.type === 'application/pdf') {
       const extracted = extractPdfText(f.bytes);
       content.push({

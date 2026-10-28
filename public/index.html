@@ -80,7 +80,6 @@
               <button data-months="60" class="active">5 years</button>
               <button data-months="120">10 years</button>
               <button data-months="0">All</button>
-              <button type="button" data-colors-toggle="portfolio">Colors</button>
             </div>
             <div class="chart-wrap"><canvas id="portfolioChart"></canvas></div>
             <div class="chart-colors hidden" data-colors-panel="portfolio"></div>
@@ -188,7 +187,6 @@
         <div class="spacer"></div>
         <button type="button" id="openMortgageBtn">Mortgage Terms &amp; Rates</button>
         <button type="button" id="openHistoryBtn">Assessment History</button>
-        <button type="button" class="small" data-colors-toggle="hero">Colors</button>
       </div>
       <div class="chart-colors hidden" data-colors-panel="hero"></div>
       <div class="toolbar range-btns" id="rangeBtns">
@@ -225,13 +223,17 @@
     </div>
 
     <!-- Property costs: the property's yearly running costs
-         (tax, strata, utilities…). The input surface is one
-         inline-editable table PER YEAR — rows edit in place, each
-         year table has its own "+ Add row"; "+ Add year" and the
-         AI fill toggle share the panel's top row. Amounts are
-         stored in their recorded basis (annual total, or monthly
-         with the recorded months kept and the average computed);
-         totals and the charts annualize. -->
+         (tax, strata, utilities…). A year selector at the panel
+         top drives ONE inline-editable table — the selected
+         year's rows, with that year's total. The table is
+         read-only until its Edit switch (same top row, with
+         "+ Add year" and the AI fill toggle) opens edit mode —
+         only then do the row Edit/Delete buttons, "+ Add row"
+         and "+ Add year" appear; Done closes it. The selector also picks the
+         pie's year and the combo chart's By month year. Amounts
+         are stored in their recorded basis (annual total, or
+         monthly with the recorded months kept and the average
+         computed); totals and the charts annualize. -->
     <div class="panel" id="costsPanel" data-outline="Property Costs">
       <div class="panel-head">
         <h3>Property costs</h3>
@@ -239,19 +241,23 @@
         <span class="note" id="costsLatestTotal" style="margin:0"></span>
       </div>
       <div class="toolbar costs-topbar" style="margin:0 0 8px">
-        <button type="button" class="small" id="addCostYearBtn">+ Add year</button>
+        <select id="costsYearSel" aria-label="Year"></select>
+        <button type="button" class="small hidden" id="addCostYearBtn">+ Add year</button>
         <button type="button" class="small" data-costs-ai-toggle>✨ Fill with AI</button>
+        <button type="button" class="small" id="costsEditToggleBtn">Edit</button>
         <span class="note hidden" data-costs-ai-summary style="margin:0"></span>
       </div>
       <div class="ai-fill" id="costsAiFill">
         <div class="ai-panel hidden" data-costs-ai-panel>
           <div class="note hidden" data-costs-ai-guidance style="margin:0 0 8px"></div>
           <div class="costs-chat-log hidden" data-costs-chat-log></div>
+          <div class="costs-chat-queue hidden" data-costs-chat-queue></div>
           <textarea rows="3" data-costs-chat-text placeholder="Paste a bill or a few months of one, or answer the AI's question…"></textarea>
           <div class="ai-panel-row">
-            <input type="file" accept="image/*,application/pdf" multiple data-costs-chat-files>
+            <input type="file" accept="image/*,application/pdf,.csv,.txt" multiple data-costs-chat-files>
             <select data-costs-chat-model title="Model" style="width:auto;flex:0 1 auto"></select>
             <button type="button" class="primary small" data-costs-chat-send>Send</button>
+            <button type="button" class="small hidden" data-costs-chat-clear>Clear session</button>
           </div>
           <div data-costs-proposed></div>
           <div class="msg" data-costs-chat-msg></div>
@@ -261,7 +267,6 @@
         <div class="costs-pie-box">
           <div class="costs-chart-head">
             <span class="costs-chart-title">Spending by year</span>
-            <select id="costsPieYear" aria-label="Pie chart year"></select>
           </div>
           <div class="chart-wrap costs-pie"><canvas id="costsPieChart"></canvas></div>
         </div>
@@ -405,7 +410,6 @@
     <div class="toolbar">
       <button type="button" id="fetchBcaBtn">Fetch from BC Assessment</button>
       <button type="button" id="pullHistoryBtn">Pull history from HouseSigma</button>
-      <button type="button" class="small" data-colors-toggle="history">Colors</button>
     </div>
     <div class="chart-colors hidden" data-colors-panel="history"></div>
     <div class="msg" id="trendMsg"></div>

@@ -257,12 +257,13 @@ label.btnlike:hover { background: #f0f4f9; }
 .chart-colors .cc-row.cc-highlight { background: #fdf3e0; border-radius: 6px; box-shadow: 0 0 0 2px #e8a33d; padding: 2px 6px; margin: -2px -6px; }
 .chart-colors input[type="color"] { width: 36px; height: 24px; padding: 0; border: 1px solid #c8d2dd; border-radius: 4px; background: none; cursor: pointer; }
 .hidden { display: none !important; }
-/* Property costs: chart slot, the per-year inline-editable
-   tables (year title row, footer total per year, the
-   monthly-average annotation under an annualized figure, the
-   12-month detail grid a monthly row opens into), and the AI
-   fill chat (log, guidance, proposal rows — a conflicting
-   proposal is tinted, shows old → new and starts unchecked). */
+/* Property costs: chart slot, the selected year's inline-
+   editable table (year title row, footer total, the monthly-
+   average annotation under an annualized figure, the 12-month
+   detail grid a monthly row opens into), and the AI fill chat
+   (log, guidance, proposal rows — a conflicting proposal is
+   tinted, shows old → new and starts unchecked). */
+.costs-topbar select { width: auto; }
 .costs-charts { display: flex; gap: 18px; flex-wrap: wrap; margin: 4px 0 10px; }
 .costs-pie-box { flex: 0 1 300px; min-width: 240px; }
 .costs-combo-box { flex: 1 1 430px; min-width: 300px; }
@@ -293,6 +294,14 @@ table.costs-table { width: 100%; }
 .costs-chat-turn { margin: 6px 0; font-size: 13px; white-space: pre-wrap; }
 .costs-chat-turn .who { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: #71808f; display: block; }
 .costs-chat-turn.pending { opacity: .55; }
+/* Pending-attachment queue above the chat textarea: files from
+   Choose Files and pasted images/files land in the same queue,
+   shown as removable chips until Send carries them off. */
+.costs-chat-queue { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.costs-chat-queue.hidden { display: none; }
+.file-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; background: #eef3f9; border: 1px solid #cfdae7; border-radius: 999px; padding: 2px 4px 2px 10px; max-width: 100%; }
+.file-chip .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-chip button { border: none; background: none; cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; color: #5a6b7d; }
 .costs-proposed { margin-top: 10px; border-top: 1px solid #e6ecf2; padding-top: 8px; }
 .costs-proposed h5 { margin: 0 0 6px; font-size: 12.5px; color: #33424f; }
 .costs-proposed-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 5px 6px; border-radius: 6px; }
@@ -344,13 +353,18 @@ table.seg-table td:last-child { text-align: right; }
    hovering, keyboard focus, or the open narrow card pauses. */
 #view-property [data-outline] { scroll-margin-top: 68px; }
 .prop-outline { position: fixed; left: 14px; top: 50%; transform: translateY(-50%); z-index: 40; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s ease, visibility 0s linear .25s; }
-.prop-outline.awake { opacity: 1; visibility: visible; pointer-events: auto; transition: opacity .25s ease, visibility 0s linear 0s; }
-.prop-outline-card { width: 182px; background: rgba(255, 255, 255, .97); border: 1px solid #dde4ec; border-radius: 12px; box-shadow: 0 10px 30px rgba(16, 32, 48, .18); padding: 8px 0; }
+/* Awake, the outline rests translucent (~85%) over a backdrop
+   blur so the page shows through softly instead of being hard-
+   covered; hovering it or focusing inside makes it fully
+   opaque — solid when it is being read or clicked. */
+.prop-outline.awake { opacity: .85; visibility: visible; pointer-events: auto; transition: opacity .25s ease, visibility 0s linear 0s; }
+.prop-outline.awake:hover, .prop-outline.awake:focus-within { opacity: 1; }
+.prop-outline-card { width: 182px; background: rgba(255, 255, 255, .97); border: 1px solid #dde4ec; border-radius: 12px; box-shadow: 0 10px 30px rgba(16, 32, 48, .18); padding: 8px 0; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 .prop-outline-list { list-style: none; margin: 0; padding: 0; }
 .prop-outline-list a { display: block; padding: 6px 14px 6px 13px; border-left: 3px solid transparent; color: #44576a; text-decoration: none; font-size: 13px; line-height: 1.35; cursor: pointer; }
 .prop-outline-list a:hover { background: #f0f4f8; }
 .prop-outline-list a.active { color: #16222e; font-weight: 600; border-left-color: #1668c4; background: #eef4fa; }
-.prop-outline-toggle { display: none; width: 44px; height: 44px; border-radius: 50%; border: 1px solid #dde4ec; background: rgba(255, 255, 255, .97); box-shadow: 0 8px 22px rgba(16, 32, 48, .22); color: #33424f; font-size: 18px; line-height: 1; cursor: pointer; align-items: center; justify-content: center; }
+.prop-outline-toggle { display: none; width: 44px; height: 44px; border-radius: 50%; border: 1px solid #dde4ec; background: rgba(255, 255, 255, .97); box-shadow: 0 8px 22px rgba(16, 32, 48, .22); color: #33424f; font-size: 18px; line-height: 1; cursor: pointer; align-items: center; justify-content: center; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 @media (max-width: 900px) {
   .prop-outline-toggle { display: flex; }
   .prop-outline-card { display: none; margin-top: 8px; }

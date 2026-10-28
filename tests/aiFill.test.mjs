@@ -166,7 +166,7 @@ test('handleAiFill: bad context / no input / bad file are 400s, oversize is a 41
   assert.equal((await handleAiFill({ context: 'bogus', text: 'x' }, deps)).status, 400);
   assert.equal((await handleAiFill({ context: 'term' }, deps)).status, 400);
   assert.equal((await handleAiFill({ context: 'term', text: '  ' }, deps)).status, 400);
-  assert.equal((await handleAiFill({ context: 'term', file: { name: 'a.txt', type: 'text/plain', data: 'aGk=' } }, deps)).status, 400);
+  assert.equal((await handleAiFill({ context: 'term', file: { name: 'a.docx', type: 'application/msword', data: 'aGk=' } }, deps)).status, 400);
   const big = Buffer.alloc(10 * 1024 * 1024 + 1, 1).toString('base64');
   assert.equal((await handleAiFill({ context: 'term', file: { name: 'a.pdf', type: 'application/pdf', data: big } }, deps)).status, 413);
 });

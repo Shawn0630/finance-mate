@@ -806,7 +806,7 @@ function attachAiFill(form, context, extras = {}) {
     <div class="ai-panel hidden" data-ai-panel>
       <textarea rows="4" data-ai-text placeholder="Paste text from a document, or describe the values…"></textarea>
       <div class="ai-panel-row">
-        <input type="file" accept="image/*,application/pdf" data-ai-file>
+        <input type="file" accept="image/*,application/pdf,.csv,.txt" data-ai-file>
         <select data-ai-model title="Model" style="width:auto;flex:0 1 auto"></select>
         <button type="button" class="primary small" data-ai-extract>Extract</button>
       </div>
@@ -824,13 +824,31 @@ function attachAiFill(form, context, extras = {}) {
     if (cfg.model) modelSel.value = cfg.model;
   });
   wrap.querySelector('[data-ai-toggle]').addEventListener('click', () => panel.classList.toggle('hidden'));
+  // The error line reports the last Extract's outcome: picking
+  // a file supersedes it (the costs chat clears by the same
+  // rule), and Extract itself already clears before running.
+  const aiFileInput = wrap.querySelector('[data-ai-file]');
+  aiFileInput.addEventListener('change', () => { msg.textContent = ''; msg.className = 'msg'; });
+  // Paste: a clipboard carrying a file fills the file input
+  // (the panel's single attachment); a text clipboard pastes
+  // as text, untouched.
+  wrap.querySelector('[data-ai-text]').addEventListener('paste', (e) => {
+    const files = e.clipboardData ? [...e.clipboardData.files] : [];
+    if (!files.length) return;
+    e.preventDefault();
+    const dt = new DataTransfer();
+    dt.items.add(files[0]);
+    aiFileInput.files = dt.files;
+    msg.textContent = '';
+    msg.className = 'msg';
+  });
   extractBtn.addEventListener('click', async () => {
     const text = wrap.querySelector('[data-ai-text]').value.trim();
     const fileInput = wrap.querySelector('[data-ai-file]');
     const file = fileInput.files && fileInput.files[0];
     msg.textContent = '';
     msg.className = 'msg';
-    if (!text && !file) { showMsg(msg, 'err', 'Paste text or attach a photo / PDF first.'); return; }
+    if (!text && !file) { showMsg(msg, 'err', 'Paste text or attach a photo, PDF or text file first.'); return; }
     extractBtn.disabled = true;
     extractBtn.textContent = 'Extracting…';
     try {
@@ -1146,9 +1164,20 @@ function saveChartColorPrefs(immediate = false) {
 
 const LIVE_CHARTS = { hero: () => chartA, history: () => historyChart, portfolio: () => portfolioLineChart };
 
+// The draw colors for one explicit hex, under the same rules
+// seriesColors applies to a stored one.
+function colorsForHex(def, hex) {
+  return {
+    backgroundColor: def.bgAlpha == null ? hex : hexToRgba(hex, def.bgAlpha),
+    borderColor: def.border ? hex : def.bg,
+  };
+}
+
 // Recolor the live chart instance in place (the builders also
-// read the same preferences when a chart is rebuilt).
-function applyChartColors(chartId) {
+// read the same preferences when a chart is rebuilt). With
+// `overrides` ({key: hex}) those series draw from the overrides
+// instead — the Colors panel's unsaved preview.
+function applyChartColors(chartId, overrides) {
   const get = LIVE_CHARTS[chartId];
   const chart = get ? get() : null;
   if (!chart) return;
@@ -1156,46 +1185,105 @@ function applyChartColors(chartId) {
     if (!ds.key) continue;
     const def = seriesDefFor(chartId, ds.key);
     if (!def) continue;
-    const c = seriesColors(chartId, def);
+    const c = overrides && overrides[ds.key] ? colorsForHex(def, overrides[ds.key]) : seriesColors(chartId, def);
     ds.backgroundColor = c.backgroundColor;
     if (def.border) ds.borderColor = c.borderColor;
   }
   chart.update('none');
 }
 
-// One row per series: its name, a native color input holding the
-// current color, and one Reset for the whole chart. The row of
-// the series last right-clicked in the legend (see the legend
-// gestures below) renders highlighted.
+// -------------------------------------------------- colors panel ---
+// The panel edits a STAGE, not the stored preferences. Opening
+// a chart's panel snapshots its effective colors (stored, else
+// default) into colorsStage[chartId]; moving a picker moves
+// the stage and previews it on the live chart, but nothing is
+// written — to chartColorPrefs or to the DB — until Save.
+// Save commits the stage (only series moved off their default
+// are stored, so a full Reset + Save leaves no entry at all)
+// and closes the panel. Closing the panel any other way — a
+// click outside it, Esc, opening another chart's panel —
+// discards the stage and the chart re-applies its stored
+// colors. Reset returns the stage to the defaults; it too
+// waits for Save.
+const colorsStage = {}; // chartId -> {key: hex}
+
+function colorsDefs(chartId) {
+  return chartId === 'portfolio' ? portfolioSeriesDefs() : (CHART_SERIES[chartId] || []);
+}
+
+function effectiveColor(chartId, def) {
+  return (chartColorPrefs[chartId] && chartColorPrefs[chartId][def.key]) || def.border || def.bg;
+}
+
+function stageColors(chartId) {
+  const stage = {};
+  for (const def of colorsDefs(chartId)) stage[def.key] = effectiveColor(chartId, def);
+  colorsStage[chartId] = stage;
+  return stage;
+}
+
+function discardColorsStage(chartId) {
+  if (!colorsStage[chartId]) return;
+  delete colorsStage[chartId];
+  applyChartColors(chartId); // back to the stored colors
+  const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
+  if (panel) panel.classList.add('hidden');
+}
+
+function saveColorsPanel(chartId) {
+  const stage = colorsStage[chartId];
+  if (stage) {
+    const kept = {};
+    for (const def of colorsDefs(chartId)) {
+      const v = stage[def.key];
+      const dflt = def.border || def.bg;
+      if (v && String(v).toLowerCase() !== String(dflt).toLowerCase()) kept[def.key] = v;
+    }
+    if (Object.keys(kept).length) chartColorPrefs[chartId] = kept;
+    else delete chartColorPrefs[chartId];
+    delete colorsStage[chartId];
+    saveChartColorPrefs(true);
+    applyChartColors(chartId);
+  }
+  const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
+  if (panel) panel.classList.add('hidden');
+}
+
+// One row per series: its name and a native color input holding
+// the staged color (the stored one when no stage is live), then
+// Reset and Save for the whole chart. The row of the series
+// last right-clicked in the legend (see the legend gestures
+// below) renders highlighted.
 function buildColorsPanel(chartId) {
   const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
   if (!panel) return;
-  const defs = chartId === 'portfolio' ? portfolioSeriesDefs() : (CHART_SERIES[chartId] || []);
-  panel.innerHTML = defs.map((def) => {
-    const current = (chartColorPrefs[chartId] && chartColorPrefs[chartId][def.key]) || def.border || def.bg;
+  const stage = colorsStage[chartId];
+  panel.innerHTML = colorsDefs(chartId).map((def) => {
+    const current = stage && stage[def.key] ? stage[def.key] : effectiveColor(chartId, def);
     const hl = legendHighlightKey[chartId] === def.key ? ' cc-highlight' : '';
     return `<span class="cc-row${hl}"><span>${esc(def.label)}</span><input type="color" data-color-input="${esc(def.key)}" value="${esc(current)}"></span>`;
-  }).join('') + '<button type="button" class="small" data-colors-reset>Reset</button>';
+  }).join('') + '<button type="button" class="small" data-colors-reset>Reset</button>'
+    + '<button type="button" class="small primary" data-colors-save>Save</button>';
 }
 
 document.addEventListener('click', (e) => {
-  const toggle = e.target.closest('[data-colors-toggle]');
-  if (toggle) {
-    const panel = document.querySelector(`[data-colors-panel="${toggle.dataset.colorsToggle}"]`);
-    if (!panel) return;
-    if (panel.classList.contains('hidden')) { buildColorsPanel(toggle.dataset.colorsToggle); panel.classList.remove('hidden'); }
-    else panel.classList.add('hidden');
-    return;
-  }
   const reset = e.target.closest('[data-colors-reset]');
   if (reset) {
     const panel = reset.closest('[data-colors-panel]');
     if (!panel) return;
     const chartId = panel.dataset.colorsPanel;
-    delete chartColorPrefs[chartId];
-    saveChartColorPrefs(true);
-    applyChartColors(chartId);
+    // Reset is staged like any other edit: the pickers and the
+    // preview go back to the defaults, Save still has to commit.
+    const stage = colorsStage[chartId] || stageColors(chartId);
+    for (const def of colorsDefs(chartId)) stage[def.key] = def.border || def.bg;
+    applyChartColors(chartId, stage);
     buildColorsPanel(chartId);
+    return;
+  }
+  const save = e.target.closest('[data-colors-save]');
+  if (save) {
+    const panel = save.closest('[data-colors-panel]');
+    if (panel) saveColorsPanel(panel.dataset.colorsPanel);
   }
 });
 document.addEventListener('input', (e) => {
@@ -1204,13 +1292,23 @@ document.addEventListener('input', (e) => {
   const panel = input.closest('[data-colors-panel]');
   if (!panel) return;
   const chartId = panel.dataset.colorsPanel;
-  if (!chartColorPrefs[chartId]) chartColorPrefs[chartId] = {};
-  chartColorPrefs[chartId][input.dataset.colorInput] = input.value;
-  applyChartColors(chartId);
-  saveChartColorPrefs(false);
+  if (!colorsStage[chartId]) stageColors(chartId);
+  colorsStage[chartId][input.dataset.colorInput] = input.value;
+  applyChartColors(chartId, colorsStage[chartId]); // preview only — nothing is stored
 });
-document.addEventListener('change', (e) => {
-  if (e.target.closest && e.target.closest('[data-color-input]')) saveChartColorPrefs(true);
+// Closing a panel without Save discards its stage: a pointer
+// press anywhere outside an open panel, or Esc.
+document.addEventListener('mousedown', (e) => {
+  for (const chartId of Object.keys(colorsStage)) {
+    const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
+    if (panel && !panel.classList.contains('hidden') && !panel.contains(e.target)) {
+      discardColorsStage(chartId);
+    }
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  for (const chartId of Object.keys(colorsStage)) discardColorsStage(chartId);
 });
 
 // ------------------------------------------------ legend gestures ---
@@ -1222,13 +1320,20 @@ document.addEventListener('change', (e) => {
 // preferences hold colors and nothing else). A RIGHT click on a
 // legend item opens that chart's Colors panel with the clicked
 // series' row highlighted, and suppresses the browser's context
-// menu; the Colors button stays for touch, which has no right
-// click. All three charts behave identically.
+// menu. That right click is the panel's only entry — the chart
+// headers used to carry a Colors button too; it was removed as
+// visual clutter. All three charts behave identically.
 const legendHighlightKey = {}; // chartId -> series key last right-clicked
 
 function openColorsPanel(chartId, focusKey) {
   const panel = document.querySelector(`[data-colors-panel="${chartId}"]`);
   if (!panel) return;
+  // One live stage at a time: opening a panel discards any
+  // other chart's unsaved stage.
+  for (const other of Object.keys(colorsStage)) {
+    if (other !== chartId) discardColorsStage(other);
+  }
+  if (!colorsStage[chartId]) stageColors(chartId);
   if (focusKey != null) legendHighlightKey[chartId] = focusKey;
   buildColorsPanel(chartId);
   panel.classList.remove('hidden');
@@ -3282,11 +3387,17 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 
 // ------------------------------------------------------- property costs ---
 // A property's yearly running costs (property tax, strata,
-// utilities…). The input surface is one inline-editable table
-// PER YEAR: each year block holds its own rows (Edit →
-// Save / Cancel in place, Delete on every row, its own
-// "+ Add row") with the year's total in its footer, and the
-// panel's top row pairs "+ Add year" with the AI fill toggle.
+// utilities…). The input surface is ONE table — the year the
+// panel's top selector is on — and it is READ-ONLY until the
+// top row's Edit switch opens edit mode: only then do the
+// rows' Edit / Delete buttons, the table's "+ Add row" and
+// the top row's "+ Add year" appear (rows then edit in place:
+// Edit → Save / Cancel); Done closes edit mode again. The
+// year's total sits in the table footer either way. The
+// selector shares the panel's top row with the Edit switch
+// and the AI fill toggle — both of which live outside edit
+// mode — and it also drives the pie's year and the combo
+// chart's By month year (By year shows all years).
 // Amounts are stored in their recorded basis: 'annual' = the
 // year's total; 'monthly' = the recorded months are kept
 // (monthlyAmounts) and amount is their average — computed by
@@ -3297,9 +3408,10 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 // with an "avg $X/mo" annotation, so nobody does the ×12 in
 // their head).
 //
-// The two charts are display only: a per-year share pie (year
-// switchable) and a bar+line combo (category-stacked bars, the
-// total as a line) with a By year / By month granularity toggle.
+// The two charts are display only: a per-year share pie (of
+// the selected year) and a bar+line combo (category-stacked
+// bars, the total as a line) with a By year / By month
+// granularity toggle — By month covers the selected year only.
 // By month, a monthly-basis category lands its recorded months
 // at their actual amounts and fills the months it does not
 // carry with its average; an annual-basis category spreads at
@@ -3326,9 +3438,11 @@ let costsData = null;      // last GET /costs view {entries, categories, years, 
 let costsLoadedFor = null; // property id the panel state belongs to
 let costsEditingKey = null; // null | 'id:<entry id>' | 'new:<year>' — the row in edit mode
 let costsExtraYears = [];   // years opened via "+ Add year" that hold no entries yet
+let costsYear = null;       // the panel's selected year: table + pie + By month
+let costsEditSnap = null;   // the edit row's last snapshot, kept across renders
+let costsEditMode = false;  // the table's Edit switch: view mode is read-only
 let costsPie = null;
 let costsCombo = null;
-let costsPieYear = null;
 let costsPieCenter = null; // {year, total} the doughnut's center text
 let costsGranularity = 'year';
 
@@ -3339,7 +3453,9 @@ async function loadCostsImpl(id) {
     costsLoadedFor = id;
     costsEditingKey = null;
     costsExtraYears = [];
-    costsPieYear = null;
+    costsYear = null;
+    costsEditSnap = null;
+    costsEditMode = false;
     resetCostsChat(id);
   }
   renderCosts();
@@ -3358,12 +3474,67 @@ function renderCosts() {
   // presets + recorded customs, so a name is never re-invented.
   $('#costCategoryOptions').innerHTML = [...COST_TYPE_PRESETS, ...costCustomCategories(), 'Other']
     .map((c) => `<option value="${esc(c)}">`).join('');
+  renderCostsYearSel();
+  renderCostsTopbar();
   renderCostsCharts();
   renderCostsYears();
   renderCostsProposed();
 }
 
-// ------------------------------------------------------- costs year tables
+// The table's Edit switch, rendered: "+ Add year" exists only
+// in edit mode, and the switch itself reads Edit / Done. The
+// year selector and the AI fill are not part of edit mode and
+// stay put in both states.
+function renderCostsTopbar() {
+  $('#addCostYearBtn').classList.toggle('hidden', !costsEditMode);
+  $('#costsEditToggleBtn').textContent = costsEditMode ? 'Done' : 'Edit';
+}
+
+$('#costsEditToggleBtn').addEventListener('click', () => {
+  costsEditMode = !costsEditMode;
+  // Leaving edit mode does not kill a row edit in progress:
+  // per the panel's render semantics its session (and its
+  // snapshot) survives, so its row stays up — in its own year —
+  // until it is saved or cancelled.
+  renderCosts();
+});
+
+// The panel's year selector: its options are the years with
+// data ∪ the opened-but-empty years ∪ the current selection
+// (so a year whose entries were all just deleted stays
+// selectable and shows its empty table, per the panel's empty-
+// year rule). The selection is validated here: a selection
+// that falls out of the union — none, after a property switch
+// — falls back to the latest year on record.
+function renderCostsYearSel() {
+  const sel = $('#costsYearSel');
+  const years = [...new Set([
+    ...(costsData ? costsData.years.map((y) => y.year) : []),
+    ...costsExtraYears,
+    ...(costsYear ? [costsYear] : []),
+  ])].sort((a, b) => b - a);
+  if (!years.includes(costsYear)) {
+    costsYear = costsData && costsData.years.length
+      ? costsData.years[0].year
+      : (years.length ? years[0] : null);
+  }
+  sel.innerHTML = years.map((y) => `<option value="${y}">${y}</option>`).join('');
+  sel.value = costsYear ? String(costsYear) : '';
+  sel.disabled = !years.length;
+}
+
+// Picking a year re-points the table, the pie and the combo's
+// By month view at it — all from the loaded view, no refetch.
+// An edit open on another year's row is not touched: its
+// session (and its snapshot) stays keyed to its own year and
+// comes back when the user returns to that year.
+$('#costsYearSel').addEventListener('change', (e) => {
+  costsYear = Number(e.target.value);
+  renderCostsCharts();
+  renderCostsYears();
+});
+
+// -------------------------------------------------- costs entries table
 function costAmountCell(e) {
   if (e.basis === 'monthly') {
     const n = e.monthlyAmounts ? Object.keys(e.monthlyAmounts).length : 0;
@@ -3393,6 +3564,12 @@ function costMonthsGridHtml(months, dataAttr = 'data-month') {
 // rebuilds and feeds the values back into the rebuilt row, so a
 // data refresh (a save landing, an AI Apply) can never wipe an
 // edit the user opened — or typed into — while it was in flight.
+// The snapshot is also kept in state (costsEditSnap): switching
+// the year selector rebuilds the table without the editing row
+// — it belongs to its own year — and the kept snapshot restores
+// its typed values when the user switches back. The snapshot is
+// keyed by the row's own key, so it can only ever land back on
+// that row, never in another year.
 function snapshotCostEditRow() {
   if (!costsEditingKey) return null;
   const row = document.querySelector('#costsYears tr.cost-editing');
@@ -3477,20 +3654,22 @@ function costEditRowHtml(entry, year, snap) {
 function renderCostsYears() {
   const host = $('#costsYears');
   if (!costsData) { host.innerHTML = ''; return; }
-  const snap = snapshotCostEditRow();
-  const byYear = new Map();
-  for (const e of costsData.entries) {
-    if (!byYear.has(e.year)) byYear.set(e.year, []);
-    byYear.get(e.year).push(e);
-  }
-  for (const arr of byYear.values()) arr.sort((a, b) => a.category.localeCompare(b.category));
-  const totals = new Map(costsData.years.map((y) => [y.year, y.total]));
-  const years = [...new Set([...byYear.keys(), ...costsExtraYears])].sort((a, b) => b - a);
-  if (!years.length) {
+  const live = snapshotCostEditRow();
+  if (live) costsEditSnap = live;
+  if (!costsEditingKey || (costsEditSnap && costsEditSnap.key !== costsEditingKey)) costsEditSnap = null;
+  const snap = costsEditSnap;
+  if (costsYear === null || costsYear === undefined) {
     host.innerHTML = '<p class="note" style="margin:0">No costs recorded yet.</p>';
     return;
   }
-  host.innerHTML = years.map((y) => costYearBlockHtml(y, byYear.get(y) || [], totals.get(y), snap)).join('');
+  // Only the selected year's table renders. An empty year (just
+  // added, or deleted clean) renders its empty table with a 0
+  // total.
+  const entries = costsData.entries
+    .filter((e) => e.year === costsYear)
+    .sort((a, b) => a.category.localeCompare(b.category));
+  const yv = costsData.years.find((y) => y.year === costsYear);
+  host.innerHTML = costYearBlockHtml(costsYear, entries, yv ? yv.total : 0, snap);
   wireCostEditRow();
 }
 
@@ -3504,9 +3683,9 @@ function costYearBlockHtml(year, entries, total, snap) {
         <td>${esc(e.category)}${e.source === 'ai' ? ' <span class="badge">AI</span>' : ''}</td>
         <td>${e.basis === 'monthly' ? 'Monthly' : 'Annual'}</td>
         <td class="num">${costAmountCell(e)}</td>
-        <td style="white-space:nowrap">
+        <td style="white-space:nowrap">${costsEditMode ? `
           <button type="button" class="small" data-cost-edit="${e.id}">Edit</button>
-          <button type="button" class="small danger" data-cost-del="${e.id}">Delete</button>
+          <button type="button" class="small danger" data-cost-del="${e.id}">Delete</button>` : ''}
         </td></tr>`);
     }
   }
@@ -3515,8 +3694,9 @@ function costYearBlockHtml(year, entries, total, snap) {
     rows.push('<tr><td colspan="4" class="note" style="margin:0">No costs recorded yet.</td></tr>');
   }
   // A year holding no entries yet is still finding its number:
-  // its title is an input until the first entry lands.
-  const head = entries.length
+  // in edit mode its title is an input until the first entry
+  // lands; in view mode the year is plain text like any other.
+  const head = entries.length || !costsEditMode
     ? `<span>${year}</span>`
     : `<input type="number" data-cost-year-input step="1" min="1900" max="2100" value="${year}">`;
   return `<div class="cost-year-block" data-cost-year-block="${year}">
@@ -3524,11 +3704,11 @@ function costYearBlockHtml(year, entries, total, snap) {
     <table class="costs-table">
       <thead><tr><th>Type</th><th>Basis</th><th class="num">Amount</th><th></th></tr></thead>
       <tbody>${rows.join('')}</tbody>
-      ${total !== undefined ? `<tfoot><tr class="cost-year-total"><td colspan="2">${year} total</td><td class="num">${money2(total)}</td><td></td></tr></tfoot>` : ''}
-    </table>
+      <tfoot><tr class="cost-year-total"><td colspan="2">${year} total</td><td class="num">${money2(total || 0)}</td><td></td></tr></tfoot>
+    </table>${costsEditMode ? `
     <div class="toolbar cost-year-toolbar" style="margin:0">
       <button type="button" class="small" data-cost-add-row="${year}">+ Add row</button>
-    </div>
+    </div>` : ''}
   </div>`;
 }
 
@@ -3585,14 +3765,16 @@ $('#costsYears').addEventListener('click', async (e) => {
     const key = row ? row.dataset.costEditrow : costsEditingKey;
     costsEditingKey = null;
     // Cancelling the only row of a just-added year abandons the
-    // year block too — it held nothing else.
+    // year too — it held nothing else. The selection lets go of
+    // it, and the selector falls back to a year that remains.
     if (key && key.startsWith('new:')) {
       const y = Number(key.slice(4));
       if (costsData && !costsData.entries.some((en) => en.year === y)) {
         costsExtraYears = costsExtraYears.filter((yy) => yy !== y);
+        if (costsYear === y) costsYear = null;
       }
     }
-    renderCostsYears();
+    renderCosts();
     return;
   }
   if (addRowBtn) {
@@ -3671,8 +3853,9 @@ $('#costsYears').addEventListener('click', async (e) => {
   }
 });
 
-// Renaming a not-yet-filled year: the block follows the input —
-// merging into an existing year when the number lands on one.
+// Renaming a not-yet-filled year: the selection follows the
+// input — merging into an existing year when the number lands
+// on one.
 $('#costsYears').addEventListener('change', (e) => {
   const inp = e.target.closest('[data-cost-year-input]');
   if (!inp) return;
@@ -3687,6 +3870,9 @@ $('#costsYears').addEventListener('change', (e) => {
   const hasData = costsData && costsData.entries.some((en) => en.year === newYear);
   if (!hasData && !costsExtraYears.includes(newYear)) costsExtraYears.push(newYear);
   if (costsEditingKey === `new:${oldYear}`) costsEditingKey = `new:${newYear}`;
+  if (costsYear === oldYear) costsYear = newYear;
+  renderCostsYearSel();
+  renderCostsCharts();
   renderCostsYears();
 });
 
@@ -3694,12 +3880,14 @@ $('#addCostYearBtn').addEventListener('click', () => {
   const used = new Set([
     ...(costsData ? costsData.entries.map((e) => e.year) : []),
     ...costsExtraYears,
+    ...(costsYear ? [costsYear] : []),
   ]);
   let y = new Date().getFullYear();
   while (used.has(y)) y += 1;
   costsExtraYears.push(y);
+  costsYear = y;
   costsEditingKey = `new:${y}`;
-  renderCostsYears();
+  renderCosts();
   const inp = document.querySelector(`[data-cost-year-block="${y}"] [data-cost-year-input]`);
   if (inp) { inp.focus(); inp.select(); }
 });
@@ -3744,12 +3932,20 @@ function renderCostsCharts() {
 }
 
 function renderCostsPie() {
-  const yearsDesc = costsData.years;
-  if (!yearsDesc.some((y) => y.year === costsPieYear)) costsPieYear = yearsDesc[0].year;
-  const sel = $('#costsPieYear');
-  sel.innerHTML = yearsDesc.map((y) => `<option value="${y.year}">${y.year}</option>`).join('');
-  sel.value = String(costsPieYear);
-  const yv = yearsDesc.find((y) => y.year === costsPieYear);
+  // The pie shows the panel selector's year. A selected year
+  // with nothing recorded has no slices: the pie steps aside
+  // (the combo still covers the panel) until the year fills.
+  const pieBox = document.querySelector('.costs-pie-box');
+  const yv = costsData.years.find((y) => y.year === costsYear);
+  if (!yv) {
+    pieBox.classList.add('hidden');
+    if (costsPie) { costsPie.destroy(); costsPie = null; }
+    costsPieCenter = null;
+    window.__fmCharts = window.__fmCharts || {};
+    window.__fmCharts.costsPie = null;
+    return;
+  }
+  pieBox.classList.remove('hidden');
   const cats = costsData.categories.filter((c) => yv.cells[c]);
   costsPieCenter = { year: yv.year, total: yv.total };
   if (costsPie) costsPie.destroy();
@@ -3795,16 +3991,22 @@ function renderCostsCombo() {
   let perCat;
   let totals;
   if (costsGranularity === 'month') {
-    // The pivot ships each cell's twelve month figures
-    // (costMonthSeries): a monthly-basis category lands its
-    // recorded months at their actual amounts and fills the
-    // months it does not carry with the average; an
+    // By month covers the SELECTED year only (By year above is
+    // the all-years view). The pivot ships each cell's twelve
+    // month figures (costMonthSeries): a monthly-basis category
+    // lands its recorded months at their actual amounts and
+    // fills the months it does not carry with the average; an
     // annual-basis one spreads at annual ÷ 12. The twelve
-    // months of a recorded year sum back to its total.
+    // months of a recorded year sum back to its total. A
+    // selected year with nothing recorded reads as twelve zero
+    // months.
     labels = [];
     perCat = cats.map(() => []);
     totals = [];
-    for (const yv of yearsAsc) {
+    const selYv = yearsAsc.find((y) => y.year === costsYear);
+    const monthYears = selYv ? [selYv]
+      : (costsYear ? [{ year: costsYear, cells: {}, total: 0 }] : []);
+    for (const yv of monthYears) {
       for (let m = 1; m <= 12; m++) {
         labels.push(`${yv.year}-${String(m).padStart(2, '0')}`);
         let tot = 0;
@@ -3853,11 +4055,6 @@ function renderCostsCombo() {
   window.__fmCharts.costsCombo = costsCombo;
 }
 
-$('#costsPieYear').addEventListener('change', (e) => {
-  costsPieYear = Number(e.target.value);
-  renderCostsPie();
-});
-
 $('#costsGranularity').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-gran]');
   if (!btn || btn.dataset.gran === costsGranularity) return;
@@ -3871,22 +4068,65 @@ $('#costsGranularity').addEventListener('click', (e) => {
 // entries and asks whenever a year / period / category /
 // property is ambiguous; only Apply writes (through the costs
 // POST, source 'ai'). The conversation lives in this page
-// session only — switching properties resets it.
+// session only — switching properties resets it, and so does
+// the panel's Clear session button (which is all resetCostsChat
+// does: recorded data is never touched, the model choice and
+// the panel's open state stay as they are).
 let costsChatState = { turns: [], proposed: [] };
 let costsChatPropertyId = null;
+// The pending-attachment queue: files picked through Choose
+// Files and files pasted into the textarea land in the SAME
+// queue, shown as chips above the textarea. Send carries the
+// whole queue off; a successful round empties it, a failed one
+// leaves it in place for a retry. The server's attachment
+// rules (type, 10 MB) still apply — a rejection lands on the
+// panel's error line, like any other round's outcome.
+let costsChatQueue = [];
+
+// The panel's error line reports the LAST action's outcome —
+// it is cleared whenever a newer action supersedes it: a send
+// starting, a round succeeding, the file selection changing,
+// or the session being cleared (resetCostsChat below).
+function clearCostsChatMsg() {
+  const msg = document.querySelector('[data-costs-chat-msg]');
+  if (msg) { msg.textContent = ''; msg.className = 'msg'; }
+}
+
+function renderCostsChatQueue() {
+  const host = document.querySelector('[data-costs-chat-queue]');
+  if (!host) return;
+  host.classList.toggle('hidden', !costsChatQueue.length);
+  host.innerHTML = costsChatQueue.map((f, i) =>
+    `<span class="file-chip"><span class="chip-name">${esc(f.name || 'attachment')}</span><button type="button" data-costs-chat-queue-remove="${i}" title="Remove">×</button></span>`).join('');
+  syncCostsChatClearBtn();
+}
 
 function resetCostsChat(propertyId) {
   costsChatState = { turns: [], proposed: [] };
   costsChatPropertyId = propertyId;
+  costsChatQueue = [];
+  renderCostsChatQueue();
   const log = document.querySelector('[data-costs-chat-log]');
   if (log) { log.innerHTML = ''; log.classList.add('hidden'); }
   const ta = document.querySelector('[data-costs-chat-text]');
   if (ta) ta.value = '';
-  const msg = document.querySelector('[data-costs-chat-msg]');
-  if (msg) { msg.textContent = ''; msg.className = 'msg'; }
+  const files = document.querySelector('[data-costs-chat-files]');
+  if (files) files.value = '';
+  clearCostsChatMsg();
   const sum = document.querySelector('[data-costs-ai-summary]');
   if (sum) { sum.textContent = ''; sum.classList.add('hidden'); }
   renderCostsProposed();
+  syncCostsChatClearBtn();
+}
+
+// Clear session is offered only while there is something to
+// clear — turns on the log, proposals not yet applied, or
+// files still queued.
+function syncCostsChatClearBtn() {
+  const btn = document.querySelector('[data-costs-chat-clear]');
+  if (!btn) return;
+  btn.classList.toggle('hidden',
+    !(costsChatState.turns.length || costsChatState.proposed.length || costsChatQueue.length));
 }
 
 function costsChatLogHtml() {
@@ -3897,6 +4137,7 @@ function costsChatLogHtml() {
 function renderCostsChatLog(pendingText) {
   const log = document.querySelector('[data-costs-chat-log]');
   if (!log) return;
+  syncCostsChatClearBtn();
   const has = costsChatState.turns.length > 0 || pendingText;
   log.classList.toggle('hidden', !has);
   log.innerHTML = costsChatLogHtml()
@@ -3934,6 +4175,7 @@ function costMonthlySummaryText(p) {
 function renderCostsProposed() {
   const host = document.querySelector('[data-costs-proposed]');
   if (!host) return;
+  syncCostsChatClearBtn();
   const proposed = costsChatState.proposed;
   if (!proposed.length) { host.innerHTML = ''; return; }
   const existing = new Map((costsData ? costsData.entries : []).map((e) => [costKeyOf(e.year, e.category), e]));
@@ -4048,6 +4290,7 @@ document.querySelector('[data-costs-proposed]').addEventListener('click', async 
     const sum = document.querySelector('[data-costs-ai-summary]');
     sum.textContent = `Applied ${chosen.length} ${chosen.length === 1 ? 'entry' : 'entries'}`;
     sum.classList.remove('hidden');
+    clearCostsChatMsg(); // a successful Apply supersedes an older error
     await loadCosts(currentPropertyId);
   } catch (err) {
     showMsg(msg, 'err', err.message);
@@ -4103,6 +4346,7 @@ document.querySelector('[data-costs-proposed]').addEventListener('input', (e) =>
   const panel = wrap.querySelector('[data-costs-ai-panel]');
   const toggle = document.querySelector('[data-costs-ai-toggle]');
   const sendBtn = wrap.querySelector('[data-costs-chat-send]');
+  const clearBtn = wrap.querySelector('[data-costs-chat-clear]');
   const modelSel = wrap.querySelector('[data-costs-chat-model]');
   const guidance = wrap.querySelector('[data-costs-ai-guidance]');
   const msg = wrap.querySelector('[data-costs-chat-msg]');
@@ -4117,11 +4361,48 @@ document.querySelector('[data-costs-proposed]').addEventListener('input', (e) =>
     }
   });
   toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
+  // Clear session: wipe the conversation and any unapplied
+  // proposals back to the empty state. Recorded entries are
+  // untouched (only Apply ever wrote), and neither the model
+  // choice nor the panel's open state resets — a fresh
+  // conversation can start immediately.
+  clearBtn.addEventListener('click', () => resetCostsChat(costsChatPropertyId));
+  const fileInput = wrap.querySelector('[data-costs-chat-files]');
+  const chatTa = wrap.querySelector('[data-costs-chat-text]');
+  const queueHost = wrap.querySelector('[data-costs-chat-queue]');
+  const queueFiles = (list) => {
+    const add = [...(list || [])];
+    if (!add.length) return;
+    costsChatQueue.push(...add);
+    renderCostsChatQueue();
+    clearCostsChatMsg(); // a changed file selection supersedes the last error
+  };
+  // Choose Files feeds the queue; the input itself resets so
+  // the same file can be picked again later.
+  fileInput.addEventListener('change', () => {
+    queueFiles(fileInput.files);
+    fileInput.value = '';
+  });
+  queueHost.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-costs-chat-queue-remove]');
+    if (!btn) return;
+    costsChatQueue.splice(Number(btn.dataset.costsChatQueueRemove), 1);
+    renderCostsChatQueue();
+  });
+  // Paste: a clipboard carrying files (a screenshot, copied
+  // files) joins the queue instead of pasting; a clipboard
+  // without files is left alone and pastes as text.
+  chatTa.addEventListener('paste', (e) => {
+    const files = e.clipboardData ? [...e.clipboardData.files] : [];
+    if (!files.length) return;
+    e.preventDefault();
+    queueFiles(files);
+  });
   sendBtn.addEventListener('click', async () => {
-    const ta = wrap.querySelector('[data-costs-chat-text]');
-    const fileInput = wrap.querySelector('[data-costs-chat-files]');
+    clearCostsChatMsg(); // a new send supersedes the last error
+    const ta = chatTa;
     const text = ta.value.trim();
-    const files = fileInput.files ? [...fileInput.files] : [];
+    const files = costsChatQueue.slice();
     if (!text && !files.length) { showMsg(msg, 'err', 'Write a message or attach a document first.'); return; }
     sendBtn.disabled = true;
     sendBtn.textContent = 'Sending…';
@@ -4149,6 +4430,9 @@ document.querySelector('[data-costs-proposed]').addEventListener('input', (e) =>
       costsChatState.proposed = r.proposed || [];
       ta.value = '';
       fileInput.value = '';
+      costsChatQueue = [];
+      renderCostsChatQueue();
+      clearCostsChatMsg(); // a successful round supersedes the last error
       renderCostsChatLog();
       renderCostsProposed();
     } catch (err) {
