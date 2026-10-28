@@ -5802,6 +5802,47 @@ try {
           return !!e && e.amount === 85
             && JSON.stringify(e.monthlyAmounts) === JSON.stringify({ '1': 80, '2': 90, '3': 85 });
         }));
+      // View mode shows every month of a monthly row: leave
+      // edit mode and read the always-on detail row under the
+      // Electricity entry — Jan/Feb/Mar at their recorded
+      // amounts, Apr–Dec filled with the 85 average and marked
+      // as fills; the twelve sum to the 1,020 year figure. The
+      // annual Property tax row carries no detail row, and
+      // switching the year swaps the detail rows with the table.
+      const elecRowId = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
+        .find((e) => e.category === 'Electricity').id;
+      const taxRowId = (await req('GET', `/api/properties/${costUiPid}/costs`)).data.entries
+        .find((e) => e.category === 'Property tax' && e.year === 2026).id;
+      const grabMonthRow = (id) => page.evaluate((rowId) => {
+        const row = document.querySelector(`#costsYears tr[data-cost-months-for="${rowId}"]`);
+        if (!row) return null;
+        return [...row.querySelectorAll('[data-mv-month]')].map((c) => ({
+          fill: c.classList.contains('is-fill'),
+          val: parseFloat(c.querySelector('.cost-mv-val').textContent.replace(/[$,]/g, '')),
+        }));
+      }, id);
+      await page.evaluate(() => document.querySelector('#costsEditToggleBtn').click());
+      await wait(300);
+      const mvElec = await grabMonthRow(elecRowId);
+      check('view mode: a monthly row shows all 12 months — recorded ones at their amounts, the rest avg fills (weakened) — summing to the year figure',
+        !!mvElec && mvElec.length === 12
+          && mvElec[0].val === 80 && !mvElec[0].fill
+          && mvElec[1].val === 90 && !mvElec[1].fill
+          && mvElec[2].val === 85 && !mvElec[2].fill
+          && mvElec.slice(3).every((c) => c.fill && c.val === 85)
+          && Math.abs(mvElec.reduce((a, c) => a + c.val, 0) - 1020) < 0.001,
+        JSON.stringify(mvElec));
+      check('an annual row carries no month detail row (the monthly one is the table’s only detail row)',
+        (await grabMonthRow(taxRowId)) === null
+          && (await page.evaluate(() => document.querySelectorAll('#costsYears tr[data-cost-months-for]').length)) === 1);
+      await selectCostYear(2025);
+      check('switching the year swaps the month detail rows with the table (2025 here is annual-only: none)',
+        (await page.evaluate(() => document.querySelectorAll('#costsYears tr[data-cost-months-for]').length)) === 0);
+      await selectCostYear(2026);
+      check('switching back to 2026 brings the Electricity month detail row back',
+        (await grabMonthRow(elecRowId)) !== null);
+      await page.evaluate(() => document.querySelector('#costsEditToggleBtn').click());
+      await wait(300);
       // By month with detail on record: actual months land at
       // their amounts, the rest fill with the average.
       await page.evaluate(() => document.querySelector('#costsGranularity button[data-gran="month"]').click());
@@ -6327,6 +6368,31 @@ try {
         !!(await until(() => !document.querySelector('#propOutline').classList.contains('awake'))));
       await page.evaluate(() => window.__fmOutline.setHideDelay(2500));
       await page.setViewport({ width: 800, height: 600 });
+      // A monthly row recorded before per-month detail existed
+      // (monthlyAmounts null) still shows its twelve months in
+      // view mode — every cell the stored average, every cell a
+      // fill. Driven last, on a scratch property: the reloads
+      // it takes would change this page's geometry (the AI
+      // chat collapses), which the outline jump checks above
+      // are sensitive to — and the totals asserted in the
+      // costs section stay untouched this way.
+      r = await req('POST', '/api/properties', { address: '9 Legacy Months Lane, Victoria, BC', purchase_date: '2024-01-01' });
+      const legacyPid = r.data.id;
+      await req('POST', `/api/properties/${legacyPid}/costs`, { year: 2026, category: 'Gas', amount: 60, basis: 'monthly' });
+      await req('POST', `/api/properties/${legacyPid}/costs`, { year: 2026, category: 'Property tax', amount: 1200 });
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, legacyPid);
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('view mode: a monthly row with no detail on record renders all 12 months as avg fills summing to its year figure',
+        await until(() => {
+          const rows = document.querySelectorAll('#costsYears tr[data-cost-months-for]');
+          if (rows.length !== 1) return false;
+          const cells = [...rows[0].querySelectorAll('[data-mv-month]')];
+          if (cells.length !== 12) return false;
+          const sum = cells.reduce((a, c) => a
+            + parseFloat(c.querySelector('.cost-mv-val').textContent.replace(/[$,]/g, '')), 0);
+          return cells.every((c) => c.classList.contains('is-fill')) && Math.abs(sum - 720) < 0.001;
+        }));
+      await req('DELETE', `/api/properties/${legacyPid}`);
       await req('DELETE', `/api/properties/${costUiPid}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.

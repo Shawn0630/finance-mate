@@ -3406,7 +3406,10 @@ $('#trendCancelBtn').addEventListener('click', resetTrendForm);
 // given average and renders the same way. Year totals and both
 // charts all work at the ANNUAL figure (monthly rows show it
 // with an "avg $X/mo" annotation, so nobody does the ×12 in
-// their head).
+// their head). Under each monthly row the table renders the
+// twelve months themselves — always on, no expander — at the
+// chart's figures: recorded months at their amounts, the rest
+// filled with the average and weakened.
 //
 // The two charts are display only: a per-year share pie (of
 // the selected year) and a bar+line combo (category-stacked
@@ -3544,6 +3547,25 @@ function costAmountCell(e) {
     return `${money2(Number(e.amount) * 12)}<div class="cost-mo-note">${note}</div>`;
   }
   return money2(e.amount);
+}
+
+// The always-on month detail rendered under a monthly row:
+// the twelve months at the same figures the By month chart
+// uses — months on record at their actual amounts, months the
+// row does not carry filled with its average and weakened
+// (class is-fill), so a fill never reads as a recorded bill.
+// The twelve sum back to the row's annual figure. A row with
+// no detail on record (monthlyAmounts null — the pre-detail
+// form) is twelve fills at its stored average.
+function costMonthsViewRowHtml(e) {
+  const det = e.monthlyAmounts || {};
+  const cells = MONTH_NAMES.map((name, i) => {
+    const recorded = det[String(i + 1)];
+    const actual = recorded !== undefined && recorded !== null;
+    const v = actual ? Number(recorded) : Number(e.amount);
+    return `<span class="cost-mv-cell${actual ? '' : ' is-fill'}" data-mv-month="${i + 1}"><span class="cost-mv-name">${name}</span><span class="cost-mv-val">${money2(v)}</span></span>`;
+  }).join('');
+  return `<tr class="cost-months-row" data-cost-months-for="${e.id}"><td colspan="4"><div class="cost-months-view">${cells}</div></td></tr>`;
 }
 
 // The 12-month detail grid a monthly row opens into: one small
@@ -3687,6 +3709,7 @@ function costYearBlockHtml(year, entries, total, snap) {
           <button type="button" class="small" data-cost-edit="${e.id}">Edit</button>
           <button type="button" class="small danger" data-cost-del="${e.id}">Delete</button>` : ''}
         </td></tr>`);
+      if (e.basis === 'monthly') rows.push(costMonthsViewRowHtml(e));
     }
   }
   if (costsEditingKey === `new:${year}`) rows.push(costEditRowHtml(null, year, snap));

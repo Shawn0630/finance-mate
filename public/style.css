@@ -259,8 +259,9 @@ label.btnlike:hover { background: #f0f4f9; }
 .hidden { display: none !important; }
 /* Property costs: chart slot, the selected year's inline-
    editable table (year title row, footer total, the monthly-
-   average annotation under an annualized figure, the 12-month
-   detail grid a monthly row opens into), and the AI fill chat
+   average annotation under an annualized figure, the always-on
+   month row under a monthly entry, the 12-month detail grid a
+   monthly row opens into when edited), and the AI fill chat
    (log, guidance, proposal rows — a conflicting proposal is
    tinted, shows old → new and starts unchecked). */
 .costs-topbar select { width: auto; }
@@ -279,6 +280,16 @@ label.btnlike:hover { background: #f0f4f9; }
 .cost-year-head .cost-year-hint { font-size: 11px; font-weight: 400; color: #71808f; }
 table.costs-table { width: 100%; }
 .costs-table td .cost-mo-note { font-size: 11px; color: #71808f; }
+/* The always-on month detail under a monthly row: a quiet
+   sub-row (light fill, no separator of its own) with the twelve
+   months as small stacked cells; average-filled months are
+   weakened so they never read as recorded bills. */
+.costs-table tr.cost-months-row td { background: #f8fafc; border-bottom: 1px solid #e6ecf2; padding-top: 0; padding-bottom: 8px; }
+.cost-months-view { display: grid; grid-template-columns: repeat(12, minmax(52px, 1fr)); gap: 2px 8px; }
+.cost-mv-cell { display: flex; flex-direction: column; }
+.cost-mv-name { font-size: 10px; letter-spacing: .05em; text-transform: uppercase; color: #71808f; }
+.cost-mv-val { font-size: 11.5px; color: #22303c; white-space: nowrap; }
+.cost-mv-cell.is-fill .cost-mv-val { color: #a7b5c2; }
 .costs-table tfoot tr.cost-year-total td { font-weight: 650; background: #f4f7fa; border-top: 1px solid #dde4ec; }
 .costs-table tr.cost-editing td { background: #fbfcfe; }
 .costs-table input[type="number"] { width: 96px; }
