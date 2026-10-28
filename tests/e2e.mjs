@@ -8172,6 +8172,71 @@ try {
       check('investments UI: a fund on trade prices keeps the record-NAV-snapshots banner',
         fundNote.includes('Priced from trade prices') && fundNote.includes('record NAV snapshots below'),
         fundNote.slice(0, 300));
+      // Splits: a 2021-style buy (78 units @ 100.30) is created
+      // with the holding; recording a 3:1 split on the holding
+      // page restates the header to 234 units and reprices the
+      // value against the adjusted stub closes (234 × 165),
+      // while the events table shows the split as its own row.
+      await page.goto(`http://ff.local/#invest-account/${invTfsaId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('#addHoldingBtn');
+      await page.waitForFunction(() => !document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 10000 });
+      // Pick the XQQ.TO candidate first (typing in the label
+      // field would open ITS dropdown over the symbol input);
+      // the pick fills the label, which is then renamed by
+      // evaluate — no typing, no second dropdown.
+      await page.type('#investHoldingForm [name="symbol"]', 'XQQ');
+      await page.waitForSelector('#investHoldingForm [data-symbol-suggest] li', { visible: true, timeout: 10000 });
+      await page.click('#investHoldingForm [data-symbol-suggest] li');
+      await page.evaluate(() => {
+        const f = document.querySelector('#investHoldingForm');
+        f.elements.label.value = 'Split XQQ';
+        const row = document.querySelector('#investHoldingForm [data-init-row]');
+        row.querySelector('[data-f="date"]').value = '2021-01-15';
+      });
+      await page.type('#investHoldingForm [data-init-row] [data-f="units"]', '78');
+      await page.type('#investHoldingForm [data-init-row] [data-f="price"]', '100.30');
+      await page.click('#investHoldingForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 15000 });
+      await waitI(600);
+      await page.evaluate(() => {
+        const row = [...document.querySelectorAll('#investHoldingsWrap tr')]
+          .find((tr) => tr.textContent.includes('Split XQQ'));
+        if (row) row.click();
+      });
+      await page.waitForFunction(() => location.hash.startsWith('#invest-holding/'), { timeout: 10000 });
+      await waitI(800);
+      const beforeSplit = await page.evaluate(() => {
+        const statCard2 = (name) => [...document.querySelectorAll('#investHoldingStats .summary-card')]
+          .find((c) => c.querySelector('.k').textContent === name).querySelector('.v').textContent;
+        return { units: statCard2('Units'), value: statCard2('Current value') };
+      });
+      check('investments UI: before the split the header shows the recorded 78 units',
+        beforeSplit.units === '78' && beforeSplit.value.includes('12,870'),
+        JSON.stringify(beforeSplit));
+      await page.select('#investEventForm [name="type"]', 'split');
+      await page.evaluate(() => { document.querySelector('#investEventForm [name="date"]').value = '2024-08-09'; });
+      await page.type('#investEventForm [name="splitNew"]', '3');
+      await page.type('#investEventForm [name="splitOld"]', '1');
+      await page.click('#investEventSubmit');
+      await page.waitForFunction(() => {
+        const card = [...document.querySelectorAll('#investHoldingStats .summary-card')]
+          .find((c) => c.querySelector('.k').textContent === 'Units');
+        return card && card.querySelector('.v').textContent === '234';
+      }, { timeout: 15000 });
+      const afterSplit = await page.evaluate(() => {
+        const statCard3 = (name) => [...document.querySelectorAll('#investHoldingStats .summary-card')]
+          .find((c) => c.querySelector('.k').textContent === name).querySelector('.v').textContent;
+        return {
+          units: statCard3('Units'), value: statCard3('Current value'),
+          events: document.querySelector('#investEventsWrap').textContent,
+        };
+      });
+      check('investments UI: the 3:1 split restates the header to 234 units and the adjusted-scale value',
+        afterSplit.units === '234' && afterSplit.value.includes('38,610'),
+        JSON.stringify({ units: afterSplit.units, value: afterSplit.value }));
+      check('investments UI: the split renders as its own "Split · 3:1" event row',
+        afterSplit.events.includes('Split · 3:1'), afterSplit.events.slice(0, 300));
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

@@ -4784,6 +4784,17 @@ async function deleteInvestHolding(id) {
 }
 window.deleteInvestHolding = deleteInvestHolding;
 
+// A split event's ratio as recorded — "3:1", "1:2" — trimming
+// float dust off the stored sides.
+function splitRatioText(e) {
+  const t = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '?';
+    return String(Number.isInteger(n) ? n : Math.round(n * 10000) / 10000);
+  };
+  return `${t(e.split_new ?? e.splitNew)}:${t(e.split_old ?? e.splitOld)}`;
+}
+
 // --------------------------------------------------------- holding level
 async function loadInvestHoldingImpl(id) {
   const data = await api(`/api/investments/holdings/${id}`);
@@ -4814,9 +4825,9 @@ async function loadInvestHoldingImpl(id) {
   noteEl.innerHTML = notes.map(esc).join('<br>');
   if (investHoldingChart) investHoldingChart.destroy();
   investHoldingChart = drawInvestChart($('#investHoldingChart'), 'investHolding', data.series, h.currency, true);
-  const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend' };
+  const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend', split: 'Split' };
   const rows = data.events.map((e) => `<tr>
-      <td>${esc(e.date)}</td><td>${typeLabels[e.type] || esc(e.type)}${aiBadge(e.source)}</td>
+      <td>${esc(e.date)}</td><td>${e.type === 'split' ? `Split · ${splitRatioText(e)}` : (typeLabels[e.type] || esc(e.type))}${aiBadge(e.source)}</td>
       <td class="num">${e.units != null ? fmtUnits(e.units) : '—'}</td>
       <td class="num">${e.price != null ? moneyC(e.price, h.currency) : (e.type === 'grant' ? '<span class="note" style="margin:0">market</span>' : '—')}</td>
       <td class="num">${e.amount != null ? moneyC(e.amount, h.currency) : '—'}</td>
@@ -4857,9 +4868,11 @@ function resetInvestEventForm() {
 function syncInvestEventFields() {
   const type = $('#investEventForm').elements.type.value;
   const isDiv = type === 'dividend';
-  document.querySelector('[data-ev-units]').classList.toggle('hidden', isDiv);
-  document.querySelector('[data-ev-price]').classList.toggle('hidden', isDiv);
+  const isSplit = type === 'split';
+  document.querySelector('[data-ev-units]').classList.toggle('hidden', isDiv || isSplit);
+  document.querySelector('[data-ev-price]').classList.toggle('hidden', isDiv || isSplit);
   document.querySelector('[data-ev-amount]').classList.toggle('hidden', !isDiv);
+  document.querySelector('[data-ev-split]').classList.toggle('hidden', !isSplit);
   $('#investEventForm').elements.price.placeholder = type === 'grant' ? 'blank = market' : '';
 }
 $('#investEventForm').elements.type.addEventListener('change', syncInvestEventFields);
@@ -4875,6 +4888,8 @@ function editInvestEvent(id) {
   form.elements.units.value = e.units ?? '';
   setMoneyValue(form.elements.price, e.price);
   setMoneyValue(form.elements.amount, e.amount);
+  form.elements.splitNew.value = e.split_new ?? '';
+  form.elements.splitOld.value = e.split_old ?? '';
   form.elements.note.value = e.note || '';
   syncInvestEventFields();
   $('#investEventSubmit').textContent = 'Save event';
@@ -4895,8 +4910,15 @@ $('#investEventForm').addEventListener('submit', async (e) => {
   const f = Object.fromEntries(new FormData(form).entries());
   parseMoneyFields(f, ['price', 'amount']);
   const id = f.id; delete f.id;
-  if (f.type === 'dividend') { f.units = null; f.price = null; }
-  else { f.amount = null; if (f.units === '') f.units = null; if (f.price === '') f.price = null; }
+  if (f.type === 'dividend') { f.units = null; f.price = null; f.splitNew = null; f.splitOld = null; }
+  else if (f.type === 'split') {
+    f.units = null; f.price = null; f.amount = null;
+    f.splitNew = f.splitNew === '' || f.splitNew == null ? null : Number(f.splitNew);
+    f.splitOld = f.splitOld === '' || f.splitOld == null ? null : Number(f.splitOld);
+  } else {
+    f.amount = null; f.splitNew = null; f.splitOld = null;
+    if (f.units === '') f.units = null; if (f.price === '') f.price = null;
+  }
   if (!f.note) f.note = null;
   try {
     if (id) await api(`/api/investments/events/${id}`, { method: 'PUT', body: f });
@@ -4979,17 +5001,21 @@ function investInitRow() {
     <label class="f-type">Type<select data-f="type">
       <option value="buy">Buy</option><option value="sell">Sell</option>
       <option value="grant">Grant</option><option value="dividend">Dividend</option>
+      <option value="split">Split</option>
     </select></label>
     <label class="f-date">Date<input type="date" data-f="date"></label>
     <label class="f-num" data-num>Units<input data-f="units" inputmode="decimal" autocomplete="off"></label>
     <label class="f-num" data-num>Price<input data-f="price" inputmode="decimal" autocomplete="off"></label>
     <label class="f-num hidden" data-amt>Amount<input data-f="amount" inputmode="decimal" autocomplete="off"></label>
+    <label class="f-num hidden" data-split>New : Old<span style="display:flex;gap:4px;align-items:center"><input data-f="splitNew" inputmode="decimal" autocomplete="off" style="width:52px"><span>:</span><input data-f="splitOld" inputmode="decimal" autocomplete="off" style="width:52px"></span></label>
     <button type="button" class="small danger f-x" data-remove-init-row title="Remove row">×</button>`;
   const type = row.querySelector('[data-f="type"]');
   const sync = () => {
     const div = type.value === 'dividend';
-    row.querySelectorAll('[data-num]').forEach((el) => el.classList.toggle('hidden', div));
+    const split = type.value === 'split';
+    row.querySelectorAll('[data-num]').forEach((el) => el.classList.toggle('hidden', div || split));
     row.querySelector('[data-amt]').classList.toggle('hidden', !div);
+    row.querySelector('[data-split]').classList.toggle('hidden', !split);
   };
   type.addEventListener('change', sync);
   sync();
@@ -5010,11 +5036,18 @@ function collectInvestInitEvents() {
     const units = val('units');
     const price = val('price');
     const amount = val('amount');
-    const touched = type === 'dividend' ? (date || amount) : (date || units || price);
+    const splitNew = val('splitNew');
+    const splitOld = val('splitOld');
+    const touched = type === 'dividend' ? (date || amount)
+      : type === 'split' ? (date || splitNew || splitOld)
+        : (date || units || price);
     if (!touched) return;
     const ev = { type, date };
     if (type === 'dividend') { if (amount) ev.amount = Number(amount); }
-    else {
+    else if (type === 'split') {
+      if (splitNew) ev.splitNew = Number(splitNew);
+      if (splitOld) ev.splitOld = Number(splitOld);
+    } else {
       if (units) ev.units = Number(units);
       if (price) ev.price = Number(price);
     }
@@ -5179,11 +5212,13 @@ function renderInvestProposed() {
       <select data-ie-target>${investTargetOptions(sel)}</select>
       <input type="date" data-ie-date value="${esc(e.date || '')}">
       <select data-ie-type>
-        ${['buy', 'sell', 'grant', 'dividend'].map((t) => `<option value="${t}"${e.type === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}
+        ${['buy', 'sell', 'grant', 'dividend', 'split'].map((t) => `<option value="${t}"${e.type === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}
       </select>
       <input type="text" inputmode="decimal" data-ie-units value="${e.units ?? ''}" placeholder="Units" style="width:84px">
       <input type="text" inputmode="decimal" data-money data-ie-price value="${esc(formatMoneyInput(e.price ?? ''))}" placeholder="Price" style="width:110px">
       <input type="text" inputmode="decimal" data-money data-ie-amount value="${esc(formatMoneyInput(e.amount ?? ''))}" placeholder="Dividend $" style="width:110px">
+      <input type="text" inputmode="decimal" data-ie-splitnew value="${e.splitNew ?? ''}" placeholder="Split new" title="Split ratio — new side" style="width:76px">
+      <input type="text" inputmode="decimal" data-ie-splitold value="${e.splitOld ?? ''}" placeholder="Split old" title="Split ratio — old side" style="width:76px">
       ${e.conflict ? '<span class="conflict-tag">Same event already recorded — applies only if checked</span>' : ''}
       <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
     </div>`;
@@ -5228,11 +5263,17 @@ function readInvestProposed() {
       date: row.querySelector('[data-ie-date]').value,
       type,
       units: null, price: null, amount: null,
+      splitNew: null, splitOld: null,
       note: prev.note || null,
       conflict: prev.conflict || null,
     };
     if (type === 'dividend') ev.amount = parseMoneyInput(row.querySelector('[data-ie-amount]').value);
-    else {
+    else if (type === 'split') {
+      const sn = row.querySelector('[data-ie-splitnew]').value.trim();
+      ev.splitNew = sn === '' ? null : Number(sn);
+      const so = row.querySelector('[data-ie-splitold]').value.trim();
+      ev.splitOld = so === '' ? null : Number(so);
+    } else {
       const u = row.querySelector('[data-ie-units]').value.trim();
       ev.units = u === '' ? null : Number(u);
       const p = parseMoneyInput(row.querySelector('[data-ie-price]').value);
@@ -5297,7 +5338,10 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     }
   }
   for (const ev of chosenEvents) {
-    if (!ev.date || (ev.type === 'dividend' ? !(ev.amount > 0) : !(ev.units > 0))) {
+    const figuresOk = ev.type === 'dividend' ? ev.amount > 0
+      : ev.type === 'split' ? (ev.splitNew > 0 && ev.splitOld > 0)
+        : ev.units > 0;
+    if (!ev.date || !figuresOk) {
       showMsg(msg, 'err', 'A selected event is missing its date or figures.');
       return;
     }

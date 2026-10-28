@@ -178,10 +178,12 @@
         <div><label>Type</label><select name="type">
           <option value="buy">Buy</option><option value="sell">Sell</option>
           <option value="grant">Grant (RSU)</option><option value="dividend">Dividend</option>
+          <option value="split">Split</option>
         </select></div>
         <div data-ev-units><label>Units</label><input type="text" inputmode="decimal" name="units" style="width:110px"></div>
         <div data-ev-price><label>Price / unit</label><input type="text" inputmode="decimal" data-money name="price" style="width:130px"></div>
         <div data-ev-amount class="hidden"><label>Amount</label><input type="text" inputmode="decimal" data-money name="amount" style="width:130px"></div>
+        <div data-ev-split class="hidden"><label>Split ratio (New : Old)</label><span style="display:flex;gap:4px;align-items:center"><input type="text" inputmode="decimal" name="splitNew" style="width:64px"><span>:</span><input type="text" inputmode="decimal" name="splitOld" style="width:64px"></span></div>
         <div><label>Note</label><input type="text" name="note" style="width:160px"></div>
         <button class="primary" type="submit" id="investEventSubmit">Add event</button>
         <button type="button" id="investEventCancel" class="hidden">Cancel edit</button>

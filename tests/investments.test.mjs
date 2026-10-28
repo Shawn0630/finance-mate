@@ -14,6 +14,7 @@ import {
   validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints,
+  splitMultiplier, splitFactorAfter, adjustedUnitsOf,
 } from '../src/investments.js';
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices,
@@ -202,10 +203,10 @@ test('validAccountInput / validHoldingInput: shapes and required fields', () => 
 
 test('validEventInput: per-type figures, grant price optional, sell guard', () => {
   assert.deepEqual(validEventInput({ date: '2026-01-05', type: 'buy', units: 10, price: 100 }),
-    { date: '2026-01-05', type: 'buy', units: 10, price: 100, amount: null, note: null });
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100, amount: null, splitNew: null, splitOld: null, note: null });
   assert.equal(validEventInput({ date: '2026-01-05', type: 'grant', units: 5 }).price, null);
   assert.deepEqual(validEventInput({ date: '2026-01-05', type: 'dividend', amount: 42.5 }),
-    { date: '2026-01-05', type: 'dividend', units: null, price: null, amount: 42.5, note: null });
+    { date: '2026-01-05', type: 'dividend', units: null, price: null, amount: 42.5, splitNew: null, splitOld: null, note: null });
   for (const bad of [
     { date: '2026-13-01', type: 'buy', units: 1, price: 1 },
     { date: '2026-01-05', type: 'buy', units: 0, price: 1 },
@@ -244,6 +245,157 @@ test('rebuildEventPricePoints: priced events materialize, dividends never do', (
   points = listPricePoints(db, 7);
   assert.deepEqual(points.map((p) => [p.date, p.price]), [['2026-01-10', 105]]);
   db.close();
+});
+
+// ------------------------------------------------------------ splits
+const SPLIT31 = { id: 90, date: '2024-08-09', type: 'split', units: null, price: null, amount: null, split_new: 3, split_old: 1 };
+
+test('split validation: a split carries only its ratio (either field spelling)', () => {
+  const v = validEventInput({ date: '2024-08-09', type: 'split', splitNew: 3, splitOld: 1 });
+  assert.equal(v.error, undefined, JSON.stringify(v));
+  assert.deepEqual([v.splitNew, v.splitOld, v.units, v.price, v.amount], [3, 1, null, null, null]);
+  const snake = validEventInput({ date: '2024-08-09', type: 'split', split_new: 1, split_old: 2 });
+  assert.deepEqual([snake.splitNew, snake.splitOld], [1, 2]);
+  assert.match(validEventInput({ date: '2024-08-09', type: 'split', splitNew: 3 }).error, /ratio/);
+  assert.match(validEventInput({ date: '2024-08-09', type: 'split', splitNew: 2, splitOld: 2 }).error, /change the unit count/);
+  assert.equal(splitMultiplier(SPLIT31), 3);
+  assert.equal(splitMultiplier({ type: 'split', splitNew: 1, splitOld: 2 }), 0.5);
+  assert.equal(splitMultiplier({ type: 'buy', units: 5 }), 1);
+});
+
+test('unitsOn restates lots by the splits that followed them', () => {
+  const events = [
+    E(1, '2021-01-15', 'buy', 20, 100),
+    E(2, '2021-06-01', 'buy', 10, 110),
+    SPLIT31,
+  ];
+  // Restatement is unconditional: even a pre-split date reads
+  // in current terms (60, not 20) — the same convention as
+  // split-adjusted price series.
+  assert.equal(unitsOn(events, '2021-02-01'), 60);
+  assert.equal(unitsOn(events, '2026-10-28'), 90);
+  assert.equal(splitFactorAfter(events, '2021-01-15'), 3);
+  assert.equal(splitFactorAfter(events, '2024-08-09'), 1, 'a split does not restate itself');
+  assert.equal(adjustedUnitsOf(events[0], events), 60);
+  // Reverse split halves the count.
+  const rev = [E(1, '2020-01-10', 'buy', 100, 10), { id: 2, date: '2022-05-02', type: 'split', split_new: 1, split_old: 2 }];
+  assert.equal(unitsOn(rev, '2026-01-01'), 50);
+});
+
+test('split engine: adjusted closes meet restated units; dollars never restate', () => {
+  const events = [
+    E(1, '2021-01-15', 'buy', 20, 100),
+    E(2, '2021-06-01', 'buy', 10, 110),
+    SPLIT31,
+    E(4, '2025-03-10', 'dividend', null, null, 45),
+  ];
+  const points = [
+    P('2021-01-29', 34), P('2021-06-30', 37), P('2024-08-30', 40), P('2026-10-15', 42),
+  ];
+  const out = computeHoldingSeries({ events, points, fxRate: () => 1, today: '2026-10-28' });
+  // Summary: 90 current units at the latest adjusted close;
+  // contributions are the recorded dollars (3100), unchanged.
+  assert.equal(out.summary.units, 90);
+  assert.equal(out.summary.latestPrice, 42);
+  assert.equal(out.summary.valueNative, 3780);
+  assert.equal(out.summary.contributionsNative, 3100);
+  assert.equal(out.summary.dividendsNative, 45);
+  assert.equal(out.summary.totalReturnNative, 725);
+  const jan21 = out.monthly.find((m) => m.month === '2021-01');
+  assert.deepEqual(
+    [jan21.endValueNative, jan21.contributionsNative, jan21.gainNative, jan21.returnPctNative, jan21.unitsEnd],
+    [2040, 2000, 40, 2, 60], JSON.stringify(jan21));
+  const jun21 = out.monthly.find((m) => m.month === '2021-06');
+  assert.deepEqual(
+    [jun21.startValueNative, jun21.endValueNative, jun21.contributionsNative, jun21.gainNative, jun21.returnPctNative],
+    [2040, 3330, 1100, 190, 6.05], JSON.stringify(jun21));
+  // The split month itself books no jump: both sides of it are
+  // already in current terms, only the price move counts.
+  const aug24 = out.monthly.find((m) => m.month === '2024-08');
+  assert.deepEqual(
+    [aug24.startValueNative, aug24.endValueNative, aug24.contributionsNative, aug24.gainNative, aug24.unitsEnd],
+    [3330, 3600, 0, 270, 90], JSON.stringify(aug24));
+  for (const m of out.monthly) {
+    assert.ok(Math.abs(m.endValueNative - (m.startValueNative + m.contributionsNative + m.gainNative)) < 0.011,
+      `identity holds in ${m.month}`);
+  }
+});
+
+test('trade-price fallback: event prices divide by the splits that followed them', () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE invest_events (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, type TEXT, units REAL, price REAL, amount REAL, split_new REAL, split_old REAL, note TEXT, source TEXT, created_at TEXT, updated_at TEXT);
+    CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));
+  `);
+  const ts = new Date().toISOString();
+  const ins = db.prepare('INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, source, created_at, updated_at) VALUES (7, ?, ?, ?, ?, ?, ?, ?, \'manual\', ?, ?)');
+  ins.run('2021-03-01', 'buy', 10, 90, null, null, null, ts, ts);
+  ins.run('2024-01-15', 'split', null, null, null, 3, 1, ts, ts);
+  rebuildEventPricePoints(db, 7, ts);
+  assert.deepEqual(listPricePoints(db, 7).map((p) => [p.date, p.price, p.source]),
+    [['2021-03-01', 30, 'event']], 'the $90 trade price restates to $30');
+  db.close();
+  // And the engine on those points: 30 restated units × $30 =
+  // the $900 that actually moved — value is invariant.
+  const out = computeHoldingSeries({
+    events: [E(1, '2021-03-01', 'buy', 10, 90), { id: 2, date: '2024-01-15', type: 'split', split_new: 3, split_old: 1 }],
+    points: [P('2021-03-01', 30, 'event')],
+    fxRate: () => 1, today: '2026-10-28',
+  });
+  assert.equal(out.summary.units, 30);
+  assert.equal(out.summary.valueNative, 900);
+  assert.equal(out.summary.contributionsNative, 900);
+  assert.equal(out.summary.totalReturnNative, 0);
+});
+
+test('sell guard after a split compares in current terms on both sides', () => {
+  const events = [
+    { id: 1, date: '2020-06-01', type: 'buy', units: 10, price: 50 },
+    { id: 2, date: '2021-03-01', type: 'split', split_new: 3, split_old: 1 },
+  ];
+  const sell = (date, units) => validEventInput({ date, type: 'sell', units, price: 40 }, { events });
+  assert.equal(sell('2022-01-10', 25).error, undefined, '25 of the 30 current units');
+  assert.match(sell('2022-01-10', 31).error, /cannot sell/);
+  // A pre-split sell is restated too: selling all 10 old units
+  // in 2020 is fine; an 11th never existed in any terms.
+  assert.equal(sell('2020-07-01', 10).error, undefined);
+  assert.match(sell('2020-07-01', 11).error, /cannot sell/);
+  assert.equal(unitsAvailableForSell(events, '2022-01-10'), 30);
+});
+
+test('validInitialEvents: a batch may carry a split; sells judge against restated units', () => {
+  const ok = validInitialEvents([
+    { date: '2021-01-15', type: 'buy', units: 10, price: 100 },
+    { date: '2024-08-09', type: 'split', splitNew: 3, splitOld: 1 },
+    { date: '2025-01-10', type: 'sell', units: 25, price: 40 },
+  ]);
+  assert.equal(ok.error, undefined, JSON.stringify(ok));
+  assert.deepEqual(ok.events.map((e) => [e.type, e.splitNew ?? null]), [['buy', null], ['split', 3], ['sell', null]]);
+  assert.match(validInitialEvents([
+    { date: '2021-01-15', type: 'buy', units: 10, price: 100 },
+    { date: '2024-08-09', type: 'split', splitNew: 3, splitOld: 1 },
+    { date: '2025-01-10', type: 'sell', units: 31, price: 40 },
+  ]).error, /cannot sell/);
+});
+
+test('normalizeProposedInvestments: split proposals normalize and flag duplicates', () => {
+  const out = normalizeProposedInvestments({
+    events: [
+      { holdingId: 12, date: '2024-08-09', type: 'split', splitNew: 3, splitOld: 1 },
+      { holdingId: 12, date: '2024-09-01', type: 'split', splitNew: 2, splitOld: 2 }, // 1:1 — dropped
+      { holdingId: 12, date: '2024-10-01', type: 'split', splitNew: 3 },               // one side — dropped
+    ],
+  }, { existingHoldings: EXISTING, existingEvents: EXISTING[0].events });
+  assert.equal(out.events.length, 1, JSON.stringify(out.events));
+  assert.deepEqual([out.events[0].type, out.events[0].splitNew, out.events[0].splitOld, out.events[0].conflict],
+    ['split', 3, 1, null]);
+  const dupe = normalizeProposedInvestments({
+    events: [{ holdingId: 12, date: '2024-08-09', type: 'split', splitNew: 3, splitOld: 1 }],
+  }, {
+    existingHoldings: EXISTING,
+    existingEvents: [{ id: 44, holding_id: 12, date: '2024-08-09', type: 'split', split_new: 3, split_old: 1 }],
+  });
+  assert.equal(dupe.events[0].conflict, 'duplicate-event');
 });
 
 // ------------------------------------------------------- Yahoo tier
@@ -450,7 +602,7 @@ test('normalizeProposedInvestments: normalization and duplicate flags', () => {
   assert.equal(out.events[0].conflict, 'duplicate-event');
   assert.deepEqual(out.events[2], {
     holdingId: null, holdingRef: 'h2', date: '2026-02-03', type: 'buy',
-    units: 20, price: 31.5, amount: null, note: null, conflict: null,
+    units: 20, price: 31.5, amount: null, splitNew: null, splitOld: null, note: null, conflict: null,
   });
 });
 

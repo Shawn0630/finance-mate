@@ -5,7 +5,9 @@
 // account → holding).
 //
 // Return engine — the conventions, pinned by tests:
-//   units(t)      = Σ buy + Σ grant − Σ sell over events dated ≤ t.
+//   units(t)      = Σ buy + Σ grant − Σ sell over events dated ≤ t,
+//                   every lot restated into current terms by the
+//                   splits that followed it (see Splits below).
 //   price(t)      = the last price point dated ≤ t (invest_prices;
 //                   same-date ties resolve manual > stooq > yahoo
 //                   > event — a hand-recorded NAV outranks a
@@ -35,11 +37,53 @@
 // values at 0 until its first priced event / snapshot and its
 // view says so (priceStatus.pricedBy 'none') — the app never
 // invents a price.
+//
+// Splits — a 'split' event carries a ratio (split_new : split_old,
+// e.g. 3:1; a reverse split is 1:2, multiplier 0.5). Fetched
+// closes are already split-adjusted (current terms), so every
+// quantity is restated into current terms before it meets a
+// price: an event's adjusted units = its recorded units × the
+// product of the multipliers of every split dated AFTER it.
+// History is restated the same way adjusted price series are:
+// a pre-split lot reads at its current-terms size in every
+// month, and an event (trade) price divides by the same product
+// so the fallback path lands on the same scale. Contribution
+// DOLLARS (buy cost, sell proceeds, dividend amounts) are never
+// restated — they are money that actually moved — and the sell
+// guard compares in current terms on both sides, which reduces
+// to the old recorded-terms check when no split exists.
 
 export const ACCOUNT_TYPES = ['TFSA', 'RRSP', 'RSU', 'NonRegistered', 'Other'];
 export const HOLDING_KINDS = ['exchange', 'fund'];
 export const HOLDING_CURRENCIES = ['CAD', 'USD'];
-export const EVENT_TYPES = ['buy', 'sell', 'grant', 'dividend'];
+export const EVENT_TYPES = ['buy', 'sell', 'grant', 'dividend', 'split'];
+
+// ------------------------------------------------------------- splits
+// A split event's multiplier: split_new / split_old (3:1 → 3,
+// 1:2 → 0.5). Rows carry the ratio sides as split_new/split_old
+// (DB / API shape) or splitNew/splitOld (validated shape).
+export function splitMultiplier(e) {
+  if (!e || e.type !== 'split') return 1;
+  const n = Number(e.split_new ?? e.splitNew);
+  const o = Number(e.split_old ?? e.splitOld);
+  return Number.isFinite(n) && Number.isFinite(o) && n > 0 && o > 0 ? n / o : 1;
+}
+
+// The product of the multipliers of every split dated strictly
+// after `date` — the factor that restates a quantity recorded
+// on that date into current (post-all-splits) terms.
+export function splitFactorAfter(events, date) {
+  let f = 1;
+  for (const e of events || []) {
+    if (e && e.type === 'split' && e.date > date) f *= splitMultiplier(e);
+  }
+  return f;
+}
+
+// An event's units restated into current terms.
+export function adjustedUnitsOf(e, events) {
+  return Number(e.units || 0) * splitFactorAfter(events, e.date);
+}
 
 const round2 = (n) => Math.round(n * 100) / 100;
 const round4 = (n) => Math.round(n * 10000) / 10000;
@@ -118,12 +162,15 @@ export function validHoldingInput(b, base = null) {
 // Sell guard: the units a sell may move are what the holding
 // holds ON the event's date (all other events dated ≤ that date;
 // a same-day event always lands after the ones already recorded).
+// Both sides are compared in CURRENT terms — every lot restated
+// by the splits that followed it — which is the recorded-terms
+// check whenever no split exists.
 export function unitsAvailableForSell(events, date, exceptId = null) {
   let u = 0;
   for (const e of events) {
     if (e.id === exceptId || e.date > date) continue;
-    if (e.type === 'buy' || e.type === 'grant') u += Number(e.units || 0);
-    else if (e.type === 'sell') u -= Number(e.units || 0);
+    if (e.type === 'buy' || e.type === 'grant') u += adjustedUnitsOf(e, events);
+    else if (e.type === 'sell') u -= adjustedUnitsOf(e, events);
   }
   return round4(u);
 }
@@ -139,11 +186,25 @@ export function validEventInput(b, ctx = {}) {
     date: merged.date,
     type: merged.type,
     units: null, price: null, amount: null,
+    splitNew: null, splitOld: null,
     note: cleanStr(merged.note, 500),
   };
   if (merged.type === 'dividend') {
     out.amount = posNum(merged.amount);
     if (out.amount == null) return { error: 'a dividend needs an amount > 0' };
+    return out;
+  }
+  if (merged.type === 'split') {
+    // A split moves no money and trades no units itself — it
+    // restates every earlier lot. Only the ratio is recorded.
+    out.splitNew = posNum(merged.splitNew ?? merged.split_new);
+    out.splitOld = posNum(merged.splitOld ?? merged.split_old);
+    if (out.splitNew == null || out.splitOld == null) {
+      return { error: 'a split needs both sides of its ratio (new : old) as numbers > 0' };
+    }
+    if (out.splitNew === out.splitOld) {
+      return { error: 'a split ratio must change the unit count (new ≠ old)' };
+    }
     return out;
   }
   out.units = posNum(merged.units);
@@ -161,7 +222,11 @@ export function validEventInput(b, ctx = {}) {
   }
   if (merged.type === 'sell' && Array.isArray(ctx.events)) {
     const avail = unitsAvailableForSell(ctx.events, out.date, ctx.exceptId ?? null);
-    if (out.units > avail + 1e-9) {
+    // The candidate folds by the splits after ITS date, the
+    // same restatement the recorded lots get — the comparison
+    // is in current terms on both sides.
+    const mine = out.units * splitFactorAfter(ctx.events, out.date);
+    if (mine > avail + 1e-9) {
       return { error: `cannot sell ${out.units} units on ${out.date} — only ${avail} held` };
     }
   }
@@ -169,15 +234,18 @@ export function validEventInput(b, ctx = {}) {
 }
 
 // The Add Holding form's optional initial transactions: a batch
-// of events created together with a brand-new holding. Each row
-// goes through the same validEventInput rules as a detail-page
-// event, but the batch is validated in DATE order (input order
-// breaks same-day ties) with every already-validated row counting
-// toward the next row's sell guard — so a sell is only accepted
-// against units the batch itself has acquired by that date, the
-// same "a same-day event lands after the ones already recorded"
-// convention as the single-event path. Any bad row fails the
-// whole batch; the caller creates nothing.
+// of events created together with a brand-new holding. Rows are
+// validated in DATE order (input order breaks same-day ties) in
+// two passes: first every row's shape through the same
+// validEventInput rules as a detail-page event, then the sell
+// guard across the whole batch in current terms — a sell is
+// only accepted against units the batch itself has acquired by
+// that date, with split restatement computed over the FULL
+// batch (a split later in the batch still restates an earlier
+// buy before an in-between sell is judged), the same "a same-day
+// event lands after the ones already recorded" convention as
+// the single-event path. Any bad row fails the whole batch; the
+// caller creates nothing.
 export function validInitialEvents(list) {
   if (list === undefined || list === null) return { events: [] };
   if (!Array.isArray(list)) return { error: 'events must be an array' };
@@ -188,9 +256,21 @@ export function validInitialEvents(list) {
   });
   const validated = [];
   for (const { row } of ordered) {
-    const v = validEventInput(row || {}, { events: validated });
+    const v = validEventInput(row || {}, {});
     if (v.error) return { error: v.error };
     validated.push(v);
+  }
+  let balance = 0; // current-terms units acquired so far
+  for (const v of validated) {
+    const f = splitFactorAfter(validated, v.date);
+    if (v.type === 'buy' || v.type === 'grant') balance += Number(v.units) * f;
+    else if (v.type === 'sell') {
+      const mine = Number(v.units) * f;
+      if (mine > balance + 1e-9) {
+        return { error: `cannot sell ${v.units} units on ${v.date} — only ${round4(balance / f)} held` };
+      }
+      balance -= mine;
+    }
   }
   return { events: validated };
 }
@@ -232,7 +312,10 @@ export function listFxPoints(db) {
 // 'event') so the price function sees every source through one
 // table. Rebuilt wholesale after any event mutation: priced
 // buys/sells/grants contribute their per-unit price; dividends
-// never do (their amount is a total, not a price).
+// never do (their amount is a total, not a price). A trade
+// price is recorded in the terms of its day, so it is divided
+// by the splits that followed it — the materialized point is
+// in current terms, the scale the restated unit counts use.
 export function rebuildEventPricePoints(db, holdingId, ts) {
   const events = listEvents(db, holdingId);
   db.transaction(() => {
@@ -240,8 +323,8 @@ export function rebuildEventPricePoints(db, holdingId, ts) {
     const ins = db.prepare(
       "INSERT OR REPLACE INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, 'event', ?)");
     for (const e of events) {
-      if (e.type !== 'dividend' && e.price != null && Number(e.price) > 0) {
-        ins.run(holdingId, e.date, Number(e.price), ts);
+      if (e.type !== 'dividend' && e.type !== 'split' && e.price != null && Number(e.price) > 0) {
+        ins.run(holdingId, e.date, Number(e.price) / splitFactorAfter(events, e.date), ts);
       }
     }
   })();
@@ -278,12 +361,15 @@ export function fxOn(fxPoints, date) {
   return best ? Number(best.rate) : Number(fxPoints[0].rate);
 }
 
+// Units held on a date, in CURRENT terms: each lot is restated
+// by every split that followed it (splits themselves move no
+// units here — they act through the restatement).
 export function unitsOn(events, date) {
   let u = 0;
   for (const e of events) {
     if (e.date > date) continue;
-    if (e.type === 'buy' || e.type === 'grant') u += Number(e.units || 0);
-    else if (e.type === 'sell') u -= Number(e.units || 0);
+    if (e.type === 'buy' || e.type === 'grant') u += adjustedUnitsOf(e, events);
+    else if (e.type === 'sell') u -= adjustedUnitsOf(e, events);
   }
   return round4(u);
 }
@@ -315,14 +401,18 @@ export function computeHoldingSeries({ events, points, fxRate, today }) {
     const native = units * px.price;
     return { native, cad: native * fxAt(date), units };
   };
-  // A grant with no stated price contributes at the market price
-  // on its own date (from whatever price source covers it); with
-  // no price anywhere it contributes 0 — and the holding view can
+  // A grant's contribution, in dollars: at its stated cost
+  // price (recorded units × recorded price — money terms, never
+  // restated) or, when unstated, at the market price on its own
+  // date (from whatever price source covers it). A market price
+  // lives in current terms, so it multiplies the grant's
+  // RESTATED units to land on the same dollars. With no price
+  // anywhere the grant contributes 0 — and the holding view can
   // count those (unpricedGrants in the summary).
-  const grantPrice = (e) => {
-    if (e.price != null) return Number(e.price);
+  const grantValue = (e) => {
+    if (e.price != null) return Number(e.units) * Number(e.price);
     const px = priceOn(points, e.date);
-    return px ? px.price : 0;
+    return px ? adjustedUnitsOf(e, sorted) * px.price : 0;
   };
   const flowsIn = (month) => {
     let contribN = 0; let contribC = 0; let divN = 0; let divC = 0;
@@ -331,7 +421,7 @@ export function computeHoldingSeries({ events, points, fxRate, today }) {
       const fx = fxAt(e.date);
       if (e.type === 'buy') { const v = Number(e.units) * Number(e.price); contribN += v; contribC += v * fx; }
       else if (e.type === 'sell') { const v = Number(e.units) * Number(e.price); contribN -= v; contribC -= v * fx; }
-      else if (e.type === 'grant') { const v = Number(e.units) * grantPrice(e); contribN += v; contribC += v * fx; }
+      else if (e.type === 'grant') { const v = grantValue(e); contribN += v; contribC += v * fx; }
       else if (e.type === 'dividend') { const v = Number(e.amount || 0); divN += v; divC += v * fx; }
     }
     return { contribN, contribC, divN, divC };

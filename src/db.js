@@ -193,10 +193,12 @@ CREATE TABLE IF NOT EXISTS invest_events (
   id INTEGER PRIMARY KEY,
   holding_id INTEGER NOT NULL REFERENCES invest_holdings(id) ON DELETE CASCADE,
   date TEXT NOT NULL,                          -- 'YYYY-MM-DD'
-  type TEXT NOT NULL,                          -- 'buy' | 'sell' | 'grant' | 'dividend'
+  type TEXT NOT NULL,                          -- 'buy' | 'sell' | 'grant' | 'dividend' | 'split'
   units REAL,                                  -- buy/sell/grant: units moved
   price REAL,                                  -- per-unit price in the holding's currency; grant: cost-basis price, NULL = market price on the grant date
   amount REAL,                                 -- dividend: total paid, in the holding's currency
+  split_new REAL,                              -- split only: the ratio's new side (3:1 → 3)
+  split_old REAL,                              -- split only: the ratio's old side (3:1 → 1); multiplier = split_new / split_old
   note TEXT,
   source TEXT NOT NULL DEFAULT 'manual',       -- 'manual' | 'ai'
   created_at TEXT NOT NULL,
@@ -329,6 +331,18 @@ if (!propCols.includes('hs_id_address')) {
   const costCols = db.prepare('PRAGMA table_info(property_costs)').all().map((c) => c.name);
   if (costCols.length && !costCols.includes('monthly_amounts')) {
     db.exec('ALTER TABLE property_costs ADD COLUMN monthly_amounts TEXT');
+  }
+}
+// invest_events: databases created before split events have no
+// ratio columns. Existing rows keep NULL — they are not splits,
+// exactly how they were always interpreted.
+{
+  const evCols = db.prepare('PRAGMA table_info(invest_events)').all().map((c) => c.name);
+  if (evCols.length && !evCols.includes('split_new')) {
+    db.exec('ALTER TABLE invest_events ADD COLUMN split_new REAL');
+  }
+  if (evCols.length && !evCols.includes('split_old')) {
+    db.exec('ALTER TABLE invest_events ADD COLUMN split_old REAL');
   }
 }
 // rate_segments: databases created before prime-spread pricing have

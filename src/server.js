@@ -2365,9 +2365,9 @@ app.post('/api/investments/accounts/:id/holdings', requireApiAuth, (req, res) =>
       .run(account.id, v.label, v.kind, v.symbol, v.fundCode, v.currency, source, ts, ts);
     holdingId = info.lastInsertRowid;
     const ins = db.prepare(
-      'INSERT INTO invest_events (holding_id, date, type, units, price, amount, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     for (const e of ev.events) {
-      ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.note, source, ts, ts);
+      ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, source, ts, ts);
     }
   })();
   if (ev.events.length) rebuildEventPricePoints(db, holdingId, ts);
@@ -2420,8 +2420,8 @@ app.post('/api/investments/holdings/:id/events', requireApiAuth, (req, res) => {
   if (v.error) return res.status(400).json({ error: v.error });
   const ts = nowIso();
   const info = db.prepare(
-    'INSERT INTO invest_events (holding_id, date, type, units, price, amount, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(holding.id, v.date, v.type, v.units, v.price, v.amount, v.note,
+    'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(holding.id, v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note,
       req.body && req.body.source === 'ai' ? 'ai' : 'manual', ts, ts);
   rebuildEventPricePoints(db, holding.id, ts);
   res.status(201).json(db.prepare('SELECT * FROM invest_events WHERE id = ?').get(info.lastInsertRowid));
@@ -2435,8 +2435,8 @@ app.put('/api/investments/events/:id', requireApiAuth, (req, res) => {
   });
   if (v.error) return res.status(400).json({ error: v.error });
   const ts = nowIso();
-  db.prepare('UPDATE invest_events SET date = ?, type = ?, units = ?, price = ?, amount = ?, note = ?, updated_at = ? WHERE id = ?')
-    .run(v.date, v.type, v.units, v.price, v.amount, v.note, ts, ev.id);
+  db.prepare('UPDATE invest_events SET date = ?, type = ?, units = ?, price = ?, amount = ?, split_new = ?, split_old = ?, note = ?, updated_at = ? WHERE id = ?')
+    .run(v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note, ts, ev.id);
   rebuildEventPricePoints(db, ev.holding_id, ts);
   res.json(db.prepare('SELECT * FROM invest_events WHERE id = ?').get(ev.id));
 });

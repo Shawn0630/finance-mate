@@ -721,8 +721,9 @@ export async function handleAiFillChat(input, deps = {}) {  const env = deps.env
 //      "holdings": [{"ref": "h1", "label": "…", "kind": "exchange"|"fund",
 //                    "symbol": "XQQ.TO"|null, "fundCode": null, "currency": "CAD"|"USD"}],
 //      "events":   [{"holdingId": 12} | {"holdingRef": "h1"},
-//                   "date": "YYYY-MM-DD", "type": "buy"|"sell"|"grant"|"dividend",
-//                   "units": n|null, "price": n|null, "amount": n|null]
+//                   "date": "YYYY-MM-DD", "type": "buy"|"sell"|"grant"|"dividend"|"split",
+//                   "units": n|null, "price": n|null, "amount": n|null,
+//                   "splitNew": n|null, "splitOld": n|null]
 //    },
 //    "ready": bool}
 //
@@ -759,10 +760,14 @@ const INVEST_CHAT_PROMPT = [
   '- Target: "holdingId" (the id of an already-recorded holding, from the list below) or',
   '  "holdingRef" (the ref of a holding in this same draft).',
   '- "type": "buy" (a purchase), "sell", "grant" (RSU / employer share grants vesting —',
-  '  units received, not bought), "dividend" (cash paid out).',
+  '  units received, not bought), "dividend" (cash paid out), "split" (a stock split or',
+  '  reverse split restating the unit count).',
   '- buy/sell/grant carry "units" and "price" (per-unit price in the holding\'s currency).',
   '  A grant\'s price may be null when the document gives no value — the app then uses the',
   '  market price on the grant date. A dividend carries "amount" (the total paid) instead.',
+  '  A split carries "splitNew" and "splitOld" (the ratio sides — a 3-for-1 split is',
+  '  splitNew 3, splitOld 1; a 1-for-2 reverse split is splitNew 1, splitOld 2) and no',
+  '  units/price/amount.',
   '- "date": the transaction date, YYYY-MM-DD.',
   '',
   'AMBIGUITY — never guess:',
@@ -786,6 +791,7 @@ function fmtHoldingLine(h) {
 function fmtEventLine(e) {
   const bits = [`#${e.id}`, e.date, e.type];
   if (e.type === 'dividend') bits.push(`amount ${e.amount}`);
+  else if (e.type === 'split') bits.push(`split ${e.split_new ?? e.splitNew}:${e.split_old ?? e.splitOld}`);
   else {
     bits.push(`${e.units} units`);
     if (e.price != null) bits.push(`@ ${e.price}`);
@@ -833,7 +839,7 @@ export function normalizeProposedInvestments(raw, deps = {}) {
   if (Array.isArray(raw.events)) {
     for (const item of raw.events) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-      const type = normEnum(item.type, ['buy', 'sell', 'grant', 'dividend']);
+      const type = normEnum(item.type, ['buy', 'sell', 'grant', 'dividend', 'split']);
       const date = normDate(item.date);
       if (!type || !date) continue;
       const holdingId = Number.isInteger(Number(item.holdingId)) && holdingIds.has(Number(item.holdingId))
@@ -843,12 +849,18 @@ export function normalizeProposedInvestments(raw, deps = {}) {
       const ev = {
         holdingId, holdingRef, date, type,
         units: null, price: null, amount: null,
+        splitNew: null, splitOld: null,
         note: normStr(item.note, 500),
         conflict: null,
       };
       if (type === 'dividend') {
         ev.amount = normNum(item.amount);
         if (ev.amount == null || ev.amount <= 0) continue;
+      } else if (type === 'split') {
+        ev.splitNew = normNum(item.splitNew ?? item.split_new);
+        ev.splitOld = normNum(item.splitOld ?? item.split_old);
+        if (ev.splitNew == null || ev.splitNew <= 0 || ev.splitOld == null || ev.splitOld <= 0
+          || ev.splitNew === ev.splitOld) continue;
       } else {
         ev.units = normNum(item.units);
         if (ev.units == null || ev.units <= 0) continue;
@@ -861,7 +873,9 @@ export function normalizeProposedInvestments(raw, deps = {}) {
           Number(e.holding_id ?? e.holdingId) === holdingId && e.date === date && e.type === type
           && (type === 'dividend'
             ? Number(e.amount) === ev.amount
-            : Number(e.units) === ev.units && Number(e.price ?? NaN) === Number(ev.price ?? NaN)));
+            : type === 'split'
+              ? Number(e.split_new ?? e.splitNew) === ev.splitNew && Number(e.split_old ?? e.splitOld) === ev.splitOld
+              : Number(e.units) === ev.units && Number(e.price ?? NaN) === Number(ev.price ?? NaN)));
         if (dupe) ev.conflict = 'duplicate-event';
       }
       out.events.push(ev);
@@ -885,7 +899,7 @@ export function buildInvestChatMessages({ account, holdings, draft, history, tex
     ...(draft && (draft.holdings.length || draft.events.length)
       ? [
         ...draft.holdings.map((h) => `- new holding [${h.ref}] ${h.label} · ${h.kind}${h.symbol ? ` · ${h.symbol}` : ''} · ${h.currency}`),
-        ...draft.events.map((e) => `- event ${e.date} ${e.type} on ${e.holdingId != null ? `holding #${e.holdingId}` : `draft ${e.holdingRef}`}${e.type === 'dividend' ? ` amount ${e.amount}` : ` ${e.units} units${e.price != null ? ` @ ${e.price}` : ''}`}`),
+        ...draft.events.map((e) => `- event ${e.date} ${e.type} on ${e.holdingId != null ? `holding #${e.holdingId}` : `draft ${e.holdingRef}`}${e.type === 'dividend' ? ` amount ${e.amount}` : e.type === 'split' ? ` split ${e.splitNew}:${e.splitOld}` : ` ${e.units} units${e.price != null ? ` @ ${e.price}` : ''}`}`),
       ]
       : ['- (none yet)']),
   ].join('\n');
