@@ -301,6 +301,27 @@ const fxStubBase = `http://127.0.0.1:${fxStub.address().port}/valet/observations
 // every other symbol 404s like Yahoo does for unknown tickers.
 const yahooDay = (y, m, d) => Date.UTC(y, m, d) / 1000;
 const yahooStub = http.createServer((req, res) => {
+  // The v1/finance/search endpoint behind the Add Holding
+  // autocomplete (the app derives its URL from YAHOO_BASE_URL's
+  // origin, so it lands on this same stub): "XQQ" returns a TSX
+  // and a NASDAQ candidate; "FAIL" simulates an upstream outage;
+  // anything else finds nothing.
+  const su = new URL(req.url, 'http://x');
+  if (su.pathname === '/v1/finance/search') {
+    const q = (su.searchParams.get('q') || '').toUpperCase();
+    if (q.includes('FAIL')) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('search unavailable');
+      return;
+    }
+    const quotes = q.includes('XQQ') ? [
+      { symbol: 'XQQ.TO', shortname: 'ISHARES NASDAQ 100 INDEX ETF', longname: 'iShares NASDAQ 100 Index ETF', exchange: 'TOR', exchDisp: 'Toronto', quoteType: 'ETF' },
+      { symbol: 'QQQ', shortname: 'Invesco QQQ Trust', exchange: 'NMS', exchDisp: 'NASDAQ', quoteType: 'ETF' },
+    ] : [];
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ quotes }));
+    return;
+  }
   if (decodeURIComponent(req.url).includes('HXQ.TO')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -7772,6 +7793,53 @@ try {
   r = await req('GET', `/api/investments/accounts/${invScratchId}`);
   check('investments: a deleted account is a 404', r.status === 404, JSON.stringify(r.data));
 
+  // ---- security search + atomic initial transactions ----
+  r = await req('GET', '/api/invest/search?q=XQQ');
+  check('invest search: XQQ returns the TSX candidate as CAD and the NASDAQ one as USD',
+    r.status === 200 && Array.isArray(r.data.results)
+      && r.data.results.some((c) => c.symbol === 'XQQ.TO' && c.currency === 'CAD' && /Toronto/.test(c.exchange || ''))
+      && r.data.results.some((c) => c.symbol === 'QQQ' && c.currency === 'USD'),
+    JSON.stringify(r.data));
+  r = await req('GET', '/api/invest/search?q=ZZFAIL');
+  check('invest search: an upstream failure degrades to an empty list, never a 500',
+    r.status === 200 && Array.isArray(r.data.results) && r.data.results.length === 0,
+    JSON.stringify({ status: r.status, data: r.data }));
+
+  // A scratch account, removed afterwards so the portfolio
+  // totals the browser flow asserts stay untouched.
+  r = await req('POST', '/api/investments/accounts', { name: 'Batch', type: 'Other' });
+  const invBatchAcctId = r.data.id;
+  r = await invPost(invBatchAcctId, { label: 'Apple batch', kind: 'exchange', symbol: 'AAPL', currency: 'USD', events: [
+    { date: '2026-01-15', type: 'buy', units: 10, price: 190 },
+    { date: '2026-02-10', type: 'sell', units: 4, price: 205 },
+  ] });
+  const invBatchId = r.data.id;
+  check('investments: a holding is created together with its initial transactions',
+    r.status === 201 && !!invBatchId, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/holdings/${invBatchId}`);
+  const batchJan = r.data.monthly.find((m) => m.month === '2026-01');
+  const batchFeb = r.data.monthly.find((m) => m.month === '2026-02');
+  check('investments: batch events price like detail-page events (buy 10 @190, sell 4 @205; FX 1.30/1.40)',
+    r.data.events.length === 2
+      && batchJan && batchJan.contributions === 2470 && batchJan.endValue === 2600 && batchJan.gain === 130
+      && batchFeb && batchFeb.contributions === -1148 && batchFeb.endValue === 1764 && batchFeb.gain === 312,
+    JSON.stringify({ events: r.data.events.length, batchJan, batchFeb }));
+  // Atomicity: one bad row (a sell the batch has not covered)
+  // fails the whole creation and leaves no holding behind.
+  r = await invPost(invBatchAcctId, { label: 'Bad batch', kind: 'exchange', symbol: 'AAPL', currency: 'USD', events: [
+    { date: '2026-01-15', type: 'buy', units: 10, price: 190 },
+    { date: '2026-01-16', type: 'sell', units: 99, price: 190 },
+  ] });
+  check('investments: a bad initial row is a 400 for the whole creation', r.status === 400, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/accounts/${invBatchAcctId}`);
+  check('investments: the failed batch left no half-created holding behind',
+    r.data.holdings.length === 1 && r.data.holdings[0].holding.id === invBatchId,
+    JSON.stringify(r.data.holdings.map((h) => h.holding.label)));
+  await req('DELETE', `/api/investments/accounts/${invBatchAcctId}`);
+  r = await req('GET', '/api/investments');
+  check('investments: batch-account cleanup restores the portfolio total',
+    r.data.summary.value === 10350, JSON.stringify(r.data.summary));
+
   // ---- account-page AI fill chat (stub LLM), two rounds ----
   fs.writeFileSync(aiStubFile, JSON.stringify({
     reply: 'I found the VFV purchase on the statement. One question before I draft the Scotia fund: is the Scotia NASDAQ Index Fund denominated in CAD or USD?',
@@ -7903,6 +7971,117 @@ try {
       check('investments UI: the overview lists the accounts and the CAD portfolio total (AI-applied holdings included)',
         overviewText.includes('TFSA') && overviewText.includes('Employer RSU') && overviewText.includes('13,850'),
         overviewText.slice(0, 300));
+      // Stocks rename + the list head's geometry standard (the
+      // Properties par: 16px of vertical padding, content edges
+      // at +17 for the panels' 1px border + 16px padding).
+      const headGeom = await page.evaluate(() => {
+        const R = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+        const head = document.querySelector('#section-investments .section-head');
+        const title = head.querySelector('h2');
+        const btn = document.querySelector('#addInvestAccountBtn');
+        const strip = document.querySelector('#section-investments .summary-strip');
+        const card = strip.querySelector('.summary-card');
+        const panel = document.querySelector('#section-investments .panel');
+        const cards = panel.querySelector('.cards');
+        return {
+          title: title.textContent.trim(),
+          nav: document.querySelector('#assetsNav a[data-section="investments"]').textContent.trim(),
+          titleLeftDelta: Math.abs(R(title).left - (R(card).left + 17)),
+          btnRightDelta: Math.abs(R(btn).right - (R(panel).right - 17)),
+          btnTopGap: R(btn).top - R(head).top,
+          headStripGap: R(strip).top - R(btn).bottom,
+          cardsBottomDelta: Math.abs((R(panel).bottom - 17) - R(cards).bottom),
+        };
+      });
+      check('investments UI: the module reads "Stocks" and its head band meets the 16/17 padding standard',
+        headGeom.title === 'Stocks' && headGeom.nav === 'Stocks'
+          && headGeom.titleLeftDelta <= 3 && headGeom.btnRightDelta <= 3
+          && Math.abs(headGeom.btnTopGap - 16) <= 3 && Math.abs(headGeom.headStripGap - 16) <= 3
+          && headGeom.cardsBottomDelta <= 3,
+        JSON.stringify(headGeom));
+      // Account page: the head toolbar lines up the same way and
+      // its breadcrumb names the module "Stocks".
+      await page.goto(`http://ff.local/#invest-account/${invTfsaId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const acctGeom = await page.evaluate(() => {
+        const R = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right }; };
+        const bar = document.querySelector('#view-invest-account > .toolbar');
+        const link = bar.querySelector('a');
+        const panel = document.querySelector('#view-invest-account .panel');
+        const del = document.querySelector('#deleteInvestAccountBtn');
+        return {
+          back: link.textContent.replace(/\s+/g, ' ').trim(),
+          leftDelta: Math.abs(R(link).left - (R(panel).left + 17)),
+          rightDelta: Math.abs(R(del).right - (R(panel).right - 17)),
+        };
+      });
+      check('investments UI: the account page head lines up with its panels and points back to Stocks',
+        acctGeom.back.includes('Back to Stocks') && acctGeom.leftDelta <= 3 && acctGeom.rightDelta <= 3,
+        JSON.stringify(acctGeom));
+      // Add holding through the security autocomplete: type XQQ,
+      // pick the TSX candidate, then submit a buy row and a sell
+      // row as initial transactions.
+      await page.click('#addHoldingBtn');
+      await page.waitForFunction(() => !document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('#investHoldingForm [name="symbol"]', 'XQQ');
+      await page.waitForSelector('#investHoldingForm [data-symbol-suggest] li', { visible: true, timeout: 10000 });
+      const firstCandidate = await page.evaluate(() =>
+        document.querySelector('#investHoldingForm [data-symbol-suggest] li').textContent.replace(/\s+/g, ' ').trim());
+      await page.click('#investHoldingForm [data-symbol-suggest] li');
+      const filled = await page.evaluate(() => {
+        const f = document.querySelector('#investHoldingForm');
+        return {
+          label: f.elements.label.value, symbol: f.elements.symbol.value,
+          kind: f.elements.kind.value, currency: f.elements.currency.value,
+        };
+      });
+      check('investments UI: picking the XQQ.TO candidate auto-fills label, symbol, kind and CAD currency',
+        firstCandidate.includes('XQQ.TO') && filled.symbol === 'XQQ.TO'
+          && filled.label.includes('iShares') && filled.kind === 'exchange' && filled.currency === 'CAD',
+        JSON.stringify({ firstCandidate, filled }));
+      await page.evaluate(() => {
+        const rows = document.querySelectorAll('#investHoldingForm [data-init-row]');
+        const set = (row, f, v) => { row.querySelector(`[data-f="${f}"]`).value = v; };
+        set(rows[0], 'date', '2026-01-15'); set(rows[0], 'units', '10'); set(rows[0], 'price', '150');
+      });
+      await page.click('#investHoldingForm [data-add-init-row]');
+      await page.evaluate(() => {
+        const rows = document.querySelectorAll('#investHoldingForm [data-init-row]');
+        const set = (row, f, v) => { row.querySelector(`[data-f="${f}"]`).value = v; };
+        set(rows[1], 'type', 'sell'); set(rows[1], 'date', '2026-02-10'); set(rows[1], 'units', '4'); set(rows[1], 'price', '155');
+      });
+      await page.click('#investHoldingForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 15000 });
+      r = await req('GET', `/api/investments/accounts/${invTfsaId}`);
+      const uiRow = r.data.holdings.find((h) => h.holding.label === 'iShares NASDAQ 100 Index ETF');
+      check('investments UI: the submitted holding exists with its two initial events',
+        !!uiRow && uiRow.events.length === 2,
+        JSON.stringify(r.data.holdings.map((h) => h.holding.label)));
+      if (uiRow) {
+        r = await req('GET', `/api/investments/holdings/${uiRow.holding.id}`);
+        const uiJan = r.data.monthly.find((m) => m.month === '2026-01');
+        const uiFeb = r.data.monthly.find((m) => m.month === '2026-02');
+        const timeline = r.data.events.map((e) => `${e.date}:${e.type}`).join(' ');
+        check('investments UI: the holding timeline and monthly figures match the two submitted rows',
+          r.data.events.length === 2 && timeline.includes('2026-01-15:buy') && timeline.includes('2026-02-10:sell')
+            && uiJan && uiJan.contributions === 1500 && uiJan.endValue === 1400 && uiJan.gain === -100
+            && uiFeb && uiFeb.contributions === -620 && uiFeb.endValue === 900 && uiFeb.gain === 120,
+          JSON.stringify({ timeline, uiJan, uiFeb }));
+      }
+      // The pure-manual path: a bank fund typed freehand, no
+      // dropdown pick, no event rows — still creates fine.
+      await page.click('#addHoldingBtn');
+      await page.waitForFunction(() => !document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('#investHoldingForm [name="label"]', 'CIBC Canadian Index Fund');
+      await page.evaluate(() => { document.querySelector('#investHoldingForm').elements.kind.value = 'fund'; });
+      await waitI(600); // let the (empty) search round-trip settle; no pick is made
+      await page.click('#investHoldingForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 15000 });
+      r = await req('GET', `/api/investments/accounts/${invTfsaId}`);
+      const fundRow = r.data.holdings.find((h) => h.holding.label === 'CIBC Canadian Index Fund' && h.holding.source === 'manual');
+      check('investments UI: a bank fund created fully manually (no pick, no rows) lands with no events',
+        !!fundRow && fundRow.holding.kind === 'fund' && fundRow.events.length === 0,
+        JSON.stringify(fundRow && fundRow.holding));
       await page.goto(`http://ff.local/#invest-account/${invRsuId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitI(800);
       const rsuPage = await page.evaluate(() => ({

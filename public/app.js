@@ -202,6 +202,93 @@ const addSuggest = attachAddressSuggest(
 const propSuggest = attachAddressSuggest(
   $('#propForm .address-input'), $('#propForm .suggest-list'));
 
+// --------------------------------------------------- security suggest ---
+// Dropdown autocomplete for the holding form's label / symbol
+// inputs, backed by GET /api/invest/search (Yahoo Finance).
+// Picking a candidate fills label, symbol, kind=exchange and
+// currency in one go. Strictly an enhancement: the endpoint
+// degrades to an empty list on failure, and free-text entry —
+// the bank-fund path — never requires a pick.
+function attachSecuritySuggest(input, list, onPick) {
+  let items = [];
+  let active = -1;
+  let timer = null;
+  let seq = 0;
+  function close() {
+    list.classList.add('hidden');
+    list.innerHTML = '';
+    items = [];
+    active = -1;
+  }
+  function render() {
+    if (!items.length) { close(); return; }
+    list.innerHTML = '';
+    items.forEach((c, i) => {
+      const li = document.createElement('li');
+      const sym = document.createElement('span');
+      sym.className = 'sg-sym';
+      sym.textContent = c.symbol;
+      li.appendChild(sym);
+      li.appendChild(document.createTextNode(' ' + c.label));
+      const meta = [c.exchange, c.currency].filter(Boolean).join(' · ');
+      if (meta) {
+        const m = document.createElement('span');
+        m.className = 'sg-meta';
+        m.textContent = meta;
+        li.appendChild(m);
+      }
+      if (i === active) li.classList.add('active');
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); pick(i); });
+      list.appendChild(li);
+    });
+    list.classList.remove('hidden');
+  }
+  function pick(i) {
+    const c = items[i];
+    if (!c) return;
+    close();
+    onPick(c);
+    input.focus();
+  }
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { close(); return; }
+    timer = setTimeout(async () => {
+      const my = ++seq;
+      try {
+        const data = await api('/api/invest/search?q=' + encodeURIComponent(q));
+        if (my !== seq) return;
+        items = data.results || [];
+        active = items.length ? 0 : -1;
+        render();
+      } catch { if (my === seq) close(); }
+    }, 250);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (list.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, items.length - 1); render(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); render(); }
+    else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); pick(active); }
+    else if (e.key === 'Escape') { close(); }
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (!list.contains(e.target) && e.target !== input) close();
+  });
+  return { close };
+}
+function fillHoldingFromCandidate(c) {
+  const form = $('#investHoldingForm');
+  form.elements.label.value = c.label || '';
+  form.elements.symbol.value = c.symbol || '';
+  form.elements.kind.value = 'exchange';
+  if (c.currency) form.elements.currency.value = c.currency;
+}
+attachSecuritySuggest(
+  $('#investHoldingForm [name="symbol"]'), $('#investHoldingForm [data-symbol-suggest]'), fillHoldingFromCandidate);
+attachSecuritySuggest(
+  $('#investHoldingForm [name="label"]'), $('#investHoldingForm [data-label-suggest]'), fillHoldingFromCandidate);
+
 // --------------------------------------------------------------- modals ---
 function openModal(id) {
   $('#' + id).classList.remove('hidden');
@@ -226,7 +313,7 @@ document.addEventListener('keydown', (e) => {
 const ASSET_SECTIONS = [
   { key: 'overview', label: 'Overview' },
   { key: 'properties', label: 'Properties', addLabel: 'Add property' },
-  { key: 'investments', label: 'Investments' },
+  { key: 'investments', label: 'Stocks' },
   { key: 'fixed-assets', category: 'fixed_assets', label: 'Fixed assets', addLabel: 'Add fixed asset' },
   { key: 'stocks', category: 'stocks', label: 'Stocks', addLabel: 'Add stock' },
   { key: 'term-deposits', category: 'term_deposits', label: 'Term deposits', addLabel: 'Add term deposit' },
@@ -4592,7 +4679,7 @@ async function loadInvestmentsImpl() {
       <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${returnText(a.summary.totalReturn, a.summary.totalReturnPct)}</div>
     </div>`).join('');
   host.innerHTML = `
-    <div class="section-head"><h2>Investments</h2>
+    <div class="section-head"><h2>Stocks</h2>
       <div class="spacer"></div>
       <button class="small" id="refreshInvestBtn">Refresh prices</button>
       <button class="primary" id="addInvestAccountBtn">+ Add account</button></div>
@@ -4857,12 +4944,78 @@ $('#investAccountForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg($('#investAccountModalMsg'), 'err', err.message); }
 });
 
+// --------------------------------- holding initial transactions
+// The Add Holding form's optional initial-transactions block:
+// event rows created together with the holding (the server
+// validates the batch and writes it atomically). Rows are plain
+// DOM read back at submit: an untouched row is skipped, a
+// half-filled one goes to the server as-is and its error comes
+// back in the modal. Once created, the events are ordinary
+// detail-page events — editable and deletable like any other.
+function investInitRow() {
+  const row = document.createElement('div');
+  row.className = 'init-event-row';
+  row.setAttribute('data-init-row', '');
+  row.innerHTML = `
+    <label class="f-type">Type<select data-f="type">
+      <option value="buy">Buy</option><option value="sell">Sell</option>
+      <option value="grant">Grant</option><option value="dividend">Dividend</option>
+    </select></label>
+    <label class="f-date">Date<input type="date" data-f="date"></label>
+    <label class="f-num" data-num>Units<input data-f="units" inputmode="decimal" autocomplete="off"></label>
+    <label class="f-num" data-num>Price<input data-f="price" inputmode="decimal" autocomplete="off"></label>
+    <label class="f-num hidden" data-amt>Amount<input data-f="amount" inputmode="decimal" autocomplete="off"></label>
+    <button type="button" class="small danger f-x" data-remove-init-row title="Remove row">×</button>`;
+  const type = row.querySelector('[data-f="type"]');
+  const sync = () => {
+    const div = type.value === 'dividend';
+    row.querySelectorAll('[data-num]').forEach((el) => el.classList.toggle('hidden', div));
+    row.querySelector('[data-amt]').classList.toggle('hidden', !div);
+  };
+  type.addEventListener('change', sync);
+  sync();
+  row.querySelector('[data-remove-init-row]').addEventListener('click', () => row.remove());
+  return row;
+}
+function resetInvestInitRows() {
+  const host = $('#investHoldingForm [data-init-rows]');
+  host.innerHTML = '';
+  host.appendChild(investInitRow());
+}
+function collectInvestInitEvents() {
+  const events = [];
+  document.querySelectorAll('#investHoldingForm [data-init-row]').forEach((row) => {
+    const val = (f) => row.querySelector(`[data-f="${f}"]`).value.trim();
+    const type = val('type');
+    const date = val('date');
+    const units = val('units');
+    const price = val('price');
+    const amount = val('amount');
+    const touched = type === 'dividend' ? (date || amount) : (date || units || price);
+    if (!touched) return;
+    const ev = { type, date };
+    if (type === 'dividend') { if (amount) ev.amount = Number(amount); }
+    else {
+      if (units) ev.units = Number(units);
+      if (price) ev.price = Number(price);
+    }
+    events.push(ev);
+  });
+  return events;
+}
+$('#investHoldingForm [data-add-init-row]').addEventListener('click', () => {
+  $('#investHoldingForm [data-init-rows]').appendChild(investInitRow());
+});
+
 function openInvestHoldingModal(id) {
   const form = $('#investHoldingForm');
   form.reset();
   $('#investHoldingModalMsg').className = 'msg';
   form.elements.id.value = id || '';
   $('#investHoldingModalTitle').textContent = id ? 'Edit holding' : 'Add holding';
+  // Initial transactions only exist when creating a holding.
+  $('#investInitEvents').classList.toggle('hidden', !!id);
+  if (!id) resetInvestInitRows();
   if (id) {
     const rows = investAccountData ? investAccountData.holdings : [];
     const row = rows.find((r) => r.holding.id === id)
@@ -4888,7 +5041,11 @@ $('#investHoldingForm').addEventListener('submit', async (e) => {
   if (!f.fundCode) f.fundCode = null;
   try {
     if (id) await api(`/api/investments/holdings/${id}`, { method: 'PUT', body: f });
-    else await api(`/api/investments/accounts/${currentInvestAccountId}/holdings`, { method: 'POST', body: f });
+    else {
+      const events = collectInvestInitEvents();
+      if (events.length) f.events = events;
+      await api(`/api/investments/accounts/${currentInvestAccountId}/holdings`, { method: 'POST', body: f });
+    }
     closeModalEl($('#investHoldingModal'));
     if (location.hash.startsWith('#invest-holding/') && id) loadInvestHolding(Number(id));
     else if (currentInvestAccountId) loadInvestAccount(currentInvestAccountId);

@@ -18,11 +18,11 @@ import {
 import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
 import {
-  ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput,
+  ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   listAccounts, getAccount, listHoldings, getHolding, listEvents, rebuildEventPricePoints,
   computeHolding, computeAccount, computePortfolio,
 } from './investments.js';
-import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver } from './prices.js';
+import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities } from './prices.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -2300,6 +2300,13 @@ app.get('/api/investments', requireApiAuth, async (req, res) => {
   });
 });
 
+// Security search for the Add Holding autocomplete. Best-effort
+// by contract: upstream failure is an empty candidate list,
+// never an error — the form always works fully manual.
+app.get('/api/invest/search', requireApiAuth, async (req, res) => {
+  res.json({ results: await searchSecurities(req.query.q) });
+});
+
 app.post('/api/investments/accounts', requireApiAuth, (req, res) => {
   const v = validAccountInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
@@ -2343,12 +2350,28 @@ app.post('/api/investments/accounts/:id/holdings', requireApiAuth, (req, res) =>
   if (!account) return res.status(404).json({ error: 'account not found' });
   const v = validHoldingInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
+  // Optional initial transactions (the Add Holding form): the
+  // whole batch validates BEFORE anything is written, then the
+  // holding and its events land in one transaction — a bad row
+  // is a 400 with nothing persisted.
+  const ev = validInitialEvents(req.body ? req.body.events : undefined);
+  if (ev.error) return res.status(400).json({ error: ev.error });
   const ts = nowIso();
-  const info = db.prepare(
-    'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(account.id, v.label, v.kind, v.symbol, v.fundCode, v.currency,
-      req.body && req.body.source === 'ai' ? 'ai' : 'manual', ts, ts);
-  res.status(201).json(getHolding(db, info.lastInsertRowid));
+  const source = req.body && req.body.source === 'ai' ? 'ai' : 'manual';
+  let holdingId = null;
+  db.transaction(() => {
+    const info = db.prepare(
+      'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(account.id, v.label, v.kind, v.symbol, v.fundCode, v.currency, source, ts, ts);
+    holdingId = info.lastInsertRowid;
+    const ins = db.prepare(
+      'INSERT INTO invest_events (holding_id, date, type, units, price, amount, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const e of ev.events) {
+      ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.note, source, ts, ts);
+    }
+  })();
+  if (ev.events.length) rebuildEventPricePoints(db, holdingId, ts);
+  res.status(201).json(getHolding(db, holdingId));
 });
 
 app.get('/api/investments/holdings/:id', requireApiAuth, async (req, res) => {

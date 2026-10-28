@@ -139,6 +139,64 @@ export async function fetchYahooHistory(symbol, timeoutMs = 10000) {
   return rows;
 }
 
+// ------------------------------------------------------- Yahoo search
+// The security search behind the Add Holding autocomplete
+// (GET /api/invest/search). Lives on the same Yahoo host family
+// as the chart API (v1/finance/search), so the base derives from
+// YAHOO_BASE_URL's origin — the e2e stub serving the chart API
+// serves search too; YAHOO_SEARCH_BASE_URL overrides it outright.
+// Search is strictly best-effort: any failure resolves to an
+// empty candidate list and the form stays fully manual.
+const SEARCH_QUOTE_TYPES = new Set(['EQUITY', 'ETF', 'MUTUALFUND']);
+const SEARCH_CAD_EXCHANGES = new Set(['TOR', 'TSX', 'NEO', 'CNQ', 'TSXV']);
+const SEARCH_USD_EXCHANGES = new Set(['NMS', 'NGM', 'NCM', 'NYQ', 'ASE', 'PCX', 'NASDAQ', 'NYSE', 'AMEX', 'BATS']);
+
+// Map a v1/finance/search payload to dropdown candidates. The
+// payload rarely carries a currency, so it is derived from the
+// exchange — Toronto/NEO → CAD, the US venues → USD — with the
+// .TO suffix as a second CAD signal; anything else keeps the
+// payload's currency field when present, else null (the form
+// then leaves its currency select untouched).
+export function parseYahooSearch(json) {
+  const quotes = json && Array.isArray(json.quotes) ? json.quotes : [];
+  const out = [];
+  for (const q of quotes) {
+    if (!q || typeof q.symbol !== 'string' || !q.symbol.trim()) continue;
+    if (q.quoteType && !SEARCH_QUOTE_TYPES.has(q.quoteType)) continue;
+    const symbol = q.symbol.trim().toUpperCase();
+    const label = String(q.longname || q.shortname || symbol).trim();
+    const exchange = String(q.exchDisp || q.exchange || '').trim();
+    let currency = typeof q.currency === 'string' && q.currency.trim()
+      ? q.currency.trim().toUpperCase() : null;
+    if (!currency) {
+      const venue = String(q.exchange || '').trim().toUpperCase();
+      if (symbol.endsWith('.TO') || SEARCH_CAD_EXCHANGES.has(venue)) currency = 'CAD';
+      else if (SEARCH_USD_EXCHANGES.has(venue)) currency = 'USD';
+    }
+    out.push({ symbol, label, exchange, currency, quoteType: q.quoteType || null });
+  }
+  return out;
+}
+
+export async function searchSecurities(query, timeoutMs = 6000) {
+  const q = String(query || '').trim();
+  if (q.length < 2) return [];
+  try {
+    const base = process.env.YAHOO_SEARCH_BASE_URL
+      || new URL('/v1/finance/search',
+        process.env.YAHOO_BASE_URL || 'https://query1.finance.yahoo.com/v8/finance/chart/').href;
+    const url = `${base}${base.includes('?') ? '&' : '?'}q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'FinanceMate/1.0' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return [];
+    return parseYahooSearch(await res.json());
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------- FX
 export const FX_SERIES = 'FX_USDCAD';
 

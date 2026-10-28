@@ -29,7 +29,7 @@
     <nav class="subnav" id="assetsNav">
       <a href="#assets/overview" data-section="overview">Overview</a>
       <a href="#assets/properties" data-section="properties">Properties</a>
-      <a href="#assets/investments" data-section="investments">Investments</a>
+      <a href="#assets/investments" data-section="investments">Stocks</a>
       <a href="#assets/fixed-assets" data-section="fixed-assets">Fixed assets</a>
       <a href="#assets/stocks" data-section="stocks">Stocks</a>
       <a href="#assets/term-deposits" data-section="term-deposits">Term deposits</a>
@@ -117,7 +117,7 @@
 
   <!-- ==================== Investment account detail ==================== -->
   <section id="view-invest-account" class="hidden">
-    <div class="toolbar"><a href="#assets/investments">&larr; Back to Investments</a><div class="spacer"></div>
+    <div class="toolbar"><a href="#assets/investments">&larr; Back to Stocks</a><div class="spacer"></div>
       <button id="editInvestAccountBtn">Edit account</button>
       <button class="danger" id="deleteInvestAccountBtn">Delete account</button></div>
     <div class="msg" id="investAccountMsg"></div>
@@ -468,7 +468,9 @@
     <div class="msg" id="investHoldingModalMsg"></div>
     <form id="investHoldingForm">
       <input type="hidden" name="id">
-      <div><label>Label *</label><input name="label" required placeholder="e.g. CIBC U.S. Index Fund, XQQ" autocomplete="off"></div>
+      <div><label>Label *</label>
+        <div class="suggest-wrap"><input name="label" required placeholder="e.g. CIBC U.S. Index Fund, XQQ" autocomplete="off"><ul class="suggest-list hidden" data-label-suggest></ul></div>
+      </div>
       <div class="grid3">
         <div><label>Kind</label><select name="kind">
           <option value="exchange">Exchange (stock / ETF)</option><option value="fund">Bank mutual fund</option>
@@ -478,7 +480,14 @@
         </select></div>
         <div><label>Fund code</label><input name="fundCode" autocomplete="off"></div>
       </div>
-      <div><label>Symbol (exchange)</label><input name="symbol" placeholder="XQQ.TO, AAPL…" autocomplete="off"></div>
+      <div><label>Symbol (exchange)</label>
+        <div class="suggest-wrap"><input name="symbol" placeholder="XQQ.TO, AAPL…" autocomplete="off"><ul class="suggest-list hidden" data-symbol-suggest></ul></div>
+      </div>
+      <div class="init-events" id="investInitEvents">
+        <h4>Initial transactions <span class="note" style="margin:0">(optional)</span></h4>
+        <div data-init-rows></div>
+        <button type="button" class="small" data-add-init-row>+ Add another</button>
+      </div>
       <div class="toolbar">
         <button class="primary" type="submit">Save</button>
         <button type="button" data-close-modal>Cancel</button>

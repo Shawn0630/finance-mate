@@ -168,6 +168,33 @@ export function validEventInput(b, ctx = {}) {
   return out;
 }
 
+// The Add Holding form's optional initial transactions: a batch
+// of events created together with a brand-new holding. Each row
+// goes through the same validEventInput rules as a detail-page
+// event, but the batch is validated in DATE order (input order
+// breaks same-day ties) with every already-validated row counting
+// toward the next row's sell guard — so a sell is only accepted
+// against units the batch itself has acquired by that date, the
+// same "a same-day event lands after the ones already recorded"
+// convention as the single-event path. Any bad row fails the
+// whole batch; the caller creates nothing.
+export function validInitialEvents(list) {
+  if (list === undefined || list === null) return { events: [] };
+  if (!Array.isArray(list)) return { error: 'events must be an array' };
+  const ordered = list.map((row, i) => ({ row, i })).sort((a, b) => {
+    const da = a.row && typeof a.row.date === 'string' ? a.row.date : '';
+    const db2 = b.row && typeof b.row.date === 'string' ? b.row.date : '';
+    return da < db2 ? -1 : da > db2 ? 1 : a.i - b.i;
+  });
+  const validated = [];
+  for (const { row } of ordered) {
+    const v = validEventInput(row || {}, { events: validated });
+    if (v.error) return { error: v.error };
+    validated.push(v);
+  }
+  return { events: validated };
+}
+
 export function validNavInput(b) {
   if (!b || typeof b !== 'object') return { error: 'a NAV snapshot is required' };
   if (!isDateStr(b.date)) return { error: 'date must be YYYY-MM-DD' };

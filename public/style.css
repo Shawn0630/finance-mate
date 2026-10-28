@@ -178,6 +178,28 @@ td.num, th.num { text-align: right; }
    padding so the top gap is exactly the padding). */
 #section-properties .section-head { padding: 16px 17px; }
 #section-properties .section-head h2 { margin-top: 0; }
+/* Stocks list head: the same standard as Properties — inset to
+   the panels'/stat cards' content edges (1px border + 16px
+   padding) with 16px of air above and below the row. */
+#section-investments .section-head { padding: 16px 17px; }
+#section-investments .section-head h2 { margin-top: 0; }
+/* Stocks detail pages (account / holding): their head band is
+   the back-link toolbar — same inset so the back link and the
+   Edit/Delete buttons line up with the panels below, and the
+   same 16px of air around the band. */
+#view-invest-account > .toolbar, #view-invest-holding > .toolbar { padding: 16px 17px; margin: 0; }
+/* Security-search candidates in the holding form's dropdown. */
+.suggest-list li .sg-sym { font-weight: 650; }
+.suggest-list li .sg-meta { color: #71808f; font-size: 12px; margin-left: 8px; }
+/* Add Holding: the optional initial-transactions rows. */
+.init-events { margin-top: 14px; border-top: 1px solid #e6ecf2; padding-top: 10px; }
+.init-events h4 { margin: 0 0 8px; font-size: 13.5px; }
+.init-event-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
+.init-event-row label { margin: 0; }
+.init-event-row .f-type { flex: 0 1 118px; }
+.init-event-row .f-date { flex: 0 1 150px; }
+.init-event-row .f-num { flex: 0 1 112px; }
+.init-event-row .f-x { flex: 0 0 auto; margin-bottom: 1px; }
 .breakdown-card { cursor: pointer; padding: 16px; }
 .breakdown-card:hover { border-color: #1668c4; }
 .breakdown-card .k { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }

@@ -11,11 +11,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import {
-  validAccountInput, validHoldingInput, validEventInput, validNavInput,
+  validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints,
 } from '../src/investments.js';
-import { parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices } from '../src/prices.js';
+import {
+  parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices,
+  parseYahooSearch, searchSecurities,
+} from '../src/prices.js';
 import { handleAiInvestFillChat, normalizeProposedInvestments } from '../src/aiFill.js';
 
 const E = (id, date, type, units = null, price = null, amount = null) =>
@@ -417,6 +420,125 @@ test('handleAiInvestFillChat: two rounds — question first, draft completes aft
   assert.equal(r2.body.proposed.holdings[0].currency, 'CAD');
   assert.equal(r2.body.proposed.events.length, 2);
   assert.equal(r2.body.proposed.events[1].holdingRef, 'h1');
+});
+
+// --------------------------------------------------- security search
+test('parseYahooSearch: field mapping — TSX candidates are CAD, US venues USD', () => {
+  const out = parseYahooSearch({ quotes: [
+    { symbol: 'XQQ.TO', shortname: 'ISHARES NASDAQ 100 INDEX ETF', longname: 'iShares XQQ', exchange: 'TOR', exchDisp: 'Toronto', quoteType: 'ETF' },
+    { symbol: 'HXQ.TO', shortname: 'ISHARES HXQ', exchange: 'TSX', quoteType: 'ETF' }, // no exchDisp, .TO suffix still CAD
+    { symbol: 'QQQ', shortname: 'Invesco QQQ Trust', exchange: 'NMS', exchDisp: 'NASDAQ', quoteType: 'ETF' },
+    { symbol: 'AAPL', shortname: 'Apple Inc.', exchange: 'NMS', quoteType: 'EQUITY', currency: 'USD' },
+    { symbol: '^GSPC', shortname: 'S&P 500', exchange: 'SNP', quoteType: 'INDEX' }, // dropped
+    { symbol: 'USD/CAD', shortname: 'US Dollar', exchange: 'CCY', quoteType: 'CURRENCY' }, // dropped
+    { shortname: 'no symbol at all', quoteType: 'ETF' }, // dropped
+  ] });
+  assert.deepEqual(out.map((c) => [c.symbol, c.currency]), [
+    ['XQQ.TO', 'CAD'], ['HXQ.TO', 'CAD'], ['QQQ', 'USD'], ['AAPL', 'USD'],
+  ]);
+  assert.equal(out[0].label, 'iShares XQQ'); // longname wins over shortname
+  assert.equal(out[0].exchange, 'Toronto'); // exchDisp is the display label
+  assert.deepEqual(parseYahooSearch(null), []);
+  assert.deepEqual(parseYahooSearch({}), []);
+  assert.deepEqual(parseYahooSearch({ quotes: 'nope' }), []);
+});
+
+test('searchSecurities: stub Yahoo answers through the YAHOO_BASE_URL seam; failures degrade to []', async () => {
+  const realFetch = globalThis.fetch;
+  const savedEnv = { y: process.env.YAHOO_BASE_URL, s: process.env.YAHOO_SEARCH_BASE_URL };
+  delete process.env.YAHOO_SEARCH_BASE_URL;
+  process.env.YAHOO_BASE_URL = 'http://stub.test/v8/finance/chart/';
+  const seen = [];
+  try {
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      return {
+        ok: true, status: 200,
+        json: async () => ({ quotes: [
+          { symbol: 'XQQ.TO', shortname: 'ISHARES NASDAQ 100', exchange: 'TOR', exchDisp: 'Toronto', quoteType: 'ETF' },
+        ] }),
+      };
+    };
+    const hits = await searchSecurities('XQQ');
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].symbol, 'XQQ.TO');
+    assert.equal(hits[0].currency, 'CAD');
+    assert.ok(seen[0].includes('/v1/finance/search') && seen[0].includes('q=XQQ'), seen[0]);
+    // Upstream HTTP failure → empty list, never a throw.
+    globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({}) });
+    assert.deepEqual(await searchSecurities('XQQ'), []);
+    // Network failure → empty list.
+    globalThis.fetch = async () => { throw new Error('connection refused'); };
+    assert.deepEqual(await searchSecurities('XQQ'), []);
+    // Too-short queries never leave the process.
+    globalThis.fetch = async () => { throw new Error('must not be called'); };
+    assert.deepEqual(await searchSecurities('X'), []);
+    assert.deepEqual(await searchSecurities('  '), []);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    if (savedEnv.s === undefined) delete process.env.YAHOO_SEARCH_BASE_URL; else process.env.YAHOO_SEARCH_BASE_URL = savedEnv.s;
+  }
+});
+
+// --------------------------------------------- initial event batches
+test('validInitialEvents: absent/empty batches are fine; non-arrays are not', () => {
+  assert.deepEqual(validInitialEvents(undefined), { events: [] });
+  assert.deepEqual(validInitialEvents(null), { events: [] });
+  assert.deepEqual(validInitialEvents([]), { events: [] });
+  assert.match(validInitialEvents('buy 10').error, /array/);
+});
+
+test('validInitialEvents: a buy + later sell batch validates in date order', () => {
+  // Listed sell-first on purpose: validation sorts by date, so
+  // the January buy covers the February sell.
+  const out = validInitialEvents([
+    { date: '2026-02-10', type: 'sell', units: 4, price: 155 },
+    { date: '2026-01-15', type: 'buy', units: 10, price: 150 },
+    { date: '2026-03-01', type: 'dividend', amount: 12.5 },
+  ]);
+  assert.equal(out.error, undefined, JSON.stringify(out));
+  assert.deepEqual(out.events.map((e) => [e.date, e.type]), [
+    ['2026-01-15', 'buy'], ['2026-02-10', 'sell'], ['2026-03-01', 'dividend'],
+  ]);
+  assert.equal(out.events[2].amount, 12.5);
+});
+
+test('validInitialEvents: sells are checked against units acquired by their date', () => {
+  // Sell exceeds the cumulative position on its date.
+  assert.match(validInitialEvents([
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100 },
+    { date: '2026-01-06', type: 'sell', units: 15, price: 100 },
+  ]).error, /cannot sell/);
+  // Sell dated BEFORE the buy that would cover it.
+  assert.match(validInitialEvents([
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100 },
+    { date: '2026-01-04', type: 'sell', units: 5, price: 100 },
+  ]).error, /cannot sell/);
+  // Same day: the batch's own order decides — buy first covers
+  // the sell; sell first has nothing to draw on.
+  assert.equal(validInitialEvents([
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100 },
+    { date: '2026-01-05', type: 'sell', units: 10, price: 100 },
+  ]).error, undefined);
+  assert.match(validInitialEvents([
+    { date: '2026-01-05', type: 'sell', units: 5, price: 100 },
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100 },
+  ]).error, /cannot sell/);
+});
+
+test('validInitialEvents: any bad row fails the whole batch', () => {
+  assert.match(validInitialEvents([
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100 },
+    { date: '2026-01-06', type: 'buy', units: 5 }, // no price
+  ]).error, /price/);
+  assert.match(validInitialEvents([
+    { date: '2026-01-05', type: 'buy', units: 10, price: 100 },
+    { date: 'not-a-date', type: 'buy', units: 5, price: 1 },
+  ]).error, /date/);
+  assert.match(validInitialEvents([
+    { date: '2026-01-05', type: 'dividend' }, // no amount
+  ]).error, /amount/);
 });
 
 test('handleAiInvestFillChat: 404 unknown account, 400 missing input, 503 unconfigured, 502 junk reply', async () => {
