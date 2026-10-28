@@ -17,7 +17,7 @@ import {
 } from '../src/investments.js';
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices,
-  parseYahooSearch, searchSecurities,
+  parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory,
 } from '../src/prices.js';
 import { handleAiInvestFillChat, normalizeProposedInvestments } from '../src/aiFill.js';
 
@@ -331,6 +331,90 @@ test('ensureHoldingPrices: Stooq empty falls back to Yahoo; Stooq data never con
     if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
     if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
     db.close();
+  }
+});
+
+test('fetchYahooHistory: browser UA, and query1 failing over to query2', async () => {
+  // Yahoo 403s non-browser agents, so the market fetches must
+  // present as a browser; and with no YAHOO_BASE_URL seam set,
+  // a dead query1 must not empty the tier — query2 serves the
+  // same chart path.
+  const ts = (y, m, d) => Date.UTC(y, m, d) / 1000;
+  const chartJson = {
+    chart: {
+      result: [{
+        timestamp: [ts(2026, 0, 2), ts(2026, 1, 2)],
+        indicators: { quote: [{ close: [71.5, 72.25] }] },
+      }],
+      error: null,
+    },
+  };
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const savedYahoo = process.env.YAHOO_BASE_URL;
+  delete process.env.YAHOO_BASE_URL;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u, ua: opts && opts.headers && opts.headers['User-Agent'] });
+    if (u.includes('query1.finance.yahoo.com')) return { ok: false, status: 403 };
+    if (u.includes('query2.finance.yahoo.com')) return { ok: true, json: async () => chartJson };
+    throw new Error(`unexpected fetch: ${u}`);
+  };
+  try {
+    const rows = await fetchYahooHistory('XQQ.TO');
+    assert.deepEqual(rows, [
+      { date: '2026-01-02', price: 71.5 },
+      { date: '2026-02-02', price: 72.25 },
+    ]);
+    assert.equal(calls.length, 2, 'query1 tried once, then query2');
+    assert.ok(calls[0].url.includes('query1.finance.yahoo.com/v8/finance/chart/XQQ.TO'));
+    assert.ok(calls[1].url.includes('query2.finance.yahoo.com/v8/finance/chart/XQQ.TO'));
+    for (const c of calls) {
+      assert.match(c.ua || '', /Mozilla\/5\.0.*Chrome\//, 'a browser UA is sent');
+      assert.ok(!/FinanceMate/.test(c.ua || ''), 'the app UA that Yahoo blocks is gone');
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedYahoo === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedYahoo;
+  }
+});
+
+test('fetchYahooHistory: an explicit YAHOO_BASE_URL stays single-host', async () => {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const savedYahoo = process.env.YAHOO_BASE_URL;
+  process.env.YAHOO_BASE_URL = 'http://stub.test/yahoo/';
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return { ok: false, status: 403 };
+  };
+  try {
+    await assert.rejects(() => fetchYahooHistory('XQQ.TO'), /HTTP 403/);
+    assert.equal(calls.length, 1, 'the seam base is the only host consulted');
+    assert.ok(calls[0].startsWith('http://stub.test/yahoo/'));
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedYahoo === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedYahoo;
+  }
+});
+
+test('fetchStooqHistory: sends a browser UA too', async () => {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  const savedStooq = process.env.STOOQ_BASE_URL;
+  process.env.STOOQ_BASE_URL = 'http://stub.test/stooq/';
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url: String(url), ua: opts && opts.headers && opts.headers['User-Agent'] });
+    return { ok: true, text: async () => 'Date,Open,High,Low,Close,Volume\n2026-01-02,1,1,1,140,1\n' };
+  };
+  try {
+    assert.deepEqual(await fetchStooqHistory('XQQ.TO'), [{ date: '2026-01-02', price: 140 }]);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].ua || '', /Mozilla\/5\.0.*Chrome\//, 'a browser UA is sent');
+    assert.ok(!/FinanceMate/.test(calls[0].ua || ''), 'the app UA is gone here too');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedStooq === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedStooq;
   }
 });
 

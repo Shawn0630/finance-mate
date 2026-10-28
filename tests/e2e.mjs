@@ -8152,6 +8152,26 @@ try {
       const hxqText = await page.evaluate(() => document.querySelector('#view-invest-holding').textContent);
       check('investments UI: the HXQ holding page names Yahoo Finance as its price source',
         hxqText.includes('Yahoo Finance'), hxqText.slice(0, 300));
+      // The trade-price fallback banner splits by kind: an
+      // exchange holding names its own ticker and must NOT get
+      // the bank-fund NAV advice; a fund with no NAV snapshots
+      // keeps the NAV wording.
+      await page.goto(`http://ff.local/#invest-holding/${invAcmeId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const acmeNote = await page.evaluate(() => document.querySelector('#investHoldingPriceNote').textContent);
+      check('investments UI: an exchange holding on trade prices gets a banner naming its symbol, no bank-fund advice',
+        acmeNote.includes('No market feed found for ACME') && acmeNote.includes('walks flat between trades')
+          && !/bank fund/i.test(acmeNote),
+        acmeNote.slice(0, 300));
+      const bareFundRes = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`, { label: 'No NAV Fund', kind: 'fund', currency: 'CAD' });
+      const invBareFundId = bareFundRes.data.id;
+      await req('POST', `/api/investments/holdings/${invBareFundId}/events`, { date: '2026-01-12', type: 'buy', units: 50, price: 25 });
+      await page.goto(`http://ff.local/#invest-holding/${invBareFundId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const fundNote = await page.evaluate(() => document.querySelector('#investHoldingPriceNote').textContent);
+      check('investments UI: a fund on trade prices keeps the record-NAV-snapshots banner',
+        fundNote.includes('Priced from trade prices') && fundNote.includes('record NAV snapshots below'),
+        fundNote.slice(0, 300));
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

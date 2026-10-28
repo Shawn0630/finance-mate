@@ -15,7 +15,12 @@
 //     2. Yahoo Finance's chart API — consulted ONLY when Stooq
 //        returns no rows for the symbol. Stored symbols are
 //        already Yahoo-format ('XQQ.TO', 'AAPL') and Yahoo's
-//        TSX coverage is complete.
+//        TSX coverage is complete. Yahoo 403/429s non-browser
+//        user agents, so the market fetches (both tiers) send a
+//        desktop Chrome UA, and the default Yahoo base tries
+//        query1 then query2 — one host throttling a request
+//        must not kill the fallback tier. (An explicit
+//        YAHOO_BASE_URL stays single-host: it is the test seam.)
 //     Both tiers empty → the holding falls back to its event
 //     prices (see investments.js) and the status says so.
 //   bank funds → NO automatic source in v1 (bank fund NAV
@@ -41,6 +46,13 @@
 
 const READ_TIMEOUT_MS = 4000;
 const FAIL_BACKOFF_MS = 15 * 60 * 1000;
+
+// Sent on the market-data fetches (Stooq + Yahoo history).
+// Yahoo's chart API rejects non-browser agents outright
+// (403/429), which silently emptied the whole fallback tier
+// when these requests identified as the app; Stooq gets the
+// same header to rule out the same class of block there.
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const vancouverDayFmt = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -90,7 +102,7 @@ export async function fetchStooqHistory(symbol, timeoutMs = 10000) {
   const base = process.env.STOOQ_BASE_URL || 'https://stooq.com/q/d/l/';
   const url = `${base}${base.includes('?') ? '&' : '?'}s=${encodeURIComponent(sym)}&i=d`;
   const res = await fetch(url, {
-    headers: { 'User-Agent': 'FinanceMate/1.0' },
+    headers: { 'User-Agent': BROWSER_UA },
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`stooq fetch failed: HTTP ${res.status}`);
@@ -126,17 +138,33 @@ export function parseYahooChart(json) {
 export async function fetchYahooHistory(symbol, timeoutMs = 10000) {
   const sym = String(symbol || '').trim();
   if (!sym) throw new Error('no symbol to fetch');
-  const base = process.env.YAHOO_BASE_URL || 'https://query1.finance.yahoo.com/v8/finance/chart/';
+  // The default base is dual-host: query1, then the same path
+  // on query2 when query1 fails, errors, or parses empty — the
+  // two hosts throttle independently, and this tier is the only
+  // market feed for tickers Stooq doesn't carry (most of TSX).
+  // An explicit YAHOO_BASE_URL (the test seam) stays as-is.
+  const bases = process.env.YAHOO_BASE_URL
+    ? [process.env.YAHOO_BASE_URL]
+    : ['https://query1.finance.yahoo.com/v8/finance/chart/',
+       'https://query2.finance.yahoo.com/v8/finance/chart/'];
   const period2 = Math.floor(Date.now() / 1000) + 86400;
-  const url = `${base}${encodeURIComponent(sym)}?period1=1262304000&period2=${period2}&interval=1d`;
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'FinanceMate/1.0' },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`yahoo fetch failed: HTTP ${res.status}`);
-  const rows = parseYahooChart(await res.json());
-  if (!rows.length) throw new Error(`yahoo returned no data for ${sym}`);
-  return rows;
+  const query = `?period1=1262304000&period2=${period2}&interval=1d`;
+  let lastErr = null;
+  for (const base of bases) {
+    try {
+      const res = await fetch(`${base}${encodeURIComponent(sym)}${query}`, {
+        headers: { 'User-Agent': BROWSER_UA },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`yahoo fetch failed: HTTP ${res.status}`);
+      const rows = parseYahooChart(await res.json());
+      if (!rows.length) throw new Error(`yahoo returned no data for ${sym}`);
+      return rows;
+    } catch (err) {
+      lastErr = err; // try the next host before giving up
+    }
+  }
+  throw lastErr || new Error(`yahoo returned no data for ${sym}`);
 }
 
 // ------------------------------------------------------- Yahoo search

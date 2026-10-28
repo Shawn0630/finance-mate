@@ -4803,7 +4803,9 @@ async function loadInvestHoldingImpl(id) {
   const st = data.priceStatus;
   const notes = [];
   if (st.pricedBy === 'none') notes.push('No price yet: this holding values at 0 until a priced event or a price snapshot exists.');
-  if (st.pricedBy === 'event') notes.push('Priced from trade prices (no market feed for this holding): the value walks flat between trades. For a bank fund, record NAV snapshots below to trace its real path.');
+  if (st.pricedBy === 'event') notes.push(h.kind === 'fund'
+    ? 'Priced from trade prices (no market feed for this holding): the value walks flat between trades. For a bank fund, record NAV snapshots below to trace its real path.'
+    : `No market feed found for ${h.symbol || h.label} — value walks flat between trades.`);
   if (st.stale) notes.push(`Market prices may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
   if (sm.unpricedGrants) notes.push(`${sm.unpricedGrants} grant(s) had no price on their date and count as $0 contributions.`);
   if (data.fxMissing && h.currency === 'USD') notes.push('USD/CAD rates are unavailable right now — CAD figures show the unconverted amounts.');
