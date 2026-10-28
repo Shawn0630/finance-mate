@@ -8237,6 +8237,50 @@ try {
         JSON.stringify({ units: afterSplit.units, value: afterSplit.value }));
       check('investments UI: the split renders as its own "Split · 3:1" event row',
         afterSplit.events.includes('Split · 3:1'), afterSplit.events.slice(0, 300));
+      // Form-control spec: one height for inputs and selects,
+      // so a mixed row shares label baselines and control
+      // edges. The event form re-renders in Buy mode after the
+      // split submit (all five fields visible); force that
+      // state defensively, then measure the row; then the Edit
+      // holding modal's Kind / Currency / Fund code row. The
+      // modal measurement needs a desktop viewport — at ≤800px
+      // .grid3 stacks into one column by design.
+      await page.setViewport({ width: 1280, height: 900 });
+      await page.waitForFunction(() => window.innerWidth >= 1000, { timeout: 5000 }).catch(() => {});
+      await waitI(300);
+      await page.evaluate(() => {
+        const sel = document.querySelector('#investEventForm [name="type"]');
+        sel.value = 'buy';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await waitI(300);
+      const evGeom = await page.evaluate(() => {
+        const R = (el) => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom }; };
+        const names = ['date', 'type', 'units', 'price', 'note'];
+        const controls = names.map((n) => R(document.querySelector(`#investEventForm [name="${n}"]`)));
+        const labels = names.map((n) => R(document.querySelector(`#investEventForm [name="${n}"]`).closest('div').querySelector('label')));
+        const spread = (rs, k) => Math.max(...rs.map((r) => r[k])) - Math.min(...rs.map((r) => r[k]));
+        return {
+          top: spread(controls, 'top'), bottom: spread(controls, 'bottom'),
+          labelTop: spread(labels, 'top'), labelBottom: spread(labels, 'bottom'),
+        };
+      });
+      check('investments UI: the Add event row shares one control height and one label baseline',
+        evGeom.top <= 1 && evGeom.bottom <= 1 && evGeom.labelTop <= 1 && evGeom.labelBottom <= 1,
+        JSON.stringify(evGeom));
+      await page.click('#editInvestHoldingBtn');
+      await page.waitForFunction(() => !document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 10000 });
+      await waitI(300);
+      const holdGeom = await page.evaluate(() => {
+        const R = (el) => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom }; };
+        const rs = ['kind', 'currency', 'fundCode'].map((n) => R(document.querySelector(`#investHoldingForm [name="${n}"]`)));
+        const spread = (k) => Math.max(...rs.map((r) => r[k])) - Math.min(...rs.map((r) => r[k]));
+        const grid = document.querySelector('#investHoldingForm .grid3');
+        return { top: spread('top'), bottom: spread('bottom'), iw: window.innerWidth, cols: grid ? getComputedStyle(grid).gridTemplateColumns : null };
+      });
+      check('investments UI: the Edit holding modal lines Kind / Currency / Fund code up on one height',
+        holdGeom.top <= 1 && holdGeom.bottom <= 1, JSON.stringify(holdGeom));
+      await page.click('#investHoldingModal [data-close-modal]');
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {
