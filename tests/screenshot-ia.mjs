@@ -99,22 +99,23 @@ await shot('property-modal.png');
 await page.keyboard.press('Escape');
 await wait(300);
 
-// 4. Stocks section listing.
-await page.evaluate(() => { location.hash = '#assets/stocks'; });
+// 4. Other section listing (the retired registry Stocks section's
+// entries live here now, tagged by category).
+await page.evaluate(() => { location.hash = '#assets/other'; });
 await wait(900);
-await shot('section-stocks.png');
+await shot('section-other.png');
 
-// 5. Add-stock modal open (category locked to Stocks).
+// 5. Add-asset modal open (category locked to Other).
 await page.evaluate(() => {
-  [...document.querySelectorAll('#section-stocks button')].find((b) => b.textContent.includes('Add stock')).click();
+  [...document.querySelectorAll('#section-other button')].find((b) => b.textContent.includes('Add asset')).click();
 });
 await wait(700);
 await shot('asset-modal.png');
 await page.keyboard.press('Escape');
 await wait(300);
 
-// 6. Stock detail view (click the first row).
-await page.click('#section-stocks tbody tr');
+// 6. Asset detail view (click the first row).
+await page.click('#section-other tbody tr');
 await wait(900);
 await shot('asset-detail.png');
 

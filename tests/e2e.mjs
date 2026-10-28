@@ -2303,8 +2303,11 @@ try {
       check('trend point edit opens grouped', editTrend === '1,950,000', String(editTrend));
 
       // Other assets get the same treatment: type bare, see grouped,
-      // stored plain; reopen the editor and it is grouped again.
-      await page.goto('http://ff.local/#assets/stocks', { waitUntil: 'networkidle0', timeout: 30000 });
+      // stored plain; reopen the editor and it is grouped again. The
+      // entry is created with category 'stocks' — the registry's old
+      // standalone Stocks section is retired, so it lists under
+      // Other; the modal still takes an explicit category.
+      await page.goto('http://ff.local/#assets/other', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
       await page.evaluate(() => window.openAssetModal(null, 'stocks'));
       await wait(500);
@@ -2323,6 +2326,58 @@ try {
       await wait(800);
       const editAsset = await fieldVal('#assetForm [name=value]');
       check('asset edit opens with the grouped value', editAsset === '750,000', String(editAsset));
+
+      // Retired registry Stocks section: the sub-nav carries exactly
+      // one "Stocks" (the accounts module at #assets/investments),
+      // the old section element is gone, and the stocks-category
+      // entry just created lists under Other with its category tag.
+      await page.keyboard.press('Escape');
+      await page.evaluate(() => { location.hash = '#assets/other'; });
+      await wait(1200);
+      const retireView = await page.evaluate(() => {
+        const navLinks = [...document.querySelectorAll('#assetsNav a')];
+        const rows = [...document.querySelectorAll('#section-other tbody tr')];
+        const mts = rows.find((tr) => tr.textContent.includes('Money Test Stock'));
+        return {
+          stocksHrefs: navLinks.filter((a) => a.textContent.trim() === 'Stocks')
+            .map((a) => a.getAttribute('href')),
+          hasOldSection: !!document.querySelector('#section-stocks'),
+          otherVisible: !document.querySelector('#section-other').classList.contains('hidden'),
+          mtsListed: !!mts,
+          mtsTagged: !!mts && mts.textContent.includes('Stocks'),
+          subtotalText: document.querySelector('#section-other .section-head .note').textContent,
+        };
+      });
+      check('sub-nav has exactly one Stocks link — the Stocks module',
+        retireView.stocksHrefs.length === 1 && retireView.stocksHrefs[0] === '#assets/investments',
+        JSON.stringify(retireView.stocksHrefs));
+      check('the old registry stocks section is gone', !retireView.hasOldSection);
+      check('stocks-category entry lists under Other with its category tag',
+        retireView.otherVisible && retireView.mtsListed && retireView.mtsTagged, JSON.stringify(retireView));
+      r = await req('GET', '/api/assets');
+      const allAssets = r.data || [];
+      const merged = allAssets.filter((a) => a.category === 'other' || a.category === 'stocks');
+      const mergedTotal = merged.reduce((sum, a) => sum + Number(a.value || 0), 0);
+      const subtotalShown = Number(String(retireView.subtotalText).replace(/[^0-9.\-]/g, ''));
+      check('Other subtotal includes stocks-category entries',
+        Math.abs(subtotalShown - mergedTotal) <= merged.length,
+        `${retireView.subtotalText} vs ${mergedTotal}`);
+      r = await req('GET', '/api/summary');
+      const allTotal = allAssets.reduce((sum, a) => sum + Number(a.value || 0), 0);
+      check('summary other-assets total still counts every category',
+        Math.abs(r.data.otherAssets - allTotal) < 0.005, `${r.data.otherAssets} vs ${allTotal}`);
+      // The retired hash lands on Other instead of a blank screen.
+      await page.goto('http://ff.local/#assets/stocks', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      const landed = await page.evaluate(() => ({
+        hash: location.hash,
+        otherVisible: !document.querySelector('#section-other').classList.contains('hidden'),
+        assetsVisible: !document.querySelector('#view-assets').classList.contains('hidden'),
+        hasMts: document.querySelector('#section-other').textContent.includes('Money Test Stock'),
+      }));
+      check('old #assets/stocks hash redirects to Other (no blank screen)',
+        landed.hash === '#assets/other' && landed.otherVisible && landed.assetsVisible && landed.hasMts,
+        JSON.stringify(landed));
 
       // A property added without a principal (the API section's
       // pidNoBal): its detail page renders the empty states, and

@@ -26,7 +26,7 @@ placeholder pages for later rounds.
   (Properties / Fixed assets / Stocks / Term deposits / Other) shows only
   its own listing, an Add button that opens a modal form, and a detail
   view per item (click a property card or an asset row). The section is
-  kept in the URL hash (`#assets/stocks`, `#property/<id>`, `#asset/<id>`).
+  kept in the URL hash (`#assets/other`, `#property/<id>`, `#asset/<id>`).
   Property values are BC Assessment *assessed* values, not market prices.
 
 ## Run with Docker

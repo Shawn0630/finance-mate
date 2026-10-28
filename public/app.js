@@ -315,13 +315,17 @@ const ASSET_SECTIONS = [
   { key: 'properties', label: 'Properties', addLabel: 'Add property' },
   { key: 'investments', label: 'Stocks' },
   { key: 'fixed-assets', category: 'fixed_assets', label: 'Fixed assets', addLabel: 'Add fixed asset' },
-  { key: 'stocks', category: 'stocks', label: 'Stocks', addLabel: 'Add stock' },
   { key: 'term-deposits', category: 'term_deposits', label: 'Term deposits', addLabel: 'Add term deposit' },
-  { key: 'other', category: 'other', label: 'Other', addLabel: 'Add asset' },
+  // The registry's old standalone 'stocks' section is retired (the real
+  // Stocks module lives at 'investments'); stocks-category entries are
+  // kept — data and summary totals unchanged — and listed under Other,
+  // each row tagged with its category.
+  { key: 'other', category: 'other', categories: ['other', 'stocks'], label: 'Other', addLabel: 'Add asset' },
 ];
 const CATEGORY_LABELS = { fixed_assets: 'Fixed assets', stocks: 'Stocks', term_deposits: 'Term deposits', other: 'Other' };
+const SECTION_CATEGORIES = (s) => s.categories || [s.category];
 const SECTION_OF_CATEGORY = Object.fromEntries(
-  ASSET_SECTIONS.filter((s) => s.category).map((s) => [s.category, s.key]));
+  ASSET_SECTIONS.filter((s) => s.category).flatMap((s) => SECTION_CATEGORIES(s).map((c) => [c, s.key])));
 
 let currentPropertyId = null;
 let currentAssetId = null;
@@ -370,7 +374,13 @@ function route() {
     showView(hash.slice(1));
   } else {
     // '#assets' or '#assets/<section>'
-    const key = hash.split('/')[1] || 'overview';
+    let key = hash.split('/')[1] || 'overview';
+    // Retired registry section: old '#assets/stocks' links land on
+    // Other, where stocks-category entries now live.
+    if (key === 'stocks') {
+      history.replaceState(null, '', '#assets/other');
+      key = 'other';
+    }
     showView('assets');
     showSection(ASSET_SECTIONS.some((s) => s.key === key) ? key : 'overview');
     loadAssets();
@@ -582,11 +592,14 @@ async function loadAssetsImpl(force = false) {
   }
   const breakdown = [
     { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · principal ${money2(summary.mortgageBalance)}` },
-    ...ASSET_SECTIONS.filter((s) => s.category).map((s) => ({
-      key: s.key, label: s.label,
-      value: (byCategory[s.category] || { total: 0 }).total,
-      note: `${(byCategory[s.category] || { count: 0 }).count} entries`,
-    })),
+    ...ASSET_SECTIONS.filter((s) => s.category).map((s) => {
+      const cats = SECTION_CATEGORIES(s);
+      return {
+        key: s.key, label: s.label,
+        value: cats.reduce((sum, c) => sum + (byCategory[c] || { total: 0 }).total, 0),
+        note: `${cats.reduce((sum, c) => sum + (byCategory[c] || { count: 0 }).count, 0)} entries`,
+      };
+    }),
   ];
   $('#breakdownCards').innerHTML = breakdown.map((b) => `
     <div class="card breakdown-card" onclick="location.hash='#assets/${b.key}'">
@@ -627,12 +640,15 @@ async function loadAssetsImpl(force = false) {
   }
   await loadPortfolio();
 
-  // One listing table per other-asset category.
+  // One listing table per other-asset section (a section may cover
+  // several categories — Other also lists stocks-category entries,
+  // each row tagged with its category).
   for (const s of ASSET_SECTIONS.filter((x) => x.category)) {
-    const rows = assets.filter((a) => a.category === s.category);
+    const cats = SECTION_CATEGORIES(s);
+    const rows = assets.filter((a) => cats.includes(a.category));
     const subtotal = rows.reduce((sum, a) => sum + Number(a.value || 0), 0);
     const body = rows.map((a) => `<tr class="clickable" onclick="location.hash='#asset/${a.id}'">
-      <td>${esc(a.name)}</td><td class="num">${money(a.value)}</td><td>${esc(a.currency)}</td>
+      <td>${esc(a.name)}${cats.length > 1 ? ` <span class="badge">${esc(CATEGORY_LABELS[a.category] || a.category)}</span>` : ''}</td><td class="num">${money(a.value)}</td><td>${esc(a.currency)}</td>
       <td>${ownerChipsHtml(a.owners)}</td>
       <td>${esc(a.notes || '')}</td>
       <td style="white-space:nowrap">
@@ -715,8 +731,9 @@ async function loadAssetDetailImpl(id) {
   catch { $('#assetDetailTitle').textContent = 'Asset not found'; $('#assetDetailBody').innerHTML = ''; return; }
   currentAssetId = a.id;
   const section = SECTION_OF_CATEGORY[a.category] || 'overview';
+  const sectionDef = ASSET_SECTIONS.find((s) => s.key === section);
   $('#assetBackLink').href = '#assets/' + section;
-  $('#assetBackLink').textContent = '← Back to ' + (CATEGORY_LABELS[a.category] || 'Assets');
+  $('#assetBackLink').textContent = '← Back to ' + (sectionDef ? sectionDef.label : 'Assets');
   $('#assetDetailTitle').textContent = a.name;
   const fmtDate = (t) => (t ? new Date(t).toLocaleString('en-CA') : '—');
   const rows = [
