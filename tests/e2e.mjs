@@ -921,6 +921,16 @@ try {
       && Math.abs(sliceB.pct - (50000 / port.totals.outstanding) * 100) <= 0.11
       && Math.abs(pctSum - 100) <= 0.5,
     JSON.stringify(port.pie.outstanding).slice(0, 200));
+  const eqSlices = port.pie.equity || [];
+  const eqProps = port.properties.filter((x) => x.equity > 0);
+  const eqPctSum = eqSlices.reduce((s, x) => s + x.pct, 0);
+  const eqValSum = eqSlices.reduce((s, x) => s + x.value, 0);
+  check('equity pie: one slice per positive-equity property, pcts sum to 100, values sum to the Total equity figure',
+    Array.isArray(port.pie.equity)
+      && eqSlices.length === eqProps.length
+      && eqSlices.every((s) => { const p = port.properties.find((x) => x.id === s.id); return p && Math.abs(s.value - p.equity) <= 0.02; })
+      && (eqSlices.length === 0 || (Math.abs(eqPctSum - 100) <= 0.5 && Math.abs(eqValSum - port.totals.equity) <= 0.05)),
+    JSON.stringify({ slices: eqSlices.length, props: eqProps.length, pct: eqPctSum, sum: eqValSum, total: port.totals.equity }).slice(0, 200));
   const rowJun27 = port.outstandingByMonth.find((m) => m.month === '2027-06');
   const balA27 = amortA.series.find((s) => s.month === '2027-06').balance;
   const balB27 = amortB.series.find((s) => s.month === '2027-06').balance;
@@ -2225,6 +2235,34 @@ try {
       check('the Add Property intro paragraph is gone from the page source', !addSrc.includes('Just the essentials'));
       await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
+      // Portfolio pie modes: three buttons side by side, and the
+      // Equity share mode draws the API's equity slices.
+      const portNow = (await req('GET', '/api/properties/portfolio')).data;
+      const pieData = () => page.evaluate(() => {
+        const c = window.__fmCharts.pie;
+        return c ? { labels: c.data.labels.slice(), data: c.data.datasets[0].data.slice() } : null;
+      });
+      check('the portfolio pie carries three mode buttons (Outstanding / Assessed / Equity)',
+        await page.evaluate(() => ['pfPieOutstandingBtn', 'pfPieAssessedBtn', 'pfPieEquityBtn'].every((id) => !!document.getElementById(id))));
+      await page.click('#pfPieEquityBtn');
+      await wait(400);
+      const eqPie = await pieData();
+      const eqApiSlices = portNow.pie.equity || [];
+      check('the Equity share mode draws one slice per positive-equity property, values matching the API slices',
+        eqApiSlices.length
+          ? (!!eqPie && eqPie.data.length === eqApiSlices.length
+            && eqPie.data.every((v, i) => Math.abs(v - eqApiSlices[i].value) <= 0.02)
+            && eqPie.labels.every((l, i) => l === eqApiSlices[i].shortLabel))
+          : eqPie === null,
+        JSON.stringify({ ui: eqPie && eqPie.data, api: eqApiSlices.map((s) => s.value) }));
+      await page.click('#pfPieOutstandingBtn');
+      await wait(400);
+      const outPie = await pieData();
+      const outApiSlices = portNow.pie.outstanding || [];
+      check('switching back to Outstanding share restores the balance slices',
+        !!outPie && outPie.data.length === outApiSlices.length
+          && outPie.data.every((v, i) => Math.abs(v - outApiSlices[i].value) <= 0.02),
+        JSON.stringify({ ui: outPie && outPie.data, api: outApiSlices.map((s) => s.value) }));
       await page.evaluate(() => document.querySelector('#addPropertyBtn').click());
       await wait(500);
       const addModalText = await page.evaluate(() => document.querySelector('#propertyModal').textContent);

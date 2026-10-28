@@ -939,6 +939,7 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
   const slices = (pick, total) => perProperty
     .filter((x) => pick(x) > 0 && total > 0)
     .map((x) => ({ id: x.id, label: x.label, shortLabel: x.shortLabel, value: pick(x), pct: r2((pick(x) / total) * 100) }));
+  const totalEquity = r2(perProperty.reduce((s, x) => s + (x.equity || 0), 0));
 
   // Assessed totals by year, carry-forward: a property counts from
   // its first known year on, at its most recent point at or before
@@ -1013,6 +1014,12 @@ app.get('/api/properties/portfolio', requireApiAuth, async (req, res) => {
     pie: {
       outstanding: slices((x) => x.outstanding, totalOutstanding),
       assessed: slices((x) => x.latestAssessed || 0, totalAssessed),
+      // Equity share: the Total equity card's per-property
+      // figures. Properties without an assessed value have null
+      // equity and drop out (the card's exclusion rule); the
+      // shared slices() filter also drops zero/negative equity
+      // and yields [] when the total is not positive.
+      equity: slices((x) => x.equity || 0, totalEquity),
     },
     assessedByYear,
     outstandingByMonth,

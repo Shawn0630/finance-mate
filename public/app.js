@@ -1704,6 +1704,7 @@ $('#pfRangeBtns').addEventListener('click', (e) => {
 });
 $('#pfPieOutstandingBtn').addEventListener('click', () => { pfPieMetric = 'outstanding'; drawPortfolioPie(); });
 $('#pfPieAssessedBtn').addEventListener('click', () => { pfPieMetric = 'assessed'; drawPortfolioPie(); });
+$('#pfPieEquityBtn').addEventListener('click', () => { pfPieMetric = 'equity'; drawPortfolioPie(); });
 
 let chartA = null; // merged detail chart: assessed + outstanding lines, interest/principal bars
 let fullSeries = [];
