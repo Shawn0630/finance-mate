@@ -4657,6 +4657,215 @@ function investMonthlyTable(monthly, cur = 'CAD') {
     <th class="num">${moneyC(tot.returnAmount, cur)}</th><th></th><th></th></tr></tfoot></table>`;
 }
 
+// --------------------------------------------- invest range controls ---
+// The three Stocks levels carry the property hero's range model:
+// preset look-back buttons (1 / 2 / 5 / 10 years, All) plus a
+// From/To month pair picked from the same month popover. The
+// chart AND the Monthly returns table both render only the
+// months in force. Presets anchor at the LAST data month —
+// investments have no projection to look forward into, so
+// "1 year" means the last 12 months of data. A picked pair is
+// clamped into the data span by the shared clampRange (a start
+// past the end pulls the end up). Default is All.
+const investRanges = {
+  investments: { months: 0, custom: null },
+  investAccount: { months: 0, custom: null },
+  investHolding: { months: 0, custom: null },
+};
+const investViewData = {}; // level -> { series, monthly, cur, native }
+let invPop = null; // { level, which: 'start'|'end', year }
+
+function investRangeControlsHtml(level) {
+  return `<div class="toolbar range-btns" id="invRangeBtns-${level}">
+    <button type="button" data-months="12">1 year</button>
+    <button type="button" data-months="24">2 years</button>
+    <button type="button" data-months="60">5 years</button>
+    <button type="button" data-months="120">10 years</button>
+    <button type="button" data-months="0" class="active">All</button>
+    <span class="range-pick">From <button type="button" id="invRangeStart-${level}" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range start month">—</button></span>
+    <span class="range-pick">To <button type="button" id="invRangeEnd-${level}" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range end month">—</button></span>
+    <div class="month-pop hidden" id="invMonthPop-${level}" role="dialog" aria-label="Choose a month">
+      <div class="month-pop-head">
+        <button type="button" class="small" data-pop-prev aria-label="Previous year">&#8249;</button>
+        <span class="month-pop-year"></span>
+        <button type="button" class="small" data-pop-next aria-label="Next year">&#8250;</button>
+      </div>
+      <div class="month-pop-grid"></div>
+    </div>
+  </div>`;
+}
+
+function investSpan(level) {
+  const d = investViewData[level];
+  if (!d) return null;
+  const ms = new Set();
+  for (const r of d.series || []) ms.add(r.month);
+  for (const r of d.monthly || []) ms.add(r.month);
+  if (!ms.size) return null;
+  const arr = [...ms].sort();
+  return { start: arr[0], end: arr[arr.length - 1] };
+}
+
+function investEffectiveRange(level) {
+  const span = investSpan(level);
+  if (!span) return null;
+  const st = investRanges[level];
+  if (st.custom) return clampRange(st.custom, span);
+  if (!st.months) return span;
+  const start = addMonthsYM(span.end, -(st.months - 1));
+  return { start: start < span.start ? span.start : start, end: span.end };
+}
+
+const INVEST_LEVEL_CONF = {
+  investments: {
+    canvas: '#investPortfolioChart', key: 'investments', monthly: '#investPortfolioMonthly',
+    get: () => investPortfolioChart, set: (c) => { investPortfolioChart = c; },
+  },
+  investAccount: {
+    canvas: '#investAccountChart', key: 'investAccount', monthly: '#investAccountMonthly',
+    get: () => investAccountChart, set: (c) => { investAccountChart = c; },
+  },
+  investHolding: {
+    canvas: '#investHoldingChart', key: 'investHolding', monthly: '#investHoldingMonthly',
+    get: () => investHoldingChart, set: (c) => { investHoldingChart = c; },
+  },
+};
+
+// Re-render one level's chart + monthly table inside the range
+// in force, and bring the controls in line with it.
+function applyInvestRange(level) {
+  const d = investViewData[level];
+  const conf = INVEST_LEVEL_CONF[level];
+  if (!d || !conf) return;
+  const r = investEffectiveRange(level);
+  const inR = (m) => !r || (m >= r.start && m <= r.end);
+  const fSeries = (d.series || []).filter((x) => inR(x.month));
+  const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
+  const old = conf.get();
+  if (old) old.destroy();
+  conf.set(drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native));
+  const mHost = $(conf.monthly);
+  if (mHost) mHost.innerHTML = investMonthlyTable(fMonthly, d.cur);
+  syncInvestRangeInputs(level);
+}
+
+function syncInvestRangeInputs(level) {
+  const bar = document.getElementById(`invRangeBtns-${level}`);
+  if (!bar) return;
+  const st = investRanges[level];
+  bar.querySelectorAll('button[data-months]').forEach((b) => {
+    b.classList.toggle('active', !st.custom && Number(b.dataset.months) === st.months);
+  });
+  const span = investSpan(level);
+  const r = investEffectiveRange(level);
+  for (const [which, ym] of [['Start', r && r.start], ['End', r && r.end]]) {
+    const btn = document.getElementById(`invRange${which}-${level}`);
+    if (!btn) continue;
+    btn.dataset.value = ym || '';
+    btn.textContent = formatYM(ym);
+    btn.disabled = !span;
+  }
+  if (invPop && invPop.level === level) renderInvMonthPop();
+}
+
+function renderInvMonthPop() {
+  if (!invPop) return;
+  const pop = document.getElementById(`invMonthPop-${invPop.level}`);
+  if (!pop) return;
+  const span = investSpan(invPop.level);
+  if (!span) { closeInvMonthPop(); return; }
+  const field = document.getElementById(`invRange${invPop.which === 'start' ? 'Start' : 'End'}-${invPop.level}`);
+  const selected = field ? field.dataset.value : '';
+  const selYear = selected ? Number(selected.slice(0, 4)) : null;
+  const minYear = Math.min(Number(span.start.slice(0, 4)), selYear ?? Infinity);
+  const maxYear = Math.max(Number(span.end.slice(0, 4)), selYear ?? -Infinity);
+  if (invPop.year == null) invPop.year = selYear ?? maxYear;
+  invPop.year = Math.min(Math.max(invPop.year, minYear), maxYear);
+  pop.querySelector('.month-pop-year').textContent = String(invPop.year);
+  pop.querySelector('[data-pop-prev]').disabled = invPop.year <= minYear;
+  pop.querySelector('[data-pop-next]').disabled = invPop.year >= maxYear;
+  pop.querySelector('.month-pop-grid').innerHTML = MONTH_NAMES.map((name, i) => {
+    const ym = `${invPop.year}-${String(i + 1).padStart(2, '0')}`;
+    const off = ym < span.start || ym > span.end;
+    return `<button type="button" data-ym="${ym}"${off ? ' disabled' : ''}${ym === selected ? ' class="sel"' : ''}>${name}</button>`;
+  }).join('');
+}
+
+function openInvMonthPop(level, which) {
+  const field = document.getElementById(`invRange${which === 'start' ? 'Start' : 'End'}-${level}`);
+  if (!field || field.disabled) return;
+  invPop = { level, which, year: field.dataset.value ? Number(field.dataset.value.slice(0, 4)) : null };
+  renderInvMonthPop();
+  if (!invPop) return; // no span — render closed it
+  const pop = document.getElementById(`invMonthPop-${level}`);
+  pop.classList.remove('hidden');
+  const bar = document.getElementById(`invRangeBtns-${level}`);
+  const left = Math.max(0, Math.min(field.offsetLeft, bar.clientWidth - pop.offsetWidth - 4));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${field.offsetTop + field.offsetHeight + 6}px`;
+  document.getElementById(`invRangeStart-${level}`).setAttribute('aria-expanded', String(which === 'start'));
+  document.getElementById(`invRangeEnd-${level}`).setAttribute('aria-expanded', String(which === 'end'));
+}
+
+function closeInvMonthPop() {
+  if (!invPop) return;
+  const pop = document.getElementById(`invMonthPop-${invPop.level}`);
+  if (pop) pop.classList.add('hidden');
+  for (const w of ['Start', 'End']) {
+    const f = document.getElementById(`invRange${w}-${invPop.level}`);
+    if (f) f.setAttribute('aria-expanded', 'false');
+  }
+  invPop = null;
+}
+
+function wireInvestRangeControls(level) {
+  const bar = document.getElementById(`invRangeBtns-${level}`);
+  if (!bar || bar.dataset.wired) return;
+  bar.dataset.wired = '1';
+  bar.addEventListener('click', (e) => {
+    const preset = e.target.closest('button[data-months]');
+    if (preset) {
+      investRanges[level].months = Number(preset.dataset.months);
+      investRanges[level].custom = null;
+      closeInvMonthPop();
+      applyInvestRange(level);
+      return;
+    }
+    if (e.target.closest(`#invRangeStart-${level}`)) {
+      if (invPop && invPop.level === level && invPop.which === 'start') closeInvMonthPop();
+      else openInvMonthPop(level, 'start');
+      return;
+    }
+    if (e.target.closest(`#invRangeEnd-${level}`)) {
+      if (invPop && invPop.level === level && invPop.which === 'end') closeInvMonthPop();
+      else openInvMonthPop(level, 'end');
+      return;
+    }
+    const pop = document.getElementById(`invMonthPop-${level}`);
+    if (pop && pop.contains(e.target)) {
+      if (e.target.closest('[data-pop-prev]')) { invPop.year -= 1; renderInvMonthPop(); return; }
+      if (e.target.closest('[data-pop-next]')) { invPop.year += 1; renderInvMonthPop(); return; }
+      const cell = e.target.closest('button[data-ym]');
+      if (!cell || cell.disabled || !invPop || invPop.level !== level) return;
+      const start = invPop.which === 'start' ? cell.dataset.ym : document.getElementById(`invRangeStart-${level}`).dataset.value;
+      const end = invPop.which === 'end' ? cell.dataset.ym : document.getElementById(`invRangeEnd-${level}`).dataset.value;
+      closeInvMonthPop();
+      if (!start || !end) return;
+      investRanges[level].custom = clampRange({ start, end }, investSpan(level));
+      applyInvestRange(level);
+    }
+  });
+}
+
+// Popover etiquette for the invest pickers: an outside click or
+// Esc closes the open one.
+document.addEventListener('click', (e) => {
+  if (!invPop) return;
+  const bar = document.getElementById(`invRangeBtns-${invPop.level}`);
+  if (bar && !bar.contains(e.target)) closeInvMonthPop();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeInvMonthPop(); });
+
 function drawInvestChart(canvas, key, series, cur, native = false) {
   if (!canvas) return null;
   const labels = series.map((r) => r.month);
@@ -4706,13 +4915,15 @@ async function loadInvestmentsImpl() {
     <div class="summary-strip">${investSummaryStrip(s)}</div>
     <div class="panel">
       <h3>Total return</h3>
+      ${investRangeControlsHtml('investments')}
       <div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div>
       <div class="cards" style="margin-top:12px">${cards || '<div class="note">No accounts yet — add one to start tracking.</div>'}</div>
     </div>
-    <div class="panel"><h3>Monthly returns</h3>${investMonthlyTable(data.monthly)}
+    <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly)}</div>
       <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
-  if (investPortfolioChart) investPortfolioChart.destroy();
-  investPortfolioChart = drawInvestChart($('#investPortfolioChart'), 'investments', data.series, 'CAD');
+  investViewData.investments = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false };
+  wireInvestRangeControls('investments');
+  applyInvestRange('investments');
   $('#addInvestAccountBtn').addEventListener('click', () => openInvestAccountModal(null));
   $('#refreshInvestBtn').addEventListener('click', async (e) => {
     e.target.disabled = true;
@@ -4744,8 +4955,8 @@ async function loadInvestAccountImpl(id) {
   const noteEl = $('#investAccountPriceNote');
   noteEl.classList.toggle('hidden', !notes.length);
   noteEl.innerHTML = notes.map(esc).join('<br>');
-  if (investAccountChart) investAccountChart.destroy();
-  investAccountChart = drawInvestChart($('#investAccountChart'), 'investAccount', data.series, 'CAD');
+  investViewData.investAccount = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false };
+  applyInvestRange('investAccount');
   const rows = data.holdings.map((row) => {
     const h = row.holding; const sm = row.summary;
     return `<tr class="clickable" onclick="location.hash='#invest-holding/${h.id}'">
@@ -4763,7 +4974,6 @@ async function loadInvestAccountImpl(id) {
   $('#investHoldingsWrap').innerHTML = data.holdings.length
     ? `<table><thead><tr><th>Holding</th><th class="num">Units</th><th class="num">Latest price</th><th class="num">Value</th><th class="num">Value (CAD)</th><th class="num">Total return</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
     : '<div class="note">No holdings yet — add one, or let ✨ Fill with AI draft them from a statement.</div>';
-  $('#investAccountMonthly').innerHTML = investMonthlyTable(data.monthly);
   $('#addHoldingBtn').onclick = () => openInvestHoldingModal(null);
   $('#editInvestAccountBtn').onclick = () => openInvestAccountModal(id);
   $('#deleteInvestAccountBtn').onclick = () => deleteInvestAccount(id);
@@ -4823,8 +5033,8 @@ async function loadInvestHoldingImpl(id) {
   const noteEl = $('#investHoldingPriceNote');
   noteEl.classList.toggle('hidden', !notes.length);
   noteEl.innerHTML = notes.map(esc).join('<br>');
-  if (investHoldingChart) investHoldingChart.destroy();
-  investHoldingChart = drawInvestChart($('#investHoldingChart'), 'investHolding', data.series, h.currency, true);
+  investViewData.investHolding = { series: data.series, monthly: data.monthly, cur: h.currency, native: true };
+  applyInvestRange('investHolding');
   const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend', split: 'Split' };
   const rows = data.events.map((e) => `<tr>
       <td>${esc(e.date)}</td><td>${e.type === 'split' ? `Split · ${splitRatioText(e)}` : (typeLabels[e.type] || esc(e.type))}${aiBadge(e.source)}</td>
@@ -4852,7 +5062,6 @@ async function loadInvestHoldingImpl(id) {
   $('#investNavWrap').innerHTML = data.navPoints.length
     ? `<table><thead><tr><th>Date</th><th class="num">${h.kind === 'fund' ? 'NAV' : 'Price'}</th><th></th></tr></thead><tbody>${navRows}</tbody></table>`
     : '<div class="note">No snapshots yet.</div>';
-  $('#investHoldingMonthly').innerHTML = investMonthlyTable(data.monthly, h.currency);
   $('#editInvestHoldingBtn').onclick = () => openInvestHoldingModal(id);
   $('#deleteInvestHoldingBtn').onclick = () => deleteInvestHolding(id);
 }
@@ -6314,6 +6523,17 @@ $('#logoutBtn').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
   location.href = '/login.html';
 });
+
+// The two static Stocks detail sections get their range
+// controls once at startup (the portfolio level re-renders its
+// own on every load).
+for (const level of ['investAccount', 'investHolding']) {
+  const host = document.getElementById(`invRangeHost-${level}`);
+  if (host) {
+    host.innerHTML = investRangeControlsHtml(level);
+    wireInvestRangeControls(level);
+  }
+}
 
 (async () => {
   try {
