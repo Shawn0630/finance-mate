@@ -253,6 +253,73 @@ const hsStub = http.createServer((req, res) => {
 await new Promise((r) => hsStub.listen(0, '127.0.0.1', r));
 const hsStubBase = `http://127.0.0.1:${hsStub.address().port}`;
 
+// Investments price sources, stubbed the same way: Stooq daily
+// CSVs keyed by the s= parameter, and the Bank of Canada Valet
+// FX_USDCAD series. Deterministic closes make the three-level
+// return math assertable to the cent.
+const stooqCsvBySymbol = {
+  'xqq.to': [
+    'Date,Open,High,Low,Close,Volume',
+    '2026-01-02,137,139,136,138,1000',
+    '2026-01-30,139,141,138,140,1000',
+    '2026-02-02,148,150,147,149,1000',
+    '2026-02-27,149,151,148,150,1000',
+    '2026-03-02,159,161,158,160,1000',
+    '2026-03-20,164,166,163,165,1000',
+  ].join('\n'),
+  'aapl.us': [
+    'Date,Open,High,Low,Close,Volume',
+    '2026-01-02,197,199,196,198,1000',
+    '2026-01-30,199,201,198,200,1000',
+    '2026-02-02,207,209,206,208,1000',
+    '2026-02-27,209,211,208,210,1000',
+    '2026-03-02,219,221,218,220,1000',
+  ].join('\n'),
+};
+const stooqStub = http.createServer((req, res) => {
+  const u = new URL(req.url, 'http://x');
+  const sym = String(u.searchParams.get('s') || '').toLowerCase();
+  res.writeHead(200, { 'Content-Type': 'text/csv' });
+  res.end(stooqCsvBySymbol[sym] || 'No data');
+});
+await new Promise((r) => stooqStub.listen(0, '127.0.0.1', r));
+const stooqStubBase = `http://127.0.0.1:${stooqStub.address().port}/q/d/l/`;
+const fxStub = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    observations: [
+      { d: '2026-01-01', FX_USDCAD: { v: '1.3000' } },
+      { d: '2026-02-01', FX_USDCAD: { v: '1.4000' } },
+    ],
+  }));
+});
+await new Promise((r) => fxStub.listen(0, '127.0.0.1', r));
+const fxStubBase = `http://127.0.0.1:${fxStub.address().port}/valet/observations`;
+// Yahoo Finance chart API stub — the fallback tier. Only
+// HXQ.TO has data here (Stooq returns "No data" for it), which
+// is exactly the TSX-gap scenario the fallback exists for;
+// every other symbol 404s like Yahoo does for unknown tickers.
+const yahooDay = (y, m, d) => Date.UTC(y, m, d) / 1000;
+const yahooStub = http.createServer((req, res) => {
+  if (decodeURIComponent(req.url).includes('HXQ.TO')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      chart: {
+        result: [{
+          timestamp: [yahooDay(2026, 0, 2), yahooDay(2026, 0, 30), yahooDay(2026, 1, 27), yahooDay(2026, 2, 2)],
+          indicators: { quote: [{ close: [59, 61, 62, 63] }] },
+        }],
+        error: null,
+      },
+    }));
+    return;
+  }
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ chart: { result: null, error: { code: 'Not Found', description: 'No data found' } } }));
+});
+await new Promise((r) => yahooStub.listen(0, '127.0.0.1', r));
+const yahooStubBase = `http://127.0.0.1:${yahooStub.address().port}/v8/finance/chart/`;
+
 // AI Fill test seam: the app reads LLM_STUB_RESPONSE_FILE on
 // every extraction, so the suite points it at a file it rewrites
 // per case — no real key, no network.
@@ -261,7 +328,7 @@ fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
 
 const server = spawn('node', ['src/server.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase, LLM_STUB_RESPONSE_FILE: aiStubFile, LLM_MODELS: 'stub-a,stub-b', LLM_MODEL: 'stub-a' },
+  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase, STOOQ_BASE_URL: stooqStubBase, FX_API_URL: fxStubBase, YAHOO_BASE_URL: yahooStubBase, LLM_STUB_RESPONSE_FILE: aiStubFile, LLM_MODELS: 'stub-a,stub-b', LLM_MODEL: 'stub-a' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
@@ -7539,6 +7606,325 @@ try {
     await req('DELETE', `/api/properties/${loadPid}`);
   }
 
+  // ================================================================
+  // Investments module: accounts → holdings → events, priced by
+  // the stubbed Stooq/Yahoo/FX sources, checked at all three
+  // levels (portfolio / account / holding) against hand-computed
+  // numbers, then the account-page AI fill chat (stub LLM).
+  // Stub closes: XQQ.TO 140/150/160/165 (Stooq), AAPL 200/210/220
+  // (Stooq), HXQ.TO — Stooq "No data" — 61/62/63 via Yahoo,
+  // ACME nothing anywhere (event prices only). FX: 1.30 through
+  // January, 1.40 from Feb 1.
+  // ================================================================
+  r = await req('POST', '/api/investments/accounts', { name: 'Bad', type: 'LIRA' });
+  check('investments: an unknown account type is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/investments/accounts', { name: 'TFSA', type: 'TFSA', institution: 'CIBC' });
+  const invTfsaId = r.data.id;
+  check('investments: TFSA account created', r.status === 201 && !!invTfsaId, JSON.stringify(r.data));
+  r = await req('POST', '/api/investments/accounts', { name: 'Employer RSU', type: 'RSU' });
+  const invRsuId = r.data.id;
+  r = await req('POST', '/api/investments/accounts', { name: 'Margin', type: 'NonRegistered', institution: 'Scotia' });
+  const invMarginId = r.data.id;
+  check('investments: RSU and non-registered accounts created', !!invRsuId && !!invMarginId, `${invRsuId}/${invMarginId}`);
+
+  r = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`, { label: 'NoTicker', kind: 'exchange', currency: 'CAD' });
+  check('investments: an exchange holding without a symbol is a 400', r.status === 400, JSON.stringify(r.data));
+  const invPost = (acct, body) => req('POST', `/api/investments/accounts/${acct}/holdings`, body);
+  r = await invPost(invTfsaId, { label: 'XQQ', kind: 'exchange', symbol: 'XQQ.TO', currency: 'CAD' });
+  const invXqqId = r.data.id;
+  r = await invPost(invTfsaId, { label: 'CIBC U.S. Index Fund', kind: 'fund', currency: 'CAD' });
+  const invFundId = r.data.id;
+  r = await invPost(invTfsaId, { label: 'HXQ', kind: 'exchange', symbol: 'HXQ.TO', currency: 'CAD' });
+  const invHxqId = r.data.id;
+  r = await invPost(invMarginId, { label: 'Apple', kind: 'exchange', symbol: 'AAPL', currency: 'USD' });
+  const invAaplId = r.data.id;
+  r = await invPost(invRsuId, { label: 'Acme Corp', kind: 'exchange', symbol: 'ACME', currency: 'USD' });
+  const invAcmeId = r.data.id;
+  check('investments: five holdings created across the accounts',
+    [invXqqId, invFundId, invHxqId, invAaplId, invAcmeId].every(Boolean),
+    JSON.stringify({ invXqqId, invFundId, invHxqId, invAaplId, invAcmeId }));
+
+  const invEvent = (hid, body) => req('POST', `/api/investments/holdings/${hid}/events`, body);
+  r = await invEvent(invXqqId, { date: '2026-01-05', type: 'buy', units: 10, price: 145 });
+  const invXqqBuy1 = r.data.id;
+  check('investments: first XQQ buy recorded', r.status === 201, JSON.stringify(r.data));
+  await invEvent(invXqqId, { date: '2026-02-03', type: 'buy', units: 10, price: 152 });
+  await invEvent(invFundId, { date: '2026-01-12', type: 'buy', units: 100, price: 30 });
+  await invEvent(invHxqId, { date: '2026-01-06', type: 'buy', units: 10, price: 60 });
+  await invEvent(invAaplId, { date: '2026-01-06', type: 'buy', units: 5, price: 205 });
+  await invEvent(invAcmeId, { date: '2026-01-15', type: 'grant', units: 20, price: 40 });
+  r = await invEvent(invAcmeId, { date: '2026-02-15', type: 'grant', units: 10 });
+  check('investments: an unpriced RSU grant is accepted (market price fills in)', r.status === 201, JSON.stringify(r.data));
+  r = await invEvent(invXqqId, { date: '2026-03-01', type: 'sell', units: 21, price: 160 });
+  check('investments: selling more than held is a 400', r.status === 400, JSON.stringify(r.data));
+
+  r = await req('POST', `/api/investments/holdings/${invFundId}/nav`, { date: '2026-01-31', price: 31 });
+  check('investments: first manual NAV snapshot recorded', r.status === 201, JSON.stringify(r.data));
+  await req('POST', `/api/investments/holdings/${invFundId}/nav`, { date: '2026-02-28', price: 32 });
+
+  // ---- holding level ----
+  r = await req('GET', `/api/investments/holdings/${invXqqId}`);
+  const xqqJan = r.data.monthly.find((m) => m.month === '2026-01');
+  const xqqFeb = r.data.monthly.find((m) => m.month === '2026-02');
+  check('investments: XQQ January — bought at 145, month-end close 140',
+    xqqJan && xqqJan.startValue === 0 && xqqJan.contributions === 1450 && xqqJan.endValue === 1400
+      && xqqJan.gain === -50 && xqqJan.returnPct === -3.45, JSON.stringify(xqqJan));
+  check('investments: XQQ February — second buy, month-end close 150',
+    xqqFeb && xqqFeb.startValue === 1400 && xqqFeb.contributions === 1520 && xqqFeb.endValue === 3000
+      && xqqFeb.gain === 80 && xqqFeb.returnPct === 2.74, JSON.stringify(xqqFeb));
+  check('investments: XQQ summary rides the latest Stooq close (165)',
+    r.data.summary.units === 20 && r.data.summary.value === 3300 && r.data.summary.contributions === 2970
+      && r.data.summary.totalReturn === 330 && r.data.summary.totalReturnPct === 11.11
+      && r.data.summary.latestPrice === 165 && r.data.summary.latestPriceDate === '2026-03-20'
+      && r.data.priceStatus.pricedBy === 'stooq' && r.data.events.length === 2,
+    JSON.stringify(r.data.summary));
+
+  r = await req('GET', `/api/investments/holdings/${invHxqId}`);
+  check('investments: HXQ is priced by the Yahoo fallback when Stooq has nothing',
+    r.data.priceStatus.pricedBy === 'yahoo' && r.data.summary.value === 630
+      && r.data.summary.contributions === 600 && r.data.summary.totalReturn === 30
+      && r.data.summary.latestPrice === 63 && r.data.summary.latestPriceSource === 'yahoo',
+    JSON.stringify({ ps: r.data.priceStatus, sm: r.data.summary }));
+
+  r = await req('GET', `/api/investments/holdings/${invAaplId}`);
+  const aaplJan = r.data.monthly.find((m) => m.month === '2026-01');
+  const aaplFeb = r.data.monthly.find((m) => m.month === '2026-02');
+  check('investments: AAPL carries its USD currency; monthly rows are CAD at the month rates',
+    r.data.holding.currency === 'USD' && aaplJan && aaplJan.contributions === 1332.5 && aaplJan.endValue === 1300
+      && aaplFeb && aaplFeb.endValue === 1470, JSON.stringify({ aaplJan, aaplFeb }));
+  check('investments: AAPL summary — native and CAD side by side',
+    r.data.summary.valueNative === 1100 && r.data.summary.value === 1540
+      && r.data.summary.totalReturn === 207.5 && r.data.summary.totalReturnPct === 15.57,
+    JSON.stringify(r.data.summary));
+
+  r = await req('GET', `/api/investments/holdings/${invAcmeId}`);
+  check('investments: RSU grants accumulate units; the unpriced grant takes the known market price',
+    r.data.summary.units === 30 && r.data.summary.valueNative === 1200 && r.data.summary.totalReturnNative === 0
+      && r.data.summary.unpricedGrants === 0 && r.data.priceStatus.pricedBy === 'event',
+    JSON.stringify(r.data.summary));
+  check('investments: RSU in CAD — the FX move is the only gain',
+    r.data.summary.value === 1680 && r.data.summary.contributions === 1600 && r.data.summary.totalReturn === 80,
+    JSON.stringify(r.data.summary));
+
+  r = await req('GET', `/api/investments/holdings/${invFundId}`);
+  check('investments: the fund rides its manual NAV snapshots',
+    r.data.priceStatus.pricedBy === 'manual' && r.data.summary.value === 3200
+      && r.data.summary.contributions === 3000 && r.data.summary.totalReturn === 200
+      && r.data.summary.latestPrice === 32, JSON.stringify(r.data.summary));
+  r = await req('POST', `/api/investments/holdings/${invFundId}/nav`, { date: '2026-03-31', price: 33 });
+  const invNav3Id = r.data.id;
+  r = await req('GET', `/api/investments/holdings/${invFundId}`);
+  check('investments: a newer NAV moves the value', r.data.summary.value === 3300, JSON.stringify(r.data.summary));
+  r = await req('DELETE', `/api/investments/prices/${invNav3Id}`);
+  r = await req('GET', `/api/investments/holdings/${invFundId}`);
+  check('investments: deleting the NAV snapshot restores the earlier value',
+    r.status === 200 && r.data.summary.value === 3200, JSON.stringify(r.data.summary));
+
+  // Dividend round trip: returns count it, value does not.
+  r = await invEvent(invXqqId, { date: '2026-03-10', type: 'dividend', amount: 25 });
+  const invDivId = r.data.id;
+  r = await req('GET', `/api/investments/holdings/${invXqqId}`);
+  check('investments: a dividend lands in return $ but not in value or contributions',
+    r.data.summary.dividends === 25 && r.data.summary.totalReturn === 355
+      && r.data.summary.value === 3300 && r.data.summary.contributions === 2970,
+    JSON.stringify(r.data.summary));
+  await req('DELETE', `/api/investments/events/${invDivId}`);
+  r = await req('PUT', `/api/investments/events/${invXqqBuy1}`, { note: 'initial position' });
+  check('investments: an event edit round-trips', r.status === 200 && r.data.note === 'initial position', JSON.stringify(r.data));
+
+  // ---- account + portfolio levels ----
+  r = await req('GET', `/api/investments/accounts/${invTfsaId}`);
+  const tfsaJan = r.data.monthly.find((m) => m.month === '2026-01');
+  check('investments: TFSA totals its three holdings (Stooq + manual NAV + Yahoo)',
+    r.data.summary.value === 7130 && r.data.summary.contributions === 6570 && r.data.summary.totalReturn === 560
+      && tfsaJan && tfsaJan.contributions === 5050 && tfsaJan.endValue === 5110 && tfsaJan.gain === 60,
+    JSON.stringify({ sm: r.data.summary, tfsaJan }));
+  check('investments: account holdings rows carry currency badges and price sources',
+    r.data.holdings.length === 3
+      && r.data.holdings.every((h) => h.holding.currency === 'CAD')
+      && r.data.holdings.find((h) => h.holding.id === invHxqId).priceStatus.pricedBy === 'yahoo',
+    JSON.stringify(r.data.holdings.map((h) => [h.holding.label, h.priceStatus.pricedBy])));
+
+  r = await req('GET', '/api/investments');
+  const pfJan = r.data.monthly.find((m) => m.month === '2026-01');
+  check('investments: portfolio totals every account in CAD',
+    r.data.summary.value === 10350 && r.data.summary.contributions === 9502.5 && r.data.summary.totalReturn === 847.5
+      && r.data.summary.totalReturnPct === 8.92 && r.data.fxMissing === false && r.data.accounts.length === 3,
+    JSON.stringify(r.data.summary));
+  check('investments: portfolio January aggregates the accounts',
+    pfJan && pfJan.contributions === 7422.5 && pfJan.endValue === 7450 && pfJan.gain === 27.5 && pfJan.returnPct === 0.37,
+    JSON.stringify(pfJan));
+  check('investments: portfolio series ends at the current total',
+    r.data.series.length > 0 && r.data.series[r.data.series.length - 1].value === 10350,
+    JSON.stringify(r.data.series.slice(-1)));
+
+  r = await req('POST', '/api/investments/refresh');
+  check('investments: manual refresh re-fetches the exchange holdings (incl. the Yahoo one)',
+    r.status === 200 && [invXqqId, invAaplId, invHxqId].every((id) => r.data.refreshed.includes(id)),
+    JSON.stringify(r.data));
+
+  // Account edit + delete round trip on a scratch account.
+  r = await req('POST', '/api/investments/accounts', { name: 'Scratch', type: 'Other' });
+  const invScratchId = r.data.id;
+  r = await req('PUT', `/api/investments/accounts/${invScratchId}`, { name: 'Scratch Renamed' });
+  check('investments: account rename round-trips', r.status === 200 && r.data.name === 'Scratch Renamed', JSON.stringify(r.data));
+  r = await req('DELETE', `/api/investments/accounts/${invScratchId}`);
+  r = await req('GET', `/api/investments/accounts/${invScratchId}`);
+  check('investments: a deleted account is a 404', r.status === 404, JSON.stringify(r.data));
+
+  // ---- account-page AI fill chat (stub LLM), two rounds ----
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'I found the VFV purchase on the statement. One question before I draft the Scotia fund: is the Scotia NASDAQ Index Fund denominated in CAD or USD?',
+    proposed: {
+      holdings: [{ ref: 'h1', label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD' }],
+      events: [{ holdingRef: 'h1', date: '2026-03-05', type: 'buy', units: 10, price: 150 }],
+    },
+    ready: false,
+  }));
+  r = await req('POST', '/api/ai/invest-fill-chat', {
+    accountId: invTfsaId,
+    text: 'Statement: bought 10 VFV.TO on Mar 5 at 150. Also hold the Scotia NASDAQ Index Fund.',
+  });
+  check('investments AI: round 1 drafts VFV and asks the fund currency instead of guessing',
+    r.status === 200 && r.data.proposed.holdings.length === 1 && r.data.proposed.holdings[0].symbol === 'VFV.TO'
+      && /CAD or USD/.test(r.data.reply) && r.data.ready === false, JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Added the Scotia NASDAQ Index Fund as a CAD fund with its first purchase.',
+    proposed: {
+      holdings: [
+        { ref: 'h1', label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD' },
+        { ref: 'h2', label: 'Scotia NASDAQ Index Fund', kind: 'fund', currency: 'CAD' },
+      ],
+      events: [
+        { holdingRef: 'h1', date: '2026-03-05', type: 'buy', units: 10, price: 150 },
+        { holdingRef: 'h2', date: '2026-03-05', type: 'buy', units: 50, price: 40 },
+      ],
+    },
+    ready: true,
+  }));
+  const invChatRound2 = {
+    accountId: invTfsaId,
+    history: [
+      { role: 'user', content: 'Statement: bought 10 VFV.TO…' },
+      { role: 'assistant', content: '…is the Scotia NASDAQ Index Fund denominated in CAD or USD?' },
+    ],
+    text: 'It is CAD. First purchase was 50 units on Mar 5 at 40.',
+    proposed: {
+      holdings: [{ ref: 'h1', label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD' }],
+      events: [{ holdingRef: 'h1', date: '2026-03-05', type: 'buy', units: 10, price: 150 }],
+    },
+  };
+  r = await req('POST', '/api/ai/invest-fill-chat', invChatRound2);
+  check('investments AI: round 2 completes the draft with both holdings and events',
+    r.status === 200 && r.data.ready === true && r.data.proposed.holdings.length === 2
+      && r.data.proposed.events.length === 2 && r.data.proposed.holdings[1].kind === 'fund',
+    JSON.stringify(r.data));
+  // Apply the way the panel does: holdings first, then their events.
+  r = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`,
+    { label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD', source: 'ai' });
+  const invVfvId = r.data.id;
+  check('investments AI: applied holding carries the ai source', r.status === 201 && r.data.source === 'ai', JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`,
+    { label: 'Scotia NASDAQ Index Fund', kind: 'fund', currency: 'CAD', source: 'ai' });
+  const invScotiaFundId = r.data.id;
+  await req('POST', `/api/investments/holdings/${invVfvId}/events`,
+    { date: '2026-03-05', type: 'buy', units: 10, price: 150, source: 'ai' });
+  r = await req('POST', `/api/investments/holdings/${invScotiaFundId}/events`,
+    { date: '2026-03-05', type: 'buy', units: 50, price: 40, source: 'ai' });
+  check('investments AI: applied event carries the ai source', r.status === 201 && r.data.source === 'ai', JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/accounts/${invTfsaId}`);
+  check('investments AI: after Apply the account totals include both new holdings',
+    r.data.summary.value === 10630 && r.data.holdings.length === 5
+      && r.data.holdings.find((h) => h.holding.id === invVfvId).holding.source === 'ai',
+    JSON.stringify({ v: r.data.summary.value, n: r.data.holdings.length }));
+  // Re-proposing what now exists flags the duplicates.
+  r = await req('POST', '/api/ai/invest-fill-chat', { accountId: invTfsaId, text: 'Add VFV again from this statement.' });
+  check('investments AI: re-proposing an existing holding is flagged as a duplicate',
+    r.status === 200 && r.data.proposed.holdings.length === 2
+      && r.data.proposed.holdings.every((h) => h.conflict === 'duplicate-holding'),
+    JSON.stringify(r.data.proposed && r.data.proposed.holdings));
+  r = await req('POST', '/api/ai/invest-fill-chat', { accountId: 999999, text: 'x' });
+  check('investments AI: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
+
+  // ---- browser pass over the three levels ----
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('investments browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardI = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResI = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueI = loginResI.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserI = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      const page = await browserI.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardI({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueI, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitI = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const overviewText = await page.evaluate(() => document.querySelector('#section-investments').textContent);
+      check('investments UI: the overview lists the accounts and the CAD portfolio total (AI-applied holdings included)',
+        overviewText.includes('TFSA') && overviewText.includes('Employer RSU') && overviewText.includes('13,850'),
+        overviewText.slice(0, 300));
+      await page.goto(`http://ff.local/#invest-account/${invRsuId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const rsuPage = await page.evaluate(() => ({
+        text: document.querySelector('#view-invest-account').textContent,
+        usdBadges: document.querySelectorAll('#view-invest-account .badge.usd').length,
+        aiPanel: !!document.querySelector('#investAiFill'),
+      }));
+      check('investments UI: the RSU account page shows the holding with a USD badge and the AI panel',
+        rsuPage.text.includes('Acme Corp') && rsuPage.usdBadges >= 1 && rsuPage.aiPanel,
+        JSON.stringify({ usdBadges: rsuPage.usdBadges, aiPanel: rsuPage.aiPanel }));
+      await page.goto(`http://ff.local/#invest-holding/${invHxqId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const hxqText = await page.evaluate(() => document.querySelector('#view-invest-holding').textContent);
+      check('investments UI: the HXQ holding page names Yahoo Finance as its price source',
+        hxqText.includes('Yahoo Finance'), hxqText.slice(0, 300));
+    } catch (err) {
+      check('investments browser flow runs to completion', false, String((err && err.message) || err));
+    } finally {
+      await browserI.close();
+    }
+  }
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
@@ -7549,6 +7935,9 @@ try {
   stub.close();
   primeStub.close();
   hsStub.close();
+  stooqStub.close();
+  fxStub.close();
+  yahooStub.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 console.log(failures === 0 ? 'E2E: ALL PASS' : `E2E: ${failures} FAILURE(S)`);

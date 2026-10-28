@@ -154,6 +154,74 @@ CREATE TABLE IF NOT EXISTS property_costs (
   UNIQUE (property_id, year, category)
 );
 CREATE INDEX IF NOT EXISTS idx_property_costs ON property_costs(property_id, year);
+-- Investments: accounts (TFSA / RRSP / RSU / non-registered …)
+-- hold exchange-traded stocks/ETFs and bank mutual funds. A
+-- holding's life is its EVENTS (buys, sells, RSU grants,
+-- dividends); its price history is cached in invest_prices from
+-- four sources — 'stooq' (fetched daily closes for exchange
+-- symbols), 'yahoo' (the same, via Yahoo Finance when Stooq has
+-- nothing for a symbol), 'manual' (NAV snapshots the user
+-- records for bank funds, which have no clean public history
+-- feed) and 'event'
+-- (the per-unit price of a priced event, materialized so a
+-- holding with no other price source still values at its last
+-- traded price). source on holdings/events is provenance only:
+-- 'manual' rows were typed in, 'ai' rows landed through the
+-- account page's AI fill chat Apply button (see src/aiFill.js).
+CREATE TABLE IF NOT EXISTS invest_accounts (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'NonRegistered',  -- 'TFSA' | 'RRSP' | 'RSU' | 'NonRegistered' | 'Other'
+  institution TEXT,                            -- free text: CIBC, Scotia, employer plan…
+  note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invest_holdings (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES invest_accounts(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,                         -- display name, e.g. 'CIBC US Index Fund'
+  kind TEXT NOT NULL DEFAULT 'exchange',       -- 'exchange' (stock/ETF) | 'fund' (bank mutual fund)
+  symbol TEXT,                                 -- exchange only: 'XQQ.TO', 'AAPL'
+  fund_code TEXT,                              -- optional fund code, display only
+  currency TEXT NOT NULL DEFAULT 'CAD',        -- 'CAD' | 'USD' — shown beside the holding everywhere
+  source TEXT NOT NULL DEFAULT 'manual',       -- 'manual' | 'ai'
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invest_events (
+  id INTEGER PRIMARY KEY,
+  holding_id INTEGER NOT NULL REFERENCES invest_holdings(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,                          -- 'YYYY-MM-DD'
+  type TEXT NOT NULL,                          -- 'buy' | 'sell' | 'grant' | 'dividend'
+  units REAL,                                  -- buy/sell/grant: units moved
+  price REAL,                                  -- per-unit price in the holding's currency; grant: cost-basis price, NULL = market price on the grant date
+  amount REAL,                                 -- dividend: total paid, in the holding's currency
+  note TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',       -- 'manual' | 'ai'
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invest_prices (
+  id INTEGER PRIMARY KEY,
+  holding_id INTEGER NOT NULL REFERENCES invest_holdings(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,                          -- 'YYYY-MM-DD'
+  price REAL NOT NULL,                         -- per-unit price / NAV in the holding's currency
+  source TEXT NOT NULL DEFAULT 'manual',       -- 'stooq' | 'yahoo' | 'manual' | 'event'
+  created_at TEXT NOT NULL,
+  UNIQUE (holding_id, date, source)
+);
+CREATE INDEX IF NOT EXISTS idx_invest_holdings_account ON invest_holdings(account_id);
+CREATE INDEX IF NOT EXISTS idx_invest_events_holding ON invest_events(holding_id, date, id);
+CREATE INDEX IF NOT EXISTS idx_invest_prices_holding ON invest_prices(holding_id, date);
+-- USD/CAD daily rates (Bank of Canada Valet FX_USDCAD), cached
+-- the way prime_rates caches the prime series: fetch-on-read,
+-- last known value when a fetch fails.
+CREATE TABLE IF NOT EXISTS invest_fx_rates (
+  date TEXT PRIMARY KEY,                       -- 'YYYY-MM-DD' observation date
+  rate REAL NOT NULL,                          -- CAD per 1 USD
+  source TEXT                                  -- series id the value came from
+);
 -- A property's uploaded photos, in display order: the gallery the
 -- detail page shows as a carousel; the first row is the Properties
 -- card cover. Files live in PHOTOS_DIR; the row stores only the name.

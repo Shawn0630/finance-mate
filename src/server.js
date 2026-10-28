@@ -15,8 +15,14 @@ import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
-import { handleAiFill, handleAiFillChat, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
+import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
+import {
+  ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput,
+  listAccounts, getAccount, listHoldings, getHolding, listEvents, rebuildEventPricePoints,
+  computeHolding, computeAccount, computePortfolio,
+} from './investments.js';
+import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver } from './prices.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -218,6 +224,29 @@ app.post('/api/ai/fill-chat', requireApiAuth, async (req, res) => {
     model: getAiFillModel(),
     property: property ? { id: property.id, address: property.address } : null,
     existing: property ? listCosts(db, property.id) : [],
+  });
+  if (status === 200 && b.model) setAiFillModel(String(b.model).trim());
+  res.status(status).json(body);
+});
+
+// The Investments account page's AI chat: the same multi-turn
+// conversation pattern (see aiFill.js), scoped to ONE account —
+// it proposes new holdings and events, asks instead of guessing,
+// and writes nothing; the panel applies the confirmed draft
+// through the investments POST endpoints with source 'ai'. The
+// account's recorded holdings and their events ride along as
+// context (and power the server-side duplicate flags).
+app.post('/api/ai/invest-fill-chat', requireApiAuth, async (req, res) => {
+  const b = req.body || {};
+  const aid = Number(b.accountId);
+  const account = Number.isInteger(aid) && aid > 0 ? getAccount(db, aid) : null;
+  const holdings = account
+    ? listHoldings(db, account.id).map((h) => ({ ...h, events: listEvents(db, h.id) }))
+    : [];
+  const { status, body } = await handleAiInvestFillChat(b, {
+    model: getAiFillModel(),
+    account,
+    holdings,
   });
   if (status === 200 && b.model) setAiFillModel(String(b.model).trim());
   res.status(status).json(body);
@@ -2231,6 +2260,202 @@ app.delete('/api/assets/:id', requireApiAuth, (req, res) => {
   const info = db.prepare('DELETE FROM other_assets WHERE id = ?').run(req.params.id);
   if (!info.changes) return res.status(404).json({ error: 'asset not found' });
   res.json({ ok: true });
+});
+
+// ------------------------------------------------------------ investments --
+// Accounts → holdings → events, with the return engine's three
+// views (portfolio / account / holding). Reads first refresh the
+// price caches (fetch-on-read, see src/prices.js): exchange
+// holdings pull Stooq closes, USD holdings pull the Valet FX
+// series; failures keep the last known values and the response's
+// priceStatus / fx fields say what is stale or missing — a read
+// never fails because a price source is down.
+async function prepareInvestScope(holdings) {
+  await Promise.all(holdings.map((h) => ensureHoldingPrices(db, h)));
+  if (holdings.some((h) => h.currency === 'USD')) await ensureFxRates(db);
+  return makeFxResolver(db);
+}
+
+const investPriceStatus = (computed) => priceStatusFor(db, computed.holding,
+  computed.summary.latestPrice != null
+    ? { price: computed.summary.latestPrice, date: computed.summary.latestPriceDate, source: computed.summary.latestPriceSource }
+    : null);
+
+const investHoldingRow = (computed) => ({
+  holding: computed.holding,
+  summary: computed.summary,
+  priceStatus: investPriceStatus(computed),
+});
+
+app.get('/api/investments', requireApiAuth, async (req, res) => {
+  const fx = await prepareInvestScope(listHoldings(db));
+  const p = computePortfolio(db, fx, vancouverToday());
+  res.json({
+    accounts: p.accounts.map((a) => ({
+      account: a.account, summary: a.summary, monthly: a.monthly, series: a.series,
+      holdings: a.holdings.map(investHoldingRow),
+    })),
+    monthly: p.monthly, series: p.series, summary: p.summary,
+    fxMissing: fx.missing,
+  });
+});
+
+app.post('/api/investments/accounts', requireApiAuth, (req, res) => {
+  const v = validAccountInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const info = db.prepare(
+    'INSERT INTO invest_accounts (name, type, institution, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(v.name, v.type, v.institution, v.note, ts, ts);
+  res.status(201).json(getAccount(db, info.lastInsertRowid));
+});
+
+app.get('/api/investments/accounts/:id', requireApiAuth, async (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const fx = await prepareInvestScope(listHoldings(db, account.id));
+  const a = computeAccount(db, account, fx, vancouverToday());
+  res.json({
+    account: a.account, summary: a.summary, monthly: a.monthly, series: a.series,
+    holdings: a.holdings.map((c) => ({ ...investHoldingRow(c), events: c.events })),
+    fxMissing: fx.missing,
+  });
+});
+
+app.put('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const v = validAccountInput(req.body || {}, account);
+  if (v.error) return res.status(400).json({ error: v.error });
+  db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, updated_at = ? WHERE id = ?')
+    .run(v.name, v.type, v.institution, v.note, nowIso(), account.id);
+  res.json(getAccount(db, account.id));
+});
+
+app.delete('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM invest_accounts WHERE id = ?').run(Number(req.params.id));
+  if (!info.changes) return res.status(404).json({ error: 'account not found' });
+  res.json({ ok: true });
+});
+
+app.post('/api/investments/accounts/:id/holdings', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const v = validHoldingInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const info = db.prepare(
+    'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(account.id, v.label, v.kind, v.symbol, v.fundCode, v.currency,
+      req.body && req.body.source === 'ai' ? 'ai' : 'manual', ts, ts);
+  res.status(201).json(getHolding(db, info.lastInsertRowid));
+});
+
+app.get('/api/investments/holdings/:id', requireApiAuth, async (req, res) => {
+  const holding = getHolding(db, Number(req.params.id));
+  if (!holding) return res.status(404).json({ error: 'holding not found' });
+  const account = getAccount(db, holding.account_id);
+  const fx = await prepareInvestScope([holding]);
+  const c = computeHolding(db, holding, fx, vancouverToday());
+  res.json({
+    holding: c.holding, account, summary: c.summary, monthly: c.monthly, series: c.series,
+    events: c.events,
+    navPoints: c.points.filter((p) => p.source === 'manual'),
+    priceStatus: investPriceStatus(c),
+    fxMissing: fx.missing,
+  });
+});
+
+app.put('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
+  const holding = getHolding(db, Number(req.params.id));
+  if (!holding) return res.status(404).json({ error: 'holding not found' });
+  const v = validHoldingInput(req.body || {}, holding);
+  if (v.error) return res.status(400).json({ error: v.error });
+  db.transaction(() => {
+    db.prepare('UPDATE invest_holdings SET label = ?, kind = ?, symbol = ?, fund_code = ?, currency = ?, updated_at = ? WHERE id = ?')
+      .run(v.label, v.kind, v.symbol, v.fundCode, v.currency, nowIso(), holding.id);
+    // A new symbol invalidates the closes fetched for the old
+    // one; the next read refetches under the new symbol.
+    if (v.symbol !== holding.symbol || v.kind !== holding.kind) {
+      db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo')").run(holding.id);
+      db.prepare("DELETE FROM app_meta WHERE key = ?").run(`invest_px_${holding.id}_ok`);
+    }
+  })();
+  res.json(getHolding(db, holding.id));
+});
+
+app.delete('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM invest_holdings WHERE id = ?').run(Number(req.params.id));
+  if (!info.changes) return res.status(404).json({ error: 'holding not found' });
+  res.json({ ok: true });
+});
+
+app.post('/api/investments/holdings/:id/events', requireApiAuth, (req, res) => {
+  const holding = getHolding(db, Number(req.params.id));
+  if (!holding) return res.status(404).json({ error: 'holding not found' });
+  const v = validEventInput(req.body || {}, { events: listEvents(db, holding.id) });
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const info = db.prepare(
+    'INSERT INTO invest_events (holding_id, date, type, units, price, amount, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(holding.id, v.date, v.type, v.units, v.price, v.amount, v.note,
+      req.body && req.body.source === 'ai' ? 'ai' : 'manual', ts, ts);
+  rebuildEventPricePoints(db, holding.id, ts);
+  res.status(201).json(db.prepare('SELECT * FROM invest_events WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.put('/api/investments/events/:id', requireApiAuth, (req, res) => {
+  const ev = db.prepare('SELECT * FROM invest_events WHERE id = ?').get(Number(req.params.id));
+  if (!ev) return res.status(404).json({ error: 'event not found' });
+  const v = validEventInput(req.body || {}, {
+    base: ev, events: listEvents(db, ev.holding_id), exceptId: ev.id,
+  });
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  db.prepare('UPDATE invest_events SET date = ?, type = ?, units = ?, price = ?, amount = ?, note = ?, updated_at = ? WHERE id = ?')
+    .run(v.date, v.type, v.units, v.price, v.amount, v.note, ts, ev.id);
+  rebuildEventPricePoints(db, ev.holding_id, ts);
+  res.json(db.prepare('SELECT * FROM invest_events WHERE id = ?').get(ev.id));
+});
+
+app.delete('/api/investments/events/:id', requireApiAuth, (req, res) => {
+  const ev = db.prepare('SELECT * FROM invest_events WHERE id = ?').get(Number(req.params.id));
+  if (!ev) return res.status(404).json({ error: 'event not found' });
+  db.prepare('DELETE FROM invest_events WHERE id = ?').run(ev.id);
+  rebuildEventPricePoints(db, ev.holding_id, nowIso());
+  res.json({ ok: true });
+});
+
+// A manual price snapshot — for bank funds this is the NAV
+// entry, the fund's official price path; for an exchange holding
+// it is a hand correction that outranks the fetched close on
+// its date.
+app.post('/api/investments/holdings/:id/nav', requireApiAuth, (req, res) => {
+  const holding = getHolding(db, Number(req.params.id));
+  if (!holding) return res.status(404).json({ error: 'holding not found' });
+  const v = validNavInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  db.prepare(
+    "INSERT INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, 'manual', ?) ON CONFLICT(holding_id, date, source) DO UPDATE SET price = excluded.price")
+    .run(holding.id, v.date, v.price, ts);
+  res.status(201).json(db.prepare(
+    "SELECT * FROM invest_prices WHERE holding_id = ? AND date = ? AND source = 'manual'").get(holding.id, v.date));
+});
+
+app.delete('/api/investments/prices/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM invest_prices WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'price point not found' });
+  if (row.source !== 'manual') {
+    return res.status(400).json({ error: 'only manual price snapshots can be deleted' });
+  }
+  db.prepare('DELETE FROM invest_prices WHERE id = ?').run(row.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/investments/refresh', requireApiAuth, async (req, res) => {
+  const refreshed = await refreshAllPrices(db, listHoldings(db));
+  res.json({ ok: true, refreshed });
 });
 
 // ---------------------------------------------------------------- summary ---

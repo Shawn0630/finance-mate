@@ -29,6 +29,7 @@
     <nav class="subnav" id="assetsNav">
       <a href="#assets/overview" data-section="overview">Overview</a>
       <a href="#assets/properties" data-section="properties">Properties</a>
+      <a href="#assets/investments" data-section="investments">Investments</a>
       <a href="#assets/fixed-assets" data-section="fixed-assets">Fixed assets</a>
       <a href="#assets/stocks" data-section="stocks">Stocks</a>
       <a href="#assets/term-deposits" data-section="term-deposits">Term deposits</a>
@@ -90,6 +91,11 @@
       <div class="cards" id="propertyCards"></div>
     </div>
 
+    <!-- Investments: accounts/holdings with tracked prices and
+         returns; rendered by app.js (loadInvestments). Lives
+         beside the other-assets registry, not inside it. -->
+    <div id="section-investments" class="asset-section hidden"></div>
+
     <!-- One listing section per other-asset category; filled by app.js. -->
     <div id="section-fixed-assets" class="asset-section hidden"></div>
     <div id="section-stocks" class="asset-section hidden"></div>
@@ -106,6 +112,99 @@
       <h3 id="assetDetailTitle">Asset</h3>
       <table class="detail-table"><tbody id="assetDetailBody"></tbody></table>
       <div class="toolbar"><button class="primary" id="editAssetBtn">Edit</button></div>
+    </div>
+  </section>
+
+  <!-- ==================== Investment account detail ==================== -->
+  <section id="view-invest-account" class="hidden">
+    <div class="toolbar"><a href="#assets/investments">&larr; Back to Investments</a><div class="spacer"></div>
+      <button id="editInvestAccountBtn">Edit account</button>
+      <button class="danger" id="deleteInvestAccountBtn">Delete account</button></div>
+    <div class="msg" id="investAccountMsg"></div>
+    <div class="panel">
+      <h3 id="investAccountTitle">Account</h3>
+      <div class="summary-strip" id="investAccountStats"></div>
+      <div class="msg warn hidden" id="investAccountPriceNote"></div>
+      <div class="chart-wrap tall"><canvas id="investAccountChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Holdings</h3>
+        <div class="spacer"></div>
+        <button type="button" class="small" data-invest-ai-toggle>✨ Fill with AI</button>
+        <button class="primary small" id="addHoldingBtn">+ Add holding</button>
+      </div>
+      <div class="ai-fill" id="investAiFill">
+        <div class="ai-panel hidden" data-invest-ai-panel>
+          <div class="note hidden" data-invest-ai-guidance style="margin:0 0 8px"></div>
+          <div class="costs-chat-log hidden" data-invest-chat-log></div>
+          <div class="costs-chat-queue hidden" data-invest-chat-queue></div>
+          <textarea rows="3" data-invest-chat-text placeholder="Paste a statement or grant notice, or answer the AI's question…"></textarea>
+          <div class="ai-panel-row">
+            <input type="file" accept="image/*,application/pdf,.csv,.txt" multiple data-invest-chat-files>
+            <select data-invest-chat-model title="Model" style="width:auto;flex:0 1 auto"></select>
+            <button type="button" class="primary small" data-invest-chat-send>Send</button>
+            <button type="button" class="small hidden" data-invest-chat-clear>Clear session</button>
+          </div>
+          <div data-invest-proposed></div>
+          <div class="msg" data-invest-chat-msg></div>
+        </div>
+      </div>
+      <div id="investHoldingsWrap"></div>
+    </div>
+    <div class="panel">
+      <h3>Monthly returns</h3>
+      <div id="investAccountMonthly"></div>
+      <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. A grant counts as a contribution at its cost (or that day's market) price, never as profit.</div>
+    </div>
+  </section>
+
+  <!-- ==================== Investment holding detail ==================== -->
+  <section id="view-invest-holding" class="hidden">
+    <div class="toolbar"><a id="investHoldingBack" href="#assets/investments">&larr; Back to account</a><div class="spacer"></div>
+      <button id="editInvestHoldingBtn">Edit holding</button>
+      <button class="danger" id="deleteInvestHoldingBtn">Delete holding</button></div>
+    <div class="msg" id="investHoldingMsg"></div>
+    <div class="panel">
+      <h3 id="investHoldingTitle">Holding</h3>
+      <div class="summary-strip" id="investHoldingStats"></div>
+      <div class="msg warn hidden" id="investHoldingPriceNote"></div>
+      <div class="chart-wrap tall"><canvas id="investHoldingChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>Events</h3></div>
+      <div id="investEventsWrap"></div>
+      <form id="investEventForm" class="toolbar" style="align-items:flex-end;margin-top:10px">
+        <input type="hidden" name="id">
+        <div><label>Date</label><input type="date" name="date" required></div>
+        <div><label>Type</label><select name="type">
+          <option value="buy">Buy</option><option value="sell">Sell</option>
+          <option value="grant">Grant (RSU)</option><option value="dividend">Dividend</option>
+        </select></div>
+        <div data-ev-units><label>Units</label><input type="text" inputmode="decimal" name="units" style="width:110px"></div>
+        <div data-ev-price><label>Price / unit</label><input type="text" inputmode="decimal" data-money name="price" style="width:130px"></div>
+        <div data-ev-amount class="hidden"><label>Amount</label><input type="text" inputmode="decimal" data-money name="amount" style="width:130px"></div>
+        <div><label>Note</label><input type="text" name="note" style="width:160px"></div>
+        <button class="primary" type="submit" id="investEventSubmit">Add event</button>
+        <button type="button" id="investEventCancel" class="hidden">Cancel edit</button>
+      </form>
+      <div class="msg" id="investEventMsg"></div>
+    </div>
+    <div class="panel" id="investNavPanel">
+      <div class="panel-head"><h3 id="investNavTitle">Price snapshots</h3></div>
+      <div class="note" id="investNavNote" style="margin-left:0"></div>
+      <div id="investNavWrap"></div>
+      <form id="investNavForm" class="toolbar" style="align-items:flex-end;margin-top:10px">
+        <div><label>Date</label><input type="date" name="date" required></div>
+        <div><label id="investNavPriceLabel">NAV / price</label><input type="text" inputmode="decimal" data-money name="price" required style="width:140px"></div>
+        <button class="primary" type="submit">Add snapshot</button>
+      </form>
+      <div class="msg" id="investNavMsg"></div>
+    </div>
+    <div class="panel">
+      <h3>Monthly returns</h3>
+      <div id="investHoldingMonthly"></div>
+      <div class="note" style="margin-left:0">In the holding's own currency. Dividends count in the month's return, not in its end value.</div>
     </div>
   </section>
 
@@ -331,6 +430,57 @@
       </div>
       <div class="toolbar">
         <button class="primary" type="submit">Add property</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="investAccountModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="investAccountModalTitle">Add account</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="investAccountModalMsg"></div>
+    <form id="investAccountForm">
+      <input type="hidden" name="id">
+      <div class="grid2">
+        <div><label>Name *</label><input name="name" required autocomplete="off"></div>
+        <div><label>Type</label><select name="type">
+          <option value="TFSA">TFSA</option><option value="RRSP">RRSP</option>
+          <option value="RSU">RSU</option><option value="NonRegistered">Non-registered</option>
+          <option value="Other">Other</option>
+        </select></div>
+      </div>
+      <div class="grid2">
+        <div><label>Institution</label><input name="institution" placeholder="CIBC, Scotia, employer plan…" autocomplete="off"></div>
+        <div><label>Note</label><input name="note" autocomplete="off"></div>
+      </div>
+      <div class="toolbar">
+        <button class="primary" type="submit">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="investHoldingModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="investHoldingModalTitle">Add holding</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="investHoldingModalMsg"></div>
+    <form id="investHoldingForm">
+      <input type="hidden" name="id">
+      <div><label>Label *</label><input name="label" required placeholder="e.g. CIBC U.S. Index Fund, XQQ" autocomplete="off"></div>
+      <div class="grid3">
+        <div><label>Kind</label><select name="kind">
+          <option value="exchange">Exchange (stock / ETF)</option><option value="fund">Bank mutual fund</option>
+        </select></div>
+        <div><label>Currency</label><select name="currency">
+          <option value="CAD">CAD</option><option value="USD">USD</option>
+        </select></div>
+        <div><label>Fund code</label><input name="fundCode" autocomplete="off"></div>
+      </div>
+      <div><label>Symbol (exchange)</label><input name="symbol" placeholder="XQQ.TO, AAPL…" autocomplete="off"></div>
+      <div class="toolbar">
+        <button class="primary" type="submit">Save</button>
         <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>

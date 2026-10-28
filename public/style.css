@@ -40,6 +40,8 @@ h2 { font-size: 16px; margin: 22px 0 10px; }
 .badge.manual { background: #fdf0e0; color: #9a6206; }
 .badge.var { background: #f3e8fd; color: #6d28a8; }
 .badge.cmp { background: #e8f5ee; color: #1e7a46; }
+.badge.usd { background: #e8f5ee; color: #1e7a46; }
+.badge.ai { background: #f3e8fd; color: #6d28a8; }
 .panel { background: #fff; border: 1px solid #dde4ec; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
 .panel h3 { margin: 0 0 8px; font-size: 15px; }
 /* Panel head: title left, actions (Edit / modal openers) top-right. */

@@ -226,6 +226,7 @@ document.addEventListener('keydown', (e) => {
 const ASSET_SECTIONS = [
   { key: 'overview', label: 'Overview' },
   { key: 'properties', label: 'Properties', addLabel: 'Add property' },
+  { key: 'investments', label: 'Investments' },
   { key: 'fixed-assets', category: 'fixed_assets', label: 'Fixed assets', addLabel: 'Add fixed asset' },
   { key: 'stocks', category: 'stocks', label: 'Stocks', addLabel: 'Add stock' },
   { key: 'term-deposits', category: 'term_deposits', label: 'Term deposits', addLabel: 'Add term deposit' },
@@ -240,11 +241,11 @@ let currentAssetId = null;
 let currentSection = 'overview';
 
 function showView(name) {
-  for (const v of ['assets', 'property', 'asset', 'spending', 'planning', 'tax', 'admin']) {
+  for (const v of ['assets', 'property', 'asset', 'invest-account', 'invest-holding', 'spending', 'planning', 'tax', 'admin']) {
     $('#view-' + v).classList.toggle('hidden', v !== name);
   }
   document.querySelectorAll('#mainNav a').forEach((a) =>
-    a.classList.toggle('active', a.dataset.nav === (name === 'property' || name === 'asset' ? 'assets' : name))
+    a.classList.toggle('active', a.dataset.nav === (['property', 'asset', 'invest-account', 'invest-holding'].includes(name) ? 'assets' : name))
   );
 }
 
@@ -267,6 +268,14 @@ function route() {
     currentAssetId = Number(hash.split('/')[1]);
     showView('asset');
     loadAssetDetail(currentAssetId);
+  } else if (hash.startsWith('#invest-account/')) {
+    currentInvestAccountId = Number(hash.split('/')[1]);
+    showView('invest-account');
+    loadInvestAccount(currentInvestAccountId);
+  } else if (hash.startsWith('#invest-holding/')) {
+    currentInvestHoldingId = Number(hash.split('/')[1]);
+    showView('invest-holding');
+    loadInvestHolding(currentInvestHoldingId);
   } else if (hash === '#admin') {
     showView('admin');
     loadAdmin();
@@ -278,6 +287,7 @@ function route() {
     showView('assets');
     showSection(ASSET_SECTIONS.some((s) => s.key === key) ? key : 'overview');
     loadAssets();
+    if (key === 'investments') loadInvestments();
     // Portfolio charts created while the section was hidden have a
     // zero-size canvas; redraw them once it is actually on screen.
     if (key === 'properties') requestAnimationFrame(redrawPortfolioIfCollapsed);
@@ -457,6 +467,9 @@ async function loadChart(id) { return withLoading(() => loadChartImpl(id)); }
 async function loadTrend(id) { return withLoading(() => loadTrendImpl(id)); }
 async function loadCosts(id) { return withLoading(() => loadCostsImpl(id)); }
 async function loadEquity(id) { return withLoading(() => loadEquityImpl(id)); }
+async function loadInvestments() { return withLoading(() => loadInvestmentsImpl()); }
+async function loadInvestAccount(id) { return withLoading(() => loadInvestAccountImpl(id)); }
+async function loadInvestHolding(id) { return withLoading(() => loadInvestHoldingImpl(id)); }
 
 function markAssetsDirty() { assetsLoaded = false; }
 
@@ -4460,6 +4473,788 @@ document.querySelector('[data-costs-proposed]').addEventListener('input', (e) =>
       renderCostsProposed();
     } catch (err) {
       renderCostsChatLog();
+      showMsg(msg, 'err', err.message);
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+    }
+  });
+}
+
+// ------------------------------------------------------------ investments --
+// Three levels, mirroring Properties: a portfolio overview in
+// the Assets > Investments section, an account detail page and a
+// holding detail page. All figures come from the server's return
+// engine (src/investments.js): values and returns at account /
+// portfolio level are CAD; a holding's own page speaks its
+// native currency, with the currency badge beside its name
+// everywhere. The other-assets registry is untouched by this
+// module — investments never go through it.
+let currentInvestAccountId = null;
+let currentInvestHoldingId = null;
+let investPortfolioChart = null;
+let investAccountChart = null;
+let investHoldingChart = null;
+let investAccountData = null; // last account-detail payload (the AI chat's context)
+let investHoldingData = null; // last holding-detail payload
+window.__fmCharts = window.__fmCharts || {};
+window.__fmCharts.investments = null;
+window.__fmCharts.investAccount = null;
+window.__fmCharts.investHolding = null;
+
+const moneyC = (n, cur = 'CAD', digits = 2) =>
+  n === null || n === undefined || n === ''
+    ? '—'
+    : Number(n).toLocaleString('en-CA', { style: 'currency', currency: cur, minimumFractionDigits: digits, maximumFractionDigits: digits });
+const fmtUnits = (n) => (n === null || n === undefined ? '—'
+  : Number(n).toLocaleString('en-CA', { maximumFractionDigits: 4 }));
+const pctText = (p) => (p === null || p === undefined ? '—' : `${Number(p) > 0 ? '+' : ''}${Number(p).toFixed(2)}%`);
+const returnText = (amt, pct, cur = 'CAD') =>
+  `${amt != null && Number(amt) > 0 ? '+' : ''}${moneyC(amt, cur)} (${pctText(pct)})`;
+const ACCOUNT_TYPE_LABELS = { TFSA: 'TFSA', RRSP: 'RRSP', RSU: 'RSU', NonRegistered: 'Non-registered', Other: 'Other' };
+const currencyBadge = (cur) => `<span class="badge ${cur === 'USD' ? 'usd' : ''}">${esc(cur)}</span>`;
+const aiBadge = (source) => (source === 'ai' ? ' <span class="badge ai">AI</span>' : '');
+
+function investSummaryStrip(s, cur = 'CAD') {
+  return `
+    <div class="summary-card"><div class="k">Current value</div><div class="v">${moneyC(s.value, cur)}</div></div>
+    <div class="summary-card"><div class="k">Net contributions</div><div class="v">${moneyC(s.contributions, cur)}</div></div>
+    <div class="summary-card"><div class="k">Dividends received</div><div class="v">${moneyC(s.dividends, cur)}</div></div>
+    <div class="summary-card"><div class="k">Total return</div><div class="v">${returnText(s.totalReturn, s.totalReturnPct, cur)}</div></div>`;
+}
+
+// The monthly return table shared by all three levels. CAD rows
+// carry the plain fields; a holding's rows carry the *Native
+// twins and render in its own currency.
+function investMonthlyTable(monthly, cur = 'CAD') {
+  if (!monthly || !monthly.length) return '<div class="note">No activity yet.</div>';
+  const native = cur !== 'CAD';
+  const g = (r, k) => (native ? r[k + 'Native'] : r[k]);
+  const tot = { contributions: 0, dividends: 0, gain: 0, returnAmount: 0 };
+  const rows = monthly.map((r) => {
+    tot.contributions += g(r, 'contributions') || 0;
+    tot.dividends += g(r, 'dividends') || 0;
+    tot.gain += g(r, 'gain') || 0;
+    tot.returnAmount += g(r, 'returnAmount') || 0;
+    return `<tr><td>${esc(r.month)}</td>
+      <td class="num">${moneyC(g(r, 'startValue'), cur)}</td>
+      <td class="num">${moneyC(g(r, 'contributions'), cur)}</td>
+      <td class="num">${moneyC(g(r, 'dividends'), cur)}</td>
+      <td class="num">${moneyC(g(r, 'gain'), cur)}</td>
+      <td class="num">${moneyC(g(r, 'returnAmount'), cur)}</td>
+      <td class="num">${pctText(native ? r.returnPctNative : r.returnPct)}</td>
+      <td class="num">${moneyC(g(r, 'endValue'), cur)}</td></tr>`;
+  }).join('');
+  return `<table><thead><tr><th>Month</th><th class="num">Start value</th><th class="num">Contributions</th>
+    <th class="num">Dividends</th><th class="num">Market gain</th><th class="num">Return</th><th class="num">Return %</th>
+    <th class="num">End value</th></tr></thead><tbody>${rows}</tbody>
+    <tfoot><tr><th>Total</th><th></th><th class="num">${moneyC(tot.contributions, cur)}</th>
+    <th class="num">${moneyC(tot.dividends, cur)}</th><th class="num">${moneyC(tot.gain, cur)}</th>
+    <th class="num">${moneyC(tot.returnAmount, cur)}</th><th></th><th></th></tr></tfoot></table>`;
+}
+
+function drawInvestChart(canvas, key, series, cur, native = false) {
+  if (!canvas) return null;
+  const labels = series.map((r) => r.month);
+  const values = series.map((r) => (native ? r.valueNative : r.value));
+  const returns = series.map((r) => (native ? r.returnAmountNative : r.returnAmount));
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: `Value (${cur})`, data: values, borderColor: '#1668c4', backgroundColor: '#1668c4', tension: 0.15, pointRadius: 0, borderWidth: 2 },
+        { label: `Cumulative return (${cur})`, data: returns, borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: { y: { ticks: { callback: moneyTick } } },
+      plugins: {
+        tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${moneyC(c.parsed.y, cur)}` } },
+      },
+    },
+  });
+  window.__fmCharts[key] = chart;
+  return chart;
+}
+
+// ------------------------------------------------------- portfolio level
+async function loadInvestmentsImpl() {
+  const host = $('#section-investments');
+  const data = await api('/api/investments');
+  const s = data.summary;
+  const cards = data.accounts.map((a) => `
+    <div class="card breakdown-card" onclick="location.hash='#invest-account/${a.account.id}'">
+      <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
+      <div class="v">${moneyC(a.summary.value)}</div>
+      <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${returnText(a.summary.totalReturn, a.summary.totalReturnPct)}</div>
+    </div>`).join('');
+  host.innerHTML = `
+    <div class="section-head"><h2>Investments</h2>
+      <div class="spacer"></div>
+      <button class="small" id="refreshInvestBtn">Refresh prices</button>
+      <button class="primary" id="addInvestAccountBtn">+ Add account</button></div>
+    <div class="msg" id="investMsg"></div>
+    ${data.fxMissing && data.accounts.some((a) => a.holdings.some((h) => h.holding.currency === 'USD'))
+      ? '<div class="msg warn">USD/CAD rates are unavailable right now — USD holdings are shown unconverted in the CAD totals.</div>' : ''}
+    <div class="summary-strip">${investSummaryStrip(s)}</div>
+    <div class="panel">
+      <h3>Total return</h3>
+      <div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div>
+      <div class="cards" style="margin-top:12px">${cards || '<div class="note">No accounts yet — add one to start tracking.</div>'}</div>
+    </div>
+    <div class="panel"><h3>Monthly returns</h3>${investMonthlyTable(data.monthly)}
+      <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
+  if (investPortfolioChart) investPortfolioChart.destroy();
+  investPortfolioChart = drawInvestChart($('#investPortfolioChart'), 'investments', data.series, 'CAD');
+  $('#addInvestAccountBtn').addEventListener('click', () => openInvestAccountModal(null));
+  $('#refreshInvestBtn').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try { await api('/api/investments/refresh', { method: 'POST', body: {} }); await loadInvestmentsImpl(); }
+    catch (err) { showMsg($('#investMsg'), 'err', err.message); }
+    finally { e.target.disabled = false; }
+  });
+}
+
+// --------------------------------------------------------- account level
+async function loadInvestAccountImpl(id) {
+  const data = await api(`/api/investments/accounts/${id}`);
+  investAccountData = data;
+  const a = data.account;
+  if (investChatAccountId !== id) resetInvestChat(id);
+  $('#investAccountTitle').innerHTML =
+    `${esc(a.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.type] || a.type)}</span>${a.institution ? ` <span class="note" style="margin:0">${esc(a.institution)}</span>` : ''}${a.note ? `<div class="note" style="margin:4px 0 0">${esc(a.note)}</div>` : ''}`;
+  $('#investAccountStats').innerHTML = investSummaryStrip(data.summary);
+  const notes = [];
+  for (const row of data.holdings) {
+    const st = row.priceStatus;
+    if (st.pricedBy === 'none') notes.push(`“${row.holding.label}” has no price yet — add an event with a price or a price snapshot.`);
+    else if (st.pricedBy === 'event') notes.push(`“${row.holding.label}” is priced from its trade prices (no market feed) — figures walk flat between trades.`);
+    else if (st.stale) notes.push(`Market prices for “${row.holding.label}” may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
+  }
+  if (data.fxMissing && data.holdings.some((r) => r.holding.currency === 'USD')) {
+    notes.push('USD/CAD rates are unavailable right now — USD holdings are shown unconverted in the CAD totals.');
+  }
+  const noteEl = $('#investAccountPriceNote');
+  noteEl.classList.toggle('hidden', !notes.length);
+  noteEl.innerHTML = notes.map(esc).join('<br>');
+  if (investAccountChart) investAccountChart.destroy();
+  investAccountChart = drawInvestChart($('#investAccountChart'), 'investAccount', data.series, 'CAD');
+  const rows = data.holdings.map((row) => {
+    const h = row.holding; const sm = row.summary;
+    return `<tr class="clickable" onclick="location.hash='#invest-holding/${h.id}'">
+      <td>${esc(h.label)}${aiBadge(h.source)} ${currencyBadge(h.currency)}<div class="note" style="margin:0">${h.kind === 'fund' ? 'Mutual fund' : 'Exchange'}${h.symbol ? ` · ${esc(h.symbol)}` : ''}${h.fund_code ? ` · ${esc(h.fund_code)}` : ''}</div></td>
+      <td class="num">${fmtUnits(sm.units)}</td>
+      <td class="num">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}${sm.latestPriceDate ? `<div class="note" style="margin:0">${esc(sm.latestPriceDate)}</div>` : ''}</td>
+      <td class="num">${moneyC(sm.valueNative, h.currency)}</td>
+      <td class="num">${moneyC(sm.value)}</td>
+      <td class="num">${returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</td>
+      <td style="white-space:nowrap">
+        <button class="small" onclick="event.stopPropagation(); openInvestHoldingModal(${h.id})">Edit</button>
+        <button class="small danger" onclick="event.stopPropagation(); deleteInvestHolding(${h.id})">Delete</button>
+      </td></tr>`;
+  }).join('');
+  $('#investHoldingsWrap').innerHTML = data.holdings.length
+    ? `<table><thead><tr><th>Holding</th><th class="num">Units</th><th class="num">Latest price</th><th class="num">Value</th><th class="num">Value (CAD)</th><th class="num">Total return</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    : '<div class="note">No holdings yet — add one, or let ✨ Fill with AI draft them from a statement.</div>';
+  $('#investAccountMonthly').innerHTML = investMonthlyTable(data.monthly);
+  $('#addHoldingBtn').onclick = () => openInvestHoldingModal(null);
+  $('#editInvestAccountBtn').onclick = () => openInvestAccountModal(id);
+  $('#deleteInvestAccountBtn').onclick = () => deleteInvestAccount(id);
+}
+
+async function deleteInvestAccount(id) {
+  if (!confirm('Delete this account and all its holdings and events?')) return;
+  await api(`/api/investments/accounts/${id}`, { method: 'DELETE' });
+  location.hash = '#assets/investments';
+}
+window.deleteInvestAccount = deleteInvestAccount;
+
+async function deleteInvestHolding(id) {
+  if (!confirm('Delete this holding and all its events?')) return;
+  await api(`/api/investments/holdings/${id}`, { method: 'DELETE' });
+  if (location.hash.startsWith('#invest-holding/')) location.hash = `#invest-account/${currentInvestAccountId}`;
+  else if (currentInvestAccountId) loadInvestAccount(currentInvestAccountId);
+}
+window.deleteInvestHolding = deleteInvestHolding;
+
+// --------------------------------------------------------- holding level
+async function loadInvestHoldingImpl(id) {
+  const data = await api(`/api/investments/holdings/${id}`);
+  investHoldingData = data;
+  const h = data.holding;
+  const sm = data.summary;
+  currentInvestAccountId = h.account_id;
+  $('#investHoldingBack').href = `#invest-account/${h.account_id}`;
+  $('#investHoldingBack').textContent = `← Back to ${data.account ? data.account.name : 'account'}`;
+  $('#investHoldingTitle').innerHTML =
+    `${esc(h.label)}${aiBadge(h.source)} ${currencyBadge(h.currency)} <span class="note" style="margin:0">${h.kind === 'fund' ? 'Mutual fund' : 'Exchange'}${h.symbol ? ` · ${esc(h.symbol)}` : ''}${h.fund_code ? ` · ${esc(h.fund_code)}` : ''} · ${esc(data.account ? data.account.name : '')}</span>`;
+  $('#investHoldingStats').innerHTML = `
+    <div class="summary-card"><div class="k">Units</div><div class="v">${fmtUnits(sm.units)}</div></div>
+    <div class="summary-card"><div class="k">Latest price</div><div class="v">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}</div><div class="n">${sm.latestPriceDate ? `${esc(sm.latestPriceDate)} · ${esc({ stooq: 'Stooq', yahoo: 'Yahoo Finance', manual: 'manual NAV', event: 'trade price' }[sm.latestPriceSource] || sm.latestPriceSource || '')}` : 'no price yet'}</div></div>
+    <div class="summary-card"><div class="k">Current value</div><div class="v">${moneyC(sm.valueNative, h.currency)}</div><div class="n">${h.currency === 'USD' ? `${moneyC(sm.value)} CAD` : ''}</div></div>
+    <div class="summary-card"><div class="k">Total return</div><div class="v">${returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</div><div class="n">contributions ${moneyC(sm.contributionsNative, h.currency)}</div></div>`;
+  const st = data.priceStatus;
+  const notes = [];
+  if (st.pricedBy === 'none') notes.push('No price yet: this holding values at 0 until a priced event or a price snapshot exists.');
+  if (st.pricedBy === 'event') notes.push('Priced from trade prices (no market feed for this holding): the value walks flat between trades. For a bank fund, record NAV snapshots below to trace its real path.');
+  if (st.stale) notes.push(`Market prices may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
+  if (sm.unpricedGrants) notes.push(`${sm.unpricedGrants} grant(s) had no price on their date and count as $0 contributions.`);
+  if (data.fxMissing && h.currency === 'USD') notes.push('USD/CAD rates are unavailable right now — CAD figures show the unconverted amounts.');
+  const noteEl = $('#investHoldingPriceNote');
+  noteEl.classList.toggle('hidden', !notes.length);
+  noteEl.innerHTML = notes.map(esc).join('<br>');
+  if (investHoldingChart) investHoldingChart.destroy();
+  investHoldingChart = drawInvestChart($('#investHoldingChart'), 'investHolding', data.series, h.currency, true);
+  const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend' };
+  const rows = data.events.map((e) => `<tr>
+      <td>${esc(e.date)}</td><td>${typeLabels[e.type] || esc(e.type)}${aiBadge(e.source)}</td>
+      <td class="num">${e.units != null ? fmtUnits(e.units) : '—'}</td>
+      <td class="num">${e.price != null ? moneyC(e.price, h.currency) : (e.type === 'grant' ? '<span class="note" style="margin:0">market</span>' : '—')}</td>
+      <td class="num">${e.amount != null ? moneyC(e.amount, h.currency) : '—'}</td>
+      <td>${esc(e.note || '')}</td>
+      <td style="white-space:nowrap">
+        <button class="small" onclick="editInvestEvent(${e.id})">Edit</button>
+        <button class="small danger" onclick="deleteInvestEvent(${e.id})">Delete</button>
+      </td></tr>`).join('');
+  $('#investEventsWrap').innerHTML = data.events.length
+    ? `<table><thead><tr><th>Date</th><th>Type</th><th class="num">Units</th><th class="num">Price</th><th class="num">Amount</th><th>Note</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    : '<div class="note">No events yet — record the first buy or grant below.</div>';
+  resetInvestEventForm();
+  // NAV / price snapshots.
+  $('#investNavTitle').textContent = h.kind === 'fund' ? 'NAV snapshots' : 'Price snapshots';
+  $('#investNavNote').textContent = h.kind === 'fund'
+    ? 'Bank funds have no public price feed here — record the fund\'s NAV from your statement and the charts trace it. Between snapshots the last NAV carries forward.'
+    : 'Exchange prices are fetched automatically; a snapshot you add here outranks the fetched close on its date (a hand correction).';
+  $('#investNavPriceLabel').textContent = h.kind === 'fund' ? 'NAV / unit' : 'Price / unit';
+  const navRows = data.navPoints.map((p) => `<tr><td>${esc(p.date)}</td>
+      <td class="num">${moneyC(p.price, h.currency)}</td>
+      <td><button class="small danger" onclick="deleteInvestNav(${p.id})">Delete</button></td></tr>`).join('');
+  $('#investNavWrap').innerHTML = data.navPoints.length
+    ? `<table><thead><tr><th>Date</th><th class="num">${h.kind === 'fund' ? 'NAV' : 'Price'}</th><th></th></tr></thead><tbody>${navRows}</tbody></table>`
+    : '<div class="note">No snapshots yet.</div>';
+  $('#investHoldingMonthly').innerHTML = investMonthlyTable(data.monthly, h.currency);
+  $('#editInvestHoldingBtn').onclick = () => openInvestHoldingModal(id);
+  $('#deleteInvestHoldingBtn').onclick = () => deleteInvestHolding(id);
+}
+
+function resetInvestEventForm() {
+  const form = $('#investEventForm');
+  form.reset();
+  form.elements.id.value = '';
+  $('#investEventSubmit').textContent = 'Add event';
+  $('#investEventCancel').classList.add('hidden');
+  syncInvestEventFields();
+}
+function syncInvestEventFields() {
+  const type = $('#investEventForm').elements.type.value;
+  const isDiv = type === 'dividend';
+  document.querySelector('[data-ev-units]').classList.toggle('hidden', isDiv);
+  document.querySelector('[data-ev-price]').classList.toggle('hidden', isDiv);
+  document.querySelector('[data-ev-amount]').classList.toggle('hidden', !isDiv);
+  $('#investEventForm').elements.price.placeholder = type === 'grant' ? 'blank = market' : '';
+}
+$('#investEventForm').elements.type.addEventListener('change', syncInvestEventFields);
+$('#investEventCancel').addEventListener('click', resetInvestEventForm);
+
+function editInvestEvent(id) {
+  const e = (investHoldingData.events || []).find((x) => x.id === id);
+  if (!e) return;
+  const form = $('#investEventForm');
+  form.elements.id.value = e.id;
+  form.elements.date.value = e.date;
+  form.elements.type.value = e.type;
+  form.elements.units.value = e.units ?? '';
+  setMoneyValue(form.elements.price, e.price);
+  setMoneyValue(form.elements.amount, e.amount);
+  form.elements.note.value = e.note || '';
+  syncInvestEventFields();
+  $('#investEventSubmit').textContent = 'Save event';
+  $('#investEventCancel').classList.remove('hidden');
+}
+window.editInvestEvent = editInvestEvent;
+
+async function deleteInvestEvent(id) {
+  if (!confirm('Delete this event?')) return;
+  await api(`/api/investments/events/${id}`, { method: 'DELETE' });
+  loadInvestHolding(currentInvestHoldingId);
+}
+window.deleteInvestEvent = deleteInvestEvent;
+
+$('#investEventForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const f = Object.fromEntries(new FormData(form).entries());
+  parseMoneyFields(f, ['price', 'amount']);
+  const id = f.id; delete f.id;
+  if (f.type === 'dividend') { f.units = null; f.price = null; }
+  else { f.amount = null; if (f.units === '') f.units = null; if (f.price === '') f.price = null; }
+  if (!f.note) f.note = null;
+  try {
+    if (id) await api(`/api/investments/events/${id}`, { method: 'PUT', body: f });
+    else await api(`/api/investments/holdings/${currentInvestHoldingId}/events`, { method: 'POST', body: f });
+    loadInvestHolding(currentInvestHoldingId);
+  } catch (err) { showMsg($('#investEventMsg'), 'err', err.message); }
+});
+
+$('#investNavForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['price']);
+  try {
+    await api(`/api/investments/holdings/${currentInvestHoldingId}/nav`, { method: 'POST', body: f });
+    loadInvestHolding(currentInvestHoldingId);
+  } catch (err) { showMsg($('#investNavMsg'), 'err', err.message); }
+});
+
+async function deleteInvestNav(id) {
+  if (!confirm('Delete this price snapshot?')) return;
+  await api(`/api/investments/prices/${id}`, { method: 'DELETE' });
+  loadInvestHolding(currentInvestHoldingId);
+}
+window.deleteInvestNav = deleteInvestNav;
+
+// ------------------------------------------------------------ modals
+function openInvestAccountModal(id) {
+  const form = $('#investAccountForm');
+  form.reset();
+  $('#investAccountModalMsg').className = 'msg';
+  form.elements.id.value = id || '';
+  $('#investAccountModalTitle').textContent = id ? 'Edit account' : 'Add account';
+  if (id) {
+    const a = (investAccountData && investAccountData.account.id === id)
+      ? investAccountData.account : null;
+    const fill = (acc) => {
+      form.elements.name.value = acc.name || '';
+      form.elements.type.value = acc.type || 'NonRegistered';
+      form.elements.institution.value = acc.institution || '';
+      form.elements.note.value = acc.note || '';
+    };
+    if (a) fill(a);
+    else api(`/api/investments/accounts/${id}`).then((d) => fill(d.account)).catch((err) => alert(err.message));
+  }
+  openModal('investAccountModal');
+}
+window.openInvestAccountModal = openInvestAccountModal;
+
+$('#investAccountForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  const id = f.id; delete f.id;
+  try {
+    if (id) {
+      await api(`/api/investments/accounts/${id}`, { method: 'PUT', body: f });
+      closeModalEl($('#investAccountModal'));
+      if (location.hash.startsWith('#invest-account/')) loadInvestAccount(Number(id));
+      else loadInvestments();
+    } else {
+      const created = await api('/api/investments/accounts', { method: 'POST', body: f });
+      closeModalEl($('#investAccountModal'));
+      location.hash = `#invest-account/${created.id}`;
+    }
+  } catch (err) { showMsg($('#investAccountModalMsg'), 'err', err.message); }
+});
+
+function openInvestHoldingModal(id) {
+  const form = $('#investHoldingForm');
+  form.reset();
+  $('#investHoldingModalMsg').className = 'msg';
+  form.elements.id.value = id || '';
+  $('#investHoldingModalTitle').textContent = id ? 'Edit holding' : 'Add holding';
+  if (id) {
+    const rows = investAccountData ? investAccountData.holdings : [];
+    const row = rows.find((r) => r.holding.id === id)
+      || (investHoldingData && investHoldingData.holding.id === id ? { holding: investHoldingData.holding } : null);
+    if (row) {
+      const h = row.holding;
+      form.elements.label.value = h.label || '';
+      form.elements.kind.value = h.kind || 'exchange';
+      form.elements.symbol.value = h.symbol || '';
+      form.elements.fundCode.value = h.fund_code || '';
+      form.elements.currency.value = h.currency || 'CAD';
+    }
+  }
+  openModal('investHoldingModal');
+}
+window.openInvestHoldingModal = openInvestHoldingModal;
+
+$('#investHoldingForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  const id = f.id; delete f.id;
+  if (!f.symbol) f.symbol = null;
+  if (!f.fundCode) f.fundCode = null;
+  try {
+    if (id) await api(`/api/investments/holdings/${id}`, { method: 'PUT', body: f });
+    else await api(`/api/investments/accounts/${currentInvestAccountId}/holdings`, { method: 'POST', body: f });
+    closeModalEl($('#investHoldingModal'));
+    if (location.hash.startsWith('#invest-holding/') && id) loadInvestHolding(Number(id));
+    else if (currentInvestAccountId) loadInvestAccount(currentInvestAccountId);
+  } catch (err) { showMsg($('#investHoldingModalMsg'), 'err', err.message); }
+});
+
+// --------------------------------------------- investments AI fill chat
+// The account page's conversation, the costs chat's sibling:
+// the model drafts NEW HOLDINGS and EVENTS for this one account
+// from statements / grant notices, asks whenever a currency, a
+// fund-vs-ETF call, a grant-vs-buy call or a date is unclear,
+// and writes nothing itself — Apply creates the confirmed draft
+// through the investments POST endpoints with source 'ai'.
+// Proposals that duplicate what is already recorded arrive
+// flagged (the server marks them) and start unchecked. The
+// conversation lives in this page session only; switching
+// accounts or Clear session resets it.
+let investChatState = { turns: [], proposed: { holdings: [], events: [] } };
+let investChatAccountId = null;
+let investChatQueue = [];
+
+function clearInvestChatMsg() {
+  const msg = document.querySelector('[data-invest-chat-msg]');
+  if (msg) { msg.textContent = ''; msg.className = 'msg'; }
+}
+
+function renderInvestChatQueue() {
+  const host = document.querySelector('[data-invest-chat-queue]');
+  if (!host) return;
+  host.classList.toggle('hidden', !investChatQueue.length);
+  host.innerHTML = investChatQueue.map((f, i) =>
+    `<span class="file-chip"><span class="chip-name">${esc(f.name || 'attachment')}</span><button type="button" data-invest-chat-queue-remove="${i}" title="Remove">×</button></span>`).join('');
+  syncInvestChatClearBtn();
+}
+
+function resetInvestChat(accountId) {
+  investChatState = { turns: [], proposed: { holdings: [], events: [] } };
+  investChatAccountId = accountId;
+  investChatQueue = [];
+  renderInvestChatQueue();
+  const log = document.querySelector('[data-invest-chat-log]');
+  if (log) { log.innerHTML = ''; log.classList.add('hidden'); }
+  const ta = document.querySelector('[data-invest-chat-text]');
+  if (ta) ta.value = '';
+  const files = document.querySelector('[data-invest-chat-files]');
+  if (files) files.value = '';
+  clearInvestChatMsg();
+  renderInvestProposed();
+  syncInvestChatClearBtn();
+}
+
+function syncInvestChatClearBtn() {
+  const btn = document.querySelector('[data-invest-chat-clear]');
+  if (!btn) return;
+  const p = investChatState.proposed;
+  btn.classList.toggle('hidden',
+    !(investChatState.turns.length || p.holdings.length || p.events.length || investChatQueue.length));
+}
+
+function investChatLogHtml() {
+  return investChatState.turns.map((t) => `<div class="costs-chat-turn ${t.role}">
+    <span class="who">${t.role === 'user' ? 'You' : 'AI'}</span>${esc(t.content)}</div>`).join('');
+}
+
+function renderInvestChatLog(pendingText) {
+  const log = document.querySelector('[data-invest-chat-log]');
+  if (!log) return;
+  syncInvestChatClearBtn();
+  const has = investChatState.turns.length > 0 || pendingText;
+  log.classList.toggle('hidden', !has);
+  log.innerHTML = investChatLogHtml()
+    + (pendingText ? `<div class="costs-chat-turn user pending"><span class="who">You</span>${esc(pendingText)}</div>` : '');
+  log.scrollTop = log.scrollHeight;
+}
+
+const investTargetOptions = (sel) => {
+  const existing = (investAccountData ? investAccountData.holdings : []).map((r) =>
+    `<option value="id:${r.holding.id}"${sel === `id:${r.holding.id}` ? ' selected' : ''}>${esc(r.holding.label)} (${esc(r.holding.currency)})</option>`);
+  const draft = investChatState.proposed.holdings.map((h) =>
+    `<option value="ref:${esc(h.ref)}"${sel === `ref:${h.ref}` ? ' selected' : ''}>New: ${esc(h.label || h.ref)}</option>`);
+  return [...existing, ...draft].join('');
+};
+
+function renderInvestProposed() {
+  const host = document.querySelector('[data-invest-proposed]');
+  if (!host) return;
+  syncInvestChatClearBtn();
+  const { holdings, events } = investChatState.proposed;
+  if (!holdings.length && !events.length) { host.innerHTML = ''; return; }
+  const holdingRows = holdings.map((h, i) => `
+    <div class="costs-proposed-row${h.conflict ? ' conflict' : ''}" data-ih-row="${i}">
+      <input type="checkbox" data-ih-check${h.conflict ? '' : ' checked'}>
+      <input type="text" class="p-cat" data-ih-label value="${esc(h.label)}" placeholder="Label">
+      <select data-ih-kind>
+        <option value="exchange"${h.kind === 'exchange' ? ' selected' : ''}>Exchange</option>
+        <option value="fund"${h.kind === 'fund' ? ' selected' : ''}>Fund</option>
+      </select>
+      <input type="text" data-ih-symbol value="${esc(h.symbol || '')}" placeholder="Symbol (XQQ.TO)" style="width:120px">
+      <input type="text" data-ih-fundcode value="${esc(h.fundCode || '')}" placeholder="Fund code" style="width:100px">
+      <select data-ih-currency>
+        <option value="CAD"${h.currency === 'CAD' ? ' selected' : ''}>CAD</option>
+        <option value="USD"${h.currency === 'USD' ? ' selected' : ''}>USD</option>
+      </select>
+      ${h.conflict ? '<span class="conflict-tag">Looks like a holding already in this account — applies only if checked</span>' : ''}
+      <button type="button" class="small danger" data-ih-remove title="Remove">×</button>
+    </div>`).join('');
+  const eventRows = events.map((e, i) => {
+    const sel = e.holdingId != null ? `id:${e.holdingId}` : `ref:${e.holdingRef}`;
+    return `
+    <div class="costs-proposed-row${e.conflict ? ' conflict' : ''}" data-ie-row="${i}">
+      <input type="checkbox" data-ie-check${e.conflict ? '' : ' checked'}>
+      <select data-ie-target>${investTargetOptions(sel)}</select>
+      <input type="date" data-ie-date value="${esc(e.date || '')}">
+      <select data-ie-type>
+        ${['buy', 'sell', 'grant', 'dividend'].map((t) => `<option value="${t}"${e.type === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}
+      </select>
+      <input type="text" inputmode="decimal" data-ie-units value="${e.units ?? ''}" placeholder="Units" style="width:84px">
+      <input type="text" inputmode="decimal" data-money data-ie-price value="${esc(formatMoneyInput(e.price ?? ''))}" placeholder="Price" style="width:110px">
+      <input type="text" inputmode="decimal" data-money data-ie-amount value="${esc(formatMoneyInput(e.amount ?? ''))}" placeholder="Dividend $" style="width:110px">
+      ${e.conflict ? '<span class="conflict-tag">Same event already recorded — applies only if checked</span>' : ''}
+      <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
+    </div>`;
+  }).join('');
+  host.innerHTML = `<div class="costs-proposed"><h5>Proposed — review, edit, then Apply</h5>
+    ${holdings.length ? `<div class="note" style="margin:0 0 4px">New holdings</div>${holdingRows}` : ''}
+    ${events.length ? `<div class="note" style="margin:6px 0 4px">Events</div>${eventRows}` : ''}
+    <div class="toolbar" style="margin-top:6px">
+      <button type="button" class="primary small" data-invest-apply>Apply selected</button>
+      <button type="button" class="small" data-invest-discard>Discard</button>
+    </div></div>`;
+  host.querySelectorAll('[data-money]').forEach(wireMoneyInput);
+}
+
+// Read the proposal rows back out of their (editable) inputs.
+function readInvestProposed() {
+  const host = document.querySelector('[data-invest-proposed]');
+  const holdings = [];
+  const events = [];
+  if (!host) return { holdings, events };
+  host.querySelectorAll('[data-ih-row]').forEach((row, i) => {
+    const prev = investChatState.proposed.holdings[i] || {};
+    holdings.push({
+      ref: prev.ref || `h${i + 1}`,
+      checked: row.querySelector('[data-ih-check]').checked,
+      label: row.querySelector('[data-ih-label]').value.trim(),
+      kind: row.querySelector('[data-ih-kind]').value,
+      symbol: row.querySelector('[data-ih-symbol]').value.trim() || null,
+      fundCode: row.querySelector('[data-ih-fundcode]').value.trim() || null,
+      currency: row.querySelector('[data-ih-currency]').value,
+      conflict: prev.conflict || null,
+    });
+  });
+  host.querySelectorAll('[data-ie-row]').forEach((row, i) => {
+    const prev = investChatState.proposed.events[i] || {};
+    const target = row.querySelector('[data-ie-target]').value || '';
+    const type = row.querySelector('[data-ie-type]').value;
+    const ev = {
+      checked: row.querySelector('[data-ie-check]').checked,
+      holdingId: target.startsWith('id:') ? Number(target.slice(3)) : null,
+      holdingRef: target.startsWith('ref:') ? target.slice(4) : null,
+      date: row.querySelector('[data-ie-date]').value,
+      type,
+      units: null, price: null, amount: null,
+      note: prev.note || null,
+      conflict: prev.conflict || null,
+    };
+    if (type === 'dividend') ev.amount = parseMoneyInput(row.querySelector('[data-ie-amount]').value);
+    else {
+      const u = row.querySelector('[data-ie-units]').value.trim();
+      ev.units = u === '' ? null : Number(u);
+      const p = parseMoneyInput(row.querySelector('[data-ie-price]').value);
+      ev.price = p === '' ? null : p;
+    }
+    events.push(ev);
+  });
+  return { holdings, events };
+}
+
+// Keep the draft state in step with the inputs without a
+// re-render (typing must not lose focus).
+document.querySelector('[data-invest-proposed]').addEventListener('change', () => {
+  const { holdings, events } = readInvestProposed();
+  investChatState.proposed = {
+    holdings: holdings.map(({ checked, ...rest }) => rest),
+    events: events.map(({ checked, ...rest }) => rest),
+  };
+});
+
+document.querySelector('[data-invest-proposed]').addEventListener('click', async (e) => {
+  if (e.target.closest('[data-ih-remove]')) {
+    const idx = Number(e.target.closest('[data-ih-row]').dataset.ihRow);
+    const { holdings, events } = readInvestProposed();
+    const removed = holdings[idx];
+    investChatState.proposed = {
+      holdings: holdings.filter((_, i) => i !== idx).map(({ checked, ...rest }) => rest),
+      // Events pointing at a removed draft holding go with it.
+      events: events.filter((ev) => ev.holdingRef !== (removed && removed.ref)).map(({ checked, ...rest }) => rest),
+    };
+    renderInvestProposed();
+    return;
+  }
+  if (e.target.closest('[data-ie-remove]')) {
+    const idx = Number(e.target.closest('[data-ie-row]').dataset.ieRow);
+    const { holdings, events } = readInvestProposed();
+    investChatState.proposed = {
+      holdings: holdings.map(({ checked, ...rest }) => rest),
+      events: events.filter((_, i) => i !== idx).map(({ checked, ...rest }) => rest),
+    };
+    renderInvestProposed();
+    return;
+  }
+  if (e.target.closest('[data-invest-discard]')) {
+    investChatState.proposed = { holdings: [], events: [] };
+    renderInvestProposed();
+    return;
+  }
+  if (!e.target.closest('[data-invest-apply]')) return;
+  const msg = document.querySelector('[data-invest-chat-msg]');
+  const draft = readInvestProposed();
+  const chosenHoldings = draft.holdings.filter((h) => h.checked);
+  const chosenEvents = draft.events.filter((ev) => ev.checked);
+  if (!chosenHoldings.length && !chosenEvents.length) {
+    showMsg(msg, 'err', 'Nothing is selected to apply.');
+    return;
+  }
+  for (const h of chosenHoldings) {
+    if (!h.label || (h.kind === 'exchange' && !h.symbol)) {
+      showMsg(msg, 'err', 'A selected holding is missing its label or (for exchange) its symbol.');
+      return;
+    }
+  }
+  for (const ev of chosenEvents) {
+    if (!ev.date || (ev.type === 'dividend' ? !(ev.amount > 0) : !(ev.units > 0))) {
+      showMsg(msg, 'err', 'A selected event is missing its date or figures.');
+      return;
+    }
+    if (ev.holdingId == null && !chosenHoldings.some((h) => h.ref === ev.holdingRef)) {
+      showMsg(msg, 'err', 'A selected event belongs to a new holding that is not selected — select the holding too.');
+      return;
+    }
+  }
+  const applyBtn = e.target.closest('[data-invest-apply]');
+  applyBtn.disabled = true;
+  try {
+    const refToId = new Map();
+    for (const h of chosenHoldings) {
+      const { checked, conflict, ref, ...fields } = h;
+      const created = await api(`/api/investments/accounts/${investChatAccountId}/holdings`, {
+        method: 'POST', body: { ...fields, source: 'ai' },
+      });
+      refToId.set(ref, created.id);
+    }
+    for (const ev of chosenEvents) {
+      const { checked, conflict, holdingRef, ...fields } = ev;
+      const holdingId = ev.holdingId != null ? ev.holdingId : refToId.get(holdingRef);
+      await api(`/api/investments/holdings/${holdingId}/events`, {
+        method: 'POST', body: { ...fields, holdingId: undefined, source: 'ai' },
+      });
+    }
+    const n = chosenHoldings.length + chosenEvents.length;
+    investChatState.proposed = {
+      holdings: draft.holdings.filter((h) => !h.checked).map(({ checked, ...rest }) => rest),
+      events: draft.events.filter((ev) => !ev.checked).map(({ checked, ...rest }) => rest),
+    };
+    investChatState.turns.push({ role: 'assistant', content: `Applied ${n} ${n === 1 ? 'item' : 'items'}.` });
+    renderInvestChatLog();
+    renderInvestProposed();
+    clearInvestChatMsg(); // a successful Apply supersedes an older error
+    await loadInvestAccount(investChatAccountId);
+  } catch (err) {
+    showMsg(msg, 'err', err.message);
+  } finally {
+    applyBtn.disabled = false;
+  }
+});
+
+{
+  const wrap = $('#investAiFill');
+  const panel = wrap.querySelector('[data-invest-ai-panel]');
+  const toggle = document.querySelector('[data-invest-ai-toggle]');
+  const sendBtn = wrap.querySelector('[data-invest-chat-send]');
+  const clearBtn = wrap.querySelector('[data-invest-chat-clear]');
+  const modelSel = wrap.querySelector('[data-invest-chat-model]');
+  const guidance = wrap.querySelector('[data-invest-ai-guidance]');
+  const msg = wrap.querySelector('[data-invest-chat-msg]');
+  loadAiConfig().then((cfg) => {
+    const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
+    modelSel.innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    if (cfg.model) modelSel.value = cfg.model;
+    if (!cfg.configured) {
+      guidance.textContent = 'AI is not configured on the server. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.';
+      guidance.classList.remove('hidden');
+      sendBtn.disabled = true;
+    }
+  });
+  toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
+  clearBtn.addEventListener('click', () => resetInvestChat(investChatAccountId));
+  const fileInput = wrap.querySelector('[data-invest-chat-files]');
+  const chatTa = wrap.querySelector('[data-invest-chat-text]');
+  const queueHost = wrap.querySelector('[data-invest-chat-queue]');
+  const queueFiles = (list) => {
+    const add = [...(list || [])];
+    if (!add.length) return;
+    investChatQueue.push(...add);
+    renderInvestChatQueue();
+    clearInvestChatMsg(); // a changed file selection supersedes the last error
+  };
+  fileInput.addEventListener('change', () => {
+    queueFiles(fileInput.files);
+    fileInput.value = '';
+  });
+  queueHost.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-invest-chat-queue-remove]');
+    if (!btn) return;
+    investChatQueue.splice(Number(btn.dataset.investChatQueueRemove), 1);
+    renderInvestChatQueue();
+  });
+  chatTa.addEventListener('paste', (e) => {
+    const files = e.clipboardData ? [...e.clipboardData.files] : [];
+    if (!files.length) return;
+    e.preventDefault();
+    queueFiles(files);
+  });
+  sendBtn.addEventListener('click', async () => {
+    clearInvestChatMsg(); // a new send supersedes the last error
+    const text = chatTa.value.trim();
+    const files = investChatQueue.slice();
+    if (!text && !files.length) { showMsg(msg, 'err', 'Write a message or attach a document first.'); return; }
+    if (investChatAccountId == null) { showMsg(msg, 'err', 'Open an account first.'); return; }
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Sending…';
+    renderInvestChatLog(text || '(attached documents)');
+    try {
+      const current = readInvestProposed();
+      const body = {
+        accountId: investChatAccountId,
+        history: investChatState.turns,
+        proposed: {
+          holdings: current.holdings.map(({ checked, ...rest }) => rest),
+          events: current.events.map(({ checked, ...rest }) => rest),
+        },
+      };
+      if (modelSel.value) body.model = modelSel.value;
+      if (text) body.text = text;
+      if (files.length) {
+        body.files = await Promise.all(files.map((f) => new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve({ name: f.name, type: f.type, data: String(reader.result).split(',')[1] || '' });
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        })));
+      }
+      const r = await api('/api/ai/invest-fill-chat', { method: 'POST', body });
+      if (body.model && aiConfigCache) aiConfigCache.model = body.model;
+      investChatState.turns.push({ role: 'user', content: text || '(attached documents)' });
+      if (r.reply) investChatState.turns.push({ role: 'assistant', content: r.reply });
+      investChatState.proposed = r.proposed || { holdings: [], events: [] };
+      chatTa.value = '';
+      fileInput.value = '';
+      investChatQueue = [];
+      renderInvestChatQueue();
+      clearInvestChatMsg(); // a successful round supersedes the last error
+      renderInvestChatLog();
+      renderInvestProposed();
+    } catch (err) {
+      renderInvestChatLog();
       showMsg(msg, 'err', err.message);
     } finally {
       sendBtn.disabled = false;

@@ -638,8 +638,7 @@ export function buildCostsChatMessages({ property, existing, draft, history, tex
 // configuration, calls the model, normalizes. The caller
 // supplies the property and its recorded costs as deps. The chat
 // itself writes nothing.
-export async function handleAiFillChat(input, deps = {}) {
-  const env = deps.env || process.env;
+export async function handleAiFillChat(input, deps = {}) {  const env = deps.env || process.env;
   const call = deps.callLlm || callLlm;
   const { propertyId, history, text, files, proposed } = input || {};
   if (!Number.isInteger(Number(propertyId)) || Number(propertyId) <= 0) {
@@ -701,6 +700,292 @@ export async function handleAiFillChat(input, deps = {}) {
     body: {
       reply: typeof parsed.reply === 'string' ? parsed.reply.slice(0, 4000) : '',
       proposed: normalizeProposedCosts(parsed.proposed),
+      ready: parsed.ready === true,
+      model,
+    },
+  };
+}
+
+// --------------------------------------------- investments fill chat
+// The account-page sibling of the costs chat: same conversation
+// rules (multi-turn, ask-don't-guess, nothing is written by the
+// chat), different payload — the model proposes NEW HOLDINGS
+// and/or EVENTS (buy / sell / grant / dividend) for ONE account
+// (the page the user is on; which account it is never needs
+// asking). The panel applies the confirmed proposal through the
+// investments POST endpoints with source 'ai'.
+//
+// Response contract (the model replies with ONLY this JSON):
+//   {"reply": "…",
+//    "proposed": {
+//      "holdings": [{"ref": "h1", "label": "…", "kind": "exchange"|"fund",
+//                    "symbol": "XQQ.TO"|null, "fundCode": null, "currency": "CAD"|"USD"}],
+//      "events":   [{"holdingId": 12} | {"holdingRef": "h1"},
+//                   "date": "YYYY-MM-DD", "type": "buy"|"sell"|"grant"|"dividend",
+//                   "units": n|null, "price": n|null, "amount": n|null]
+//    },
+//    "ready": bool}
+//
+// A proposal that duplicates something already on record (same
+// holding by symbol/label, same event by date+type+figures) is
+// flagged "conflict" by the normalizer — the panel shows it
+// flagged and leaves it unchecked by default.
+
+const INVEST_CHAT_PROMPT = [
+  'You help the user record the holdings and transactions of ONE investment account from',
+  'statements, grant notices and notes they paste or attach. The account is given below —',
+  'never ask which account anything belongs to.',
+  'Reply with ONLY a JSON object of the form',
+  '{"reply": "...", "proposed": {"holdings": [{"ref": "h1", "label": "XQQ", "kind": "exchange", "symbol": "XQQ.TO", "fundCode": null, "currency": "CAD"}], "events": [{"holdingRef": "h1", "date": "2026-01-15", "type": "buy", "units": 40, "price": 155.2, "amount": null}]}, "ready": false}',
+  '— no prose outside the JSON, no code fences.',
+  '',
+  '"proposed" is the CURRENT DRAFT: return the whole draft every time (what you extracted',
+  'plus what the user confirmed or corrected), never anything already recorded (listed',
+  'below) unless the user is correcting it.',
+  '',
+  'HOLDINGS — a new position the account does not have yet:',
+  '- "ref": a short id you assign ("h1", "h2", …) so events below can point at it.',
+  '- "label": the display name from the document (fund name, or the stock/ETF name).',
+  '- "kind": "exchange" for a stock/ETF traded under a ticker symbol; "fund" for a bank',
+  '  mutual fund (these usually have a name and maybe a fund code, no ticker).',
+  '- "symbol": the ticker for exchange holdings (keep a ".TO" suffix for Toronto-listed);',
+  '  null for funds. "fundCode": a fund code when the document shows one, else null.',
+  '- "currency": "CAD" or "USD" — the currency the position is DENOMINATED in. Warning:',
+  '  a Canadian bank fund that invests in US assets (e.g. "CIBC U.S. Index Fund") is usually',
+  '  the CAD version — do not read "U.S." in a name as USD. Only use USD when the document',
+  '  actually states US dollars; when it does not say, ASK (see below).',
+  '',
+  'EVENTS — a transaction on a holding:',
+  '- Target: "holdingId" (the id of an already-recorded holding, from the list below) or',
+  '  "holdingRef" (the ref of a holding in this same draft).',
+  '- "type": "buy" (a purchase), "sell", "grant" (RSU / employer share grants vesting —',
+  '  units received, not bought), "dividend" (cash paid out).',
+  '- buy/sell/grant carry "units" and "price" (per-unit price in the holding\'s currency).',
+  '  A grant\'s price may be null when the document gives no value — the app then uses the',
+  '  market price on the grant date. A dividend carries "amount" (the total paid) instead.',
+  '- "date": the transaction date, YYYY-MM-DD.',
+  '',
+  'AMBIGUITY — never guess:',
+  'Leave the unclear item OUT of "proposed" and ask one focused question in "reply" when:',
+  'a fund\'s currency is not stated; a name could be a mutual fund or an ETF and no ticker',
+  'or fund code settles it; units could be a grant vesting or a purchase; a transaction has',
+  'no date; a figure could be units or dollars. Asking is always better than inventing.',
+  '',
+  '"ready" is true only when the draft covers everything the user provided and no question',
+  'is outstanding; otherwise false. Keep "reply" short and concrete.',
+].join('\n');
+
+function fmtHoldingLine(h) {
+  const bits = [`#${h.id}`, h.label, h.kind];
+  if (h.symbol) bits.push(h.symbol);
+  if (h.fundCode || h.fund_code) bits.push(`fund code ${h.fundCode || h.fund_code}`);
+  bits.push(h.currency);
+  return bits.join(' · ');
+}
+
+function fmtEventLine(e) {
+  const bits = [`#${e.id}`, e.date, e.type];
+  if (e.type === 'dividend') bits.push(`amount ${e.amount}`);
+  else {
+    bits.push(`${e.units} units`);
+    if (e.price != null) bits.push(`@ ${e.price}`);
+  }
+  return bits.join(' · ');
+}
+
+// Validate + normalize the model's proposed holdings/events and
+// flag duplicates of what is already recorded. deps carries
+// existingHoldings + existingEvents (with holding_id) so a
+// duplicate is detected server-side, not just by the panel.
+export function normalizeProposedInvestments(raw, deps = {}) {
+  const existingHoldings = deps.existingHoldings || [];
+  const existingEvents = deps.existingEvents || [];
+  const out = { holdings: [], events: [] };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  const symKey = (s) => (typeof s === 'string' && s.trim() ? s.trim().toUpperCase() : null);
+  const labelKey = (s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
+  if (Array.isArray(raw.holdings)) {
+    for (const item of raw.holdings) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const label = normStr(item.label, 160);
+      const kind = normEnum(item.kind, ['exchange', 'fund']);
+      const currency = normEnum(item.currency, ['cad', 'usd']);
+      if (!label || !kind || !currency) continue;
+      let symbol = normStr(item.symbol, 24);
+      if (symbol) symbol = symbol.toUpperCase();
+      if (kind === 'exchange' && !symbol) continue; // an exchange draft without a ticker is unusable
+      const dupe = existingHoldings.some((h) =>
+        (symbol && symKey(h.symbol) === symbol) || labelKey(h.label) === labelKey(label));
+      out.holdings.push({
+        ref: normStr(item.ref, 24) || `h${out.holdings.length + 1}`,
+        label,
+        kind,
+        symbol: symbol || null,
+        fundCode: normStr(item.fundCode ?? item.fund_code, 40),
+        currency: currency.toUpperCase(),
+        conflict: dupe ? 'duplicate-holding' : null,
+      });
+      if (out.holdings.length >= 20) break;
+    }
+  }
+  const refs = new Set(out.holdings.map((h) => h.ref));
+  const holdingIds = new Set(existingHoldings.map((h) => Number(h.id)));
+  if (Array.isArray(raw.events)) {
+    for (const item of raw.events) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const type = normEnum(item.type, ['buy', 'sell', 'grant', 'dividend']);
+      const date = normDate(item.date);
+      if (!type || !date) continue;
+      const holdingId = Number.isInteger(Number(item.holdingId)) && holdingIds.has(Number(item.holdingId))
+        ? Number(item.holdingId) : null;
+      const holdingRef = typeof item.holdingRef === 'string' && refs.has(item.holdingRef) ? item.holdingRef : null;
+      if (holdingId == null && holdingRef == null) continue; // nowhere to attach it
+      const ev = {
+        holdingId, holdingRef, date, type,
+        units: null, price: null, amount: null,
+        note: normStr(item.note, 500),
+        conflict: null,
+      };
+      if (type === 'dividend') {
+        ev.amount = normNum(item.amount);
+        if (ev.amount == null || ev.amount <= 0) continue;
+      } else {
+        ev.units = normNum(item.units);
+        if (ev.units == null || ev.units <= 0) continue;
+        ev.price = normNum(item.price);
+        if (type !== 'grant' && (ev.price == null || ev.price <= 0)) continue;
+        if (type === 'grant' && ev.price != null && ev.price <= 0) ev.price = null;
+      }
+      if (holdingId != null) {
+        const dupe = existingEvents.some((e) =>
+          Number(e.holding_id ?? e.holdingId) === holdingId && e.date === date && e.type === type
+          && (type === 'dividend'
+            ? Number(e.amount) === ev.amount
+            : Number(e.units) === ev.units && Number(e.price ?? NaN) === Number(ev.price ?? NaN)));
+        if (dupe) ev.conflict = 'duplicate-event';
+      }
+      out.events.push(ev);
+      if (out.events.length >= 50) break;
+    }
+  }
+  return out;
+}
+
+export function buildInvestChatMessages({ account, holdings, draft, history, text, files }) {
+  const context = [
+    `Account: ${account ? `${account.name} (${account.type}${account.institution ? `, ${account.institution}` : ''})` : '(unknown account)'}`,
+    'Holdings already recorded in this account (events for these use their holdingId):',
+    ...(holdings && holdings.length
+      ? holdings.flatMap((h) => [
+        `- ${fmtHoldingLine(h)}`,
+        ...((h.events || []).map((e) => `    event ${fmtEventLine(e)}`)),
+      ])
+      : ['- (none)']),
+    'Current draft proposals (the user may correct these):',
+    ...(draft && (draft.holdings.length || draft.events.length)
+      ? [
+        ...draft.holdings.map((h) => `- new holding [${h.ref}] ${h.label} · ${h.kind}${h.symbol ? ` · ${h.symbol}` : ''} · ${h.currency}`),
+        ...draft.events.map((e) => `- event ${e.date} ${e.type} on ${e.holdingId != null ? `holding #${e.holdingId}` : `draft ${e.holdingRef}`}${e.type === 'dividend' ? ` amount ${e.amount}` : ` ${e.units} units${e.price != null ? ` @ ${e.price}` : ''}`}`),
+      ]
+      : ['- (none yet)']),
+  ].join('\n');
+  const content = [{ type: 'text', text: (text && text.trim()) || 'Please review the attached document(s).' }];
+  for (const f of files || []) {
+    if (f.type.startsWith('image/')) {
+      content.push({ type: 'image_url', image_url: { url: `data:${f.type};base64,${f.data}` } });
+    } else if (f.text != null) {
+      content.push({ type: 'text', text: textFileBlock(f) });
+    } else if (f.type === 'application/pdf') {
+      const extracted = extractPdfText(f.bytes);
+      content.push({
+        type: 'text',
+        text: extracted ? `Document text (${f.name || 'attachment'}):\n${extracted.slice(0, 20000)}` : `A PDF (${f.name || 'attachment'}) was attached, but no text could be extracted from it.`,
+      });
+    }
+  }
+  return [
+    { role: 'system', content: `${INVEST_CHAT_PROMPT}\n\n${context}` },
+    ...truncateChatHistory(history),
+    { role: 'user', content },
+  ];
+}
+
+// The investments fill-chat endpoint as a pure-ish function
+// (same deps / error conventions as handleAiFillChat). The
+// caller supplies the account and its recorded holdings/events
+// as deps. The chat itself writes nothing; the panel applies
+// the confirmed draft through the investments POST endpoints
+// with source 'ai'.
+export async function handleAiInvestFillChat(input, deps = {}) {
+  const env = deps.env || process.env;
+  const call = deps.callLlm || callLlm;
+  const { accountId, history, text, files, proposed } = input || {};
+  if (!Number.isInteger(Number(accountId)) || Number(accountId) <= 0) {
+    return { status: 400, body: { error: 'accountId is required.' } };
+  }
+  if (!deps.account) return { status: 404, body: { error: 'account not found' } };
+  if (!llmConfigured(env)) {
+    return {
+      status: 503,
+      body: { error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' },
+    };
+  }
+  const models = llmModels(env);
+  let model = null;
+  if (input && input.model != null && String(input.model).trim() !== '') {
+    model = String(input.model).trim();
+    if (!models.includes(model)) {
+      return { status: 400, body: { error: `model "${model}" is not in the configured model list` } };
+    }
+  } else if (deps.model && models.includes(deps.model)) {
+    model = deps.model;
+  } else {
+    model = llmDefaultModel(env);
+  }
+  let fileInfos = [];
+  if (files != null) {
+    if (!Array.isArray(files)) return { status: 400, body: { error: 'files must be an array.' } };
+    if (files.length > MAX_CHAT_FILES) {
+      return { status: 400, body: { error: `Attach at most ${MAX_CHAT_FILES} files per message.` } };
+    }
+    for (const f of files) {
+      const v = validateFile(f);
+      if (v.error) return { status: v.status, body: { error: v.error } };
+      fileInfos.push(v);
+    }
+  }
+  const hasText = typeof text === 'string' && text.trim().length > 0;
+  if (!hasText && !fileInfos.length) {
+    return { status: 400, body: { error: 'Write a message or attach a document first.' } };
+  }
+  const holdings = deps.holdings || [];
+  let rawText;
+  try {
+    rawText = await call(buildInvestChatMessages({
+      account: deps.account,
+      holdings,
+      draft: normalizeProposedInvestments(proposed, {
+        existingHoldings: holdings,
+        existingEvents: holdings.flatMap((h) => h.events || []),
+      }),
+      history, text: hasText ? text : '', files: fileInfos,
+    }), env, model);
+  } catch {
+    return { status: 502, body: { error: 'The AI service could not complete the chat.' } };
+  }
+  const parsed = parseModelJson(rawText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed.reply === undefined && parsed.proposed === undefined)) {
+    return { status: 502, body: { error: 'The AI response could not be read.' } };
+  }
+  return {
+    status: 200,
+    body: {
+      reply: typeof parsed.reply === 'string' ? parsed.reply.slice(0, 4000) : '',
+      proposed: normalizeProposedInvestments(parsed.proposed, {
+        existingHoldings: holdings,
+        existingEvents: holdings.flatMap((h) => h.events || []),
+      }),
       ready: parsed.ready === true,
       model,
     },
