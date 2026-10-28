@@ -8371,6 +8371,86 @@ try {
       check('investments UI: the portfolio back to All restores everything',
         ps.labels.length === pFull && ps.rows === pFull,
         JSON.stringify({ points: ps.labels.length, rows: ps.rows, full: pFull }));
+
+      // Account share doughnut + stacked per-account bars.
+      r = await req('GET', '/api/investments');
+      const pf = r.data;
+      const posAccts = (pf.accounts || []).filter((a) => a.summary.value > 0);
+      const pfTotal = posAccts.reduce((s, a) => s + a.summary.value, 0);
+      const lastSeriesVal = pf.series[pf.series.length - 1].value;
+      const shareState = () => page.evaluate(() => {
+        const c = window.__fmCharts.investShare;
+        const main = window.__fmCharts.investments;
+        return {
+          slices: c ? c.data.datasets[0].data.slice() : [],
+          sliceLabels: c ? c.data.labels.slice() : [],
+          barSets: main ? main.data.datasets.filter((d) => d.accountId != null).map((d) => ({ label: d.label, len: d.data.length, last: d.data[d.data.length - 1] })) : [],
+          lineSets: main ? main.data.datasets.filter((d) => d.accountId == null).map((d) => d.label) : [],
+          labels: main ? main.data.labels.length : 0,
+        };
+      });
+      let sh = await shareState();
+      const sliceSum = sh.slices.reduce((a, b) => a + b, 0);
+      const pctSum = sh.slices.reduce((s, v) => s + (sliceSum ? (v / sliceSum) * 100 : 0), 0);
+      check('investments UI: the share doughnut has one slice per valued account and the percentages sum to 100',
+        sh.slices.length === posAccts.length && Math.abs(sliceSum - pfTotal) <= 1 && Math.abs(pctSum - 100) <= 0.6,
+        JSON.stringify({ slices: sh.slices.length, want: posAccts.length, sum: sliceSum, total: pfTotal, pct: pctSum }));
+      const barSum = sh.barSets.reduce((s, d) => s + (d.last || 0), 0);
+      check('investments UI: the stacked bar segments at the last month sum to the portfolio value, lines intact',
+        sh.barSets.length === (pf.accounts || []).length
+          && Math.abs(barSum - lastSeriesVal) <= Math.max(1, lastSeriesVal * 0.005)
+          && sh.lineSets.length === 2,
+        JSON.stringify({ bars: sh.barSets.length, accounts: (pf.accounts || []).length, barSum, value: lastSeriesVal, lines: sh.lineSets }));
+      await page.click('#invRangeBtns-investments button[data-months="12"]');
+      await waitI(400);
+      sh = await shareState();
+      check('investments UI: the stacked bars follow the range while the doughnut keeps the current shares',
+        sh.labels === 12 && sh.barSets.every((d) => d.len === 12) && sh.slices.length === posAccts.length,
+        JSON.stringify({ labels: sh.labels, barLens: sh.barSets.map((d) => d.len), slices: sh.slices.length }));
+      await page.click('#invRangeBtns-investments button[data-months="0"]');
+      await waitI(400);
+      // Legend toggle: one click on an account's legend item
+      // hides it in BOTH charts; the lines stay; a second click
+      // restores it.
+      const toggleName = posAccts[0].account.name;
+      const clickLegendItem = (name) => page.evaluate((n) => {
+        const c = window.__fmCharts.investments;
+        if (!c || !c.legend) return false;
+        const i = c.legend.legendItems.findIndex((it) => it.text === n);
+        if (i < 0) return false;
+        const b = c.legend.legendHitBoxes[i];
+        const rect = c.canvas.getBoundingClientRect();
+        c.canvas.dispatchEvent(new MouseEvent('click', {
+          bubbles: true, cancelable: true,
+          clientX: rect.left + b.left + b.width / 2, clientY: rect.top + b.top + b.height / 2,
+        }));
+        return true;
+      }, name);
+      const acctVis = (name) => page.evaluate((n) => {
+        const main = window.__fmCharts.investments;
+        const shareC = window.__fmCharts.investShare;
+        const di = main.data.datasets.findIndex((d) => d.label === n);
+        const si = shareC.data.labels.indexOf(n);
+        const item = main.legend.legendItems.find((it) => it.text === n);
+        return {
+          bar: di >= 0 ? main.isDatasetVisible(di) : null,
+          slice: si >= 0 ? shareC.getDataVisibility(si) : null,
+          struck: item ? !!item.hidden : null,
+          valueLine: main.isDatasetVisible(main.data.datasets.findIndex((d) => d.label.startsWith('Value'))),
+        };
+      }, name);
+      check('investments UI: legend click lands on the account item', await clickLegendItem(toggleName) === true);
+      await waitI(300);
+      let vis = await acctVis(toggleName);
+      check('investments UI: hiding an account from the legend removes its bar segment and its doughnut slice, lines untouched',
+        vis.bar === false && vis.slice === false && vis.struck === true && vis.valueLine === true,
+        JSON.stringify(vis));
+      check('investments UI: legend click lands again for the restore', await clickLegendItem(toggleName) === true);
+      await waitI(300);
+      vis = await acctVis(toggleName);
+      check('investments UI: a second legend click restores the account in both charts',
+        vis.bar === true && vis.slice === true && vis.struck === false,
+        JSON.stringify(vis));
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

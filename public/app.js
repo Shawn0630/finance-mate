@@ -4731,6 +4731,195 @@ const INVEST_LEVEL_CONF = {
   },
 };
 
+// Account colors: one fixed palette shared by the share
+// doughnut and the portfolio chart's stacked bars, keyed by
+// account id so an account keeps its color across renders (the
+// costs categories' fixed-map idea; NOT part of the per-user
+// chart_colors preference).
+const INVEST_ACCOUNT_COLORS = ['#8d6e00', '#5d4037', '#283593', '#00695c', '#ad1457', '#4527a0', '#558b2f', '#6a1b9a', '#37474f', '#9e9d24'];
+function investAccountColor(account) {
+  const id = Math.abs(Number(account && account.id) || 0);
+  return INVEST_ACCOUNT_COLORS[id % INVEST_ACCOUNT_COLORS.length];
+}
+
+// Accounts toggled off from either portfolio legend; the two
+// charts stay in sync and the lines never join the toggle.
+const investHiddenAccounts = new Set();
+let investShareChart = null;
+let investShareAccounts = []; // account rows in doughnut order
+let investShareCenter = null; // { total } for the center plugin
+
+function toggleInvestAccount(id) {
+  if (investHiddenAccounts.has(id)) investHiddenAccounts.delete(id);
+  else investHiddenAccounts.add(id);
+  const hidden = investHiddenAccounts.has(id);
+  if (investPortfolioChart) {
+    investPortfolioChart.data.datasets.forEach((ds, i) => {
+      if (ds.accountId === id) investPortfolioChart.setDatasetVisibility(i, !hidden);
+    });
+    investPortfolioChart.update();
+  }
+  if (investShareChart) {
+    const i = investShareAccounts.findIndex((a) => a.id === id);
+    // The vendored Chart.js has toggle/getDataVisibility but no
+    // setDataVisibility — flip only when the state differs.
+    if (i >= 0 && investShareChart.getDataVisibility(i) === hidden) {
+      investShareChart.toggleDataVisibility(i);
+      investShareChart.update();
+    }
+  }
+}
+
+// The portfolio charts' legend handler, following the app's
+// legend convention: left click toggles. Account entries route
+// through toggleInvestAccount so the bars and the doughnut move
+// together; the Value / Cumulative return lines toggle only
+// themselves, exactly like Chart.js' default.
+function investLegendClick(e, item, legend) {
+  const chart = legend.chart;
+  const ds = chart.data.datasets[item.datasetIndex];
+  if (ds && ds.accountId != null) { toggleInvestAccount(ds.accountId); return; }
+  chart.setDatasetVisibility(item.datasetIndex, !chart.isDatasetVisible(item.datasetIndex));
+  chart.update();
+}
+
+// The portfolio level's chart: one stacked bar per month, each
+// segment an account's month-end value (carried forward across
+// months the account has no point for), under the same Value
+// and Cumulative return lines the other levels draw. Follows
+// the range in force like the lines do.
+function drawInvestPortfolioChart(canvas, data, fSeries) {
+  if (!canvas) return null;
+  const months = fSeries.map((r) => r.month);
+  const bars = (data.accounts || []).map((a) => {
+    const byMonth = new Map((a.series || []).map((p) => [p.month, p.value]));
+    let cur = 0;
+    const vals = months.map((m) => { if (byMonth.has(m)) cur = byMonth.get(m); return cur; });
+    return {
+      type: 'bar', label: a.account.name, accountId: a.account.id, data: vals,
+      backgroundColor: investAccountColor(a.account), stack: 'value', order: 3, maxBarThickness: 28,
+    };
+  });
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: months,
+      datasets: [
+        ...bars,
+        { label: 'Value (CAD)', data: fSeries.map((r) => r.value), borderColor: '#1668c4', backgroundColor: '#1668c4', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+        { label: 'Cumulative return (CAD)', data: fSeries.map((r) => r.returnAmount), borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: moneyTick } } },
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12 }, onClick: investLegendClick },
+        tooltip: {
+          callbacks: {
+            label: (c) => {
+              const ds = c.dataset;
+              if (ds.accountId != null) {
+                const total = c.chart.data.datasets.reduce((s, d) => s + (d.accountId != null ? (d.data[c.dataIndex] || 0) : 0), 0);
+                const pct = total ? ((c.parsed.y / total) * 100).toFixed(1) : '0.0';
+                return `${ds.label}: ${moneyC(c.parsed.y, 'CAD')} (${pct}%)`;
+              }
+              return `${c.dataset.label}: ${moneyC(c.parsed.y, 'CAD')}`;
+            },
+          },
+        },
+      },
+    },
+  });
+  bars.forEach((ds, i) => { if (investHiddenAccounts.has(ds.accountId)) chart.setDatasetVisibility(i, false); });
+  chart.update();
+  window.__fmCharts.investments = chart;
+  return chart;
+}
+
+// The portfolio total in the doughnut's hole (the costs pie's
+// center plugin, same typography).
+const investShareCenterPlugin = {
+  id: 'investShareCenter',
+  afterDraw(chart) {
+    if (!investShareCenter || chart !== investShareChart) return;
+    const area = chart.chartArea;
+    const x = (area.left + area.right) / 2;
+    const y = (area.top + area.bottom) / 2;
+    const c = chart.ctx;
+    c.save();
+    c.textAlign = 'center';
+    c.fillStyle = '#71808f';
+    c.font = '11px system-ui, sans-serif';
+    c.fillText('Total value', x, y - 4);
+    c.fillStyle = '#22303c';
+    c.font = '700 14px system-ui, sans-serif';
+    c.fillText(moneyC(investShareCenter.total), x, y + 14);
+    c.restore();
+  },
+};
+
+// The account-share doughnut: each account's CURRENT value as a
+// slice of the portfolio total. It reflects "now" and does not
+// follow the range control.
+function drawInvestShareChart(data) {
+  const canvas = $('#investShareChart');
+  if (!canvas) return;
+  const accts = (data.accounts || []).filter((a) => a.summary && a.summary.value > 0);
+  investShareAccounts = accts.map((a) => a.account);
+  const total = accts.reduce((s, a) => s + a.summary.value, 0);
+  const empty = $('#investShareEmpty');
+  const wrap = $('#investShareWrap');
+  if (!accts.length || total <= 0) {
+    if (investShareChart) { investShareChart.destroy(); investShareChart = null; }
+    investShareCenter = null;
+    window.__fmCharts.investShare = null;
+    if (wrap) wrap.classList.add('hidden');
+    if (empty) empty.classList.remove('hidden');
+    return;
+  }
+  if (wrap) wrap.classList.remove('hidden');
+  if (empty) empty.classList.add('hidden');
+  investShareCenter = { total };
+  if (investShareChart) investShareChart.destroy();
+  investShareChart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels: accts.map((a) => a.account.name),
+      datasets: [{
+        data: accts.map((a) => a.summary.value),
+        backgroundColor: accts.map((a) => investAccountColor(a.account)),
+        borderColor: '#fff', borderWidth: 1,
+      }],
+    },
+    plugins: [investShareCenterPlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '58%',
+      plugins: {
+        legend: {
+          position: 'bottom', labels: { boxWidth: 12 },
+          onClick: (e, item) => { const a = investShareAccounts[item.index]; if (a) toggleInvestAccount(a.id); },
+        },
+        tooltip: {
+          callbacks: {
+            label: (item) => {
+              const t = item.dataset.data.reduce((a, b) => a + b, 0);
+              const pct = t ? ((item.parsed / t) * 100).toFixed(1) : '0.0';
+              return ` ${item.label}: ${moneyC(item.parsed)} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+  investShareAccounts.forEach((a, i) => {
+    if (investHiddenAccounts.has(a.id) && investShareChart.getDataVisibility(i)) investShareChart.toggleDataVisibility(i);
+  });
+  investShareChart.update();
+  window.__fmCharts.investShare = investShareChart;
+}
+
 // Re-render one level's chart + monthly table inside the range
 // in force, and bring the controls in line with it.
 function applyInvestRange(level) {
@@ -4743,7 +4932,9 @@ function applyInvestRange(level) {
   const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
   const old = conf.get();
   if (old) old.destroy();
-  conf.set(drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native));
+  conf.set(level === 'investments'
+    ? drawInvestPortfolioChart($(conf.canvas), d, fSeries)
+    : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native));
   const mHost = $(conf.monthly);
   if (mHost) mHost.innerHTML = investMonthlyTable(fMonthly, d.cur);
   syncInvestRangeInputs(level);
@@ -4919,11 +5110,17 @@ async function loadInvestmentsImpl() {
       <div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div>
       <div class="cards" style="margin-top:12px">${cards || '<div class="note">No accounts yet — add one to start tracking.</div>'}</div>
     </div>
+    <div class="panel">
+      <h3>Account share</h3>
+      <div class="invest-share-box" id="investShareWrap"><div class="chart-wrap invest-share"><canvas id="investShareChart"></canvas></div></div>
+      <div class="note hidden" id="investShareEmpty">No account values yet.</div>
+    </div>
     <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly)}</div>
       <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
-  investViewData.investments = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false };
+  investViewData.investments = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false, accounts: data.accounts };
   wireInvestRangeControls('investments');
   applyInvestRange('investments');
+  drawInvestShareChart(data);
   $('#addInvestAccountBtn').addEventListener('click', () => openInvestAccountModal(null));
   $('#refreshInvestBtn').addEventListener('click', async (e) => {
     e.target.disabled = true;
