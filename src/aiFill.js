@@ -765,6 +765,11 @@ const INVEST_CHAT_PROMPT = [
   '- buy/sell/grant carry "units" and "price" (per-unit price in the holding\'s currency).',
   '  A grant\'s price may be null when the document gives no value — the app then uses the',
   '  market price on the grant date. A dividend carries "amount" (the total paid) instead.',
+  '  Statements often print a sale as a NEGATIVE unit count, and a fund "redemption" or',
+  '  "switch out" is a sale — still emit type "sell" with positive units and either a',
+  '  per-unit price or a total amount. If anything in the documents does not make it into',
+  '  "proposed", name it in "reply" (what it was and why it was left out) so the user can',
+  '  correct it.',
   '  A split carries "splitNew" and "splitOld" (the ratio sides — a 3-for-1 split is',
   '  splitNew 3, splitOld 1; a 1-for-2 reverse split is splitNew 1, splitOld 2) and no',
   '  units/price/amount.',
@@ -806,20 +811,37 @@ function fmtEventLine(e) {
 export function normalizeProposedInvestments(raw, deps = {}) {
   const existingHoldings = deps.existingHoldings || [];
   const existingEvents = deps.existingEvents || [];
-  const out = { holdings: [], events: [] };
+  // "dropped" is the audit trail for the silent-skip problem:
+  // every proposal item the normalizer refuses, with a short
+  // human-readable reason, so the panel can show the user
+  // what did NOT make it in instead of losing it quietly.
+  const out = { holdings: [], events: [], dropped: [] };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  const summarize = (item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return 'unreadable item';
+    const bits = [];
+    if (item.date) bits.push(String(item.date));
+    if (item.type) bits.push(String(item.type));
+    if (item.label) bits.push(String(item.label));
+    if (item.symbol) bits.push(String(item.symbol));
+    if (item.units != null) bits.push(`${item.units} units`);
+    if (item.amount != null) bits.push(`$${item.amount}`);
+    return bits.length ? bits.join(' ') : 'item';
+  };
+  const drop = (item, reason) => { out.dropped.push({ summary: summarize(item), reason }); };
   const symKey = (s) => (typeof s === 'string' && s.trim() ? s.trim().toUpperCase() : null);
   const labelKey = (s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
   if (Array.isArray(raw.holdings)) {
     for (const item of raw.holdings) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) { drop(item, 'could not be read'); continue; }
+      if (out.holdings.length >= 20) { drop(item, 'over the 20-holding proposal limit'); continue; }
       const label = normStr(item.label, 160);
       const kind = normEnum(item.kind, ['exchange', 'fund']);
       const currency = normEnum(item.currency, ['cad', 'usd']);
-      if (!label || !kind || !currency) continue;
+      if (!label || !kind || !currency) { drop(item, 'missing label, kind or currency'); continue; }
       let symbol = normStr(item.symbol, 24);
       if (symbol) symbol = symbol.toUpperCase();
-      if (kind === 'exchange' && !symbol) continue; // an exchange draft without a ticker is unusable
+      if (kind === 'exchange' && !symbol) { drop(item, 'exchange holding without a ticker symbol'); continue; } // an exchange draft without a ticker is unusable
       const dupe = existingHoldings.some((h) =>
         (symbol && symKey(h.symbol) === symbol) || labelKey(h.label) === labelKey(label));
       out.holdings.push({
@@ -831,41 +853,54 @@ export function normalizeProposedInvestments(raw, deps = {}) {
         currency: currency.toUpperCase(),
         conflict: dupe ? 'duplicate-holding' : null,
       });
-      if (out.holdings.length >= 20) break;
     }
   }
   const refs = new Set(out.holdings.map((h) => h.ref));
   const holdingIds = new Set(existingHoldings.map((h) => Number(h.id)));
   if (Array.isArray(raw.events)) {
     for (const item of raw.events) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) { drop(item, 'could not be read'); continue; }
+      if (out.events.length >= 50) { drop(item, 'over the 50-event proposal limit'); continue; }
       const type = normEnum(item.type, ['buy', 'sell', 'grant', 'dividend', 'split']);
       const date = normDate(item.date);
-      if (!type || !date) continue;
+      if (!type || !date) { drop(item, 'missing or invalid date or type'); continue; }
       const holdingId = Number.isInteger(Number(item.holdingId)) && holdingIds.has(Number(item.holdingId))
         ? Number(item.holdingId) : null;
       const holdingRef = typeof item.holdingRef === 'string' && refs.has(item.holdingRef) ? item.holdingRef : null;
-      if (holdingId == null && holdingRef == null) continue; // nowhere to attach it
+      if (holdingId == null && holdingRef == null) { drop(item, 'could not be matched to a holding in this account or in this draft'); continue; } // nowhere to attach it
       const ev = {
         holdingId, holdingRef, date, type,
         units: null, price: null, amount: null,
         splitNew: null, splitOld: null,
+        priceDerived: false,
         note: normStr(item.note, 500),
         conflict: null,
       };
       if (type === 'dividend') {
         ev.amount = normNum(item.amount);
-        if (ev.amount == null || ev.amount <= 0) continue;
+        if (ev.amount == null || ev.amount <= 0) { drop(item, 'dividend needs a positive amount'); continue; }
       } else if (type === 'split') {
         ev.splitNew = normNum(item.splitNew ?? item.split_new);
         ev.splitOld = normNum(item.splitOld ?? item.split_old);
         if (ev.splitNew == null || ev.splitNew <= 0 || ev.splitOld == null || ev.splitOld <= 0
-          || ev.splitNew === ev.splitOld) continue;
+          || ev.splitNew === ev.splitOld) { drop(item, 'split needs a valid new:old ratio'); continue; }
       } else {
-        ev.units = normNum(item.units);
-        if (ev.units == null || ev.units <= 0) continue;
+        // Statements commonly print a sale as a NEGATIVE unit
+        // count; the sign is presentation, not a different
+        // transaction — normalize to a positive count.
+        const rawUnits = normNum(item.units);
+        ev.units = rawUnits == null ? null : Math.abs(rawUnits);
+        if (ev.units == null || ev.units <= 0) { drop(item, 'units must be a positive number'); continue; }
         ev.price = normNum(item.price);
-        if (type !== 'grant' && (ev.price == null || ev.price <= 0)) continue;
+        if (type !== 'grant' && (ev.price == null || ev.price <= 0)) {
+          // A sale (or purchase) printed with only a total:
+          // derive the per-unit price from the amount.
+          const amt = normNum(item.amount);
+          if (amt != null && amt !== 0) {
+            ev.price = Math.abs(amt) / ev.units;
+            ev.priceDerived = true;
+          } else { drop(item, 'price is missing and no total amount to derive it from'); continue; }
+        }
         if (type === 'grant' && ev.price != null && ev.price <= 0) ev.price = null;
       }
       if (holdingId != null) {
@@ -879,7 +914,6 @@ export function normalizeProposedInvestments(raw, deps = {}) {
         if (dupe) ev.conflict = 'duplicate-event';
       }
       out.events.push(ev);
-      if (out.events.length >= 50) break;
     }
   }
   return out;

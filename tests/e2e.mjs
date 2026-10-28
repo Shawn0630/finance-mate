@@ -7980,6 +7980,31 @@ try {
     r.status === 200 && r.data.ready === true && r.data.proposed.holdings.length === 2
       && r.data.proposed.events.length === 2 && r.data.proposed.holdings[1].kind === 'fund',
     JSON.stringify(r.data));
+  // Sell-heavy statement: a sale printed as negative units, a
+  // sale with only a total, and one sale that matches no
+  // holding — the first two must survive as sell proposals
+  // (the second with a derived price and flag), the third must
+  // be reported in dropped, not lost silently.
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Found the sales. One sale could not be matched to a holding.',
+    proposed: {
+      holdings: [{ ref: 'h1', label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD' }],
+      events: [
+        { holdingRef: 'h1', date: '2026-03-10', type: 'sell', units: -50, price: 40 },
+        { holdingRef: 'h1', date: '2026-03-11', type: 'sell', units: 20, amount: 1000 },
+        { holdingId: 999999, date: '2026-03-12', type: 'sell', units: 5, price: 40 },
+      ],
+    },
+    ready: true,
+  }));
+  r = await req('POST', '/api/ai/invest-fill-chat', { accountId: invTfsaId, text: 'Statement sales for VFV.' });
+  check('investments AI: negative-unit and amount-only sales survive as sell proposals; an unmatched sale is reported in dropped',
+    r.status === 200 && r.data.proposed.events.length === 2
+      && r.data.proposed.events.every((e) => e.type === 'sell')
+      && r.data.proposed.events[0].units === 50 && r.data.proposed.events[0].priceDerived === false
+      && r.data.proposed.events[1].price === 50 && r.data.proposed.events[1].priceDerived === true
+      && r.data.proposed.dropped.length === 1 && /matched/.test(r.data.proposed.dropped[0].reason),
+    JSON.stringify(r.data.proposed));
   // Apply the way the panel does: holdings first, then their events.
   r = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`,
     { label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD', source: 'ai' });
@@ -7999,6 +8024,23 @@ try {
       && r.data.holdings.find((h) => h.holding.id === invVfvId).holding.source === 'ai',
     JSON.stringify({ v: r.data.summary.value, n: r.data.holdings.length }));
   // Re-proposing what now exists flags the duplicates.
+  // (The sell-heavy stub from the dropped-items round above is
+  // replaced with the two-holding draft so this round sees
+  // both applied holdings again.)
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Added the Scotia NASDAQ Index Fund as a CAD fund with its first purchase.',
+    proposed: {
+      holdings: [
+        { ref: 'h1', label: 'VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD' },
+        { ref: 'h2', label: 'Scotia NASDAQ Index Fund', kind: 'fund', currency: 'CAD' },
+      ],
+      events: [
+        { holdingRef: 'h1', date: '2026-03-05', type: 'buy', units: 10, price: 150 },
+        { holdingRef: 'h2', date: '2026-03-05', type: 'buy', units: 50, price: 40 },
+      ],
+    },
+    ready: true,
+  }));
   r = await req('POST', '/api/ai/invest-fill-chat', { accountId: invTfsaId, text: 'Add VFV again from this statement.' });
   check('investments AI: re-proposing an existing holding is flagged as a duplicate',
     r.status === 200 && r.data.proposed.holdings.length === 2
@@ -8489,6 +8531,44 @@ try {
       check('investments UI: a second legend click restores the account in both charts',
         vis.bar === true && vis.slice === true && vis.struck === false,
         JSON.stringify(vis));
+
+      // AI panel: a sell-heavy stub round must show both sell
+      // proposals (one with the derived-price marker) and the
+      // dropped-items warning — the sells must not vanish.
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'Found the sales. One sale could not be matched to a holding.',
+        proposed: {
+          holdings: [{ ref: 'h1', label: 'Panel VFV', kind: 'exchange', symbol: 'VFV.TO', currency: 'CAD' }],
+          events: [
+            { holdingRef: 'h1', date: '2026-03-10', type: 'sell', units: -50, price: 40 },
+            { holdingRef: 'h1', date: '2026-03-11', type: 'sell', units: 20, amount: 1000 },
+            { holdingId: 999999, date: '2026-03-12', type: 'sell', units: 5, price: 40 },
+          ],
+        },
+        ready: true,
+      }));
+      await page.goto(`http://ff.local/#invest-account/${invTfsaId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('[data-invest-ai-toggle]');
+      await page.waitForFunction(() => !document.querySelector('[data-invest-ai-panel]').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('[data-invest-chat-text]', 'Statement sales for VFV.');
+      await page.click('[data-invest-chat-send]');
+      await page.waitForFunction(() => document.querySelectorAll('[data-invest-proposed] [data-ie-row]').length === 2, { timeout: 20000 });
+      const panelSell = await page.evaluate(() => {
+        const host = document.querySelector('[data-invest-proposed]');
+        const rows = [...host.querySelectorAll('[data-ie-row]')].map((row) => ({
+          type: row.querySelector('[data-ie-type]').value,
+          units: row.querySelector('[data-ie-units]').value,
+          price: row.querySelector('[data-ie-price]').value,
+        }));
+        return { text: host.textContent, rows };
+      });
+      check('investments UI: the AI panel shows both sell proposals (negative units normalized, amount-only price derived) and the dropped-items note',
+        panelSell.rows.length === 2 && panelSell.rows.every((r) => r.type === 'sell')
+          && panelSell.rows[0].units === '50'
+          && panelSell.text.includes('Price derived from total amount')
+          && panelSell.text.includes('Not included from the statement') && panelSell.text.includes('matched'),
+        JSON.stringify(panelSell));
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

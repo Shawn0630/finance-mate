@@ -398,6 +398,26 @@ test('normalizeProposedInvestments: split proposals normalize and flag duplicate
   assert.equal(dupe.events[0].conflict, 'duplicate-event');
 });
 
+test('normalizeProposedInvestments: negative-unit sells normalize, amount-only sells derive a price, orphans land in dropped', () => {
+  const out = normalizeProposedInvestments({
+    events: [
+      { holdingId: 12, date: '2026-03-05', type: 'sell', units: -50, price: 40 }, // sale printed negative
+      { holdingId: 12, date: '2026-03-06', type: 'sell', units: 20, amount: 1000 }, // total only
+      { holdingId: 12, date: '2026-03-07', type: 'buy', units: 10, price: 150 },   // normal path, zero regression
+      { holdingId: 999, date: '2026-03-08', type: 'sell', units: 5, price: 40 },   // matches nothing
+      { holdingId: 12, date: '2026-03-09', type: 'sell', units: 5 },               // no price, no amount
+    ],
+  }, { existingHoldings: EXISTING, existingEvents: [] });
+  assert.deepEqual(out.events.map((e) => [e.type, e.units, e.price, e.priceDerived]), [
+    ['sell', 50, 40, false],
+    ['sell', 20, 50, true],
+    ['buy', 10, 150, false],
+  ]);
+  assert.equal(out.dropped.length, 2, JSON.stringify(out.dropped));
+  assert.match(out.dropped[0].reason, /matched to a holding/);
+  assert.match(out.dropped[1].reason, /price/);
+});
+
 // ------------------------------------------------------- Yahoo tier
 test('parseYahooChart: zips timestamps with closes, drops nulls and error shapes', () => {
   const ts = (y, m, d) => Date.UTC(y, m, d) / 1000;
@@ -602,7 +622,7 @@ test('normalizeProposedInvestments: normalization and duplicate flags', () => {
   assert.equal(out.events[0].conflict, 'duplicate-event');
   assert.deepEqual(out.events[2], {
     holdingId: null, holdingRef: 'h2', date: '2026-02-03', type: 'buy',
-    units: 20, price: 31.5, amount: null, splitNew: null, splitOld: null, note: null, conflict: null,
+    units: 20, price: 31.5, amount: null, splitNew: null, splitOld: null, priceDerived: false, note: null, conflict: null,
   });
 });
 

@@ -5523,6 +5523,7 @@ $('#investHoldingForm').addEventListener('submit', async (e) => {
 // conversation lives in this page session only; switching
 // accounts or Clear session resets it.
 let investChatState = { turns: [], proposed: { holdings: [], events: [] } };
+let investChatDropped = []; // items the last AI round did not turn into proposals, with reasons
 let investChatAccountId = null;
 let investChatQueue = [];
 
@@ -5542,6 +5543,7 @@ function renderInvestChatQueue() {
 
 function resetInvestChat(accountId) {
   investChatState = { turns: [], proposed: { holdings: [], events: [] } };
+  investChatDropped = [];
   investChatAccountId = accountId;
   investChatQueue = [];
   renderInvestChatQueue();
@@ -5561,7 +5563,7 @@ function syncInvestChatClearBtn() {
   if (!btn) return;
   const p = investChatState.proposed;
   btn.classList.toggle('hidden',
-    !(investChatState.turns.length || p.holdings.length || p.events.length || investChatQueue.length));
+    !(investChatState.turns.length || p.holdings.length || p.events.length || investChatQueue.length || investChatDropped.length));
 }
 
 function investChatLogHtml() {
@@ -5593,7 +5595,14 @@ function renderInvestProposed() {
   if (!host) return;
   syncInvestChatClearBtn();
   const { holdings, events } = investChatState.proposed;
-  if (!holdings.length && !events.length) { host.innerHTML = ''; return; }
+  // The dropped-items warning is functional, not decorative: it
+  // is the only place a user learns a statement line never
+  // became a proposal, so it renders even when nothing else
+  // survived the round.
+  const droppedHtml = investChatDropped.length
+    ? `<div class="msg warn">Not included from the statement (${investChatDropped.length}): ${investChatDropped.map((d) => `${esc(d.summary)} — ${esc(d.reason)}`).join('; ')}</div>`
+    : '';
+  if (!holdings.length && !events.length) { host.innerHTML = droppedHtml; return; }
   const holdingRows = holdings.map((h, i) => `
     <div class="costs-proposed-row${h.conflict ? ' conflict' : ''}" data-ih-row="${i}">
       <input type="checkbox" data-ih-check${h.conflict ? '' : ' checked'}>
@@ -5626,11 +5635,12 @@ function renderInvestProposed() {
       <input type="text" inputmode="decimal" data-money data-ie-amount value="${esc(formatMoneyInput(e.amount ?? ''))}" placeholder="Dividend $" style="width:110px">
       <input type="text" inputmode="decimal" data-ie-splitnew value="${e.splitNew ?? ''}" placeholder="Split new" title="Split ratio — new side" style="width:76px">
       <input type="text" inputmode="decimal" data-ie-splitold value="${e.splitOld ?? ''}" placeholder="Split old" title="Split ratio — old side" style="width:76px">
+      ${e.priceDerived ? '<span class="note">Price derived from total amount</span>' : ''}
       ${e.conflict ? '<span class="conflict-tag">Same event already recorded — applies only if checked</span>' : ''}
       <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
     </div>`;
   }).join('');
-  host.innerHTML = `<div class="costs-proposed"><h5>Proposed — review, edit, then Apply</h5>
+  host.innerHTML = `<div class="costs-proposed">${droppedHtml}<h5>Proposed — review, edit, then Apply</h5>
     ${holdings.length ? `<div class="note" style="margin:0 0 4px">New holdings</div>${holdingRows}` : ''}
     ${events.length ? `<div class="note" style="margin:6px 0 4px">Events</div>${eventRows}` : ''}
     <div class="toolbar" style="margin-top:6px">
@@ -5726,6 +5736,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   }
   if (e.target.closest('[data-invest-discard]')) {
     investChatState.proposed = { holdings: [], events: [] };
+    investChatDropped = [];
     renderInvestProposed();
     return;
   }
@@ -5780,6 +5791,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       holdings: draft.holdings.filter((h) => !h.checked).map(({ checked, ...rest }) => rest),
       events: draft.events.filter((ev) => !ev.checked).map(({ checked, ...rest }) => rest),
     };
+    investChatDropped = []; // the round is closed; the next send re-derives the warning
     investChatState.turns.push({ role: 'assistant', content: `Applied ${n} ${n === 1 ? 'item' : 'items'}.` });
     renderInvestChatLog();
     renderInvestProposed();
@@ -5872,7 +5884,11 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       if (body.model && aiConfigCache) aiConfigCache.model = body.model;
       investChatState.turns.push({ role: 'user', content: text || '(attached documents)' });
       if (r.reply) investChatState.turns.push({ role: 'assistant', content: r.reply });
-      investChatState.proposed = r.proposed || { holdings: [], events: [] };
+      investChatState.proposed = {
+        holdings: (r.proposed && r.proposed.holdings) || [],
+        events: (r.proposed && r.proposed.events) || [],
+      };
+      investChatDropped = (r.proposed && Array.isArray(r.proposed.dropped)) ? r.proposed.dropped : [];
       chatTa.value = '';
       fileInput.value = '';
       investChatQueue = [];
