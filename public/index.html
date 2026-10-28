@@ -132,6 +132,7 @@
         <h3>Holdings</h3>
         <div class="spacer"></div>
         <button type="button" class="small" data-invest-ai-toggle>✨ Fill with AI</button>
+        <button type="button" class="small" data-invest-import-csv>Import CSV</button>
         <button class="primary small" id="addHoldingBtn">+ Add holding</button>
       </div>
       <div class="ai-fill" id="investAiFill">
@@ -140,6 +141,7 @@
           <div class="costs-chat-log hidden" data-invest-chat-log></div>
           <div class="costs-chat-queue hidden" data-invest-chat-queue></div>
           <textarea rows="3" data-invest-chat-text placeholder="Paste a statement or grant notice, or answer the AI's question…"></textarea>
+          <input type="file" accept=".csv" class="hidden" data-invest-import-file>
           <div class="ai-panel-row">
             <input type="file" accept="image/*,application/pdf,.csv,.txt" multiple data-invest-chat-files>
             <select data-invest-chat-model title="Model" style="width:auto;flex:0 1 auto"></select>

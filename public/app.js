@@ -5526,6 +5526,8 @@ let investChatState = { turns: [], proposed: { holdings: [], events: [] } };
 let investChatDropped = []; // items the last AI round did not turn into proposals, with reasons
 let investChatAccountId = null;
 let investChatQueue = [];
+let investImportMode = false; // the proposed panel holds a CSV import preview, not an AI draft
+let investImportReport = null; // { holdings, events, skipped, skippedByType, duplicates } counts for the preview header
 
 function clearInvestChatMsg() {
   const msg = document.querySelector('[data-invest-chat-msg]');
@@ -5546,6 +5548,8 @@ function resetInvestChat(accountId) {
   investChatDropped = [];
   investChatAccountId = accountId;
   investChatQueue = [];
+  investImportMode = false;
+  investImportReport = null;
   renderInvestChatQueue();
   const log = document.querySelector('[data-invest-chat-log]');
   if (log) { log.innerHTML = ''; log.classList.add('hidden'); }
@@ -5602,7 +5606,10 @@ function renderInvestProposed() {
   const droppedHtml = investChatDropped.length
     ? `<div class="msg warn">Not included from the statement (${investChatDropped.length}): ${investChatDropped.map((d) => `${esc(d.summary)} — ${esc(d.reason)}`).join('; ')}</div>`
     : '';
-  if (!holdings.length && !events.length) { host.innerHTML = droppedHtml; return; }
+  const reportHtml = investImportReport
+    ? `<div class="note">CSV import preview: ${investImportReport.holdings} new holdings, ${investImportReport.events} events · Skipped ${investImportReport.skipped} cash rows${investImportReport.skippedByType && Object.keys(investImportReport.skippedByType).length ? ` (${Object.entries(investImportReport.skippedByType).map(([t, n]) => `${esc(t)} ${n}`).join(', ')})` : ''} · Already recorded: ${investImportReport.duplicates}</div>`
+    : '';
+  if (!holdings.length && !events.length) { host.innerHTML = reportHtml + droppedHtml; return; }
   const holdingRows = holdings.map((h, i) => `
     <div class="costs-proposed-row${h.conflict ? ' conflict' : ''}" data-ih-row="${i}">
       <input type="checkbox" data-ih-check${h.conflict ? '' : ' checked'}>
@@ -5640,7 +5647,7 @@ function renderInvestProposed() {
       <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
     </div>`;
   }).join('');
-  host.innerHTML = `<div class="costs-proposed">${droppedHtml}<h5>Proposed — review, edit, then Apply</h5>
+  host.innerHTML = `<div class="costs-proposed">${reportHtml}${droppedHtml}<h5>Proposed — review, edit, then Apply</h5>
     ${holdings.length ? `<div class="note" style="margin:0 0 4px">New holdings</div>${holdingRows}` : ''}
     ${events.length ? `<div class="note" style="margin:6px 0 4px">Events</div>${eventRows}` : ''}
     <div class="toolbar" style="margin-top:6px">
@@ -5737,7 +5744,66 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   if (e.target.closest('[data-invest-discard]')) {
     investChatState.proposed = { holdings: [], events: [] };
     investChatDropped = [];
+    investImportMode = false;
+    investImportReport = null;
     renderInvestProposed();
+    return;
+  }
+  if (investImportMode && e.target.closest('[data-invest-apply]')) {
+    // CSV import Apply: one atomic server call with source 'csv',
+    // not the AI path's per-item posts.
+    const msg = document.querySelector('[data-invest-chat-msg]');
+    const draft = readInvestProposed();
+    const chosenHoldings = draft.holdings.filter((h) => h.checked);
+    const chosenEvents = draft.events.filter((ev) => ev.checked);
+    if (!chosenHoldings.length && !chosenEvents.length) {
+      showMsg(msg, 'err', 'Nothing is selected to apply.');
+      return;
+    }
+    for (const h of chosenHoldings) {
+      if (!h.label || (h.kind === 'exchange' && !h.symbol)) {
+        showMsg(msg, 'err', 'A selected holding is missing its label or (for exchange) its symbol.');
+        return;
+      }
+    }
+    for (const ev of chosenEvents) {
+      const figuresOk = ev.type === 'dividend' ? ev.amount > 0
+        : ev.type === 'split' ? (ev.splitNew > 0 && ev.splitOld > 0)
+        : ev.units > 0;
+      if (!ev.date || !figuresOk) {
+        showMsg(msg, 'err', 'A selected event is missing its date or figures.');
+        return;
+      }
+      if (ev.holdingId == null && !chosenHoldings.some((h) => h.ref === ev.holdingRef)) {
+        showMsg(msg, 'err', 'A selected event belongs to a new holding that is not selected — select the holding too.');
+        return;
+      }
+    }
+    const applyBtn = e.target.closest('[data-invest-apply]');
+    applyBtn.disabled = true;
+    try {
+      const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv/apply`, {
+        method: 'POST',
+        body: {
+          holdings: chosenHoldings.map(({ checked, conflict, ...rest }) => rest),
+          events: chosenEvents.map(({ checked, conflict, ...rest }) => rest),
+        },
+      });
+      const dup = r.skippedDuplicates && r.skippedDuplicates.length ? ` (${r.skippedDuplicates.length} already recorded, skipped)` : '';
+      investChatState.proposed = { holdings: [], events: [] };
+      investChatDropped = [];
+      investImportMode = false;
+      investImportReport = null;
+      investChatState.turns.push({ role: 'assistant', content: `Imported ${r.createdHoldings} holdings and ${r.createdEvents} events${dup}.` });
+      renderInvestChatLog();
+      renderInvestProposed();
+      clearInvestChatMsg();
+      await loadInvestAccount(investChatAccountId);
+    } catch (err) {
+      showMsg(msg, 'err', err.message);
+    } finally {
+      applyBtn.disabled = false;
+    }
     return;
   }
   if (!e.target.closest('[data-invest-apply]')) return;
@@ -5851,6 +5917,38 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     e.preventDefault();
     queueFiles(files);
   });
+  // Deterministic Wealthsimple CSV import: parse on the server,
+  // preview in the same proposed panel as the AI draft, Apply
+  // writes it in one transaction with source 'csv'.
+  const importBtn = document.querySelector('[data-invest-import-csv]');
+  const importFile = wrap.querySelector('[data-invest-import-file]');
+  importBtn.addEventListener('click', () => {
+    if (investChatAccountId == null) { showMsg(msg, 'err', 'Open an account first.'); return; }
+    panel.classList.remove('hidden');
+    importFile.click();
+  });
+  importFile.addEventListener('change', async () => {
+    const f = importFile.files[0];
+    importFile.value = '';
+    if (!f) return;
+    clearInvestChatMsg(); // a new import supersedes the last error
+    try {
+      const text = await f.text();
+      const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv`, { method: 'POST', body: { csv: text } });
+      investChatState.proposed = { holdings: r.holdings || [], events: r.events || [] };
+      investChatDropped = r.failed || [];
+      investImportMode = true;
+      investImportReport = {
+        holdings: (r.holdings || []).length, events: (r.events || []).length,
+        skipped: r.skipped ? r.skipped.total : 0,
+        skippedByType: r.skipped ? r.skipped.byType : {},
+        duplicates: r.duplicates || 0,
+      };
+      renderInvestProposed();
+    } catch (err) {
+      showMsg(msg, 'err', err.message);
+    }
+  });
   sendBtn.addEventListener('click', async () => {
     clearInvestChatMsg(); // a new send supersedes the last error
     const text = chatTa.value.trim();
@@ -5889,6 +5987,8 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
         events: (r.proposed && r.proposed.events) || [],
       };
       investChatDropped = (r.proposed && Array.isArray(r.proposed.dropped)) ? r.proposed.dropped : [];
+      investImportMode = false; // an AI round replaces any import preview
+      investImportReport = null;
       chatTa.value = '';
       fileInput.value = '';
       investChatQueue = [];

@@ -8049,6 +8049,20 @@ try {
   r = await req('POST', '/api/ai/invest-fill-chat', { accountId: 999999, text: 'x' });
   check('investments AI: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
 
+  // Synthetic Wealthsimple fixture shared by the CSV import API
+  // round below and the browser round inside the investments
+  // browser block (the user's real export never appears here).
+  const WS_H = ['effective_date', 'effective_time', 'settlement_date', 'account_id', 'account_type', 'activity_type', 'activity_sub_type', 'description', 'direction', 'symbol', 'name', 'currency', 'quantity', 'unit_price', 'commission', 'net_cash_amount'];
+  const wsLine = (o) => WS_H.map((c) => o[c] ?? '').join(',');
+  const wsFixture = [WS_H.join(','), wsLine({ effective_date: '2026-01-05', activity_type: 'Trade', activity_sub_type: 'BUY', symbol: 'XQQ', name: 'XQQ fund', currency: 'CAD', quantity: '100', unit_price: '50', commission: '0', net_cash_amount: '-5000' }),
+    wsLine({ effective_date: '2026-01-06', activity_type: 'Trade', activity_sub_type: 'SELL', symbol: 'XQQ', name: 'XQQ fund', currency: 'CAD', quantity: '-40', unit_price: '60', commission: '0', net_cash_amount: '2400' }),
+    wsLine({ effective_date: '2026-01-07', activity_type: 'Dividend', activity_sub_type: '-', symbol: 'XQQ', name: 'XQQ fund', currency: 'CAD', quantity: '12.5', net_cash_amount: '12.5' }),
+    wsLine({ effective_date: '2026-01-08', activity_type: 'CorporateAction', activity_sub_type: 'SUBDIVISION', symbol: 'XQQ', name: 'XQQ fund', currency: '', quantity: '120' }),
+    wsLine({ effective_date: '2026-01-09', activity_type: 'Trade', activity_sub_type: 'BUY', symbol: 'XQQ', name: 'XQQ fund', currency: 'CAD', quantity: '10', unit_price: '55', commission: '0', net_cash_amount: '-550' }),
+    wsLine({ effective_date: '2026-01-10', activity_type: 'MoneyMovement', activity_sub_type: 'EFT', currency: 'CAD', net_cash_amount: '1000' }),
+    wsLine({ effective_date: '2026-01-11', activity_type: 'Trade', activity_sub_type: 'SELL', symbol: 'XQQ', name: 'XQQ fund', currency: 'CAD', quantity: '-9999', unit_price: '55', commission: '0', net_cash_amount: '549945' }),
+    wsLine({ effective_date: '2026-01-12', activity_type: 'Trade', activity_sub_type: 'BUY', symbol: 'VFV', name: 'VFV fund', currency: 'CAD', quantity: '5', unit_price: '100', commission: '0', net_cash_amount: '-500' })].join('\n');
+
   // ---- browser pass over the three levels ----
   if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
     console.log('investments browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -8574,7 +8588,98 @@ try {
     } finally {
       await browserI.close();
     }
+
+    // CSV import: the account page's Import CSV button previews
+    // the same synthetic fixture and Apply lands it.
+    r = await req('POST', '/api/investments/accounts', { name: 'CSV import UI', type: 'TFSA', institution: 'Wealthsimple' });
+    const csvUiAcctId = r.data.id;
+    const csvTmp = path.join(os.tmpdir(), `ff-e2e-ws-${Date.now()}.csv`);
+    fs.writeFileSync(csvTmp, wsFixture);
+    const browserCsv = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      const pageCsv = await browserCsv.newPage();
+      const clientCsv = await pageCsv.target().createCDPSession();
+      await clientCsv.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      clientCsv.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await clientCsv.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardI({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await clientCsv.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await clientCsv.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await clientCsv.send('Network.setCookie', { name: 'ff_session', value: cookieValueI, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitCsv = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await pageCsv.goto(`http://ff.local/#invest-account/${csvUiAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitCsv(800);
+      await pageCsv.click('[data-invest-import-csv]');
+      const csvInput = await pageCsv.$('[data-invest-import-file]');
+      await csvInput.uploadFile(csvTmp);
+      await pageCsv.waitForFunction(() => document.querySelectorAll('[data-invest-proposed] [data-ie-row]').length === 6, { timeout: 20000 });
+      const csvPanel = await pageCsv.evaluate(() => {
+        const host = document.querySelector('[data-invest-proposed]');
+        return { text: host.textContent, rows: host.querySelectorAll('[data-ie-row]').length };
+      });
+      check('investments UI: Import CSV previews 6 events, the cash skip and the failed oversell',
+        csvPanel.rows === 6 && csvPanel.text.includes('Skipped 1 cash rows') && csvPanel.text.includes('Already recorded: 0')
+          && csvPanel.text.includes('cannot sell 9999 units'),
+        JSON.stringify(csvPanel));
+      await pageCsv.click('[data-invest-apply]');
+      await pageCsv.waitForFunction(() => document.querySelector('#investHoldingsWrap').textContent.includes('XQQ.TO'), { timeout: 20000 });
+      r = await req('GET', `/api/investments/accounts/${csvUiAcctId}`);
+      const xqqUi = r.data.holdings.find((row) => row.holding.symbol === 'XQQ.TO');
+      check('investments UI: applying the CSV preview stores the split-restated units',
+        xqqUi && xqqUi.summary.units === 190,
+        JSON.stringify(r.data.holdings.map((row) => [row.holding.symbol, row.summary.units])));
+    } catch (err) {
+      check('investments CSV browser flow runs to completion', false, String((err && err.message) || err));
+    } finally {
+      await browserCsv.close();
+    }
   }
+
+  // ---- Wealthsimple CSV import: API round ----
+  r = await req('POST', '/api/investments/accounts', { name: 'CSV import', type: 'TFSA', institution: 'Wealthsimple' });
+  const csvAcctId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${csvAcctId}/import-csv`, { csv: wsFixture });
+  const csvParse = r.data;
+  check('csv import: parse maps buys, a negative sell, a dividend and a 3:1 split, skips the cash row, fails the oversell',
+    r.status === 200 && csvParse.holdings.length === 2 && csvParse.events.length === 6
+      && csvParse.skipped.total === 1 && csvParse.failed.length === 1 && csvParse.duplicates === 0
+      && csvParse.events.some((e) => e.type === 'split' && e.splitNew === 180 && e.splitOld === 60)
+      && csvParse.holdings.every((h) => h.symbol.endsWith('.TO')),
+    JSON.stringify(csvParse));
+  r = await req('POST', `/api/investments/accounts/${csvAcctId}/import-csv/apply`, { holdings: csvParse.holdings, events: csvParse.events });
+  check('csv import: apply writes 2 holdings and 6 events',
+    r.status === 201 && r.data.createdHoldings === 2 && r.data.createdEvents === 6, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/accounts/${csvAcctId}`);
+  const csvUnits = Object.fromEntries(r.data.holdings.map((row) => [row.holding.symbol, row.summary.units]));
+  const csvSources = new Set(r.data.holdings.flatMap((row) => [row.holding.source, ...row.events.map((e) => e.source)]));
+  check('csv import: stored units restate through the split (60 x 3 + 10 = 190) and everything carries source csv',
+    csvUnits['XQQ.TO'] === 190 && csvUnits['VFV.TO'] === 5 && csvSources.size === 1 && csvSources.has('csv'),
+    JSON.stringify({ units: csvUnits, sources: [...csvSources] }));
+  r = await req('POST', `/api/investments/accounts/${csvAcctId}/import-csv`, { csv: wsFixture });
+  check('csv import: re-parsing after apply is all duplicates (the failed oversell still fails)',
+    r.data.events.length === 0 && r.data.duplicates === 6 && r.data.failed.length === 1,
+    JSON.stringify({ events: r.data.events.length, dup: r.data.duplicates, failed: r.data.failed.length }));
+  r = await req('POST', `/api/investments/accounts/${csvAcctId}/import-csv`, { csv: 'a,b,c\n1,2,3' });
+  check('csv import: a non-Wealthsimple file is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/accounts/999999/import-csv`, { csv: wsFixture });
+  check('csv import: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
 
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);

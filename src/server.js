@@ -23,6 +23,7 @@ import {
   computeHolding, computeAccount, computePortfolio,
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities } from './prices.js';
+import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -250,6 +251,59 @@ app.post('/api/ai/invest-fill-chat', requireApiAuth, async (req, res) => {
   });
   if (status === 200 && b.model) setAiFillModel(String(b.model).trim());
   res.status(status).json(body);
+});
+
+// The Investments account page's deterministic CSV import: a
+// Wealthsimple activities export maps mechanically to holdings and
+// events (see wsImport.js). Parse writes nothing — the panel
+// reviews the preview and Apply writes it in one transaction with
+// source 'csv', re-validated (shape, duplicates, sell guard).
+const investExistingForImport = (accountId) => {
+  const holdings = listHoldings(db, accountId);
+  const eventsByHolding = {};
+  for (const h of holdings) eventsByHolding[h.id] = listEvents(db, h.id);
+  return { holdings, eventsByHolding };
+};
+app.post('/api/investments/accounts/:id/import-csv', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const csv = req.body && typeof req.body.csv === 'string' ? req.body.csv : '';
+  if (!csv) return res.status(400).json({ error: 'csv text is required' });
+  if (csv.length > 1024 * 1024) return res.status(400).json({ error: 'csv is too large (max 1 MB)' });
+  try {
+    res.json(parseWealthsimpleCsv(csv, investExistingForImport(account.id)));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+app.post('/api/investments/accounts/:id/import-csv/apply', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const v = validateImportApply(req.body || {}, investExistingForImport(account.id));
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const refToId = new Map();
+  try {
+    db.transaction(() => {
+      for (const h of v.holdings) {
+        const info = db.prepare(
+          'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(account.id, h.label, h.kind, h.symbol, h.fundCode, h.currency, 'csv', ts, ts);
+        refToId.set(h.ref, info.lastInsertRowid);
+      }
+      const ins = db.prepare(
+        'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      for (const e of v.events) {
+        const holdingId = e.holdingId != null ? e.holdingId : refToId.get(e.holdingRef);
+        ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, 'csv', ts, ts);
+      }
+    })();
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const touched = new Set([...refToId.values(), ...v.events.filter((e) => e.holdingId != null).map((e) => e.holdingId)]);
+  for (const hid of touched) rebuildEventPricePoints(db, hid, ts);
+  res.status(201).json({ createdHoldings: v.holdings.length, createdEvents: v.events.length, skippedDuplicates: v.skippedDuplicates });
 });
 
 app.get('/api/users', requireApiAuth, (req, res) => {
