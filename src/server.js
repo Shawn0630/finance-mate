@@ -24,6 +24,7 @@ import {
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
+import { analyzeCsv, applyMappedCsv, proposeCsvMapping } from './csvMapImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -276,9 +277,90 @@ app.post('/api/investments/accounts/:id/import-csv', requireApiAuth, (req, res) 
     res.status(400).json({ error: err.message });
   }
 });
+// AI-mapped CSV import: for broker exports that are not
+// Wealthsimple's. The model proposes a mapping from the file's
+// structure (columns, samples, distinct activity words) — it
+// never invents per-row figures. The user confirms or edits the
+// mapping, the deterministic engine previews every row, and
+// Apply writes atomically with source 'csv-ai'. A confirmed
+// mapping is remembered per user by column fingerprint, so a
+// second export from the same broker reuses it and skips the AI
+// and confirmation steps; preview and Apply still run.
+const CSV_MAPPINGS_KEY = 'csv_mappings';
+const getSavedCsvMappings = (userId) => {
+  const row = db.prepare('SELECT value FROM user_preferences WHERE user_id = ? AND key = ?').get(userId, CSV_MAPPINGS_KEY);
+  if (!row) return {};
+  try {
+    const v = JSON.parse(row.value);
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+  } catch { return {}; }
+};
+const saveCsvMapping = (userId, fingerprint, mapping, answers) => {
+  const all = getSavedCsvMappings(userId);
+  all[fingerprint] = { mapping, answers: answers || [], savedAt: nowIso() };
+  db.prepare(
+    `INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+    .run(userId, CSV_MAPPINGS_KEY, JSON.stringify(all), nowIso());
+};
+app.post('/api/investments/accounts/:id/import-csv-map/analyze', requireApiAuth, async (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const csv = req.body && typeof req.body.csv === 'string' ? req.body.csv : '';
+  if (!csv) return res.status(400).json({ error: 'csv text is required' });
+  if (csv.length > 1024 * 1024) return res.status(400).json({ error: 'csv is too large (max 1 MB)' });
+  let structure;
+  try {
+    structure = analyzeCsv(csv);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!req.body.forceRefresh) {
+    const saved = getSavedCsvMappings(req.user.id)[structure.fingerprint];
+    if (saved && saved.mapping) {
+      return res.json({ structure, mapping: saved.mapping, questions: [], reused: true });
+    }
+  }
+  if (!llmConfigured()) {
+    return res.status(503).json({ error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' });
+  }
+  try {
+    const r = await proposeCsvMapping(structure, { model: effectiveAiModel() });
+    res.json({ structure, mapping: r.mapping, questions: r.questions, reply: r.reply, reused: false });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+app.post('/api/investments/accounts/:id/import-csv-map/preview', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const csv = req.body && typeof req.body.csv === 'string' ? req.body.csv : '';
+  if (!csv) return res.status(400).json({ error: 'csv text is required' });
+  if (csv.length > 1024 * 1024) return res.status(400).json({ error: 'csv is too large (max 1 MB)' });
+  const mapping = req.body.mapping;
+  if (!mapping || typeof mapping !== 'object') return res.status(400).json({ error: 'mapping is required' });
+  let structure;
+  try {
+    structure = analyzeCsv(csv);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  try {
+    const preview = applyMappedCsv(csv, mapping, investExistingForImport(account.id));
+    // Confirming the mapping is what remembers it: the fingerprint
+    // lookup on the next file from this broker reuses it. A
+    // mapping that fails to preview is not remembered.
+    const answers = Array.isArray(req.body.answers) ? req.body.answers.filter((a) => typeof a === 'string') : [];
+    saveCsvMapping(req.user.id, structure.fingerprint, mapping, answers);
+    res.json(preview);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
 app.post('/api/investments/accounts/:id/import-csv/apply', requireApiAuth, (req, res) => {
   const account = getAccount(db, Number(req.params.id));
   if (!account) return res.status(404).json({ error: 'account not found' });
+  const source = req.body && (req.body.source === 'csv-ai' ? 'csv-ai' : 'csv');
   const v = validateImportApply(req.body || {}, investExistingForImport(account.id));
   if (v.error) return res.status(400).json({ error: v.error });
   const ts = nowIso();
@@ -288,14 +370,14 @@ app.post('/api/investments/accounts/:id/import-csv/apply', requireApiAuth, (req,
       for (const h of v.holdings) {
         const info = db.prepare(
           'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(account.id, h.label, h.kind, h.symbol, h.fundCode, h.currency, 'csv', ts, ts);
+          .run(account.id, h.label, h.kind, h.symbol, h.fundCode, h.currency, source, ts, ts);
         refToId.set(h.ref, info.lastInsertRowid);
       }
       const ins = db.prepare(
         'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
       for (const e of v.events) {
         const holdingId = e.holdingId != null ? e.holdingId : refToId.get(e.holdingRef);
-        ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, 'csv', ts, ts);
+        ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, source, ts, ts);
       }
     })();
   } catch (err) {

@@ -8650,6 +8650,85 @@ try {
     } finally {
       await browserCsv.close();
     }
+
+    // AI-mapped CSV import: a non-Wealthsimple broker shape (an
+    // extra Note column keeps its fingerprint apart from the API
+    // round's fixture below, so the two rounds stay independent).
+    // The stubbed model proposes the mapping; the test confirms
+    // it unchanged and applies the preview.
+    fs.writeFileSync(aiStubFile, JSON.stringify({
+      columns: { date: 'Date', symbol: 'Ticker', name: 'Description', activity: 'Txn', units: 'Shares', price: 'Price', amount: 'Amount', currency: 'Curr' },
+      values: { Bought: 'buy', Sold: 'sell', Dividend: 'dividend', Fee: 'skip' },
+      defaultCurrency: null,
+      symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+      questions: [],
+      reply: 'Mapped.',
+    }));
+    r = await req('POST', '/api/investments/accounts', { name: 'CSV map import UI', type: 'TFSA', institution: 'NorthTrade' });
+    const mapUiAcctId = r.data.id;
+    const mapTmp = path.join(os.tmpdir(), `ff-e2e-map-${Date.now()}.csv`);
+    fs.writeFileSync(mapTmp, ['Date,Ticker,Description,Txn,Shares,Price,Amount,Curr,Note',
+      '2026-02-02,ZWC,BMO fund,Bought,50,20,-1000,CAD,',
+      '2026-02-03,ZWC,BMO fund,Sold,-10,22,220,CAD,',
+      '2026-02-04,ZWC,BMO fund,Dividend,,,5.5,CAD,',
+      '2026-02-05,ZWC,BMO fund,Fee,,,9.99,CAD,',
+      '2026-02-06,MSFT,Microsoft,Bought,5,300,-1500,USD,'].join('\n'));
+    const browserMap = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      const pageMap = await browserMap.newPage();
+      const clientMap = await pageMap.target().createCDPSession();
+      await clientMap.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      clientMap.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await clientMap.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardI({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await clientMap.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await clientMap.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await clientMap.send('Network.setCookie', { name: 'ff_session', value: cookieValueI, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitMap = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await pageMap.goto(`http://ff.local/#invest-account/${mapUiAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitMap(800);
+      await pageMap.click('[data-invest-import-csv-map]');
+      const mapInput = await pageMap.$('[data-invest-import-map-file]');
+      await mapInput.uploadFile(mapTmp);
+      await pageMap.waitForFunction(() => !!document.querySelector('[data-map-confirm]'), { timeout: 20000 });
+      await pageMap.click('[data-map-confirm]');
+      await pageMap.waitForFunction(() => document.querySelectorAll('[data-invest-proposed] [data-ie-row]').length === 4, { timeout: 20000 });
+      const mapPanel = await pageMap.evaluate(() => {
+        const host = document.querySelector('[data-invest-proposed]');
+        return { text: host.textContent, rows: host.querySelectorAll('[data-ie-row]').length };
+      });
+      check('investments UI: AI-mapped CSV previews 4 events and the fee skip',
+        mapPanel.rows === 4 && mapPanel.text.includes('Skipped 1 cash rows') && mapPanel.text.includes('Already recorded: 0'),
+        JSON.stringify(mapPanel));
+      await pageMap.click('[data-invest-apply]');
+      await pageMap.waitForFunction(() => document.querySelector('#investHoldingsWrap').textContent.includes('ZWC.TO'), { timeout: 20000 });
+      r = await req('GET', `/api/investments/accounts/${mapUiAcctId}`);
+      const zwcUi = r.data.holdings.find((row) => row.holding.symbol === 'ZWC.TO');
+      check('investments UI: applying the mapped preview stores 40 ZWC units with source csv-ai',
+        zwcUi && zwcUi.summary.units === 40 && zwcUi.holding.source === 'csv-ai',
+        JSON.stringify(r.data.holdings.map((row) => [row.holding.symbol, row.summary.units, row.holding.source])));
+    } catch (err) {
+      check('investments AI-mapped CSV browser flow runs to completion', false, String((err && err.message) || err));
+    } finally {
+      await browserMap.close();
+    }
   }
 
   // ---- Wealthsimple CSV import: API round ----
@@ -8680,6 +8759,58 @@ try {
   check('csv import: a non-Wealthsimple file is a 400', r.status === 400, JSON.stringify(r.data));
   r = await req('POST', `/api/investments/accounts/999999/import-csv`, { csv: wsFixture });
   check('csv import: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
+
+  // ---- AI-mapped CSV import: API round ----
+  // Same broker shape as the browser round minus the Note column,
+  // so its fingerprint is its own. The stubbed model proposes the
+  // mapping; the round confirms it, applies it, then proves the
+  // fingerprint reuse and the duplicate-on-re-preview behaviour.
+  const mapFixture = ['Date,Ticker,Description,Txn,Shares,Price,Amount,Curr',
+    '2026-02-02,ZWC,BMO fund,Bought,50,20,-1000,CAD',
+    '2026-02-03,ZWC,BMO fund,Sold,-10,22,220,CAD',
+    '2026-02-04,ZWC,BMO fund,Dividend,,,5.5,CAD',
+    '2026-02-05,ZWC,BMO fund,Fee,,,9.99,CAD',
+    '2026-02-06,MSFT,Microsoft,Bought,5,300,-1500,USD'].join('\n');
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    columns: { date: 'Date', symbol: 'Ticker', name: 'Description', activity: 'Txn', units: 'Shares', price: 'Price', amount: 'Amount', currency: 'Curr' },
+    values: { Bought: 'buy', Sold: 'sell', Dividend: 'dividend', Fee: 'skip' },
+    defaultCurrency: null,
+    symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+    questions: [],
+    reply: 'Mapped.',
+  }));
+  r = await req('POST', '/api/investments/accounts', { name: 'CSV map import', type: 'TFSA', institution: 'NorthTrade' });
+  const mapAcctId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${mapAcctId}/import-csv-map/analyze`, { csv: mapFixture });
+  check('csv-ai map: analyze proposes the stub mapping (not reused)',
+    r.status === 200 && r.data.reused === false && r.data.mapping.columns.date === 'Date' && r.data.mapping.values.Bought === 'buy',
+    JSON.stringify(r.data.mapping));
+  const mapMapping = r.data.mapping;
+  r = await req('POST', `/api/investments/accounts/${mapAcctId}/import-csv-map/preview`, { csv: mapFixture, mapping: mapMapping });
+  const mapPreview = r.data;
+  check('csv-ai map: preview maps buys, a negative sell and a dividend, skips the fee row',
+    r.status === 200 && mapPreview.holdings.length === 2 && mapPreview.events.length === 4
+      && mapPreview.skipped.total === 1 && mapPreview.failed.length === 0 && mapPreview.duplicates === 0
+      && mapPreview.holdings.some((h) => h.symbol === 'ZWC.TO') && mapPreview.holdings.some((h) => h.symbol === 'MSFT'),
+    JSON.stringify(mapPreview));
+  r = await req('POST', `/api/investments/accounts/${mapAcctId}/import-csv/apply`, { source: 'csv-ai', holdings: mapPreview.holdings, events: mapPreview.events });
+  check('csv-ai map: apply writes 2 holdings and 4 events',
+    r.status === 201 && r.data.createdHoldings === 2 && r.data.createdEvents === 4, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/accounts/${mapAcctId}`);
+  const mapUnits = Object.fromEntries(r.data.holdings.map((row) => [row.holding.symbol, row.summary.units]));
+  const mapSources = new Set(r.data.holdings.flatMap((row) => [row.holding.source, ...row.events.map((e) => e.source)]));
+  check('csv-ai map: stored units (50 - 10 = 40; MSFT 5) and everything carries source csv-ai',
+    mapUnits['ZWC.TO'] === 40 && mapUnits.MSFT === 5 && mapSources.size === 1 && mapSources.has('csv-ai'),
+    JSON.stringify({ units: mapUnits, sources: [...mapSources] }));
+  r = await req('POST', `/api/investments/accounts/${mapAcctId}/import-csv-map/analyze`, { csv: mapFixture });
+  check('csv-ai map: a second file with the same columns reuses the saved mapping',
+    r.status === 200 && r.data.reused === true, JSON.stringify({ reused: r.data.reused }));
+  r = await req('POST', `/api/investments/accounts/${mapAcctId}/import-csv-map/preview`, { csv: mapFixture, mapping: mapMapping });
+  check('csv-ai map: re-preview after apply is all duplicates',
+    r.data.events.length === 0 && r.data.duplicates === 4,
+    JSON.stringify({ events: r.data.events.length, dup: r.data.duplicates }));
+  r = await req('POST', `/api/investments/accounts/999999/import-csv-map/analyze`, { csv: mapFixture });
+  check('csv-ai map: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
 
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);

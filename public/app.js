@@ -5528,6 +5528,16 @@ let investChatAccountId = null;
 let investChatQueue = [];
 let investImportMode = false; // the proposed panel holds a CSV import preview, not an AI draft
 let investImportReport = null; // { holdings, events, skipped, skippedByType, duplicates } counts for the preview header
+let investImportSource = 'csv'; // 'csv' for Wealthsimple imports, 'csv-ai' for AI-mapped imports
+// AI-mapped CSV import: the file text and the mapping being
+// confirmed survive between the analyze and preview calls.
+let investMapCsv = null;
+let investMapStructure = null;
+let investMapMapping = null;
+let investMapQuestions = [];
+let investMapReply = '';
+let investMapReused = false;
+let investMapValueList = []; // raw activity values listed in the editor, in row order
 
 function clearInvestChatMsg() {
   const msg = document.querySelector('[data-invest-chat-msg]');
@@ -5550,6 +5560,16 @@ function resetInvestChat(accountId) {
   investChatQueue = [];
   investImportMode = false;
   investImportReport = null;
+  investImportSource = 'csv';
+  investMapCsv = null;
+  investMapStructure = null;
+  investMapMapping = null;
+  investMapQuestions = [];
+  investMapReply = '';
+  investMapReused = false;
+  investMapValueList = [];
+  const mapHost = document.querySelector('[data-invest-map-editor]');
+  if (mapHost) mapHost.innerHTML = '';
   renderInvestChatQueue();
   const log = document.querySelector('[data-invest-chat-log]');
   if (log) { log.innerHTML = ''; log.classList.add('hidden'); }
@@ -5785,6 +5805,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv/apply`, {
         method: 'POST',
         body: {
+          source: investImportSource,
           holdings: chosenHoldings.map(({ checked, conflict, ...rest }) => rest),
           events: chosenEvents.map(({ checked, conflict, ...rest }) => rest),
         },
@@ -5938,6 +5959,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       investChatState.proposed = { holdings: r.holdings || [], events: r.events || [] };
       investChatDropped = r.failed || [];
       investImportMode = true;
+      investImportSource = 'csv';
       investImportReport = {
         holdings: (r.holdings || []).length, events: (r.events || []).length,
         skipped: r.skipped ? r.skipped.total : 0,
@@ -5945,6 +5967,191 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
         duplicates: r.duplicates || 0,
       };
       renderInvestProposed();
+    } catch (err) {
+      showMsg(msg, 'err', err.message);
+    }
+  });
+  // AI-mapped CSV import: for broker exports that are not
+  // Wealthsimple's. The model proposes a mapping from the file's
+  // structure; the user confirms or edits it here; only then
+  // does the deterministic engine preview every row, and Apply
+  // writes it with source 'csv-ai'.
+  const mapBtn = document.querySelector('[data-invest-import-csv-map]');
+  const mapFile = wrap.querySelector('[data-invest-import-map-file]');
+  const mapHost = wrap.querySelector('[data-invest-map-editor]');
+  const MAP_COL_FIELDS = [
+    ['date', 'Date'], ['symbol', 'Symbol'], ['name', 'Name'], ['activity', 'Activity'],
+    ['units', 'Units'], ['price', 'Unit price'], ['amount', 'Total amount'], ['currency', 'Currency'],
+    ['splitAdded', 'Split added units'], ['splitNew', 'Split new side'], ['splitOld', 'Split old side'],
+  ];
+  const MAP_VALUE_TARGETS = ['buy', 'sell', 'grant', 'dividend', 'split', 'skip'];
+  const mapColOptions = (sel) => `<option value="">(not mapped)</option>`
+    + (investMapStructure ? investMapStructure.columns.map((c) => `<option value="${esc(c)}"${sel === c ? ' selected' : ''}>${esc(c)}</option>`).join('') : '');
+  const mapActivityValues = () => {
+    if (!investMapStructure || !investMapMapping) return [];
+    const actCol = investMapMapping.columns.activity;
+    if (!actCol) return [];
+    const stat = investMapStructure.columnStats.find((s) => s.name === actCol);
+    if (!stat) return [];
+    if (stat.distinct && stat.distinct.length) return stat.distinct;
+    return stat.samples || [];
+  };
+  const renderMapValueRows = () => {
+    const box = mapHost.querySelector('[data-map-values]');
+    if (!box) return;
+    const prev = {};
+    box.querySelectorAll('[data-map-value-idx]').forEach((sel) => {
+      const raw = investMapValueList[Number(sel.dataset.mapValueIdx)];
+      if (raw !== undefined && sel.value) prev[raw] = sel.value;
+    });
+    const values = mapActivityValues();
+    investMapValueList = values;
+    const merged = { ...(investMapMapping.values || {}), ...prev };
+    const actCol = investMapMapping.columns.activity;
+    const stat = actCol ? investMapStructure.columnStats.find((s) => s.name === actCol) : null;
+    box.innerHTML = values.length
+      ? values.map((v, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(v)}</span>
+          <select data-map-value-idx="${i}"><option value="">(pick a target)</option>
+          ${MAP_VALUE_TARGETS.map((t) => `<option value="${t}"${merged[v] === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></div>`).join('')
+        + (stat && stat.distinctTruncated ? `<div class="note">More than ${stat.distinctCount} distinct values — only the first listed can be mapped here; the rest fail loudly in the preview.</div>` : '')
+      : '<div class="note">Pick an activity column above to map its values.</div>';
+  };
+  const renderMapEditor = () => {
+    if (!investMapStructure || !investMapMapping) { mapHost.innerHTML = ''; return; }
+    const m = investMapMapping;
+    const suffix = m.symbolSuffix || {};
+    mapHost.innerHTML = `<div class="costs-proposed"><h5>CSV mapping — review, edit, then Confirm</h5>
+      ${investMapReused ? '<div class="note">Reused saved mapping for this file format — confirm to preview, or ask AI to re-map.</div>' : ''}
+      ${investMapReply ? `<div class="note">${esc(investMapReply)}</div>` : ''}
+      <div class="note" style="margin:0 0 4px">Columns (${investMapStructure.rowCount} rows)</div>
+      ${MAP_COL_FIELDS.map(([f, label]) => `<div class="costs-proposed-row"><span style="flex:1">${label}</span>
+        <select data-map-col="${f}">${mapColOptions(m.columns[f] || '')}</select></div>`).join('')}
+      <div class="note" style="margin:6px 0 4px">Activity values → event type</div>
+      <div data-map-values></div>
+      <div class="costs-proposed-row"><span style="flex:1">Default currency</span>
+        <select data-map-default-currency><option value="">(none — use currency column)</option>
+        <option value="CAD"${m.defaultCurrency === 'CAD' ? ' selected' : ''}>CAD</option>
+        <option value="USD"${m.defaultCurrency === 'USD' ? ' selected' : ''}>USD</option></select></div>
+      <div class="costs-proposed-row"><span style="flex:1">Symbol suffix</span>
+        <input type="text" data-map-suffix value="${esc(suffix.suffix || '')}" placeholder=".TO" style="width:80px">
+        <select data-map-suffix-when><option value="">Any currency</option>
+        <option value="CAD"${suffix.whenCurrency === 'CAD' ? ' selected' : ''}>CAD only</option>
+        <option value="USD"${suffix.whenCurrency === 'USD' ? ' selected' : ''}>USD only</option></select></div>
+      ${investMapQuestions.length ? `<div class="note" style="margin:6px 0 4px">Questions from the mapping</div>
+        ${investMapQuestions.map((q, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(q)}</span>
+          <input type="text" data-map-answer-idx="${i}" placeholder="Your answer (optional)" style="flex:2"></div>`).join('')}` : ''}
+      <div class="toolbar" style="margin-top:6px">
+        <button type="button" class="primary small" data-map-confirm>Confirm mapping</button>
+        ${investMapReused ? '<button type="button" class="small" data-map-remap>Ask AI to re-map</button>' : ''}
+        <button type="button" class="small" data-map-cancel>Cancel</button>
+      </div></div>`;
+    renderMapValueRows();
+  };
+  const readMapEditor = () => {
+    const columns = {};
+    mapHost.querySelectorAll('[data-map-col]').forEach((sel) => { if (sel.value) columns[sel.dataset.mapCol] = sel.value; });
+    const values = {};
+    mapHost.querySelectorAll('[data-map-value-idx]').forEach((sel) => {
+      const raw = investMapValueList[Number(sel.dataset.mapValueIdx)];
+      if (raw !== undefined && sel.value) values[raw] = sel.value;
+    });
+    const suffix = (mapHost.querySelector('[data-map-suffix]').value || '').trim();
+    const when = mapHost.querySelector('[data-map-suffix-when]').value || null;
+    const answers = [];
+    mapHost.querySelectorAll('[data-map-answer-idx]').forEach((inp) => {
+      const a = inp.value.trim();
+      if (a) answers.push(a);
+    });
+    return {
+      mapping: {
+        columns,
+        values,
+        defaultCurrency: mapHost.querySelector('[data-map-default-currency]').value || null,
+        symbolSuffix: suffix ? { suffix, whenCurrency: when } : null,
+      },
+      answers,
+    };
+  };
+  mapHost.addEventListener('change', (e) => {
+    if (e.target.matches('[data-map-col="activity"]')) {
+      // The value rows follow the activity column; keep targets
+      // for raw values that exist under the new column too.
+      investMapMapping = { ...investMapMapping, columns: { ...readMapEditor().mapping.columns } };
+      renderMapValueRows();
+    }
+  });
+  mapHost.addEventListener('click', async (e) => {
+    if (e.target.closest('[data-map-cancel]')) {
+      investMapCsv = null; investMapStructure = null; investMapMapping = null;
+      investMapQuestions = []; investMapReply = ''; investMapReused = false; investMapValueList = [];
+      mapHost.innerHTML = '';
+      return;
+    }
+    if (e.target.closest('[data-map-remap]')) {
+      if (investChatAccountId == null || !investMapCsv) return;
+      clearInvestChatMsg();
+      try {
+        const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/analyze`, { method: 'POST', body: { csv: investMapCsv, forceRefresh: true } });
+        investMapStructure = r.structure; investMapMapping = r.mapping; investMapQuestions = r.questions || [];
+        investMapReply = r.reply || ''; investMapReused = !!r.reused;
+        renderMapEditor();
+      } catch (err) { showMsg(msg, 'err', err.message); }
+      return;
+    }
+    if (e.target.closest('[data-map-confirm]')) {
+      if (investChatAccountId == null || !investMapCsv) return;
+      const { mapping, answers } = readMapEditor();
+      if (!mapping.columns.date || !mapping.columns.symbol || !mapping.columns.activity) {
+        showMsg(msg, 'err', 'Pick the date, symbol and activity columns first.');
+        return;
+      }
+      if (!mapping.columns.currency && !mapping.defaultCurrency) {
+        showMsg(msg, 'err', 'Pick a currency column or a default currency first.');
+        return;
+      }
+      const unmapped = investMapValueList.filter((v) => !mapping.values[v]);
+      if (unmapped.length) {
+        showMsg(msg, 'err', `Pick a target for every activity value (unmapped: ${unmapped.join(', ')}).`);
+        return;
+      }
+      clearInvestChatMsg();
+      try {
+        const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/preview`, { method: 'POST', body: { csv: investMapCsv, mapping, answers } });
+        investChatState.proposed = { holdings: r.holdings || [], events: r.events || [] };
+        investChatDropped = r.failed || [];
+        investImportMode = true;
+        investImportSource = 'csv-ai';
+        investImportReport = {
+          holdings: (r.holdings || []).length, events: (r.events || []).length,
+          skipped: r.skipped ? r.skipped.total : 0,
+          skippedByType: r.skipped ? r.skipped.byType : {},
+          duplicates: r.duplicates || 0,
+        };
+        mapHost.innerHTML = '';
+        renderInvestProposed();
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    }
+  });
+  mapBtn.addEventListener('click', () => {
+    if (investChatAccountId == null) { showMsg(msg, 'err', 'Open an account first.'); return; }
+    panel.classList.remove('hidden');
+    mapFile.click();
+  });
+  mapFile.addEventListener('change', async () => {
+    const f = mapFile.files[0];
+    mapFile.value = '';
+    if (!f) return;
+    clearInvestChatMsg(); // a new import supersedes the last error
+    try {
+      const text = await f.text();
+      const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/analyze`, { method: 'POST', body: { csv: text } });
+      investMapCsv = text;
+      investMapStructure = r.structure;
+      investMapMapping = r.mapping;
+      investMapQuestions = r.questions || [];
+      investMapReply = r.reply || '';
+      investMapReused = !!r.reused;
+      renderMapEditor();
     } catch (err) {
       showMsg(msg, 'err', err.message);
     }
@@ -5989,6 +6196,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       investChatDropped = (r.proposed && Array.isArray(r.proposed.dropped)) ? r.proposed.dropped : [];
       investImportMode = false; // an AI round replaces any import preview
       investImportReport = null;
+      investImportSource = 'csv';
       chatTa.value = '';
       fileInput.value = '';
       investChatQueue = [];

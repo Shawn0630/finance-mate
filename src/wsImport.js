@@ -60,8 +60,11 @@ const numOrNull = (v) => {
 };
 
 // Minimal RFC 4180 reader: quoted fields (with "" escapes), CRLF,
-// trailing newline. Returns rows as objects keyed by header.
-export function parseCsvText(text) {
+// trailing newline. Returns raw rows (arrays of strings, untrimmed)
+// — the format-specific parsers above it decide what a header is.
+// Shared with the AI-mapped CSV import, which must read files
+// whose column contract is unknown until the model maps it.
+export function readCsvRows(text) {
   const src = String(text || '').replace(/^\uFEFF/, '');
   const rows = [];
   let field = '';
@@ -87,6 +90,11 @@ export function parseCsvText(text) {
   }
   if (quoted) throw new Error('unclosed quoted field in CSV');
   if (field !== '' || row.length) pushRow();
+  return rows;
+}
+
+export function parseCsvText(text) {
+  const rows = readCsvRows(text);
   const nonEmpty = rows.filter((r) => r.some((c) => String(c).trim() !== ''));
   if (!nonEmpty.length) throw new Error('CSV is empty');
   const header = nonEmpty[0].map((c) => String(c).trim());
@@ -107,7 +115,7 @@ export function mapWsSymbol(raw, currency) {
   return s;
 }
 
-const dupKey = (holdingKey, ev) => {
+export const dupKey = (holdingKey, ev) => {
   const figures = ev.type === 'dividend' ? `amount ${canon(ev.amount)}`
     : ev.type === 'split' ? `split ${canon(ev.splitNew)}:${canon(ev.splitOld)}`
     : `${canon(ev.units)} @ ${canon(ev.price)}`;
@@ -119,7 +127,7 @@ const dupKey = (holdingKey, ev) => {
 // after it and before `date`. A CSV split's ratio needs this plus
 // the CSV rows already processed for the holding — a split derives
 // from everything held before it, not just the file's rows.
-function recordedPositionBefore(recordedEvents, date) {
+export function recordedPositionBefore(recordedEvents, date) {
   let pos = 0;
   for (const e of recordedEvents || []) {
     if (e.date >= date) continue;
@@ -281,7 +289,7 @@ function processRows(rows, existing, skipIndices) {
 // candidate sells can fail; a failing sell's row index is returned
 // so the caller can re-run without it (its exclusion changes later
 // split ratios, which changes other sells' standing).
-function guardFailures(candidates, existing) {
+export function guardFailures(candidates, existing) {
   const failures = [];
   const byHolding = new Map();
   for (const e of candidates) {
