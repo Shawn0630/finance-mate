@@ -5209,7 +5209,7 @@ async function loadInvestmentsImpl() {
   host.innerHTML = `
     <div class="section-head"><h2>Stocks</h2>
       <div class="spacer"></div>
-      <button class="small" id="refreshInvestBtn">Refresh prices</button>
+      <button id="refreshInvestBtn">Refresh prices</button>
       <button class="primary" id="addInvestAccountBtn">+ Add account</button></div>
     <div class="msg" id="investMsg"></div>
     ${data.fxMissing && data.accounts.some((a) => a.holdings.some((h) => h.holding.currency === 'USD'))

@@ -8205,6 +8205,7 @@ try {
         const head = document.querySelector('#section-investments .section-head');
         const title = head.querySelector('h2');
         const btn = document.querySelector('#addInvestAccountBtn');
+        const refreshBtn = document.querySelector('#refreshInvestBtn');
         const strip = document.querySelector('#section-investments .summary-strip');
         const card = strip.querySelector('.summary-card');
         const panel = document.querySelector('#section-investments .panel');
@@ -8217,8 +8218,13 @@ try {
           btnTopGap: R(btn).top - R(head).top,
           headStripGap: R(strip).top - R(btn).bottom,
           cardsBottomDelta: Math.abs((R(panel).bottom - 17) - R(cards).bottom),
+          refreshH: R(refreshBtn).bottom - R(refreshBtn).top,
+          addH: R(btn).bottom - R(btn).top,
         };
       });
+      check('investments UI: Refresh prices matches Add account height in the Stocks head row',
+        Math.abs(headGeom.refreshH - headGeom.addH) <= 1,
+        JSON.stringify({ refreshH: headGeom.refreshH, addH: headGeom.addH }));
       check('investments UI: the module reads "Stocks" and its head band meets the 16/17 padding standard',
         headGeom.title === 'Stocks' && headGeom.nav === 'Stocks'
           && headGeom.titleLeftDelta <= 3 && headGeom.btnRightDelta <= 3
