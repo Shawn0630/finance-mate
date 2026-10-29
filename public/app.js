@@ -5580,10 +5580,11 @@ function investInitRow() {
       <option value="buy">Buy</option><option value="sell">Sell</option>
       <option value="grant">Grant</option><option value="dividend">Dividend</option>
       <option value="split">Split</option>
+      <option value="position">Position (cost unknown)</option>
     </select></label>
     <label class="f-date">Date<input type="date" data-f="date"></label>
     <label class="f-num" data-num>Units<input data-f="units" inputmode="decimal" autocomplete="off"></label>
-    <label class="f-num" data-num>Price<input data-f="price" inputmode="decimal" autocomplete="off"></label>
+    <label class="f-num" data-num data-price>Price<input data-f="price" inputmode="decimal" autocomplete="off"></label>
     <label class="f-num hidden" data-amt>Amount<input data-f="amount" inputmode="decimal" autocomplete="off"></label>
     <label class="f-num hidden" data-split>New : Old<span style="display:flex;gap:4px;align-items:center"><input data-f="splitNew" inputmode="decimal" autocomplete="off" style="width:52px"><span>:</span><input data-f="splitOld" inputmode="decimal" autocomplete="off" style="width:52px"></span></label>
     <button type="button" class="small danger f-x" data-remove-init-row title="Remove row">×</button>`;
@@ -5591,7 +5592,9 @@ function investInitRow() {
   const sync = () => {
     const div = type.value === 'dividend';
     const split = type.value === 'split';
+    const pos = type.value === 'position';
     row.querySelectorAll('[data-num]').forEach((el) => el.classList.toggle('hidden', div || split));
+    row.querySelector('[data-price]').classList.toggle('hidden', div || split || pos);
     row.querySelector('[data-amt]').classList.toggle('hidden', !div);
     row.querySelector('[data-split]').classList.toggle('hidden', !split);
   };
@@ -6006,6 +6009,7 @@ function renderInvestProposed() {
     </div></div>`;
   host.querySelectorAll('[data-money]').forEach(wireMoneyInput);
   if (investImportMode) syncInvestGroupChecks(host);
+  scheduleInvestPreview();
 }
 
 // Read the proposal rows back out of their (editable) inputs.
@@ -6129,6 +6133,52 @@ document.querySelector('[data-invest-proposed]').addEventListener('change', (e) 
     if (ev && sentence) sentence.textContent = investEventSentence(ev, investEventSymbol(ev));
   }
 });
+
+// Live value preview for the Fill-with-AI draft: one line per
+// holding the draft touches — the post-Apply current value and
+// its delta against the recorded value. The panel only ever
+// posts the checked rows (exactly what Apply would write); the
+// numbers come from the server preview endpoint, which runs the
+// holding engine over recorded state + the draft, so the preview
+// and the post-Apply page agree. The preview box is a sibling
+// of the proposed host, never re-rendered with it, so typing
+// never loses focus. Import mode has its own preview and is
+// left alone.
+let investPreviewSeq = 0;
+let investPreviewTimer = null;
+function scheduleInvestPreview() {
+  const box = document.querySelector('[data-invest-preview]');
+  if (!box) return;
+  if (investImportMode) { box.innerHTML = ''; return; }
+  clearTimeout(investPreviewTimer);
+  investPreviewTimer = setTimeout(refreshInvestPreview, 300);
+}
+async function refreshInvestPreview() {
+  const box = document.querySelector('[data-invest-preview]');
+  if (!box) return;
+  if (investImportMode || investChatAccountId == null) { box.innerHTML = ''; return; }
+  const draft = readInvestProposed();
+  const holdings = draft.holdings.filter((h) => h.checked);
+  const events = draft.events.filter((e) => e.checked);
+  const nav = (draft.nav || []).filter((n) => n.checked);
+  if (!holdings.length && !events.length && !nav.length) { box.innerHTML = ''; return; }
+  const my = ++investPreviewSeq;
+  try {
+    const r = await api(`/api/investments/accounts/${investChatAccountId}/fill-preview`, {
+      method: 'POST', body: { holdings, events, nav },
+    });
+    if (my !== investPreviewSeq) return;
+    const deltaStr = (d, cur) => (d == null ? '' : ` (${d >= 0 ? '+' : ''}${moneyC(d, cur)})`);
+    const lines = (r.previews || []).map((p) => {
+      const main = `${esc(p.label)} · ${moneyC(p.valueNative, p.currency)}${deltaStr(p.deltaNative, p.currency)}`;
+      const cad = p.currency === 'USD' ? ` · ${moneyC(p.value)} CAD${deltaStr(p.delta, 'CAD')} CAD` : '';
+      return `<div class="note" data-invest-preview-line="${esc(p.key)}">${main}${cad}</div>`;
+    }).join('');
+    box.innerHTML = lines ? `<div class="note" style="margin:6px 0 4px">Preview value after Apply</div>${lines}` : '';
+  } catch { if (my === investPreviewSeq) box.innerHTML = ''; }
+}
+document.querySelector('[data-invest-proposed]').addEventListener('input', scheduleInvestPreview);
+document.querySelector('[data-invest-proposed]').addEventListener('change', scheduleInvestPreview);
 
 document.querySelector('[data-invest-proposed]').addEventListener('click', async (e) => {
   if (e.target.closest('[data-ie-group-head]') && !e.target.closest('[data-ie-group-check]')) {

@@ -735,7 +735,7 @@ export async function handleAiFillChat(input, deps = {}) {  const env = deps.env
 // normalizer — the panel shows it flagged and leaves it
 // unchecked by default.
 
-const INVEST_CHAT_PROMPT = [
+export const INVEST_CHAT_PROMPT = [
   'You help the user record the holdings and transactions of ONE investment account from',
   'statements, grant notices and notes they paste or attach. The account is given below —',
   'never ask which account anything belongs to.',
@@ -801,6 +801,9 @@ const INVEST_CHAT_PROMPT = [
   '- A position contributes $0, counts toward units held, and flags the holding',
   '  cost-unknown until real buy records replace it. Never dress a position up as a',
   '  buy to make the draft look complete.',
+  '- When a statement holdings section creates a NEW holding, the draft MUST contain',
+  '  both its position (units) and its NAV snapshots in the same round — never NAVs',
+  '  alone. NAVs without units price nothing the user owns.',
   '',
   'AMBIGUITY — never guess:',
   'Leave the unclear item OUT of "proposed" and ask one focused question in "reply" when:',

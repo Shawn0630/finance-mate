@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   normalizeAiFields, parseModelJson, handleAiFill, llmConfigured, extractPdfText,
-  llmModels, llmDefaultModel, callLlm,
+  llmModels, llmDefaultModel, callLlm, INVEST_CHAT_PROMPT,
 } from '../src/aiFill.js';
 
 test('normalizeAiFields: unknown keys are dropped, garbage values are dropped', () => {
@@ -207,4 +207,12 @@ test('extractPdfText: recovers text from a Flate content stream', () => {
   assert.ok(text.includes('RBC Royal Bank'), text);
   assert.ok(text.includes('Prime - 1.00'), text);
   assert.equal(extractPdfText(Buffer.from('not a pdf')), '');
+});
+
+test('invest chat prompt: a holdings-section draft must pair position with NAVs', () => {
+  const prompt = INVEST_CHAT_PROMPT;
+  assert.equal(typeof prompt, 'string');
+  const flat = prompt.replace(/\s+/g, ' ');
+  assert.ok(flat.includes('MUST contain both its position (units) and its NAV snapshots in the same round'));
+  assert.ok(flat.includes('never NAVs alone'));
 });

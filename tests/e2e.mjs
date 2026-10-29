@@ -8182,6 +8182,36 @@ try {
       && r.data.proposed.nav[1].conflict === 'nav-differs' && r.data.proposed.nav[1].oldPrice === 92.0252,
     JSON.stringify(r.data.proposed.nav));
 
+  // Package rule: a holdings-section draft pairs the position
+  // with its NAVs in one round, and Apply writes both.
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'CIBC NASDAQ statement: position plus two NAVs.',
+    proposed: {
+      holdings: [{ ref: 'h1', label: 'CIBC NASDAQ Index Fund', kind: 'fund', currency: 'CAD', fundCode: 'ATL8096' }],
+      events: [{ holdingRef: 'h1', date: '2026-09-30', type: 'position', units: 462.8297, note: 'units derived: 85529.91 ÷ 184.7978' }],
+      nav: [
+        { holdingRef: 'h1', date: '2026-06-30', price: 183.3359 },
+        { holdingRef: 'h1', date: '2026-09-30', price: 184.7978 },
+      ],
+    },
+    ready: true,
+  }));
+  r = await req('POST', '/api/ai/invest-fill-chat', { accountId: invTfsaId, text: 'CIBC NASDAQ statement Sep 30: 462.8297 units, NAV 184.7978, market value 85529.91; Jun 30 NAV 183.3359.' });
+  check('investments AI: a holdings-section draft pairs position with NAVs, never NAVs alone',
+    r.status === 200 && r.data.proposed.events.length === 1 && r.data.proposed.events[0].type === 'position'
+      && r.data.proposed.nav.length === 2 && r.data.proposed.events.every((e) => e.type !== 'buy'),
+    JSON.stringify(r.data.proposed));
+  r = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`, { label: 'CIBC NASDAQ Index Fund', kind: 'fund', currency: 'CAD', fundCode: 'ATL8096', source: 'ai' });
+  const invNasdaqId = r.data.id;
+  await req('POST', `/api/investments/holdings/${invNasdaqId}/events`, { date: '2026-09-30', type: 'position', units: 462.8297, note: 'units derived: 85529.91 ÷ 184.7978', source: 'ai' });
+  await req('POST', `/api/investments/holdings/${invNasdaqId}/nav`, { date: '2026-06-30', price: 183.3359 });
+  await req('POST', `/api/investments/holdings/${invNasdaqId}/nav`, { date: '2026-09-30', price: 184.7978 });
+  r = await req('GET', `/api/investments/holdings/${invNasdaqId}`);
+  check('investments AI: applied position + NAVs value the holding at the statement market value',
+    r.data.summary.units === 462.8297 && r.data.summary.valueNative === 85529.91 && r.data.summary.costUnknown === true,
+    JSON.stringify(r.data.summary));
+  await req('DELETE', `/api/investments/holdings/${invNasdaqId}`);
+
   // Synthetic Wealthsimple fixture shared by the CSV import API
   // round below and the browser round inside the investments
   // browser block (the user's real export never appears here).
@@ -8506,6 +8536,117 @@ try {
       // opens it with one toggle click.
       await page.click('[data-invest-ai-toggle]');
       await page.waitForFunction(() => document.querySelector('[data-invest-ai-panel]').classList.contains('hidden'), { timeout: 10000 });
+      // Add holding offers Position in its initial-transactions
+      // row: a cost-unknown holding can be created in one step,
+      // without a price anywhere.
+      r = await req('POST', '/api/investments/accounts', { name: 'InitPos', type: 'RRSP' });
+      const initPosAcctId = r.data.id;
+      await page.goto(`http://ff.local/#invest-account/${initPosAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('#addHoldingBtn');
+      await page.waitForFunction(() => !document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => {
+        const f = document.querySelector('#investHoldingForm');
+        f.querySelector('[name="label"]').value = 'CIBC NASDAQ Index Fund';
+        f.querySelector('[name="fundCode"]').value = 'ATL8096';
+      });
+      await page.select('#investHoldingForm [name="kind"]', 'fund');
+      await page.select('#investHoldingForm [data-init-row] [data-f="type"]', 'position');
+      await page.evaluate(() => {
+        const row = document.querySelector('#investHoldingForm [data-init-row]');
+        row.querySelector('[data-f="date"]').value = '2026-09-30';
+        row.querySelector('[data-f="units"]').value = '462.8297';
+      });
+      const initPosRow = await page.evaluate(() => {
+        const row = document.querySelector('#investHoldingForm [data-init-row]');
+        return { priceHidden: row.querySelector('[data-price]').classList.contains('hidden') };
+      });
+      check('investments UI: initial Position row hides the price field',
+        initPosRow.priceHidden === true, JSON.stringify(initPosRow));
+      await page.click('#investHoldingForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#investHoldingModal').classList.contains('hidden'), { timeout: 10000 });
+      r = await req('GET', `/api/investments/accounts/${initPosAcctId}`);
+      const initPosHolding = r.data.holdings.find((h) => h.holding.label === 'CIBC NASDAQ Index Fund');
+      check('investments UI: Add holding with an initial Position row creates a cost-unknown holding',
+        initPosHolding && initPosHolding.summary.costUnknown === true && initPosHolding.summary.units === 462.8297
+          && initPosHolding.events.some((e) => e.type === 'position'),
+        JSON.stringify(initPosHolding && initPosHolding.summary));
+      await req('DELETE', `/api/investments/accounts/${initPosAcctId}`);
+      // Fill-with-AI preview: value + delta per holding, live
+      // on every edit, and equal to the post-Apply page value.
+      r = await req('POST', '/api/investments/accounts', { name: 'PreviewAcct', type: 'RRSP' });
+      const previewAcctId = r.data.id;
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'CIBC NASDAQ statement: position plus two NAVs.',
+        proposed: {
+          holdings: [{ ref: 'h1', label: 'CIBC NASDAQ Index Fund', kind: 'fund', currency: 'CAD', fundCode: 'ATL8096' }],
+          events: [{ holdingRef: 'h1', date: '2026-09-30', type: 'position', units: 462.8297, note: 'units derived: 85529.91 ÷ 184.7978' }],
+          nav: [
+            { holdingRef: 'h1', date: '2026-06-30', price: 183.3359 },
+            { holdingRef: 'h1', date: '2026-09-30', price: 184.7978 },
+          ],
+        },
+        ready: true,
+      }));
+      await page.goto(`http://ff.local/#invest-account/${previewAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('[data-invest-ai-toggle]');
+      await page.waitForFunction(() => !document.querySelector('[data-invest-ai-panel]').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('[data-invest-chat-text]', 'CIBC NASDAQ statement Sep 30.');
+      await page.click('[data-invest-chat-send]');
+      await page.waitForFunction(() => document.querySelector('[data-invest-preview]').textContent.includes('85,529.91'), { timeout: 20000 });
+      const preview1 = await page.evaluate(() => document.querySelector('[data-invest-preview]').textContent);
+      check('investments UI: preview shows the post-Apply value and its full delta for a new holding',
+        preview1.includes('CIBC NASDAQ Index Fund') && preview1.includes('85,529.91') && preview1.includes('+$85,529.91'),
+        preview1);
+      // Edit the units: the preview recomputes live.
+      await page.evaluate(() => {
+        const input = document.querySelector('[data-invest-proposed] [data-ie-row] [data-ie-units]');
+        input.value = '500';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.waitForFunction(() => document.querySelector('[data-invest-preview]').textContent.includes('92,398.90'), { timeout: 20000 });
+      // Uncheck the September NAV: the June NAV prices the preview.
+      // Units are still 500 from the edit above, so the preview is
+      // 500 x the June NAV, not the restored-units figure.
+      await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-invest-proposed] [data-in-row]')];
+        const sep = rows.find((row) => row.querySelector('[data-in-date]').value === '2026-09-30');
+        sep.querySelector('[data-in-check]').click();
+      });
+      await page.waitForFunction(() => document.querySelector('[data-invest-preview]').textContent.includes('91,667.95'), { timeout: 20000 });
+      // Re-check it, restore the units, and Apply: the holding
+      // page must show exactly the previewed value, to the cent.
+      await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-invest-proposed] [data-in-row]')];
+        const sep = rows.find((row) => row.querySelector('[data-in-date]').value === '2026-09-30');
+        sep.querySelector('[data-in-check]').click();
+        const units = document.querySelector('[data-invest-proposed] [data-ie-row] [data-ie-units]');
+        units.value = '462.8297';
+        units.dispatchEvent(new Event('input', { bubbles: true }));
+        units.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.waitForFunction(() => document.querySelector('[data-invest-preview]').textContent.includes('85,529.91'), { timeout: 20000 });
+      await page.click('[data-invest-proposed] [data-invest-apply]');
+      await page.waitForFunction(() => document.querySelectorAll('[data-invest-proposed] [data-ie-row]').length === 0, { timeout: 20000 });
+      r = await req('GET', `/api/investments/accounts/${previewAcctId}`);
+      const previewHolding = r.data.holdings.find((h) => h.holding.label === 'CIBC NASDAQ Index Fund');
+      await page.goto(`http://ff.local/#invest-holding/${previewHolding.holding.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const previewHoldingPage = await page.evaluate(() => {
+        const stats = [...document.querySelectorAll('#investHoldingStats .summary-card')].map((c) => ({
+          k: c.querySelector('.k').textContent, v: c.querySelector('.v').textContent,
+        }));
+        return (stats.find((s) => s.k === 'Current value') || {}).v;
+      });
+      check('investments UI: Apply lands exactly on the previewed value',
+        previewHoldingPage === '$85,529.91', previewHoldingPage);
+      await page.goto(`http://ff.local/#invest-account/${previewAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('[data-invest-ai-toggle]');
+      await page.waitForFunction(() => document.querySelector('[data-invest-ai-panel]').classList.contains('hidden'), { timeout: 10000 });
+      await req('DELETE', `/api/investments/accounts/${previewAcctId}`);
       // Replaceability: delete the position, add real buys, and
       // the marker clears while history recomputes.
       r = await req('GET', `/api/investments/holdings/${invCibcId}`);

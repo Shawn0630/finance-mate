@@ -638,6 +638,84 @@ export function computePortfolio(db, fxResolver, today) {
   return { accounts, ...agg };
 }
 
+// Fill-with-AI preview: what each holding in a draft would be
+// worth AFTER Apply, and how far that moves its recorded value
+// — computed with the same engine the holding page uses, over
+// recorded state + the draft rows, so the preview and the
+// post-Apply page cannot disagree on the same inputs. The
+// caller passes checked rows only (exactly what Apply would
+// write). Rows that cannot be computed — no valid date, no
+// price on a NAV row, a target that is not in the draft — are
+// skipped, never guessed. Values mirror the holding page
+// headline exactly: the summary's native value (0 when nothing
+// is priced yet) and its CAD value; the delta is preview minus
+// the recorded summary (a new holding's baseline is 0).
+export function computeFillPreview({ recorded, draft, fxResolver, today }) {
+  const byId = new Map();
+  for (const r of recorded || []) {
+    if (r && r.holding && r.holding.id != null) byId.set(r.holding.id, r);
+  }
+  const draftHoldings = draft && Array.isArray(draft.holdings) ? draft.holdings : [];
+  const draftEvents = draft && Array.isArray(draft.events) ? draft.events : [];
+  const draftNav = draft && Array.isArray(draft.nav) ? draft.nav : [];
+  const targets = [];
+  for (const h of draftHoldings) {
+    if (!h || typeof h.ref !== 'string' || !h.ref) continue;
+    targets.push({ key: `ref:${h.ref}`, label: h.label || h.ref, currency: h.currency || 'CAD', recorded: null, draftHolding: h });
+  }
+  const touchedIds = new Set();
+  for (const e of draftEvents) if (e && e.holdingId != null && byId.has(e.holdingId)) touchedIds.add(e.holdingId);
+  for (const n of draftNav) if (n && n.holdingId != null && byId.has(n.holdingId)) touchedIds.add(n.holdingId);
+  for (const id of touchedIds) {
+    const r = byId.get(id);
+    targets.push({ key: `id:${id}`, label: r.holding.label, currency: r.holding.currency, recorded: r, draftHolding: null });
+  }
+  const numOrNull = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+  const fxFor = (currency) => (currency === 'CAD' ? () => 1 : (d) => fxResolver.rate(currency, d));
+  const previews = [];
+  for (const t of targets) {
+    const recEvents = t.recorded ? t.recorded.events : [];
+    const recPoints = t.recorded ? t.recorded.points : [];
+    const mine = (row) => (row.holdingId != null && t.recorded && row.holdingId === t.recorded.holding.id)
+      || (row.holdingRef != null && t.draftHolding && row.holdingRef === t.draftHolding.ref);
+    const evs = draftEvents.filter((e) => e && isDateStr(e.date) && mine(e)).map((e) => ({
+      date: e.date, type: e.type,
+      units: numOrNull(e.units), price: numOrNull(e.price), amount: numOrNull(e.amount),
+      splitNew: numOrNull(e.splitNew), splitOld: numOrNull(e.splitOld),
+    }));
+    const navs = draftNav.filter((n) => n && isDateStr(n.date) && Number(n.price) > 0 && mine(n))
+      .map((n) => ({ date: n.date, price: Number(n.price) }));
+    const hypoEvents = [...recEvents, ...evs];
+    // The hypothetical price path mirrors Apply exactly: recorded
+    // non-event points stand, a proposed NAV replaces the recorded
+    // manual point on its date, and event points rebuild wholesale
+    // from the hypothetical event set (a trade price is recorded in
+    // its day's terms, so it is divided by the splits after it).
+    const navDates = new Set(navs.map((n) => n.date));
+    const hypoPoints = [
+      ...recPoints.filter((p) => p.source !== 'event' && !(p.source === 'manual' && navDates.has(p.date))),
+      ...hypoEvents.filter((e) => e.price != null && e.price > 0 && e.type !== 'dividend' && e.type !== 'split')
+        .map((e) => ({ date: e.date, price: e.price / splitFactorAfter(hypoEvents, e.date), source: 'event' })),
+      ...navs.map((n) => ({ date: n.date, price: n.price, source: 'manual' })),
+    ];
+    const fxRate = fxFor(t.currency);
+    const preview = computeHoldingSeries({ events: hypoEvents, points: hypoPoints, fxRate, today }).summary;
+    const recordedSummary = t.recorded
+      ? computeHoldingSeries({ events: recEvents, points: recPoints, fxRate, today }).summary
+      : null;
+    const baseNative = t.recorded ? recordedSummary.valueNative : 0;
+    const baseCad = t.recorded ? recordedSummary.value : 0;
+    previews.push({
+      key: t.key, label: t.label, currency: t.currency,
+      units: preview.units,
+      valueNative: preview.valueNative, value: preview.value,
+      deltaNative: round2(preview.valueNative - baseNative),
+      delta: round2(preview.value - baseCad),
+    });
+  }
+  return previews;
+}
+
 // --------------------------------------------- monthly year paging --
 // The Monthly returns table spans first-event month to today, so
 // a multi-year holding renders dozens of rows. The table pages

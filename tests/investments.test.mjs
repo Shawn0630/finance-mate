@@ -14,7 +14,7 @@ import {
   validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   getAccount, listAccounts,
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
-  computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints,
+  computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints, computeFillPreview,
   splitMultiplier, splitFactorAfter, adjustedUnitsOf, derivePositionUnits,
   monthlyYears, latestMonthlyYear, monthlyRowsForYear,
 } from '../src/investments.js';
@@ -1098,4 +1098,114 @@ test('normalizeProposedInvestments: position events need units, reject a price, 
     existingEvents: [{ id: 50, holding_id: 12, date: '2026-06-30', type: 'position', units: 695.5991, price: null }],
   });
   assert.equal(dupe.events[0].conflict, 'duplicate-event');
+});
+
+test('computeFillPreview: new holding position + NAVs values at units x latest NAV, delta is the full value', () => {
+  const out = computeFillPreview({
+    recorded: [],
+    draft: {
+      holdings: [{ ref: 'h1', label: 'CIBC NASDAQ Index Fund', kind: 'fund', currency: 'CAD' }],
+      events: [{ holdingRef: 'h1', date: '2026-09-30', type: 'position', units: 462.8297 }],
+      nav: [
+        { holdingRef: 'h1', date: '2026-06-30', price: 183.3359 },
+        { holdingRef: 'h1', date: '2026-09-30', price: 184.7978 },
+      ],
+    },
+    fxResolver: { rate: () => 1 },
+    today: '2026-10-28',
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].units, 462.8297);
+  assert.equal(out[0].valueNative, 85529.91);
+  assert.equal(out[0].value, 85529.91);
+  assert.equal(out[0].deltaNative, 85529.91);
+  assert.equal(out[0].delta, 85529.91);
+});
+
+test('computeFillPreview: existing holding buys + new NAV move value, delta is preview minus recorded', () => {
+  const recorded = [{
+    holding: { id: 1, label: 'Fund', currency: 'CAD' },
+    events: [E(1, '2026-01-15', 'buy', 10, 100)],
+    points: [P('2026-01-15', 100, 'event'), P('2026-06-30', 110, 'manual')],
+  }];
+  const out = computeFillPreview({
+    recorded,
+    draft: {
+      holdings: [],
+      events: [{ holdingId: 1, date: '2026-09-30', type: 'buy', units: 5, price: 120 }],
+      nav: [{ holdingId: 1, date: '2026-09-30', price: 130 }],
+    },
+    fxResolver: { rate: () => 1 },
+    today: '2026-10-28',
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].units, 15);
+  assert.equal(out[0].valueNative, 1950);
+  assert.equal(out[0].deltaNative, 850);
+});
+
+test('computeFillPreview: a proposed split restates recorded lots, value unchanged when price follows', () => {
+  const recorded = [{
+    holding: { id: 1, label: 'Fund', currency: 'CAD' },
+    events: [E(1, '2026-01-15', 'buy', 100, 10)],
+    points: [P('2026-01-15', 10, 'event')],
+  }];
+  const out = computeFillPreview({
+    recorded,
+    draft: {
+      holdings: [],
+      events: [{ holdingId: 1, date: '2026-06-01', type: 'split', splitNew: 2, splitOld: 1 }],
+      nav: [],
+    },
+    fxResolver: { rate: () => 1 },
+    today: '2026-10-28',
+  });
+  assert.equal(out[0].units, 200);
+  assert.equal(out[0].valueNative, 1000);
+  assert.equal(out[0].deltaNative, 0);
+});
+
+test('computeFillPreview: same-date manual NAV outranks the event price; USD converts at the resolver rate', () => {
+  const recorded = [{
+    holding: { id: 7, label: 'US Fund', currency: 'USD' },
+    events: [E(7, '2026-01-15', 'buy', 10, 50)],
+    points: [P('2026-01-15', 50, 'event')],
+  }];
+  const out = computeFillPreview({
+    recorded,
+    draft: {
+      holdings: [],
+      events: [{ holdingId: 7, date: '2026-09-30', type: 'buy', units: 10, price: 60 }],
+      nav: [{ holdingId: 7, date: '2026-09-30', price: 70 }],
+    },
+    fxResolver: { rate: (c) => (c === 'USD' ? 1.35 : 1) },
+    today: '2026-10-28',
+  });
+  // Units 20, latest price is the manual 70 (not the same-day event 60).
+  assert.equal(out[0].units, 20);
+  assert.equal(out[0].valueNative, 1400);
+  assert.equal(out[0].value, 1890);
+  assert.equal(out[0].deltaNative, 900);
+  assert.equal(out[0].delta, 1215);
+});
+
+test('computeFillPreview: units without any price value at 0; orphan and dateless rows are skipped', () => {
+  const out = computeFillPreview({
+    recorded: [],
+    draft: {
+      holdings: [{ ref: 'h1', label: 'Priceless', kind: 'fund', currency: 'CAD' }],
+      events: [
+        { holdingRef: 'h1', date: '2026-09-30', type: 'position', units: 100 },
+        { holdingRef: 'nope', date: '2026-09-30', type: 'buy', units: 5, price: 10 },
+        { holdingRef: 'h1', date: '', type: 'buy', units: 5, price: 10 },
+      ],
+      nav: [{ holdingRef: 'h1', date: '2026-09-30', price: null }],
+    },
+    fxResolver: { rate: () => 1 },
+    today: '2026-10-28',
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].units, 100);
+  assert.equal(out[0].valueNative, 0);
+  assert.equal(out[0].deltaNative, 0);
 });

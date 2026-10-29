@@ -20,7 +20,7 @@ import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmo
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   listAccounts, getAccount, listHoldings, getHolding, listEvents, listPricePoints, rebuildEventPricePoints,
-  computeHolding, computeAccount, computePortfolio,
+  computeHolding, computeAccount, computePortfolio, computeFillPreview,
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
@@ -2512,6 +2512,29 @@ app.get('/api/investments', requireApiAuth, async (req, res) => {
 // never an error — the form always works fully manual.
 app.get('/api/invest/search', requireApiAuth, async (req, res) => {
   res.json({ results: await searchSecurities(req.query.q) });
+});
+
+// Fill-with-AI preview: what each holding in a checked draft
+// would be worth after Apply, and how far that moves its
+// recorded value. Read-only — it writes nothing, and it uses
+// stored prices/FX only (no fetch), so the preview is a pure
+// function of recorded state + the draft. The panel posts the
+// same checked rows Apply would write; the values come from
+// computeFillPreview, the same engine the holding page uses.
+app.post('/api/investments/accounts/:id/fill-preview', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const b = req.body || {};
+  const draft = {
+    holdings: Array.isArray(b.holdings) ? b.holdings : [],
+    events: Array.isArray(b.events) ? b.events : [],
+    nav: Array.isArray(b.nav) ? b.nav : [],
+  };
+  const recorded = listHoldings(db, account.id).map((h) => ({
+    holding: h, events: listEvents(db, h.id), points: listPricePoints(db, h.id),
+  }));
+  const previews = computeFillPreview({ recorded, draft, fxResolver: makeFxResolver(db), today: vancouverToday() });
+  res.json({ previews });
 });
 
 app.post('/api/investments/accounts', requireApiAuth, (req, res) => {
