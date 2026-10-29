@@ -211,6 +211,77 @@ export function calcSalary(job, payroll) {
   };
 }
 
+// ------------------------------------------------------- charts --
+// Pure aggregation for the Earnings charts. Read-only over the
+// server-computed calcs — charts never recompute tax. A job is one
+// annual figure per tax year; a rental year is one annual figure
+// per property per tax year, so every chart's axis is tax years.
+// Salary net is the person's income; rental net is the whole
+// property's 9946 net (ownerShareNet rides alongside for the
+// per-person note). Rentals carry no person field, so only salary
+// splits by earner; rental stays a total in the overview.
+export function aggregateEarningsCharts(jobs, rentals) {
+  const yearsSet = new Set();
+  const overview = {}; // year -> { salaryGross, salaryNet, rentalGross, rentalNet, earners: {name: net} }
+  const salary = {}; // year -> { gross, net, employers: {name: {gross, net}} }
+  const rentalAgg = {}; // year -> { gross, expenses, net, properties: {id: {label, gross, expenses, net, ownerShareNet}} }
+  const earners = new Set();
+  const employers = new Set();
+  const properties = new Map();
+  const yearOf = (y) => {
+    if (!overview[y]) overview[y] = { salaryGross: 0, salaryNet: 0, rentalGross: 0, rentalNet: 0, earners: {} };
+    if (!salary[y]) salary[y] = { gross: 0, net: 0, employers: {} };
+    if (!rentalAgg[y]) rentalAgg[y] = { gross: 0, expenses: 0, net: 0, properties: {} };
+    yearsSet.add(y);
+    return y;
+  };
+  for (const j of jobs || []) {
+    if (!j || !j.calc) continue;
+    const y = yearOf(j.tax_year);
+    const g = round2(j.calc.annualGross || 0);
+    const n = round2(j.calc.netAnnual || 0);
+    overview[y].salaryGross = round2(overview[y].salaryGross + g);
+    overview[y].salaryNet = round2(overview[y].salaryNet + n);
+    salary[y].gross = round2(salary[y].gross + g);
+    salary[y].net = round2(salary[y].net + n);
+    const earner = j.owner || 'Unassigned';
+    earners.add(earner);
+    overview[y].earners[earner] = round2((overview[y].earners[earner] || 0) + n);
+    const emp = j.employer || 'Unnamed';
+    employers.add(emp);
+    if (!salary[y].employers[emp]) salary[y].employers[emp] = { gross: 0, net: 0 };
+    salary[y].employers[emp].gross = round2(salary[y].employers[emp].gross + g);
+    salary[y].employers[emp].net = round2(salary[y].employers[emp].net + n);
+  }
+  for (const r of rentals || []) {
+    properties.set(r.id, r.label || 'Unnamed');
+    for (const yr of r.years || []) {
+      if (!yr || !yr.calc) continue;
+      const y = yearOf(yr.tax_year);
+      const g = round2(yr.calc.grossWhole || 0);
+      const e = round2(yr.calc.deductibleExpenses || 0);
+      const n = round2(yr.calc.netWhole9946 || 0);
+      overview[y].rentalGross = round2(overview[y].rentalGross + g);
+      overview[y].rentalNet = round2(overview[y].rentalNet + n);
+      rentalAgg[y].gross = round2(rentalAgg[y].gross + g);
+      rentalAgg[y].expenses = round2(rentalAgg[y].expenses + e);
+      rentalAgg[y].net = round2(rentalAgg[y].net + n);
+      rentalAgg[y].properties[r.id] = {
+        label: r.label || 'Unnamed',
+        gross: g, expenses: e, net: n, ownerShareNet: round2(yr.calc.ownerShareNet || 0),
+      };
+    }
+  }
+  const years = [...yearsSet].sort((a, b) => a - b);
+  return {
+    years,
+    earners: [...earners].sort(),
+    employers: [...employers].sort(),
+    properties: [...properties.entries()].map(([id, label]) => ({ id, label })),
+    overview, salary, rentals: rentalAgg,
+  };
+}
+
 // ------------------------------------------------------------ rental --
 export function validRentalInput(body) {
   const b = body || {};

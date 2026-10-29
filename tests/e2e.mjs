@@ -8974,7 +8974,14 @@ try {
     r.status === 200 && r.data.netWorth === sumBefore.data.netWorth
     && r.data.propertyValue === sumBefore.data.propertyValue && r.data.otherAssets === sumBefore.data.otherAssets,
     JSON.stringify({ before: sumBefore.data, after: r.data }));
-
+  r = await req('GET', '/api/earnings/charts');
+  check('earnings charts: aggregation sums salary gross and rental 9946 net by year',
+    r.status === 200 && JSON.stringify(r.data.years) === '[2026]'
+    && r.data.salary[2026].gross === 120000 && r.data.rentals[2026].net === 11500
+    && r.data.rentals[2026].gross === 24000 && r.data.rentals[2026].expenses === 12500
+    && r.data.overview[2026].rentalNet === 11500
+    && r.data.employers.includes('Acme Corp') && r.data.properties.length === 1,
+    JSON.stringify(r.data));
   // ---- Earnings: browser pass over the new section ----
   if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
     console.log('earnings browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -9038,6 +9045,68 @@ try {
       check('earnings UI: rentals section lists the rental with its T776 year summary',
         rentalText.includes('Basement suite') && rentalText.includes('Owner share'),
         rentalText.slice(0, 300));
+      // Earnings charts: overview composition, salary trend, rental
+      // net — plus the standard legend left-click toggle.
+      const clickLegend = (chartKey, seriesKey) => page.evaluate((ck, sk) => {
+        const c = window.__fmCharts[ck];
+        if (!c || !c.legend) return 'no-chart';
+        const i = c.legend.legendItems.findIndex((it) => {
+          const ds = c.data.datasets[it.datasetIndex];
+          return ds && ds.key === sk;
+        });
+        if (i < 0) return 'no-item';
+        const b = c.legend.legendHitBoxes[i];
+        const r = c.canvas.getBoundingClientRect();
+        c.canvas.dispatchEvent(new MouseEvent('click', {
+          bubbles: true, cancelable: true,
+          clientX: r.left + b.left + b.width / 2, clientY: r.top + b.top + b.height / 2,
+        }));
+        return 'clicked';
+      }, chartKey, seriesKey);
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const ovInfo = await page.evaluate(() => {
+        const c = window.__fmCharts.earnOverview;
+        return c ? { labels: c.data.labels, keys: c.data.datasets.map((d) => d.key) } : null;
+      });
+      check('earnings charts: overview composition shows salary + rental series for 2026',
+        ovInfo && ovInfo.labels.includes('2026') && ovInfo.keys.includes('salary') && ovInfo.keys.includes('rental'),
+        JSON.stringify(ovInfo));
+      await clickLegend('earnOverview', 'salary');
+      await waitE(300);
+      const salaryHidden = await page.evaluate(() => {
+        const c = window.__fmCharts.earnOverview;
+        return c ? !c.isDatasetVisible(0) : null;
+      });
+      check('earnings charts: legend left click hides the salary series',
+        salaryHidden === true, JSON.stringify(salaryHidden));
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const salInfo = await page.evaluate(() => {
+        const c = window.__fmCharts.earnSalary;
+        return c ? { labels: c.data.labels, keys: c.data.datasets.map((d) => d.key) } : null;
+      });
+      check('earnings charts: salary trend shows gross + net series',
+        salInfo && salInfo.labels.includes('2026') && salInfo.keys.includes('gross') && salInfo.keys.includes('net'),
+        JSON.stringify(salInfo));
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const rentInfo = await page.evaluate(() => {
+        const c = window.__fmCharts.earnRentals;
+        return c ? { labels: c.data.labels, keys: c.data.datasets.map((d) => d.key) } : null;
+      });
+      check('earnings charts: rentals chart shows the property net series',
+        rentInfo && rentInfo.labels.includes('2026') && rentInfo.keys.some((k) => k.startsWith('rental:')),
+        JSON.stringify(rentInfo));
+      await page.click('#earnRentalsViewBtns [data-view="income"]');
+      await waitE(500);
+      const rentIncomeInfo = await page.evaluate(() => {
+        const c = window.__fmCharts.earnRentals;
+        return c ? c.data.datasets.map((d) => d.key) : null;
+      });
+      check('earnings charts: income vs expenses view swaps in gross + expenses series',
+        rentIncomeInfo && rentIncomeInfo.includes('gross') && rentIncomeInfo.includes('expenses'),
+        JSON.stringify(rentIncomeInfo));
     } finally {
       await browserE.close();
     }

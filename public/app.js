@@ -373,6 +373,7 @@ function route() {
   } else if (hash === '#earnings' || hash.startsWith('#earnings/')) {
     showView('earnings');
     const sub = hash.split('/')[1] || 'salary';
+    $('#earn-overview').classList.toggle('hidden', sub !== 'overview');
     $('#earn-salary').classList.toggle('hidden', sub !== 'salary');
     $('#earn-rentals').classList.toggle('hidden', sub !== 'rentals');
     document.querySelectorAll('#earningsNav a').forEach((a) =>
@@ -1232,6 +1233,18 @@ const CHART_SERIES = {
     { key: 'outstanding', label: 'Total outstanding principal', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
     { key: 'equity', label: 'Total equity', bg: '#7c3aed', border: '#7c3aed', bgAlpha: null },
   ],
+  earnOverview: [
+    { key: 'salary', label: 'Salary net', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+    { key: 'rental', label: 'Rental net', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
+  ],
+  earnSalary: [
+    { key: 'gross', label: 'Annual gross', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+    { key: 'net', label: 'Annual net', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
+  ],
+  earnRentals: [
+    { key: 'gross', label: 'Gross rents', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
+    { key: 'expenses', label: 'Deductible expenses', bg: '#d97706', border: '#d97706', bgAlpha: null },
+  ],
 };
 let chartColorPrefs = {};
 
@@ -1254,10 +1267,32 @@ function portfolioSeriesDefs() {
   return defs;
 }
 
+// Earnings dynamic series, same idea as the portfolio's per-property
+// defs: the per-earner / per-employer / per-rental series are keyed
+// by their semantic name, so a stored color keeps matching.
+let earnChartData = null;
+const earnDef = (key, label, i) => ({ key, label, bg: PF_COLORS[i % PF_COLORS.length], border: PF_COLORS[i % PF_COLORS.length], bgAlpha: null });
+function earnOverviewSeriesDefs() {
+  const defs = [...CHART_SERIES.earnOverview];
+  if (earnChartData) earnChartData.earners.forEach((e, i) => defs.push(earnDef(`earner:${e}`, `${e} salary net`, i + 2)));
+  return defs;
+}
+function earnSalarySeriesDefs() {
+  const defs = [...CHART_SERIES.earnSalary];
+  if (earnChartData) earnChartData.employers.forEach((e, i) => defs.push(earnDef(`employer:${e}`, `${e} net`, i + 2)));
+  return defs;
+}
+function earnRentalsSeriesDefs() {
+  const defs = [];
+  if (earnChartData) earnChartData.properties.forEach((p, i) => defs.push(earnDef(`rental:${p.id}`, `${p.label} net`, i)));
+  return [...defs, ...CHART_SERIES.earnRentals];
+}
+const earnSeriesDefs = { earnOverview: earnOverviewSeriesDefs, earnSalary: earnSalarySeriesDefs, earnRentals: earnRentalsSeriesDefs };
+
 function seriesDefFor(chartId, key) {
-  return chartId === 'portfolio'
-    ? portfolioSeriesDefs().find((d) => d.key === key) || null
-    : chartSeriesDef(chartId, key);
+  if (chartId === 'portfolio') return portfolioSeriesDefs().find((d) => d.key === key) || null;
+  if (earnSeriesDefs[chartId]) return earnSeriesDefs[chartId]().find((d) => d.key === key) || null;
+  return chartSeriesDef(chartId, key);
 }
 
 function hexToRgba(hex, alpha) {
@@ -1288,7 +1323,7 @@ function saveChartColorPrefs(immediate = false) {
   else chartColorSaveTimer = setTimeout(put, 400);
 }
 
-const LIVE_CHARTS = { hero: () => chartA, history: () => historyChart, portfolio: () => portfolioLineChart };
+const LIVE_CHARTS = { hero: () => chartA, history: () => historyChart, portfolio: () => portfolioLineChart, earnOverview: () => earnOverviewChart, earnSalary: () => earnSalaryChart, earnRentals: () => earnRentalsChart };
 
 // The draw colors for one explicit hex, under the same rules
 // seriesColors applies to a stored one.
@@ -1334,7 +1369,9 @@ function applyChartColors(chartId, overrides) {
 const colorsStage = {}; // chartId -> {key: hex}
 
 function colorsDefs(chartId) {
-  return chartId === 'portfolio' ? portfolioSeriesDefs() : (CHART_SERIES[chartId] || []);
+  if (chartId === 'portfolio') return portfolioSeriesDefs();
+  if (earnSeriesDefs[chartId]) return earnSeriesDefs[chartId]();
+  return CHART_SERIES[chartId] || [];
 }
 
 function effectiveColor(chartId, def) {
@@ -1500,6 +1537,9 @@ function wireLegendContextMenu(chartId, canvasId) {
 wireLegendContextMenu('hero', 'combinedChart');
 wireLegendContextMenu('history', 'historyChart');
 wireLegendContextMenu('portfolio', 'portfolioChart');
+wireLegendContextMenu('earnOverview', 'earnOverviewChart');
+wireLegendContextMenu('earnSalary', 'earnSalaryChart');
+wireLegendContextMenu('earnRentals', 'earnRentalsChart');
 
 function drawPortfolioPie() {
   const ctx = $('#portfolioPie');
@@ -1728,7 +1768,7 @@ let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
 // Test/debug hook: lets the screenshot script read the live chart configs.
-window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null });
+window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null, earnOverview: null, earnSalary: null, earnRentals: null });
 
 // ------------------------------------------------------------ photos ---
 // The detail page's gallery: a carousel over the property's photos
@@ -7157,8 +7197,206 @@ async function loadEarnings() {
     $('#earnRentalList').innerHTML = earnData.rentals.length
       ? earnData.rentals.map(earnRentalCard).join('')
       : '<div class="note">No rentals yet.</div>';
+    try { earnChartData = await api('/api/earnings/charts'); } catch { earnChartData = null; }
+    drawEarnVisibleChart();
   } catch (e) { showMsg($('#earnSalaryMsg'), 'err', e.message); }
 }
+
+// ------------------------------------------------------- earn charts ---
+// Earnings charts read the server's aggregation over stored records —
+// the panels never recompute tax. Every chart's axis is tax years
+// (jobs and rental years are annual figures), so the range control
+// is year-based: presets 1/2/5/10y/All plus From/To year selects,
+// the same shape as the property/stocks range precedent. Legend
+// gestures follow the app standard: left click toggles a series
+// (Chart.js default), right click opens that chart's Colors panel
+// (the only entry, wired above).
+let earnOverviewChart = null;
+let earnSalaryChart = null;
+let earnRentalsChart = null;
+let earnRentalsView = 'net';
+const earnChartRanges = {
+  overview: { years: 0, from: null, to: null },
+  salary: { years: 0, from: null, to: null },
+  rentals: { years: 0, from: null, to: null },
+};
+
+function earnRangeControlsHtml(key) {
+  const years = (earnChartData && earnChartData.years) || [];
+  const opts = '<option value="">—</option>' + years.map((y) => `<option value="${y}">${y}</option>`).join('');
+  const st = earnChartRanges[key];
+  const presets = [[1, '1 year'], [2, '2 years'], [5, '5 years'], [10, '10 years'], [0, 'All']];
+  return `<div class="toolbar range-btns" data-earn-range="${key}">`
+    + presets.map(([n, label]) => `<button type="button" data-years="${n}" class="${st.years === n && st.from == null && st.to == null ? 'active' : ''}">${label}</button>`).join('')
+    + `<span class="range-pick">From <select data-earn-from>${opts}</select></span>`
+    + `<span class="range-pick">To <select data-earn-to>${opts}</select></span></div>`;
+}
+
+function earnWireRange(key) {
+  const wrap = document.querySelector(`[data-earn-range="${key}"]`);
+  if (!wrap) return;
+  const st = earnChartRanges[key];
+  wrap.querySelectorAll('[data-years]').forEach((b) => {
+    b.onclick = () => {
+      st.years = Number(b.dataset.years); st.from = null; st.to = null;
+      wrap.querySelectorAll('[data-earn-from],[data-earn-to]').forEach((s) => { s.value = ''; });
+      drawEarnVisibleChart();
+    };
+  });
+  const from = wrap.querySelector('[data-earn-from]');
+  const to = wrap.querySelector('[data-earn-to]');
+  if (from) from.value = st.from == null ? '' : String(st.from);
+  if (to) to.value = st.to == null ? '' : String(st.to);
+  const custom = () => {
+    st.from = from && from.value ? Number(from.value) : null;
+    st.to = to && to.value ? Number(to.value) : null;
+    drawEarnVisibleChart();
+  };
+  if (from) from.onchange = custom;
+  if (to) to.onchange = custom;
+}
+
+function earnEffectiveYears(key) {
+  const all = (earnChartData && earnChartData.years) || [];
+  if (!all.length) return [];
+  const st = earnChartRanges[key];
+  if (st.from != null || st.to != null) {
+    return all.filter((y) => (st.from == null || y >= st.from) && (st.to == null || y <= st.to));
+  }
+  if (!st.years) return all;
+  const max = all[all.length - 1];
+  return all.filter((y) => y > max - st.years);
+}
+
+function earnChartBase() {
+  return {
+    options: {
+      responsive: true,
+      scales: { x: { stacked: false }, y: { beginAtZero: true, ticks: { callback: (v) => '$' + Number(v).toLocaleString() } } },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } },
+    },
+  };
+}
+
+function earnSetEmpty(canvasId, emptyId, empty) {
+  const canvas = document.getElementById(canvasId);
+  if (canvas) canvas.parentElement.classList.toggle('hidden', empty);
+  const note = document.getElementById(emptyId);
+  if (note) note.classList.toggle('hidden', !empty);
+}
+
+function drawEarnOverviewChart() {
+  const years = earnEffectiveYears('overview');
+  if (earnOverviewChart) { earnOverviewChart.destroy(); earnOverviewChart = null; window.__fmCharts.earnOverview = null; }
+  const empty = !earnChartData || !years.length;
+  earnSetEmpty('earnOverviewChart', 'earnOverviewEmpty', empty);
+  if (empty) return;
+  const ov = earnChartData.overview;
+  const ds = (key, label, values, stack, hidden) => {
+    const def = seriesDefFor('earnOverview', key);
+    const c = seriesColors('earnOverview', def);
+    return { key, label: def ? def.label : label, data: values, backgroundColor: c.backgroundColor, borderColor: c.borderColor, borderWidth: 1, stack, hidden: !!hidden };
+  };
+  const datasets = [
+    ds('salary', 'Salary net', years.map((y) => (ov[y] && ov[y].salaryNet) || 0), 'income', false),
+    ds('rental', 'Rental net', years.map((y) => (ov[y] && ov[y].rentalNet) || 0), 'income', false),
+  ];
+  // Per-earner salary series: hidden by default — the legend
+  // switches the view from totals to people. They stack with the
+  // totals, so showing both double-counts; that is the user's
+  // explicit legend choice, as with portfolio totals vs properties.
+  earnChartData.earners.forEach((e) => {
+    datasets.push(ds(`earner:${e}`, `${e} salary net`, years.map((y) => (ov[y] && ov[y].earners && ov[y].earners[e]) || 0), 'income', true));
+  });
+  const base = earnChartBase();
+  base.options.scales.x.stacked = true;
+  base.options.scales.y.stacked = true;
+  earnOverviewChart = new Chart($('#earnOverviewChart'), { type: 'bar', data: { labels: years.map(String), datasets }, ...base });
+  window.__fmCharts.earnOverview = earnOverviewChart;
+}
+
+function drawEarnSalaryChart() {
+  const years = earnEffectiveYears('salary');
+  if (earnSalaryChart) { earnSalaryChart.destroy(); earnSalaryChart = null; window.__fmCharts.earnSalary = null; }
+  const empty = !earnChartData || !years.length || !earnChartData.employers.length;
+  earnSetEmpty('earnSalaryChart', 'earnSalaryEmpty', empty);
+  if (empty) return;
+  const s = earnChartData.salary;
+  const ds = (key, values, type, hidden) => {
+    const def = seriesDefFor('earnSalary', key);
+    const c = seriesColors('earnSalary', def);
+    return { key, label: def ? def.label : key, data: values, backgroundColor: c.backgroundColor, borderColor: c.borderColor, borderWidth: type === 'line' ? 2 : 1, type, hidden: !!hidden };
+  };
+  const datasets = [
+    ds('gross', years.map((y) => (s[y] && s[y].gross) || 0), 'bar', false),
+    ds('net', years.map((y) => (s[y] && s[y].net) || 0), 'bar', false),
+  ];
+  // Per-employer net lines: hidden by default, legend toggles.
+  // The CPP/EI cap jump is in the stored net figures, so the
+  // lines show it faithfully — nothing is recomputed here.
+  earnChartData.employers.forEach((e) => {
+    datasets.push(ds(`employer:${e}`, years.map((y) => (s[y] && s[y].employers && s[y].employers[e] ? s[y].employers[e].net : 0)), 'line', true));
+  });
+  earnSalaryChart = new Chart($('#earnSalaryChart'), { type: 'bar', data: { labels: years.map(String), datasets }, ...earnChartBase() });
+  window.__fmCharts.earnSalary = earnSalaryChart;
+}
+
+function drawEarnRentalsChart() {
+  const years = earnEffectiveYears('rentals');
+  if (earnRentalsChart) { earnRentalsChart.destroy(); earnRentalsChart = null; window.__fmCharts.earnRentals = null; }
+  const empty = !earnChartData || !years.length || !earnChartData.properties.length;
+  earnSetEmpty('earnRentalsChart', 'earnRentalsEmpty', empty);
+  if (empty) return;
+  const r = earnChartData.rentals;
+  const ds = (key, values, stack) => {
+    const def = seriesDefFor('earnRentals', key);
+    const c = seriesColors('earnRentals', def);
+    return { key, label: def ? def.label : key, data: values, backgroundColor: c.backgroundColor, borderColor: c.borderColor, borderWidth: 1, stack: stack || undefined };
+  };
+  let datasets;
+  if (earnRentalsView === 'income') {
+    // Income vs expenses: stacked totals per year.
+    datasets = [
+      ds('gross', years.map((y) => (r[y] && r[y].gross) || 0), 'total'),
+      ds('expenses', years.map((y) => (r[y] && r[y].expenses) || 0), 'total'),
+    ];
+  } else {
+    // Net by property: one bar series per rental, 9946 net.
+    // Owner-share net rides in the year table, not the chart —
+    // the chart is whole-property net, matching the overview.
+    datasets = earnChartData.properties.map((p) => ds(`rental:${p.id}`,
+      years.map((y) => (r[y] && r[y].properties && r[y].properties[p.id] ? r[y].properties[p.id].net : 0))));
+  }
+  const base = earnChartBase();
+  if (earnRentalsView === 'income') { base.options.scales.x.stacked = true; base.options.scales.y.stacked = true; }
+  earnRentalsChart = new Chart($('#earnRentalsChart'), { type: 'bar', data: { labels: years.map(String), datasets }, ...base });
+  window.__fmCharts.earnRentals = earnRentalsChart;
+}
+
+function drawEarnVisibleChart() {
+  const sub = (location.hash.split('/')[1] || 'salary');
+  if (sub === 'overview') {
+    $('#earnOverviewRange').innerHTML = earnRangeControlsHtml('overview');
+    earnWireRange('overview');
+    drawEarnOverviewChart();
+  } else if (sub === 'rentals') {
+    $('#earnRentalsRange').innerHTML = earnRangeControlsHtml('rentals');
+    earnWireRange('rentals');
+    drawEarnRentalsChart();
+  } else {
+    $('#earnSalaryRange').innerHTML = earnRangeControlsHtml('salary');
+    earnWireRange('salary');
+    drawEarnSalaryChart();
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest ? e.target.closest('#earnRentalsViewBtns [data-view]') : null;
+  if (!btn) return;
+  earnRentalsView = btn.dataset.view;
+  document.querySelectorAll('#earnRentalsViewBtns [data-view]').forEach((b) => b.classList.toggle('active', b === btn));
+  drawEarnRentalsChart();
+});
 
 function earnReadForm(form) {
   const data = {};

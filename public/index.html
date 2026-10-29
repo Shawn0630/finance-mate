@@ -420,13 +420,26 @@
   <!-- ============================= Earnings ============================= -->
   <section id="view-earnings" class="hidden">
     <nav class="subnav" id="earningsNav">
+      <a href="#earnings/overview" data-section="overview">Overview</a>
       <a href="#earnings/salary" data-section="salary">Salary</a>
       <a href="#earnings/rentals" data-section="rentals">Rentals</a>
     </nav>
+    <div id="earn-overview" class="asset-section hidden">
+      <div class="section-head"><h2>Overview</h2></div>
+      <div class="note">Income composition by year — salary net plus rental net (whole property). Per-earner salary series are hidden by default; click a legend item to show one.</div>
+      <div id="earnOverviewRange"></div>
+      <div class="panel"><canvas id="earnOverviewChart"></canvas></div>
+      <div class="chart-colors hidden" data-colors-panel="earnOverview"></div>
+      <div class="note hidden" id="earnOverviewEmpty">No earnings records yet.</div>
+    </div>
     <div id="earn-salary" class="asset-section">
       <div class="section-head"><h2>Salary</h2><div class="spacer"></div><button class="primary" id="addEarnJobBtn">+ Add job</button></div>
       <div class="msg" id="earnSalaryMsg"></div>
       <div class="note">Estimate — actual tax is settled on the T1. Withholding uses the province of employment; the final return uses the province of residence on Dec 31.</div>
+      <div id="earnSalaryRange"></div>
+      <div class="panel"><canvas id="earnSalaryChart"></canvas></div>
+      <div class="chart-colors hidden" data-colors-panel="earnSalary"></div>
+      <div class="note hidden" id="earnSalaryEmpty">No jobs yet.</div>
       <div id="earnJobList"></div>
       <div class="panel hidden" id="earnJobFormPanel">
         <h3 id="earnJobFormTitle">Add job</h3>
@@ -454,6 +467,14 @@
       <div class="section-head"><h2>Rentals</h2><div class="spacer"></div><button class="primary" id="addEarnRentalBtn">+ Add rental</button></div>
       <div class="msg" id="earnRentalMsg"></div>
       <div class="note">Rental income is a flow, not an asset — it never enters the net-worth summary. Mortgage interest and principal are separate fields; only interest is deductible.</div>
+      <div id="earnRentalsRange"></div>
+      <div class="toolbar range-btns" id="earnRentalsViewBtns">
+        <button type="button" data-view="net" class="active">Net by property</button>
+        <button type="button" data-view="income">Income vs expenses</button>
+      </div>
+      <div class="panel"><canvas id="earnRentalsChart"></canvas></div>
+      <div class="chart-colors hidden" data-colors-panel="earnRentals"></div>
+      <div class="note hidden" id="earnRentalsEmpty">No rental year records yet.</div>
       <div id="earnRentalList"></div>
       <div class="panel hidden" id="earnRentalFormPanel">
         <h3 id="earnRentalFormTitle">Add rental</h3>

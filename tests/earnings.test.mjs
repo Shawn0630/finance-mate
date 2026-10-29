@@ -183,3 +183,56 @@ test('job owner: single earner kept, empty/omitted means unassigned', () => {
   assert.equal(validJobInput({ ...base }).owner, null);
   assert.equal(validJobInput({ ...base, owner: '  Jiaying  ' }).owner, 'Jiaying');
 });
+
+// ------------------------------------------------------- chart aggregates --
+import { aggregateEarningsCharts } from '../src/earnings.js';
+
+const chartJobs = [
+  { tax_year: 2025, employer: 'Acme', owner: 'Shawn', calc: { annualGross: 60000, netAnnual: 50000 } },
+  { tax_year: 2026, employer: 'Acme', owner: 'Shawn', calc: { annualGross: 65000, netAnnual: 54000 } },
+  { tax_year: 2026, employer: 'Beta', owner: null, calc: { annualGross: 20000, netAnnual: 17000 } },
+  { tax_year: 2026, employer: 'Ghost', owner: 'Nobody', calc: null }, // no calc: skipped, never crashes
+];
+const chartRentals = [
+  { id: 1, label: 'Suite', years: [
+    { tax_year: 2025, calc: { grossWhole: 12000, deductibleExpenses: 3000, netWhole9946: 9000, ownerShareNet: 9000 } },
+    { tax_year: 2026, calc: { grossWhole: 13200, deductibleExpenses: 3200, netWhole9946: 10000, ownerShareNet: 5000 } },
+  ] },
+  { id: 2, label: 'Empty House', years: [] },
+];
+
+test('charts: overview composition sums salary net + rental net by year', () => {
+  const c = aggregateEarningsCharts(chartJobs, chartRentals);
+  assert.deepEqual(c.years, [2025, 2026]);
+  assert.equal(c.overview[2025].salaryNet, 50000);
+  assert.equal(c.overview[2025].rentalNet, 9000);
+  assert.equal(c.overview[2026].salaryNet, 71000);
+  assert.equal(c.overview[2026].rentalNet, 10000);
+  assert.equal(c.overview[2026].earners.Shawn, 54000);
+  assert.equal(c.overview[2026].earners.Unassigned, 17000);
+});
+
+test('charts: salary trend aggregates gross/net and per-employer net by year', () => {
+  const c = aggregateEarningsCharts(chartJobs, chartRentals);
+  assert.equal(c.salary[2026].gross, 85000);
+  assert.equal(c.salary[2026].net, 71000);
+  assert.equal(c.salary[2026].employers.Acme.net, 54000);
+  assert.equal(c.salary[2026].employers.Beta.net, 17000);
+  assert.equal(c.salary[2025].employers.Acme.gross, 60000);
+  assert.deepEqual(c.employers, ['Acme', 'Beta']);
+});
+
+test('charts: rental aggregates per-property 9946 net and income vs expenses by year', () => {
+  const c = aggregateEarningsCharts(chartJobs, chartRentals);
+  assert.equal(c.rentals[2025].net, 9000);
+  assert.equal(c.rentals[2025].gross, 12000);
+  assert.equal(c.rentals[2025].expenses, 3000);
+  assert.equal(c.rentals[2026].properties[1].net, 10000);
+  assert.equal(c.rentals[2026].properties[1].ownerShareNet, 5000);
+  assert.deepEqual(c.properties.map((p) => p.label), ['Suite', 'Empty House']);
+});
+
+test('charts: empty input aggregates to empty years, no crash', () => {
+  const c = aggregateEarningsCharts([], []);
+  assert.deepEqual(c, { years: [], earners: [], employers: [], properties: [], overview: {}, salary: {}, rentals: {} });
+});

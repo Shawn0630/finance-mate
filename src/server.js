@@ -26,7 +26,7 @@ import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, m
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
-  calcSalary, calcRentalYear,
+  calcSalary, calcRentalYear, aggregateEarningsCharts,
 } from './earnings.js';
 import { analyzeCsv, applyMappedCsv, proposeCsvMapping } from './csvMapImport.js';
 
@@ -2683,6 +2683,12 @@ const earnRentalRow = (row) => {
   const years = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC').all(row.id);
   return { ...rental, years: years.map((y) => earnRentalYearRow(rental, y)) };
 };
+
+app.get('/api/earnings/charts', requireApiAuth, (req, res) => {
+  const jobs = db.prepare('SELECT * FROM earn_jobs ORDER BY employer').all().map(earnJobRow);
+  const rentals = db.prepare('SELECT * FROM earn_rentals ORDER BY label').all().map(earnRentalRow);
+  res.json(aggregateEarningsCharts(jobs, rentals));
+});
 
 app.get('/api/earnings', requireApiAuth, (req, res) => {
   const region = earnRegion();
