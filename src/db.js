@@ -224,6 +224,70 @@ CREATE TABLE IF NOT EXISTS invest_fx_rates (
   rate REAL NOT NULL,                          -- CAD per 1 USD
   source TEXT                                  -- series id the value came from
 );
+-- Earnings (salary + rental): flows, never assets — nothing here
+-- feeds the net-worth summary. Salary jobs carry the inputs the
+-- T4127-style estimate needs and nothing else: no SIN, birth date,
+-- bank details, employer payroll account, or T4 fields. Rental years
+-- carry T776-line expenses as JSON plus mortgage interest and
+-- principal as SEPARATE columns — principal never flows to an
+-- expense line. GST fields do not exist on this schema: long-term
+-- rent is GST-exempt; short-term GST/ITC tracking belongs to the
+-- future Tax module, not to a rental year row.
+CREATE TABLE IF NOT EXISTS earn_jobs (
+  id INTEGER PRIMARY KEY,
+  employer TEXT NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'CAD',
+  province TEXT NOT NULL,                        -- employment province code (BC, ON, …)
+  frequency TEXT NOT NULL,                      -- weekly | biweekly | semimonthly | monthly | annual
+  gross_amount REAL NOT NULL,                   -- per-period if gross_basis='period', else annual
+  gross_basis TEXT NOT NULL DEFAULT 'annual',   -- 'annual' | 'period'
+  tax_year INTEGER NOT NULL,
+  td1_federal REAL,                             -- NULL = default (federal BPA, phased out at high income)
+  td1_provincial REAL,                          -- NULL = default (provincial BPA)
+  ytd_cpp REAL NOT NULL DEFAULT 0,
+  ytd_cpp2 REAL NOT NULL DEFAULT 0,
+  ytd_ei REAL NOT NULL DEFAULT 0,
+  cpp_exempt INTEGER NOT NULL DEFAULT 0,
+  ei_exempt INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS earn_rentals (
+  id INTEGER PRIMARY KEY,
+  property_id INTEGER REFERENCES properties(id) ON DELETE SET NULL,
+  label TEXT NOT NULL,
+  address TEXT,
+  rental_type TEXT NOT NULL,                    -- long_term | short_term | commercial
+  services_level TEXT NOT NULL DEFAULT 'basic', -- basic (T776) | hotel_like (T2125)
+  ownership_pct REAL NOT NULL DEFAULT 100,      -- owner's share of net (T1 line 12600)
+  is_principal_residence INTEGER NOT NULL DEFAULT 0,
+  was_principal_residence INTEGER NOT NULL DEFAULT 0,
+  structural_change INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS earn_rental_years (
+  id INTEGER PRIMARY KEY,
+  rental_id INTEGER NOT NULL REFERENCES earn_rentals(id) ON DELETE CASCADE,
+  tax_year INTEGER NOT NULL,
+  gross_rents REAL NOT NULL DEFAULT 0,
+  other_income REAL NOT NULL DEFAULT 0,         -- T776 line 8230
+  area_share_pct REAL NOT NULL DEFAULT 100,     -- rented area share (partial rentals)
+  rental_days INTEGER NOT NULL DEFAULT 365,     -- rented days in the year
+  mortgage_interest REAL NOT NULL DEFAULT 0,    -- flows to T776 line 8710
+  mortgage_principal REAL NOT NULL DEFAULT 0,   -- stored only; NEVER an expense
+  expenses TEXT NOT NULL DEFAULT '[]',          -- [{line, amount, direct}] — line 8710 excluded (see above)
+  claim_cca INTEGER NOT NULL DEFAULT 0,
+  cca_acknowledged INTEGER NOT NULL DEFAULT 0,
+  ucc_class1 REAL,                              -- Class 1 (4%) undepreciated capital cost
+  ucc_class8 REAL,                              -- Class 8 (20%) UCC
+  str_compliant_days INTEGER,
+  str_non_compliant_days INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (rental_id, tax_year)
+);
+CREATE INDEX IF NOT EXISTS idx_earn_rental_years ON earn_rental_years(rental_id, tax_year);
 -- A property's uploaded photos, in display order: the gallery the
 -- detail page shows as a carousel; the first row is the Properties
 -- card cover. Files live in PHOTOS_DIR; the row stores only the name.

@@ -8812,6 +8812,116 @@ try {
   r = await req('POST', `/api/investments/accounts/999999/import-csv-map/analyze`, { csv: mapFixture });
   check('csv-ai map: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
 
+  // ---- Earnings: salary + rental (API round) ----
+  const sumBefore = await req('GET', '/api/summary');
+  r = await req('POST', '/api/earnings/jobs', {
+    employer: 'Acme Corp', currency: 'CAD', province: 'BC', frequency: 'annual',
+    gross_amount: 60000, gross_basis: 'annual', tax_year: 2026,
+  });
+  check('earnings: job created with the pinned CPP/EI figures',
+    r.status === 201 && r.data.calc.cpp === 3361.75 && r.data.calc.ei === 978, JSON.stringify(r.data.calc));
+  const earnJobId = r.data.id;
+  r = await req('POST', '/api/earnings/jobs', {
+    employer: 'No SIN Here', currency: 'CAD', province: 'QC', frequency: 'monthly',
+    gross_amount: 5000, gross_basis: 'period', tax_year: 2026,
+  });
+  check('earnings: unverified province computes federal only, provincial null',
+    r.status === 201 && r.data.calc.provincialTax === null && r.data.calc.provinceVerified === false,
+    JSON.stringify(r.data.calc));
+  r = await req('POST', '/api/earnings/rentals', {
+    label: 'Basement suite', rental_type: 'long_term', services_level: 'basic', ownership_pct: 50,
+  });
+  check('earnings: rental created', r.status === 201 && r.data.label === 'Basement suite', JSON.stringify(r.data));
+  const earnRentalId = r.data.id;
+  r = await req('POST', `/api/earnings/rentals/${earnRentalId}/years`, {
+    tax_year: 2026, gross_rents: 24000, other_income: 0, area_share_pct: 50, rental_days: 365,
+    mortgage_interest: 6000, mortgage_principal: 9000,
+    expenses: [{ line: '9180', amount: 12000, direct: false }, { line: '8521', amount: 500, direct: true }],
+  });
+  check('earnings: rental year pro-rates shared expenses, halves net for the co-owner, principal excluded',
+    r.status === 201 && r.data.calc.personalPortion9949 === 6000 && r.data.calc.ownerShareNet === 5750
+    && r.data.calc.netWhole9946 === 11500 && r.data.calc.gst.status === 'exempt',
+    JSON.stringify(r.data.calc));
+  r = await req('GET', '/api/earnings');
+  check('earnings: overview lists both jobs and the rental with computed summaries',
+    r.status === 200 && r.data.jobs.length === 2 && r.data.rentals.length === 1
+    && r.data.rentals[0].years.length === 1 && r.data.payrollProvinces.some((p) => p.code === 'BC' && p.verified)
+    && r.data.payrollProvinces.some((p) => p.code === 'QC' && !p.verified),
+    JSON.stringify({ jobs: r.data.jobs.length, rentals: r.data.rentals.length }));
+  r = await req('GET', '/api/summary');
+  check('earnings: flows do not enter the net-worth summary',
+    r.status === 200 && r.data.netWorth === sumBefore.data.netWorth
+    && r.data.propertyValue === sumBefore.data.propertyValue && r.data.otherAssets === sumBefore.data.otherAssets,
+    JSON.stringify({ before: sumBefore.data, after: r.data }));
+
+  // ---- Earnings: browser pass over the new section ----
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('earnings browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardE = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResE = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueE = loginResE.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserE = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+      const page = await browserE.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardE({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueE, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitE = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const salaryText = await page.evaluate(() => document.querySelector('#earn-salary').textContent);
+      check('earnings UI: salary section lists the job with annual net',
+        salaryText.includes('Acme Corp') && salaryText.includes('Annual net'),
+        salaryText.slice(0, 300));
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const rentalText = await page.evaluate(() => document.querySelector('#earn-rentals').textContent);
+      check('earnings UI: rentals section lists the rental with its T776 year summary',
+        rentalText.includes('Basement suite') && rentalText.includes('Owner share'),
+        rentalText.slice(0, 300));
+    } finally {
+      await browserE.close();
+    }
+  }
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above

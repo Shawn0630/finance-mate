@@ -24,6 +24,10 @@ import {
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
+import {
+  PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
+  calcSalary, calcRentalYear,
+} from './earnings.js';
 import { analyzeCsv, applyMappedCsv, proposeCsvMapping } from './csvMapImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -2622,6 +2626,169 @@ app.delete('/api/investments/prices/:id', requireApiAuth, (req, res) => {
 app.post('/api/investments/refresh', requireApiAuth, async (req, res) => {
   const refreshed = await refreshAllPrices(db, listHoldings(db));
   res.json({ ok: true, refreshed });
+});
+
+// --------------------------------------------------------------- earnings ---
+// Earnings is flows, not assets: nothing here feeds /api/summary.
+// Salary and rental computations run server-side on read, so an edit
+// always recalculates every derived number it governs.
+const earnRegion = () => getRegion('CA');
+const earnJobRow = (row) => ({
+  ...row,
+  cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
+  calc: calcSalary(row, earnRegion().payroll),
+});
+const earnRentalYearRow = (rental, row) => ({
+  ...row,
+  expenses: JSON.parse(row.expenses || '[]'),
+  claim_cca: row.claim_cca === 1, cca_acknowledged: row.cca_acknowledged === 1,
+  calc: calcRentalYear(rental, {
+    ...row, expenses: JSON.parse(row.expenses || '[]'),
+    claim_cca: row.claim_cca === 1, cca_acknowledged: row.cca_acknowledged === 1,
+  }, earnRegion().rental),
+});
+const earnRentalRow = (row) => {
+  const rental = {
+    ...row,
+    is_principal_residence: row.is_principal_residence === 1,
+    was_principal_residence: row.was_principal_residence === 1,
+    structural_change: row.structural_change === 1,
+  };
+  const years = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC').all(row.id);
+  return { ...rental, years: years.map((y) => earnRentalYearRow(rental, y)) };
+};
+
+app.get('/api/earnings', requireApiAuth, (req, res) => {
+  const region = earnRegion();
+  res.json({
+    jobs: db.prepare('SELECT * FROM earn_jobs ORDER BY employer').all().map(earnJobRow),
+    rentals: db.prepare('SELECT * FROM earn_rentals ORDER BY label').all().map(earnRentalRow),
+    payrollProvinces: Object.entries(region.payroll.provinces).map(([code, p]) => ({
+      code, label: p.label, verified: !!p.verified, note: p.note || null,
+    })),
+    payFrequencies: Object.entries(PAY_FREQUENCIES).map(([key, f]) => ({ key, ...f })),
+    t776Lines: region.rental.t776Lines,
+    taxYear: region.payroll.taxYear,
+  });
+});
+
+app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
+  const v = validJobInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const info = db.prepare(
+    `INSERT INTO earn_jobs (employer, currency, province, frequency, gross_amount, gross_basis, tax_year,
+     td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    v.employer, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+    v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
+    v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, ts, ts);
+  res.status(201).json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(info.lastInsertRowid)));
+});
+app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
+  const v = validJobInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const id = Number(req.params.id);
+  if (!db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(id)) return res.status(404).json({ error: 'job not found' });
+  db.prepare(
+    `UPDATE earn_jobs SET employer = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
+     tax_year = ?, td1_federal = ?, td1_provincial = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?,
+     cpp_exempt = ?, ei_exempt = ?, updated_at = ? WHERE id = ?`).run(
+    v.employer, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+    v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
+    v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, nowIso(), id);
+  res.json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
+});
+app.delete('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(Number(req.params.id));
+  if (!info.changes) return res.status(404).json({ error: 'job not found' });
+  res.json({ ok: true });
+});
+
+app.post('/api/earnings/rentals', requireApiAuth, (req, res) => {
+  const v = validRentalInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  if (v.property_id != null && !db.prepare('SELECT id FROM properties WHERE id = ?').get(v.property_id)) {
+    return res.status(400).json({ error: 'property not found.' });
+  }
+  const ts = nowIso();
+  const info = db.prepare(
+    `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level, ownership_pct,
+     is_principal_residence, was_principal_residence, structural_change, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
+    v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, ts, ts);
+  res.status(201).json(earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(info.lastInsertRowid)));
+});
+app.put('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
+  const v = validRentalInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const id = Number(req.params.id);
+  if (!db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(id)) return res.status(404).json({ error: 'rental not found' });
+  if (v.property_id != null && !db.prepare('SELECT id FROM properties WHERE id = ?').get(v.property_id)) {
+    return res.status(400).json({ error: 'property not found.' });
+  }
+  db.prepare(
+    `UPDATE earn_rentals SET property_id = ?, label = ?, address = ?, rental_type = ?, services_level = ?,
+     ownership_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
+     updated_at = ? WHERE id = ?`).run(
+    v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
+    v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, nowIso(), id);
+  res.json(earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(id)));
+});
+app.delete('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM earn_rentals WHERE id = ?').run(Number(req.params.id));
+  if (!info.changes) return res.status(404).json({ error: 'rental not found' });
+  res.json({ ok: true });
+});
+
+app.post('/api/earnings/rentals/:id/years', requireApiAuth, (req, res) => {
+  const rentalId = Number(req.params.id);
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(rentalId);
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  const v = validRentalYearInput(req.body || {}, earnRegion().rental.t776Lines);
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  try {
+    const info = db.prepare(
+      `INSERT INTO earn_rental_years (rental_id, tax_year, gross_rents, other_income, area_share_pct, rental_days,
+       mortgage_interest, mortgage_principal, expenses, claim_cca, cca_acknowledged, ucc_class1, ucc_class8,
+       str_compliant_days, str_non_compliant_days, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      rentalId, v.tax_year, v.gross_rents, v.other_income, v.area_share_pct, v.rental_days,
+      v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
+      v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
+      v.str_compliant_days, v.str_non_compliant_days, ts, ts);
+    res.status(201).json(earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(info.lastInsertRowid)));
+  } catch {
+    return res.status(400).json({ error: 'a year record already exists for this rental.' });
+  }
+});
+app.put('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, res) => {
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.rentalId));
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  const yearId = Number(req.params.yearId);
+  if (!db.prepare('SELECT id FROM earn_rental_years WHERE id = ? AND rental_id = ?').get(yearId, rental.id)) {
+    return res.status(404).json({ error: 'year record not found' });
+  }
+  const v = validRentalYearInput(req.body || {}, earnRegion().rental.t776Lines);
+  if (v.error) return res.status(400).json({ error: v.error });
+  db.prepare(
+    `UPDATE earn_rental_years SET tax_year = ?, gross_rents = ?, other_income = ?, area_share_pct = ?, rental_days = ?,
+     mortgage_interest = ?, mortgage_principal = ?, expenses = ?, claim_cca = ?, cca_acknowledged = ?,
+     ucc_class1 = ?, ucc_class8 = ?, str_compliant_days = ?, str_non_compliant_days = ?, updated_at = ?
+     WHERE id = ?`).run(
+    v.tax_year, v.gross_rents, v.other_income, v.area_share_pct, v.rental_days,
+    v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
+    v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
+    v.str_compliant_days, v.str_non_compliant_days, nowIso(), yearId);
+  res.json(earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(yearId)));
+});
+app.delete('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM earn_rental_years WHERE id = ? AND rental_id = ?')
+    .run(Number(req.params.yearId), Number(req.params.rentalId));
+  if (!info.changes) return res.status(404).json({ error: 'year record not found' });
+  res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------- summary ---

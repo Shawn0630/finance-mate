@@ -1,0 +1,350 @@
+// Earnings — salary gross-to-net and rental T776 summaries.
+//
+// Pure computation + input validation. Region-specific numbers (tax
+// brackets, CPP/EI, T776 lines, CCA classes) come from the region
+// layer (src/regions/ca.js); nothing Canadian is hard-coded here, so
+// a future region implements the same payroll/rental shape.
+//
+// SALARY MODEL — a simplified T4127-style estimate, documented
+// honestly: CRA's statutory withholding uses the full T4127 formula
+// (K factors, exact TD1 handling) and will differ from this estimate
+// by small amounts. Every salary surface therefore carries an
+// "estimate — actual tax is settled on the T1" note. What IS exact
+// here: the CPP/CPP2/EI annual amounts and caps (pinned by tests),
+// and the frequency annualisation.
+//   annualGross = per-period gross × periodsPerYear
+//   cpp  = min(max(0, min(annualGross, ympe) − exemption) × rate, max) − ytdCpp
+//   cpp2 = min(max(0, annualGross − ympe) × cpp2Rate, max2) − ytdCpp2
+//   ei   = min(annualGross, mie) × rate − ytdEi
+//   cppBase = 4.95% portion of cpp (a credit); the rest of cpp plus
+//     all of cpp2 is a deduction from income (the CPP enhancement).
+//   taxable = annualGross − cppEnhancement
+//   federalTax = bracketTax(federal, taxable)
+//     − (td1Federal + cppBase + ei) × federalLowestRate
+//     − min(annualGross, employmentAmountMax) × federalLowestRate
+//   provincialTax = bracketTax(province, taxable)
+//     − (td1Provincial + cppBase + ei) × provincialLowestRate
+//     (+ Ontario surtax + Ontario health premium)
+//   All taxes floored at 0. Per-period figures = annual ÷ periods.
+//   The default TD1 claim is the basic personal amount (federal BPA
+//   phases out $181,440→$258,482); an entered TD1 total replaces it.
+//
+// RENTAL MODEL — one T776-equivalent per property per tax year:
+//   shared expenses are pro-rated by area share × time share;
+//   direct expenses count 100%. Personal portion (line 9949) is the
+//   shared part that is NOT deductible. Mortgage interest flows to
+//   line 8710; mortgage principal NEVER flows to any expense line.
+//   CCA is optional, capped at net-before-CCA (it cannot create or
+//   increase a loss), and blocked with a warning on any (former)
+//   principal residence unless explicitly acknowledged (the PRE trap).
+//   Long-term residential rent is GST/HST-exempt: no GST fields exist
+//   on that path. Short-term rent is taxable: the summary carries the
+//   registration-threshold note and the s.67.7 non-compliant-day
+//   expense denial. Hotel-like services route to T2125, not T776.
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+export const PAY_FREQUENCIES = {
+  weekly: { periods: 52, label: 'Weekly' },
+  biweekly: { periods: 26, label: 'Bi-weekly' },
+  semimonthly: { periods: 24, label: 'Semi-monthly' },
+  monthly: { periods: 12, label: 'Monthly' },
+  annual: { periods: 1, label: 'Annual salary' },
+};
+
+export const PROVINCE_CODES = ['BC', 'AB', 'ON', 'MB', 'SK', 'QC', 'NB', 'NS', 'PE', 'NL', 'YT', 'NT', 'NU'];
+export const RENTAL_TYPES = ['long_term', 'short_term', 'commercial'];
+export const RENTAL_TYPE_LABELS = { long_term: 'Long-term', short_term: 'Short-term', commercial: 'Commercial' };
+export const SERVICE_LEVELS = ['basic', 'hotel_like'];
+
+export function bracketTax(brackets, income) {
+  let tax = 0;
+  let lower = 0;
+  for (const b of brackets || []) {
+    if (income <= lower) break;
+    tax += (Math.min(income, b.upper) - lower) * b.rate;
+    lower = b.upper;
+  }
+  return tax;
+}
+
+export function federalBpa(income, fed) {
+  if (income <= fed.phaseOutStart) return fed.bpaMax;
+  if (income >= fed.phaseOutEnd) return fed.bpaBase;
+  return fed.bpaMax - (fed.bpaMax - fed.bpaBase) * ((income - fed.phaseOutStart) / (fed.phaseOutEnd - fed.phaseOutStart));
+}
+
+export function ontarioHealthPremium(taxableIncome, tiers) {
+  // Graduated tiers: the premium steps up at each threshold (the
+  // within-tier percentages in CRA tables are approximated by the
+  // tier ceilings here — the premium is an estimate line, labelled so).
+  let premium = 0;
+  for (const t of tiers || []) {
+    if (taxableIncome > t.upper) premium = t.premium;
+    else break;
+  }
+  // The top tier's ceiling is the $900 cap.
+  return premium;
+}
+
+function ontarioSurtax(basicTax, surtax) {
+  // Surtax tiers stack: each slice between thresholds is taxed at
+  // that tier's rate (20% over $5,818, plus 36% over $7,446).
+  let total = 0;
+  const sorted = [...(surtax || [])].sort((a, b) => a.threshold - b.threshold);
+  for (let i = 0; i < sorted.length; i++) {
+    const lo = sorted[i].threshold;
+    const hi = i + 1 < sorted.length ? sorted[i + 1].threshold : Infinity;
+    if (basicTax > lo) total += (Math.min(basicTax, hi) - lo) * sorted[i].rate;
+  }
+  return total;
+}
+
+// ------------------------------------------------------------ salary --
+const cleanStr = (v, max) => {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s ? s.slice(0, max) : null;
+};
+const numOr = (v, dflt) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : dflt;
+};
+const optNum = (v) => {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+export function validJobInput(body) {
+  const b = body || {};
+  const employer = cleanStr(b.employer, 120);
+  if (!employer) return { error: 'employer is required.' };
+  const province = String(b.province || '').toUpperCase();
+  if (!PROVINCE_CODES.includes(province)) return { error: 'province must be a Canadian province or territory code.' };
+  const frequency = String(b.frequency || '');
+  if (!PAY_FREQUENCIES[frequency]) return { error: 'frequency must be weekly, biweekly, semimonthly, monthly or annual.' };
+  const grossAmount = Number(b.gross_amount);
+  if (!Number.isFinite(grossAmount) || grossAmount < 0) return { error: 'gross amount must be a number ≥ 0.' };
+  const grossBasis = b.gross_basis === 'period' ? 'period' : 'annual';
+  const taxYear = Number(b.tax_year);
+  if (!Number.isInteger(taxYear) || taxYear < 2000 || taxYear > 2100) return { error: 'tax year must be a valid year.' };
+  const currency = cleanStr(b.currency, 3) || 'CAD';
+  // Deliberately no SIN, birth date, bank details, employer payroll
+  // account number, or T4 fields: none of them affect this estimate.
+  return {
+    employer, province, frequency, gross_amount: grossAmount, gross_basis: grossBasis,
+    tax_year: taxYear, currency: currency.toUpperCase(),
+    td1_federal: optNum(b.td1_federal), td1_provincial: optNum(b.td1_provincial),
+    ytd_cpp: numOr(b.ytd_cpp, 0), ytd_cpp2: numOr(b.ytd_cpp2, 0), ytd_ei: numOr(b.ytd_ei, 0),
+    cpp_exempt: b.cpp_exempt === true || b.cpp_exempt === 1 || b.cpp_exempt === '1',
+    ei_exempt: b.ei_exempt === true || b.ei_exempt === 1 || b.ei_exempt === '1',
+  };
+}
+
+export function calcSalary(job, payroll) {
+  const periods = PAY_FREQUENCIES[job.frequency].periods;
+  const annualGross = job.gross_basis === 'period' ? job.gross_amount * periods : job.gross_amount;
+  const perPeriodGross = annualGross / periods;
+  const warnings = [];
+  const { cpp, ei, federal } = payroll;
+  let cppAnnual = 0;
+  let cpp2Annual = 0;
+  let eiAnnual = 0;
+  if (!job.cpp_exempt) {
+    cppAnnual = Math.max(0, Math.min(Math.max(0, Math.min(annualGross, cpp.ympe) - cpp.exemption) * cpp.rate, cpp.max) - (job.ytd_cpp || 0));
+    cpp2Annual = Math.max(0, Math.min(Math.max(0, annualGross - cpp.ympe) * cpp.cpp2Rate, cpp.max2) - (job.ytd_cpp2 || 0));
+  }
+  if (!job.ei_exempt) {
+    eiAnnual = Math.max(0, Math.min(annualGross, ei.mie) * ei.rate - (job.ytd_ei || 0));
+  }
+  const cppBase = job.cpp_exempt ? 0
+    : Math.min(Math.max(0, Math.min(annualGross, cpp.ympe) - cpp.exemption) * cpp.baseRate,
+      Math.max(0, (cpp.ympe - cpp.exemption) * cpp.baseRate));
+  const cppEnhancement = Math.max(0, (cppAnnual + (job.ytd_cpp || 0) + cpp2Annual + (job.ytd_cpp2 || 0)) - cppBase);
+  const taxable = Math.max(0, annualGross - cppEnhancement);
+  const td1Federal = job.td1_federal != null ? job.td1_federal : federalBpa(taxable, federal);
+  const employmentCredit = Math.min(annualGross, federal.employmentAmountMax) * federal.lowestRate;
+  const federalTax = Math.max(0, bracketTax(federal.brackets, taxable)
+    - (td1Federal + cppBase + eiAnnual + (job.ytd_ei || 0)) * federal.lowestRate - employmentCredit);
+  const prov = payroll.provinces[job.province];
+  let provincialTax = null;
+  let healthPremium = 0;
+  if (prov && prov.verified) {
+    const td1Prov = job.td1_provincial != null ? job.td1_provincial : prov.bpa;
+    const basic = Math.max(0, bracketTax(prov.brackets, taxable)
+      - (td1Prov + cppBase + eiAnnual + (job.ytd_ei || 0)) * prov.lowestRate);
+    provincialTax = basic;
+    if (prov.surtax) provincialTax += ontarioSurtax(basic, prov.surtax);
+    if (prov.healthPremium) {
+      healthPremium = ontarioHealthPremium(taxable, prov.healthPremium);
+      provincialTax += healthPremium;
+    }
+  } else {
+    warnings.push(prov && prov.note
+      ? `Provincial table unverified — ${prov.note} Federal tax, CPP and EI are computed; provincial tax is not.`
+      : 'Provincial table unverified — federal tax, CPP and EI are computed; provincial tax is not.');
+  }
+  const totalTax = federalTax + (provincialTax || 0);
+  const netAnnual = annualGross - cppAnnual - cpp2Annual - eiAnnual - totalTax;
+  const div = (n) => round2(n / periods);
+  return {
+    annualGross: round2(annualGross), perPeriodGross: round2(perPeriodGross),
+    cpp: round2(cppAnnual), cpp2: round2(cpp2Annual), ei: round2(eiAnnual),
+    cppBase: round2(cppBase), cppEnhancement: round2(cppEnhancement),
+    taxableIncome: round2(taxable), td1Federal: round2(td1Federal),
+    federalTax: round2(federalTax), provincialTax: provincialTax == null ? null : round2(provincialTax),
+    healthPremium: round2(healthPremium), totalTax: round2(totalTax), netAnnual: round2(netAnnual),
+    perPeriod: {
+      gross: round2(perPeriodGross), cpp: div(cppAnnual), cpp2: div(cpp2Annual), ei: div(eiAnnual),
+      federalTax: div(federalTax), provincialTax: provincialTax == null ? null : div(provincialTax),
+      totalTax: div(totalTax), net: div(netAnnual),
+    },
+    provinceVerified: !!(prov && prov.verified),
+    provinceLabel: prov ? prov.label : job.province,
+    estimateNote: 'Estimate — actual tax is settled on the T1.',
+    warnings,
+  };
+}
+
+// ------------------------------------------------------------ rental --
+export function validRentalInput(body) {
+  const b = body || {};
+  const label = cleanStr(b.label, 160);
+  if (!label) return { error: 'label is required.' };
+  const rentalType = String(b.rental_type || '');
+  if (!RENTAL_TYPES.includes(rentalType)) return { error: 'rental_type must be long_term, short_term or commercial.' };
+  const servicesLevel = String(b.services_level || 'basic');
+  if (!SERVICE_LEVELS.includes(servicesLevel)) return { error: 'services_level must be basic or hotel_like.' };
+  const ownershipPct = Number(b.ownership_pct);
+  if (!Number.isFinite(ownershipPct) || ownershipPct <= 0 || ownershipPct > 100) {
+    return { error: 'ownership_pct must be between 0 and 100.' };
+  }
+  const propertyId = b.property_id == null || b.property_id === '' ? null : Number(b.property_id);
+  if (propertyId != null && (!Number.isInteger(propertyId) || propertyId <= 0)) {
+    return { error: 'property_id must be an existing property id.' };
+  }
+  // Deliberately no tenant identifiers, mortgage account number, or
+  // GST fields here: long-term rent is GST-exempt, and GST fields
+  // only exist on the short-term/commercial path (year records).
+  return {
+    label, rental_type: rentalType, services_level: servicesLevel, ownership_pct: ownershipPct,
+    property_id: propertyId, address: cleanStr(b.address, 240),
+    is_principal_residence: b.is_principal_residence === true || b.is_principal_residence === 1 || b.is_principal_residence === '1',
+    was_principal_residence: b.was_principal_residence === true || b.was_principal_residence === 1 || b.was_principal_residence === '1',
+    structural_change: b.structural_change === true || b.structural_change === 1 || b.structural_change === '1',
+  };
+}
+
+export function validRentalYearInput(body, t776Lines) {
+  const b = body || {};
+  const taxYear = Number(b.tax_year);
+  if (!Number.isInteger(taxYear) || taxYear < 2000 || taxYear > 2100) return { error: 'tax year must be a valid year.' };
+  const grossRents = Number(b.gross_rents);
+  if (!Number.isFinite(grossRents) || grossRents < 0) return { error: 'gross_rents must be a number ≥ 0.' };
+  const otherIncome = numOr(b.other_income, 0);
+  if (otherIncome < 0) return { error: 'other_income must be ≥ 0.' };
+  const areaShare = numOr(b.area_share_pct, 100);
+  if (areaShare <= 0 || areaShare > 100) return { error: 'area_share_pct must be between 0 and 100.' };
+  const rentalDays = Number(b.rental_days);
+  if (!Number.isInteger(rentalDays) || rentalDays < 0 || rentalDays > 366) {
+    return { error: 'rental_days must be between 0 and 366.' };
+  }
+  const mortgageInterest = numOr(b.mortgage_interest, 0);
+  const mortgagePrincipal = numOr(b.mortgage_principal, 0);
+  if (mortgageInterest < 0 || mortgagePrincipal < 0) return { error: 'mortgage interest and principal must be ≥ 0.' };
+  // Expenses: [{line, amount, direct}] — line must be a T776 line.
+  const lineSet = new Set((t776Lines || []).map((l) => l.line));
+  const expenses = [];
+  if (Array.isArray(b.expenses)) {
+    for (const e of b.expenses) {
+      if (!e || !lineSet.has(String(e.line))) return { error: `expense line ${e && e.line} is not a T776 line.` };
+      const amount = Number(e.amount);
+      if (!Number.isFinite(amount) || amount < 0) return { error: 'expense amounts must be ≥ 0.' };
+      if (String(e.line) === '8710') return { error: 'line 8710 comes from mortgage interest — enter it as mortgage interest, not as an expense.' };
+      expenses.push({ line: String(e.line), amount, direct: e.direct === true || e.direct === 1 || e.direct === '1' });
+    }
+  }
+  const claimCca = b.claim_cca === true || b.claim_cca === 1 || b.claim_cca === '1';
+  return {
+    tax_year: taxYear, gross_rents: grossRents, other_income: otherIncome,
+    area_share_pct: areaShare, rental_days: rentalDays,
+    mortgage_interest: mortgageInterest, mortgage_principal: mortgagePrincipal,
+    expenses, claim_cca: claimCca,
+    cca_acknowledged: b.cca_acknowledged === true || b.cca_acknowledged === 1 || b.cca_acknowledged === '1',
+    ucc_class1: optNum(b.ucc_class1), ucc_class8: optNum(b.ucc_class8),
+    str_compliant_days: b.str_compliant_days == null ? null : Number(b.str_compliant_days),
+    str_non_compliant_days: b.str_non_compliant_days == null ? null : Number(b.str_non_compliant_days),
+  };
+}
+
+export function calcRentalYear(rental, year, rentalRegion) {
+  const warnings = [];
+  const factor = (year.area_share_pct / 100) * (year.rental_days / 365);
+  const byLine = {};
+  for (const l of rentalRegion.t776Lines) byLine[l.line] = 0;
+  let directTotal = 0;
+  let sharedTotal = 0;
+  for (const e of year.expenses || []) {
+    if (e.direct) directTotal += e.amount;
+    else sharedTotal += e.amount;
+    byLine[e.line] = round2((byLine[e.line] || 0) + e.amount);
+  }
+  // Mortgage interest flows to 8710 (it is an expense); principal
+  // never flows anywhere in the expense set.
+  byLine['8710'] = round2((byLine['8710'] || 0) + year.mortgage_interest);
+  const deductibleShared = sharedTotal * factor;
+  const personalPortion = round2(sharedTotal * (1 - factor));
+  const deductibleExpenses = round2(directTotal + deductibleShared + year.mortgage_interest);
+  const grossWhole = round2(year.gross_rents + year.other_income);
+  let netBeforeCca = round2(grossWhole - deductibleExpenses);
+  // s.67.7: short-term non-compliant days deny expenses pro-rata.
+  let deniedExpenses = 0;
+  if (rental.rental_type === 'short_term' && year.str_non_compliant_days > 0) {
+    const totalDays = (year.str_compliant_days || 0) + year.str_non_compliant_days;
+    if (totalDays > 0) {
+      deniedExpenses = round2(deductibleExpenses * (year.str_non_compliant_days / totalDays));
+      netBeforeCca = round2(netBeforeCca + deniedExpenses);
+      warnings.push(`s.67.7: ${year.str_non_compliant_days} non-compliant short-term days deny $${deniedExpenses.toFixed(2)} of expenses.`);
+    }
+  }
+  // CCA: optional, capped at net-before-CCA (never creates or
+  // increases a loss), blocked on (former) principal residences
+  // unless explicitly acknowledged (the PRE trap).
+  let ccaClaim = 0;
+  if (year.claim_cca) {
+    const isPr = rental.is_principal_residence || rental.was_principal_residence;
+    if (isPr && !year.cca_acknowledged) {
+      warnings.push('CCA blocked: claiming CCA on a (former) principal residence can end its principal-residence exemption. Acknowledge the trade-off to claim.');
+    } else {
+      if (isPr && year.cca_acknowledged) {
+        warnings.push('CCA acknowledged on a (former) principal residence — the principal-residence exemption for the rented portion is at risk.');
+      }
+      const maxClaim = rentalRegion.ccaClasses.reduce((sum, c) => {
+        const ucc = c.class === 1 ? (year.ucc_class1 || 0) : (year.ucc_class8 || 0);
+        return sum + ucc * c.rate;
+      }, 0);
+      ccaClaim = round2(Math.min(maxClaim, Math.max(0, netBeforeCca)));
+    }
+  }
+  const netWhole = round2(netBeforeCca - ccaClaim);
+  const ownerShare = round2(netWhole * (rental.ownership_pct / 100));
+  const filing = rental.services_level === 'hotel_like' ? 'T2125' : 'T776';
+  if (filing === 'T2125') {
+    warnings.push('Hotel-like services (meals, daily cleaning during a stay, concierge) make this business income — report on T2125, not T776.');
+  }
+  const gst = rental.rental_type === 'long_term'
+    ? { status: 'exempt', note: 'Long-term residential rent is GST/HST-exempt — no GST field applies.' }
+    : rental.rental_type === 'short_term'
+      ? { status: 'taxable', note: 'Short-term rent is a taxable supply — GST/HST registration is mandatory once taxable supplies exceed $30,000 over four quarters.' }
+      : { status: 'taxable', note: 'Commercial rent is a taxable supply.' };
+  return {
+    grossWhole, otherIncome: round2(year.other_income),
+    expensesByLine: byLine, totalExpensesEntered: round2(directTotal + sharedTotal),
+    personalPortion9949: personalPortion, deductibleExpenses,
+    mortgageInterest: round2(year.mortgage_interest), mortgagePrincipal: round2(year.mortgage_principal),
+    deniedExpenses, netBeforeCca9369: netBeforeCca, ccaClaim9936: ccaClaim,
+    netWhole9946: netWhole, ownerShareNet: ownerShare, ownershipPct: rental.ownership_pct,
+    filing, gst, warnings,
+  };
+}

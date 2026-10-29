@@ -332,7 +332,7 @@ let currentAssetId = null;
 let currentSection = 'overview';
 
 function showView(name) {
-  for (const v of ['assets', 'property', 'asset', 'invest-account', 'invest-holding', 'spending', 'planning', 'tax', 'admin']) {
+  for (const v of ['assets', 'property', 'asset', 'invest-account', 'invest-holding', 'earnings', 'spending', 'planning', 'tax', 'admin']) {
     $('#view-' + v).classList.toggle('hidden', v !== name);
   }
   document.querySelectorAll('#mainNav a').forEach((a) =>
@@ -370,6 +370,14 @@ function route() {
   } else if (hash === '#admin') {
     showView('admin');
     loadAdmin();
+  } else if (hash === '#earnings' || hash.startsWith('#earnings/')) {
+    showView('earnings');
+    const sub = hash.split('/')[1] || 'salary';
+    $('#earn-salary').classList.toggle('hidden', sub !== 'salary');
+    $('#earn-rentals').classList.toggle('hidden', sub !== 'rentals');
+    document.querySelectorAll('#earningsNav a').forEach((a) =>
+      a.classList.toggle('active', a.dataset.section === sub));
+    loadEarnings();
   } else if (['#spending', '#planning', '#tax'].includes(hash)) {
     showView(hash.slice(1));
   } else {
@@ -7056,6 +7064,226 @@ for (const level of ['investAccount', 'investHolding']) {
     wireInvestRangeControls(level);
   }
 }
+
+// --------------------------------------------------------------- earnings ---
+// Earnings: salary + rentals. Flows, never assets — nothing here feeds
+// the net-worth summary. All computed figures come from the server;
+// the panel only renders them.
+let earnData = null;
+let earnEditJobId = null;
+let earnEditRentalId = null;
+let earnYearRentalId = null;
+let earnEditYearId = null;
+
+function earnJobCard(j) {
+  const c = j.calc;
+  const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
+  return `<div class="panel">
+    <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
+    <div class="spacer"></div>
+    <button class="small" onclick="earnEditJob(${j.id})">Edit</button>
+    <button class="small danger" onclick="earnDeleteJob(${j.id})">Delete</button></div>
+    <div class="summary-strip">
+      <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
+      <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(c.netAnnual)}</div></div>
+      <div class="summary-card"><div class="k">Net per pay period</div><div class="v">${money2(c.perPeriod.net)}</div></div>
+      <div class="summary-card"><div class="k">Total tax</div><div class="v">${money2(c.totalTax)}</div></div>
+    </div>
+    <table><tbody>
+      <tr><td>Federal tax</td><td>${money2(c.federalTax)}</td><td>CPP</td><td>${money2(c.cpp)}</td></tr>
+      <tr><td>Provincial tax (${esc(c.provinceLabel)})</td><td>${c.provincialTax == null ? '—' : money2(c.provincialTax)}</td><td>CPP2</td><td>${money2(c.cpp2)}</td></tr>
+      <tr><td>Taxable income</td><td>${money2(c.taxableIncome)}</td><td>EI</td><td>${money2(c.ei)}</td></tr>
+    </tbody></table>
+    ${c.provincialTax == null ? `<div class="msg warn">Provincial table unverified — provincial tax is not computed for ${esc(j.province)}.</div>` : ''}
+    ${c.warnings.map((w) => `<div class="msg warn">${esc(w)}</div>`).join('')}
+    <div class="note">${esc(c.estimateNote)}</div>
+  </div>`;
+}
+
+function earnYearBlock(r, y) {
+  const c = y.calc;
+  const lines = Object.entries(c.expensesByLine).filter(([, v]) => v)
+    .map(([line, v]) => `<tr><td>${line}</td><td>${money2(v)}</td></tr>`).join('');
+  return `<div class="panel">
+    <div class="section-head"><h3>${y.tax_year}</h3><div class="spacer"></div>
+    <button class="small" onclick="earnEditYear(${r.id}, ${y.id})">Edit</button>
+    <button class="small danger" onclick="earnDeleteYear(${r.id}, ${y.id})">Delete</button></div>
+    <table><tbody>
+      <tr><td>Gross rents (whole property)</td><td>${money2(c.grossWhole)}</td></tr>
+      <tr><td>Deductible expenses</td><td>${money2(c.deductibleExpenses)}</td></tr>
+      <tr><td>Personal portion (9949)</td><td>${money2(c.personalPortion9949)}</td></tr>
+      <tr><td>Net before CCA (9369)</td><td>${money2(c.netBeforeCca9369)}</td></tr>
+      <tr><td>CCA claimed (9936)</td><td>${money2(c.ccaClaim9936)}</td></tr>
+      <tr><td>Net, whole property (9946)</td><td>${money2(c.netWhole9946)}</td></tr>
+      <tr><td>Owner share (${r.ownership_pct}%)</td><td>${money2(c.ownerShareNet)}</td></tr>
+      <tr><td>Mortgage principal (never deductible)</td><td>${money2(c.mortgagePrincipal)}</td></tr>
+    </tbody></table>
+    ${lines ? `<table><tbody>${lines}</tbody></table>` : ''}
+    <div class="note">Filing: ${esc(c.filing)} · GST/HST: ${esc(c.gst.status)} — ${esc(c.gst.note)}</div>
+    ${c.warnings.map((w) => `<div class="msg warn">${esc(w)}</div>`).join('')}
+  </div>`;
+}
+
+function earnRentalCard(r) {
+  return `<div class="panel">
+    <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span>
+    <div class="spacer"></div>
+    <button class="small" onclick="earnAddYear(${r.id})">+ Year record</button>
+    <button class="small" onclick="earnEditRental(${r.id})">Edit</button>
+    <button class="small danger" onclick="earnDeleteRental(${r.id})">Delete</button></div>
+    ${r.years.length ? r.years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
+  </div>`;
+}
+
+async function loadEarnings() {
+  try {
+    earnData = await api('/api/earnings');
+    $('#earnJobProvince').innerHTML = earnData.payrollProvinces.map((p) =>
+      `<option value="${p.code}">${esc(p.label)}${p.verified ? '' : ' (unverified)'}</option>`).join('');
+    $('#earnJobFrequency').innerHTML = earnData.payFrequencies.map((f) =>
+      `<option value="${f.key}">${esc(f.label)}</option>`).join('');
+    $('#earnJobList').innerHTML = earnData.jobs.length
+      ? earnData.jobs.map(earnJobCard).join('')
+      : '<div class="note">No jobs yet.</div>';
+    $('#earnRentalList').innerHTML = earnData.rentals.length
+      ? earnData.rentals.map(earnRentalCard).join('')
+      : '<div class="note">No rentals yet.</div>';
+  } catch (e) { showMsg($('#earnSalaryMsg'), 'err', e.message); }
+}
+
+function earnReadForm(form) {
+  const data = {};
+  new FormData(form).forEach((v, k) => { data[k] = v; });
+  for (const el of form.querySelectorAll('input[type=checkbox]')) data[el.name] = el.checked;
+  return data;
+}
+
+$('#addEarnJobBtn').onclick = () => {
+  earnEditJobId = null;
+  $('#earnJobFormTitle').textContent = 'Add job';
+  $('#earnJobForm').reset();
+  $('#earnJobFormPanel').classList.remove('hidden');
+};
+$('#earnJobCancelBtn').onclick = () => $('#earnJobFormPanel').classList.add('hidden');
+$('#earnJobForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const body = earnReadForm(e.target);
+    if (earnEditJobId) await api(`/api/earnings/jobs/${earnEditJobId}`, { method: 'PUT', body });
+    else await api('/api/earnings/jobs', { method: 'POST', body });
+    $('#earnJobFormPanel').classList.add('hidden');
+    loadEarnings();
+  } catch (err) { showMsg($('#earnSalaryMsg'), 'err', err.message); }
+};
+window.earnEditJob = (id) => {
+  const j = earnData.jobs.find((x) => x.id === id);
+  if (!j) return;
+  earnEditJobId = id;
+  $('#earnJobFormTitle').textContent = 'Edit job';
+  const f = $('#earnJobForm');
+  f.employer.value = j.employer; f.currency.value = j.currency; f.province.value = j.province;
+  f.frequency.value = j.frequency; f.gross_amount.value = j.gross_amount; f.gross_basis.value = j.gross_basis;
+  f.tax_year.value = j.tax_year; f.td1_federal.value = j.td1_federal ?? ''; f.td1_provincial.value = j.td1_provincial ?? '';
+  f.ytd_cpp.value = j.ytd_cpp; f.ytd_cpp2.value = j.ytd_cpp2; f.ytd_ei.value = j.ytd_ei;
+  f.cpp_exempt.checked = j.cpp_exempt; f.ei_exempt.checked = j.ei_exempt;
+  $('#earnJobFormPanel').classList.remove('hidden');
+};
+window.earnDeleteJob = async (id) => {
+  if (!confirm('Delete this job?')) return;
+  await api(`/api/earnings/jobs/${id}`, { method: 'DELETE' });
+  loadEarnings();
+};
+
+$('#addEarnRentalBtn').onclick = () => {
+  earnEditRentalId = null;
+  $('#earnRentalFormTitle').textContent = 'Add rental';
+  $('#earnRentalForm').reset();
+  $('#earnRentalFormPanel').classList.remove('hidden');
+};
+$('#earnRentalCancelBtn').onclick = () => $('#earnRentalFormPanel').classList.add('hidden');
+$('#earnRentalForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const body = earnReadForm(e.target);
+    if (earnEditRentalId) await api(`/api/earnings/rentals/${earnEditRentalId}`, { method: 'PUT', body });
+    else await api('/api/earnings/rentals', { method: 'POST', body });
+    $('#earnRentalFormPanel').classList.add('hidden');
+    loadEarnings();
+  } catch (err) { showMsg($('#earnRentalMsg'), 'err', err.message); }
+};
+window.earnEditRental = (id) => {
+  const r = earnData.rentals.find((x) => x.id === id);
+  if (!r) return;
+  earnEditRentalId = id;
+  $('#earnRentalFormTitle').textContent = 'Edit rental';
+  const f = $('#earnRentalForm');
+  f.label.value = r.label; f.property_id.value = r.property_id ?? ''; f.address.value = r.address || '';
+  f.rental_type.value = r.rental_type; f.services_level.value = r.services_level; f.ownership_pct.value = r.ownership_pct;
+  f.is_principal_residence.checked = r.is_principal_residence; f.was_principal_residence.checked = r.was_principal_residence;
+  f.structural_change.checked = r.structural_change;
+  $('#earnRentalFormPanel').classList.remove('hidden');
+};
+window.earnDeleteRental = async (id) => {
+  if (!confirm('Delete this rental and all its year records?')) return;
+  await api(`/api/earnings/rentals/${id}`, { method: 'DELETE' });
+  loadEarnings();
+};
+
+function earnExpenseRow(line = '', amount = '', direct = false) {
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `<select class="earn-exp-line">${earnData.t776Lines.filter((l) => l.line !== '8710').map((l) =>
+    `<option value="${l.line}" ${l.line === line ? 'selected' : ''}>${l.line} ${esc(l.label)}</option>`).join('')}</select>
+    <input class="earn-exp-amount" type="number" step="0.01" min="0" value="${amount}" placeholder="Amount">
+    <label><input class="earn-exp-direct" type="checkbox" ${direct ? 'checked' : ''}> Direct</label>
+    <button type="button" class="small" onclick="this.parentElement.remove()">Remove</button>`;
+  return wrap;
+}
+$('#earnExpenseAddBtn').onclick = () => $('#earnExpenseRows').appendChild(earnExpenseRow());
+window.earnAddYear = (rentalId) => {
+  earnYearRentalId = rentalId; earnEditYearId = null;
+  $('#earnRentalYearFormTitle').textContent = 'Add year record';
+  $('#earnRentalYearForm').reset();
+  $('#earnExpenseRows').innerHTML = '';
+  $('#earnRentalYearFormPanel').classList.remove('hidden');
+};
+$('#earnRentalYearCancelBtn').onclick = () => $('#earnRentalYearFormPanel').classList.add('hidden');
+$('#earnRentalYearForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const body = earnReadForm(e.target);
+    body.expenses = [...document.querySelectorAll('#earnExpenseRows > div')].map((row) => ({
+      line: row.querySelector('.earn-exp-line').value,
+      amount: Number(row.querySelector('.earn-exp-amount').value || 0),
+      direct: row.querySelector('.earn-exp-direct').checked,
+    }));
+    if (earnEditYearId) await api(`/api/earnings/rentals/${earnYearRentalId}/years/${earnEditYearId}`, { method: 'PUT', body });
+    else await api(`/api/earnings/rentals/${earnYearRentalId}/years`, { method: 'POST', body });
+    $('#earnRentalYearFormPanel').classList.add('hidden');
+    loadEarnings();
+  } catch (err) { showMsg($('#earnRentalMsg'), 'err', err.message); }
+};
+window.earnEditYear = (rentalId, yearId) => {
+  const r = earnData.rentals.find((x) => x.id === rentalId);
+  const y = r && r.years.find((v) => v.id === yearId);
+  if (!y) return;
+  earnYearRentalId = rentalId; earnEditYearId = yearId;
+  $('#earnRentalYearFormTitle').textContent = 'Edit year record';
+  const f = $('#earnRentalYearForm');
+  f.tax_year.value = y.tax_year; f.gross_rents.value = y.gross_rents; f.other_income.value = y.other_income;
+  f.area_share_pct.value = y.area_share_pct; f.rental_days.value = y.rental_days;
+  f.mortgage_interest.value = y.mortgage_interest; f.mortgage_principal.value = y.mortgage_principal;
+  f.claim_cca.checked = y.claim_cca; f.cca_acknowledged.checked = y.cca_acknowledged;
+  f.ucc_class1.value = y.ucc_class1 ?? ''; f.ucc_class8.value = y.ucc_class8 ?? '';
+  f.str_compliant_days.value = y.str_compliant_days ?? ''; f.str_non_compliant_days.value = y.str_non_compliant_days ?? '';
+  $('#earnExpenseRows').innerHTML = '';
+  for (const ex of y.expenses) $('#earnExpenseRows').appendChild(earnExpenseRow(ex.line, ex.amount, ex.direct));
+  $('#earnRentalYearFormPanel').classList.remove('hidden');
+};
+window.earnDeleteYear = async (rentalId, yearId) => {
+  if (!confirm('Delete this year record?')) return;
+  await api(`/api/earnings/rentals/${rentalId}/years/${yearId}`, { method: 'DELETE' });
+  loadEarnings();
+};
 
 (async () => {
   try {
