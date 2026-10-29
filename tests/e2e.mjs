@@ -8571,22 +8571,34 @@ try {
       const hFull = hMonths.length;
       const hFirst = hMonths[0];
       const hLast = hMonths[hMonths.length - 1];
-      const holdRangeState = () => page.evaluate(() => ({
-        labels: window.__fmCharts.investHolding ? window.__fmCharts.investHolding.data.labels : [],
-        rows: [...document.querySelectorAll('#investHoldingMonthly tbody tr')].map((tr) => tr.children[0].textContent),
-      }));
+      const holdRangeState = () => page.evaluate(() => {
+        const sel = document.querySelector('#investHoldingMonthly select');
+        return {
+          labels: window.__fmCharts.investHolding ? window.__fmCharts.investHolding.data.labels : [],
+          rows: [...document.querySelectorAll('#investHoldingMonthly tbody tr')].map((tr) => tr.children[0].textContent),
+          hasSelect: !!sel, selValue: sel ? sel.value : null,
+          selOptions: sel ? [...sel.options].map((o) => o.value) : [],
+        };
+      });
+      // The table pages by year when the range spans years
+      // (the chart keeps the full range): expectations below
+      // are the latest year's page, not the whole window.
+      const latestYearOf = (months) => months.filter((m) => m.startsWith(months[months.length - 1].slice(0, 4)));
       let rs = await holdRangeState();
-      check('investments UI: the holding range defaults to All — chart points and table rows span the full history',
-        rs.labels.length === hFull && rs.rows.length === hFull && rs.rows[0] === hFirst && rs.rows[rs.rows.length - 1] === hLast,
+      const hLatest = latestYearOf(hMonths);
+      check('investments UI: the holding range defaults to All — chart spans the full history, table pages to the latest year',
+        rs.labels.length === hFull && rs.rows.length === hLatest.length && rs.rows[0] === hLatest[0] && rs.rows[rs.rows.length - 1] === hLast
+          && rs.hasSelect && rs.selValue === hLast.slice(0, 4),
         JSON.stringify({ points: rs.labels.length, rows: rs.rows.length, full: hFull }));
       await page.click('#invRangeBtns-investHolding button[data-months="12"]');
       await waitI(400);
       rs = await holdRangeState();
       const hWin = Math.min(12, hFull);
-      check('investments UI: the 1 year preset converges chart and table to the last 12 months of data',
-        rs.labels.length === hWin && rs.rows.length === hWin
+      const hWinLatest = latestYearOf(hMonths.slice(-hWin));
+      check('investments UI: the 1 year preset converges the chart to the last 12 months and pages the table to its latest year',
+        rs.labels.length === hWin && rs.rows.length === hWinLatest.length
           && rs.labels[0] === addMonthsStr2(hLast, -(hWin - 1)) && rs.labels[rs.labels.length - 1] === hLast
-          && rs.rows[0] === addMonthsStr2(hLast, -(hWin - 1)) && rs.rows[rs.rows.length - 1] === hLast,
+          && rs.rows[0] === hWinLatest[0] && rs.rows[rs.rows.length - 1] === hLast,
         JSON.stringify({ points: rs.labels.length, rows: rs.rows.length, first: rs.rows[0], last: rs.rows[rs.rows.length - 1] }));
       // Manual From/To through the month popover: a 12-month
       // window starting 30 months after the first data month.
@@ -8608,43 +8620,57 @@ try {
       await pickMonth('#invRangeStart-investHolding', '#invMonthPop-investHolding', mFrom);
       await pickMonth('#invRangeEnd-investHolding', '#invMonthPop-investHolding', mTo);
       rs = await holdRangeState();
-      check('investments UI: a manual From/To pair drives the table first/last rows and the chart window',
-        rs.rows.length === 12 && rs.rows[0] === mFrom && rs.rows[rs.rows.length - 1] === mTo
+      const winMonths = [];
+      for (let i = 0; i < 12; i++) winMonths.push(addMonthsStr2(mFrom, i));
+      const toYearRows = winMonths.filter((m) => m.startsWith(mTo.slice(0, 4)));
+      check('investments UI: a manual From/To pair drives the chart window and defaults the table to the latest year page',
+        rs.rows.length === toYearRows.length && rs.rows[0] === toYearRows[0] && rs.rows[rs.rows.length - 1] === mTo
           && rs.labels.length === 12 && rs.labels[0] === mFrom && rs.labels[rs.labels.length - 1] === mTo,
         JSON.stringify({ rows: rs.rows.length, first: rs.rows[0], last: rs.rows[rs.rows.length - 1], want: [mFrom, mTo] }));
+      await page.select('#investHoldingMonthly select', mFrom.slice(0, 4));
+      await waitI(400);
+      rs = await holdRangeState();
+      const fromYearRows = winMonths.filter((m) => m.startsWith(mFrom.slice(0, 4)));
+      check('investments UI: switching the year page shows only that year, chart window unchanged',
+        rs.rows.length === fromYearRows.length && rs.rows[0] === mFrom && rs.rows[rs.rows.length - 1] === fromYearRows[fromYearRows.length - 1]
+          && rs.labels.length === 12 && rs.labels[0] === mFrom && rs.labels[rs.labels.length - 1] === mTo,
+        JSON.stringify({ rows: rs.rows.length, first: rs.rows[0], last: rs.rows[rs.rows.length - 1] }));
       await page.click('#invRangeBtns-investHolding button[data-months="0"]');
       await waitI(400);
       rs = await holdRangeState();
-      check('investments UI: back to All restores the full chart and table',
-        rs.labels.length === hFull && rs.rows.length === hFull,
+      check('investments UI: back to All restores the full chart and re-defaults the table to the latest year',
+        rs.labels.length === hFull && rs.rows.length === hLatest.length && rs.rows[0] === hLatest[0],
         JSON.stringify({ points: rs.labels.length, rows: rs.rows.length, full: hFull }));
 
       // Same linkage on the portfolio overview.
       r = await req('GET', '/api/investments');
-      const pFull = (r.data.monthly || []).length;
+      const pMonths = (r.data.monthly || []).map((x) => x.month);
+      const pFull = pMonths.length;
+      const pLatest = pMonths.filter((m) => m.startsWith(pMonths[pMonths.length - 1].slice(0, 4)));
       await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitI(1200);
       const pfRangeState = () => page.evaluate(() => ({
         labels: window.__fmCharts.investments ? window.__fmCharts.investments.data.labels : [],
-        rows: document.querySelectorAll('#investPortfolioMonthly tbody tr').length,
+        rows: [...document.querySelectorAll('#investPortfolioMonthly tbody tr')].map((tr) => tr.children[0].textContent),
       }));
       let ps = await pfRangeState();
-      check('investments UI: the portfolio range defaults to All',
-        ps.labels.length === pFull && ps.rows === pFull,
-        JSON.stringify({ points: ps.labels.length, rows: ps.rows, full: pFull }));
+      check('investments UI: the portfolio range defaults to All — chart spans everything, table pages to the latest year',
+        ps.labels.length === pFull && ps.rows.length === pLatest.length && ps.rows[0] === pLatest[0],
+        JSON.stringify({ points: ps.labels.length, rows: ps.rows.length, full: pFull }));
       await page.click('#invRangeBtns-investments button[data-months="12"]');
       await waitI(400);
       ps = await pfRangeState();
       const pWin = Math.min(12, pFull);
-      check('investments UI: the portfolio 1 year preset converges its chart and table too',
-        ps.labels.length === pWin && ps.rows === pWin,
-        JSON.stringify({ points: ps.labels.length, rows: ps.rows, want: pWin }));
+      const pWinLatest = pMonths.slice(-pWin).filter((m) => m.startsWith(pMonths[pMonths.length - 1].slice(0, 4)));
+      check('investments UI: the portfolio 1 year preset converges its chart and pages its table to the latest year too',
+        ps.labels.length === pWin && ps.rows.length === pWinLatest.length && ps.rows[0] === pWinLatest[0],
+        JSON.stringify({ points: ps.labels.length, rows: ps.rows.length, want: pWin }));
       await page.click('#invRangeBtns-investments button[data-months="0"]');
       await waitI(400);
       ps = await pfRangeState();
-      check('investments UI: the portfolio back to All restores everything',
-        ps.labels.length === pFull && ps.rows === pFull,
-        JSON.stringify({ points: ps.labels.length, rows: ps.rows, full: pFull }));
+      check('investments UI: the portfolio back to All restores the chart and re-defaults the table to the latest year',
+        ps.labels.length === pFull && ps.rows.length === pLatest.length && ps.rows[0] === pLatest[0],
+        JSON.stringify({ points: ps.labels.length, rows: ps.rows.length, full: pFull }));
 
       // Account share doughnut + stacked per-account bars.
       r = await req('GET', '/api/investments');

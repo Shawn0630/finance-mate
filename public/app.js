@@ -5042,6 +5042,10 @@ function applyInvestRange(level) {
   conf.set(level === 'investments'
     ? drawInvestPortfolioChart($(conf.canvas), d, fSeries)
     : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native));
+  // A range change re-defaults the table to the latest year
+  // in the new range; the year switcher only navigates within
+  // the range in force.
+  investYearPage[level] = null;
   renderInvestMonthlyOnly(level);
   syncInvestRangeInputs(level);
 }
