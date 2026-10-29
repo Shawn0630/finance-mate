@@ -27,8 +27,9 @@ import {
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
-  PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
+  PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts,
+  deriveRentalYearFigures, entryCoveredYears,
 } from './earnings.js';
 import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
 
@@ -2812,15 +2813,31 @@ const earnJobRow = (row) => ({
   cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
   calc: calcSalary(row, earnRegion().payroll),
 });
-const earnRentalYearRow = (rental, row) => ({
-  ...row,
-  expenses: JSON.parse(row.expenses || '[]'),
-  claim_cca: row.claim_cca === 1, cca_acknowledged: row.cca_acknowledged === 1,
-  calc: calcRentalYear(rental, {
-    ...row, expenses: JSON.parse(row.expenses || '[]'),
+const earnRentalYearRow = (rental, row) => {
+  // Rent figures are derived from entries when any entry covers the
+  // year; otherwise the row's stored figures stand (that is what
+  // pre-entry records carry, and what a manual expenses-only year
+  // shows). The calc always runs on the effective figures, so an
+  // entry edit recalculates every derived number it governs.
+  const entries = rental.entries || [];
+  const derived = deriveRentalYearFigures(entries, row.tax_year);
+  const effective = derived.covered
+    ? { ...row, gross_rents: derived.gross_rents, rental_days: derived.rental_days }
+    : row;
+  const year = {
+    ...effective,
+    expenses: JSON.parse(row.expenses || '[]'),
     claim_cca: row.claim_cca === 1, cca_acknowledged: row.cca_acknowledged === 1,
-  }, earnRegion().rental),
-});
+    rent_derived: derived.covered,
+  };
+  return {
+    ...year,
+    calc: calcRentalYear(rental, {
+      ...year, expenses: year.expenses,
+      claim_cca: year.claim_cca, cca_acknowledged: year.cca_acknowledged,
+    }, earnRegion().rental),
+  };
+};
 const earnRentalRow = (row) => {
   const rental = {
     ...row,
@@ -2828,8 +2845,26 @@ const earnRentalRow = (row) => {
     was_principal_residence: row.was_principal_residence === 1,
     structural_change: row.structural_change === 1,
   };
+  const entries = db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(row.id);
+  rental.entries = entries;
   const years = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC').all(row.id);
   return { ...rental, years: years.map((y) => earnRentalYearRow(rental, y)) };
+};
+// Every tax year an entry covers gets a year record (bare defaults;
+// the rent figures come from the entries at read time). INSERT OR
+// IGNORE keeps a hand-made year record the user already has. Year
+// records are never auto-deleted: if entries stop covering a year,
+// that year falls back to its stored figures.
+const ensureRentalYearsForEntry = (rentalId, entry) => {
+  const ts = nowIso();
+  for (const taxYear of entryCoveredYears(entry)) {
+    const derived = deriveRentalYearFigures([entry], taxYear);
+    db.prepare(
+      `INSERT OR IGNORE INTO earn_rental_years (rental_id, tax_year, gross_rents, other_income, area_share_pct, rental_days,
+       mortgage_interest, mortgage_principal, expenses, claim_cca, cca_acknowledged, created_at, updated_at)
+       VALUES (?, ?, ?, 0, 100, ?, 0, 0, '[]', 0, 0, ?, ?)`).run(
+      rentalId, taxYear, derived.gross_rents, derived.rental_days, ts, ts);
+  }
 };
 
 app.get('/api/earnings/charts', requireApiAuth, (req, res) => {
@@ -2945,8 +2980,8 @@ app.post('/api/earnings/rentals/:id/years', requireApiAuth, (req, res) => {
       `INSERT INTO earn_rental_years (rental_id, tax_year, gross_rents, other_income, area_share_pct, rental_days,
        mortgage_interest, mortgage_principal, expenses, claim_cca, cca_acknowledged, ucc_class1, ucc_class8,
        str_compliant_days, str_non_compliant_days, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      rentalId, v.tax_year, v.gross_rents, v.other_income, v.area_share_pct, v.rental_days,
+       VALUES (?, ?, 0, ?, ?, 365, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      rentalId, v.tax_year, v.other_income, v.area_share_pct,
       v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
       v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
       v.str_compliant_days, v.str_non_compliant_days, ts, ts);
@@ -2965,11 +3000,11 @@ app.put('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, r
   const v = validRentalYearInput(req.body || {}, earnRegion().rental.t776Lines);
   if (v.error) return res.status(400).json({ error: v.error });
   db.prepare(
-    `UPDATE earn_rental_years SET tax_year = ?, gross_rents = ?, other_income = ?, area_share_pct = ?, rental_days = ?,
+    `UPDATE earn_rental_years SET tax_year = ?, other_income = ?, area_share_pct = ?,
      mortgage_interest = ?, mortgage_principal = ?, expenses = ?, claim_cca = ?, cca_acknowledged = ?,
      ucc_class1 = ?, ucc_class8 = ?, str_compliant_days = ?, str_non_compliant_days = ?, updated_at = ?
      WHERE id = ?`).run(
-    v.tax_year, v.gross_rents, v.other_income, v.area_share_pct, v.rental_days,
+    v.tax_year, v.other_income, v.area_share_pct,
     v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
     v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
     v.str_compliant_days, v.str_non_compliant_days, nowIso(), yearId);
@@ -2979,6 +3014,48 @@ app.delete('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req
   const info = db.prepare('DELETE FROM earn_rental_years WHERE id = ? AND rental_id = ?')
     .run(Number(req.params.yearId), Number(req.params.rentalId));
   if (!info.changes) return res.status(404).json({ error: 'year record not found' });
+  res.json({ ok: true });
+});
+
+// -------------------------------------------------------- rent entries --
+// The user-facing rent input: entries, not annual figures. An entry
+// save re-derives every year it covers (the read path recomputes;
+// this only ensures the year records exist).
+app.post('/api/earnings/rentals/:id/entries', requireApiAuth, (req, res) => {
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.id));
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  const v = validRentalEntryInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const info = db.prepare(
+    `INSERT INTO earn_rental_entries (rental_id, start_ym, end_ym, monthly_rent, pay_day, cash_amount, tenant_name, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    rental.id, v.start_ym, v.end_ym, v.monthly_rent, v.pay_day, v.cash_amount, v.tenant_name, ts, ts);
+  const entry = db.prepare('SELECT * FROM earn_rental_entries WHERE id = ?').get(info.lastInsertRowid);
+  ensureRentalYearsForEntry(rental.id, entry);
+  res.status(201).json(earnRentalRow(rental));
+});
+app.put('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (req, res) => {
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.rentalId));
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  const entryId = Number(req.params.entryId);
+  if (!db.prepare('SELECT id FROM earn_rental_entries WHERE id = ? AND rental_id = ?').get(entryId, rental.id)) {
+    return res.status(404).json({ error: 'entry not found' });
+  }
+  const v = validRentalEntryInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  db.prepare(
+    `UPDATE earn_rental_entries SET start_ym = ?, end_ym = ?, monthly_rent = ?, pay_day = ?,
+     cash_amount = ?, tenant_name = ?, updated_at = ? WHERE id = ?`).run(
+    v.start_ym, v.end_ym, v.monthly_rent, v.pay_day, v.cash_amount, v.tenant_name, nowIso(), entryId);
+  const entry = db.prepare('SELECT * FROM earn_rental_entries WHERE id = ?').get(entryId);
+  ensureRentalYearsForEntry(rental.id, entry);
+  res.json(earnRentalRow(rental));
+});
+app.delete('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM earn_rental_entries WHERE id = ? AND rental_id = ?')
+    .run(Number(req.params.entryId), Number(req.params.rentalId));
+  if (!info.changes) return res.status(404).json({ error: 'entry not found' });
   res.json({ ok: true });
 });
 

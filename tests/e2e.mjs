@@ -10267,18 +10267,39 @@ try {
   check('earnings: rental created', r.status === 201 && r.data.label === 'Basement suite', JSON.stringify(r.data));
   const earnRentalId = r.data.id;
   r = await req('POST', `/api/earnings/rentals/${earnRentalId}/years`, {
-    tax_year: 2026, gross_rents: 24000, other_income: 0, area_share_pct: 50, rental_days: 365,
+    tax_year: 2026, other_income: 0, area_share_pct: 50,
     mortgage_interest: 6000, mortgage_principal: 9000,
     expenses: [{ line: '9180', amount: 12000, direct: false }, { line: '8521', amount: 500, direct: true }],
   });
-  check('earnings: rental year pro-rates shared expenses, halves net for the co-owner, principal excluded',
-    r.status === 201 && r.data.calc.personalPortion9949 === 6000 && r.data.calc.ownerShareNet === 5750
-    && r.data.calc.netWhole9946 === 11500 && r.data.calc.gst.status === 'exempt',
-    JSON.stringify(r.data.calc));
+  check('earnings: rental year created without typed rent figures', r.status === 201 && r.data.tax_year === 2026, JSON.stringify(r.data));
+  r = await req('POST', `/api/earnings/rentals/${earnRentalId}/entries`, {
+    start_ym: '2025-01', end_ym: '2026-12', monthly_rent: 2000, pay_day: 1, cash_amount: 500, tenant_name: 'Test Tenant',
+  });
+  check('earnings: rent entry created with tenant as a plain string', r.status === 201
+    && r.data.entries.length === 1 && r.data.entries[0].tenant_name === 'Test Tenant'
+    && r.data.entries[0].cash_amount === 500, JSON.stringify(r.data.entries));
+  r = await req('POST', `/api/earnings/rentals/${earnRentalId}/entries`, {
+    start_ym: '2026-01', monthly_rent: 1000, pay_day: 32,
+  });
+  check('earnings: rent entry validation rejects pay day 32', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/earnings/rentals/${earnRentalId}/entries`, {
+    start_ym: '2026-01', monthly_rent: 1000, pay_day: 1, cash_amount: 1001,
+  });
+  check('earnings: rent entry validation rejects cash over monthly rent', r.status === 400, JSON.stringify(r.data));
+  r = await req('GET', '/api/earnings');
+  const earnYear2026 = r.data.rentals[0].years.find((y) => y.tax_year === 2026);
+  const earnYear2025 = r.data.rentals[0].years.find((y) => y.tax_year === 2025);
+  check('earnings: entry auto-creates covered years and derives gross + days (no typing)',
+    r.status === 200 && r.data.rentals[0].years.length === 2
+    && earnYear2026.gross_rents === 24000 && earnYear2026.rental_days === 365 && earnYear2026.rent_derived === true
+    && earnYear2026.calc.personalPortion9949 === 6000 && earnYear2026.calc.ownerShareNet === 5750
+    && earnYear2026.calc.netWhole9946 === 11500 && earnYear2026.calc.gst.status === 'exempt'
+    && earnYear2025.gross_rents === 24000 && earnYear2025.rental_days === 365,
+    JSON.stringify(r.data.rentals[0].years.map((y) => ({ tax_year: y.tax_year, gross_rents: y.gross_rents, rental_days: y.rental_days, rent_derived: y.rent_derived, calc: y.calc }))));
   r = await req('GET', '/api/earnings');
   check('earnings: overview lists both jobs and the rental with computed summaries',
     r.status === 200 && r.data.jobs.length === 2 && r.data.rentals.length === 1
-    && r.data.rentals[0].years.length === 1 && r.data.payrollProvinces.some((p) => p.code === 'BC' && p.verified)
+    && r.data.rentals[0].years.length === 2 && r.data.payrollProvinces.some((p) => p.code === 'BC' && p.verified)
     && r.data.payrollProvinces.some((p) => p.code === 'QC' && !p.verified),
     JSON.stringify({ jobs: r.data.jobs.length, rentals: r.data.rentals.length }));
   r = await req('GET', '/api/summary');
@@ -10288,12 +10309,28 @@ try {
     JSON.stringify({ before: sumBefore.data, after: r.data }));
   r = await req('GET', '/api/earnings/charts');
   check('earnings charts: aggregation sums salary gross and rental 9946 net by year',
-    r.status === 200 && JSON.stringify(r.data.years) === '[2026]'
+    r.status === 200 && JSON.stringify(r.data.years) === '[2025,2026]'
     && r.data.salary[2026].gross === 120000 && r.data.rentals[2026].net === 11500
     && r.data.rentals[2026].gross === 24000 && r.data.rentals[2026].expenses === 12500
     && r.data.overview[2026].rentalNet === 11500
+    && r.data.rentals[2025].gross === 24000 && r.data.rentals[2025].net === 24000
+    && r.data.overview[2025].rentalNet === 24000
     && r.data.employers.includes('Acme Corp') && r.data.properties.length === 1,
     JSON.stringify(r.data));
+  // Editing the entry recomputes the affected years, then reverts.
+  const earnEntryId = (await req('GET', '/api/earnings')).data.rentals[0].entries[0].id;
+  r = await req('PUT', `/api/earnings/rentals/${earnRentalId}/entries/${earnEntryId}`, {
+    start_ym: '2025-01', end_ym: '2026-12', monthly_rent: 2100, pay_day: 1, cash_amount: 500, tenant_name: 'Test Tenant',
+  });
+  check('earnings: editing an entry recomputes the derived year gross',
+    r.status === 200 && r.data.years.find((y) => y.tax_year === 2026).gross_rents === 25200,
+    JSON.stringify(r.data.years.map((y) => ({ tax_year: y.tax_year, gross_rents: y.gross_rents }))));
+  r = await req('PUT', `/api/earnings/rentals/${earnRentalId}/entries/${earnEntryId}`, {
+    start_ym: '2025-01', end_ym: '2026-12', monthly_rent: 2000, pay_day: 1, cash_amount: 500, tenant_name: 'Test Tenant',
+  });
+  check('earnings: entry edit reverts to the original derived gross',
+    r.status === 200 && r.data.years.find((y) => y.tax_year === 2026).gross_rents === 24000,
+    JSON.stringify(r.data.years.map((y) => ({ tax_year: y.tax_year, gross_rents: y.gross_rents }))));
   // ---- Earnings: browser pass over the new section ----
   if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
     console.log('earnings browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -10419,6 +10456,28 @@ try {
       check('earnings charts: income vs expenses view swaps in gross + expenses series',
         rentIncomeInfo && rentIncomeInfo.includes('gross') && rentIncomeInfo.includes('expenses'),
         JSON.stringify(rentIncomeInfo));
+
+      // Rent entries UI: the rental card lists the entry (tenant as a
+      // plain string) and the year block marks its days as derived;
+      // the monthly-rent money input groups while typing.
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const entryUi = await page.evaluate(async () => {
+        const text = document.querySelector('#earn-rentals').textContent;
+        const d = await (await fetch('/api/earnings')).json();
+        const rental = d.rentals.find((x) => x.label === 'Basement suite');
+        window.earnAddEntry(rental.id);
+        const input = document.querySelector('#earnRentalEntryForm [name="monthly_rent"]');
+        input.value = '1234';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        const grouped = input.value;
+        document.querySelector('#earnRentalEntryCancelBtn').click();
+        return { textHasTenant: text.includes('Test Tenant'), textHasDerived: text.includes('from rent entries'), grouped };
+      });
+      check('earnings UI: rental card lists the rent entry and marks derived days',
+        entryUi.textHasTenant && entryUi.textHasDerived, JSON.stringify(entryUi));
+      check('earnings UI: monthly-rent input groups thousands while typing',
+        entryUi.grouped === '1,234', JSON.stringify(entryUi));
 
       // Rental form: property dropdown lists app properties (never BCA
       // results); picking one disables + clears Address; Standalone

@@ -7915,6 +7915,7 @@ function earnYearBlock(r, y) {
     <button class="small danger" onclick="earnDeleteYear(${r.id}, ${y.id})">Delete</button></div>
     <table><tbody>
       <tr><td>Gross rents (whole property)</td><td>${money2(c.grossWhole)}</td></tr>
+      <tr><td>Rented days</td><td>${y.rental_days}${y.rent_derived ? ' (from rent entries)' : ''}</td></tr>
       <tr><td>Deductible expenses</td><td>${money2(c.deductibleExpenses)}</td></tr>
       <tr><td>Personal portion (9949)</td><td>${money2(c.personalPortion9949)}</td></tr>
       <tr><td>Net before CCA (9369)</td><td>${money2(c.netBeforeCca9369)}</td></tr>
@@ -7929,13 +7930,29 @@ function earnYearBlock(r, y) {
   </div>`;
 }
 
+const ymLabel = (ym) => {
+  if (!ym) return 'Ongoing';
+  const [y, m] = ym.split('-').map(Number);
+  return `${MONTH_NAMES[m - 1]} ${y}`;
+};
+function earnEntryBlock(r, e) {
+  const bits = [`${ymLabel(e.start_ym)} – ${ymLabel(e.end_ym)}`, `${money2(e.monthly_rent)}/mo`, `paid on day ${e.pay_day}`];
+  if (e.cash_amount !== null && e.cash_amount !== undefined) bits.push(`cash ${money2(e.cash_amount)}`);
+  if (e.tenant_name) bits.push(esc(e.tenant_name));
+  return `<div class="note">${bits.join(' · ')}
+    <button class="small" onclick="earnEditEntry(${r.id}, ${e.id})">Edit</button>
+    <button class="small danger" onclick="earnDeleteEntry(${r.id}, ${e.id})">Delete</button></div>`;
+}
+
 function earnRentalCard(r) {
   return `<div class="panel">
     <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span>
     <div class="spacer"></div>
+    <button class="small" onclick="earnAddEntry(${r.id})">+ Rent entry</button>
     <button class="small" onclick="earnAddYear(${r.id})">+ Year record</button>
     <button class="small" onclick="earnEditRental(${r.id})">Edit</button>
     <button class="small danger" onclick="earnDeleteRental(${r.id})">Delete</button></div>
+    ${(r.entries || []).length ? `<div><div class="note">Rent entries</div>${r.entries.map((e) => earnEntryBlock(r, e)).join('')}</div>` : ''}
     ${r.years.length ? r.years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
   </div>`;
 }
@@ -8277,6 +8294,8 @@ window.earnAddYear = (rentalId) => {
   $('#earnRentalYearFormTitle').textContent = 'Add year record';
   $('#earnRentalYearForm').reset();
   $('#earnExpenseRows').innerHTML = '';
+  $('#earnYearDerived').textContent = 'Gross rents and rented days are calculated from rent entries.';
+  $('#earnYearDerived').classList.remove('hidden');
   $('#earnRentalYearFormPanel').classList.remove('hidden');
 };
 $('#earnRentalYearCancelBtn').onclick = () => $('#earnRentalYearFormPanel').classList.add('hidden');
@@ -8302,8 +8321,10 @@ window.earnEditYear = (rentalId, yearId) => {
   earnYearRentalId = rentalId; earnEditYearId = yearId;
   $('#earnRentalYearFormTitle').textContent = 'Edit year record';
   const f = $('#earnRentalYearForm');
-  f.tax_year.value = y.tax_year; f.gross_rents.value = y.gross_rents; f.other_income.value = y.other_income;
-  f.area_share_pct.value = y.area_share_pct; f.rental_days.value = y.rental_days;
+  f.tax_year.value = y.tax_year; f.other_income.value = y.other_income;
+  f.area_share_pct.value = y.area_share_pct;
+  $('#earnYearDerived').innerHTML = `Gross rents ${money2(y.gross_rents)} · Rented days ${y.rental_days}${y.rent_derived ? ' (from rent entries)' : ''}`;
+  $('#earnYearDerived').classList.remove('hidden');
   f.mortgage_interest.value = y.mortgage_interest; f.mortgage_principal.value = y.mortgage_principal;
   f.claim_cca.checked = y.claim_cca; f.cca_acknowledged.checked = y.cca_acknowledged;
   f.ucc_class1.value = y.ucc_class1 ?? ''; f.ucc_class8.value = y.ucc_class8 ?? '';
@@ -8315,6 +8336,45 @@ window.earnEditYear = (rentalId, yearId) => {
 window.earnDeleteYear = async (rentalId, yearId) => {
   if (!confirm('Delete this year record?')) return;
   await api(`/api/earnings/rentals/${rentalId}/years/${yearId}`, { method: 'DELETE' });
+  loadEarnings();
+};
+
+// ------------------------------------------------------ rent entries --
+let earnEntryRentalId = null;
+let earnEditEntryId = null;
+window.earnAddEntry = (rentalId) => {
+  earnEntryRentalId = rentalId; earnEditEntryId = null;
+  $('#earnRentalEntryFormTitle').textContent = 'Add rent entry';
+  $('#earnRentalEntryForm').reset();
+  $('#earnRentalEntryFormPanel').classList.remove('hidden');
+};
+$('#earnRentalEntryCancelBtn').onclick = () => $('#earnRentalEntryFormPanel').classList.add('hidden');
+$('#earnRentalEntryForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const body = earnReadForm(e.target);
+    parseMoneyFields(body, ['monthly_rent', 'cash_amount']);
+    if (earnEditEntryId) await api(`/api/earnings/rentals/${earnEntryRentalId}/entries/${earnEditEntryId}`, { method: 'PUT', body });
+    else await api(`/api/earnings/rentals/${earnEntryRentalId}/entries`, { method: 'POST', body });
+    $('#earnRentalEntryFormPanel').classList.add('hidden');
+    loadEarnings();
+  } catch (err) { showMsg($('#earnRentalMsg'), 'err', err.message); }
+};
+window.earnEditEntry = (rentalId, entryId) => {
+  const r = earnData.rentals.find((x) => x.id === rentalId);
+  const en = r && (r.entries || []).find((v) => v.id === entryId);
+  if (!en) return;
+  earnEntryRentalId = rentalId; earnEditEntryId = entryId;
+  $('#earnRentalEntryFormTitle').textContent = 'Edit rent entry';
+  const f = $('#earnRentalEntryForm');
+  f.start_ym.value = en.start_ym; f.end_ym.value = en.end_ym || '';
+  setMoneyValue(f.monthly_rent, en.monthly_rent); f.pay_day.value = en.pay_day;
+  setMoneyValue(f.cash_amount, en.cash_amount ?? ''); f.tenant_name.value = en.tenant_name || '';
+  $('#earnRentalEntryFormPanel').classList.remove('hidden');
+};
+window.earnDeleteEntry = async (rentalId, entryId) => {
+  if (!confirm('Delete this rent entry? Year records it created stay.')) return;
+  await api(`/api/earnings/rentals/${rentalId}/entries/${entryId}`, { method: 'DELETE' });
   loadEarnings();
 };
 

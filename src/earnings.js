@@ -41,6 +41,18 @@
 //   on that path. Short-term rent is taxable: the summary carries the
 //   registration-threshold note and the s.67.7 non-compliant-day
 //   expense denial. Hotel-like services route to T2125, not T776.
+//   RENT ENTRIES — the year record's rent figures are DERIVED, not
+//   typed: the user enters rent entries (a tenancy period, a monthly
+//   amount, the day of the month rent is paid, an optional cash
+//   portion, an optional tenant name as a raw string) and the app
+//   computes each tax year's gross rents and rented days from them.
+//   Month granularity: a covered month counts fully, no mid-month
+//   pro-rating. Gross sums across entries; rented days count the
+//   UNION of covered months, so two overlapping tenancies never push
+//   days past the year's calendar. Pay day is recorded only — it
+//   never shifts year attribution; coverage months govern. An entry
+//   with no end month is ongoing and covers through the current
+//   month.
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -311,20 +323,111 @@ export function validRentalInput(body) {
   };
 }
 
+// --------------------------------------------------- rent entries --
+// A rent entry is one tenancy's rent schedule: from year-month to
+// year-month (blank end = ongoing), a monthly amount, the day of the
+// month rent is paid, an optional cash portion of that month's rent,
+// and an optional tenant name — a raw string on the entry, never a
+// tenant record, lookup, or dropdown.
+const YM_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
+function parseYm(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const m = YM_RE.exec(String(v).trim());
+  if (!m) return null;
+  const year = Number(m[1]);
+  if (year < 2000 || year > 2100) return null;
+  return { year, month: Number(m[2]) };
+}
+const ymKey = (y, m) => y * 12 + (m - 1);
+const daysInMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
+export const currentYm = () => {
+  const d = new Date();
+  return { year: d.getFullYear(), month: d.getMonth() + 1 };
+};
+
+export function validRentalEntryInput(body) {
+  const b = body || {};
+  const start = parseYm(b.start_ym);
+  if (!start) return { error: 'start month must be a year-month (YYYY-MM).' };
+  const end = parseYm(b.end_ym);
+  if (b.end_ym !== null && b.end_ym !== undefined && b.end_ym !== '' && !end) {
+    return { error: 'end month must be a year-month (YYYY-MM) or blank for ongoing.' };
+  }
+  if (end && ymKey(end.year, end.month) < ymKey(start.year, start.month)) {
+    return { error: 'end month must not be before start month.' };
+  }
+  const monthlyRent = Number(b.monthly_rent);
+  if (!Number.isFinite(monthlyRent) || monthlyRent < 0) return { error: 'monthly_rent must be a number ≥ 0.' };
+  const payDay = Number(b.pay_day);
+  if (!Number.isInteger(payDay) || payDay < 1 || payDay > 31) return { error: 'pay_day must be a day of the month (1–31).' };
+  let cashAmount = null;
+  if (b.cash_amount !== null && b.cash_amount !== undefined && b.cash_amount !== '') {
+    cashAmount = Number(b.cash_amount);
+    if (!Number.isFinite(cashAmount) || cashAmount < 0) return { error: 'cash_amount must be a number ≥ 0.' };
+    if (cashAmount > monthlyRent) return { error: 'cash_amount must not exceed monthly_rent.' };
+  }
+  return {
+    start_ym: `${start.year}-${String(start.month).padStart(2, '0')}`,
+    end_ym: end ? `${end.year}-${String(end.month).padStart(2, '0')}` : null,
+    monthly_rent: monthlyRent, pay_day: payDay, cash_amount: cashAmount,
+    tenant_name: cleanStr(b.tenant_name, 160),
+  };
+}
+
+// Months of taxYear an entry covers, as [year, month] pairs. An
+// ongoing entry (no end) runs through the current month.
+export function entryCoveredMonths(entry, taxYear, now = currentYm()) {
+  const start = parseYm(entry.start_ym);
+  if (!start) return [];
+  const end = parseYm(entry.end_ym) || now;
+  const from = Math.max(ymKey(start.year, start.month), ymKey(taxYear, 1));
+  const to = Math.min(ymKey(end.year, end.month), ymKey(taxYear, 12));
+  const months = [];
+  for (let k = from; k <= to; k++) months.push([Math.floor(k / 12), (k % 12) + 1]);
+  return months;
+}
+
+// Tax years an entry covers (for auto-creating year records).
+export function entryCoveredYears(entry, now = currentYm()) {
+  const start = parseYm(entry.start_ym);
+  if (!start) return [];
+  const end = parseYm(entry.end_ym) || now;
+  const years = [];
+  for (let y = start.year; y <= end.year; y++) years.push(y);
+  return years;
+}
+
+// Derive one tax year's rent figures from entries. Gross sums across
+// entries; days count the union of covered months. covered is false
+// when no entry touches the year (callers then fall back to the year
+// record's stored figures, which is what pre-entry records carry).
+export function deriveRentalYearFigures(entries, taxYear, now = currentYm()) {
+  const coveredMonths = new Set();
+  let gross = 0;
+  for (const e of entries || []) {
+    const months = entryCoveredMonths(e, taxYear, now);
+    for (const [y, m] of months) coveredMonths.add(`${y}-${m}`);
+    gross = round2(gross + e.monthly_rent * months.length);
+  }
+  let days = 0;
+  for (const key of coveredMonths) {
+    const [y, m] = key.split('-').map(Number);
+    days += daysInMonth(y, m);
+  }
+  return { gross_rents: gross, rental_days: days, covered: coveredMonths.size > 0 };
+}
+
 export function validRentalYearInput(body, t776Lines) {
   const b = body || {};
   const taxYear = Number(b.tax_year);
   if (!Number.isInteger(taxYear) || taxYear < 2000 || taxYear > 2100) return { error: 'tax year must be a valid year.' };
-  const grossRents = Number(b.gross_rents);
-  if (!Number.isFinite(grossRents) || grossRents < 0) return { error: 'gross_rents must be a number ≥ 0.' };
+  // Gross rents and rented days are DERIVED from rent entries, never
+  // typed: the form no longer sends them, and values in an old
+  // request body are ignored rather than stored.
   const otherIncome = numOr(b.other_income, 0);
   if (otherIncome < 0) return { error: 'other_income must be ≥ 0.' };
   const areaShare = numOr(b.area_share_pct, 100);
   if (areaShare <= 0 || areaShare > 100) return { error: 'area_share_pct must be between 0 and 100.' };
-  const rentalDays = Number(b.rental_days);
-  if (!Number.isInteger(rentalDays) || rentalDays < 0 || rentalDays > 366) {
-    return { error: 'rental_days must be between 0 and 366.' };
-  }
   const mortgageInterest = numOr(b.mortgage_interest, 0);
   const mortgagePrincipal = numOr(b.mortgage_principal, 0);
   if (mortgageInterest < 0 || mortgagePrincipal < 0) return { error: 'mortgage interest and principal must be ≥ 0.' };
@@ -342,8 +445,8 @@ export function validRentalYearInput(body, t776Lines) {
   }
   const claimCca = b.claim_cca === true || b.claim_cca === 1 || b.claim_cca === '1';
   return {
-    tax_year: taxYear, gross_rents: grossRents, other_income: otherIncome,
-    area_share_pct: areaShare, rental_days: rentalDays,
+    tax_year: taxYear, other_income: otherIncome,
+    area_share_pct: areaShare,
     mortgage_interest: mortgageInterest, mortgage_principal: mortgagePrincipal,
     expenses, claim_cca: claimCca,
     cca_acknowledged: b.cca_acknowledged === true || b.cca_acknowledged === 1 || b.cca_acknowledged === '1',

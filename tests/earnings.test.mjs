@@ -5,8 +5,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { payroll, rental } from '../src/regions/ca.js';
 import {
-  PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
+  PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
+  deriveRentalYearFigures, entryCoveredYears,
 } from '../src/earnings.js';
 
 const job = (over = {}) => ({
@@ -235,4 +236,59 @@ test('charts: rental aggregates per-property 9946 net and income vs expenses by 
 test('charts: empty input aggregates to empty years, no crash', () => {
   const c = aggregateEarningsCharts([], []);
   assert.deepEqual(c, { years: [], earners: [], employers: [], properties: [], overview: {}, salary: {}, rentals: {} });
+});
+
+// -------------------------------------------------------- rent entries --
+test('rent entries: a tenancy spanning a year boundary splits gross and days by coverage month', () => {
+  const e = { start_ym: '2025-03', end_ym: '2026-02', monthly_rent: 2000 };
+  assert.deepEqual(deriveRentalYearFigures([e], 2025), { gross_rents: 20000, rental_days: 306, covered: true });
+  assert.deepEqual(deriveRentalYearFigures([e], 2026), { gross_rents: 4000, rental_days: 59, covered: true });
+  assert.deepEqual(deriveRentalYearFigures([e], 2024), { gross_rents: 0, rental_days: 0, covered: false });
+});
+
+test('rent entries: ongoing entry covers through the current month only', () => {
+  const e = { start_ym: '2026-06', end_ym: null, monthly_rent: 1500 };
+  assert.deepEqual(deriveRentalYearFigures([e], 2026, { year: 2026, month: 10 }), { gross_rents: 7500, rental_days: 153, covered: true });
+  assert.deepEqual(deriveRentalYearFigures([e], 2025, { year: 2026, month: 10 }), { gross_rents: 0, rental_days: 0, covered: false });
+  assert.deepEqual(entryCoveredYears(e, { year: 2026, month: 10 }), [2026]);
+});
+
+test('rent entries: month granularity counts whole calendar months, leap February included', () => {
+  const e = { start_ym: '2024-02', end_ym: '2024-02', monthly_rent: 1000 };
+  assert.deepEqual(deriveRentalYearFigures([e], 2024), { gross_rents: 1000, rental_days: 29, covered: true });
+});
+
+test('rent entries: overlapping tenancies sum gross but count days only once', () => {
+  const es = [
+    { start_ym: '2026-01', end_ym: '2026-12', monthly_rent: 1000 },
+    { start_ym: '2026-06', end_ym: '2026-12', monthly_rent: 500 },
+  ];
+  assert.deepEqual(deriveRentalYearFigures(es, 2026), { gross_rents: 15500, rental_days: 365, covered: true });
+});
+
+test('rent entries: validation rejects bad months, bad pay day, end before start, cash over rent', () => {
+  const base = { start_ym: '2026-01', end_ym: '2026-12', monthly_rent: 2000, pay_day: 1 };
+  assert.ok(validRentalEntryInput({ ...base, start_ym: '2026-13' }).error);
+  assert.ok(validRentalEntryInput({ ...base, pay_day: 0 }).error);
+  assert.ok(validRentalEntryInput({ ...base, pay_day: 32 }).error);
+  assert.ok(validRentalEntryInput({ ...base, end_ym: '2025-12' }).error);
+  assert.ok(validRentalEntryInput({ ...base, cash_amount: 2001 }).error);
+  const ok = validRentalEntryInput({ ...base, cash_amount: 500, tenant_name: 'Jane Doe' });
+  assert.ok(!ok.error);
+  assert.equal(ok.cash_amount, 500);
+  assert.equal(ok.tenant_name, 'Jane Doe');
+  assert.equal(ok.end_ym, '2026-12');
+  const ongoing = validRentalEntryInput({ start_ym: '2026-01', monthly_rent: 2000, pay_day: 15 });
+  assert.ok(!ongoing.error);
+  assert.equal(ongoing.end_ym, null);
+  assert.equal(ongoing.cash_amount, null);
+  assert.equal(ongoing.tenant_name, null);
+});
+
+test('rent entries: year input no longer takes gross rents or rented days, but still guards 8710', () => {
+  const v = validRentalYearInput({ tax_year: 2026, other_income: 0, area_share_pct: 100 }, rental.t776Lines);
+  assert.ok(!v.error);
+  assert.equal(v.gross_rents, undefined);
+  assert.equal(v.rental_days, undefined);
+  assert.ok(validRentalYearInput({ tax_year: 2026, gross_rents: 1, expenses: [{ line: '8710', amount: 1 }] }, rental.t776Lines).error);
 });

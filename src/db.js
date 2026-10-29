@@ -289,6 +289,19 @@ CREATE TABLE IF NOT EXISTS earn_rental_years (
   UNIQUE (rental_id, tax_year)
 );
 CREATE INDEX IF NOT EXISTS idx_earn_rental_years ON earn_rental_years(rental_id, tax_year);
+CREATE TABLE IF NOT EXISTS earn_rental_entries (
+  id INTEGER PRIMARY KEY,
+  rental_id INTEGER NOT NULL REFERENCES earn_rentals(id) ON DELETE CASCADE,
+  start_ym TEXT NOT NULL,                      -- 'YYYY-MM', first rent month
+  end_ym TEXT,                                 -- 'YYYY-MM' or NULL = ongoing
+  monthly_rent REAL NOT NULL DEFAULT 0,
+  pay_day INTEGER NOT NULL,                    -- day of month rent is paid (1–31)
+  cash_amount REAL,                            -- optional cash portion of monthly rent
+  tenant_name TEXT,                            -- optional raw string; never a tenant record
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_earn_rental_entries ON earn_rental_entries(rental_id, start_ym);
 -- A property's uploaded photos, in display order: the gallery the
 -- detail page shows as a carousel; the first row is the Properties
 -- card cover. Files live in PHOTOS_DIR; the row stores only the name.
