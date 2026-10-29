@@ -19,7 +19,7 @@ import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmD
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
-  listAccounts, getAccount, listHoldings, getHolding, listEvents, rebuildEventPricePoints,
+  listAccounts, getAccount, listHoldings, getHolding, listEvents, listPricePoints, rebuildEventPricePoints,
   computeHolding, computeAccount, computePortfolio,
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
@@ -247,12 +247,17 @@ app.post('/api/ai/invest-fill-chat', requireApiAuth, async (req, res) => {
   const aid = Number(b.accountId);
   const account = Number.isInteger(aid) && aid > 0 ? getAccount(db, aid) : null;
   const holdings = account
-    ? listHoldings(db, account.id).map((h) => ({ ...h, events: listEvents(db, h.id) }))
+    ? listHoldings(db, account.id).map((h) => ({
+      ...h,
+      events: listEvents(db, h.id),
+      navPoints: listPricePoints(db, h.id).filter((p) => p.source === 'manual'),
+    }))
     : [];
   const { status, body } = await handleAiInvestFillChat(b, {
     model: getAiFillModel(),
     account,
     holdings,
+    existingNav: holdings.flatMap((h) => h.navPoints.map((p) => ({ holding_id: h.id, date: p.date, price: p.price }))),
   });
   if (status === 200 && b.model) setAiFillModel(String(b.model).trim());
   res.status(status).json(body);

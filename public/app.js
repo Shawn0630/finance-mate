@@ -4674,13 +4674,13 @@ function investSummaryStrip(s, cur = 'CAD') {
     <div class="summary-card"><div class="k">Current value</div><div class="v">${moneyC(s.value, cur)}</div></div>
     <div class="summary-card"><div class="k">Net contributions</div><div class="v">${moneyC(s.contributions, cur)}</div></div>
     <div class="summary-card"><div class="k">Dividends received</div><div class="v">${moneyC(s.dividends, cur)}</div></div>
-    <div class="summary-card"><div class="k">Total return</div><div class="v">${returnText(s.totalReturn, s.totalReturnPct, cur)}</div></div>`;
+    <div class="summary-card"><div class="k">Total return</div><div class="v">${s.costUnknown ? '—' : returnText(s.totalReturn, s.totalReturnPct, cur)}</div>${s.costUnknown ? '<div class="n">cost unknown — gain not shown</div>' : ''}</div>`;
 }
 
 // The monthly return table shared by all three levels. CAD rows
 // carry the plain fields; a holding's rows carry the *Native
 // twins and render in its own currency.
-function investMonthlyTable(monthly, cur = 'CAD') {
+function investMonthlyTable(monthly, cur = 'CAD', gainUnknown = false) {
   if (!monthly || !monthly.length) return '<div class="note">No activity yet.</div>';
   const native = cur !== 'CAD';
   const g = (r, k) => (native ? r[k + 'Native'] : r[k]);
@@ -4694,17 +4694,17 @@ function investMonthlyTable(monthly, cur = 'CAD') {
       <td class="num">${moneyC(g(r, 'startValue'), cur)}</td>
       <td class="num">${moneyC(g(r, 'contributions'), cur)}</td>
       <td class="num">${moneyC(g(r, 'dividends'), cur)}</td>
-      <td class="num">${moneyC(g(r, 'gain'), cur)}</td>
-      <td class="num">${moneyC(g(r, 'returnAmount'), cur)}</td>
-      <td class="num">${pctText(native ? r.returnPctNative : r.returnPct)}</td>
+      <td class="num">${gainUnknown ? '—' : moneyC(g(r, 'gain'), cur)}</td>
+      <td class="num">${gainUnknown ? '—' : moneyC(g(r, 'returnAmount'), cur)}</td>
+      <td class="num">${gainUnknown ? '—' : pctText(native ? r.returnPctNative : r.returnPct)}</td>
       <td class="num">${moneyC(g(r, 'endValue'), cur)}</td></tr>`;
   }).join('');
   return `<table><thead><tr><th>Month</th><th class="num">Start value</th><th class="num">Contributions</th>
     <th class="num">Dividends</th><th class="num">Market gain</th><th class="num">Return</th><th class="num">Return %</th>
     <th class="num">End value</th></tr></thead><tbody>${rows}</tbody>
     <tfoot><tr><th>Total</th><th></th><th class="num">${moneyC(tot.contributions, cur)}</th>
-    <th class="num">${moneyC(tot.dividends, cur)}</th><th class="num">${moneyC(tot.gain, cur)}</th>
-    <th class="num">${moneyC(tot.returnAmount, cur)}</th><th></th><th></th></tr></tfoot></table>`;
+    <th class="num">${moneyC(tot.dividends, cur)}</th><th class="num">${gainUnknown ? '—' : moneyC(tot.gain, cur)}</th>
+    <th class="num">${gainUnknown ? '—' : moneyC(tot.returnAmount, cur)}</th><th></th><th></th></tr></tfoot></table>`;
 }
 
 // --------------------------------------------- invest range controls ---
@@ -4723,9 +4723,9 @@ function investMonthlyYears(monthly) {
   return [...years].sort();
 }
 
-function investMonthlyBlock(monthly, level, cur) {
+function investMonthlyBlock(monthly, level, cur, gainUnknown = false) {
   const years = investMonthlyYears(monthly);
-  if (years.length <= 1) return investMonthlyTable(monthly, cur);
+  if (years.length <= 1) return investMonthlyTable(monthly, cur, gainUnknown);
   let year = investYearPage[level];
   if (!years.includes(year)) { year = years[years.length - 1]; investYearPage[level] = year; }
   const idx = years.indexOf(year);
@@ -4735,7 +4735,7 @@ function investMonthlyBlock(monthly, level, cur) {
     <button type="button" class="small" onclick="investYearStep('${level}', -1)"${idx <= 0 ? ' disabled' : ''}>&#8249; Prev year</button>
     <select aria-label="Monthly returns year" onchange="investYearPick('${level}', this.value)">${opts}</select>
     <button type="button" class="small" onclick="investYearStep('${level}', 1)"${idx >= years.length - 1 ? ' disabled' : ''}>Next year &#8250;</button>
-  </div>${investMonthlyTable(pageRows, cur)}`;
+  </div>${investMonthlyTable(pageRows, cur, gainUnknown)}`;
 }
 
 // Re-render only one level's monthly table (chart and range
@@ -4748,7 +4748,7 @@ function renderInvestMonthlyOnly(level) {
   const inR = (m) => !r || (m >= r.start && m <= r.end);
   const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
   const mHost = $(conf.monthly);
-  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur);
+  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur, !!d.gainUnknown);
 }
 
 window.investYearPick = (level, year) => {
@@ -4915,7 +4915,10 @@ function drawInvestPortfolioChart(canvas, data, fSeries) {
       datasets: [
         ...bars,
         { label: 'Value (CAD)', data: fSeries.map((r) => r.value), borderColor: '#1668c4', backgroundColor: '#1668c4', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
-        { label: 'Cumulative return (CAD)', data: fSeries.map((r) => r.returnAmount), borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+        // Same rule as the single-holding chart: a cost-unknown
+        // constituent makes the cumulative return fake, so the
+        // line is dropped when the aggregate is flagged.
+        ...(data.gainUnknown ? [] : [{ label: 'Cumulative return (CAD)', data: fSeries.map((r) => r.returnAmount), borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 }]),
       ],
     },
     options: {
@@ -5041,7 +5044,7 @@ function applyInvestRange(level) {
   if (old) old.destroy();
   conf.set(level === 'investments'
     ? drawInvestPortfolioChart($(conf.canvas), d, fSeries)
-    : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native));
+    : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native, !!d.gainUnknown));
   // A range change re-defaults the table to the latest year
   // in the new range; the year switcher only navigates within
   // the range in force.
@@ -5167,7 +5170,7 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeInvMonthPop(); });
 
-function drawInvestChart(canvas, key, series, cur, native = false) {
+function drawInvestChart(canvas, key, series, cur, native = false, gainUnknown = false) {
   if (!canvas) return null;
   const labels = series.map((r) => r.month);
   const values = series.map((r) => (native ? r.valueNative : r.value));
@@ -5178,7 +5181,10 @@ function drawInvestChart(canvas, key, series, cur, native = false) {
       labels,
       datasets: [
         { label: `Value (${cur})`, data: values, borderColor: '#1668c4', backgroundColor: '#1668c4', tension: 0.15, pointRadius: 0, borderWidth: 2 },
-        { label: `Cumulative return (${cur})`, data: returns, borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2 },
+        // A cost-unknown holding's cumulative return is value
+        // minus zero contributions — a fake number — so the
+        // return line is dropped, not drawn.
+        ...(gainUnknown ? [] : [{ label: `Cumulative return (${cur})`, data: returns, borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2 }]),
       ],
     },
     options: {
@@ -5203,7 +5209,7 @@ async function loadInvestmentsImpl() {
     <div class="card breakdown-card" onclick="location.hash='#invest-account/${a.account.id}'">
       <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
       <div class="v">${moneyC(a.summary.value)}</div>
-      <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${returnText(a.summary.totalReturn, a.summary.totalReturnPct)}</div>
+      <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${a.summary.costUnknown ? '—' : returnText(a.summary.totalReturn, a.summary.totalReturnPct)}${a.summary.costUnknown ? ' · cost unknown' : ''}</div>
       ${a.account.owners && a.account.owners.length ? `<div class="n">${ownerChipsHtml(a.account.owners)}</div>` : ''}
     </div>`).join('');
   host.innerHTML = `
@@ -5228,7 +5234,7 @@ async function loadInvestmentsImpl() {
     </div>
     <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly)}</div>
       <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
-  investViewData.investments = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false, accounts: data.accounts };
+  investViewData.investments = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false, accounts: data.accounts, gainUnknown: !!data.summary.costUnknown };
   wireInvestRangeControls('investments');
   applyInvestRange('investments');
   drawInvestShareChart(data);
@@ -5289,17 +5295,17 @@ async function loadInvestAccountImpl(id) {
   const noteEl = $('#investAccountPriceNote');
   noteEl.classList.toggle('hidden', !notes.length);
   noteEl.innerHTML = notes.map(esc).join('<br>');
-  investViewData.investAccount = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false };
+  investViewData.investAccount = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false, gainUnknown: !!data.summary.costUnknown };
   applyInvestRange('investAccount');
   const rows = data.holdings.map((row) => {
     const h = row.holding; const sm = row.summary;
     return `<tr class="clickable" onclick="location.hash='#invest-holding/${h.id}'">
-      <td>${esc(h.label)}${aiBadge(h.source)} ${currencyBadge(h.currency)}<div class="note" style="margin:0">${h.kind === 'fund' ? 'Mutual fund' : 'Exchange'}${h.symbol ? ` · ${esc(h.symbol)}` : ''}${h.fund_code ? ` · ${esc(h.fund_code)}` : ''}</div></td>
+      <td>${esc(h.label)}${aiBadge(h.source)} ${currencyBadge(h.currency)}<div class="note" style="margin:0">${h.kind === 'fund' ? 'Mutual fund' : 'Exchange'}${h.symbol ? ` · ${esc(h.symbol)}` : ''}${h.fund_code ? ` · ${esc(h.fund_code)}` : ''}${sm.costUnknown ? ' · cost unknown' : ''}</div></td>
       <td class="num">${fmtUnits(sm.units)}</td>
       <td class="num">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}${sm.latestPriceDate ? `<div class="note" style="margin:0">${esc(sm.latestPriceDate)}</div>` : ''}</td>
       <td class="num">${moneyC(sm.valueNative, h.currency)}</td>
       <td class="num">${moneyC(sm.value)}</td>
-      <td class="num">${returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</td>
+      <td class="num">${sm.costUnknown ? '—' : returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</td>
       <td style="white-space:nowrap">
         <button class="small" onclick="event.stopPropagation(); openInvestHoldingModal(${h.id})">Edit</button>
         <button class="small danger" onclick="event.stopPropagation(); deleteInvestHolding(${h.id})">Delete</button>
@@ -5354,7 +5360,7 @@ async function loadInvestHoldingImpl(id) {
     <div class="summary-card"><div class="k">Units</div><div class="v">${fmtUnits(sm.units)}</div></div>
     <div class="summary-card"><div class="k">Latest price</div><div class="v">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}</div><div class="n">${sm.latestPriceDate ? `${esc(sm.latestPriceDate)} · ${esc({ stooq: 'Stooq', yahoo: 'Yahoo Finance', manual: 'manual NAV', event: 'trade price' }[sm.latestPriceSource] || sm.latestPriceSource || '')}` : 'no price yet'}</div></div>
     <div class="summary-card"><div class="k">Current value</div><div class="v">${moneyC(sm.valueNative, h.currency)}</div><div class="n">${h.currency === 'USD' ? `${moneyC(sm.value)} CAD` : ''}</div></div>
-    <div class="summary-card"><div class="k">Total return</div><div class="v">${returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</div><div class="n">contributions ${moneyC(sm.contributionsNative, h.currency)}</div></div>`;
+    <div class="summary-card"><div class="k">Total return</div><div class="v">${sm.costUnknown ? '—' : returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</div><div class="n">contributions ${moneyC(sm.contributionsNative, h.currency)}${sm.costUnknown ? ` · ${fmtUnits(sm.unknownCostUnits)} units with unknown cost` : ''}</div></div>`;
   const st = data.priceStatus;
   const notes = [];
   if (st.pricedBy === 'none') notes.push('No price yet: this holding values at 0 until a priced event or a price snapshot exists.');
@@ -5364,13 +5370,14 @@ async function loadInvestHoldingImpl(id) {
   if (st.stale) notes.push(`Market prices may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
   if (st.fetchFailedToday) notes.push(`Market price fetch failed (${esc(st.lastError)}) — last attempt ${esc(st.lastAttemptAt || '—')}.`);
   if (sm.unpricedGrants) notes.push(`${sm.unpricedGrants} grant(s) had no price on their date and count as $0 contributions.`);
+  if (sm.costUnknown) notes.push('Cost unknown — gain is not shown: replace the position record(s) with actual buy records when available.');
   if (data.fxMissing && h.currency === 'USD') notes.push('USD/CAD rates are unavailable right now — CAD figures show the unconverted amounts.');
   const noteEl = $('#investHoldingPriceNote');
   noteEl.classList.toggle('hidden', !notes.length);
   noteEl.innerHTML = notes.map(esc).join('<br>');
-  investViewData.investHolding = { series: data.series, monthly: data.monthly, cur: h.currency, native: true };
+  investViewData.investHolding = { series: data.series, monthly: data.monthly, cur: h.currency, native: true, gainUnknown: !!sm.costUnknown };
   applyInvestRange('investHolding');
-  const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend', split: 'Split' };
+  const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend', split: 'Split', position: 'Position' };
   const rows = data.events.map((e) => `<tr>
       <td>${esc(e.date)}</td><td>${e.type === 'split' ? `Split · ${splitRatioText(e)}` : (typeLabels[e.type] || esc(e.type))}${aiBadge(e.source)}</td>
       <td class="num">${e.units != null ? fmtUnits(e.units) : '—'}</td>
@@ -5413,13 +5420,30 @@ function syncInvestEventFields() {
   const type = $('#investEventForm').elements.type.value;
   const isDiv = type === 'dividend';
   const isSplit = type === 'split';
+  const isPos = type === 'position';
   document.querySelector('[data-ev-units]').classList.toggle('hidden', isDiv || isSplit);
-  document.querySelector('[data-ev-price]').classList.toggle('hidden', isDiv || isSplit);
+  document.querySelector('[data-ev-price]').classList.toggle('hidden', isDiv || isSplit || isPos);
   document.querySelector('[data-ev-amount]').classList.toggle('hidden', !isDiv);
   document.querySelector('[data-ev-split]').classList.toggle('hidden', !isSplit);
+  document.querySelector('[data-ev-derive]').classList.toggle('hidden', !isPos);
   $('#investEventForm').elements.price.placeholder = type === 'grant' ? 'blank = market' : '';
 }
 $('#investEventForm').elements.type.addEventListener('change', syncInvestEventFields);
+// Value ÷ NAV helper: the only arithmetic the cost-unknown
+// path allows — both inputs are observed figures, so the
+// quotient is exact, never an invented price.
+document.querySelector('#investEventDeriveBtn').addEventListener('click', () => {
+  const form = $('#investEventForm');
+  const v = parseMoneyInput(form.elements.deriveValue.value);
+  const n = parseMoneyInput(form.elements.deriveNav.value);
+  const msg = $('#investEventMsg');
+  if (v === '' || n === '' || !(Number(v) > 0) || !(Number(n) > 0)) {
+    showMsg(msg, 'err', 'Enter a total value and a NAV per unit, both above 0.');
+    return;
+  }
+  form.elements.units.value = String(Math.round((Number(v) / Number(n)) * 10000) / 10000);
+  msg.textContent = ''; msg.className = 'msg';
+});
 $('#investEventCancel').addEventListener('click', resetInvestEventForm);
 
 function editInvestEvent(id) {
@@ -5459,11 +5483,18 @@ $('#investEventForm').addEventListener('submit', async (e) => {
     f.units = null; f.price = null; f.amount = null;
     f.splitNew = f.splitNew === '' || f.splitNew == null ? null : Number(f.splitNew);
     f.splitOld = f.splitOld === '' || f.splitOld == null ? null : Number(f.splitOld);
+  } else if (f.type === 'position') {
+    // A position never carries a price — drop anything the
+    // hidden price input still holds from another type.
+    f.price = null; f.amount = null; f.splitNew = null; f.splitOld = null;
+    if (f.units === '') f.units = null;
   } else {
     f.amount = null; f.splitNew = null; f.splitOld = null;
     if (f.units === '') f.units = null; if (f.price === '') f.price = null;
   }
   if (!f.note) f.note = null;
+  // The derive helper's inputs are form-only, never submitted.
+  delete f.deriveValue; delete f.deriveNav;
   try {
     if (id) await api(`/api/investments/events/${id}`, { method: 'PUT', body: f });
     else await api(`/api/investments/holdings/${currentInvestHoldingId}/events`, { method: 'POST', body: f });
@@ -5662,7 +5693,7 @@ $('#investHoldingForm').addEventListener('submit', async (e) => {
 // flagged (the server marks them) and start unchecked. The
 // conversation lives in this page session only; switching
 // accounts or Clear session resets it.
-let investChatState = { turns: [], proposed: { holdings: [], events: [] } };
+let investChatState = { turns: [], proposed: { holdings: [], events: [], nav: [] } };
 let investChatDropped = []; // items the last AI round did not turn into proposals, with reasons
 let investChatAccountId = null;
 let investChatQueue = [];
@@ -5696,7 +5727,7 @@ function renderInvestChatQueue() {
 }
 
 function resetInvestChat(accountId) {
-  investChatState = { turns: [], proposed: { holdings: [], events: [] } };
+  investChatState = { turns: [], proposed: { holdings: [], events: [], nav: [] } };
   investChatDropped = [];
   investChatAccountId = accountId;
   investChatQueue = [];
@@ -5730,7 +5761,7 @@ function syncInvestChatClearBtn() {
   if (!btn) return;
   const p = investChatState.proposed;
   btn.classList.toggle('hidden',
-    !(investChatState.turns.length || p.holdings.length || p.events.length || investChatQueue.length || investChatDropped.length));
+    !(investChatState.turns.length || p.holdings.length || p.events.length || (p.nav && p.nav.length) || investChatQueue.length || investChatDropped.length));
 }
 
 function investChatLogHtml() {
@@ -5789,6 +5820,10 @@ const investEventSentence = (e, symbol) => {
   if (e.type === 'split') return (e.splitNew != null && e.splitOld != null)
     ? `${date} · Split · ${sym} · ${investFmtUnits(e.splitNew)}:${investFmtUnits(e.splitOld)}`
     : `${date} · Split · ${sym} · (no ratio)`;
+  if (e.type === 'position') {
+    const units = investFmtUnits(e.units);
+    return `${date} · Position · ${sym} · ${units != null ? `${units} units` : '(no units)'} (cost unknown)${e.note ? ` — ${e.note}` : ''}`;
+  }
   const action = e.type === 'buy' ? 'Buy' : e.type === 'sell' ? 'Sell' : 'Grant';
   const units = investFmtUnits(e.units);
   let pricePart = '';
@@ -5801,18 +5836,18 @@ const investGroupEvents = (events) => {
   const keyOf = (e) => {
     if (investImportGroupBy === 'symbol') return investEventSymbol(e);
     if (investImportGroupBy === 'month') return (e.date || '').slice(0, 7) || '(no date)';
-    return e.type === 'buy' ? 'Buy' : e.type === 'sell' ? 'Sell' : e.type === 'grant' ? 'Grant' : e.type === 'dividend' ? 'Dividend' : 'Split';
+    return e.type === 'buy' ? 'Buy' : e.type === 'sell' ? 'Sell' : e.type === 'grant' ? 'Grant' : e.type === 'dividend' ? 'Dividend' : e.type === 'position' ? 'Position' : 'Split';
   };
   events.forEach((e, i) => {
     const key = keyOf(e);
     if (!groups.has(key)) groups.set(key, { key, indices: [], units: 0, div: 0 });
     const g = groups.get(key);
     g.indices.push(i);
-    if ((e.type === 'buy' || e.type === 'sell' || e.type === 'grant') && Number.isFinite(Number(e.units))) g.units += Math.abs(Number(e.units));
+    if ((e.type === 'buy' || e.type === 'sell' || e.type === 'grant' || e.type === 'position') && Number.isFinite(Number(e.units))) g.units += Math.abs(Number(e.units));
     if (e.type === 'dividend' && Number.isFinite(Number(e.amount))) g.div += Number(e.amount);
   });
   const order = investImportGroupBy === 'type'
-    ? ['Buy', 'Sell', 'Grant', 'Dividend', 'Split']
+    ? ['Buy', 'Sell', 'Grant', 'Dividend', 'Position', 'Split']
     : [...groups.keys()].sort();
   return order.filter((k) => groups.has(k)).map((k) => groups.get(k));
 };
@@ -5838,7 +5873,7 @@ function renderInvestProposed() {
   const host = document.querySelector('[data-invest-proposed]');
   if (!host) return;
   syncInvestChatClearBtn();
-  const { holdings, events } = investChatState.proposed;
+  const { holdings, events, nav = [] } = investChatState.proposed;
   // The dropped-items warning is functional, not decorative: it
   // is the only place a user learns a statement line never
   // became a proposal, so it renders even when nothing else
@@ -5849,7 +5884,7 @@ function renderInvestProposed() {
   const reportHtml = investImportReport
     ? `<div class="note">CSV import preview: ${investImportReport.holdings} new holdings, ${investImportReport.events} events · Skipped ${investImportReport.skipped} cash rows${investImportReport.skippedByType && Object.keys(investImportReport.skippedByType).length ? ` (${Object.entries(investImportReport.skippedByType).map(([t, n]) => `${esc(t)} ${n}`).join(', ')})` : ''} · Already recorded: ${investImportReport.duplicates}</div>`
     : '';
-  if (!holdings.length && !events.length) { host.innerHTML = reportHtml + droppedHtml; return; }
+  if (!holdings.length && !events.length && !nav.length) { host.innerHTML = reportHtml + droppedHtml; return; }
   const holdingRows = holdings.map((h, i) => `
     <div class="costs-proposed-row${h.conflict ? ' conflict' : ''}" data-ih-row="${i}">
       <input type="checkbox" data-ih-check${h.conflict ? '' : ' checked'}>
@@ -5872,7 +5907,7 @@ function renderInvestProposed() {
       <select data-ie-target>${investTargetOptions(sel)}</select>
       <input type="date" data-ie-date value="${esc(e.date || '')}">
       <select data-ie-type>
-        ${['buy', 'sell', 'grant', 'dividend', 'split'].map((t) => `<option value="${t}"${e.type === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}
+        ${['buy', 'sell', 'grant', 'dividend', 'split', 'position'].map((t) => `<option value="${t}"${e.type === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}
       </select>
       <input type="text" inputmode="decimal" data-ie-units value="${e.units ?? ''}" placeholder="Units" style="width:84px">
       <input type="text" inputmode="decimal" data-money data-ie-price value="${esc(formatMoneyInput(e.price ?? ''))}" placeholder="Price" style="width:110px">
@@ -5886,8 +5921,29 @@ function renderInvestProposed() {
       <input type="checkbox" data-ie-check${ieChecked(e)}>
       ${investEventInputs(e, sel)}
       ${e.priceDerived ? '<span class="note">Price derived from total amount</span>' : ''}
+      ${e.type === 'position' ? '<span class="note">Cost unknown — no price on this record</span>' : ''}
+      ${e.type === 'position' && e.note ? `<span class="note">${esc(e.note)}</span>` : ''}
       ${e.conflict ? '<span class="conflict-tag">Same event already recorded — applies only if checked</span>' : ''}
       <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
+    </div>`;
+  }).join('');
+  // NAV snapshots are observations, not transactions: their own
+  // flat section (no grouping — a price series browses by date,
+  // and CSV import never produces them).
+  const navRows = nav.map((n, i) => {
+    const sel = n.holdingId != null ? `id:${n.holdingId}` : `ref:${n.holdingRef}`;
+    const conflictTag = !n.conflict ? ''
+      : n.conflict === 'nav-differs'
+        ? `<span class="conflict-tag">NAV already recorded: ${investFmtMoney(n.oldPrice)} → ${investFmtMoney(n.price)} — applies only if checked</span>`
+        : '<span class="conflict-tag">Same NAV already recorded — applies only if checked</span>';
+    return `
+    <div class="costs-proposed-row${n.conflict ? ' conflict' : ''}" data-in-row="${i}">
+      <input type="checkbox" data-in-check${ieChecked(n)}>
+      <select data-in-target>${investTargetOptions(sel)}</select>
+      <input type="date" data-in-date value="${esc(n.date || '')}">
+      <input type="text" inputmode="decimal" data-money data-in-price value="${esc(formatMoneyInput(n.price ?? ''))}" placeholder="NAV / unit" style="width:110px">
+      ${conflictTag}
+      <button type="button" class="small danger" data-in-remove title="Remove">×</button>
     </div>`;
   }).join('');
   // Import mode rows read as sentences first (browsing) with the
@@ -5935,6 +5991,7 @@ function renderInvestProposed() {
   host.innerHTML = `<div class="costs-proposed">${reportHtml}${droppedHtml}<h5>Proposed — review, edit, then Apply</h5>
     ${holdings.length ? `<div class="note" style="margin:0 0 4px">New holdings</div>${holdingRows}` : ''}
     ${investImportMode ? importEventSection : (events.length ? `<div class="note" style="margin:6px 0 4px">Events</div>${eventRows}` : '')}
+    ${nav.length ? `<div class="note" style="margin:6px 0 4px">NAV snapshots — observed prices, not transactions</div>${navRows}` : ''}
     <div class="toolbar" style="margin-top:6px">
       <button type="button" class="primary small" data-invest-apply>Apply selected</button>
       <button type="button" class="small" data-invest-discard>Discard</button>
@@ -5953,7 +6010,8 @@ function readInvestProposed() {
   const host = document.querySelector('[data-invest-proposed]');
   const holdings = [];
   const events = [];
-  if (!host) return { holdings, events };
+  const nav = [];
+  if (!host) return { holdings, events, nav };
   const slot = (list, rows, build) => {
     const placed = new Array(list.length).fill(undefined);
     const extra = [];
@@ -5999,20 +6057,36 @@ function readInvestProposed() {
       const u = row.querySelector('[data-ie-units]').value.trim();
       ev.units = u === '' ? null : Number(u);
       const p = parseMoneyInput(row.querySelector('[data-ie-price]').value);
-      ev.price = p === '' ? null : p;
+      // A position carries no price by definition — never let
+      // a stray price input turn it into a buy.
+      ev.price = type === 'position' ? null : (p === '' ? null : p);
     }
     return ev;
   }).forEach((e) => events.push(e));
-  return { holdings, events };
+  slot(investChatState.proposed.nav || [], [...host.querySelectorAll('[data-in-row]')], (row, prev) => {
+    const target = row.querySelector('[data-in-target]').value || '';
+    const p = parseMoneyInput(row.querySelector('[data-in-price]').value);
+    return {
+      checked: row.querySelector('[data-in-check]').checked,
+      holdingId: target.startsWith('id:') ? Number(target.slice(3)) : null,
+      holdingRef: target.startsWith('ref:') ? target.slice(4) : null,
+      date: row.querySelector('[data-in-date]').value,
+      price: p === '' ? null : p,
+      conflict: prev.conflict || null,
+      oldPrice: prev.oldPrice ?? null,
+    };
+  }).forEach((n) => nav.push(n));
+  return { holdings, events, nav };
 }
 
 // Keep the draft state in step with the inputs without a
 // re-render (typing must not lose focus).
 document.querySelector('[data-invest-proposed]').addEventListener('change', () => {
-  const { holdings, events } = readInvestProposed();
+  const { holdings, events, nav } = readInvestProposed();
   investChatState.proposed = {
     holdings: holdings.map(({ checked, ...rest }) => rest),
     events: events.map(({ checked, ...rest }) => rest),
+    nav: nav.map(({ checked, ...rest }) => rest),
   };
 });
 
@@ -6024,7 +6098,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('change', (e) 
   const host = document.querySelector('[data-invest-proposed]');
   if (e.target.matches('[data-ie-group-by]')) {
     const draft = readInvestProposed();
-    investChatState.proposed = { holdings: draft.holdings, events: draft.events };
+    investChatState.proposed = { holdings: draft.holdings, events: draft.events, nav: draft.nav };
     investImportGroupBy = e.target.value;
     renderInvestProposed();
     return;
@@ -6075,28 +6149,41 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   }
   if (e.target.closest('[data-ih-remove]')) {
     const idx = Number(e.target.closest('[data-ih-row]').dataset.ihRow);
-    const { holdings, events } = readInvestProposed();
+    const { holdings, events, nav } = readInvestProposed();
     const removed = holdings[idx];
     investChatState.proposed = {
       holdings: holdings.filter((_, i) => i !== idx).map(({ checked, ...rest }) => rest),
-      // Events pointing at a removed draft holding go with it.
+      // Events and NAV rows pointing at a removed draft holding go with it.
       events: events.filter((ev) => ev.holdingRef !== (removed && removed.ref)).map(({ checked, ...rest }) => rest),
+      nav: nav.filter((n) => n.holdingRef !== (removed && removed.ref)).map(({ checked, ...rest }) => rest),
     };
     renderInvestProposed();
     return;
   }
   if (e.target.closest('[data-ie-remove]')) {
     const idx = Number(e.target.closest('[data-ie-row]').dataset.ieRow);
-    const { holdings, events } = readInvestProposed();
+    const { holdings, events, nav } = readInvestProposed();
     investChatState.proposed = {
       holdings: holdings.map(({ checked, ...rest }) => rest),
       events: events.filter((_, i) => i !== idx).map(({ checked, ...rest }) => rest),
+      nav: nav.map(({ checked, ...rest }) => rest),
+    };
+    renderInvestProposed();
+    return;
+  }
+  if (e.target.closest('[data-in-remove]')) {
+    const idx = Number(e.target.closest('[data-in-row]').dataset.inRow);
+    const { holdings, events, nav } = readInvestProposed();
+    investChatState.proposed = {
+      holdings: holdings.map(({ checked, ...rest }) => rest),
+      events: events.map(({ checked, ...rest }) => rest),
+      nav: nav.filter((_, i) => i !== idx).map(({ checked, ...rest }) => rest),
     };
     renderInvestProposed();
     return;
   }
   if (e.target.closest('[data-invest-discard]')) {
-    investChatState.proposed = { holdings: [], events: [] };
+    investChatState.proposed = { holdings: [], events: [], nav: [] };
     investChatDropped = [];
     investImportMode = false;
     investImportReport = null;
@@ -6166,7 +6253,8 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   const draft = readInvestProposed();
   const chosenHoldings = draft.holdings.filter((h) => h.checked);
   const chosenEvents = draft.events.filter((ev) => ev.checked);
-  if (!chosenHoldings.length && !chosenEvents.length) {
+  const chosenNav = (draft.nav || []).filter((n) => n.checked);
+  if (!chosenHoldings.length && !chosenEvents.length && !chosenNav.length) {
     showMsg(msg, 'err', 'Nothing is selected to apply.');
     return;
   }
@@ -6189,6 +6277,16 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       return;
     }
   }
+  for (const n of chosenNav) {
+    if (!n.date || !(n.price > 0)) {
+      showMsg(msg, 'err', 'A selected NAV snapshot is missing its date or price.');
+      return;
+    }
+    if (n.holdingId == null && !chosenHoldings.some((h) => h.ref === n.holdingRef)) {
+      showMsg(msg, 'err', 'A selected NAV snapshot belongs to a new holding that is not selected — select the holding too.');
+      return;
+    }
+  }
   const applyBtn = e.target.closest('[data-invest-apply]');
   applyBtn.disabled = true;
   try {
@@ -6207,10 +6305,20 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
         method: 'POST', body: { ...fields, holdingId: undefined, source: 'ai' },
       });
     }
-    const n = chosenHoldings.length + chosenEvents.length;
+    // NAV snapshots write through the same manual endpoint the
+    // holding page uses — Apply only ever writes checked rows.
+    for (const n of chosenNav) {
+      const { checked, conflict, oldPrice, holdingRef, ...fields } = n;
+      const holdingId = n.holdingId != null ? n.holdingId : refToId.get(holdingRef);
+      await api(`/api/investments/holdings/${holdingId}/nav`, {
+        method: 'POST', body: { date: fields.date, price: fields.price },
+      });
+    }
+    const n = chosenHoldings.length + chosenEvents.length + chosenNav.length;
     investChatState.proposed = {
       holdings: draft.holdings.filter((h) => !h.checked).map(({ checked, ...rest }) => rest),
       events: draft.events.filter((ev) => !ev.checked).map(({ checked, ...rest }) => rest),
+      nav: (draft.nav || []).filter((x) => !x.checked).map(({ checked, ...rest }) => rest),
     };
     investChatDropped = []; // the round is closed; the next send re-derives the warning
     investChatState.turns.push({ role: 'assistant', content: `Applied ${n} ${n === 1 ? 'item' : 'items'}.` });
@@ -6290,7 +6398,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     try {
       const text = await f.text();
       const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv`, { method: 'POST', body: { csv: text } });
-      investChatState.proposed = { holdings: r.holdings || [], events: r.events || [] };
+      investChatState.proposed = { holdings: r.holdings || [], events: r.events || [], nav: [] };
       investChatDropped = r.failed || [];
       investImportMode = true;
       investImportSource = 'csv';
@@ -6546,7 +6654,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       clearInvestChatMsg();
       try {
         const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/preview`, { method: 'POST', body: { csv: investMapCsv, mapping, answers } });
-        investChatState.proposed = { holdings: r.holdings || [], events: r.events || [] };
+        investChatState.proposed = { holdings: r.holdings || [], events: r.events || [], nav: [] };
         investChatDropped = r.failed || [];
         investImportMode = true;
         investImportSource = 'csv-ai';
@@ -6622,6 +6730,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       investChatState.proposed = {
         holdings: (r.proposed && r.proposed.holdings) || [],
         events: (r.proposed && r.proposed.events) || [],
+        nav: (r.proposed && r.proposed.nav) || [],
       };
       investChatDropped = (r.proposed && Array.isArray(r.proposed.dropped)) ? r.proposed.dropped : [];
       investImportMode = false; // an AI round replaces any import preview

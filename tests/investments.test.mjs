@@ -15,7 +15,7 @@ import {
   getAccount, listAccounts,
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints,
-  splitMultiplier, splitFactorAfter, adjustedUnitsOf,
+  splitMultiplier, splitFactorAfter, adjustedUnitsOf, derivePositionUnits,
   monthlyYears, latestMonthlyYear, monthlyRowsForYear,
 } from '../src/investments.js';
 import {
@@ -978,4 +978,124 @@ test('account owners: stored JSON array reads back as an array; NULL reads as []
   assert.deepEqual(getAccount(db, 3).owners, []);
   assert.deepEqual(listAccounts(db).map((a) => a.owners), [['Shawn', 'Jiaying'], [], []]);
   assert.equal(getAccount(db, 99), null);
+});
+
+// ------------------------------------------- cost-unknown positions
+test('validEventInput: a position needs units, rejects any price, counts toward the sell guard', () => {
+  assert.deepEqual(validEventInput({ date: '2026-06-30', type: 'position', units: 695.5991 }),
+    { date: '2026-06-30', type: 'position', units: 695.5991, price: null, amount: null, splitNew: null, splitOld: null, note: null });
+  assert.ok(validEventInput({ date: '2026-06-30', type: 'position', units: 10, price: 92 }).error);
+  assert.ok(validEventInput({ date: '2026-06-30', type: 'position' }).error);
+  assert.ok(validEventInput({ date: '2026-06-30', type: 'position', units: 0 }).error);
+  const events = [E(1, '2026-06-30', 'position', 695.5991)];
+  assert.equal(unitsOn(events, '2026-06-30'), 695.5991);
+  assert.equal(unitsAvailableForSell(events, '2026-07-01'), 695.5991);
+  assert.ok(!validEventInput({ date: '2026-07-01', type: 'sell', units: 100, price: 95 }, { events }).error);
+  assert.ok(validEventInput({ date: '2026-07-01', type: 'sell', units: 700, price: 95 }, { events }).error);
+  // Initial-transaction batches count position units toward later sells.
+  const batch = validInitialEvents([
+    { date: '2026-06-30', type: 'position', units: 100 },
+    { date: '2026-07-01', type: 'sell', units: 40, price: 95 },
+  ]);
+  assert.ok(!batch.error, JSON.stringify(batch));
+});
+
+test('computeHoldingSeries: a cost-unknown position values from NAVs, contributes 0, flags costUnknown, identity holds', () => {
+  const events = [E(1, '2026-06-30', 'position', 695.5991)];
+  const points = [P('2026-06-30', 92.0252, 'manual'), P('2026-09-30', 94.3201, 'manual')];
+  const { monthly, summary } = computeHoldingSeries({ events, points, fxRate: () => 1, today: '2026-10-15' });
+  assert.equal(summary.units, 695.5991);
+  assert.equal(summary.valueNative, 65608.98); // 695.5991 × 94.3201
+  assert.equal(summary.contributionsNative, 0);
+  assert.equal(summary.unknownCostUnits, 695.5991);
+  assert.equal(summary.costUnknown, true);
+  for (const r of monthly) {
+    assert.equal(r.endValueNative, r.startValueNative + r.contributionsNative + r.gainNative, r.month);
+  }
+  const jun = monthly.find((r) => r.month === '2026-06');
+  assert.deepEqual([jun.startValueNative, jun.contributionsNative, jun.endValueNative], [0, 0, 64012.65]);
+  // Replacing the position with a real buy clears the flag and books the cost.
+  const bought = computeHoldingSeries({
+    events: [E(1, '2025-01-15', 'buy', 695.5991, 73.8594)],
+    points, fxRate: () => 1, today: '2026-10-15',
+  }).summary;
+  assert.equal(bought.costUnknown, false);
+  // 73.8594 is the book cost per unit rounded to 4dp, so the
+  // re-booked total is 2c off the printed $51,376.55 — rounding,
+  // not a model error.
+  assert.equal(bought.contributionsNative, 51376.53);
+});
+
+test('aggregateComputed: costUnknown propagates from any holding', () => {
+  const a = computeHoldingSeries({
+    events: [E(1, '2026-06-30', 'position', 10)], points: [P('2026-06-30', 100, 'manual')],
+    fxRate: () => 1, today: '2026-10-15',
+  });
+  const b = computeHoldingSeries({
+    events: [E(1, '2026-06-30', 'buy', 10, 50)], points: [P('2026-06-30', 100, 'manual')],
+    fxRate: () => 1, today: '2026-10-15',
+  });
+  const agg = aggregateComputed([a, b]);
+  assert.equal(agg.summary.costUnknown, true);
+  assert.equal(agg.summary.unknownCostUnits, 10);
+  assert.equal(aggregateComputed([b]).summary.costUnknown, false);
+});
+
+test('derivePositionUnits: value ÷ NAV, null on bad input', () => {
+  assert.equal(derivePositionUnits(65608.98, 94.3201), 695.5991);
+  assert.equal(derivePositionUnits(0, 94.3201), null);
+  assert.equal(derivePositionUnits(65608.98, 0), null);
+  assert.equal(derivePositionUnits(null, 94.3201), null);
+  assert.equal(derivePositionUnits('65608.98', '94.3201'), 695.5991);
+});
+
+// ------------------------------------------------- NAV proposals (AI)
+test('normalizeProposedInvestments: NAV snapshots validate, flag duplicates and corrections, orphans land in dropped', () => {
+  const existingNav = [{ holding_id: 12, date: '2026-06-30', price: 92.0252 }];
+  const out = normalizeProposedInvestments({
+    nav: [
+      { holdingId: 12, date: '2026-06-30', price: 92.0252 }, // exact duplicate
+      { holdingId: 12, date: '2026-06-30', price: 94.3201 }, // same date, corrected price
+      { holdingId: 12, date: '2026-09-30', price: 94.3201 }, // new snapshot
+      { holdingId: 12, date: '2026-10-31', price: 0 },       // bad price — dropped
+      { holdingId: 12, date: 'not-a-date', price: 95 },      // bad date — dropped
+      { holdingId: 999, date: '2026-09-30', price: 95 },     // matches nothing — dropped
+    ],
+  }, { existingHoldings: EXISTING, existingEvents: [], existingNav });
+  assert.equal(out.nav.length, 3, JSON.stringify(out.nav));
+  assert.deepEqual(out.nav.map((n) => [n.date, n.price, n.conflict]), [
+    ['2026-06-30', 92.0252, 'duplicate-nav'],
+    ['2026-06-30', 94.3201, 'nav-differs'],
+    ['2026-09-30', 94.3201, null],
+  ]);
+  assert.equal(out.nav[1].oldPrice, 92.0252);
+  assert.equal(out.dropped.length, 3, JSON.stringify(out.dropped));
+  assert.match(out.dropped[0].reason, /price/);
+  assert.match(out.dropped[1].reason, /date/);
+  assert.match(out.dropped[2].reason, /matched to a holding/);
+});
+
+test('normalizeProposedInvestments: position events need units, reject a price, flag duplicates null-safely', () => {
+  const out = normalizeProposedInvestments({
+    events: [
+      { holdingId: 12, date: '2026-06-30', type: 'position', units: 695.5991, note: 'units derived: 65608.98 ÷ 94.3201' },
+      { holdingId: 12, date: '2026-06-30', type: 'position', units: 10, price: 92 }, // priced — dropped
+      { holdingId: 12, date: '2026-07-31', type: 'position' },                       // no units — dropped
+    ],
+  }, { existingHoldings: EXISTING, existingEvents: [] });
+  assert.equal(out.events.length, 1, JSON.stringify(out.events));
+  assert.deepEqual([out.events[0].type, out.events[0].units, out.events[0].price, out.events[0].note],
+    ['position', 695.5991, null, 'units derived: 65608.98 ÷ 94.3201']);
+  assert.equal(out.dropped.length, 2, JSON.stringify(out.dropped));
+  assert.match(out.dropped[0].reason, /no price/);
+  assert.match(out.dropped[1].reason, /units/);
+  // A recorded position (price null) re-proposed flags duplicate —
+  // the old NaN-equals-NaN comparison missed exactly this case.
+  const dupe = normalizeProposedInvestments({
+    events: [{ holdingId: 12, date: '2026-06-30', type: 'position', units: 695.5991 }],
+  }, {
+    existingHoldings: EXISTING,
+    existingEvents: [{ id: 50, holding_id: 12, date: '2026-06-30', type: 'position', units: 695.5991, price: null }],
+  });
+  assert.equal(dupe.events[0].conflict, 'duplicate-event');
 });

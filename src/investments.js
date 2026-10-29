@@ -56,7 +56,7 @@
 export const ACCOUNT_TYPES = ['TFSA', 'RRSP', 'RSU', 'NonRegistered', 'Other'];
 export const HOLDING_KINDS = ['exchange', 'fund'];
 export const HOLDING_CURRENCIES = ['CAD', 'USD'];
-export const EVENT_TYPES = ['buy', 'sell', 'grant', 'dividend', 'split'];
+export const EVENT_TYPES = ['buy', 'sell', 'grant', 'dividend', 'split', 'position'];
 
 // ------------------------------------------------------------- splits
 // A split event's multiplier: split_new / split_old (3:1 → 3,
@@ -169,7 +169,7 @@ export function unitsAvailableForSell(events, date, exceptId = null) {
   let u = 0;
   for (const e of events) {
     if (e.id === exceptId || e.date > date) continue;
-    if (e.type === 'buy' || e.type === 'grant') u += adjustedUnitsOf(e, events);
+    if (e.type === 'buy' || e.type === 'grant' || e.type === 'position') u += adjustedUnitsOf(e, events);
     else if (e.type === 'sell') u -= adjustedUnitsOf(e, events);
   }
   return round4(u);
@@ -204,6 +204,21 @@ export function validEventInput(b, ctx = {}) {
     }
     if (out.splitNew === out.splitOld) {
       return { error: 'a split ratio must change the unit count (new ≠ old)' };
+    }
+    return out;
+  }
+  if (merged.type === 'position') {
+    // A cost-unknown position: units observed (a statement
+    // holding, or value ÷ NAV on one date), NO price. A price
+    // on this record would make it a buy — the whole point of
+    // the type is that nothing about cost is invented. It
+    // counts toward units held and toward the sell guard, but
+    // contributes $0 and flags the holding cost-unknown until
+    // real buy records replace it.
+    out.units = posNum(merged.units);
+    if (out.units == null) return { error: 'a position needs units > 0' };
+    if (merged.price !== undefined && merged.price !== null && merged.price !== '') {
+      return { error: 'a position carries no price — use buy when a price is known' };
     }
     return out;
   }
@@ -263,7 +278,7 @@ export function validInitialEvents(list) {
   let balance = 0; // current-terms units acquired so far
   for (const v of validated) {
     const f = splitFactorAfter(validated, v.date);
-    if (v.type === 'buy' || v.type === 'grant') balance += Number(v.units) * f;
+    if (v.type === 'buy' || v.type === 'grant' || v.type === 'position') balance += Number(v.units) * f;
     else if (v.type === 'sell') {
       const mine = Number(v.units) * f;
       if (mine > balance + 1e-9) {
@@ -383,10 +398,21 @@ export function unitsOn(events, date) {
   let u = 0;
   for (const e of events) {
     if (e.date > date) continue;
-    if (e.type === 'buy' || e.type === 'grant') u += adjustedUnitsOf(e, events);
+    if (e.type === 'buy' || e.type === 'grant' || e.type === 'position') u += adjustedUnitsOf(e, events);
     else if (e.type === 'sell') u -= adjustedUnitsOf(e, events);
   }
   return round4(u);
+}
+
+// Derive units from a same-date total value and per-unit
+// price — the ONLY arithmetic the cost-unknown path allows:
+// both inputs are observed figures, the quotient is exact.
+// Null when either side is missing or not positive.
+export function derivePositionUnits(value, nav) {
+  const v = posNum(value);
+  const n = posNum(nav);
+  if (v == null || n == null) return null;
+  return round4(v / n);
 }
 
 // ------------------------------------------------------------- engine
@@ -489,6 +515,15 @@ export function computeHoldingSeries({ events, points, fxRate, today }) {
   const latestPx = priceOn(points, today);
   const totalRetC = now.cad - totContribC + totDivC;
   const totalRetN = now.native - totContribN + totDivN;
+  // Cost-unknown units: position events restated into current
+  // terms, like every other lot. While any remain, the
+  // holding's gain is NOT a number — it would read as
+  // "value minus zero contributions" — so the summary flags
+  // it and the views render gain / return % as unknown.
+  // The monthly identity itself still holds numerically;
+  // only the display suppresses the gain.
+  const unknownCostUnits = round4(sorted.reduce(
+    (s, e) => (e.type === 'position' ? s + adjustedUnitsOf(e, sorted) : s), 0));
   const summary = {
     units: now.units,
     latestPrice: latestPx ? latestPx.price : null,
@@ -501,6 +536,8 @@ export function computeHoldingSeries({ events, points, fxRate, today }) {
     totalReturnPct: totContribC > 0 ? round2((totalRetC / totContribC) * 100) : null,
     totalReturnPctNative: totContribN > 0 ? round2((totalRetN / totContribN) * 100) : null,
     unpricedGrants: sorted.filter((e) => e.type === 'grant' && e.price == null && !priceOn(points, e.date)).length,
+    unknownCostUnits,
+    costUnknown: unknownCostUnits > 0,
   };
   return { monthly, series, summary };
 }
@@ -511,6 +548,7 @@ function emptySummary() {
     value: 0, valueNative: 0, contributions: 0, contributionsNative: 0,
     dividends: 0, dividendsNative: 0, totalReturn: 0, totalReturnNative: 0,
     totalReturnPct: null, totalReturnPctNative: null, unpricedGrants: 0,
+    unknownCostUnits: 0, costUnknown: false,
   };
 }
 
@@ -553,17 +591,21 @@ export function aggregateComputed(list) {
   });
   const summary = {
     value: 0, contributions: 0, dividends: 0, totalReturn: 0, totalReturnPct: null,
+    unknownCostUnits: 0, costUnknown: false,
   };
   for (const c of list) {
     summary.value += c.summary.value;
     summary.contributions += c.summary.contributions;
     summary.dividends += c.summary.dividends;
     summary.totalReturn += c.summary.totalReturn;
+    summary.unknownCostUnits += c.summary.unknownCostUnits || 0;
+    if (c.summary.costUnknown) summary.costUnknown = true;
   }
   summary.value = round2(summary.value);
   summary.contributions = round2(summary.contributions);
   summary.dividends = round2(summary.dividends);
   summary.totalReturn = round2(summary.totalReturn);
+  summary.unknownCostUnits = round4(summary.unknownCostUnits);
   summary.totalReturnPct = summary.contributions > 0
     ? round2((summary.totalReturn / summary.contributions) * 100) : null;
   return { monthly, series, summary };

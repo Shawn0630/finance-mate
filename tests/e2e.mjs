@@ -8126,6 +8126,62 @@ try {
   r = await req('POST', '/api/ai/invest-fill-chat', { accountId: 999999, text: 'x' });
   check('investments AI: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
 
+  // ---- NAV snapshots + cost-unknown positions through Fill with AI ----
+  // A fund statement's holdings section (units + NAV + market
+  // value, no buy price anywhere) must propose NAV snapshots
+  // and a position — never a buy at a NAV price.
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Found the CIBC U.S. Index Fund on the statement: no buy prices are printed, so the units go in as a cost-unknown position with the two NAV snapshots.',
+    proposed: {
+      holdings: [{ ref: 'c1', label: 'CIBC U.S. Index Fund', kind: 'fund', currency: 'CAD' }],
+      events: [{ holdingRef: 'c1', date: '2026-09-30', type: 'position', units: 695.5991, note: 'units derived: 65608.98 ÷ 94.3201' }],
+      nav: [
+        { holdingRef: 'c1', date: '2026-06-30', price: 92.0252 },
+        { holdingRef: 'c1', date: '2026-09-30', price: 94.3201 },
+      ],
+    },
+    ready: true,
+  }));
+  r = await req('POST', '/api/ai/invest-fill-chat', { accountId: invTfsaId, text: 'CIBC statement Sep 30: U.S. Index Fund 695.5991 units, NAV 94.3201, market value 65608.98; Jun 30 NAV 92.0252.' });
+  check('investments AI: a holdings-only statement proposes NAV snapshots and a position, never a buy',
+    r.status === 200 && r.data.proposed.nav.length === 2
+      && r.data.proposed.events.length === 1 && r.data.proposed.events[0].type === 'position'
+      && r.data.proposed.events[0].price == null && /65608.98 ÷ 94.3201/.test(r.data.proposed.events[0].note || '')
+      && r.data.proposed.events.every((e) => e.type !== 'buy'),
+    JSON.stringify(r.data.proposed));
+  // Apply the way the panel does: holding, then its events, then its NAV snapshots.
+  r = await req('POST', `/api/investments/accounts/${invTfsaId}/holdings`, { label: 'CIBC U.S. Index Fund', kind: 'fund', currency: 'CAD', source: 'ai' });
+  const invCibcId = r.data.id;
+  check('investments AI: applied NAV holding carries the ai source', r.status === 201 && r.data.source === 'ai', JSON.stringify(r.data));
+  await req('POST', `/api/investments/holdings/${invCibcId}/events`, { date: '2026-09-30', type: 'position', units: 695.5991, note: 'units derived: 65608.98 ÷ 94.3201', source: 'ai' });
+  await req('POST', `/api/investments/holdings/${invCibcId}/nav`, { date: '2026-06-30', price: 92.0252 });
+  await req('POST', `/api/investments/holdings/${invCibcId}/nav`, { date: '2026-09-30', price: 94.3201 });
+  r = await req('GET', `/api/investments/holdings/${invCibcId}`);
+  check('investments AI: after Apply the holding has the position units, both NAVs, and the cost-unknown flag',
+    r.data.summary.units === 695.5991 && r.data.summary.costUnknown === true
+      && r.data.summary.valueNative === 65608.98 && r.data.summary.contributionsNative === 0
+      && r.data.navPoints.length === 2,
+    JSON.stringify({ summary: r.data.summary, nav: r.data.navPoints }));
+  // Re-proposing the same NAV flags a duplicate; a corrected
+  // price for the same date flags old → new. Both stay
+  // unchecked in the panel (asserted in the browser pass).
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    reply: 'Same statement again, with a corrected June NAV.',
+    proposed: {
+      nav: [
+        { holdingId: invCibcId, date: '2026-06-30', price: 92.0252 },
+        { holdingId: invCibcId, date: '2026-06-30', price: 94.3201 },
+      ],
+    },
+    ready: true,
+  }));
+  r = await req('POST', '/api/ai/invest-fill-chat', { accountId: invTfsaId, text: 'Same statement again, corrected Jun NAV.' });
+  check('investments AI: a re-proposed NAV flags duplicate and corrected-price conflicts',
+    r.status === 200 && r.data.proposed.nav.length === 2
+      && r.data.proposed.nav[0].conflict === 'duplicate-nav'
+      && r.data.proposed.nav[1].conflict === 'nav-differs' && r.data.proposed.nav[1].oldPrice === 92.0252,
+    JSON.stringify(r.data.proposed.nav));
+
   // Synthetic Wealthsimple fixture shared by the CSV import API
   // round below and the browser round inside the investments
   // browser block (the user's real export never appears here).
@@ -8398,6 +8454,74 @@ try {
       check('investments UI: a fund on trade prices keeps the record-NAV-snapshots banner',
         fundNote.includes('Priced from trade prices') && fundNote.includes('record NAV snapshots below'),
         fundNote.slice(0, 300));
+      // Cost-unknown position: the holding page shows the
+      // marker, suppresses the gain to —, and lists the NAV
+      // snapshots applied from the chat.
+      await page.goto(`http://ff.local/#invest-holding/${invCibcId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const cibcPage = await page.evaluate(() => {
+        const stats = [...document.querySelectorAll('#investHoldingStats .summary-card')].map((c) => ({
+          k: c.querySelector('.k').textContent, v: c.querySelector('.v').textContent,
+        }));
+        return {
+          text: document.querySelector('#view-invest-holding').textContent,
+          totalReturn: (stats.find((s) => s.k === 'Total return') || {}).v,
+        };
+      });
+      check('investments UI: a cost-unknown holding shows the marker, gain —, and both NAV snapshots',
+        cibcPage.text.includes('Cost unknown') && cibcPage.totalReturn === '—'
+          && cibcPage.text.includes('2026-06-30') && cibcPage.text.includes('2026-09-30')
+          && cibcPage.text.includes('Position'),
+        JSON.stringify({ totalReturn: cibcPage.totalReturn, tail: cibcPage.text.slice(0, 400) }));
+      // The chat panel renders conflict NAV rows unchecked.
+      fs.writeFileSync(aiStubFile, JSON.stringify({
+        reply: 'Same statement again.',
+        proposed: {
+          nav: [
+            { holdingId: invCibcId, date: '2026-06-30', price: 92.0252 },
+            { holdingId: invCibcId, date: '2026-06-30', price: 94.3201 },
+          ],
+        },
+        ready: true,
+      }));
+      await page.goto(`http://ff.local/#invest-account/${invTfsaId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('[data-invest-ai-toggle]');
+      await page.waitForFunction(() => !document.querySelector('[data-invest-ai-panel]').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('[data-invest-chat-text]', 'Same statement again.');
+      await page.click('[data-invest-chat-send]');
+      await page.waitForFunction(() => document.querySelectorAll('[data-invest-proposed] [data-in-row]').length === 2, { timeout: 20000 });
+      const navPanel = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-invest-proposed] [data-in-row]')].map((row) => ({
+          checked: row.querySelector('[data-in-check]').checked,
+          conflict: row.textContent.includes('already recorded'),
+        }));
+        return { rows, text: document.querySelector('[data-invest-proposed]').textContent };
+      });
+      check('investments UI: conflict NAV rows render unchecked in the proposal panel',
+        navPanel.rows.length === 2 && navPanel.rows.every((r) => r.checked === false && r.conflict === true),
+        JSON.stringify(navPanel.rows));
+      // The panel is static HTML: its open state survives SPA
+      // navigation, so close it again — the next chat test
+      // opens it with one toggle click.
+      await page.click('[data-invest-ai-toggle]');
+      await page.waitForFunction(() => document.querySelector('[data-invest-ai-panel]').classList.contains('hidden'), { timeout: 10000 });
+      // Replaceability: delete the position, add real buys, and
+      // the marker clears while history recomputes.
+      r = await req('GET', `/api/investments/holdings/${invCibcId}`);
+      const posEv = r.data.events.find((e) => e.type === 'position');
+      await req('DELETE', `/api/investments/events/${posEv.id}`);
+      await req('POST', `/api/investments/holdings/${invCibcId}/events`, { date: '2025-01-15', type: 'buy', units: 695.5991, price: 73.8594 });
+      r = await req('GET', `/api/investments/holdings/${invCibcId}`);
+      check('investments AI: deleting the position and adding buys clears cost-unknown and books the cost',
+        r.data.summary.costUnknown === false && r.data.summary.contributionsNative === 51376.53
+          && r.data.summary.units === 695.5991,
+        JSON.stringify(r.data.summary));
+      await page.goto(`http://ff.local/#invest-holding/${invCibcId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const cibcReplaced = await page.evaluate(() => document.querySelector('#view-invest-holding').textContent);
+      check('investments UI: after replacement the cost-unknown marker is gone',
+        !cibcReplaced.includes('Cost unknown'), cibcReplaced.slice(0, 300));
       // Loud price failures: a holding neither tier knows shows
       // the verbatim fetch error in the account price banner.
       r = await req('POST', '/api/investments/accounts', { name: 'BannerFail', type: 'Other' });

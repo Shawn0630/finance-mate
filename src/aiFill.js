@@ -721,23 +721,26 @@ export async function handleAiFillChat(input, deps = {}) {  const env = deps.env
 //      "holdings": [{"ref": "h1", "label": "…", "kind": "exchange"|"fund",
 //                    "symbol": "XQQ.TO"|null, "fundCode": null, "currency": "CAD"|"USD"}],
 //      "events":   [{"holdingId": 12} | {"holdingRef": "h1"},
-//                   "date": "YYYY-MM-DD", "type": "buy"|"sell"|"grant"|"dividend"|"split",
+//                   "date": "YYYY-MM-DD", "type": "buy"|"sell"|"grant"|"dividend"|"split"|"position",
 //                   "units": n|null, "price": n|null, "amount": n|null,
-//                   "splitNew": n|null, "splitOld": n|null]
+//                   "splitNew": n|null, "splitOld": n|null, "note": "…"],
+//      "nav":      [{"holdingId": 12} | {"holdingRef": "h1"},
+//                   "date": "YYYY-MM-DD", "price": n]
 //    },
 //    "ready": bool}
 //
 // A proposal that duplicates something already on record (same
-// holding by symbol/label, same event by date+type+figures) is
-// flagged "conflict" by the normalizer — the panel shows it
-// flagged and leaves it unchecked by default.
+// holding by symbol/label, same event by date+type+figures, same
+// holding+date NAV snapshot) is flagged "conflict" by the
+// normalizer — the panel shows it flagged and leaves it
+// unchecked by default.
 
 const INVEST_CHAT_PROMPT = [
   'You help the user record the holdings and transactions of ONE investment account from',
   'statements, grant notices and notes they paste or attach. The account is given below —',
   'never ask which account anything belongs to.',
   'Reply with ONLY a JSON object of the form',
-  '{"reply": "...", "proposed": {"holdings": [{"ref": "h1", "label": "XQQ", "kind": "exchange", "symbol": "XQQ.TO", "fundCode": null, "currency": "CAD"}], "events": [{"holdingRef": "h1", "date": "2026-01-15", "type": "buy", "units": 40, "price": 155.2, "amount": null}]}, "ready": false}',
+  '{"reply": "...", "proposed": {"holdings": [{"ref": "h1", "label": "XQQ", "kind": "exchange", "symbol": "XQQ.TO", "fundCode": null, "currency": "CAD"}], "events": [{"holdingRef": "h1", "date": "2026-01-15", "type": "buy", "units": 40, "price": 155.2, "amount": null}], "nav": [{"holdingRef": "h1", "date": "2026-01-31", "price": 156.1}]}, "ready": false}',
   '— no prose outside the JSON, no code fences.',
   '',
   '"proposed" is the CURRENT DRAFT: return the whole draft every time (what you extracted',
@@ -774,6 +777,30 @@ const INVEST_CHAT_PROMPT = [
   '  splitNew 3, splitOld 1; a 1-for-2 reverse split is splitNew 1, splitOld 2) and no',
   '  units/price/amount.',
   '- "date": the transaction date, YYYY-MM-DD.',
+  '',
+  'NAV SNAPSHOTS ("nav") — an observed per-unit price, NOT a transaction. It moves',
+  'no money and no units; it only pins the price path the charts trace:',
+  '- Target: "holdingId" or "holdingRef", same as events. "date": the statement date.',
+  '  "price": the per-unit NAV / close printed on that date.',
+  '- A statement\'s HOLDINGS section (units + NAV + market value, e.g. a quarterly fund',
+  '  statement) produces NAV snapshots — NEVER buy events. The units in that section are',
+  '  a position at a date, not a purchase on that date.',
+  '- A buy\'s price may ONLY come from a number the document itself gives for that',
+  '  purchase (a trade price, or a book cost divided by units when the document prints',
+  '  both). NEVER use a NAV as a buy price, and NEVER invent a price to fill the slot.',
+  '- For an exchange holding, a NAV snapshot is a hand correction that outranks the',
+  '  fetched close on its date; for a bank fund it is the official price path.',
+  '',
+  'POSITIONS ("position" events) — units held with UNKNOWN cost. Use this type exactly',
+  'when the document shows units but no purchase price and no book cost:',
+  '- "units": the units held. "price": ALWAYS null — a position carries no price, and a',
+  '  record with a price is a buy, not a position. "note": when the units were derived',
+  '  from a same-date total value and NAV, write the derivation here, e.g.',
+  '  "units derived: 65608.98 ÷ 94.3201". Deriving units as value ÷ NAV on one date is',
+  '  exact arithmetic from two observed figures; inventing a price is not.',
+  '- A position contributes $0, counts toward units held, and flags the holding',
+  '  cost-unknown until real buy records replace it. Never dress a position up as a',
+  '  buy to make the draft look complete.',
   '',
   'AMBIGUITY — never guess:',
   'Leave the unclear item OUT of "proposed" and ask one focused question in "reply" when:',
@@ -815,7 +842,7 @@ export function normalizeProposedInvestments(raw, deps = {}) {
   // every proposal item the normalizer refuses, with a short
   // human-readable reason, so the panel can show the user
   // what did NOT make it in instead of losing it quietly.
-  const out = { holdings: [], events: [], dropped: [] };
+  const out = { holdings: [], events: [], nav: [], dropped: [] };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
   const summarize = (item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return 'unreadable item';
@@ -825,6 +852,7 @@ export function normalizeProposedInvestments(raw, deps = {}) {
     if (item.label) bits.push(String(item.label));
     if (item.symbol) bits.push(String(item.symbol));
     if (item.units != null) bits.push(`${item.units} units`);
+    if (item.price != null) bits.push(`@ ${item.price}`);
     if (item.amount != null) bits.push(`$${item.amount}`);
     return bits.length ? bits.join(' ') : 'item';
   };
@@ -861,7 +889,7 @@ export function normalizeProposedInvestments(raw, deps = {}) {
     for (const item of raw.events) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) { drop(item, 'could not be read'); continue; }
       if (out.events.length >= 50) { drop(item, 'over the 50-event proposal limit'); continue; }
-      const type = normEnum(item.type, ['buy', 'sell', 'grant', 'dividend', 'split']);
+      const type = normEnum(item.type, ['buy', 'sell', 'grant', 'dividend', 'split', 'position']);
       const date = normDate(item.date);
       if (!type || !date) { drop(item, 'missing or invalid date or type'); continue; }
       const holdingId = Number.isInteger(Number(item.holdingId)) && holdingIds.has(Number(item.holdingId))
@@ -884,6 +912,13 @@ export function normalizeProposedInvestments(raw, deps = {}) {
         ev.splitOld = normNum(item.splitOld ?? item.split_old);
         if (ev.splitNew == null || ev.splitNew <= 0 || ev.splitOld == null || ev.splitOld <= 0
           || ev.splitNew === ev.splitOld) { drop(item, 'split needs a valid new:old ratio'); continue; }
+      } else if (type === 'position') {
+        // Cost-unknown units only: a price on this record
+        // would make it a buy, which is exactly what the
+        // type exists to avoid inventing.
+        ev.units = normNum(item.units);
+        if (ev.units == null || ev.units <= 0) { drop(item, 'position needs units > 0'); continue; }
+        if (normNum(item.price) != null) { drop(item, 'a position carries no price — use buy when a price is known'); continue; }
       } else {
         // Statements commonly print a sale as a NEGATIVE unit
         // count; the sign is presentation, not a different
@@ -910,10 +945,43 @@ export function normalizeProposedInvestments(raw, deps = {}) {
             ? Number(e.amount) === ev.amount
             : type === 'split'
               ? Number(e.split_new ?? e.splitNew) === ev.splitNew && Number(e.split_old ?? e.splitOld) === ev.splitOld
-              : Number(e.units) === ev.units && Number(e.price ?? NaN) === Number(ev.price ?? NaN)));
+              : Number(e.units) === ev.units
+                // Null-safe price comparison: position (and
+                // unpriced grant) records carry no price, and
+                // NaN never equals NaN — compare nulls as equal.
+                && ((e.price == null && ev.price == null) || Number(e.price) === Number(ev.price))));
         if (dupe) ev.conflict = 'duplicate-event';
       }
       out.events.push(ev);
+    }
+  }
+  // NAV snapshots: observed prices, not transactions. Conflict
+  // reuses the event semantics against the holding's recorded
+  // manual snapshots: same date + same price is a duplicate,
+  // same date + different price is an old → new correction,
+  // both left unchecked by default.
+  const existingNav = deps.existingNav || [];
+  if (Array.isArray(raw.nav)) {
+    for (const item of raw.nav) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) { drop(item, 'could not be read'); continue; }
+      if (out.nav.length >= 100) { drop(item, 'over the 100-NAV proposal limit'); continue; }
+      const date = normDate(item.date);
+      const price = normNum(item.price);
+      if (!date || price == null || price <= 0) { drop(item, 'NAV needs a valid date and a price > 0'); continue; }
+      const holdingId = Number.isInteger(Number(item.holdingId)) && holdingIds.has(Number(item.holdingId))
+        ? Number(item.holdingId) : null;
+      const holdingRef = typeof item.holdingRef === 'string' && refs.has(item.holdingRef) ? item.holdingRef : null;
+      if (holdingId == null && holdingRef == null) { drop(item, 'could not be matched to a holding in this account or in this draft'); continue; }
+      const nav = { holdingId, holdingRef, date, price, conflict: null, oldPrice: null };
+      if (holdingId != null) {
+        const prior = existingNav.find((p) =>
+          Number(p.holding_id ?? p.holdingId) === holdingId && p.date === date);
+        if (prior) {
+          nav.conflict = Number(prior.price) === price ? 'duplicate-nav' : 'nav-differs';
+          nav.oldPrice = Number(prior.price);
+        }
+      }
+      out.nav.push(nav);
     }
   }
   return out;
@@ -927,13 +995,15 @@ export function buildInvestChatMessages({ account, holdings, draft, history, tex
       ? holdings.flatMap((h) => [
         `- ${fmtHoldingLine(h)}`,
         ...((h.events || []).map((e) => `    event ${fmtEventLine(e)}`)),
+        ...((h.navPoints || []).map((p) => `    NAV ${p.date} @ ${p.price}`)),
       ])
       : ['- (none)']),
     'Current draft proposals (the user may correct these):',
-    ...(draft && (draft.holdings.length || draft.events.length)
+    ...(draft && (draft.holdings.length || draft.events.length || (draft.nav && draft.nav.length))
       ? [
         ...draft.holdings.map((h) => `- new holding [${h.ref}] ${h.label} · ${h.kind}${h.symbol ? ` · ${h.symbol}` : ''} · ${h.currency}`),
         ...draft.events.map((e) => `- event ${e.date} ${e.type} on ${e.holdingId != null ? `holding #${e.holdingId}` : `draft ${e.holdingRef}`}${e.type === 'dividend' ? ` amount ${e.amount}` : e.type === 'split' ? ` split ${e.splitNew}:${e.splitOld}` : ` ${e.units} units${e.price != null ? ` @ ${e.price}` : ''}`}`),
+        ...((draft.nav || []).map((n) => `- NAV ${n.date} @ ${n.price} on ${n.holdingId != null ? `holding #${n.holdingId}` : `draft ${n.holdingRef}`}`)),
       ]
       : ['- (none yet)']),
   ].join('\n');
@@ -1015,6 +1085,7 @@ export async function handleAiInvestFillChat(input, deps = {}) {
       draft: normalizeProposedInvestments(proposed, {
         existingHoldings: holdings,
         existingEvents: holdings.flatMap((h) => h.events || []),
+        existingNav: deps.existingNav || [],
       }),
       history, text: hasText ? text : '', files: fileInfos,
     }), env, model);
@@ -1033,6 +1104,7 @@ export async function handleAiInvestFillChat(input, deps = {}) {
       proposed: normalizeProposedInvestments(parsed.proposed, {
         existingHoldings: holdings,
         existingEvents: holdings.flatMap((h) => h.events || []),
+        existingNav: deps.existingNav || [],
       }),
       ready: parsed.ready === true,
       model,
