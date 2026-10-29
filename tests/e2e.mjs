@@ -7927,6 +7927,32 @@ try {
   check('investments: manual refresh re-fetches the exchange holdings (incl. the Yahoo one)',
     r.status === 200 && [invXqqId, invAaplId, invHxqId].every((id) => r.data.refreshed.includes(id)),
     JSON.stringify(r.data));
+  check('investments: refresh results name the source per holding',
+    Array.isArray(r.data.results)
+      && r.data.results.find((x) => x.id === invXqqId && x.ok === true && x.source === 'stooq')
+      && r.data.results.find((x) => x.id === invHxqId && x.ok === true && x.source === 'yahoo'),
+    JSON.stringify(r.data.results));
+
+  // Refresh failures are loud: a symbol neither tier knows
+  // (Stooq "No data", Yahoo 404) reports its verbatim error
+  // in the refresh results and in the holding's price status.
+  r = await req('POST', '/api/investments/accounts', { name: 'FailRefresh', type: 'Other' });
+  const invFailAcctId = r.data.id;
+  r = await invPost(invFailAcctId, { label: 'Zed Fail', kind: 'exchange', symbol: 'ZZFAIL.TO', currency: 'CAD' });
+  const invZzId = r.data.id;
+  r = await req('POST', '/api/investments/refresh');
+  const zzRes = (r.data.results || []).find((x) => x.id === invZzId);
+  check('investments: a refresh failure names the holding and the verbatim upstream error',
+    r.status === 200 && zzRes && zzRes.ok === false && /404/.test(zzRes.error || '')
+      && !r.data.refreshed.includes(invZzId),
+    JSON.stringify({ zzRes, refreshed: r.data.refreshed }));
+  r = await req('GET', `/api/investments/accounts/${invFailAcctId}`);
+  const zzRow = (r.data.holdings || []).find((h) => h.holding.id === invZzId);
+  check('investments: a failed-today fetch surfaces in the holding price status',
+    zzRow && zzRow.priceStatus.fetchFailedToday === true && /404/.test(zzRow.priceStatus.lastError || '')
+      && !!zzRow.priceStatus.lastAttemptAt,
+    JSON.stringify(zzRow && zzRow.priceStatus));
+  await req('DELETE', `/api/investments/accounts/${invFailAcctId}`);
 
   // Account edit + delete round trip on a scratch account.
   r = await req('POST', '/api/investments/accounts', { name: 'Scratch', type: 'Other' });
@@ -8366,6 +8392,55 @@ try {
       check('investments UI: a fund on trade prices keeps the record-NAV-snapshots banner',
         fundNote.includes('Priced from trade prices') && fundNote.includes('record NAV snapshots below'),
         fundNote.slice(0, 300));
+      // Loud price failures: a holding neither tier knows shows
+      // the verbatim fetch error in the account price banner.
+      r = await req('POST', '/api/investments/accounts', { name: 'BannerFail', type: 'Other' });
+      const bannerAcctId = r.data.id;
+      await invPost(bannerAcctId, { label: 'Zed Banner', kind: 'exchange', symbol: 'ZZFAIL.TO', currency: 'CAD' });
+      await req('POST', '/api/investments/refresh');
+      await page.goto(`http://ff.local/#invest-account/${bannerAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const bannerNote = await page.evaluate(() => document.querySelector('#investAccountPriceNote').textContent);
+      check('investments UI: a failed-today fetch shows its reason in the account price banner',
+        bannerNote.includes('fetch failed') && bannerNote.includes('404'),
+        bannerNote.slice(0, 300));
+      await req('DELETE', `/api/investments/accounts/${bannerAcctId}`);
+      // Monthly returns paginate by year: a holding bought in
+      // 2025-01 pages 2025 and 2026 separately while the chart
+      // keeps the full range.
+      r = await req('POST', '/api/investments/accounts', { name: 'PageYears', type: 'Other' });
+      const pageAcctId = r.data.id;
+      await invPost(pageAcctId, { label: 'Page Co', kind: 'exchange', symbol: 'PAGE.TO', currency: 'CAD', events: [
+        { date: '2025-01-15', type: 'buy', units: 10, price: 100 },
+      ] });
+      await page.goto(`http://ff.local/#invest-account/${pageAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const pageState = await page.evaluate(() => {
+        const sel = document.querySelector('#investAccountMonthly select');
+        const rows = [...document.querySelectorAll('#investAccountMonthly tbody tr')].map((tr) => tr.cells[0].textContent.trim());
+        const labels = window.__fmCharts.invest ? [...window.__fmCharts.invest.data.labels] : null;
+        return { hasSelect: !!sel, value: sel ? sel.value : null, options: sel ? [...sel.options].map((o) => o.value) : [], rows, labels };
+      });
+      const curMonth = new Date().toISOString().slice(0, 7);
+      const months2026 = curMonth.startsWith('2026')
+        ? (Number(curMonth.slice(5, 7))) : 0;
+      check('investments UI: monthly returns default to the latest year with a year switcher',
+        pageState.hasSelect && pageState.options.includes('2025') && pageState.options.includes('2026')
+          && pageState.value === '2026' && pageState.rows.length === months2026
+          && pageState.rows.every((m) => m.startsWith('2026-')),
+        JSON.stringify({ ...pageState, months2026 }));
+      await page.select('#investAccountMonthly select', '2025');
+      await waitI(500);
+      const pageState25 = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#investAccountMonthly tbody tr')].map((tr) => tr.cells[0].textContent.trim());
+        const labels = window.__fmCharts.invest ? [...window.__fmCharts.invest.data.labels] : null;
+        return { rows, labels };
+      });
+      check('investments UI: switching the year shows only that year while the chart keeps its range',
+        pageState25.rows.length === 12 && pageState25.rows.every((m) => m.startsWith('2025-'))
+          && JSON.stringify(pageState25.labels) === JSON.stringify(pageState.labels),
+        JSON.stringify({ rows: pageState25.rows.length, labelsSame: JSON.stringify(pageState25.labels) === JSON.stringify(pageState.labels) }));
+      await req('DELETE', `/api/investments/accounts/${pageAcctId}`);
       // Splits: a 2021-style buy (78 units @ 100.30) is created
       // with the holding; recording a 3:1 split on the holding
       // page restates the header to 234 units and reprices the

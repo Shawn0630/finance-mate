@@ -4708,6 +4708,64 @@ function investMonthlyTable(monthly, cur = 'CAD') {
 }
 
 // --------------------------------------------- invest range controls ---
+// The Monthly returns table pages by year when the visible
+// range spans more than one year (the chart keeps the full
+// range): a prev/next + year dropdown switcher above the
+// table, defaulting to the latest year in range. Paging is a
+// pure display slice over the range-filtered rows — it moves
+// no selection state (the monthly table has no row checkboxes)
+// and never touches the chart or the range controls. A range
+// change that drops the stored year resets it to the latest.
+const investYearPage = { investments: null, investAccount: null, investHolding: null };
+
+function investMonthlyYears(monthly) {
+  const years = new Set((monthly || []).map((r) => String(r.month || '').slice(0, 4)).filter(Boolean));
+  return [...years].sort();
+}
+
+function investMonthlyBlock(monthly, level, cur) {
+  const years = investMonthlyYears(monthly);
+  if (years.length <= 1) return investMonthlyTable(monthly, cur);
+  let year = investYearPage[level];
+  if (!years.includes(year)) { year = years[years.length - 1]; investYearPage[level] = year; }
+  const idx = years.indexOf(year);
+  const pageRows = monthly.filter((r) => String(r.month).startsWith(`${year}-`));
+  const opts = years.map((y) => `<option value="${y}"${y === year ? ' selected' : ''}>${y}</option>`).join('');
+  return `<div class="toolbar" style="margin-bottom:8px">
+    <button type="button" class="small" onclick="investYearStep('${level}', -1)"${idx <= 0 ? ' disabled' : ''}>&#8249; Prev year</button>
+    <select aria-label="Monthly returns year" onchange="investYearPick('${level}', this.value)">${opts}</select>
+    <button type="button" class="small" onclick="investYearStep('${level}', 1)"${idx >= years.length - 1 ? ' disabled' : ''}>Next year &#8250;</button>
+  </div>${investMonthlyTable(pageRows, cur)}`;
+}
+
+// Re-render only one level's monthly table (chart and range
+// inputs untouched) — the year switcher's whole job.
+function renderInvestMonthlyOnly(level) {
+  const d = investViewData[level];
+  const conf = INVEST_LEVEL_CONF[level];
+  if (!d || !conf) return;
+  const r = investEffectiveRange(level);
+  const inR = (m) => !r || (m >= r.start && m <= r.end);
+  const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
+  const mHost = $(conf.monthly);
+  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur);
+}
+
+window.investYearPick = (level, year) => {
+  investYearPage[level] = year;
+  renderInvestMonthlyOnly(level);
+};
+
+window.investYearStep = (level, dir) => {
+  const d = investViewData[level];
+  if (!d) return;
+  const r = investEffectiveRange(level);
+  const inR = (m) => !r || (m >= r.start && m <= r.end);
+  const years = investMonthlyYears((d.monthly || []).filter((x) => inR(x.month)));
+  const idx = years.indexOf(investYearPage[level]);
+  const next = years[Math.min(Math.max(idx + dir, 0), years.length - 1)];
+  if (next) investYearPick(level, next);
+};
 // The three Stocks levels carry the property hero's range model:
 // preset look-back buttons (1 / 2 / 5 / 10 years, All) plus a
 // From/To month pair picked from the same month popover. The
@@ -4769,15 +4827,15 @@ function investEffectiveRange(level) {
 const INVEST_LEVEL_CONF = {
   investments: {
     canvas: '#investPortfolioChart', key: 'investments', monthly: '#investPortfolioMonthly',
-    get: () => investPortfolioChart, set: (c) => { investPortfolioChart = c; },
+    get: () => investPortfolioChart, set: (c) => { investPortfolioChart = c; window.__fmCharts.invest = c; },
   },
   investAccount: {
     canvas: '#investAccountChart', key: 'investAccount', monthly: '#investAccountMonthly',
-    get: () => investAccountChart, set: (c) => { investAccountChart = c; },
+    get: () => investAccountChart, set: (c) => { investAccountChart = c; window.__fmCharts.invest = c; },
   },
   investHolding: {
     canvas: '#investHoldingChart', key: 'investHolding', monthly: '#investHoldingMonthly',
-    get: () => investHoldingChart, set: (c) => { investHoldingChart = c; },
+    get: () => investHoldingChart, set: (c) => { investHoldingChart = c; window.__fmCharts.invest = c; },
   },
 };
 
@@ -4979,14 +5037,12 @@ function applyInvestRange(level) {
   const r = investEffectiveRange(level);
   const inR = (m) => !r || (m >= r.start && m <= r.end);
   const fSeries = (d.series || []).filter((x) => inR(x.month));
-  const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
   const old = conf.get();
   if (old) old.destroy();
   conf.set(level === 'investments'
     ? drawInvestPortfolioChart($(conf.canvas), d, fSeries)
     : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native));
-  const mHost = $(conf.monthly);
-  if (mHost) mHost.innerHTML = investMonthlyTable(fMonthly, d.cur);
+  renderInvestMonthlyOnly(level);
   syncInvestRangeInputs(level);
 }
 

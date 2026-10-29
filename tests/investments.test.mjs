@@ -16,6 +16,7 @@ import {
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints,
   splitMultiplier, splitFactorAfter, adjustedUnitsOf,
+  monthlyYears, latestMonthlyYear, monthlyRowsForYear,
 } from '../src/investments.js';
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices, ensureHoldingPricesDetailed,
@@ -602,6 +603,20 @@ test('manual refresh retries once on timeout, fetch-on-read does not', async () 
     if (savedEnv.fx === undefined) delete process.env.FX_API_URL; else process.env.FX_API_URL = savedEnv.fx;
     db.close();
   }
+});
+
+test('monthly year paging: distinct years, latest default, cross-year boundary slices', () => {
+  const rows = [
+    { month: '2021-03' }, { month: '2025-12' }, { month: '2026-01' }, { month: '2026-10' },
+  ];
+  assert.deepEqual(monthlyYears(rows), ['2021', '2025', '2026']);
+  assert.equal(latestMonthlyYear(rows), '2026');
+  assert.deepEqual(monthlyRowsForYear(rows, '2025').map((r) => r.month), ['2025-12']);
+  assert.deepEqual(monthlyRowsForYear(rows, '2026').map((r) => r.month), ['2026-01', '2026-10']);
+  assert.deepEqual(monthlyRowsForYear(rows, '2024'), []);
+  assert.deepEqual(monthlyYears([]), []);
+  assert.equal(latestMonthlyYear([]), null);
+  assert.deepEqual(monthlyRowsForYear([], '2026'), []);
 });
 
 test('fetchYahooHistory: browser UA, and query1 failing over to query2', async () => {

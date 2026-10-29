@@ -595,3 +595,25 @@ export function computePortfolio(db, fxResolver, today) {
   const agg = aggregateComputed(accounts.flatMap((a) => a.holdings));
   return { accounts, ...agg };
 }
+
+// --------------------------------------------- monthly year paging --
+// The Monthly returns table spans first-event month to today, so
+// a multi-year holding renders dozens of rows. The table pages
+// by year (the chart keeps the full range): distinct years in
+// the visible rows, the latest year as the default page, and
+// the rows of one year. Pure functions — the frontend mirrors
+// the same slice (month prefix match) for display.
+export function monthlyYears(monthly) {
+  const years = new Set((monthly || []).map((r) => String(r.month || '').slice(0, 4)).filter(Boolean));
+  return [...years].sort();
+}
+
+export function latestMonthlyYear(monthly) {
+  const years = monthlyYears(monthly);
+  return years.length ? years[years.length - 1] : null;
+}
+
+export function monthlyRowsForYear(monthly, year) {
+  if (!year) return monthly || [];
+  return (monthly || []).filter((r) => String(r.month || '').startsWith(`${year}-`));
+}
