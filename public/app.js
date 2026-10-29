@@ -4821,16 +4821,19 @@ function investMonthlyBlock(monthly, level, cur, gainUnknown = false, nativePct 
 }
 
 // Re-render only one level's monthly table (chart and range
-// inputs untouched) — the year switcher's whole job.
+// inputs untouched) — the year switcher's whole job. On the
+// portfolio level the rows are the VISIBLE accounts' rows, so
+// paging after a hide never resurrects a hidden account.
 function renderInvestMonthlyOnly(level) {
   const d = investViewData[level];
   const conf = INVEST_LEVEL_CONF[level];
   if (!d || !conf) return;
   const r = investEffectiveRange(level);
   const inR = (m) => !r || (m >= r.start && m <= r.end);
-  const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
+  const vis = level === 'investments' ? investPortfolioVisible(d) : null;
+  const fMonthly = (vis ? vis.monthly : d.monthly || []).filter((x) => inR(x.month));
   const mHost = $(conf.monthly);
-  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur, !!d.gainUnknown, !!d.nativePct);
+  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur, vis ? !!vis.gainUnknown : !!d.gainUnknown, !!d.nativePct);
 }
 
 window.investYearPick = (level, year) => {
@@ -4937,8 +4940,14 @@ function investAccountColor(account) {
   return INVEST_ACCOUNT_COLORS[id % INVEST_ACCOUNT_COLORS.length];
 }
 
-// Accounts toggled off from either portfolio legend; the two
-// charts stay in sync and the lines never join the toggle.
+// Accounts toggled off from either portfolio legend or a
+// card's Hide button share one per-visit set: the bars, the
+// doughnut, the monthly table, and the summary strip all
+// recompute from the visible accounts (investPortfolioVisible),
+// so no figure can disagree with the chart. The Value /
+// Cumulative return lines are redrawn from the visible series
+// too — they are no longer a precomputed total that ignores
+// the toggle.
 const investHiddenAccounts = new Set();
 let investShareChart = null;
 let investShareAccounts = []; // account rows in doughnut order
@@ -4947,25 +4956,45 @@ let overviewChart = null;
 let overviewShareChart = null;
 let overviewShareCenter = null; // { total } for the overview center plugin
 
+// The portfolio's visible-accounts view: when nothing is
+// hidden this is the server's aggregate verbatim (so an
+// unhide restores every figure exactly, to the cent); with a
+// hidden account it is investVisibleAggregate over the
+// visible accounts, its series zero-filled to the full span
+// so the chart's time axis never shrinks on a hide. Only the
+// portfolio level has a hidden set — account/holding levels
+// never consult it.
+function investPortfolioVisible(d) {
+  if (!investHiddenAccounts.size) {
+    return { monthly: d.monthly, series: d.series, summary: d.summary, gainUnknown: !!d.gainUnknown };
+  }
+  const vis = investVisibleAggregate(d.accounts, investHiddenAccounts, (d.series || []).map((r) => r.month));
+  return { monthly: vis.monthly, series: vis.series, summary: vis.summary, gainUnknown: vis.summary.costUnknown };
+}
+
+// Card Hide buttons mirror the hidden set: a hidden card is
+// greyed and its button reads Show. Runs after every render
+// that rebuilds the cards and after every toggle, so the
+// legend and the cards can never disagree.
+function syncInvestHideCards() {
+  document.querySelectorAll('.invest-hide-btn').forEach((btn) => {
+    const hidden = investHiddenAccounts.has(Number(btn.dataset.accountId));
+    btn.textContent = hidden ? 'Show' : 'Hide';
+    const card = btn.closest('.breakdown-card');
+    if (card) card.classList.toggle('invest-hidden-card', hidden);
+  });
+}
+
 function toggleInvestAccount(id) {
   if (investHiddenAccounts.has(id)) investHiddenAccounts.delete(id);
   else investHiddenAccounts.add(id);
-  const hidden = investHiddenAccounts.has(id);
-  if (investPortfolioChart) {
-    investPortfolioChart.data.datasets.forEach((ds, i) => {
-      if (ds.accountId === id) investPortfolioChart.setDatasetVisibility(i, !hidden);
-    });
-    investPortfolioChart.update();
-  }
-  if (investShareChart) {
-    const i = investShareAccounts.findIndex((a) => a.id === id);
-    // The vendored Chart.js has toggle/getDataVisibility but no
-    // setDataVisibility — flip only when the state differs.
-    if (i >= 0 && investShareChart.getDataVisibility(i) === hidden) {
-      investShareChart.toggleDataVisibility(i);
-      investShareChart.update();
-    }
-  }
+  syncInvestHideCards();
+  const d = investViewData.investments;
+  if (!d || !document.getElementById('investPortfolioChart')) return;
+  const vis = investPortfolioVisible(d);
+  const strip = document.getElementById('investPortfolioStrip');
+  if (strip) strip.innerHTML = investSummaryStrip(vis.summary, d.cur);
+  applyInvestRange('investments');
 }
 
 // The portfolio charts' legend handler, following the app's
@@ -5022,7 +5051,9 @@ function drawInvestPortfolioChart(canvas, data, fSeries, cur = 'CAD') {
             label: (c) => {
               const ds = c.dataset;
               if (ds.accountId != null) {
-                const total = c.chart.data.datasets.reduce((s, d) => s + (d.accountId != null ? (d.data[c.dataIndex] || 0) : 0), 0);
+                // The % is over the VISIBLE segments only — a
+                // hidden account must not dilute the shares.
+                const total = c.chart.data.datasets.reduce((s, d, i) => s + (d.accountId != null && c.chart.isDatasetVisible(i) ? (d.data[c.dataIndex] || 0) : 0), 0);
                 const pct = total ? ((c.parsed.y / total) * 100).toFixed(1) : '0.0';
                 return `${ds.label}: ${moneyC(c.parsed.y, cur)} (${pct}%)`;
               }
@@ -5213,7 +5244,13 @@ function drawInvestShareChart(accounts, cur = 'CAD', endMonth = null) {
   }
   if (wrap) wrap.classList.remove('hidden');
   if (empty) empty.classList.add('hidden');
-  investShareCenter = { total, cur };
+  // The doughnut keeps every account's slice (hidden ones flip
+  // off via toggleDataVisibility below, so either legend can
+  // restore them), but its center total counts VISIBLE accounts
+  // only — otherwise the hole would disagree with the slices.
+  const visibleTotal = rows.filter((r) => !investHiddenAccounts.has(r.account.id))
+    .reduce((s, r) => s + r.value, 0);
+  investShareCenter = { total: visibleTotal, cur };
   if (investShareChart) investShareChart.destroy();
   investShareChart = new Chart(canvas, {
     type: 'doughnut',
@@ -5237,7 +5274,9 @@ function drawInvestShareChart(accounts, cur = 'CAD', endMonth = null) {
         tooltip: {
           callbacks: {
             label: (item) => {
-              const t = item.dataset.data.reduce((a, b) => a + b, 0);
+              // The % is over the VISIBLE slices only, matching
+              // the center total.
+              const t = item.dataset.data.reduce((s, v, i) => s + (item.chart.getDataVisibility(i) ? v : 0), 0);
               const pct = t ? ((item.parsed / t) * 100).toFixed(1) : '0.0';
               return ` ${item.label}: ${moneyC(item.parsed, cur)} (${pct}%)`;
             },
@@ -5261,7 +5300,8 @@ function applyInvestRange(level) {
   if (!d || !conf) return;
   const r = investEffectiveRange(level);
   const inR = (m) => !r || (m >= r.start && m <= r.end);
-  const fSeries = (d.series || []).filter((x) => inR(x.month));
+  const vis = level === 'investments' ? investPortfolioVisible(d) : null;
+  const fSeries = (vis ? vis.series : d.series || []).filter((x) => inR(x.month));
   const old = conf.get();
   if (old) old.destroy();
   if (level === 'overview') {
@@ -5274,7 +5314,7 @@ function applyInvestRange(level) {
     drawOverviewShareChart(d.assessedByYear, d.stockSeries, r ? r.end : null);
   } else {
     conf.set(level === 'investments'
-      ? drawInvestPortfolioChart($(conf.canvas), d, fSeries, d.cur)
+      ? drawInvestPortfolioChart($(conf.canvas), vis ? { ...d, gainUnknown: vis.gainUnknown } : d, fSeries, d.cur)
       : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, !!d.gainUnknown));
   }
   // The portfolio doughnut follows the same range: its shares
@@ -5447,13 +5487,17 @@ async function loadInvestmentsImpl() {
   const cur = data.display || 'CAD';
   investDisplay.investments = cur;
   const s = data.summary;
-  const cards = data.accounts.map((a) => `
-    <div class="card breakdown-card" onclick="location.hash='#invest-account/${a.account.id}'">
+  const cards = data.accounts.map((a) => {
+    const hidden = investHiddenAccounts.has(a.account.id);
+    return `
+    <div class="card breakdown-card${hidden ? ' invest-hidden-card' : ''}" data-invest-account-card="${a.account.id}" onclick="location.hash='#invest-account/${a.account.id}'">
       <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
       <div class="v">${moneyC(a.summary.value, cur)}</div>
       <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${a.summary.costUnknown ? '—' : returnText(a.summary.totalReturn, a.summary.totalReturnPct, cur)}${a.summary.costUnknown ? ' · cost unknown' : ''}</div>
       ${a.account.owners && a.account.owners.length ? `<div class="n">${ownerChipsHtml(a.account.owners)}</div>` : ''}
-    </div>`).join('');
+      <div class="toolbar" style="margin-top:8px"><button type="button" class="small invest-hide-btn" data-account-id="${a.account.id}">${hidden ? 'Show' : 'Hide'}</button></div>
+    </div>`;
+  }).join('');
   host.innerHTML = `
     <div class="section-head"><h2>Stocks</h2>
       <div class="spacer"></div>
@@ -5463,7 +5507,7 @@ async function loadInvestmentsImpl() {
     <div class="msg" id="investMsg"></div>
     ${data.fxMissing && data.accounts.some((a) => a.holdings.some((h) => h.holding.currency !== cur))
       ? `<div class="msg warn">USD/CAD rates are unavailable right now — holdings are shown unconverted in the ${cur} totals.</div>` : ''}
-    <div class="summary-strip">${investSummaryStrip(s, cur)}</div>
+    <div class="summary-strip" id="investPortfolioStrip">${investSummaryStrip(s, cur)}</div>
     <div class="panel">
       <h3>Total return</h3>
       ${investRangeControlsHtml('investments')}
@@ -5479,7 +5523,22 @@ async function loadInvestmentsImpl() {
     </div>
     <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly, cur)}</div>
       <div class="note" style="margin-left:0">All figures in ${cur}. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
-  investViewData.investments = { series: data.series, monthly: data.monthly, cur, nativePct: false, accounts: data.accounts, gainUnknown: !!data.summary.costUnknown };
+  investViewData.investments = { series: data.series, monthly: data.monthly, cur, nativePct: false, accounts: data.accounts, gainUnknown: !!data.summary.costUnknown, summary: data.summary };
+  // A display switch re-renders the whole page while the
+  // per-visit hidden set survives: the strip must follow the
+  // visible figures, not the server's full summary.
+  if (investHiddenAccounts.size) {
+    const strip0 = document.getElementById('investPortfolioStrip');
+    if (strip0) strip0.innerHTML = investSummaryStrip(investPortfolioVisible(investViewData.investments).summary, cur);
+  }
+  // Hide buttons stop at the button — a Hide click must not
+  // follow the card's navigation onclick.
+  host.querySelectorAll('.invest-hide-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleInvestAccount(Number(btn.dataset.accountId));
+    });
+  });
   wireInvestRangeControls('investments');
   applyInvestRange('investments');
   $('#investDisplayBtn').addEventListener('click', () => {

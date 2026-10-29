@@ -6,7 +6,7 @@
   "description": "家庭财务管理 — 资产板块（房产 / 固定资产 / 投资理财）",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test tests/engine.test.mjs tests/aiFill.test.mjs tests/costs.test.mjs tests/investments.test.mjs tests/investShare.test.mjs tests/overviewChart.test.mjs tests/wsImport.test.mjs tests/csvMapImport.test.mjs tests/earnings.test.mjs",
+    "test": "node --test tests/engine.test.mjs tests/aiFill.test.mjs tests/costs.test.mjs tests/investments.test.mjs tests/investShare.test.mjs tests/investVisible.test.mjs tests/overviewChart.test.mjs tests/wsImport.test.mjs tests/csvMapImport.test.mjs tests/earnings.test.mjs",
     "e2e": "node tests/e2e.mjs"
   },
   "dependencies": {

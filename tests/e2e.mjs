@@ -9247,6 +9247,101 @@ try {
         vis.bar === true && vis.slice === true && vis.struck === false,
         JSON.stringify(vis));
 
+      // Card Hide button: the same hidden set as the legend,
+      // and every computed figure recomputes from the visible
+      // accounts — bars, total line, doughnut center, monthly
+      // table, and summary strip — then restores exactly.
+      const pfH = (await req('GET', '/api/investments')).data;
+      const hideAcct = (pfH.accounts || []).find((a) => a.summary.value > 0);
+      const parseMoney = (s) => Number(String(s || '').replace(/[^0-9.\-]/g, '')) || 0;
+      const stripVals = () => page.evaluate(() => [...document.querySelectorAll('#investPortfolioStrip .summary-card .v')].map((el) => el.textContent));
+      const cardSt = (id) => page.evaluate((aid) => {
+        const card = document.querySelector(`[data-invest-account-card="${aid}"]`);
+        if (!card) return null;
+        const btn = card.querySelector('.invest-hide-btn');
+        return { grey: card.classList.contains('invest-hidden-card'), btn: btn ? btn.textContent : null };
+      }, id);
+      const hideState = () => page.evaluate(() => {
+        const main = window.__fmCharts.investments;
+        const shareC = window.__fmCharts.investShare;
+        const valueDs = main.data.datasets.find((d) => d.label.startsWith('Value'));
+        const tf = document.querySelector('#investPortfolioMonthly tfoot');
+        return {
+          labels: main.data.labels.length,
+          valueLast: valueDs ? valueDs.data[valueDs.data.length - 1] : null,
+          barVis: main.data.datasets.filter((d) => d.accountId != null).map((d) => ({ label: d.label, vis: main.isDatasetVisible(main.data.datasets.indexOf(d)) })),
+          sliceVis: shareC ? shareC.data.labels.map((l, i) => ({ label: l, vis: shareC.getDataVisibility(i) })) : [],
+          centerTotal: shareC ? shareC.data.datasets[0].data.reduce((s, v, i) => s + (shareC.getDataVisibility(i) ? v : 0), 0) : 0,
+          foot: tf ? [...tf.querySelectorAll('.num')].map((el) => el.textContent) : null,
+        };
+      });
+      const hideName = hideAcct.account.name;
+      const hideLast = hideAcct.series[hideAcct.series.length - 1].value;
+      // The table pages by year, so its footer sums the
+      // DISPLAYED year page only — the expected footer is
+      // recomputed for whatever year page is showing after
+      // the hide, from the visible accounts' API rows.
+      const tablePageYear = () => page.evaluate(() => {
+        const sel = document.querySelector('#investPortfolioMonthly select');
+        const first = document.querySelector('#investPortfolioMonthly tbody tr');
+        return sel ? sel.value : (first ? first.cells[0].textContent.slice(0, 4) : '');
+      });
+      const footContribForYear = (year) => (pfH.accounts || [])
+        .filter((a) => a.account.id !== hideAcct.account.id)
+        .reduce((s, a) => s + a.monthly
+          .filter((r) => r.month.startsWith(`${year}-`))
+          .reduce((s2, r) => s2 + (r.contributions || 0), 0), 0);
+      const strip0 = await stripVals();
+      const st0 = await hideState();
+      const cardValSum = (pfH.accounts || []).reduce((s, a) => s + a.summary.value, 0);
+      await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
+      await waitI(400);
+      let cs = await cardSt(hideAcct.account.id);
+      let hs = await hideState();
+      const strip1 = await stripVals();
+      check('investments UI: card Hide greys the card and flips its button to Show',
+        cs && cs.grey === true && cs.btn === 'Show', JSON.stringify(cs));
+      check('investments UI: hiding an account drops its bar, its doughnut slice, and the total line by its values',
+        hs.barVis.find((b) => b.label === hideName).vis === false
+          && hs.sliceVis.find((b) => b.label === hideName).vis === false
+          && Math.abs(hs.valueLast - (st0.valueLast - hideLast)) <= Math.max(1, st0.valueLast * 0.005)
+          && Math.abs(hs.centerTotal - (st0.centerTotal - hideLast)) <= Math.max(1, st0.centerTotal * 0.005)
+          && hs.labels === st0.labels,
+        JSON.stringify({ valueLast: hs.valueLast, want: st0.valueLast - hideLast, center: hs.centerTotal, wantCenter: st0.centerTotal - hideLast, labels: hs.labels }));
+      check('investments UI: hiding an account recomputes the strip and the monthly table from the visible accounts',
+        Math.abs(parseMoney(strip1[0]) - (cardValSum - hideAcct.summary.value)) <= 1
+          && Math.abs(parseMoney(hs.foot[0]) - footContribForYear(await tablePageYear())) <= 1,
+        JSON.stringify({ strip: strip1[0], wantStrip: cardValSum - hideAcct.summary.value, foot: hs.foot, wantFoot: footContribForYear(await tablePageYear()) }));
+      check('investments UI: legend click on the hidden account restores it (sync both ways)', await clickLegendItem(hideName) === true);
+      await waitI(400);
+      cs = await cardSt(hideAcct.account.id);
+      hs = await hideState();
+      const strip2 = await stripVals();
+      check('investments UI: after the legend restore the card, chart, table, and strip are back exactly',
+        cs && cs.grey === false && cs.btn === 'Hide'
+          && hs.barVis.find((b) => b.label === hideName).vis === true
+          && hs.sliceVis.find((b) => b.label === hideName).vis === true
+          && hs.valueLast === st0.valueLast && hs.centerTotal === st0.centerTotal
+          && strip2[0] === strip0[0] && JSON.stringify(hs.foot) === JSON.stringify(st0.foot),
+        JSON.stringify({ card: cs, valueLast: hs.valueLast, center: hs.centerTotal, strip: strip2[0], foot: hs.foot }));
+      await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
+      await waitI(400);
+      cs = await cardSt(hideAcct.account.id);
+      check('investments UI: card Hide hides again after a legend restore', cs && cs.grey === true && cs.btn === 'Show', JSON.stringify(cs));
+      await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
+      await waitI(400);
+      cs = await cardSt(hideAcct.account.id);
+      check('investments UI: card Show restores the account', cs && cs.grey === false && cs.btn === 'Hide', JSON.stringify(cs));
+      await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
+      await waitI(400);
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(1200);
+      cs = await cardSt(hideAcct.account.id);
+      const strip3 = await stripVals();
+      check('investments UI: hiding is per-visit — a reload restores every account',
+        cs && cs.grey === false && cs.btn === 'Hide' && strip3[0] === strip0[0],
+        JSON.stringify({ card: cs, strip: strip3[0] }));
+
       // Share doughnut: side by side with Total return, driven
       // by the same picker — a past range end re-renders it to
       // that month's split, and back to All restores current.
