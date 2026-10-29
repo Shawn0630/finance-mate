@@ -10049,6 +10049,102 @@ try {
       check('earnings charts: income vs expenses view swaps in gross + expenses series',
         rentIncomeInfo && rentIncomeInfo.includes('gross') && rentIncomeInfo.includes('expenses'),
         JSON.stringify(rentIncomeInfo));
+
+      // Rental form: property dropdown lists app properties (never BCA
+      // results); picking one disables + clears Address; Standalone
+      // re-enables it; BCA suggest fills standalone text only.
+      r = await req('POST', '/api/properties', {
+        address: '999 Rental Test St, Victoria, BC',
+        mortgage_balance: 100000, purchase_date: '2020-03-15',
+      });
+      check('rental form setup: property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data).slice(0, 200));
+      const rentPropId = r.data.id;
+      // The page is already on #earnings/rentals from the chart checks,
+      // and same-hash navigation does not reload — go away and back so
+      // loadEarnings refills the dropdown with the new property.
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(500);
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      await page.click('#addEarnRentalBtn');
+      await waitE(300);
+      const rentPropOpts = await page.evaluate(() => [...document.querySelectorAll('#earnRentalProperty option')].map((o) => [o.value, o.textContent]));
+      check('rental form: property dropdown lists app properties with standalone first',
+        rentPropOpts.length > 1 && rentPropOpts[0][1].includes('Standalone') && rentPropOpts.some(([v, t]) => v === String(rentPropId) && t.includes('999 Rental Test St')),
+        JSON.stringify(rentPropOpts));
+      await page.select('#earnRentalProperty', String(rentPropId));
+      await waitE(200);
+      const linkedState = await page.evaluate(() => {
+        const a = document.querySelector('#earnRentalForm [name="address"]');
+        return { disabled: a.disabled, value: a.value };
+      });
+      check('rental form: picking a property disables and clears Address',
+        linkedState.disabled === true && linkedState.value === '', JSON.stringify(linkedState));
+      await page.select('#earnRentalProperty', '');
+      await waitE(200);
+      const standaloneState = await page.evaluate(() => {
+        const a = document.querySelector('#earnRentalForm [name="address"]');
+        return { disabled: a.disabled };
+      });
+      check('rental form: back to Standalone re-enables Address', standaloneState.disabled === false, JSON.stringify(standaloneState));
+      await page.type('#earnRentalForm [name="label"]', 'Suite standalone');
+      await page.type('#earnRentalForm [name="address"]', '12 Test Lane');
+      await page.click('#earnRentalForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Suite standalone'), { timeout: 10000 });
+      r = await req('GET', '/api/earnings');
+      const suiteStandalone = (r.data.rentals || []).find((x) => x.label === 'Suite standalone');
+      check('rental form: standalone save stores address, property_id null',
+        suiteStandalone && suiteStandalone.property_id == null && suiteStandalone.address === '12 Test Lane',
+        JSON.stringify(suiteStandalone));
+      await page.click('#addEarnRentalBtn');
+      await waitE(300);
+      await page.type('#earnRentalForm [name="label"]', 'Suite linked');
+      await page.select('#earnRentalProperty', String(rentPropId));
+      await waitE(200);
+      await page.click('#earnRentalForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Suite linked'), { timeout: 10000 });
+      r = await req('GET', '/api/earnings');
+      const suiteLinked = (r.data.rentals || []).find((x) => x.label === 'Suite linked');
+      check('rental form: linked save stores property_id, address null',
+        suiteLinked && suiteLinked.property_id === rentPropId && suiteLinked.address == null,
+        JSON.stringify(suiteLinked));
+      await page.evaluate((id) => window.earnEditRental(id), suiteLinked.id);
+      await waitE(300);
+      const editState = await page.evaluate(() => ({
+        prop: document.querySelector('#earnRentalProperty').value,
+        disabled: document.querySelector('#earnRentalForm [name="address"]').disabled,
+      }));
+      check('rental form: edit echo restores linked property + disabled Address',
+        editState.prop === String(rentPropId) && editState.disabled === true, JSON.stringify(editState));
+      await page.click('#earnRentalCancelBtn');
+      await page.click('#addEarnRentalBtn');
+      await waitE(300);
+      await page.type('#earnRentalForm [name="address"]', '1200 Gov');
+      await page.waitForFunction(() => document.querySelectorAll('#earnRentalForm .suggest-list li').length > 0, { timeout: 10000 });
+      const sugText = await page.evaluate(() => document.querySelector('#earnRentalForm .suggest-list').textContent);
+      check('rental form: BCA suggest offers the stub suggestion',
+        sugText.includes('1200 GOVERNMENT ST VICTORIA'), sugText);
+      await page.click('#earnRentalForm .suggest-list li');
+      await waitE(200);
+      const pickedAddr = await page.evaluate(() => document.querySelector('#earnRentalForm [name="address"]').value);
+      const pickedProp = await page.evaluate(() => document.querySelector('#earnRentalProperty').value);
+      check('rental form: picking a suggestion fills standalone text only, no property link',
+        pickedAddr === '1200 GOVERNMENT ST VICTORIA' && pickedProp === '', JSON.stringify({ pickedAddr, pickedProp }));
+      await page.click('#earnRentalCancelBtn');
+      stubBcaDown = true;
+      await page.click('#addEarnRentalBtn');
+      await waitE(300);
+      await page.type('#earnRentalForm [name="label"]', 'Suite typed');
+      await page.type('#earnRentalForm [name="address"]', '34 Typed Rd');
+      await page.waitForFunction(() => !document.querySelector('#earnRentalForm .suggest-note').classList.contains('hidden'), { timeout: 10000 });
+      check('rental form: BCA down shows the suggestions-unavailable note', true, '');
+      await page.click('#earnRentalForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Suite typed'), { timeout: 10000 });
+      r = await req('GET', '/api/earnings');
+      const suiteTyped = (r.data.rentals || []).find((x) => x.label === 'Suite typed');
+      check('rental form: BCA down still saves free-text standalone address',
+        suiteTyped && suiteTyped.address === '34 Typed Rd', JSON.stringify(suiteTyped));
+      stubBcaDown = false;
     } finally {
       await browserE.close();
     }

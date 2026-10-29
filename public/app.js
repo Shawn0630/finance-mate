@@ -201,6 +201,11 @@ const addSuggest = attachAddressSuggest(
   $('#addPropForm .address-input'), $('#addPropForm .suggest-list'));
 const propSuggest = attachAddressSuggest(
   $('#propForm .address-input'), $('#propForm .suggest-list'));
+// Rental form address: same BC Assessment suggest as the property forms.
+// A picked suggestion only fills the standalone address text — it never
+// creates a property link (a BCA address is not an app property).
+const earnRentalSuggest = attachAddressSuggest(
+  $('#earnRentalForm .address-input'), $('#earnRentalForm .suggest-list'));
 
 // --------------------------------------------------- security suggest ---
 // Dropdown autocomplete for the holding form's label / symbol
@@ -7819,6 +7824,15 @@ async function loadEarnings() {
       `<option value="${esc(u)}">${esc(u)}</option>`).join('');
     $('#earnJobFrequency').innerHTML = earnData.payFrequencies.map((f) =>
       `<option value="${f.key}">${esc(f.label)}</option>`).join('');
+    // Rental property dropdown: the app's own properties, never BCA
+    // search results. The standalone option stays first; a refill
+    // keeps the current selection when it still exists.
+    const earnProps = await api('/api/properties');
+    const earnPropSel = $('#earnRentalProperty');
+    const earnPropCur = earnPropSel.value;
+    earnPropSel.innerHTML = `<option value="">— Standalone address —</option>` + earnProps.map((p) =>
+      `<option value="${p.id}">${esc(p.address)}</option>`).join('');
+    if (earnProps.some((p) => String(p.id) === earnPropCur)) earnPropSel.value = earnPropCur;
     $('#earnJobList').innerHTML = earnData.jobs.length
       ? earnData.jobs.map(earnJobCard).join('')
       : '<div class="note">No jobs yet.</div>';
@@ -8069,10 +8083,27 @@ window.earnDeleteJob = async (id) => {
   loadEarnings();
 };
 
+// Linked property vs standalone address are mutually exclusive: picking
+// a property disables and clears Address (a disabled control is omitted
+// from FormData, so the server stores address null — no ambiguity about
+// which one the rental uses). Back to Standalone re-enables it.
+function syncEarnRentalAddressState() {
+  const f = $('#earnRentalForm');
+  const linked = f.property_id.value !== '';
+  f.address.disabled = linked;
+  if (linked) {
+    f.address.value = '';
+    earnRentalSuggest.reset();
+  }
+}
+$('#earnRentalProperty').addEventListener('change', syncEarnRentalAddressState);
+
 $('#addEarnRentalBtn').onclick = () => {
   earnEditRentalId = null;
   $('#earnRentalFormTitle').textContent = 'Add rental';
   $('#earnRentalForm').reset();
+  earnRentalSuggest.reset();
+  syncEarnRentalAddressState();
   $('#earnRentalFormPanel').classList.remove('hidden');
 };
 $('#earnRentalCancelBtn').onclick = () => $('#earnRentalFormPanel').classList.add('hidden');
@@ -8096,6 +8127,7 @@ window.earnEditRental = (id) => {
   f.rental_type.value = r.rental_type; f.services_level.value = r.services_level; f.ownership_pct.value = r.ownership_pct;
   f.is_principal_residence.checked = r.is_principal_residence; f.was_principal_residence.checked = r.was_principal_residence;
   f.structural_change.checked = r.structural_change;
+  syncEarnRentalAddressState();
   $('#earnRentalFormPanel').classList.remove('hidden');
 };
 window.earnDeleteRental = async (id) => {

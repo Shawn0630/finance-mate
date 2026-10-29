@@ -483,7 +483,7 @@
         <form id="earnRentalForm">
           <div><label>Label *</label><input name="label" required></div>
           <div><label>Property (optional — link an existing property)</label><select name="property_id" id="earnRentalProperty"><option value="">— Standalone address —</option></select></div>
-          <div><label>Address</label><input name="address"></div>
+          <div><label>Address</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off"><ul class="suggest-list hidden"></ul><p class="suggest-note hidden">Address suggestions are unavailable right now — you can still type the full address.</p></div></div>
           <div><label>Rental type *</label><select name="rental_type"><option value="long_term">Long-term</option><option value="short_term">Short-term</option><option value="commercial">Commercial</option></select></div>
           <div><label>Services *</label><select name="services_level"><option value="basic">Basic (T776)</option><option value="hotel_like">Hotel-like (T2125)</option></select></div>
           <div><label>Ownership % *</label><input name="ownership_pct" type="number" step="0.01" min="0" max="100" value="100" required></div>
