@@ -23,6 +23,7 @@ import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, parseNasdaqHistorical, ensureHoldingPrices, ensureHoldingPricesDetailed,
   refreshAllPrices, priceStatusFor, clearHoldingPriceMeta,
   parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory,
+  fetchFxRates, FX_SERIES,
 } from '../src/prices.js';
 import { handleAiInvestFillChat, normalizeProposedInvestments } from '../src/aiFill.js';
 
@@ -705,7 +706,7 @@ test('manual refresh retries once on timeout, fetch-on-read does not', async () 
   let failFirstPass = true;
   globalThis.fetch = async (url) => {
     if (String(url).includes('/fx/')) {
-      return { ok: true, json: async () => ({ observations: [{ d: '2026-01-01', FX_USDCAD: { v: '1.3000' } }] }) };
+      return { ok: true, json: async () => ({ observations: [{ d: '2026-01-01', FXUSDCAD: { v: '1.3000' } }] }) };
     }
     calls++;
     if (failFirstPass && calls <= 2) throw timeoutErr();
@@ -1342,4 +1343,43 @@ test('computeFillPreview: units without any price value at 0; orphan and dateles
   assert.equal(out[0].units, 100);
   assert.equal(out[0].valueNative, 0);
   assert.equal(out[0].deltaNative, 0);
+});
+
+// Regression: the Bank of Canada Valet series is FXUSDCAD, not
+// FX_USDCAD — the old name 404s ("Series FX_USDCAD not
+// found"), which left invest_fx_rates permanently empty and
+// every USD holding unconverted. The earlier suite passed
+// while production 404'd because no stub ever validated the
+// series name in the request URL; this test does exactly
+// that, with FX_API_URL unset so the production URL is built.
+test('FX fetch asks Valet for FXUSDCAD, never FX_USDCAD', async () => {
+  assert.equal(FX_SERIES, 'FXUSDCAD');
+  const realFetch = globalThis.fetch;
+  const savedFx = process.env.FX_API_URL;
+  delete process.env.FX_API_URL;
+  let capturedUrl = null;
+  globalThis.fetch = async (url) => {
+    capturedUrl = String(url);
+    if (capturedUrl.includes('FX_USDCAD')) {
+      return { ok: false, status: 404, json: async () => ({ message: 'Series FX_USDCAD not found.' }) };
+    }
+    if (capturedUrl.includes('FXUSDCAD')) {
+      return { ok: true, json: async () => ({ observations: [
+        { d: '2026-01-01', FXUSDCAD: { v: '1.3000' } },
+        { d: '2026-02-01', FXUSDCAD: { v: '1.4000' } },
+      ] }) };
+    }
+    throw new Error(`unexpected FX url ${capturedUrl}`);
+  };
+  try {
+    const rates = await fetchFxRates(5000);
+    assert.equal(rates.length, 2);
+    assert.equal(rates[0].rate, 1.3);
+    assert.equal(rates[1].rate, 1.4);
+    assert.match(capturedUrl, /\/observations\/FXUSDCAD\//);
+    assert.doesNotMatch(capturedUrl, /FX_USDCAD/);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedFx === undefined) delete process.env.FX_API_URL; else process.env.FX_API_URL = savedFx;
+  }
 });

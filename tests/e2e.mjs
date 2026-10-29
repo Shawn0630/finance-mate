@@ -255,7 +255,7 @@ const hsStubBase = `http://127.0.0.1:${hsStub.address().port}`;
 
 // Investments price sources, stubbed the same way: Stooq daily
 // CSVs keyed by the s= parameter, and the Bank of Canada Valet
-// FX_USDCAD series. Deterministic closes make the three-level
+// FXUSDCAD series. Deterministic closes make the three-level
 // return math assertable to the cent.
 const stooqCsvBySymbol = {
   'xqq.to': [
@@ -288,8 +288,8 @@ const fxStub = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     observations: [
-      { d: '2026-01-01', FX_USDCAD: { v: '1.3000' } },
-      { d: '2026-02-01', FX_USDCAD: { v: '1.4000' } },
+      { d: '2026-01-01', FXUSDCAD: { v: '1.3000' } },
+      { d: '2026-02-01', FXUSDCAD: { v: '1.4000' } },
     ],
   }));
 });

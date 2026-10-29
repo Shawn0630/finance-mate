@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS invest_prices (
 CREATE INDEX IF NOT EXISTS idx_invest_holdings_account ON invest_holdings(account_id);
 CREATE INDEX IF NOT EXISTS idx_invest_events_holding ON invest_events(holding_id, date, id);
 CREATE INDEX IF NOT EXISTS idx_invest_prices_holding ON invest_prices(holding_id, date);
--- USD/CAD daily rates (Bank of Canada Valet FX_USDCAD), cached
+-- USD/CAD daily rates (Bank of Canada Valet FXUSDCAD), cached
 -- the way prime_rates caches the prime series: fetch-on-read,
 -- last known value when a fetch fails.
 CREATE TABLE IF NOT EXISTS invest_fx_rates (

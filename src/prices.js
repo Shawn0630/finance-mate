@@ -43,7 +43,7 @@
 //     history has no clean public feed): manual NAV snapshots
 //     the user records are the official path, event prices the
 //     fallback. The provider seam stays here for a future feed.
-//   USD/CAD → Bank of Canada Valet daily series FX_USDCAD, the
+//   USD/CAD → Bank of Canada Valet daily series FXUSDCAD, the
 //     same Valet the prime rate uses (src/regions/ca.js).
 //
 // Fetch policy mirrors prime.js: fetch-on-read with a
@@ -287,7 +287,7 @@ export async function fetchNasdaqHistory(symbol, timeoutMs = 10000) {
 }
 
 // ---------------------------------------------------------------- FX
-export const FX_SERIES = 'FX_USDCAD';
+export const FX_SERIES = 'FXUSDCAD';
 
 export async function fetchFxRates(timeoutMs = 10000) {
   const url = process.env.FX_API_URL
@@ -447,14 +447,17 @@ export function ensureHoldingPrices(db, holding, opts) {
 }
 
 // Refresh the USD/CAD cache if stale. Never throws.
-export function ensureFxRates(db) {
+// Manual refresh passes the longer timeout: the first fetch
+// after a long outage pulls the full series (~300KB), which
+// is the one FX fetch that can approach the 4s read budget.
+export function ensureFxRates(db, opts = {}) {
   const key = 'fx';
   if (inflight.has(key)) return inflight.get(key);
   if (fetchedToday(db, 'invest_fx_ok') || backedOff(db, 'invest_fx_try')) return Promise.resolve(false);
   const p = (async () => {
     setMeta(db, 'invest_fx_try', String(Date.now()));
     try {
-      const rates = await fetchFxRates(READ_TIMEOUT_MS);
+      const rates = await fetchFxRates(opts.timeoutMs || READ_TIMEOUT_MS);
       const ins = db.prepare(
         'INSERT INTO invest_fx_rates (date, rate, source) VALUES (?, ?, ?) ON CONFLICT(date) DO UPDATE SET rate = excluded.rate, source = excluded.source');
       db.transaction(() => { for (const r of rates) ins.run(r.date, r.rate, FX_SERIES); })();
@@ -493,7 +496,7 @@ export async function refreshAllPrices(db, holdings) {
   }
   setMeta(db, 'invest_fx_ok', '0');
   setMeta(db, 'invest_fx_try', '0');
-  const fxJob = ensureFxRates(db);
+  const fxJob = ensureFxRates(db, { timeoutMs: MANUAL_REFRESH_TIMEOUT_MS });
   const results = await Promise.all(jobs);
   await fxJob;
   return results;
