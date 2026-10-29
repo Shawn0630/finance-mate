@@ -406,6 +406,18 @@ if (!propCols.includes('hs_id_address')) {
     db.exec('ALTER TABLE property_costs ADD COLUMN monthly_amounts TEXT');
   }
 }
+// invest_accounts: databases created before account default
+// currencies have no default_currency column. Existing rows
+// keep NULL — the default then derives from the holdings at
+// read time (one currency wins, mixed falls back to CAD), so a
+// single-currency account now opens in its own currency while
+// a mixed account keeps opening in CAD, as before.
+{
+  const accCols = db.prepare('PRAGMA table_info(invest_accounts)').all().map((c) => c.name);
+  if (accCols.length && !accCols.includes('default_currency')) {
+    db.exec('ALTER TABLE invest_accounts ADD COLUMN default_currency TEXT');
+  }
+}
 // invest_events: databases created before split events have no
 // ratio columns. Existing rows keep NULL — they are not splits,
 // exactly how they were always interpreted.

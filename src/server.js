@@ -22,6 +22,7 @@ import {
   addNavPoint, updateNavPoint,
   listAccounts, getAccount, listHoldings, getHolding, listEvents, listPricePoints, rebuildEventPricePoints,
   computeHolding, computeAccount, computePortfolio, computeFillPreview,
+  effectiveAccountDefaultCurrency, pinCadReturnPct,
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
@@ -2513,9 +2514,22 @@ app.delete('/api/assets/:id', requireApiAuth, (req, res) => {
 // series; failures keep the last known values and the response's
 // priceStatus / fx fields say what is stale or missing — a read
 // never fails because a price source is down.
-async function prepareInvestScope(holdings) {
+// Display currency for a read: an explicit ?display=CAD|USD
+// wins; anything else falls back to the caller-supplied page
+// default (portfolio: CAD, account: the account's effective
+// default, holding: the holding's own currency).
+const parseInvestDisplay = (raw, fallback) =>
+  (raw === 'CAD' || raw === 'USD') ? raw : fallback;
+
+async function prepareInvestScope(holdings, display = 'CAD') {
   await Promise.all(holdings.map((h) => ensureHoldingPrices(db, h)));
-  if (holdings.some((h) => h.currency === 'USD')) await ensureFxRates(db);
+  // FX is needed whenever a conversion crosses CAD↔USD: a USD
+  // holding under a CAD display, or a CAD holding under a USD
+  // display. (The cache itself is day-gated, so this costs
+  // nothing on a fresh day.)
+  if (holdings.some((h) => h.currency === 'USD' || (display === 'USD' && h.currency === 'CAD'))) {
+    await ensureFxRates(db);
+  }
   return makeFxResolver(db);
 }
 
@@ -2531,9 +2545,12 @@ const investHoldingRow = (computed) => ({
 });
 
 app.get('/api/investments', requireApiAuth, async (req, res) => {
-  const fx = await prepareInvestScope(listHoldings(db));
-  const p = computePortfolio(db, fx, vancouverToday());
+  const display = parseInvestDisplay(req.query.display, 'CAD');
+  const fx = await prepareInvestScope(listHoldings(db), display);
+  const p = computePortfolio(db, fx, vancouverToday(), display);
+  if (display === 'USD') pinCadReturnPct(p, computePortfolio(db, fx, vancouverToday(), 'CAD'));
   res.json({
+    display,
     accounts: p.accounts.map((a) => ({
       account: a.account, summary: a.summary, monthly: a.monthly, series: a.series,
       holdings: a.holdings.map(investHoldingRow),
@@ -2580,18 +2597,27 @@ app.post('/api/investments/accounts', requireApiAuth, (req, res) => {
   if (own.error) return res.status(400).json({ error: own.error });
   const ts = nowIso();
   const info = db.prepare(
-    'INSERT INTO invest_accounts (name, type, institution, note, owners, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(v.name, v.type, v.institution, v.note, JSON.stringify(own.value || []), ts, ts);
+    'INSERT INTO invest_accounts (name, type, institution, note, owners, default_currency, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(v.name, v.type, v.institution, v.note, JSON.stringify(own.value || []), v.defaultCurrency, ts, ts);
   res.status(201).json(getAccount(db, info.lastInsertRowid));
 });
 
 app.get('/api/investments/accounts/:id', requireApiAuth, async (req, res) => {
   const account = getAccount(db, Number(req.params.id));
   if (!account) return res.status(404).json({ error: 'account not found' });
-  const fx = await prepareInvestScope(listHoldings(db, account.id));
-  const a = computeAccount(db, account, fx, vancouverToday());
+  const holdings = listHoldings(db, account.id);
+  // No explicit display → the account page opens in the
+  // account's effective default (stored setting, else derived
+  // from its holdings). An explicit ?display= overrides it for
+  // this visit only and never rewrites the setting.
+  const defaultCurrency = effectiveAccountDefaultCurrency(account, holdings);
+  const display = parseInvestDisplay(req.query.display, defaultCurrency);
+  const fx = await prepareInvestScope(holdings, display);
+  const a = computeAccount(db, account, fx, vancouverToday(), display);
+  if (display === 'USD') pinCadReturnPct(a, computeAccount(db, account, fx, vancouverToday(), 'CAD'));
   res.json({
-    account: a.account, summary: a.summary, monthly: a.monthly, series: a.series,
+    account: a.account, defaultCurrency, display,
+    summary: a.summary, monthly: a.monthly, series: a.series,
     holdings: a.holdings.map((c) => ({ ...investHoldingRow(c), events: c.events })),
     fxMissing: fx.missing,
   });
@@ -2609,8 +2635,8 @@ app.put('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
     if (own.error) return res.status(400).json({ error: own.error });
     owners = own.value;
   }
-  db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, owners = ?, updated_at = ? WHERE id = ?')
-    .run(v.name, v.type, v.institution, v.note, JSON.stringify(owners), nowIso(), account.id);
+  db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, owners = ?, default_currency = ?, updated_at = ? WHERE id = ?')
+    .run(v.name, v.type, v.institution, v.note, JSON.stringify(owners), v.defaultCurrency, nowIso(), account.id);
   res.json(getAccount(db, account.id));
 });
 
@@ -2658,10 +2684,15 @@ app.get('/api/investments/holdings/:id', requireApiAuth, async (req, res) => {
   const holding = getHolding(db, Number(req.params.id));
   if (!holding) return res.status(404).json({ error: 'holding not found' });
   const account = getAccount(db, holding.account_id);
-  const fx = await prepareInvestScope([holding]);
-  const c = computeHolding(db, holding, fx, vancouverToday());
+  // No explicit display → the holding page opens in the
+  // holding's own currency (a single holding's native view is
+  // the natural default). An explicit ?display= overrides it
+  // for this visit only.
+  const display = parseInvestDisplay(req.query.display, holding.currency);
+  const fx = await prepareInvestScope([holding], display);
+  const c = computeHolding(db, holding, fx, vancouverToday(), display);
   res.json({
-    holding: c.holding, account, summary: c.summary, monthly: c.monthly, series: c.series,
+    holding: c.holding, account, display, summary: c.summary, monthly: c.monthly, series: c.series,
     events: c.events,
     navPoints: c.points.filter((p) => p.source === 'manual'),
     priceStatus: investPriceStatus(c),

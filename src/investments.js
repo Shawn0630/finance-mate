@@ -129,12 +129,39 @@ export function validAccountInput(b, base = null) {
   if (!name) return { error: 'name is required' };
   const type = ACCOUNT_TYPES.includes(merged.type) ? merged.type : (base ? base.type : null);
   if (!type) return { error: `type must be one of ${ACCOUNT_TYPES.join(', ')}` };
+  // Default display currency: an explicit CAD/USD wins; anything
+  // else (including the form's '' Auto option) stores NULL, which
+  // reads back as the holdings-derived default (see below). A PUT
+  // that omits the field keeps the base value via the merge.
+  const dcRaw = merged.defaultCurrency ?? merged.default_currency;
+  let defaultCurrency = null;
+  if (dcRaw !== undefined && dcRaw !== null && dcRaw !== '') {
+    if (!HOLDING_CURRENCIES.includes(dcRaw)) return { error: "default currency must be 'CAD' or 'USD'" };
+    defaultCurrency = dcRaw;
+  }
   return {
     name,
     type,
     institution: cleanStr(merged.institution, 120),
     note: cleanStr(merged.note, 500),
+    defaultCurrency,
   };
+}
+
+// An account's display default, derived from its holdings when
+// no explicit default is stored: a single holding currency wins,
+// a mixed-currency (or empty) account falls back to CAD — the
+// same fallback the portfolio overview uses.
+export function deriveAccountDefaultCurrency(holdings) {
+  const curs = new Set((holdings || []).map((h) => h && h.currency).filter(Boolean));
+  return curs.size === 1 ? [...curs][0] : 'CAD';
+}
+
+export function effectiveAccountDefaultCurrency(account, holdings) {
+  if (account && (account.default_currency === 'CAD' || account.default_currency === 'USD')) {
+    return account.default_currency;
+  }
+  return deriveAccountDefaultCurrency(holdings);
 }
 
 export function validHoldingInput(b, base = null) {
@@ -455,8 +482,8 @@ export function derivePositionUnits(value, nav) {
 
 // ------------------------------------------------------------- engine
 // One holding's full computation: the monthly return table (in
-// the holding's native currency AND in CAD), the month-end
-// series for the chart, and the current summary.
+// the holding's native currency AND in the display currency),
+// the month-end series for the chart, and the current summary.
 //   fxRate(date) → CAD per 1 unit of the holding's currency
 //                  (identically 1 for CAD holdings).
 export function computeHoldingSeries({ events, points, fxRate, today }) {
@@ -591,8 +618,8 @@ function emptySummary() {
 }
 
 // Aggregate computed holdings (same engine output) into one
-// monthly table + series + summary, all in CAD. Months span the
-// union of the inputs.
+// monthly table + series + summary, all in the display
+// currency. Months span the union of the inputs.
 export function aggregateComputed(list) {
   const byMonth = new Map();
   for (const c of list) {
@@ -653,27 +680,76 @@ export function aggregateComputed(list) {
 // fxResolver: { rate(currency, date) → CAD per unit | null,
 // missing: bool } built by the caller (server) after ensuring
 // the FX cache; CAD always resolves to 1.
-export function computeHolding(db, holding, fxResolver, today) {
+//
+// Display currency — the read endpoints take ?display=CAD|USD
+// (default CAD on the portfolio, the account's effective
+// default on an account page, the holding's own currency on a
+// holding page). The engine itself is currency-agnostic: its
+// fxRate parameter is "display units per one unit of the
+// holding's currency", so the plain value/contribution/gain
+// fields below always carry the DISPLAY currency and the
+// *Native twins always carry the holding's own currency. A
+// display switch is therefore a pure re-render: no event,
+// price, or FX row is ever written by toggling, and the monthly
+// identity holds in either currency (flows convert at their
+// event-date rate, month-end values at the month-end rate —
+// the same rule the CAD totals always used, mirrored).
+export function displayRate(fxResolver, currency, display, date) {
+  if (display === 'USD') {
+    if (currency === 'USD') return 1;
+    if (currency === 'CAD') {
+      const fx = fxResolver.rate('USD', date); // CAD per USD
+      return fx ? 1 / fx : null; // null → the engine prices unconverted, as with missing CAD FX
+    }
+  }
+  return fxResolver.rate(currency, date);
+}
+
+export function computeHolding(db, holding, fxResolver, today, display = 'CAD') {
   const events = listEvents(db, holding.id);
   const points = listPricePoints(db, holding.id);
-  const fxRate = holding.currency === 'CAD'
-    ? () => 1
-    : (d) => fxResolver.rate(holding.currency, d);
+  const fxRate = (d) => displayRate(fxResolver, holding.currency, display, d);
   const computed = computeHoldingSeries({ events, points, fxRate, today });
   return { holding, events, points, ...computed };
 }
 
-export function computeAccount(db, account, fxResolver, today) {
+export function computeAccount(db, account, fxResolver, today, display = 'CAD') {
   const holdings = listHoldings(db, account.id)
-    .map((h) => computeHolding(db, h, fxResolver, today));
+    .map((h) => computeHolding(db, h, fxResolver, today, display));
   const agg = aggregateComputed(holdings);
   return { account, holdings, ...agg };
 }
 
-export function computePortfolio(db, fxResolver, today) {
-  const accounts = listAccounts(db).map((a) => computeAccount(db, a, fxResolver, today));
+export function computePortfolio(db, fxResolver, today, display = 'CAD') {
+  const accounts = listAccounts(db).map((a) => computeAccount(db, a, fxResolver, today, display));
   const agg = aggregateComputed(accounts.flatMap((a) => a.holdings));
   return { accounts, ...agg };
+}
+
+// Return % never converts: when a view is rendered in USD, its
+// $ figures convert but its % figures stay exactly where the
+// CAD view put them. The server computes the CAD run alongside
+// the USD run and copies the CAD % fields over (summary
+// totalReturnPct and each monthly returnPct, recursively
+// through accounts and holdings). A % is a ratio, never money
+// multiplied by a rate.
+export function pinCadReturnPct(displayNode, cadNode) {
+  if (!displayNode || !cadNode) return;
+  if (displayNode.summary && cadNode.summary) {
+    displayNode.summary.totalReturnPct = cadNode.summary.totalReturnPct;
+  }
+  if (Array.isArray(displayNode.monthly) && Array.isArray(cadNode.monthly)) {
+    const byMonth = new Map(cadNode.monthly.map((r) => [r.month, r.returnPct]));
+    for (const r of displayNode.monthly) {
+      if (byMonth.has(r.month)) r.returnPct = byMonth.get(r.month);
+    }
+  }
+  if (Array.isArray(displayNode.accounts) && Array.isArray(cadNode.accounts)) {
+    displayNode.accounts.forEach((a, i) => { if (cadNode.accounts[i]) pinCadReturnPct(a, cadNode.accounts[i]); });
+  }
+  if (Array.isArray(displayNode.holdings) && Array.isArray(cadNode.holdings)) {
+    displayNode.holdings.forEach((h, i) => { if (cadNode.holdings[i]) pinCadReturnPct(h, cadNode.holdings[i]); });
+  }
 }
 
 // Fill-with-AI preview: what each holding in a draft would be

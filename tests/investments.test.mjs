@@ -18,6 +18,7 @@ import {
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints, computeFillPreview,
   splitMultiplier, splitFactorAfter, adjustedUnitsOf, derivePositionUnits,
   monthlyYears, latestMonthlyYear, monthlyRowsForYear,
+  deriveAccountDefaultCurrency, effectiveAccountDefaultCurrency, displayRate, pinCadReturnPct,
 } from '../src/investments.js';
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, parseNasdaqHistorical, ensureHoldingPrices, ensureHoldingPricesDetailed,
@@ -191,7 +192,7 @@ test('aggregateComputed: CAD sums across holdings, % from the totals', () => {
 // ------------------------------------------------------------- validation
 test('validAccountInput / validHoldingInput: shapes and required fields', () => {
   assert.deepEqual(validAccountInput({ name: ' My TFSA ', type: 'TFSA', institution: 'CIBC' }),
-    { name: 'My TFSA', type: 'TFSA', institution: 'CIBC', note: null });
+    { name: 'My TFSA', type: 'TFSA', institution: 'CIBC', note: null, defaultCurrency: null });
   assert.ok(validAccountInput({ name: 'X', type: 'LIRA' }).error);
   assert.ok(validAccountInput({ type: 'TFSA' }).error);
   assert.deepEqual(validHoldingInput({ label: 'XQQ', kind: 'exchange', symbol: 'xqq.to', currency: 'CAD' }),
@@ -1382,4 +1383,87 @@ test('FX fetch asks Valet for FXUSDCAD, never FX_USDCAD', async () => {
     globalThis.fetch = realFetch;
     if (savedFx === undefined) delete process.env.FX_API_URL; else process.env.FX_API_URL = savedFx;
   }
+});
+// ------------------------------------------------- display currency
+test('deriveAccountDefaultCurrency: one currency wins, mixed or empty falls back to CAD', () => {
+  assert.equal(deriveAccountDefaultCurrency([{ currency: 'USD' }, { currency: 'USD' }]), 'USD');
+  assert.equal(deriveAccountDefaultCurrency([{ currency: 'CAD' }]), 'CAD');
+  assert.equal(deriveAccountDefaultCurrency([{ currency: 'CAD' }, { currency: 'USD' }]), 'CAD');
+  assert.equal(deriveAccountDefaultCurrency([]), 'CAD');
+});
+
+test('effectiveAccountDefaultCurrency: a stored setting beats the derivation', () => {
+  const usdOnly = [{ currency: 'USD' }];
+  const cadOnly = [{ currency: 'CAD' }];
+  assert.equal(effectiveAccountDefaultCurrency({ default_currency: 'CAD' }, usdOnly), 'CAD');
+  assert.equal(effectiveAccountDefaultCurrency({ default_currency: 'USD' }, cadOnly), 'USD');
+  assert.equal(effectiveAccountDefaultCurrency({ default_currency: null }, usdOnly), 'USD');
+  assert.equal(effectiveAccountDefaultCurrency({}, usdOnly), 'USD');
+  assert.equal(effectiveAccountDefaultCurrency({ default_currency: 'EUR' }, usdOnly), 'USD');
+});
+
+test('validAccountInput: default currency accepts CAD/USD/Auto, rejects the rest, PUT omission keeps base', () => {
+  assert.equal(validAccountInput({ name: 'A', type: 'TFSA', defaultCurrency: 'USD' }).defaultCurrency, 'USD');
+  assert.equal(validAccountInput({ name: 'A', type: 'TFSA', defaultCurrency: '' }).defaultCurrency, null);
+  assert.equal(validAccountInput({ name: 'A', type: 'TFSA' }).defaultCurrency, null);
+  assert.equal(validAccountInput({ name: 'A', type: 'TFSA', defaultCurrency: 'EUR' }).error,
+    "default currency must be 'CAD' or 'USD'");
+  assert.equal(validAccountInput({ name: 'A' }, { type: 'TFSA', default_currency: 'USD' }).defaultCurrency, 'USD');
+});
+
+test('displayRate: USD display inverts CAD, CAD display passes the resolver through, missing FX is null', () => {
+  const fx = { rate: (c) => (c === 'USD' ? 1.4 : 1) };
+  assert.equal(displayRate(fx, 'USD', 'USD', '2026-02-01'), 1);
+  assert.equal(displayRate(fx, 'CAD', 'USD', '2026-02-01'), 1 / 1.4);
+  assert.equal(displayRate(fx, 'USD', 'CAD', '2026-02-01'), 1.4);
+  assert.equal(displayRate(fx, 'CAD', 'CAD', '2026-02-01'), 1);
+  const missing = { rate: () => null };
+  assert.equal(displayRate(missing, 'CAD', 'USD', '2026-02-01'), null);
+  assert.equal(displayRate(missing, 'USD', 'CAD', '2026-02-01'), null);
+});
+
+test('computeHoldingSeries in USD display: a CAD holding converts flows at event-date rates, values at month-end', () => {
+  const fx = [{ date: '2026-01-01', rate: 1.3 }, { date: '2026-02-01', rate: 1.4 }];
+  const events = [E(1, '2026-01-05', 'buy', 10, 100)];
+  const points = [P('2026-01-31', 110), P('2026-02-27', 120)];
+  const usdRate = (d) => displayRate({ rate: (c, date) => fxOn(fx, date) }, 'CAD', 'USD', d);
+  const { monthly, summary } = computeHoldingSeries({ events, points, fxRate: usdRate, today: '2026-03-01' });
+  const [jan, feb] = monthly;
+  assert.equal(jan.contributions, 769.23); // 1000 CAD ÷ 1.30 (rate on the buy date)
+  assert.equal(jan.endValue, 846.15);      // 1100 CAD ÷ 1.30 (Jan 31 rate)
+  assert.equal(jan.gain, 76.92);
+  assert.equal(feb.endValue, 857.14);      // 1200 CAD ÷ 1.40 (Feb 27 rate)
+  assert.equal(summary.value, 857.14);
+  assert.equal(summary.valueNative, 1200);
+  for (const r of monthly) {
+    assert.equal(r.endValue, r.startValue + r.contributions + r.gain, r.month);
+  }
+});
+
+test('computeHoldingSeries with missing FX: a display conversion prices unconverted, never at 1.0 silently', () => {
+  const events = [E(1, '2026-01-05', 'buy', 10, 100)];
+  const points = [P('2026-01-31', 110)];
+  const { monthly, summary } = computeHoldingSeries({ events, points, fxRate: () => null, today: '2026-02-01' });
+  assert.equal(monthly[0].contributions, 1000);
+  assert.equal(monthly[0].endValue, 1100);
+  assert.equal(summary.value, 1100);
+});
+
+test('pinCadReturnPct: USD view keeps the CAD percentages, dollar fields untouched, missing months kept', () => {
+  const display = {
+    summary: { totalReturnPct: 99 },
+    monthly: [{ month: '2026-01', returnPct: 99 }, { month: '2026-02', returnPct: 99 }],
+    accounts: [{ summary: { totalReturnPct: 99 }, monthly: [{ month: '2026-01', returnPct: 99 }] }],
+  };
+  const cad = {
+    summary: { totalReturnPct: 10 },
+    monthly: [{ month: '2026-01', returnPct: 5 }],
+    accounts: [{ summary: { totalReturnPct: 7 }, monthly: [{ month: '2026-01', returnPct: 3 }] }],
+  };
+  pinCadReturnPct(display, cad);
+  assert.equal(display.summary.totalReturnPct, 10);
+  assert.equal(display.monthly[0].returnPct, 5);
+  assert.equal(display.monthly[1].returnPct, 99);
+  assert.equal(display.accounts[0].summary.totalReturnPct, 7);
+  assert.equal(display.accounts[0].monthly[0].returnPct, 3);
 });

@@ -7881,7 +7881,7 @@ try {
       && r.data.summary.latestPrice === 63 && r.data.summary.latestPriceSource === 'yahoo',
     JSON.stringify({ ps: r.data.priceStatus, sm: r.data.summary }));
 
-  r = await req('GET', `/api/investments/holdings/${invAaplId}`);
+  r = await req('GET', `/api/investments/holdings/${invAaplId}?display=CAD`);
   const aaplJan = r.data.monthly.find((m) => m.month === '2026-01');
   const aaplFeb = r.data.monthly.find((m) => m.month === '2026-02');
   check('investments: AAPL carries its USD currency; monthly rows are CAD at the month rates',
@@ -7892,7 +7892,7 @@ try {
       && r.data.summary.totalReturn === 207.5 && r.data.summary.totalReturnPct === 15.57,
     JSON.stringify(r.data.summary));
 
-  r = await req('GET', `/api/investments/holdings/${invAcmeId}`);
+  r = await req('GET', `/api/investments/holdings/${invAcmeId}?display=CAD`);
   check('investments: RSU grants accumulate units; the unpriced grant takes the known market price',
     r.data.summary.units === 30 && r.data.summary.valueNative === 1200 && r.data.summary.totalReturnNative === 0
       && r.data.summary.unpricedGrants === 0 && r.data.priceStatus.pricedBy === 'event',
@@ -7900,6 +7900,62 @@ try {
   check('investments: RSU in CAD — the FX move is the only gain',
     r.data.summary.value === 1680 && r.data.summary.contributions === 1600 && r.data.summary.totalReturn === 80,
     JSON.stringify(r.data.summary));
+
+  // ---- display currency ----
+  // Portfolio in USD: CAD holdings divide by the latest stub
+  // rate (1.40), USD holdings stand native; the % figures do
+  // not move (pinned to the CAD run).
+  r = await req('GET', '/api/investments');
+  const cadPort = r.data;
+  check('investments: portfolio opens in CAD by default',
+    r.data.display === 'CAD' && r.data.summary.value === 10350, JSON.stringify(r.data.summary));
+  r = await req('GET', '/api/investments?display=USD');
+  const usdPort = r.data;
+  check('investments: portfolio in USD converts dollars, keeps the CAD percentages',
+    r.data.display === 'USD' && r.data.summary.value === 7392.85
+      && r.data.summary.totalReturnPct === cadPort.summary.totalReturnPct
+      && r.data.monthly.find((m) => m.month === '2026-01').returnPct
+        === cadPort.monthly.find((m) => m.month === '2026-01').returnPct,
+    JSON.stringify({ usd: r.data.summary, cad: cadPort.summary }));
+  check('investments: an invalid display falls back to CAD',
+    (await req('GET', '/api/investments?display=EUR')).data.display === 'CAD');
+  // Holding pages open in their own currency.
+  r = await req('GET', `/api/investments/holdings/${invAaplId}`);
+  check('investments: a USD holding page opens in USD',
+    r.data.display === 'USD' && r.data.summary.value === 1100 && r.data.summary.valueNative === 1100,
+    JSON.stringify(r.data.summary));
+  r = await req('GET', `/api/investments/holdings/${invXqqId}`);
+  check('investments: a CAD holding page opens in CAD',
+    r.data.display === 'CAD' && r.data.summary.value === 3300, JSON.stringify(r.data.summary));
+  // Account defaults derive from the holdings; a stored
+  // setting beats the derivation; Auto restores it.
+  r = await req('GET', `/api/investments/accounts/${invRsuId}`);
+  check('investments: an all-USD account page opens in USD by derivation',
+    r.data.display === 'USD' && r.data.defaultCurrency === 'USD', JSON.stringify({ d: r.data.display, dc: r.data.defaultCurrency }));
+  r = await req('GET', `/api/investments/accounts/${invTfsaId}`);
+  check('investments: an all-CAD account page opens in CAD by derivation',
+    r.data.display === 'CAD' && r.data.defaultCurrency === 'CAD', JSON.stringify({ d: r.data.display, dc: r.data.defaultCurrency }));
+  r = await req('PUT', `/api/investments/accounts/${invRsuId}`, { defaultCurrency: 'CAD' });
+  check('investments: a stored default currency is accepted', r.status === 200 && r.data.default_currency === 'CAD', JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/accounts/${invRsuId}`);
+  check('investments: a stored CAD default beats USD holdings',
+    r.data.display === 'CAD' && r.data.defaultCurrency === 'CAD', JSON.stringify({ d: r.data.display, dc: r.data.defaultCurrency }));
+  r = await req('PUT', `/api/investments/accounts/${invRsuId}`, { defaultCurrency: 'EUR' });
+  check('investments: an unknown default currency is a 400', r.status === 400, JSON.stringify(r.data));
+  await req('PUT', `/api/investments/accounts/${invRsuId}`, { defaultCurrency: '' });
+  r = await req('GET', `/api/investments/accounts/${invRsuId}`);
+  check('investments: Auto restores the derived USD default',
+    r.data.display === 'USD' && r.data.defaultCurrency === 'USD', JSON.stringify({ d: r.data.display, dc: r.data.defaultCurrency }));
+  // A mixed-currency account falls back to CAD (created and
+  // removed here so later portfolio totals are untouched).
+  r = await req('POST', '/api/investments/accounts', { name: 'Mixed Display', type: 'Other' });
+  const invMixedId = r.data.id;
+  await req('POST', `/api/investments/accounts/${invMixedId}/holdings`, { label: 'Cad Bit', kind: 'fund', currency: 'CAD' });
+  await req('POST', `/api/investments/accounts/${invMixedId}/holdings`, { label: 'Usd Bit', kind: 'fund', currency: 'USD' });
+  r = await req('GET', `/api/investments/accounts/${invMixedId}`);
+  check('investments: a mixed-currency account falls back to CAD',
+    r.data.display === 'CAD' && r.data.defaultCurrency === 'CAD', JSON.stringify({ d: r.data.display, dc: r.data.defaultCurrency }));
+  await req('DELETE', `/api/investments/accounts/${invMixedId}`);
 
   r = await req('GET', `/api/investments/holdings/${invFundId}`);
   check('investments: the fund rides its manual NAV snapshots',
@@ -8067,7 +8123,7 @@ try {
   const invBatchId = r.data.id;
   check('investments: a holding is created together with its initial transactions',
     r.status === 201 && !!invBatchId, JSON.stringify(r.data));
-  r = await req('GET', `/api/investments/holdings/${invBatchId}`);
+  r = await req('GET', `/api/investments/holdings/${invBatchId}?display=CAD`);
   const batchJan = r.data.monthly.find((m) => m.month === '2026-01');
   const batchFeb = r.data.monthly.find((m) => m.month === '2026-02');
   check('investments: batch events price like detail-page events (buy 10 @190, sell 4 @205; FX 1.30/1.40)',
@@ -8576,7 +8632,7 @@ try {
         }));
         return {
           text: document.querySelector('#view-invest-holding').textContent,
-          totalReturn: (stats.find((s) => s.k === 'Total return') || {}).v,
+          totalReturn: (stats.find((s) => s.k.startsWith('Total return')) || {}).v,
         };
       });
       check('investments UI: a cost-unknown holding shows the marker, gain —, and both NAV snapshots',
@@ -8785,7 +8841,7 @@ try {
         const stats = [...document.querySelectorAll('#investHoldingStats .summary-card')].map((c) => ({
           k: c.querySelector('.k').textContent, v: c.querySelector('.v').textContent,
         }));
-        return (stats.find((s) => s.k === 'Current value') || {}).v;
+        return (stats.find((s) => s.k.startsWith('Current value')) || {}).v;
       });
       check('investments UI: Apply lands exactly on the previewed value',
         previewHoldingPage === '$85,529.91', previewHoldingPage);
@@ -8899,8 +8955,10 @@ try {
       await page.waitForFunction(() => location.hash.startsWith('#invest-holding/'), { timeout: 10000 });
       await waitI(800);
       const beforeSplit = await page.evaluate(() => {
+        // Card labels carry the display currency now
+        // ("Current value (CAD)"), so match by prefix.
         const statCard2 = (name) => [...document.querySelectorAll('#investHoldingStats .summary-card')]
-          .find((c) => c.querySelector('.k').textContent === name).querySelector('.v').textContent;
+          .find((c) => c.querySelector('.k').textContent.startsWith(name)).querySelector('.v').textContent;
         return { units: statCard2('Units'), value: statCard2('Current value') };
       });
       check('investments UI: before the split the header shows the recorded 78 units',
@@ -8918,7 +8976,7 @@ try {
       }, { timeout: 15000 });
       const afterSplit = await page.evaluate(() => {
         const statCard3 = (name) => [...document.querySelectorAll('#investHoldingStats .summary-card')]
-          .find((c) => c.querySelector('.k').textContent === name).querySelector('.v').textContent;
+          .find((c) => c.querySelector('.k').textContent.startsWith(name)).querySelector('.v').textContent;
         return {
           units: statCard3('Units'), value: statCard3('Current value'),
           events: document.querySelector('#investEventsWrap').textContent,
@@ -9228,6 +9286,79 @@ try {
         const j = d.jobs.find((x) => x.employer === 'Owner Browser Corp');
         if (j) await fetch(`/api/earnings/jobs/${j.id}`, { method: 'DELETE' });
       });
+      // Display currency: a fresh all-USD account opens in USD
+      // by derivation; the form's default setting changes what
+      // the next visit opens in; toggles never leak across pages.
+      r = await req('POST', '/api/investments/accounts', { name: 'Display Default UI', type: 'RSU' });
+      const dispAcctId = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${dispAcctId}/holdings`, { label: 'USD Fund', kind: 'fund', currency: 'USD' });
+      const dispHoldId = r.data.id;
+      await req('POST', `/api/investments/holdings/${dispHoldId}/events`, { date: '2026-01-05', type: 'buy', units: 10, price: 50 });
+      await page.goto(`http://ff.local/#invest-account/${dispAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const dispDerived = await page.evaluate(() => ({
+        btn: document.querySelector('#investAccountDisplayBtn').textContent.trim(),
+        strip: document.querySelector('#investAccountStats').textContent,
+      }));
+      check('investments UI: a new all-USD account opens in USD by derivation, strip labeled USD',
+        dispDerived.btn === 'Display: USD' && dispDerived.strip.includes('US$500') && dispDerived.strip.includes('Current value (USD)'),
+        JSON.stringify(dispDerived));
+      // Change the stored default in the form; the next visit
+      // opens in the new default (here CAD: 500 USD × 1.40).
+      await page.click('#editInvestAccountBtn');
+      await page.waitForFunction(() => !document.querySelector('#investAccountModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.select('#investAccountForm select[name=defaultCurrency]', 'CAD');
+      await page.click('#investAccountForm button[type=submit]');
+      await page.waitForFunction(() => document.querySelector('#investAccountModal').classList.contains('hidden'), { timeout: 15000 });
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.goto(`http://ff.local/#invest-account/${dispAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const dispStored = await page.evaluate(() => ({
+        btn: document.querySelector('#investAccountDisplayBtn').textContent.trim(),
+        strip: document.querySelector('#investAccountStats').textContent,
+      }));
+      check('investments UI: after setting the default to CAD, re-entering opens in CAD',
+        dispStored.btn === 'Display: CAD' && dispStored.strip.includes('700') && !dispStored.strip.includes('US$'),
+        JSON.stringify(dispStored));
+      // The overview still opens in CAD, and toggling the
+      // account page does not move it.
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const overDefault = await page.evaluate(() => document.querySelector('#investDisplayBtn').textContent.trim());
+      check('investments UI: the overview opens in CAD by default',
+        overDefault === 'Display: CAD', overDefault);
+      await page.goto(`http://ff.local/#invest-account/${dispAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('#investAccountDisplayBtn');
+      await waitI(800);
+      const acctToggled = await page.evaluate(() => document.querySelector('#investAccountDisplayBtn').textContent.trim());
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const overAfter = await page.evaluate(() => document.querySelector('#investDisplayBtn').textContent.trim());
+      check('investments UI: toggling the account page to USD leaves the overview in CAD',
+        acctToggled === 'Display: USD' && overAfter === 'Display: CAD',
+        JSON.stringify({ acctToggled, overAfter }));
+      // The overview toggle converts and labels its own page;
+      // the account page then re-opens in its own stored
+      // default, not the overview's display.
+      await page.click('#investDisplayBtn');
+      await waitI(800);
+      const overToggled = await page.evaluate(() => ({
+        btn: document.querySelector('#investDisplayBtn').textContent.trim(),
+        strip: document.querySelector('#section-investments .summary-strip').textContent,
+        monthlyHead: document.querySelector('#investPortfolioMonthly thead').textContent,
+      }));
+      check('investments UI: toggling the overview to USD labels strip and monthly headers USD',
+        overToggled.btn === 'Display: USD' && overToggled.strip.includes('Current value (USD)')
+          && overToggled.monthlyHead.includes('Start value (USD)'),
+        JSON.stringify(overToggled));
+      await page.goto(`http://ff.local/#invest-account/${dispAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const acctAfter = await page.evaluate(() => document.querySelector('#investAccountDisplayBtn').textContent.trim());
+      check('investments UI: the account page re-opens in its stored CAD default, not the overview USD',
+        acctAfter === 'Display: CAD', acctAfter);
+      await req('DELETE', `/api/investments/accounts/${dispAcctId}`);
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

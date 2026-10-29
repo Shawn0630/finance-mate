@@ -579,9 +579,14 @@ async function loadChart(id) { return withLoading(() => loadChartImpl(id)); }
 async function loadTrend(id) { return withLoading(() => loadTrendImpl(id)); }
 async function loadCosts(id) { return withLoading(() => loadCostsImpl(id)); }
 async function loadEquity(id) { return withLoading(() => loadEquityImpl(id)); }
-async function loadInvestments() { return withLoading(() => loadInvestmentsImpl()); }
-async function loadInvestAccount(id) { return withLoading(() => loadInvestAccountImpl(id)); }
-async function loadInvestHolding(id) { return withLoading(() => loadInvestHoldingImpl(id)); }
+// Router entry resets each page to its default display (the
+// toggle is per-visit only): the overview always opens in CAD,
+// an account/holding page opens in its server default (null
+// here = "let the server decide"), and only the toggle handler
+// below sets a non-default display for the current visit.
+async function loadInvestments() { investDisplay.investments = 'CAD'; return withLoading(() => loadInvestmentsImpl()); }
+async function loadInvestAccount(id) { investDisplay.investAccount = null; return withLoading(() => loadInvestAccountImpl(id)); }
+async function loadInvestHolding(id) { investDisplay.investHolding = null; return withLoading(() => loadInvestHoldingImpl(id)); }
 
 function markAssetsDirty() { assetsLoaded = false; }
 
@@ -4644,11 +4649,17 @@ document.querySelector('[data-costs-proposed]').addEventListener('input', (e) =>
 // Three levels, mirroring Properties: a portfolio overview in
 // the Assets > Investments section, an account detail page and a
 // holding detail page. All figures come from the server's return
-// engine (src/investments.js): values and returns at account /
-// portfolio level are CAD; a holding's own page speaks its
-// native currency, with the currency badge beside its name
-// everywhere. The other-assets registry is untouched by this
-// module — investments never go through it.
+// engine (src/investments.js) in the page's DISPLAY currency:
+// the overview opens in CAD, an account page in the account's
+// effective default (its stored setting, else derived from its
+// holdings), a holding page in the holding's own currency. Each
+// page carries its own Display toggle (a per-visit view switch:
+// it never changes another page, and never rewrites an account's
+// default). Every converted figure is labeled with its currency
+// — strip labels, chart legends, monthly headers, the holdings
+// table's converted column — and the native-currency badge
+// beside a holding's name stays. The other-assets registry is
+// untouched by this module — investments never go through it.
 let currentInvestAccountId = null;
 let currentInvestHoldingId = null;
 let investPortfolioChart = null;
@@ -4674,21 +4685,37 @@ const ACCOUNT_TYPE_LABELS = { TFSA: 'TFSA', RRSP: 'RRSP', RSU: 'RSU', NonRegiste
 const currencyBadge = (cur) => `<span class="badge ${cur === 'USD' ? 'usd' : ''}">${esc(cur)}</span>`;
 const aiBadge = (source) => (source === 'ai' ? ' <span class="badge ai">AI</span>' : '');
 
+// Per-visit display currency, one per page: the toggle below
+// rewrites only its own page's entry, and every loader resets
+// its page to that page's default on entry (overview: CAD,
+// account: the account's effective default, holding: the
+// holding's own currency). Nothing here is persisted — the
+// only stored currency choice is the account's default.
+const investDisplay = { investments: 'CAD', investAccount: 'CAD', investHolding: 'CAD' };
+const investDisplayLabel = (cur) => `Display: ${cur}`;
+// The static account/holding toolbar buttons are bound once,
+// so their handlers must read the current page id from here,
+// not from the loader call that bound them.
+let investDisplayAccountId = null;
+let investDisplayHoldingId = null;
+
 function investSummaryStrip(s, cur = 'CAD') {
   return `
-    <div class="summary-card"><div class="k">Current value</div><div class="v">${moneyC(s.value, cur)}</div></div>
-    <div class="summary-card"><div class="k">Net contributions</div><div class="v">${moneyC(s.contributions, cur)}</div></div>
-    <div class="summary-card"><div class="k">Dividends received</div><div class="v">${moneyC(s.dividends, cur)}</div></div>
-    <div class="summary-card"><div class="k">Total return</div><div class="v">${s.costUnknown ? '—' : returnText(s.totalReturn, s.totalReturnPct, cur)}</div>${s.costUnknown ? '<div class="n">cost unknown — gain not shown</div>' : ''}</div>`;
+    <div class="summary-card"><div class="k">Current value (${cur})</div><div class="v">${moneyC(s.value, cur)}</div></div>
+    <div class="summary-card"><div class="k">Net contributions (${cur})</div><div class="v">${moneyC(s.contributions, cur)}</div></div>
+    <div class="summary-card"><div class="k">Dividends received (${cur})</div><div class="v">${moneyC(s.dividends, cur)}</div></div>
+    <div class="summary-card"><div class="k">Total return (${cur})</div><div class="v">${s.costUnknown ? '—' : returnText(s.totalReturn, s.totalReturnPct, cur)}</div>${s.costUnknown ? '<div class="n">cost unknown — gain not shown</div>' : ''}</div>`;
 }
 
-// The monthly return table shared by all three levels. CAD rows
-// carry the plain fields; a holding's rows carry the *Native
-// twins and render in its own currency.
-function investMonthlyTable(monthly, cur = 'CAD', gainUnknown = false) {
+// The monthly return table shared by all three levels. The
+// money columns always read the server's plain fields, which
+// carry the page's display currency; the % column is the one
+// thing that never converts — aggregates keep their CAD-basis
+// % (the server pins it), a holding page keeps its native %
+// (nativePct), so toggling never moves a percentage.
+function investMonthlyTable(monthly, cur = 'CAD', gainUnknown = false, nativePct = false) {
   if (!monthly || !monthly.length) return '<div class="note">No activity yet.</div>';
-  const native = cur !== 'CAD';
-  const g = (r, k) => (native ? r[k + 'Native'] : r[k]);
+  const g = (r, k) => r[k];
   const tot = { contributions: 0, dividends: 0, gain: 0, returnAmount: 0 };
   const rows = monthly.map((r) => {
     tot.contributions += g(r, 'contributions') || 0;
@@ -4701,12 +4728,12 @@ function investMonthlyTable(monthly, cur = 'CAD', gainUnknown = false) {
       <td class="num">${moneyC(g(r, 'dividends'), cur)}</td>
       <td class="num">${gainUnknown ? '—' : moneyC(g(r, 'gain'), cur)}</td>
       <td class="num">${gainUnknown ? '—' : moneyC(g(r, 'returnAmount'), cur)}</td>
-      <td class="num">${gainUnknown ? '—' : pctText(native ? r.returnPctNative : r.returnPct)}</td>
+      <td class="num">${gainUnknown ? '—' : pctText(nativePct ? r.returnPctNative : r.returnPct)}</td>
       <td class="num">${moneyC(g(r, 'endValue'), cur)}</td></tr>`;
   }).join('');
-  return `<table><thead><tr><th>Month</th><th class="num">Start value</th><th class="num">Contributions</th>
-    <th class="num">Dividends</th><th class="num">Market gain</th><th class="num">Return</th><th class="num">Return %</th>
-    <th class="num">End value</th></tr></thead><tbody>${rows}</tbody>
+  return `<table><thead><tr><th>Month</th><th class="num">Start value (${cur})</th><th class="num">Contributions (${cur})</th>
+    <th class="num">Dividends (${cur})</th><th class="num">Market gain (${cur})</th><th class="num">Return (${cur})</th><th class="num">Return %</th>
+    <th class="num">End value (${cur})</th></tr></thead><tbody>${rows}</tbody>
     <tfoot><tr><th>Total</th><th></th><th class="num">${moneyC(tot.contributions, cur)}</th>
     <th class="num">${moneyC(tot.dividends, cur)}</th><th class="num">${gainUnknown ? '—' : moneyC(tot.gain, cur)}</th>
     <th class="num">${gainUnknown ? '—' : moneyC(tot.returnAmount, cur)}</th><th></th><th></th></tr></tfoot></table>`;
@@ -4728,9 +4755,9 @@ function investMonthlyYears(monthly) {
   return [...years].sort();
 }
 
-function investMonthlyBlock(monthly, level, cur, gainUnknown = false) {
+function investMonthlyBlock(monthly, level, cur, gainUnknown = false, nativePct = false) {
   const years = investMonthlyYears(monthly);
-  if (years.length <= 1) return investMonthlyTable(monthly, cur, gainUnknown);
+  if (years.length <= 1) return investMonthlyTable(monthly, cur, gainUnknown, nativePct);
   let year = investYearPage[level];
   if (!years.includes(year)) { year = years[years.length - 1]; investYearPage[level] = year; }
   const idx = years.indexOf(year);
@@ -4740,7 +4767,7 @@ function investMonthlyBlock(monthly, level, cur, gainUnknown = false) {
     <button type="button" class="small" onclick="investYearStep('${level}', -1)"${idx <= 0 ? ' disabled' : ''}>&#8249; Prev year</button>
     <select aria-label="Monthly returns year" onchange="investYearPick('${level}', this.value)">${opts}</select>
     <button type="button" class="small" onclick="investYearStep('${level}', 1)"${idx >= years.length - 1 ? ' disabled' : ''}>Next year &#8250;</button>
-  </div>${investMonthlyTable(pageRows, cur, gainUnknown)}`;
+  </div>${investMonthlyTable(pageRows, cur, gainUnknown, nativePct)}`;
 }
 
 // Re-render only one level's monthly table (chart and range
@@ -4753,7 +4780,7 @@ function renderInvestMonthlyOnly(level) {
   const inR = (m) => !r || (m >= r.start && m <= r.end);
   const fMonthly = (d.monthly || []).filter((x) => inR(x.month));
   const mHost = $(conf.monthly);
-  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur, !!d.gainUnknown);
+  if (mHost) mHost.innerHTML = investMonthlyBlock(fMonthly, level, d.cur, !!d.gainUnknown, !!d.nativePct);
 }
 
 window.investYearPick = (level, year) => {
@@ -4785,7 +4812,7 @@ const investRanges = {
   investAccount: { months: 0, custom: null },
   investHolding: { months: 0, custom: null },
 };
-const investViewData = {}; // level -> { series, monthly, cur, native }
+const investViewData = {}; // level -> { series, monthly, cur, nativePct }
 let invPop = null; // { level, which: 'start'|'end', year }
 
 function investRangeControlsHtml(level) {
@@ -4901,13 +4928,13 @@ function investLegendClick(e, item, legend) {
 // months the account has no point for), under the same Value
 // and Cumulative return lines the other levels draw. Follows
 // the range in force like the lines do.
-function drawInvestPortfolioChart(canvas, data, fSeries) {
+function drawInvestPortfolioChart(canvas, data, fSeries, cur = 'CAD') {
   if (!canvas) return null;
   const months = fSeries.map((r) => r.month);
   const bars = (data.accounts || []).map((a) => {
     const byMonth = new Map((a.series || []).map((p) => [p.month, p.value]));
-    let cur = 0;
-    const vals = months.map((m) => { if (byMonth.has(m)) cur = byMonth.get(m); return cur; });
+    let run = 0;
+    const vals = months.map((m) => { if (byMonth.has(m)) run = byMonth.get(m); return run; });
     return {
       type: 'bar', label: a.account.name, accountId: a.account.id, data: vals,
       backgroundColor: investAccountColor(a.account), stack: 'value', order: 3, maxBarThickness: 28,
@@ -4919,11 +4946,11 @@ function drawInvestPortfolioChart(canvas, data, fSeries) {
       labels: months,
       datasets: [
         ...bars,
-        { label: 'Value (CAD)', data: fSeries.map((r) => r.value), borderColor: '#1668c4', backgroundColor: '#1668c4', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+        { label: `Value (${cur})`, data: fSeries.map((r) => r.value), borderColor: '#1668c4', backgroundColor: '#1668c4', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
         // Same rule as the single-holding chart: a cost-unknown
         // constituent makes the cumulative return fake, so the
         // line is dropped when the aggregate is flagged.
-        ...(data.gainUnknown ? [] : [{ label: 'Cumulative return (CAD)', data: fSeries.map((r) => r.returnAmount), borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 }]),
+        ...(data.gainUnknown ? [] : [{ label: `Cumulative return (${cur})`, data: fSeries.map((r) => r.returnAmount), borderColor: '#2e7d4f', backgroundColor: '#2e7d4f', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 }]),
       ],
     },
     options: {
@@ -4939,9 +4966,9 @@ function drawInvestPortfolioChart(canvas, data, fSeries) {
               if (ds.accountId != null) {
                 const total = c.chart.data.datasets.reduce((s, d) => s + (d.accountId != null ? (d.data[c.dataIndex] || 0) : 0), 0);
                 const pct = total ? ((c.parsed.y / total) * 100).toFixed(1) : '0.0';
-                return `${ds.label}: ${moneyC(c.parsed.y, 'CAD')} (${pct}%)`;
+                return `${ds.label}: ${moneyC(c.parsed.y, cur)} (${pct}%)`;
               }
-              return `${c.dataset.label}: ${moneyC(c.parsed.y, 'CAD')}`;
+              return `${c.dataset.label}: ${moneyC(c.parsed.y, cur)}`;
             },
           },
         },
@@ -4971,7 +4998,7 @@ const investShareCenterPlugin = {
     c.fillText('Total value', x, y - 4);
     c.fillStyle = '#22303c';
     c.font = '700 14px system-ui, sans-serif';
-    c.fillText(moneyC(investShareCenter.total), x, y + 14);
+    c.fillText(moneyC(investShareCenter.total, investShareCenter.cur || 'CAD'), x, y + 14);
     c.restore();
   },
 };
@@ -4979,7 +5006,7 @@ const investShareCenterPlugin = {
 // The account-share doughnut: each account's CURRENT value as a
 // slice of the portfolio total. It reflects "now" and does not
 // follow the range control.
-function drawInvestShareChart(data) {
+function drawInvestShareChart(data, cur = 'CAD') {
   const canvas = $('#investShareChart');
   if (!canvas) return;
   const accts = (data.accounts || []).filter((a) => a.summary && a.summary.value > 0);
@@ -4997,7 +5024,7 @@ function drawInvestShareChart(data) {
   }
   if (wrap) wrap.classList.remove('hidden');
   if (empty) empty.classList.add('hidden');
-  investShareCenter = { total };
+  investShareCenter = { total, cur };
   if (investShareChart) investShareChart.destroy();
   investShareChart = new Chart(canvas, {
     type: 'doughnut',
@@ -5022,7 +5049,7 @@ function drawInvestShareChart(data) {
             label: (item) => {
               const t = item.dataset.data.reduce((a, b) => a + b, 0);
               const pct = t ? ((item.parsed / t) * 100).toFixed(1) : '0.0';
-              return ` ${item.label}: ${moneyC(item.parsed)} (${pct}%)`;
+              return ` ${item.label}: ${moneyC(item.parsed, cur)} (${pct}%)`;
             },
           },
         },
@@ -5048,8 +5075,8 @@ function applyInvestRange(level) {
   const old = conf.get();
   if (old) old.destroy();
   conf.set(level === 'investments'
-    ? drawInvestPortfolioChart($(conf.canvas), d, fSeries)
-    : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, d.native, !!d.gainUnknown));
+    ? drawInvestPortfolioChart($(conf.canvas), d, fSeries, d.cur)
+    : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, !!d.gainUnknown));
   // A range change re-defaults the table to the latest year
   // in the new range; the year switcher only navigates within
   // the range in force.
@@ -5175,11 +5202,14 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeInvMonthPop(); });
 
-function drawInvestChart(canvas, key, series, cur, native = false, gainUnknown = false) {
+function drawInvestChart(canvas, key, series, cur, gainUnknown = false) {
   if (!canvas) return null;
   const labels = series.map((r) => r.month);
-  const values = series.map((r) => (native ? r.valueNative : r.value));
-  const returns = series.map((r) => (native ? r.returnAmountNative : r.returnAmount));
+  // Series values always read the plain fields: the server
+  // renders them in the page's display currency, so the chart
+  // needs no native branch anymore.
+  const values = series.map((r) => r.value);
+  const returns = series.map((r) => r.returnAmount);
   const chart = new Chart(canvas, {
     type: 'line',
     data: {
@@ -5208,24 +5238,28 @@ function drawInvestChart(canvas, key, series, cur, native = false, gainUnknown =
 // ------------------------------------------------------- portfolio level
 async function loadInvestmentsImpl() {
   const host = $('#section-investments');
-  const data = await api('/api/investments');
+  const display = investDisplay.investments || 'CAD';
+  const data = await api(`/api/investments?display=${display}`);
+  const cur = data.display || 'CAD';
+  investDisplay.investments = cur;
   const s = data.summary;
   const cards = data.accounts.map((a) => `
     <div class="card breakdown-card" onclick="location.hash='#invest-account/${a.account.id}'">
       <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
-      <div class="v">${moneyC(a.summary.value)}</div>
-      <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${a.summary.costUnknown ? '—' : returnText(a.summary.totalReturn, a.summary.totalReturnPct)}${a.summary.costUnknown ? ' · cost unknown' : ''}</div>
+      <div class="v">${moneyC(a.summary.value, cur)}</div>
+      <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${a.summary.costUnknown ? '—' : returnText(a.summary.totalReturn, a.summary.totalReturnPct, cur)}${a.summary.costUnknown ? ' · cost unknown' : ''}</div>
       ${a.account.owners && a.account.owners.length ? `<div class="n">${ownerChipsHtml(a.account.owners)}</div>` : ''}
     </div>`).join('');
   host.innerHTML = `
     <div class="section-head"><h2>Stocks</h2>
       <div class="spacer"></div>
+      <button id="investDisplayBtn">${investDisplayLabel(cur)}</button>
       <button id="refreshInvestBtn">Refresh prices</button>
       <button class="primary" id="addInvestAccountBtn">+ Add account</button></div>
     <div class="msg" id="investMsg"></div>
-    ${data.fxMissing && data.accounts.some((a) => a.holdings.some((h) => h.holding.currency === 'USD'))
-      ? '<div class="msg warn">USD/CAD rates are unavailable right now — USD holdings are shown unconverted in the CAD totals.</div>' : ''}
-    <div class="summary-strip">${investSummaryStrip(s)}</div>
+    ${data.fxMissing && data.accounts.some((a) => a.holdings.some((h) => h.holding.currency !== cur))
+      ? `<div class="msg warn">USD/CAD rates are unavailable right now — holdings are shown unconverted in the ${cur} totals.</div>` : ''}
+    <div class="summary-strip">${investSummaryStrip(s, cur)}</div>
     <div class="panel">
       <h3>Total return</h3>
       ${investRangeControlsHtml('investments')}
@@ -5237,12 +5271,16 @@ async function loadInvestmentsImpl() {
       <div class="invest-share-box" id="investShareWrap"><div class="chart-wrap invest-share"><canvas id="investShareChart"></canvas></div></div>
       <div class="note hidden" id="investShareEmpty">No account values yet.</div>
     </div>
-    <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly)}</div>
-      <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
-  investViewData.investments = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false, accounts: data.accounts, gainUnknown: !!data.summary.costUnknown };
+    <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly, cur)}</div>
+      <div class="note" style="margin-left:0">All figures in ${cur}. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
+  investViewData.investments = { series: data.series, monthly: data.monthly, cur, nativePct: false, accounts: data.accounts, gainUnknown: !!data.summary.costUnknown };
   wireInvestRangeControls('investments');
   applyInvestRange('investments');
-  drawInvestShareChart(data);
+  drawInvestShareChart(data, cur);
+  $('#investDisplayBtn').addEventListener('click', () => {
+    investDisplay.investments = investDisplay.investments === 'CAD' ? 'USD' : 'CAD';
+    loadInvestmentsImpl();
+  });
   $('#addInvestAccountBtn').addEventListener('click', () => openInvestAccountModal(null));
   $('#refreshInvestBtn').addEventListener('click', async (e) => {
     e.target.disabled = true;
@@ -5279,13 +5317,30 @@ function renderInvestRefreshResult(results) {
 
 // --------------------------------------------------------- account level
 async function loadInvestAccountImpl(id) {
-  const data = await api(`/api/investments/accounts/${id}`);
+  const wanted = investDisplay.investAccount; // null = the server's default for this account
+  const data = await api(`/api/investments/accounts/${id}${wanted ? `?display=${wanted}` : ''}`);
+  const display = data.display || 'CAD';
+  investDisplay.investAccount = display;
   investAccountData = data;
   const a = data.account;
   if (investChatAccountId !== id) resetInvestChat(id);
+  // The toggle lives in the static toolbar (the loader never
+  // re-renders it): bind once, re-label on every render.
+  investDisplayAccountId = id;
+  const dispBtn = $('#investAccountDisplayBtn');
+  if (dispBtn) {
+    dispBtn.textContent = investDisplayLabel(display);
+    if (!dispBtn.dataset.wired) {
+      dispBtn.dataset.wired = '1';
+      dispBtn.addEventListener('click', () => {
+        investDisplay.investAccount = investDisplay.investAccount === 'CAD' ? 'USD' : 'CAD';
+        loadInvestAccountImpl(investDisplayAccountId);
+      });
+    }
+  }
   $('#investAccountTitle').innerHTML =
     `${esc(a.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.type] || a.type)}</span>${a.institution ? ` <span class="note" style="margin:0">${esc(a.institution)}</span>` : ''}${a.owners && a.owners.length ? `<div style="margin:4px 0 0">${ownerChipsHtml(a.owners)}</div>` : ''}${a.note ? `<div class="note" style="margin:4px 0 0">${esc(a.note)}</div>` : ''}`;
-  $('#investAccountStats').innerHTML = investSummaryStrip(data.summary);
+  $('#investAccountStats').innerHTML = investSummaryStrip(data.summary, display);
   const notes = [];
   for (const row of data.holdings) {
     const st = row.priceStatus;
@@ -5294,13 +5349,13 @@ async function loadInvestAccountImpl(id) {
     else if (st.stale) notes.push(`Market prices for “${row.holding.label}” may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
     if (st.fetchFailedToday) notes.push(`Market price fetch failed for “${row.holding.label}” (${esc(st.lastError)}) — last attempt ${esc(st.lastAttemptAt || '—')}.`);
   }
-  if (data.fxMissing && data.holdings.some((r) => r.holding.currency === 'USD')) {
-    notes.push('USD/CAD rates are unavailable right now — USD holdings are shown unconverted in the CAD totals.');
+  if (data.fxMissing && data.holdings.some((r) => r.holding.currency !== display)) {
+    notes.push(`USD/CAD rates are unavailable right now — holdings are shown unconverted in the ${display} totals.`);
   }
   const noteEl = $('#investAccountPriceNote');
   noteEl.classList.toggle('hidden', !notes.length);
   noteEl.innerHTML = notes.map(esc).join('<br>');
-  investViewData.investAccount = { series: data.series, monthly: data.monthly, cur: 'CAD', native: false, gainUnknown: !!data.summary.costUnknown };
+  investViewData.investAccount = { series: data.series, monthly: data.monthly, cur: display, nativePct: false, gainUnknown: !!data.summary.costUnknown };
   applyInvestRange('investAccount');
   const rows = data.holdings.map((row) => {
     const h = row.holding; const sm = row.summary;
@@ -5309,15 +5364,15 @@ async function loadInvestAccountImpl(id) {
       <td class="num">${fmtUnits(sm.units)}</td>
       <td class="num">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}${sm.latestPriceDate ? `<div class="note" style="margin:0">${esc(sm.latestPriceDate)}</div>` : ''}</td>
       <td class="num">${moneyC(sm.valueNative, h.currency)}</td>
-      <td class="num">${moneyC(sm.value)}</td>
-      <td class="num">${sm.costUnknown ? '—' : returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</td>
+      <td class="num">${moneyC(sm.value, display)}</td>
+      <td class="num">${sm.costUnknown ? '—' : returnText(sm.totalReturn, sm.totalReturnPctNative, display)}</td>
       <td style="white-space:nowrap">
         <button class="small" onclick="event.stopPropagation(); openInvestHoldingModal(${h.id})">Edit</button>
         <button class="small danger" onclick="event.stopPropagation(); deleteInvestHolding(${h.id})">Delete</button>
       </td></tr>`;
   }).join('');
   $('#investHoldingsWrap').innerHTML = data.holdings.length
-    ? `<table><thead><tr><th>Holding</th><th class="num">Units</th><th class="num">Latest price</th><th class="num">Value</th><th class="num">Value (CAD)</th><th class="num">Total return</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    ? `<table><thead><tr><th>Holding</th><th class="num">Units</th><th class="num">Latest price</th><th class="num">Value</th><th class="num">Value (${display})</th><th class="num">Total return</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
     : '<div class="note">No holdings yet — add one, or let ✨ Fill with AI draft them from a statement.</div>';
   $('#addHoldingBtn').onclick = () => openInvestHoldingModal(null);
   $('#editInvestAccountBtn').onclick = () => openInvestAccountModal(id);
@@ -5352,20 +5407,40 @@ function splitRatioText(e) {
 
 // --------------------------------------------------------- holding level
 async function loadInvestHoldingImpl(id) {
-  const data = await api(`/api/investments/holdings/${id}`);
+  const wanted = investDisplay.investHolding; // null = the server's default for this holding (its own currency)
+  const data = await api(`/api/investments/holdings/${id}${wanted ? `?display=${wanted}` : ''}`);
+  const display = data.display || 'CAD';
+  investDisplay.investHolding = display;
   investHoldingData = data;
   const h = data.holding;
   const sm = data.summary;
   currentInvestAccountId = h.account_id;
+  // Same once-bound static toolbar button as the account page.
+  investDisplayHoldingId = id;
+  const dispBtn = $('#investHoldingDisplayBtn');
+  if (dispBtn) {
+    dispBtn.textContent = investDisplayLabel(display);
+    if (!dispBtn.dataset.wired) {
+      dispBtn.dataset.wired = '1';
+      dispBtn.addEventListener('click', () => {
+        investDisplay.investHolding = investDisplay.investHolding === 'CAD' ? 'USD' : 'CAD';
+        loadInvestHoldingImpl(investDisplayHoldingId);
+      });
+    }
+  }
   $('#investHoldingBack').href = `#invest-account/${h.account_id}`;
   $('#investHoldingBack').textContent = `← Back to ${data.account ? data.account.name : 'account'}`;
   $('#investHoldingTitle').innerHTML =
     `${esc(h.label)}${aiBadge(h.source)} ${currencyBadge(h.currency)} <span class="note" style="margin:0">${h.kind === 'fund' ? 'Mutual fund' : 'Exchange'}${h.symbol ? ` · ${esc(h.symbol)}` : ''}${h.fund_code ? ` · ${esc(h.fund_code)}` : ''} · ${esc(data.account ? data.account.name : '')}</span>`;
+  // Value cards follow the display currency; the per-unit price
+  // and the event/NAV tables below stay native (recorded
+  // figures, not converted values). The sub-line names the
+  // native figure whenever it differs from the display one.
   $('#investHoldingStats').innerHTML = `
     <div class="summary-card"><div class="k">Units</div><div class="v">${fmtUnits(sm.units)}</div></div>
-    <div class="summary-card"><div class="k">Latest price</div><div class="v">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}</div><div class="n">${sm.latestPriceDate ? `${esc(sm.latestPriceDate)} · ${esc({ stooq: 'Stooq', yahoo: 'Yahoo Finance', nasdaq: 'Nasdaq', manual: 'manual NAV', event: 'trade price' }[sm.latestPriceSource] || sm.latestPriceSource || '')}` : 'no price yet'}</div></div>
-    <div class="summary-card"><div class="k">Current value</div><div class="v">${moneyC(sm.valueNative, h.currency)}</div><div class="n">${h.currency === 'USD' ? `${moneyC(sm.value)} CAD` : ''}</div></div>
-    <div class="summary-card"><div class="k">Total return</div><div class="v">${sm.costUnknown ? '—' : returnText(sm.totalReturnNative, sm.totalReturnPctNative, h.currency)}</div><div class="n">contributions ${moneyC(sm.contributionsNative, h.currency)}${sm.costUnknown ? ` · ${fmtUnits(sm.unknownCostUnits)} units with unknown cost` : ''}</div></div>`;
+    <div class="summary-card"><div class="k">Latest price (${h.currency})</div><div class="v">${sm.latestPrice != null ? moneyC(sm.latestPrice, h.currency) : '—'}</div><div class="n">${sm.latestPriceDate ? `${esc(sm.latestPriceDate)} · ${esc({ stooq: 'Stooq', yahoo: 'Yahoo Finance', nasdaq: 'Nasdaq', manual: 'manual NAV', event: 'trade price' }[sm.latestPriceSource] || sm.latestPriceSource || '')}` : 'no price yet'}</div></div>
+    <div class="summary-card"><div class="k">Current value (${display})</div><div class="v">${moneyC(sm.value, display)}</div><div class="n">${display !== h.currency ? `${moneyC(sm.valueNative, h.currency)} native` : ''}</div></div>
+    <div class="summary-card"><div class="k">Total return (${display})</div><div class="v">${sm.costUnknown ? '—' : returnText(sm.totalReturn, sm.totalReturnPctNative, display)}</div><div class="n">contributions ${moneyC(sm.contributions, display)}${sm.costUnknown ? ` · ${fmtUnits(sm.unknownCostUnits)} units with unknown cost` : ''}</div></div>`;
   const st = data.priceStatus;
   const notes = [];
   if (st.pricedBy === 'none') notes.push('No price yet: this holding values at 0 until a priced event or a price snapshot exists.');
@@ -5376,11 +5451,11 @@ async function loadInvestHoldingImpl(id) {
   if (st.fetchFailedToday) notes.push(`Market price fetch failed (${esc(st.lastError)}) — last attempt ${esc(st.lastAttemptAt || '—')}.`);
   if (sm.unpricedGrants) notes.push(`${sm.unpricedGrants} grant(s) had no price on their date and count as $0 contributions.`);
   if (sm.costUnknown) notes.push('Cost unknown — gain is not shown: replace the position record(s) with actual buy records when available.');
-  if (data.fxMissing && h.currency === 'USD') notes.push('USD/CAD rates are unavailable right now — CAD figures show the unconverted amounts.');
+  if (data.fxMissing && h.currency !== display) notes.push(`USD/CAD rates are unavailable right now — ${display} figures show the unconverted amounts.`);
   const noteEl = $('#investHoldingPriceNote');
   noteEl.classList.toggle('hidden', !notes.length);
   noteEl.innerHTML = notes.map(esc).join('<br>');
-  investViewData.investHolding = { series: data.series, monthly: data.monthly, cur: h.currency, native: true, gainUnknown: !!sm.costUnknown };
+  investViewData.investHolding = { series: data.series, monthly: data.monthly, cur: display, nativePct: true, gainUnknown: !!sm.costUnknown };
   applyInvestRange('investHolding');
   const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend', split: 'Split', position: 'Position' };
   const rows = data.events.map((e) => `<tr>
@@ -5572,6 +5647,11 @@ function openInvestAccountModal(id) {
       form.elements.type.value = acc.type || 'NonRegistered';
       form.elements.institution.value = acc.institution || '';
       form.elements.note.value = acc.note || '';
+      // The stored setting, not the derived one: an account on
+      // Auto shows Auto (''), even though its page opens in the
+      // derived currency — saving must not silently lock the
+      // derivation in.
+      form.elements.defaultCurrency.value = acc.default_currency || '';
       investAccountOwnerPicker.set(acc.owners || []);
     };
     if (a) fill(a);

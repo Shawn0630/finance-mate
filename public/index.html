@@ -118,6 +118,7 @@
   <!-- ==================== Investment account detail ==================== -->
   <section id="view-invest-account" class="hidden">
     <div class="toolbar"><a href="#assets/investments">&larr; Back to Stocks</a><div class="spacer"></div>
+      <button id="investAccountDisplayBtn">Display: CAD</button>
       <button id="editInvestAccountBtn">Edit account</button>
       <button class="danger" id="deleteInvestAccountBtn">Delete account</button></div>
     <div class="msg" id="investAccountMsg"></div>
@@ -169,6 +170,7 @@
   <!-- ==================== Investment holding detail ==================== -->
   <section id="view-invest-holding" class="hidden">
     <div class="toolbar"><a id="investHoldingBack" href="#assets/investments">&larr; Back to account</a><div class="spacer"></div>
+      <button id="investHoldingDisplayBtn">Display: CAD</button>
       <button id="editInvestHoldingBtn">Edit holding</button>
       <button class="danger" id="deleteInvestHoldingBtn">Delete holding</button></div>
     <div class="msg" id="investHoldingMsg"></div>
@@ -561,6 +563,9 @@
         <div><label>Institution</label><input name="institution" placeholder="CIBC, Scotia, employer plan…" autocomplete="off"></div>
         <div><label>Note</label><input name="note" autocomplete="off"></div>
       </div>
+      <div><label>Default currency</label><select name="defaultCurrency">
+        <option value="">Auto (from holdings)</option><option value="CAD">CAD</option><option value="USD">USD</option>
+      </select></div>
       <div><label>Owners</label><div class="owner-picker" id="investAccountOwnerPicker"><div class="owner-chips"></div><div class="owner-candidates"></div></div></div>
       <div class="toolbar">
         <button class="primary" type="submit">Save</button>
