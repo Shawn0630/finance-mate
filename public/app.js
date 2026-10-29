@@ -5032,6 +5032,7 @@ function drawInvestPortfolioChart(canvas, data, fSeries, cur = 'CAD') {
         },
       },
     },
+    plugins: [guideLinePlugin],
   });
   bars.forEach((ds, i) => { if (investHiddenAccounts.has(ds.accountId)) chart.setDatasetVisibility(i, false); });
   chart.update();
@@ -5222,6 +5223,7 @@ function drawInvestShareChart(accounts, cur = 'CAD', endMonth = null) {
         data: rows.map((r) => r.value),
         backgroundColor: rows.map((r) => investAccountColor(r.account)),
         borderColor: '#fff', borderWidth: 1,
+        hoverOffset: 10, // Property pie parity: the slice pops out on hover.
       }],
     },
     plugins: [investShareCenterPlugin],
@@ -5431,6 +5433,7 @@ function drawInvestChart(canvas, key, series, cur, gainUnknown = false) {
         tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${moneyC(c.parsed.y, cur)}` } },
       },
     },
+    plugins: [guideLinePlugin],
   });
   window.__fmCharts[key] = chart;
   return chart;

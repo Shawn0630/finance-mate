@@ -9345,6 +9345,97 @@ try {
         JSON.stringify(narrowGeom));
       await page.setViewport({ width: 800, height: 600 });
 
+      // Hover animation parity with the property charts: the
+      // share doughnut pops its slice out on hover (hoverOffset
+      // 10, the property pie's value) and every invest time chart
+      // carries the vertical dashed guide line plugin.
+      const hoverPins = () => page.evaluate(() => {
+        const plugIds = (c) => (c && c.config && Array.isArray(c.config.plugins) ? c.config.plugins.map((p) => p.id) : []);
+        const share = window.__fmCharts.investShare;
+        const main = window.__fmCharts.investments;
+        return {
+          shareHoverOffset: share ? share.data.datasets[0].hoverOffset : null,
+          sharePlugIds: plugIds(share),
+          mainGuideIds: plugIds(main),
+        };
+      });
+      let hp = await hoverPins();
+      check('investments UI: the share doughnut carries hoverOffset 10 and the portfolio chart carries the guide line plugin',
+        hp.shareHoverOffset === 10 && hp.mainGuideIds.includes('guideLine'),
+        JSON.stringify(hp));
+      // Real hover dispatches (not config-only): move the mouse
+      // onto a doughnut slice and onto the portfolio plot area;
+      // both charts must resolve active elements, which is what
+      // the guide line plugin draws from.
+      const hoverActive = async (canvasSel, chartKey, pointFn) => {
+        const pt = await page.evaluate((sel) => {
+          const cv = document.querySelector(sel);
+          if (!cv) return null;
+          cv.scrollIntoView();
+          const r = cv.getBoundingClientRect();
+          return { x: r.left, y: r.top, w: r.width, h: r.height };
+        }, canvasSel);
+        if (!pt) return -1;
+        for (const p of pointFn(pt)) {
+          await page.mouse.move(p.x, p.y);
+          await waitI(250);
+          const n = await page.evaluate((key) => {
+            const c = window.__fmCharts[key];
+            return c ? c.getActiveElements().length : -1;
+          }, chartKey);
+          if (n > 0) return n;
+        }
+        return 0;
+      };
+      const doughnutPts = (pt) => {
+        const cx = pt.x + pt.w / 2; const cy = pt.y + pt.h / 2;
+        const rad = Math.min(pt.w, pt.h) * 0.395;
+        return [-90, -45, 0, 45].map((deg) => {
+          const a = (deg * Math.PI) / 180;
+          return { x: cx + rad * Math.cos(a), y: cy + rad * Math.sin(a) };
+        });
+      };
+      const plotPts = (pt) => [{ x: pt.x + pt.w / 2, y: pt.y + pt.h / 2 }];
+      const doughnutActive = await hoverActive('#investShareChart', 'investShare', doughnutPts);
+      check('investments UI: hovering a share doughnut slice resolves an active element',
+        doughnutActive > 0, JSON.stringify({ active: doughnutActive }));
+      const plotActive = await hoverActive('#investPortfolioChart', 'investments', plotPts);
+      check('investments UI: hovering the portfolio plot area resolves active elements (the guide line\'s input)',
+        plotActive > 0, JSON.stringify({ active: plotActive }));
+
+      // Account + holding time charts carry the guide line too.
+      const invApi = (await req('GET', '/api/investments')).data;
+      const firstAcct = (invApi.accounts || [])[0];
+      const levelGuide = () => page.evaluate(() => {
+        const c = window.__fmCharts.invest;
+        const ids = c && c.config && Array.isArray(c.config.plugins) ? c.config.plugins.map((p) => p.id) : [];
+        return { canvas: c && c.canvas ? c.canvas.id : null, guide: ids.includes('guideLine'), ids };
+      });
+      if (firstAcct) {
+        await page.evaluate((id) => { location.hash = `#invest-account/${id}`; }, firstAcct.account.id);
+        await page.waitForFunction(() => {
+          const c = window.__fmCharts.invest;
+          return c && c.canvas && c.canvas.id === 'investAccountChart';
+        }, { timeout: 10000 });
+        const acctGuide = await levelGuide();
+        check('investments UI: the account chart carries the guide line plugin',
+          acctGuide.guide === true && acctGuide.canvas === 'investAccountChart',
+          JSON.stringify(acctGuide));
+        const firstHolding = (firstAcct.holdings || [])[0];
+        const holdId = firstHolding ? (firstHolding.holding ? firstHolding.holding.id : firstHolding.id) : null;
+        if (holdId) {
+          await page.evaluate((id) => { location.hash = `#invest-holding/${id}`; }, holdId);
+          await page.waitForFunction(() => {
+            const c = window.__fmCharts.invest;
+            return c && c.canvas && c.canvas.id === 'investHoldingChart';
+          }, { timeout: 10000 });
+          const holdGuide = await levelGuide();
+          check('investments UI: the holding chart carries the guide line plugin',
+            holdGuide.guide === true && holdGuide.canvas === 'investHoldingChart',
+            JSON.stringify(holdGuide));
+        }
+      }
+
       // Overview chart panel: left share doughnut (Property +
       // Stock), right history chart (stacked bars + total line),
       // same range picker driving both; the strip above must
