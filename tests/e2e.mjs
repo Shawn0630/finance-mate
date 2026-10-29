@@ -9244,6 +9244,102 @@ try {
     await browserWiz.close();
   }
   }
+  // ---- AI-mapped CSV import: pair-mode wizard browser round ----
+  // The stub proposes the correct pair mapping, so the editor must
+  // render the second activity column and the pair rows
+  // ("Trade / BUY", "Dividend / -", …) pre-filled, and confirming
+  // must carry the pairs through preview to stored events.
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    columns: { date: 'effective_date', symbol: 'symbol', activity: 'activity_type', activity2: 'activity_sub_type', units: 'quantity', price: 'unit_price', amount: 'net_cash_amount', currency: 'currency', splitAdded: 'quantity' },
+    values: { 'Trade / BUY': 'buy', 'Trade / SELL': 'sell', 'Dividend / -': 'dividend', 'CorporateAction / SUBDIVISION': 'split', 'MoneyMovement / EFT': 'skip', 'Interest / -': 'skip', 'Tax / NRT': 'skip', 'BonusPayment / REFER': 'skip' },
+    defaultCurrency: null,
+    symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+    questions: [],
+    reply: 'Mapped as type / sub-type pairs.',
+  }));
+  r = await req('POST', '/api/investments/accounts', { name: 'CSV pair wizard', type: 'TFSA', institution: 'NorthTrade' });
+  const pairWizAcctId = r.data.id;
+  const pairWizTmp = path.join(os.tmpdir(), `ff-e2e-pairwiz-${Date.now()}.csv`);
+  fs.writeFileSync(pairWizTmp, ['effective_date,symbol,quantity,unit_price,net_cash_amount,currency,activity_type,activity_sub_type',
+    '2021-01-10,,,10,10,CAD,BonusPayment,REFER',
+    '2021-01-12,,,5000,5000,CAD,MoneyMovement,EFT',
+    '2021-01-15,XQQ,20,100.30,-2006,CAD,Trade,BUY',
+    '2021-02-01,XQQ,999,,15.80,CAD,Dividend,-',
+    '2021-02-02,,,0.50,0.50,CAD,Interest,-',
+    '2021-02-04,XQQ,5,110,550,CAD,Trade,SELL',
+    '2021-03-01,XQQ,30,,,CAD,CorporateAction,SUBDIVISION'].join('\n'));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('investments pair wizard browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+  const browserPair = await puppeteer.launch({
+    executablePath: '/opt/meta-chromium/chrome',
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-dev-shm-usage'],
+  });
+  try {
+    const pagePair = await browserPair.newPage();
+    const clientPair = await pagePair.target().createCDPSession();
+    await clientPair.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+    clientPair.on('Fetch.requestPaused', async (e) => {
+      try {
+        const u = new URL(e.request.url);
+        if (u.hostname !== 'ff.local') { await clientPair.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+        const headers = {};
+        for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+        const resp = await forwardWiz({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+        const respHeaders = Object.entries(resp.headers)
+          .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+          .map(([name, value]) => ({ name, value: String(value) }));
+        await clientPair.send('Fetch.fulfillRequest', {
+          requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+          body: resp.body.toString('base64'),
+        });
+      } catch {
+        try { await clientPair.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+      }
+    });
+    await clientPair.send('Network.setCookie', { name: 'ff_session', value: cookieValueWiz, domain: 'ff.local', path: '/', httpOnly: true });
+    const waitPair = (ms) => new Promise((res2) => setTimeout(res2, ms));
+    await pagePair.goto(`http://ff.local/#invest-account/${pairWizAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+    await waitPair(800);
+    await pagePair.click('[data-invest-import-csv-map]');
+    const pairInput = await pagePair.$('[data-invest-import-map-file]');
+    await pairInput.uploadFile(pairWizTmp);
+    await pagePair.waitForFunction(() => !!document.querySelector('[data-map-confirm]'), { timeout: 20000 });
+    await pagePair.waitForFunction(
+      () => (document.querySelector('[data-wiz-values]') || {}).textContent.includes('Trade / BUY')
+        && (document.querySelector('[data-wiz-values]') || {}).textContent.includes('Dividend / -'),
+      { timeout: 20000 });
+    const pairRows = await pagePair.evaluate(() => ({
+      secondCol: document.querySelector('[data-wiz-col="activity2"]').value,
+      valuesText: document.querySelector('[data-wiz-values]').textContent,
+      tradeBuy: document.querySelector('[data-wiz-value-idx="2"]').value,
+      dividend: document.querySelector('[data-wiz-value-idx="3"]').value,
+    }));
+    check('csv-ai pair wizard: editor shows the second activity column and the pair rows pre-filled from the stub',
+      pairRows.secondCol === 'activity_sub_type' && pairRows.tradeBuy === 'buy' && pairRows.dividend === 'dividend',
+      JSON.stringify(pairRows));
+    await pagePair.waitForFunction(
+      () => (document.querySelector('[data-wiz-preview]') || {}).textContent.includes('2021-02-01 · Dividend · XQQ.TO · $15.80'),
+      { timeout: 20000 });
+    await pagePair.click('[data-map-confirm]');
+    await pagePair.waitForFunction(() => document.querySelectorAll('[data-invest-proposed] [data-ie-row]').length === 4, { timeout: 20000 });
+    await pagePair.click('[data-invest-apply]');
+    await pagePair.waitForFunction(() => document.querySelector('#investHoldingsWrap').textContent.includes('XQQ.TO'), { timeout: 20000 });
+    r = await req('GET', `/api/investments/accounts/${pairWizAcctId}`);
+    const pairWizHolding = r.data.holdings.find((row) => row.holding.symbol === 'XQQ.TO');
+    check('csv-ai pair wizard: applying stores the dividend and the split-restated 45 units with source csv-ai',
+      pairWizHolding && pairWizHolding.summary.units === 45 && pairWizHolding.holding.source === 'csv-ai'
+        && pairWizHolding.events.some((e) => e.type === 'dividend' && e.amount === 15.8)
+        && pairWizHolding.events.some((e) => e.type === 'split' && e.split_new === 45 && e.split_old === 15),
+      JSON.stringify(r.data.holdings.map((row) => [row.holding.symbol, row.summary.units, row.holding.source, row.events.map((e) => [e.type, e.units, e.price, e.amount, e.split_new, e.split_old])])));
+  } catch (err) {
+    check('investments AI-mapped CSV pair wizard browser flow runs to completion', false, String((err && err.message) || err));
+  } finally {
+    await browserPair.close();
+  }
+  }
+
   // ---- Wealthsimple CSV import: API round ----
   r = await req('POST', '/api/investments/accounts', { name: 'CSV import', type: 'TFSA', institution: 'Wealthsimple' });
   const csvAcctId = r.data.id;
@@ -9324,6 +9420,73 @@ try {
     JSON.stringify({ events: r.data.events.length, dup: r.data.duplicates }));
   r = await req('POST', `/api/investments/accounts/999999/import-csv-map/analyze`, { csv: mapFixture });
   check('csv-ai map: an unknown account is a 404', r.status === 404, JSON.stringify(r.data));
+
+  // ---- AI-mapped CSV import: two-column (pair) round ----
+  // The shape that lost dividends under a single activity column:
+  // type + sub-type jointly decide the operation, '-' means a
+  // dividend under Dividend but cash under Interest, and the file
+  // opens with cash rows so the old first-five preview never
+  // showed a dividend row.
+  const pairFixture = ['effective_date,symbol,quantity,unit_price,net_cash_amount,currency,activity_type,activity_sub_type,description',
+    '2021-01-10,,,10,10,CAD,BonusPayment,REFER,',
+    '2021-01-12,,,5000,5000,CAD,MoneyMovement,EFT,',
+    '2021-01-13,,,3.30,3.30,CAD,Tax,NRT,',
+    '2021-01-14,,,0.50,0.50,CAD,Interest,-,',
+    '2021-01-15,XQQ,20,100.30,-2006,CAD,Trade,BUY,',
+    '2021-02-01,XQQ,999,,15.80,CAD,Dividend,-,',
+    '2021-02-04,XQQ,5,110,550,CAD,Trade,SELL,',
+    '2021-03-01,XQQ,30,,,CAD,CorporateAction,SUBDIVISION,'].join('\n');
+  fs.writeFileSync(aiStubFile, JSON.stringify({
+    columns: { date: 'effective_date', symbol: 'symbol', activity: 'activity_type', activity2: 'activity_sub_type', units: 'quantity', price: 'unit_price', amount: 'net_cash_amount', currency: 'currency', splitAdded: 'quantity' },
+    values: { 'Trade / BUY': 'buy', 'Trade / SELL': 'sell', 'Dividend / -': 'dividend', 'CorporateAction / SUBDIVISION': 'split', 'MoneyMovement / EFT': 'skip', 'Interest / -': 'skip', 'Tax / NRT': 'skip', 'BonusPayment / REFER': 'skip' },
+    defaultCurrency: null,
+    symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+    questions: [],
+    reply: 'Mapped as type / sub-type pairs.',
+  }));
+  r = await req('POST', '/api/investments/accounts', { name: 'CSV pair map', type: 'TFSA', institution: 'NorthTrade' });
+  const pairAcctId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${pairAcctId}/import-csv-map/analyze`, { csv: pairFixture });
+  const pairMapping = r.data.mapping;
+  check('csv-ai pair: analyze proposes the type / sub-type pair mapping (not reused)',
+    r.status === 200 && r.data.reused === false && pairMapping.columns.activity2 === 'activity_sub_type'
+      && pairMapping.values['Dividend / -'] === 'dividend',
+    JSON.stringify(pairMapping));
+  r = await req('POST', `/api/investments/accounts/${pairAcctId}/import-csv-map/activity-values`, { csv: pairFixture, mapping: pairMapping });
+  check('csv-ai pair: activity-values lists the eight pairs first-seen with labels',
+    r.status === 200 && r.data.values.length === 8 && r.data.values[0] === 'BonusPayment / REFER'
+      && r.data.values.includes('Dividend / -') && r.data.values.includes('Interest / -') && r.data.count === 8,
+    JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/accounts/${pairAcctId}/import-csv-map/translate`, { csv: pairFixture, mapping: pairMapping });
+  const pairSentences = (r.data.sentences || []).join('\n');
+  check('csv-ai pair: translate covers the late-file dividend and split, not just the opening cash rows',
+    r.status === 200 && pairSentences.includes('2021-02-01 · Dividend · XQQ.TO · $15.80')
+      && pairSentences.includes('2021-03-01 · Split · XQQ.TO · +30 units (ratio derived on apply)')
+      && pairSentences.includes('2021-01-10 · Skipped: BonusPayment / REFER'),
+    pairSentences);
+  r = await req('POST', `/api/investments/accounts/${pairAcctId}/import-csv-map/preview`, { csv: pairFixture, mapping: pairMapping });
+  const pairPreview = r.data;
+  check('csv-ai pair: preview keeps the dividend (amount column, not quantity), derives the 45:15 split, skips four cash rows',
+    r.status === 200 && pairPreview.holdings.length === 1 && pairPreview.events.length === 4
+      && pairPreview.skipped.total === 4 && pairPreview.failed.length === 0
+      && pairPreview.events.some((e) => e.type === 'dividend' && e.amount === 15.8)
+      && pairPreview.events.some((e) => e.type === 'split' && e.splitNew === 45 && e.splitOld === 15),
+    JSON.stringify(pairPreview));
+  const pairMissing = { ...pairMapping, values: { ...pairMapping.values } };
+  delete pairMissing.values['Dividend / -'];
+  r = await req('POST', `/api/investments/accounts/${pairAcctId}/import-csv-map/preview`, { csv: pairFixture, mapping: pairMissing });
+  check('csv-ai pair: a pair without a target fails loudly naming the pair',
+    r.status === 200 && r.data.failed.some((f) => f.reason.includes('no mapping for activity value "Dividend / -"'))
+      && !r.data.events.some((e) => e.type === 'dividend'),
+    JSON.stringify(r.data.failed));
+  r = await req('POST', `/api/investments/accounts/${pairAcctId}/import-csv/apply`, { source: 'csv-ai', holdings: pairPreview.holdings, events: pairPreview.events });
+  check('csv-ai pair: apply writes 1 holding and 4 events', r.status === 201 && r.data.createdHoldings === 1 && r.data.createdEvents === 4, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/accounts/${pairAcctId}`);
+  const pairHolding = r.data.holdings[0];
+  check('csv-ai pair: stored units restate through the split ((20 - 5) x 3 = 45) with source csv-ai',
+    pairHolding && pairHolding.summary.units === 45 && pairHolding.holding.source === 'csv-ai'
+      && pairHolding.events.some((e) => e.type === 'dividend' && e.amount === 15.8),
+    JSON.stringify(r.data.holdings.map((row) => [row.holding.symbol, row.summary.units, row.events.map((e) => [e.type, e.units, e.price, e.amount])])));
 
   // ---- Earnings: salary + rental (API round) ----
   const sumBefore = await req('GET', '/api/summary');

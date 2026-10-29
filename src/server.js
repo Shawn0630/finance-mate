@@ -28,7 +28,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts,
 } from './earnings.js';
-import { analyzeCsv, applyMappedCsv, proposeCsvMapping, translatePreview } from './csvMapImport.js';
+import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, translatePreview } from './csvMapImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -355,6 +355,26 @@ app.post('/api/investments/accounts/:id/import-csv-map/translate', requireApiAut
   if (!mapping || typeof mapping !== 'object') return res.status(400).json({ error: 'mapping is required' });
   try {
     res.json({ sentences: translatePreview(csv, mapping, 5) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+// Pair-mode step-4 list: the distinct activity keys (type / sub-type
+// pairs, or plain values without a second column) for the mapping as
+// it currently stands, in first-seen order with display labels. The
+// editor cannot compute pairs from the analyze summary alone — it
+// has column stats, not rows — so it asks here whenever the activity
+// columns change. Read-only, writes nothing.
+app.post('/api/investments/accounts/:id/import-csv-map/activity-values', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const csv = req.body && typeof req.body.csv === 'string' ? req.body.csv : '';
+  if (!csv) return res.status(400).json({ error: 'csv text is required' });
+  if (csv.length > 1024 * 1024) return res.status(400).json({ error: 'csv is too large (max 1 MB)' });
+  const mapping = req.body.mapping;
+  if (!mapping || typeof mapping !== 'object') return res.status(400).json({ error: 'mapping is required' });
+  try {
+    res.json(activityValuesFor(csv, mapping));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

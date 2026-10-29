@@ -5709,6 +5709,12 @@ let investMapQuestions = [];
 let investMapReply = '';
 let investMapReused = false;
 let investMapValueList = []; // raw activity values listed in the editor, in row order
+let investMapPairValues = []; // pair-mode step-4 keys (raw "type / subtype"), from the server
+let investMapPairLabels = []; // pair-mode display labels (blank parts as '-'), same order
+let investMapPairTruncated = false; // more distinct pairs exist than the list shows
+let investMapPairCount = 0; // total distinct pairs in the file
+let investMapPairLoaded = false; // pair list is in sync with the activity columns (confirm guard)
+let investMapPairSeq = 0; // pair-list fetch generation, so a stale reply cannot overwrite a newer one
 let investMapWizard = null; // wizard step state for the mapping editor
 let investImportGroupBy = 'type'; // proposed-panel grouping in import mode: type | symbol | month
 
@@ -5741,6 +5747,8 @@ function resetInvestChat(accountId) {
   investMapReply = '';
   investMapReused = false;
   investMapValueList = [];
+  investMapPairValues = []; investMapPairLabels = [];
+  investMapPairTruncated = false; investMapPairCount = 0; investMapPairLoaded = false;
   investMapWizard = null; investImportGroupBy = 'type';
   const mapHost = document.querySelector('[data-invest-map-editor]');
   if (mapHost) mapHost.innerHTML = '';
@@ -6443,7 +6451,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     const c = (m && m.columns) || {};
     return {
       dateCol: c.date || '', symbolCol: c.symbol || '', nameCol: c.name || '',
-      activityCol: c.activity || '', unitsCol: c.units || '', priceCol: c.price || '',
+      activityCol: c.activity || '', activity2Col: c.activity2 || '', unitsCol: c.units || '', priceCol: c.price || '',
       amountCol: c.amount || '', currencyCol: c.currency || '',
       splitAddedCol: c.splitAdded || '', splitNewCol: c.splitNew || '', splitOldCol: c.splitOld || '',
       defaultCurrency: (m && m.defaultCurrency) || null,
@@ -6456,7 +6464,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     const columns = {};
     const pairs = [
       ['dateCol', 'date'], ['symbolCol', 'symbol'], ['nameCol', 'name'],
-      ['activityCol', 'activity'], ['unitsCol', 'units'], ['priceCol', 'price'],
+      ['activityCol', 'activity'], ['activity2Col', 'activity2'], ['unitsCol', 'units'], ['priceCol', 'price'],
       ['amountCol', 'amount'], ['currencyCol', 'currency'],
       ['splitAddedCol', 'splitAdded'], ['splitNewCol', 'splitNew'], ['splitOldCol', 'splitOld'],
     ];
@@ -6476,6 +6484,10 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     }).join('') : '');
   const wizValueList = () => {
     if (!investMapStructure || !investMapWizard) return [];
+    // Pair mode: the list comes from the server (the analyze summary
+    // has column stats, not rows, so only the server can pair the
+    // two columns' values). Single mode keeps the column stats.
+    if (investMapWizard.activity2Col) return investMapPairValues || [];
     const actCol = investMapWizard.activityCol;
     if (!actCol) return [];
     const stat = investMapStructure.columnStats.find((s) => s.name === actCol);
@@ -6495,13 +6507,44 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     investMapValueList = values;
     const merged = { ...(investMapWizard.valueTargets || {}), ...prev };
     const actCol = investMapWizard.activityCol;
-    const stat = actCol ? investMapStructure.columnStats.find((s) => s.name === actCol) : null;
+    const pairMode = !!investMapWizard.activity2Col;
+    const stat = !pairMode && actCol ? investMapStructure.columnStats.find((s) => s.name === actCol) : null;
     box.innerHTML = values.length
-      ? values.map((v, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(v)}</span>
+      ? values.map((v, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(pairMode ? (investMapPairLabels[i] || v) : v)}</span>
           <select data-wiz-value-idx="${i}"><option value="">(pick one)</option>
           ${WIZ_TARGETS.map((t) => `<option value="${t}"${merged[v] === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></div>`).join('')
+        + (pairMode && investMapPairTruncated ? `<div class="note">More than ${investMapPairCount} distinct activity pairs — only the first listed can be mapped here; the rest fail loudly in the preview.</div>` : '')
         + (stat && stat.distinctTruncated ? `<div class="note">More than ${stat.distinctCount} distinct values — only the first listed can be mapped here; the rest fail loudly in the preview.</div>` : '')
       : '<div class="note">Pick the column that says buy or sell in step 4 to map its values.</div>';
+  };
+  // Pair-mode step-4 list: ask the server for the distinct pairs of
+  // the two activity columns as they currently stand. The list is
+  // what the confirm guard checks, so it must be in sync before a
+  // confirm is allowed (investMapPairLoaded); a stale reply from an
+  // older column choice is dropped by generation.
+  const refreshPairValues = async () => {
+    const w = investMapWizard;
+    if (!w || !w.activity2Col) { investMapPairLoaded = true; return; }
+    investMapPairLoaded = false;
+    const seq = ++investMapPairSeq;
+    try {
+      const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/activity-values`, { method: 'POST', body: { csv: investMapCsv, mapping: wizardToEngine(readWizard().wizard) } });
+      if (seq !== investMapPairSeq || !mapHost.querySelector('[data-wiz-values]')) return;
+      investMapPairValues = r.values || [];
+      investMapPairLabels = r.labels || [];
+      investMapPairTruncated = !!r.truncated;
+      investMapPairCount = r.count || 0;
+      investMapPairLoaded = true;
+      renderWizValueRows();
+      // The value rows just landed (pre-filled from the mapping), so
+      // the live preview must re-translate with them — the preview
+      // that ran at editor render time saw no value rows at all and
+      // still shows every row as unmapped.
+      refreshMapPreview();
+    } catch {
+      if (seq !== investMapPairSeq) return;
+      showMsg(msg, 'err', 'Could not list the activity pairs — change the activity columns again to retry.');
+    }
   };
   const readWizard = () => {
     const col = (f) => {
@@ -6523,7 +6566,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     return {
       wizard: {
         dateCol: col('date'), symbolCol: col('symbol'), nameCol: col('name'),
-        activityCol: col('activity'), unitsCol: col('units'), priceCol: col('price'),
+        activityCol: col('activity'), activity2Col: col('activity2'), unitsCol: col('units'), priceCol: col('price'),
         amountCol: col('amount'), currencyCol: col('currency'),
         splitAddedCol: col('splitAdded'), splitNewCol: col('splitNew'), splitOldCol: col('splitOld'),
         defaultCurrency: mapHost.querySelector('[data-wiz-default-currency]').value || null,
@@ -6570,6 +6613,8 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       <div class="note" style="margin:6px 0 4px">Step 4 — How do we tell buys from sells?</div>
       <div class="costs-proposed-row"><span style="flex:1">Buy / sell column</span>
         <select data-wiz-col="activity">${wizColOptions(w.activityCol)}</select></div>
+      <div class="costs-proposed-row"><span style="flex:1">Second activity column (optional — only when one column can't tell operations apart: type + sub-type together, e.g. Trade / BUY vs Dividend / -)</span>
+        <select data-wiz-col="activity2">${wizColOptions(w.activity2Col || '')}</select></div>
       <div data-wiz-values></div>
       <details data-wiz-optional style="margin-top:6px"><summary>Optional fields</summary>
         <div class="costs-proposed-row"><span style="flex:1">Name column</span>
@@ -6609,12 +6654,19 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
         <button type="button" class="small" data-map-cancel>Cancel</button>
       </div></div>`;
     renderWizValueRows();
+    if (w.activity2Col) refreshPairValues();
     refreshMapPreview();
   };
   mapHost.addEventListener('change', (e) => {
     if (e.target.matches('[data-wiz-col="activity"]')) {
       investMapWizard = { ...investMapWizard, activityCol: e.target.value };
-      renderWizValueRows();
+      if (investMapWizard.activity2Col) refreshPairValues();
+      else renderWizValueRows();
+    }
+    if (e.target.matches('[data-wiz-col="activity2"]')) {
+      investMapWizard = { ...investMapWizard, activity2Col: e.target.value };
+      if (e.target.value) refreshPairValues();
+      else { investMapPairLoaded = true; renderWizValueRows(); }
     }
     refreshMapPreview();
   });
@@ -6622,6 +6674,8 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     if (e.target.closest('[data-map-cancel]')) {
       investMapCsv = null; investMapStructure = null; investMapMapping = null; investMapWizard = null;
       investMapQuestions = []; investMapReply = ''; investMapReused = false; investMapValueList = [];
+      investMapPairValues = []; investMapPairLabels = [];
+      investMapPairTruncated = false; investMapPairCount = 0; investMapPairLoaded = false;
       mapHost.innerHTML = '';
       return;
     }
@@ -6648,6 +6702,9 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
         showMsg(msg, 'err', 'Pick a currency column or a default currency first.'); return;
       }
       const unmapped = investMapValueList.filter((v) => !mapping.values[v]);
+      if (mapping.columns.activity2 && !investMapPairLoaded) {
+        showMsg(msg, 'err', 'The activity pairs are still loading — wait a moment and try again.'); return;
+      }
       if (unmapped.length) {
         showMsg(msg, 'err', `Pick a target for every activity value (unmapped: ${unmapped.join(', ')}).`); return;
       }

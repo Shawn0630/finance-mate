@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   analyzeCsv, fingerprintFor, normalizeMapping, applyMappedCsv, proposeCsvMapping,
-  wizardToMapping, mappingToWizard, translatePreviewRow, translatePreview,
+  wizardToMapping, mappingToWizard, translatePreviewRow, translatePreview, activityValuesFor,
 } from '../src/csvMapImport.js';
 
 const empty = { holdings: [], eventsByHolding: {} };
@@ -282,7 +282,7 @@ test('translatePreviewRow turns rows into plain-words sentences', () => {
     '2024-08-08 · Split · XQQ · +408 units (ratio derived on apply)');
 });
 
-test('translatePreview returns the first five rows in file order', () => {
+test('translatePreview returns the first five rows plus one sample per activity key not yet covered', () => {
   const csv = aCsv(
     aRow('2026-01-01', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
     aRow('2026-01-02', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
@@ -293,7 +293,163 @@ test('translatePreview returns the first five rows in file order', () => {
     aRow('2026-01-07', 'XQQ', 'XQQ fund', 'Sale', '5', '60', '300'),
   );
   const sentences = translatePreview(csv, A_MAP);
-  assert.equal(sentences.length, 5);
+  assert.equal(sentences.length, 6);
   assert.ok(sentences[0].startsWith('2026-01-01 · Buy'));
   assert.ok(sentences[4].startsWith('2026-01-05 · Buy'));
+  assert.ok(sentences[5].startsWith('2026-01-06 · Sell'));
+});
+
+// Pair-mode shape: a file whose operation is decided by TWO columns
+// (type + sub-type), modelled on the two-column broker shape where a
+// '-' sub-type means a dividend under Dividend but cash under
+// Interest, and Trade covers both buys and sells. Synthetic rows
+// only; no user file appears here.
+const P_COLS = ['effective_date', 'symbol', 'quantity', 'unit_price', 'net_cash_amount', 'currency', 'activity_type', 'activity_sub_type'];
+const P_MAP = {
+  columns: {
+    date: 'effective_date', symbol: 'symbol', activity: 'activity_type', activity2: 'activity_sub_type',
+    units: 'quantity', price: 'unit_price', amount: 'net_cash_amount', currency: 'currency', splitAdded: 'quantity',
+  },
+  values: {
+    'Trade / BUY': 'buy', 'Trade / SELL': 'sell', 'Dividend / -': 'dividend',
+    'CorporateAction / SUBDIVISION': 'split', 'MoneyMovement / EFT': 'skip',
+    'Interest / -': 'skip', 'Tax / NRT': 'skip', 'BonusPayment / REFER': 'skip',
+  },
+  defaultCurrency: null,
+  symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+};
+const pRow = (o) => P_COLS.map((c) => o[c] ?? '').join(',');
+const pCsv = (...rows) => [P_COLS.join(','), ...rows].join('\n');
+const pFixture = () => pCsv(
+  // File order deliberately opens with cash rows, the shape that hid
+  // the dividend loss behind the old first-five preview.
+  pRow({ effective_date: '2021-01-10', quantity: '10', net_cash_amount: '10', currency: 'CAD', activity_type: 'BonusPayment', activity_sub_type: 'REFER' }),
+  pRow({ effective_date: '2021-01-12', quantity: '5000', net_cash_amount: '5000', currency: 'CAD', activity_type: 'MoneyMovement', activity_sub_type: 'EFT' }),
+  pRow({ effective_date: '2021-01-15', symbol: 'XQQ', quantity: '20', unit_price: '100.30', net_cash_amount: '-2006', currency: 'CAD', activity_type: 'Trade', activity_sub_type: 'BUY' }),
+  pRow({ effective_date: '2021-02-01', symbol: 'XQQ', quantity: '999', net_cash_amount: '15.80', currency: 'CAD', activity_type: 'Dividend', activity_sub_type: '-' }),
+  pRow({ effective_date: '2021-02-02', symbol: 'XQQ', quantity: '0.50', net_cash_amount: '0.50', currency: 'CAD', activity_type: 'Interest', activity_sub_type: '-' }),
+  pRow({ effective_date: '2021-02-03', symbol: 'XQQ', quantity: '3.30', net_cash_amount: '3.30', currency: 'CAD', activity_type: 'Tax', activity_sub_type: 'NRT' }),
+  pRow({ effective_date: '2021-02-04', symbol: 'XQQ', quantity: '5', unit_price: '110', net_cash_amount: '550', currency: 'CAD', activity_type: 'Trade', activity_sub_type: 'SELL' }),
+  // Position before the split is 20 - 5 = 15; +30 added derives 45:15.
+  pRow({ effective_date: '2021-03-01', symbol: 'XQQ', quantity: '30', currency: 'CAD', activity_type: 'CorporateAction', activity_sub_type: 'SUBDIVISION' }),
+);
+
+test('pair mapping: two-column files keep dividends, split from added units, skip cash rows', () => {
+  const r = applyMappedCsv(pFixture(), P_MAP, empty);
+  assert.equal(r.holdings.length, 1);
+  assert.equal(r.holdings[0].symbol, 'XQQ.TO');
+  assert.deepEqual(r.events.map((e) => [e.type, e.units, e.price, e.amount]), [
+    ['buy', 20, 100.3, null],
+    ['dividend', null, null, 15.8],
+    ['sell', 5, 110, null],
+    ['split', null, null, null],
+  ]);
+  const split = r.events.find((e) => e.type === 'split');
+  assert.deepEqual([split.splitNew, split.splitOld], [45, 15]);
+  // The dividend amount comes from the amount column, not the
+  // quantity column (which carries an unrelated number here, and
+  // the real shape's dollars on dividend rows).
+  assert.equal(r.events.find((e) => e.type === 'dividend').amount, 15.8);
+  assert.equal(r.skipped.total, 4);
+  assert.equal(r.failed.length, 0);
+});
+
+test('pair mapping: the same file under a single-column mapping loses its dividends', () => {
+  // Documents why pairs exist: with only the sub-type column, '-'
+  // cannot tell a dividend from interest, so the old single-column
+  // mapping skips both — the dividend loss this round fixes.
+  const single = {
+    columns: {
+      date: 'effective_date', symbol: 'symbol', activity: 'activity_sub_type',
+      units: 'quantity', price: 'unit_price', amount: 'net_cash_amount', currency: 'currency', splitAdded: 'quantity',
+    },
+    values: { BUY: 'buy', SELL: 'sell', '-': 'skip', SUBDIVISION: 'split', EFT: 'skip', NRT: 'skip', REFER: 'skip' },
+    defaultCurrency: null,
+    symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+  };
+  const r = applyMappedCsv(pFixture(), single, empty);
+  assert.equal(r.events.some((e) => e.type === 'dividend'), false);
+  assert.equal(r.skipped.byType['-'], 2);
+});
+
+test('pair mapping: an unmapped pair fails loudly with its pair name, never silently', () => {
+  const missing = { ...P_MAP, values: { ...P_MAP.values } };
+  delete missing.values['Dividend / -'];
+  const r = applyMappedCsv(pFixture(), missing, empty);
+  assert.equal(r.events.some((e) => e.type === 'dividend'), false);
+  assert.ok(r.failed.some((f) => f.reason.includes('no mapping for activity value "Dividend / -"')));
+});
+
+test('pair mapping: wizard round-trip keeps the second activity column; old single mappings still load', () => {
+  const back = wizardToMapping(mappingToWizard(P_MAP), P_COLS).mapping;
+  assert.deepEqual(back, P_MAP);
+  const old = { ...A_MAP };
+  const oldWizard = mappingToWizard(old);
+  assert.equal(oldWizard.activity2Col, '');
+  assert.deepEqual(wizardToMapping(oldWizard, A_COLS).mapping, A_MAP);
+});
+
+test('pair mapping: preview sentences use pair labels, blank parts read as dash', () => {
+  const m = P_MAP;
+  const row = (o) => ({ effective_date: '', symbol: '', quantity: '', unit_price: '', net_cash_amount: '', currency: 'CAD', activity_type: '', activity_sub_type: '', ...o });
+  assert.equal(
+    translatePreviewRow(row({ effective_date: '2021-01-15', symbol: 'XQQ', quantity: '20', unit_price: '100.30', activity_type: 'Trade', activity_sub_type: 'BUY' }), m),
+    '2021-01-15 · Buy · XQQ.TO · 20 units @ $100.30');
+  assert.equal(
+    translatePreviewRow(row({ effective_date: '2021-02-01', symbol: 'XQQ', net_cash_amount: '15.80', activity_type: 'Dividend', activity_sub_type: '-' }), m),
+    '2021-02-01 · Dividend · XQQ.TO · $15.80');
+  assert.equal(
+    translatePreviewRow(row({ effective_date: '2021-02-02', symbol: 'XQQ', activity_type: 'Interest', activity_sub_type: '-' }), m),
+    '2021-02-02 · Skipped: Interest / -');
+  assert.equal(
+    translatePreviewRow(row({ effective_date: '2021-02-04', symbol: 'XQQ', activity_type: 'Trade', activity_sub_type: 'HOLD' }), m),
+    '2021-02-04 · Unmapped "Trade / HOLD" · XQQ.TO');
+  // A blank second part displays as a dash, and stays a different
+  // key from the literal '-' sub-type.
+  assert.equal(
+    translatePreviewRow(row({ effective_date: '2021-02-05', symbol: 'XQQ', activity_type: 'Dividend', activity_sub_type: '' }), m),
+    '2021-02-05 · Unmapped "Dividend / -" · XQQ.TO');
+});
+
+test('pair mapping: preview covers a late-file operation class the first rows never show', () => {
+  const sentences = translatePreview(pFixture(), P_MAP);
+  assert.ok(sentences.some((s) => s.startsWith('2021-02-01 · Dividend')));
+  assert.ok(sentences.some((s) => s.startsWith('2021-03-01 · Split')));
+  assert.ok(sentences.some((s) => s.startsWith('2021-01-10 · Skipped: BonusPayment / REFER')));
+});
+
+test('pair mapping: activityValuesFor lists pairs first-seen with labels', () => {
+  const r = activityValuesFor(pFixture(), P_MAP);
+  assert.deepEqual(r.values, [
+    'BonusPayment / REFER', 'MoneyMovement / EFT', 'Trade / BUY', 'Dividend / -',
+    'Interest / -', 'Tax / NRT', 'Trade / SELL', 'CorporateAction / SUBDIVISION',
+  ]);
+  assert.deepEqual(r.labels, r.values);
+  assert.equal(r.truncated, false);
+  assert.equal(r.count, 8);
+  // No activity column: nothing to list.
+  assert.deepEqual(activityValuesFor(pFixture(), { columns: { date: 'effective_date', symbol: 'symbol' }, values: {} }).values, []);
+});
+
+test('pair mapping: proposeCsvMapping keeps a model-proposed pair mapping', async () => {
+  const structure = analyzeCsv(pFixture());
+  const stub = async () => JSON.stringify({
+    columns: {
+      date: 'effective_date', symbol: 'symbol', activity: 'activity_type', activity2: 'activity_sub_type',
+      units: 'quantity', price: 'unit_price', amount: 'net_cash_amount', currency: 'currency', splitAdded: 'quantity',
+    },
+    values: {
+      'Trade / BUY': 'buy', 'Trade / SELL': 'sell', 'Dividend / -': 'dividend',
+      'CorporateAction / SUBDIVISION': 'split', 'MoneyMovement / EFT': 'skip',
+      'Interest / -': 'skip', 'Tax / NRT': 'skip', 'BonusPayment / REFER': 'skip',
+    },
+    defaultCurrency: null,
+    symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+    questions: [],
+    reply: 'Mapped as type / sub-type pairs.',
+  });
+  const r = await proposeCsvMapping(structure, { callLlm: stub });
+  assert.equal(r.mapping.columns.activity2, 'activity_sub_type');
+  assert.equal(r.mapping.values['Dividend / -'], 'dividend');
+  assert.equal(r.mapping.values['Trade / BUY'], 'buy');
 });

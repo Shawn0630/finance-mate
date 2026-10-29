@@ -27,9 +27,47 @@ import { callLlm } from './aiFill.js';
 
 export const MAP_TARGETS = ['buy', 'sell', 'grant', 'dividend', 'split', 'skip'];
 export const MAP_COLUMN_FIELDS = [
-  'date', 'symbol', 'name', 'activity', 'units', 'price', 'amount',
+  'date', 'symbol', 'name', 'activity', 'activity2', 'units', 'price', 'amount',
   'currency', 'splitAdded', 'splitNew', 'splitOld',
 ];
+// The value(s) that decide a row's operation. With a second activity
+// column set, the key is the pair "type / subtype" built from the raw
+// trimmed values — a blank part stays blank, so a blank sub-type and
+// a literal '-' sub-type are different keys (a file that writes '-'
+// for both dividends and interest still needs the type column to
+// tell them apart, which is the whole point of the pair). Pair keys
+// are only ever interpreted in pair mode, so they can never collide
+// with single-column keys; broker activity words are short codes
+// that never contain ' / ', and the display form keeps the split
+// visible. Without a second column, the key is the single column's
+// value, exactly as before.
+export const PAIR_SEP = ' / ';
+export function activityKeyOf(row, cols) {
+  const a = String((cols.activity ? row[cols.activity] : '') ?? '').trim();
+  if (!cols.activity2) return a;
+  const b = String((cols.activity2 ? row[cols.activity2] : '') ?? '').trim();
+  return `${a}${PAIR_SEP}${b}`;
+}
+// Display form of a key: blank parts read as '-', the wizard's
+// blank-value convention. Single-column keys pass through untouched.
+export function activityKeyLabel(key, paired) {
+  if (!paired) return key;
+  return String(key).split(PAIR_SEP).map((p) => (p === '' ? '-' : p)).join(PAIR_SEP);
+}
+// Distinct activity keys in first-seen order, capped like the
+// column-stats distinct lists (the rest fail loudly at apply, never
+// silently). Returns the kept keys plus whether more exist.
+export function distinctActivityKeys(rows, cols, cap = 50) {
+  const keys = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const k = activityKeyOf(row, cols);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    if (keys.length < cap) keys.push(k);
+  }
+  return { keys, truncated: seen.size > keys.length, count: seen.size };
+}
 // Wizard step state: the same mapping, organized the way a user
 // thinks about a trade — when, what, how many, buy-or-sell,
 // what it cost — instead of a flat column list. The wizard UI
@@ -37,7 +75,7 @@ export const MAP_COLUMN_FIELDS = [
 // mapping (and back, for pre-filling from an AI proposal or a
 // saved mapping). The engine never sees the wizard shape.
 export const WIZARD_STEP_FIELDS = [
-  'dateCol', 'symbolCol', 'nameCol', 'activityCol', 'unitsCol',
+  'dateCol', 'symbolCol', 'nameCol', 'activityCol', 'activity2Col', 'unitsCol',
   'priceCol', 'amountCol', 'currencyCol',
 ];
 export function wizardToMapping(wizard, columns) {
@@ -45,7 +83,7 @@ export function wizardToMapping(wizard, columns) {
   const columnsOut = {};
   const pairs = [
     ['dateCol', 'date'], ['symbolCol', 'symbol'], ['nameCol', 'name'],
-    ['activityCol', 'activity'], ['unitsCol', 'units'], ['priceCol', 'price'],
+    ['activityCol', 'activity'], ['activity2Col', 'activity2'], ['unitsCol', 'units'], ['priceCol', 'price'],
     ['amountCol', 'amount'], ['currencyCol', 'currency'],
     ['splitAddedCol', 'splitAdded'], ['splitNewCol', 'splitNew'], ['splitOldCol', 'splitOld'],
   ];
@@ -70,7 +108,7 @@ export function mappingToWizard(mapping) {
   const c = m.columns || {};
   return {
     dateCol: c.date || '', symbolCol: c.symbol || '', nameCol: c.name || '',
-    activityCol: c.activity || '', unitsCol: c.units || '', priceCol: c.price || '',
+    activityCol: c.activity || '', activity2Col: c.activity2 || '', unitsCol: c.units || '', priceCol: c.price || '',
     amountCol: c.amount || '', currencyCol: c.currency || '',
     splitAddedCol: c.splitAdded || '', splitNewCol: c.splitNew || '', splitOldCol: c.splitOld || '',
     defaultCurrency: m.defaultCurrency || null,
@@ -99,7 +137,8 @@ export function translatePreviewRow(row, mapping) {
   const cols = (mapping && mapping.columns) || {};
   const val = (f) => (cols[f] ? (row[cols[f]] ?? '') : '');
   const date = String(val('date') || '').trim() || '(no date)';
-  const rawActivity = String(val('activity') || '').trim();
+  const rawActivity = activityKeyOf(row, cols);
+  const shownActivity = cols.activity2 ? activityKeyLabel(rawActivity, true) : (rawActivity || '(blank)');
   const target = mapping && mapping.values ? mapping.values[rawActivity] : undefined;
   const currency = (String(val('currency') || '').trim().toUpperCase())
     || (mapping && mapping.defaultCurrency) || '';
@@ -110,8 +149,8 @@ export function translatePreviewRow(row, mapping) {
     symbol += mapping.symbolSuffix.suffix;
   }
   symbol = symbol || '(no symbol)';
-  if (target === undefined) return `${date} · Unmapped "${rawActivity || '(blank)'}" · ${symbol}`;
-  if (target === 'skip') return `${date} · Skipped: ${rawActivity || '(blank)'}`;
+  if (target === undefined) return `${date} · Unmapped "${shownActivity}" · ${symbol}`;
+  if (target === 'skip') return `${date} · Skipped: ${shownActivity}`;
   if (target === 'dividend') {
     const amount = numOrNull(cols.amount ? row[cols.amount] : null);
     return `${date} · Dividend · ${symbol} · ${fmtSentenceMoney(amount) || '(no amount)'}`;
@@ -152,10 +191,38 @@ export function translatePreviewRow(row, mapping) {
 }
 // First N data rows of the file, in file order, as plain-words
 // sentences for the wizard's live preview.
+// First `count` rows in file order, plus one sample row per activity
+// key not already covered — a whole operation class skipped by the
+// mapping must show up here, not hide behind the file's first rows
+// (a file that opens with cash rows would otherwise preview clean
+// while its dividends vanish). Added samples are capped at 50, the
+// same distinct-value budget as the column stats.
 export function translatePreview(text, mapping, count = 5) {
   const { structure, rows } = rowsOf(text);
   const { mapping: norm } = normalizeMapping(mapping, structure.columns, { allowMissingCurrency: true });
-  return rows.slice(0, count).map((row) => translatePreviewRow(row, norm || { columns: {}, values: {} }));
+  const m = norm || { columns: {}, values: {} };
+  const picked = [];
+  const seen = new Set();
+  const take = (row) => { picked.push(row); seen.add(activityKeyOf(row, m.columns)); };
+  rows.slice(0, count).forEach(take);
+  for (const row of rows) {
+    if (picked.length >= count + 50) break;
+    if (!seen.has(activityKeyOf(row, m.columns))) take(row);
+  }
+  return picked.map((row) => translatePreviewRow(row, m));
+}
+// Distinct activity keys for the mapping editor's step-4 list, in
+// first-seen order with display labels. With no activity column
+// there is nothing to list; with no second column the editor keeps
+// using the column stats, so this is only the pair-mode list.
+export function activityValuesFor(text, mapping) {
+  const { structure, rows } = rowsOf(text);
+  const { mapping: norm } = normalizeMapping(mapping, structure.columns, { allowMissingCurrency: true });
+  const m = norm || { columns: {}, values: {} };
+  if (!m.columns.activity) return { values: [], labels: [], truncated: false, count: 0 };
+  const { keys, truncated, count } = distinctActivityKeys(rows, m.columns);
+  const paired = !!m.columns.activity2;
+  return { values: keys, labels: keys.map((k) => (paired ? activityKeyLabel(k, true) : k)), truncated, count };
 }
 export const MAP_REQUIRED_FIELDS = ['date', 'symbol', 'activity'];
 const MAX_DISTINCT = 50;
@@ -269,11 +336,12 @@ export function normalizeMapping(raw, columns, opts = {}) {
 
 const MAP_PROMPT = [
   'You map the columns of an unknown broker\'s CSV export to investment events. Reply with ONLY a JSON object — no prose, no code fences.',
-  'Form: {"columns": {"date": "<exact column name>", "symbol": "<exact column name>", "name": "<exact column name>"|null, "activity": "<exact column name>", "units": "<exact column name>"|null, "price": "<exact column name>"|null, "amount": "<exact column name>"|null, "currency": "<exact column name>"|null, "splitAdded": "<exact column name>"|null, "splitNew": "<exact column name>"|null, "splitOld": "<exact column name>"|null}, "values": {"<exact activity value>": "buy"|"sell"|"grant"|"dividend"|"split"|"skip"}, "defaultCurrency": "CAD"|"USD"|null, "symbolSuffix": {"suffix": ".TO", "whenCurrency": "CAD"|"USD"|null}|null, "questions": ["..."], "reply": "..."}',
+  'Form: {"columns": {"date": "<exact column name>", "symbol": "<exact column name>", "name": "<exact column name>"|null, "activity": "<exact column name>", "activity2": "<exact column name>"|null, "units": "<exact column name>"|null, "price": "<exact column name>"|null, "amount": "<exact column name>"|null, "currency": "<exact column name>"|null, "splitAdded": "<exact column name>"|null, "splitNew": "<exact column name>"|null, "splitOld": "<exact column name>"|null}, "values": {"<exact activity value>": "buy"|"sell"|"grant"|"dividend"|"split"|"skip"}, "defaultCurrency": "CAD"|"USD"|null, "symbolSuffix": {"suffix": ".TO", "whenCurrency": "CAD"|"USD"|null}|null, "questions": ["..."], "reply": "..."}',
   'Rules:',
   '- Column names and activity values must be copied EXACTLY from the file summary below; never invent one.',
   '- "columns.date", "columns.symbol" and "columns.activity" are required; the rest are null when the file has no such column.',
   '- "values" maps every distinct activity value you can identify: a purchase word -> "buy", a sale word -> "sell", a grant/vesting word -> "grant", a dividend/distribution word -> "dividend", a split/subdivision word -> "split", a cash-flow word (deposit, withdrawal, interest, fee, tax) -> "skip".',
+  '- When the file has BOTH a type column (Trade, Dividend, Interest, …) and a sub-type column (BUY, SELL, -, EFT, …) and one column alone would map different operations to the same value — a Trade column covering both buys and sells, or a "-" / blank sub-type that is a dividend under Dividend but cash under Interest — map BOTH: "activity" is the type column, "activity2" is the sub-type column, and "values" keys are "Type / Subtype" pairs (a blank second part is written as an empty string after the separator, e.g. "Dividend / "). Never decide a bare "-" or blank sub-type on its own: under a dividend/distribution type it is "dividend", under an interest/cash type it is "skip". When a single column already separates every operation, leave "activity2" null and use plain values.',
   '- A split row either carries ratio columns (map splitNew/splitOld) or an added-units column (map splitAdded) — map whichever the file has, never both.',
   '- "defaultCurrency" is the holding currency when the file has no currency column; use it only when the file or account context states it, else null.',
   '- "symbolSuffix" only when the evidence supports it (e.g. a CAD account whose tickers are bare Toronto symbols that need ".TO"); "whenCurrency" restricts it to that currency, null means always.',
@@ -398,11 +466,12 @@ function processMappedRows(rows, mapping, existing, skipIndices) {
     if (skipIndices.has(i)) continue;
     const date = row[cols.date];
     if (!isDateStr(date)) { fail(`${row[cols.symbol] || '(no symbol)'} ${date || '(no date)'}`, 'missing or invalid date'); continue; }
-    const rawActivity = (row[cols.activity] || '').trim();
+    const rawActivity = activityKeyOf(row, cols);
+    const shownActivity = cols.activity2 ? activityKeyLabel(rawActivity, true) : rawActivity;
     const target = mapping.values[rawActivity];
-    if (target === undefined) { fail(`${date} ${row[cols.symbol] || '(no symbol)'} ${rawActivity || '(no activity)'}`, `no mapping for activity value "${rawActivity}"`); continue; }
+    if (target === undefined) { fail(`${date} ${row[cols.symbol] || '(no symbol)'} ${shownActivity || '(no activity)'}`, `no mapping for activity value "${shownActivity}"`); continue; }
     if (target === 'skip') {
-      skipped.byType[rawActivity || '(blank)'] = (skipped.byType[rawActivity || '(blank)'] || 0) + 1;
+      skipped.byType[shownActivity || '(blank)'] = (skipped.byType[shownActivity || '(blank)'] || 0) + 1;
       skipped.total += 1;
       continue;
     }
@@ -441,7 +510,7 @@ function processMappedRows(rows, mapping, existing, skipIndices) {
     }
     const holdingKey = state.holdingId != null ? `id:${state.holdingId}` : `ref:${state.holdingRef}`;
     const targetRef = state.holdingId != null ? { holdingId: state.holdingId, holdingRef: null } : { holdingId: null, holdingRef: state.holdingRef };
-    const summary = `${date} ${symbol} ${rawActivity}`;
+    const summary = `${date} ${symbol} ${shownActivity}`;
 
     let ev = null;
     if (target === 'buy' || target === 'sell' || target === 'grant') {
