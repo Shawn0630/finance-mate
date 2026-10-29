@@ -30,6 +30,133 @@ export const MAP_COLUMN_FIELDS = [
   'date', 'symbol', 'name', 'activity', 'units', 'price', 'amount',
   'currency', 'splitAdded', 'splitNew', 'splitOld',
 ];
+// Wizard step state: the same mapping, organized the way a user
+// thinks about a trade — when, what, how many, buy-or-sell,
+// what it cost — instead of a flat column list. The wizard UI
+// holds this shape; wizardToMapping turns it into the engine
+// mapping (and back, for pre-filling from an AI proposal or a
+// saved mapping). The engine never sees the wizard shape.
+export const WIZARD_STEP_FIELDS = [
+  'dateCol', 'symbolCol', 'nameCol', 'activityCol', 'unitsCol',
+  'priceCol', 'amountCol', 'currencyCol',
+];
+export function wizardToMapping(wizard, columns) {
+  if (!wizard || typeof wizard !== 'object' || Array.isArray(wizard)) return { error: 'wizard state must be an object' };
+  const columnsOut = {};
+  const pairs = [
+    ['dateCol', 'date'], ['symbolCol', 'symbol'], ['nameCol', 'name'],
+    ['activityCol', 'activity'], ['unitsCol', 'units'], ['priceCol', 'price'],
+    ['amountCol', 'amount'], ['currencyCol', 'currency'],
+    ['splitAddedCol', 'splitAdded'], ['splitNewCol', 'splitNew'], ['splitOldCol', 'splitOld'],
+  ];
+  for (const [w, e] of pairs) {
+    const v = wizard[w];
+    if (typeof v === 'string' && v.trim() !== '') columnsOut[e] = v.trim();
+  }
+  const suffix = typeof wizard.symbolSuffix === 'string' ? wizard.symbolSuffix.trim() : '';
+  const raw = {
+    columns: columnsOut,
+    values: wizard.valueTargets && typeof wizard.valueTargets === 'object' && !Array.isArray(wizard.valueTargets)
+      ? wizard.valueTargets : {},
+    defaultCurrency: wizard.defaultCurrency,
+    symbolSuffix: suffix
+      ? { suffix, whenCurrency: wizard.suffixWhenCurrency || null }
+      : null,
+  };
+  return normalizeMapping(raw, columns, { allowMissingCurrency: true });
+}
+export function mappingToWizard(mapping) {
+  const m = (mapping && typeof mapping === 'object' && !Array.isArray(mapping)) ? mapping : {};
+  const c = m.columns || {};
+  return {
+    dateCol: c.date || '', symbolCol: c.symbol || '', nameCol: c.name || '',
+    activityCol: c.activity || '', unitsCol: c.units || '', priceCol: c.price || '',
+    amountCol: c.amount || '', currencyCol: c.currency || '',
+    splitAddedCol: c.splitAdded || '', splitNewCol: c.splitNew || '', splitOldCol: c.splitOld || '',
+    defaultCurrency: m.defaultCurrency || null,
+    valueTargets: { ...(m.values || {}) },
+    symbolSuffix: (m.symbolSuffix && m.symbolSuffix.suffix) || '',
+    suffixWhenCurrency: (m.symbolSuffix && m.symbolSuffix.whenCurrency) || null,
+  };
+}
+
+const fmtSentenceUnits = (n) => {
+  if (n == null || !Number.isFinite(n)) return null;
+  const abs = Math.abs(n);
+  return Number.isInteger(abs) ? String(abs) : String(Math.round(abs * 10000) / 10000);
+};
+const fmtSentenceMoney = (n) => {
+  if (n == null || !Number.isFinite(n)) return null;
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+// One data row translated into plain words, so the user can see
+// at a glance whether the mapping matches their file — before
+// anything is previewed or applied. Display-only: it never
+// writes, never guards, never derives a split ratio (a split
+// from an added-units column says so plainly, since its ratio
+// needs the running position only the engine has).
+export function translatePreviewRow(row, mapping) {
+  const cols = (mapping && mapping.columns) || {};
+  const val = (f) => (cols[f] ? (row[cols[f]] ?? '') : '');
+  const date = String(val('date') || '').trim() || '(no date)';
+  const rawActivity = String(val('activity') || '').trim();
+  const target = mapping && mapping.values ? mapping.values[rawActivity] : undefined;
+  const currency = (String(val('currency') || '').trim().toUpperCase())
+    || (mapping && mapping.defaultCurrency) || '';
+  let symbol = String(val('symbol') || '').trim().toUpperCase();
+  if (symbol && mapping && mapping.symbolSuffix
+    && (mapping.symbolSuffix.whenCurrency == null || mapping.symbolSuffix.whenCurrency === currency)
+    && !symbol.includes('.')) {
+    symbol += mapping.symbolSuffix.suffix;
+  }
+  symbol = symbol || '(no symbol)';
+  if (target === undefined) return `${date} · Unmapped "${rawActivity || '(blank)'}" · ${symbol}`;
+  if (target === 'skip') return `${date} · Skipped: ${rawActivity || '(blank)'}`;
+  if (target === 'dividend') {
+    const amount = numOrNull(cols.amount ? row[cols.amount] : null);
+    return `${date} · Dividend · ${symbol} · ${fmtSentenceMoney(amount) || '(no amount)'}`;
+  }
+  if (target === 'split') {
+    if (cols.splitNew && cols.splitOld) {
+      const sn = numOrNull(row[cols.splitNew]);
+      const so = numOrNull(row[cols.splitOld]);
+      return (sn != null && so != null && sn > 0 && so > 0)
+        ? `${date} · Split · ${symbol} · ${fmtSentenceUnits(sn)}:${fmtSentenceUnits(so)}`
+        : `${date} · Split · ${symbol} · (no ratio)`;
+    }
+    if (cols.splitAdded) {
+      const added = numOrNull(row[cols.splitAdded]);
+      return added != null && added !== 0
+        ? `${date} · Split · ${symbol} · +${fmtSentenceUnits(added)} units (ratio derived on apply)`
+        : `${date} · Split · ${symbol} · (no split quantity)`;
+    }
+    return `${date} · Split · ${symbol} · (no ratio mapping)`;
+  }
+  // buy / sell / grant
+  const unitsNum = numOrNull(cols.units ? row[cols.units] : null);
+  const units = fmtSentenceUnits(unitsNum);
+  const action = target === 'buy' ? 'Buy' : target === 'sell' ? 'Sell' : 'Grant';
+  let pricePart = '';
+  let price = numOrNull(cols.price ? row[cols.price] : null);
+  if (price != null && price > 0) {
+    pricePart = ` @ ${fmtSentenceMoney(price)}`;
+  } else if (target !== 'grant') {
+    const amount = numOrNull(cols.amount ? row[cols.amount] : null);
+    if (amount != null && amount !== 0 && unitsNum != null && unitsNum !== 0) {
+      pricePart = ` @ ${fmtSentenceMoney(Math.abs(amount) / Math.abs(unitsNum))} (derived from total ${fmtSentenceMoney(Math.abs(amount))})`;
+    } else {
+      pricePart = ' @ (no price)';
+    }
+  }
+  return `${date} · ${action} · ${symbol} · ${units != null ? `${units} units` : '(no units)'}${pricePart}`;
+}
+// First N data rows of the file, in file order, as plain-words
+// sentences for the wizard's live preview.
+export function translatePreview(text, mapping, count = 5) {
+  const { structure, rows } = rowsOf(text);
+  const { mapping: norm } = normalizeMapping(mapping, structure.columns, { allowMissingCurrency: true });
+  return rows.slice(0, count).map((row) => translatePreviewRow(row, norm || { columns: {}, values: {} }));
+}
 export const MAP_REQUIRED_FIELDS = ['date', 'symbol', 'activity'];
 const MAX_DISTINCT = 50;
 const MAX_SAMPLES = 5;

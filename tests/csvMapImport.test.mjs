@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   analyzeCsv, fingerprintFor, normalizeMapping, applyMappedCsv, proposeCsvMapping,
+  wizardToMapping, mappingToWizard, translatePreviewRow, translatePreview,
 } from '../src/csvMapImport.js';
 
 const empty = { holdings: [], eventsByHolding: {} };
@@ -208,4 +209,91 @@ test('proposeCsvMapping normalizes the model reply and asks about what it missed
   const r2 = await proposeCsvMapping(structure, { callLlm: stubPartial });
   assert.ok(r2.questions.some((q) => q.includes('activity')));
   await assert.rejects(() => proposeCsvMapping(structure, { callLlm: async () => 'not json' }), /not valid JSON/);
+});
+
+test('wizardToMapping converts step state to the engine mapping and drops empties', () => {
+  const { mapping, error } = wizardToMapping({
+    dateCol: 'TxnDate', symbolCol: 'Security', nameCol: '', activityCol: 'Action',
+    unitsCol: 'Qty', priceCol: 'UnitPrice', amountCol: 'Total', currencyCol: 'Currency',
+    splitAddedCol: '', splitNewCol: '', splitOldCol: '',
+    defaultCurrency: null,
+    valueTargets: { Purchase: 'buy', Sale: 'explode' },
+    symbolSuffix: '.TO', suffixWhenCurrency: 'CAD',
+  }, A_COLS);
+  assert.equal(error, undefined);
+  assert.deepEqual(mapping.columns, {
+    date: 'TxnDate', symbol: 'Security', activity: 'Action', units: 'Qty',
+    price: 'UnitPrice', amount: 'Total', currency: 'Currency',
+  });
+  assert.equal(mapping.values.Purchase, 'buy');
+  assert.equal(mapping.values.Sale, undefined);
+  assert.deepEqual(mapping.symbolSuffix, { suffix: '.TO', whenCurrency: 'CAD' });
+  // Unknown columns and a bare suffix without a dot are dropped.
+  const bad = wizardToMapping({
+    dateCol: 'Nope', symbolCol: 'Security', activityCol: 'Action', unitsCol: 'Qty',
+    defaultCurrency: 'CAD', valueTargets: {}, symbolSuffix: 'TO', suffixWhenCurrency: null,
+  }, A_COLS);
+  assert.equal(bad.mapping.columns.date, undefined);
+  assert.equal(bad.mapping.symbolSuffix, null);
+  // Round-trip: engine -> wizard -> engine is stable.
+  const back = wizardToMapping(mappingToWizard(A_MAP), A_COLS).mapping;
+  assert.deepEqual(back, A_MAP);
+});
+
+test('translatePreviewRow turns rows into plain-words sentences', () => {
+  const m = A_MAP;
+  const row = (o) => ({ TxnDate: '', Security: '', SecurityName: '', Action: '', Qty: '', UnitPrice: '', Total: '', Currency: 'CAD', ...o });
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-01-05', Security: 'XQQ', Action: 'Purchase', Qty: '20', UnitPrice: '100.3' }), m),
+    '2026-01-05 · Buy · XQQ.TO · 20 units @ $100.30');
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-02-04', Security: 'XQQ', Action: 'Sale', Qty: '-102', UnitPrice: '22.08' }), m),
+    '2026-02-04 · Sell · XQQ.TO · 102 units @ $22.08');
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-03-01', Security: 'XQQ', Action: 'Distribution', Total: '8.21' }), m),
+    '2026-03-01 · Dividend · XQQ.TO · $8.21');
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-01-12', Security: 'XQQ', Action: 'Journal', Total: '1000' }), m),
+    '2026-01-12 · Skipped: Journal');
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-01-05', Security: 'XQQ', Action: 'Mystery', Qty: '5' }), m),
+    '2026-01-05 · Unmapped "Mystery" · XQQ.TO');
+  // Amount-only buy derives the per-unit price and says so.
+  const noPrice = { ...m, columns: { ...m.columns, price: undefined } };
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-01-05', Security: 'XQQ', Action: 'Purchase', Qty: '20', Total: '-2006' }), noPrice),
+    '2026-01-05 · Buy · XQQ.TO · 20 units @ $100.30 (derived from total $2,006.00)');
+  // Suffix applies only when the currency matches its gate.
+  assert.equal(
+    translatePreviewRow(row({ TxnDate: '2026-01-05', Security: 'AAPL', Action: 'Purchase', Qty: '10', UnitPrice: '200', Currency: 'USD' }), m),
+    '2026-01-05 · Buy · AAPL · 10 units @ $200.00');
+  // Missing pieces show as placeholders, never blanks.
+  assert.equal(
+    translatePreviewRow(row({ Action: 'Purchase' }), m),
+    '(no date) · Buy · (no symbol) · (no units) @ (no price)');
+  // Split rows: ratio columns, and added-units rows that defer the ratio.
+  const ratioMap = { columns: { date: 'TxnDate', symbol: 'Security', activity: 'Action', splitNew: 'SplitNew', splitOld: 'SplitOld' }, values: { Subdivision: 'split' } };
+  assert.equal(
+    translatePreviewRow({ TxnDate: '2024-08-08', Security: 'XQQ', Action: 'Subdivision', SplitNew: '3', SplitOld: '1' }, ratioMap),
+    '2024-08-08 · Split · XQQ · 3:1');
+  const addedMap = { columns: { date: 'TxnDate', symbol: 'Security', activity: 'Action', splitAdded: 'Qty' }, values: { Subdivision: 'split' } };
+  assert.equal(
+    translatePreviewRow({ TxnDate: '2024-08-08', Security: 'XQQ', Action: 'Subdivision', Qty: '408' }, addedMap),
+    '2024-08-08 · Split · XQQ · +408 units (ratio derived on apply)');
+});
+
+test('translatePreview returns the first five rows in file order', () => {
+  const csv = aCsv(
+    aRow('2026-01-01', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
+    aRow('2026-01-02', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
+    aRow('2026-01-03', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
+    aRow('2026-01-04', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
+    aRow('2026-01-05', 'XQQ', 'XQQ fund', 'Purchase', '10', '50', '-500'),
+    aRow('2026-01-06', 'XQQ', 'XQQ fund', 'Sale', '5', '60', '300'),
+    aRow('2026-01-07', 'XQQ', 'XQQ fund', 'Sale', '5', '60', '300'),
+  );
+  const sentences = translatePreview(csv, A_MAP);
+  assert.equal(sentences.length, 5);
+  assert.ok(sentences[0].startsWith('2026-01-01 · Buy'));
+  assert.ok(sentences[4].startsWith('2026-01-05 · Buy'));
 });

@@ -5591,6 +5591,8 @@ let investMapQuestions = [];
 let investMapReply = '';
 let investMapReused = false;
 let investMapValueList = []; // raw activity values listed in the editor, in row order
+let investMapWizard = null; // wizard step state for the mapping editor
+let investImportGroupBy = 'type'; // proposed-panel grouping in import mode: type | symbol | month
 
 function clearInvestChatMsg() {
   const msg = document.querySelector('[data-invest-chat-msg]');
@@ -5621,6 +5623,7 @@ function resetInvestChat(accountId) {
   investMapReply = '';
   investMapReused = false;
   investMapValueList = [];
+  investMapWizard = null; investImportGroupBy = 'type';
   const mapHost = document.querySelector('[data-invest-map-editor]');
   if (mapHost) mapHost.innerHTML = '';
   renderInvestChatQueue();
@@ -5667,6 +5670,83 @@ const investTargetOptions = (sel) => {
   return [...existing, ...draft].join('');
 };
 
+// Import-preview grouping: many transactions browse better
+// grouped than flat. Grouping is a view only — rows keep their
+// own checkboxes and Apply reads them directly, so grouping
+// never changes what Apply writes; a group header checkbox is
+// just a shortcut that toggles its whole group.
+const investFmtUnits = (n) => {
+  if (n == null || n === '' || !Number.isFinite(Number(n))) return null;
+  const v = Number(n);
+  return Number.isInteger(v) ? String(v) : String(Math.round(v * 10000) / 10000);
+};
+const investFmtMoney = (n) => {
+  if (n == null || n === '' || !Number.isFinite(Number(n))) return null;
+  return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+const investEventSymbol = (e) => {
+  if (e.holdingRef) {
+    const h = investChatState.proposed.holdings.find((x) => x.ref === e.holdingRef);
+    if (h) return h.symbol || h.label || '(no symbol)';
+  }
+  if (e.holdingId != null && investAccountData) {
+    const r = investAccountData.holdings.find((x) => x.holding.id === e.holdingId);
+    if (r) return r.holding.symbol || r.holding.label || '(no symbol)';
+  }
+  return '(no symbol)';
+};
+const investEventSentence = (e, symbol) => {
+  const date = e.date || '(no date)';
+  const sym = symbol || '(no symbol)';
+  if (e.type === 'dividend') return `${date} · Dividend · ${sym} · ${investFmtMoney(e.amount) || '(no amount)'}`;
+  if (e.type === 'split') return (e.splitNew != null && e.splitOld != null)
+    ? `${date} · Split · ${sym} · ${investFmtUnits(e.splitNew)}:${investFmtUnits(e.splitOld)}`
+    : `${date} · Split · ${sym} · (no ratio)`;
+  const action = e.type === 'buy' ? 'Buy' : e.type === 'sell' ? 'Sell' : 'Grant';
+  const units = investFmtUnits(e.units);
+  let pricePart = '';
+  if (e.price != null && e.price !== '' && Number(e.price) > 0) pricePart = ` @ ${investFmtMoney(e.price)}`;
+  else if (e.type !== 'grant') pricePart = ' @ (no price)';
+  return `${date} · ${action} · ${sym} · ${units != null ? `${units} units` : '(no units)'}${pricePart}`;
+};
+const investGroupEvents = (events) => {
+  const groups = new Map();
+  const keyOf = (e) => {
+    if (investImportGroupBy === 'symbol') return investEventSymbol(e);
+    if (investImportGroupBy === 'month') return (e.date || '').slice(0, 7) || '(no date)';
+    return e.type === 'buy' ? 'Buy' : e.type === 'sell' ? 'Sell' : e.type === 'grant' ? 'Grant' : e.type === 'dividend' ? 'Dividend' : 'Split';
+  };
+  events.forEach((e, i) => {
+    const key = keyOf(e);
+    if (!groups.has(key)) groups.set(key, { key, indices: [], units: 0, div: 0 });
+    const g = groups.get(key);
+    g.indices.push(i);
+    if ((e.type === 'buy' || e.type === 'sell' || e.type === 'grant') && Number.isFinite(Number(e.units))) g.units += Math.abs(Number(e.units));
+    if (e.type === 'dividend' && Number.isFinite(Number(e.amount))) g.div += Number(e.amount);
+  });
+  const order = investImportGroupBy === 'type'
+    ? ['Buy', 'Sell', 'Grant', 'Dividend', 'Split']
+    : [...groups.keys()].sort();
+  return order.filter((k) => groups.has(k)).map((k) => groups.get(k));
+};
+const investGroupTotals = (g) => {
+  const bits = [`${g.indices.length} rows`];
+  if (g.units) bits.push(`${investFmtUnits(g.units)} units`);
+  if (g.div) bits.push(investFmtMoney(g.div));
+  return bits.join(' · ');
+};
+const syncInvestGroupChecks = (host) => {
+  host.querySelectorAll('[data-ie-group]').forEach((group) => {
+    const key = group.dataset.ieGroup;
+    const head = group.querySelector('[data-ie-group-check]');
+    const rows = [...group.querySelectorAll('[data-ie-check]')];
+    if (!head || !rows.length) return;
+    const checked = rows.filter((c) => c.checked).length;
+    head.checked = checked === rows.length;
+    head.indeterminate = checked > 0 && checked < rows.length;
+  });
+};
+
 function renderInvestProposed() {
   const host = document.querySelector('[data-invest-proposed]');
   if (!host) return;
@@ -5700,11 +5780,8 @@ function renderInvestProposed() {
       ${h.conflict ? '<span class="conflict-tag">Looks like a holding already in this account — applies only if checked</span>' : ''}
       <button type="button" class="small danger" data-ih-remove title="Remove">×</button>
     </div>`).join('');
-  const eventRows = events.map((e, i) => {
-    const sel = e.holdingId != null ? `id:${e.holdingId}` : `ref:${e.holdingRef}`;
-    return `
-    <div class="costs-proposed-row${e.conflict ? ' conflict' : ''}" data-ie-row="${i}">
-      <input type="checkbox" data-ie-check${e.conflict ? '' : ' checked'}>
+  const ieChecked = (e) => (e.checked != null ? e.checked : !e.conflict) ? ' checked' : '';
+  const investEventInputs = (e, sel) => `
       <select data-ie-target>${investTargetOptions(sel)}</select>
       <input type="date" data-ie-date value="${esc(e.date || '')}">
       <select data-ie-type>
@@ -5714,43 +5791,104 @@ function renderInvestProposed() {
       <input type="text" inputmode="decimal" data-money data-ie-price value="${esc(formatMoneyInput(e.price ?? ''))}" placeholder="Price" style="width:110px">
       <input type="text" inputmode="decimal" data-money data-ie-amount value="${esc(formatMoneyInput(e.amount ?? ''))}" placeholder="Dividend $" style="width:110px">
       <input type="text" inputmode="decimal" data-ie-splitnew value="${e.splitNew ?? ''}" placeholder="Split new" title="Split ratio — new side" style="width:76px">
-      <input type="text" inputmode="decimal" data-ie-splitold value="${e.splitOld ?? ''}" placeholder="Split old" title="Split ratio — old side" style="width:76px">
+      <input type="text" inputmode="decimal" data-ie-splitold value="${e.splitOld ?? ''}" placeholder="Split old" title="Split ratio — old side" style="width:76px">`;
+  const eventRows = events.map((e, i) => {
+    const sel = e.holdingId != null ? `id:${e.holdingId}` : `ref:${e.holdingRef}`;
+    return `
+    <div class="costs-proposed-row${e.conflict ? ' conflict' : ''}" data-ie-row="${i}">
+      <input type="checkbox" data-ie-check${ieChecked(e)}>
+      ${investEventInputs(e, sel)}
       ${e.priceDerived ? '<span class="note">Price derived from total amount</span>' : ''}
       ${e.conflict ? '<span class="conflict-tag">Same event already recorded — applies only if checked</span>' : ''}
       <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
     </div>`;
   }).join('');
+  // Import mode rows read as sentences first (browsing) with the
+  // inputs one Edit click away (editing preserved). Grouped by
+  // type by default, or by symbol / month; groups start
+  // collapsed with count + totals on the header, and a header
+  // checkbox toggles the whole group.
+  const investImportEventRow = (e, i) => {
+    const sel = e.holdingId != null ? `id:${e.holdingId}` : `ref:${e.holdingRef}`;
+    const symbol = investEventSymbol(e);
+    return `
+    <div data-ie-row="${i}" data-ie-symbol="${esc(symbol)}">
+      <div class="costs-proposed-row${e.conflict ? ' conflict' : ''}">
+        <input type="checkbox" data-ie-check${ieChecked(e)}>
+        <span data-ie-sentence style="flex:1">${esc(investEventSentence(e, symbol))}</span>
+        ${e.priceDerived ? '<span class="note">Price derived from total amount</span>' : ''}
+        ${e.conflict ? '<span class="conflict-tag">Same event already recorded — applies only if checked</span>' : ''}
+        <button type="button" class="small" data-ie-edit>Edit</button>
+        <button type="button" class="small danger" data-ie-remove title="Remove">×</button>
+      </div>
+      <div data-ie-inputs style="display:none"><div class="costs-proposed-row">
+        ${investEventInputs(e, sel)}
+      </div></div>
+    </div>`;
+  };
+  const importEventSection = !events.length ? '' : `
+    <div class="note" style="margin:6px 0 4px">Events · Group by
+      <select data-ie-group-by>
+        <option value="type"${investImportGroupBy === 'type' ? ' selected' : ''}>Type</option>
+        <option value="symbol"${investImportGroupBy === 'symbol' ? ' selected' : ''}>Symbol</option>
+        <option value="month"${investImportGroupBy === 'month' ? ' selected' : ''}>Month</option>
+      </select></div>
+    ${investGroupEvents(events).map((g) => `
+    <div data-ie-group="${esc(g.key)}">
+      <div class="costs-proposed-row" data-ie-group-head="${esc(g.key)}" style="cursor:pointer">
+        <input type="checkbox" data-ie-group-check="${esc(g.key)}">
+        <span data-ie-group-arrow>▸</span>
+        <span>${esc(g.key)}</span>
+        <span class="note" style="flex:1">${investGroupTotals(g)}</span>
+      </div>
+      <div data-ie-group-body="${esc(g.key)}" style="display:none">
+        ${g.indices.map((i) => investImportEventRow(events[i], i)).join('')}
+      </div>
+    </div>`).join('')}`;
   host.innerHTML = `<div class="costs-proposed">${reportHtml}${droppedHtml}<h5>Proposed — review, edit, then Apply</h5>
     ${holdings.length ? `<div class="note" style="margin:0 0 4px">New holdings</div>${holdingRows}` : ''}
-    ${events.length ? `<div class="note" style="margin:6px 0 4px">Events</div>${eventRows}` : ''}
+    ${investImportMode ? importEventSection : (events.length ? `<div class="note" style="margin:6px 0 4px">Events</div>${eventRows}` : '')}
     <div class="toolbar" style="margin-top:6px">
       <button type="button" class="primary small" data-invest-apply>Apply selected</button>
       <button type="button" class="small" data-invest-discard>Discard</button>
     </div></div>`;
   host.querySelectorAll('[data-money]').forEach(wireMoneyInput);
+  if (investImportMode) syncInvestGroupChecks(host);
 }
 
 // Read the proposal rows back out of their (editable) inputs.
+// Rows are slotted by their own data-ie-row / data-ih-row index,
+// not by DOM position: the import preview groups rows (by type,
+// symbol or month), so DOM order is no longer state order, and
+// positional reads would attach notes, conflicts and removals to
+// the wrong rows.
 function readInvestProposed() {
   const host = document.querySelector('[data-invest-proposed]');
   const holdings = [];
   const events = [];
   if (!host) return { holdings, events };
-  host.querySelectorAll('[data-ih-row]').forEach((row, i) => {
-    const prev = investChatState.proposed.holdings[i] || {};
-    holdings.push({
-      ref: prev.ref || `h${i + 1}`,
-      checked: row.querySelector('[data-ih-check]').checked,
-      label: row.querySelector('[data-ih-label]').value.trim(),
-      kind: row.querySelector('[data-ih-kind]').value,
-      symbol: row.querySelector('[data-ih-symbol]').value.trim() || null,
-      fundCode: row.querySelector('[data-ih-fundcode]').value.trim() || null,
-      currency: row.querySelector('[data-ih-currency]').value,
-      conflict: prev.conflict || null,
+  const slot = (list, rows, build) => {
+    const placed = new Array(list.length).fill(undefined);
+    const extra = [];
+    let extraIdx = list.length;
+    rows.forEach((row) => {
+      const idx = Number(row.dataset.ihRow ?? row.dataset.ieRow);
+      if (Number.isInteger(idx) && idx >= 0 && idx < list.length) placed[idx] = build(row, list[idx] || {}, idx);
+      else extra.push(build(row, {}, extraIdx++));
     });
-  });
-  host.querySelectorAll('[data-ie-row]').forEach((row, i) => {
-    const prev = investChatState.proposed.events[i] || {};
+    return [...placed.filter((v) => v !== undefined), ...extra];
+  };
+  slot(investChatState.proposed.holdings, [...host.querySelectorAll('[data-ih-row]')], (row, prev, idx) => ({
+    ref: prev.ref || `h${idx + 1}`,
+    checked: row.querySelector('[data-ih-check]').checked,
+    label: row.querySelector('[data-ih-label]').value.trim(),
+    kind: row.querySelector('[data-ih-kind]').value,
+    symbol: row.querySelector('[data-ih-symbol]').value.trim() || null,
+    fundCode: row.querySelector('[data-ih-fundcode]').value.trim() || null,
+    currency: row.querySelector('[data-ih-currency]').value,
+    conflict: prev.conflict || null,
+  })).forEach((h) => holdings.push(h));
+  slot(investChatState.proposed.events, [...host.querySelectorAll('[data-ie-row]')], (row, prev) => {
     const target = row.querySelector('[data-ie-target]').value || '';
     const type = row.querySelector('[data-ie-type]').value;
     const ev = {
@@ -5776,8 +5914,8 @@ function readInvestProposed() {
       const p = parseMoneyInput(row.querySelector('[data-ie-price]').value);
       ev.price = p === '' ? null : p;
     }
-    events.push(ev);
-  });
+    return ev;
+  }).forEach((e) => events.push(e));
   return { holdings, events };
 }
 
@@ -5791,7 +5929,63 @@ document.querySelector('[data-invest-proposed]').addEventListener('change', () =
   };
 });
 
+// Grouping controls for the import preview: a group header
+// checkbox toggles its whole group, the group-by select
+// re-renders from the live DOM (edits survive regrouping),
+// and editing an import row refreshes its sentence live.
+document.querySelector('[data-invest-proposed]').addEventListener('change', (e) => {
+  const host = document.querySelector('[data-invest-proposed]');
+  if (e.target.matches('[data-ie-group-by]')) {
+    const draft = readInvestProposed();
+    investChatState.proposed = { holdings: draft.holdings, events: draft.events };
+    investImportGroupBy = e.target.value;
+    renderInvestProposed();
+    return;
+  }
+  if (e.target.matches('[data-ie-group-check]')) {
+    const key = e.target.dataset.ieGroupCheck;
+    const body = host.querySelector(`[data-ie-group-body="${CSS.escape(key)}"]`);
+    if (body) body.querySelectorAll('[data-ie-check]').forEach((c) => { c.checked = e.target.checked; });
+    return;
+  }
+  if (e.target.matches('[data-ie-check]')) {
+    syncInvestGroupChecks(host);
+    return;
+  }
+  const row = e.target.closest('[data-ie-row]');
+  if (row && row.querySelector('[data-ie-sentence]')) {
+    const draft = readInvestProposed();
+    const ev = draft.events[Number(row.dataset.ieRow)];
+    const sentence = row.querySelector('[data-ie-sentence]');
+    if (ev && sentence) sentence.textContent = investEventSentence(ev, investEventSymbol(ev));
+  }
+});
+
 document.querySelector('[data-invest-proposed]').addEventListener('click', async (e) => {
+  if (e.target.closest('[data-ie-group-head]') && !e.target.closest('[data-ie-group-check]')) {
+    const head = e.target.closest('[data-ie-group-head]');
+    const key = head.dataset.ieGroupHead;
+    const host = document.querySelector('[data-invest-proposed]');
+    const body = host.querySelector(`[data-ie-group-body="${CSS.escape(key)}"]`);
+    const arrow = head.querySelector('[data-ie-group-arrow]');
+    if (body) {
+      const open = body.style.display !== 'none';
+      body.style.display = open ? 'none' : '';
+      if (arrow) arrow.textContent = open ? '▸' : '▾';
+    }
+    return;
+  }
+  if (e.target.closest('[data-ie-edit]')) {
+    const row = e.target.closest('[data-ie-row]');
+    const inputs = row.querySelector('[data-ie-inputs]');
+    const btn = e.target.closest('[data-ie-edit]');
+    if (inputs) {
+      const open = inputs.style.display !== 'none';
+      inputs.style.display = open ? 'none' : '';
+      btn.textContent = open ? 'Edit' : 'Done';
+    }
+    return;
+  }
   if (e.target.closest('[data-ih-remove]')) {
     const idx = Number(e.target.closest('[data-ih-row]').dataset.ihRow);
     const { holdings, events } = readInvestProposed();
@@ -6029,113 +6223,209 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   // structure; the user confirms or edits it here; only then
   // does the deterministic engine preview every row, and Apply
   // writes it with source 'csv-ai'.
+  // AI-mapped CSV import, wizard edition: the mapping is edited
+  // as operations, not column names — when, what, how many,
+  // buy-or-sell, what it cost — with the file's first rows
+  // translated into plain words underneath, live, so a wrong
+  // mapping shows up before anything is applied. The model only
+  // pre-fills the wizard; the deterministic engine, sell guard,
+  // dedup, split derivation and preview → Apply flow are
+  // unchanged, and confirming still saves the corrected mapping
+  // by column fingerprint for the next file from this broker.
   const mapBtn = document.querySelector('[data-invest-import-csv-map]');
   const mapFile = wrap.querySelector('[data-invest-import-map-file]');
   const mapHost = wrap.querySelector('[data-invest-map-editor]');
-  const MAP_COL_FIELDS = [
-    ['date', 'Date'], ['symbol', 'Symbol'], ['name', 'Name'], ['activity', 'Activity'],
-    ['units', 'Units'], ['price', 'Unit price'], ['amount', 'Total amount'], ['currency', 'Currency'],
-    ['splitAdded', 'Split added units'], ['splitNew', 'Split new side'], ['splitOld', 'Split old side'],
-  ];
-  const MAP_VALUE_TARGETS = ['buy', 'sell', 'grant', 'dividend', 'split', 'skip'];
-  const mapColOptions = (sel) => `<option value="">(not mapped)</option>`
-    + (investMapStructure ? investMapStructure.columns.map((c) => `<option value="${esc(c)}"${sel === c ? ' selected' : ''}>${esc(c)}</option>`).join('') : '');
-  const mapActivityValues = () => {
-    if (!investMapStructure || !investMapMapping) return [];
-    const actCol = investMapMapping.columns.activity;
+  const WIZ_TARGETS = ['buy', 'sell', 'grant', 'dividend', 'split', 'skip'];
+  let wizPreviewSeq = 0;
+  // Engine mapping <-> wizard step state. The wizard groups the
+  // same fields by operation: required steps (when, what, how
+  // many, buy-or-sell) always visible, optional steps (name,
+  // price/amount, currency, symbol suffix, split columns) in a
+  // collapsed section. Mirrors the server's wizardToMapping /
+  // mappingToWizard pair; the engine only ever sees the engine
+  // shape.
+  const engineToWizard = (m) => {
+    const c = (m && m.columns) || {};
+    return {
+      dateCol: c.date || '', symbolCol: c.symbol || '', nameCol: c.name || '',
+      activityCol: c.activity || '', unitsCol: c.units || '', priceCol: c.price || '',
+      amountCol: c.amount || '', currencyCol: c.currency || '',
+      splitAddedCol: c.splitAdded || '', splitNewCol: c.splitNew || '', splitOldCol: c.splitOld || '',
+      defaultCurrency: (m && m.defaultCurrency) || null,
+      valueTargets: { ...((m && m.values) || {}) },
+      symbolSuffix: (m && m.symbolSuffix && m.symbolSuffix.suffix) || '',
+      suffixWhenCurrency: (m && m.symbolSuffix && m.symbolSuffix.whenCurrency) || null,
+    };
+  };
+  const wizardToEngine = (w) => {
+    const columns = {};
+    const pairs = [
+      ['dateCol', 'date'], ['symbolCol', 'symbol'], ['nameCol', 'name'],
+      ['activityCol', 'activity'], ['unitsCol', 'units'], ['priceCol', 'price'],
+      ['amountCol', 'amount'], ['currencyCol', 'currency'],
+      ['splitAddedCol', 'splitAdded'], ['splitNewCol', 'splitNew'], ['splitOldCol', 'splitOld'],
+    ];
+    for (const [wk, ek] of pairs) if (w[wk]) columns[ek] = w[wk];
+    return {
+      columns,
+      values: { ...(w.valueTargets || {}) },
+      defaultCurrency: w.defaultCurrency || null,
+      symbolSuffix: w.symbolSuffix ? { suffix: w.symbolSuffix, whenCurrency: w.suffixWhenCurrency || null } : null,
+    };
+  };
+  const wizColOptions = (sel) => `<option value="">(not mapped)</option>`
+    + (investMapStructure ? investMapStructure.columns.map((c) => {
+      const stat = investMapStructure.columnStats.find((s) => s.name === c);
+      const samples = stat && stat.samples ? stat.samples.slice(0, 2).join(', ') : '';
+      return `<option value="${esc(c)}"${sel === c ? ' selected' : ''}>${esc(c)}${samples ? ` — e.g. ${esc(samples)}` : ''}</option>`;
+    }).join('') : '');
+  const wizValueList = () => {
+    if (!investMapStructure || !investMapWizard) return [];
+    const actCol = investMapWizard.activityCol;
     if (!actCol) return [];
     const stat = investMapStructure.columnStats.find((s) => s.name === actCol);
     if (!stat) return [];
     if (stat.distinct && stat.distinct.length) return stat.distinct;
     return stat.samples || [];
   };
-  const renderMapValueRows = () => {
-    const box = mapHost.querySelector('[data-map-values]');
+  const renderWizValueRows = () => {
+    const box = mapHost.querySelector('[data-wiz-values]');
     if (!box) return;
     const prev = {};
-    box.querySelectorAll('[data-map-value-idx]').forEach((sel) => {
-      const raw = investMapValueList[Number(sel.dataset.mapValueIdx)];
+    box.querySelectorAll('[data-wiz-value-idx]').forEach((sel) => {
+      const raw = investMapValueList[Number(sel.dataset.wizValueIdx)];
       if (raw !== undefined && sel.value) prev[raw] = sel.value;
     });
-    const values = mapActivityValues();
+    const values = wizValueList();
     investMapValueList = values;
-    const merged = { ...(investMapMapping.values || {}), ...prev };
-    const actCol = investMapMapping.columns.activity;
+    const merged = { ...(investMapWizard.valueTargets || {}), ...prev };
+    const actCol = investMapWizard.activityCol;
     const stat = actCol ? investMapStructure.columnStats.find((s) => s.name === actCol) : null;
     box.innerHTML = values.length
       ? values.map((v, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(v)}</span>
-          <select data-map-value-idx="${i}"><option value="">(pick a target)</option>
-          ${MAP_VALUE_TARGETS.map((t) => `<option value="${t}"${merged[v] === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></div>`).join('')
+          <select data-wiz-value-idx="${i}"><option value="">(pick one)</option>
+          ${WIZ_TARGETS.map((t) => `<option value="${t}"${merged[v] === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></div>`).join('')
         + (stat && stat.distinctTruncated ? `<div class="note">More than ${stat.distinctCount} distinct values — only the first listed can be mapped here; the rest fail loudly in the preview.</div>` : '')
-      : '<div class="note">Pick an activity column above to map its values.</div>';
+      : '<div class="note">Pick the column that says buy or sell in step 4 to map its values.</div>';
   };
-  const renderMapEditor = () => {
-    if (!investMapStructure || !investMapMapping) { mapHost.innerHTML = ''; return; }
-    const m = investMapMapping;
-    const suffix = m.symbolSuffix || {};
-    mapHost.innerHTML = `<div class="costs-proposed"><h5>CSV mapping — review, edit, then Confirm</h5>
-      ${investMapReused ? '<div class="note">Reused saved mapping for this file format — confirm to preview, or ask AI to re-map.</div>' : ''}
-      ${investMapReply ? `<div class="note">${esc(investMapReply)}</div>` : ''}
-      <div class="note" style="margin:0 0 4px">Columns (${investMapStructure.rowCount} rows)</div>
-      ${MAP_COL_FIELDS.map(([f, label]) => `<div class="costs-proposed-row"><span style="flex:1">${label}</span>
-        <select data-map-col="${f}">${mapColOptions(m.columns[f] || '')}</select></div>`).join('')}
-      <div class="note" style="margin:6px 0 4px">Activity values → event type</div>
-      <div data-map-values></div>
-      <div class="costs-proposed-row"><span style="flex:1">Default currency</span>
-        <select data-map-default-currency><option value="">(none — use currency column)</option>
-        <option value="CAD"${m.defaultCurrency === 'CAD' ? ' selected' : ''}>CAD</option>
-        <option value="USD"${m.defaultCurrency === 'USD' ? ' selected' : ''}>USD</option></select></div>
-      <div class="costs-proposed-row"><span style="flex:1">Symbol suffix</span>
-        <input type="text" data-map-suffix value="${esc(suffix.suffix || '')}" placeholder=".TO" style="width:80px">
-        <select data-map-suffix-when><option value="">Any currency</option>
-        <option value="CAD"${suffix.whenCurrency === 'CAD' ? ' selected' : ''}>CAD only</option>
-        <option value="USD"${suffix.whenCurrency === 'USD' ? ' selected' : ''}>USD only</option></select></div>
-      ${investMapQuestions.length ? `<div class="note" style="margin:6px 0 4px">Questions from the mapping</div>
-        ${investMapQuestions.map((q, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(q)}</span>
-          <input type="text" data-map-answer-idx="${i}" placeholder="Your answer (optional)" style="flex:2"></div>`).join('')}` : ''}
-      <div class="toolbar" style="margin-top:6px">
-        <button type="button" class="primary small" data-map-confirm>Confirm mapping</button>
-        ${investMapReused ? '<button type="button" class="small" data-map-remap>Ask AI to re-map</button>' : ''}
-        <button type="button" class="small" data-map-cancel>Cancel</button>
-      </div></div>`;
-    renderMapValueRows();
-  };
-  const readMapEditor = () => {
-    const columns = {};
-    mapHost.querySelectorAll('[data-map-col]').forEach((sel) => { if (sel.value) columns[sel.dataset.mapCol] = sel.value; });
+  const readWizard = () => {
+    const col = (f) => {
+      const sel = mapHost.querySelector(`[data-wiz-col="${f}"]`);
+      return sel && sel.value ? sel.value : '';
+    };
     const values = {};
-    mapHost.querySelectorAll('[data-map-value-idx]').forEach((sel) => {
-      const raw = investMapValueList[Number(sel.dataset.mapValueIdx)];
+    mapHost.querySelectorAll('[data-wiz-value-idx]').forEach((sel) => {
+      const raw = investMapValueList[Number(sel.dataset.wizValueIdx)];
       if (raw !== undefined && sel.value) values[raw] = sel.value;
     });
-    const suffix = (mapHost.querySelector('[data-map-suffix]').value || '').trim();
-    const when = mapHost.querySelector('[data-map-suffix-when]').value || null;
+    const suffix = (mapHost.querySelector('[data-wiz-suffix]').value || '').trim();
+    const when = mapHost.querySelector('[data-wiz-suffix-when]').value || null;
     const answers = [];
-    mapHost.querySelectorAll('[data-map-answer-idx]').forEach((inp) => {
+    mapHost.querySelectorAll('[data-wiz-answer-idx]').forEach((inp) => {
       const a = inp.value.trim();
       if (a) answers.push(a);
     });
     return {
-      mapping: {
-        columns,
-        values,
-        defaultCurrency: mapHost.querySelector('[data-map-default-currency]').value || null,
-        symbolSuffix: suffix ? { suffix, whenCurrency: when } : null,
+      wizard: {
+        dateCol: col('date'), symbolCol: col('symbol'), nameCol: col('name'),
+        activityCol: col('activity'), unitsCol: col('units'), priceCol: col('price'),
+        amountCol: col('amount'), currencyCol: col('currency'),
+        splitAddedCol: col('splitAdded'), splitNewCol: col('splitNew'), splitOldCol: col('splitOld'),
+        defaultCurrency: mapHost.querySelector('[data-wiz-default-currency]').value || null,
+        valueTargets: values,
+        symbolSuffix: suffix, suffixWhenCurrency: when,
       },
       answers,
     };
   };
-  mapHost.addEventListener('change', (e) => {
-    if (e.target.matches('[data-map-col="activity"]')) {
-      // The value rows follow the activity column; keep targets
-      // for raw values that exist under the new column too.
-      investMapMapping = { ...investMapMapping, columns: { ...readMapEditor().mapping.columns } };
-      renderMapValueRows();
+  const refreshMapPreview = async () => {
+    const box = mapHost.querySelector('[data-wiz-preview]');
+    if (!box || investChatAccountId == null || !investMapCsv) return;
+    const seq = ++wizPreviewSeq;
+    const { wizard } = readWizard();
+    try {
+      const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/translate`, { method: 'POST', body: { csv: investMapCsv, mapping: wizardToEngine(wizard) } });
+      if (seq !== wizPreviewSeq || !mapHost.querySelector('[data-wiz-preview]')) return;
+      const target = mapHost.querySelector('[data-wiz-preview]');
+      target.innerHTML = (r.sentences || []).map((s) => `<div>${esc(s)}</div>`).join('')
+        || '<div class="note">No rows to preview.</div>';
+    } catch {
+      if (seq !== wizPreviewSeq) return;
+      const target = mapHost.querySelector('[data-wiz-preview]');
+      if (target && !target.innerHTML) target.innerHTML = '<div class="note">Preview unavailable right now.</div>';
     }
+  };
+  const renderMapEditor = () => {
+    if (!investMapStructure || !investMapWizard) { mapHost.innerHTML = ''; return; }
+    const w = investMapWizard;
+    const suffix = w.symbolSuffix || '';
+    mapHost.innerHTML = `<div class="costs-proposed"><h5>Map your CSV — what does each part mean?</h5>
+      ${investMapReused ? '<div class="note">Reused saved mapping for this file format — correct it below if needed, or ask AI to re-map.</div>' : ''}
+      ${investMapReply ? `<div class="note">${esc(investMapReply)}</div>` : ''}
+      <div class="note" style="margin:0 0 4px">${investMapStructure.rowCount} rows in this file</div>
+      <div class="note" style="margin:6px 0 4px">Step 1 — When did it happen?</div>
+      <div class="costs-proposed-row"><span style="flex:1">Date column</span>
+        <select data-wiz-col="date">${wizColOptions(w.dateCol)}</select></div>
+      <div class="note" style="margin:6px 0 4px">Step 2 — What was bought or sold?</div>
+      <div class="costs-proposed-row"><span style="flex:1">Symbol column</span>
+        <select data-wiz-col="symbol">${wizColOptions(w.symbolCol)}</select></div>
+      <div class="note" style="margin:6px 0 4px">Step 3 — How many units?</div>
+      <div class="costs-proposed-row"><span style="flex:1">Units column</span>
+        <select data-wiz-col="units">${wizColOptions(w.unitsCol)}</select></div>
+      <div class="note" style="margin:6px 0 4px">Step 4 — How do we tell buys from sells?</div>
+      <div class="costs-proposed-row"><span style="flex:1">Buy / sell column</span>
+        <select data-wiz-col="activity">${wizColOptions(w.activityCol)}</select></div>
+      <div data-wiz-values></div>
+      <details data-wiz-optional style="margin-top:6px"><summary>Optional fields</summary>
+        <div class="costs-proposed-row"><span style="flex:1">Name column</span>
+          <select data-wiz-col="name">${wizColOptions(w.nameCol)}</select></div>
+        <div class="note" style="margin:6px 0 4px">Step 5 — What did it cost? Pick whichever your file has; with totals only, the price per unit is derived.</div>
+        <div class="costs-proposed-row"><span style="flex:1">Price per unit column</span>
+          <select data-wiz-col="price">${wizColOptions(w.priceCol)}</select></div>
+        <div class="costs-proposed-row"><span style="flex:1">Total amount column</span>
+          <select data-wiz-col="amount">${wizColOptions(w.amountCol)}</select></div>
+        <div class="costs-proposed-row"><span style="flex:1">Split: added units column</span>
+          <select data-wiz-col="splitAdded">${wizColOptions(w.splitAddedCol || '')}</select></div>
+        <div class="costs-proposed-row"><span style="flex:1">Split: new side column</span>
+          <select data-wiz-col="splitNew">${wizColOptions(w.splitNewCol || '')}</select></div>
+        <div class="costs-proposed-row"><span style="flex:1">Split: old side column</span>
+          <select data-wiz-col="splitOld">${wizColOptions(w.splitOldCol || '')}</select></div>
+        <div class="note" style="margin:6px 0 4px">Currency &amp; symbols</div>
+        <div class="costs-proposed-row"><span style="flex:1">Currency column</span>
+          <select data-wiz-col="currency">${wizColOptions(w.currencyCol)}</select></div>
+        <div class="costs-proposed-row"><span style="flex:1">Default currency</span>
+          <select data-wiz-default-currency><option value="">(none — use currency column)</option>
+          <option value="CAD"${w.defaultCurrency === 'CAD' ? ' selected' : ''}>CAD</option>
+          <option value="USD"${w.defaultCurrency === 'USD' ? ' selected' : ''}>USD</option></select></div>
+        <div class="costs-proposed-row"><span style="flex:1">Symbol suffix</span>
+          <input type="text" data-wiz-suffix value="${esc(suffix)}" placeholder=".TO" style="width:80px">
+          <select data-wiz-suffix-when><option value="">Any currency</option>
+          <option value="CAD"${w.suffixWhenCurrency === 'CAD' ? ' selected' : ''}>CAD only</option>
+          <option value="USD"${w.suffixWhenCurrency === 'USD' ? ' selected' : ''}>USD only</option></select></div>
+      </details>
+      ${investMapQuestions.length ? `<div class="note" style="margin:6px 0 4px">Questions from the mapping</div>
+        ${investMapQuestions.map((q, i) => `<div class="costs-proposed-row"><span style="flex:1">${esc(q)}</span>
+          <input type="text" data-wiz-answer-idx="${i}" placeholder="Your answer (optional)" style="flex:2"></div>`).join('')}` : ''}
+      <div class="note" style="margin:6px 0 4px">Preview — your first rows in plain words</div>
+      <div data-wiz-preview></div>
+      <div class="toolbar" style="margin-top:6px">
+        <button type="button" class="primary small" data-map-confirm>Confirm mapping</button>
+        <button type="button" class="small" data-map-remap>Ask AI to re-map</button>
+        <button type="button" class="small" data-map-cancel>Cancel</button>
+      </div></div>`;
+    renderWizValueRows();
+    refreshMapPreview();
+  };
+  mapHost.addEventListener('change', (e) => {
+    if (e.target.matches('[data-wiz-col="activity"]')) {
+      investMapWizard = { ...investMapWizard, activityCol: e.target.value };
+      renderWizValueRows();
+    }
+    refreshMapPreview();
   });
   mapHost.addEventListener('click', async (e) => {
     if (e.target.closest('[data-map-cancel]')) {
-      investMapCsv = null; investMapStructure = null; investMapMapping = null;
+      investMapCsv = null; investMapStructure = null; investMapMapping = null; investMapWizard = null;
       investMapQuestions = []; investMapReply = ''; investMapReused = false; investMapValueList = [];
       mapHost.innerHTML = '';
       return;
@@ -6145,7 +6435,8 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       clearInvestChatMsg();
       try {
         const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/analyze`, { method: 'POST', body: { csv: investMapCsv, forceRefresh: true } });
-        investMapStructure = r.structure; investMapMapping = r.mapping; investMapQuestions = r.questions || [];
+        investMapStructure = r.structure; investMapMapping = r.mapping; investMapWizard = engineToWizard(r.mapping);
+        investMapQuestions = r.questions || [];
         investMapReply = r.reply || ''; investMapReused = !!r.reused;
         renderMapEditor();
       } catch (err) { showMsg(msg, 'err', err.message); }
@@ -6153,19 +6444,17 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
     }
     if (e.target.closest('[data-map-confirm]')) {
       if (investChatAccountId == null || !investMapCsv) return;
-      const { mapping, answers } = readMapEditor();
+      const { wizard, answers } = readWizard();
+      const mapping = wizardToEngine(wizard);
       if (!mapping.columns.date || !mapping.columns.symbol || !mapping.columns.activity) {
-        showMsg(msg, 'err', 'Pick the date, symbol and activity columns first.');
-        return;
+        showMsg(msg, 'err', 'Pick the date, symbol and activity columns first.'); return;
       }
       if (!mapping.columns.currency && !mapping.defaultCurrency) {
-        showMsg(msg, 'err', 'Pick a currency column or a default currency first.');
-        return;
+        showMsg(msg, 'err', 'Pick a currency column or a default currency first.'); return;
       }
       const unmapped = investMapValueList.filter((v) => !mapping.values[v]);
       if (unmapped.length) {
-        showMsg(msg, 'err', `Pick a target for every activity value (unmapped: ${unmapped.join(', ')}).`);
-        return;
+        showMsg(msg, 'err', `Pick a target for every activity value (unmapped: ${unmapped.join(', ')}).`); return;
       }
       clearInvestChatMsg();
       try {
@@ -6201,6 +6490,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       investMapCsv = text;
       investMapStructure = r.structure;
       investMapMapping = r.mapping;
+      investMapWizard = engineToWizard(r.mapping);
       investMapQuestions = r.questions || [];
       investMapReply = r.reply || '';
       investMapReused = !!r.reused;

@@ -28,7 +28,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts,
 } from './earnings.js';
-import { analyzeCsv, applyMappedCsv, proposeCsvMapping } from './csvMapImport.js';
+import { analyzeCsv, applyMappedCsv, proposeCsvMapping, translatePreview } from './csvMapImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -333,6 +333,25 @@ app.post('/api/investments/accounts/:id/import-csv-map/analyze', requireApiAuth,
     res.json({ structure, mapping: r.mapping, questions: r.questions, reply: r.reply, reused: false });
   } catch (err) {
     res.status(502).json({ error: err.message });
+  }
+});
+// Wizard live preview: the first rows of the file translated into
+// plain words with the mapping as it currently stands in the
+// editor. Read-only, writes nothing, and tolerates a partial
+// mapping (a missing column shows as a placeholder in the
+// sentence) so the user can see what is still unmapped.
+app.post('/api/investments/accounts/:id/import-csv-map/translate', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const csv = req.body && typeof req.body.csv === 'string' ? req.body.csv : '';
+  if (!csv) return res.status(400).json({ error: 'csv text is required' });
+  if (csv.length > 1024 * 1024) return res.status(400).json({ error: 'csv is too large (max 1 MB)' });
+  const mapping = req.body.mapping;
+  if (!mapping || typeof mapping !== 'object') return res.status(400).json({ error: 'mapping is required' });
+  try {
+    res.json({ sentences: translatePreview(csv, mapping, 5) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 app.post('/api/investments/accounts/:id/import-csv-map/preview', requireApiAuth, (req, res) => {
