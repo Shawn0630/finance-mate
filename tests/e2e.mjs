@@ -9246,8 +9246,8 @@ try {
         };
       });
       const geom = await shareGeom();
-      check('investments UI: the share doughnut sits side by side with the Total return chart on a wide viewport',
-        geom.share.left >= geom.chart.right - 1 && geom.share.top < geom.chart.bottom && geom.share.bottom > geom.chart.top,
+      check('investments UI: the share doughnut sits LEFT of the Total return chart on a wide viewport',
+        geom.share.right <= geom.chart.left + 1 && geom.share.top < geom.chart.bottom && geom.share.bottom > geom.chart.top,
         JSON.stringify(geom));
       const shareNow = () => page.evaluate(() => ({
         slices: window.__fmCharts.investShare ? window.__fmCharts.investShare.data.datasets[0].data.slice() : [],
@@ -9318,6 +9318,12 @@ try {
         JSON.stringify({ btn: shUsd.btn, sum: usdSum, total: usdTotal }));
       await page.click('#investDisplayBtn');
       await waitI(800);
+      await page.setViewport({ width: 700, height: 900 });
+      await waitI(400);
+      const narrowGeom = await shareGeom();
+      check('investments UI: on a narrow viewport the row stacks with the chart on top and the doughnut below it',
+        narrowGeom.share.top >= narrowGeom.chart.bottom - 1,
+        JSON.stringify(narrowGeom));
       await page.setViewport({ width: 800, height: 600 });
 
       // AI panel: a sell-heavy stub round must show both sell

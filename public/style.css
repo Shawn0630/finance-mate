@@ -310,6 +310,12 @@ label.btnlike:hover { background: #f0f4f9; }
 .invest-charts-row { display: flex; gap: 18px; flex-wrap: wrap; margin: 4px 0 10px; }
 .invest-main-chart { flex: 1 1 430px; min-width: 300px; }
 .invest-share-col { flex: 0 1 300px; min-width: 240px; }
+/* Share-first DOM order puts the doughnut left of the chart on
+   a wide row (the property costs pattern). Below the row's wrap
+   point (~816px viewport: main padding + panel padding eat 68px
+   off the 430 + 300 + 18px row) the row stacks, and this pulls
+   the chart back on top so the doughnut still wraps below it. */
+@media (max-width: 815px) { .invest-main-chart { order: -1; } }
 .invest-share-head h3 { margin: 0 0 4px; }
 .chart-wrap.invest-share { height: 280px; }
 .chart-wrap.costs-combo { height: 230px; }

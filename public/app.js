@@ -5275,12 +5275,12 @@ async function loadInvestmentsImpl() {
       <h3>Total return</h3>
       ${investRangeControlsHtml('investments')}
       <div class="invest-charts-row">
-        <div class="invest-main-chart"><div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div></div>
         <div class="invest-share-col">
           <div class="invest-share-head"><h3 id="investShareTitle">Account share</h3></div>
           <div class="invest-share-box" id="investShareWrap"><div class="chart-wrap invest-share"><canvas id="investShareChart"></canvas></div></div>
           <div class="note hidden" id="investShareEmpty">No account values yet.</div>
         </div>
+        <div class="invest-main-chart"><div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div></div>
       </div>
       <div class="cards" style="margin-top:12px">${cards || '<div class="note">No accounts yet — add one to start tracking.</div>'}</div>
     </div>
