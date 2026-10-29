@@ -5003,18 +5003,26 @@ const investShareCenterPlugin = {
   },
 };
 
-// The account-share doughnut: each account's CURRENT value as a
-// slice of the portfolio total. It reflects "now" and does not
-// follow the range control.
-function drawInvestShareChart(data, cur = 'CAD') {
+// The account-share doughnut: each account's share of value at
+// the END month of the range in force — the same picker that
+// drives the Total return chart re-renders it, no reload. For
+// a range ending at the last data month that is exactly
+// today's current values; a past end month shows that month's
+// split instead. Zero-value accounts are dropped, and the
+// heading names the as-of month so a historical split can
+// never be mistaken for current. Values arrive in the page's
+// display currency (the toggle round's seam); nothing here
+// converts or fetches.
+function drawInvestShareChart(accounts, cur = 'CAD', endMonth = null) {
   const canvas = $('#investShareChart');
   if (!canvas) return;
-  const accts = (data.accounts || []).filter((a) => a.summary && a.summary.value > 0);
-  investShareAccounts = accts.map((a) => a.account);
-  const total = accts.reduce((s, a) => s + a.summary.value, 0);
+  const { rows, total } = investShareAtMonth(accounts, endMonth);
+  investShareAccounts = rows.map((r) => r.account);
+  const title = $('#investShareTitle');
+  if (title) title.textContent = endMonth ? `Account share · ${formatYM(endMonth)}` : 'Account share';
   const empty = $('#investShareEmpty');
   const wrap = $('#investShareWrap');
-  if (!accts.length || total <= 0) {
+  if (!rows.length || total <= 0) {
     if (investShareChart) { investShareChart.destroy(); investShareChart = null; }
     investShareCenter = null;
     window.__fmCharts.investShare = null;
@@ -5029,10 +5037,10 @@ function drawInvestShareChart(data, cur = 'CAD') {
   investShareChart = new Chart(canvas, {
     type: 'doughnut',
     data: {
-      labels: accts.map((a) => a.account.name),
+      labels: rows.map((r) => r.account.name),
       datasets: [{
-        data: accts.map((a) => a.summary.value),
-        backgroundColor: accts.map((a) => investAccountColor(a.account)),
+        data: rows.map((r) => r.value),
+        backgroundColor: rows.map((r) => investAccountColor(r.account)),
         borderColor: '#fff', borderWidth: 1,
       }],
     },
@@ -5077,6 +5085,9 @@ function applyInvestRange(level) {
   conf.set(level === 'investments'
     ? drawInvestPortfolioChart($(conf.canvas), d, fSeries, d.cur)
     : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, !!d.gainUnknown));
+  // The portfolio doughnut follows the same range: its shares
+  // are the accounts' values at the range-end month.
+  if (level === 'investments') drawInvestShareChart(d.accounts, d.cur, r ? r.end : null);
   // A range change re-defaults the table to the latest year
   // in the new range; the year switcher only navigates within
   // the range in force.
@@ -5263,20 +5274,21 @@ async function loadInvestmentsImpl() {
     <div class="panel">
       <h3>Total return</h3>
       ${investRangeControlsHtml('investments')}
-      <div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div>
+      <div class="invest-charts-row">
+        <div class="invest-main-chart"><div class="chart-wrap tall"><canvas id="investPortfolioChart"></canvas></div></div>
+        <div class="invest-share-col">
+          <div class="invest-share-head"><h3 id="investShareTitle">Account share</h3></div>
+          <div class="invest-share-box" id="investShareWrap"><div class="chart-wrap invest-share"><canvas id="investShareChart"></canvas></div></div>
+          <div class="note hidden" id="investShareEmpty">No account values yet.</div>
+        </div>
+      </div>
       <div class="cards" style="margin-top:12px">${cards || '<div class="note">No accounts yet — add one to start tracking.</div>'}</div>
-    </div>
-    <div class="panel">
-      <h3>Account share</h3>
-      <div class="invest-share-box" id="investShareWrap"><div class="chart-wrap invest-share"><canvas id="investShareChart"></canvas></div></div>
-      <div class="note hidden" id="investShareEmpty">No account values yet.</div>
     </div>
     <div class="panel"><h3>Monthly returns</h3><div id="investPortfolioMonthly">${investMonthlyTable(data.monthly, cur)}</div>
       <div class="note" style="margin-left:0">All figures in ${cur}. Dividends count in the month's return, not in its end value. Grants count as contributions at their cost (or that day's market) price, never as profit.</div></div>`;
   investViewData.investments = { series: data.series, monthly: data.monthly, cur, nativePct: false, accounts: data.accounts, gainUnknown: !!data.summary.costUnknown };
   wireInvestRangeControls('investments');
   applyInvestRange('investments');
-  drawInvestShareChart(data, cur);
   $('#investDisplayBtn').addEventListener('click', () => {
     investDisplay.investments = investDisplay.investments === 'CAD' ? 'USD' : 'CAD';
     loadInvestmentsImpl();

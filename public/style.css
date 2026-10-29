@@ -307,6 +307,10 @@ label.btnlike:hover { background: #f0f4f9; }
 .costs-chart-head .range-btns { margin-left: auto; }
 .chart-wrap.costs-pie { height: 230px; }
 .invest-share-box { max-width: 320px; }
+.invest-charts-row { display: flex; gap: 18px; flex-wrap: wrap; margin: 4px 0 10px; }
+.invest-main-chart { flex: 1 1 430px; min-width: 300px; }
+.invest-share-col { flex: 0 1 300px; min-width: 240px; }
+.invest-share-head h3 { margin: 0 0 4px; }
 .chart-wrap.invest-share { height: 280px; }
 .chart-wrap.costs-combo { height: 230px; }
 .cost-year-block { margin: 0 0 14px; }

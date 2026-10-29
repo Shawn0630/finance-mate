@@ -9180,7 +9180,7 @@ try {
       await page.click('#invRangeBtns-investments button[data-months="12"]');
       await waitI(400);
       sh = await shareState();
-      check('investments UI: the stacked bars follow the range while the doughnut keeps the current shares',
+      check('investments UI: the stacked bars follow the range and the doughnut follows the range end (a preset ending at the last month still shows current shares)',
         sh.labels === 12 && sh.barSets.every((d) => d.len === 12) && sh.slices.length === posAccts.length,
         JSON.stringify({ labels: sh.labels, barLens: sh.barSets.map((d) => d.len), slices: sh.slices.length }));
       await page.click('#invRangeBtns-investments button[data-months="0"]');
@@ -9227,6 +9227,98 @@ try {
       check('investments UI: a second legend click restores the account in both charts',
         vis.bar === true && vis.slice === true && vis.struck === false,
         JSON.stringify(vis));
+
+      // Share doughnut: side by side with Total return, driven
+      // by the same picker — a past range end re-renders it to
+      // that month's split, and back to All restores current.
+      await page.setViewport({ width: 1400, height: 900 });
+      await waitI(300);
+      await page.click('#invRangeBtns-investments button[data-months="0"]');
+      await waitI(400);
+      const shareGeom = () => page.evaluate(() => {
+        const chart = document.querySelector('#investPortfolioChart').closest('.chart-wrap');
+        const share = document.querySelector('#investShareWrap');
+        const cr = chart.getBoundingClientRect();
+        const sr = share.getBoundingClientRect();
+        return {
+          chart: { left: cr.left, right: cr.right, top: cr.top, bottom: cr.bottom },
+          share: { left: sr.left, right: sr.right, top: sr.top, bottom: sr.bottom },
+        };
+      });
+      const geom = await shareGeom();
+      check('investments UI: the share doughnut sits side by side with the Total return chart on a wide viewport',
+        geom.share.left >= geom.chart.right - 1 && geom.share.top < geom.chart.bottom && geom.share.bottom > geom.chart.top,
+        JSON.stringify(geom));
+      const shareNow = () => page.evaluate(() => ({
+        slices: window.__fmCharts.investShare ? window.__fmCharts.investShare.data.datasets[0].data.slice() : [],
+        title: document.querySelector('#investShareTitle') ? document.querySelector('#investShareTitle').textContent : '',
+      }));
+      const curShares = await shareNow();
+      // Pick a past end month whose split actually differs from
+      // current, from the API series (the same data the page uses).
+      const pfNow = (await req('GET', '/api/investments')).data;
+      const sharesAt = (end) => {
+        const rows = [];
+        for (const a of pfNow.accounts || []) {
+          let v = 0; let best = '';
+          for (const p of a.series || []) if (p.month <= end && p.month > best) { best = p.month; v = p.value; }
+          if (v > 0) rows.push(v);
+        }
+        return rows;
+      };
+      const curJson = JSON.stringify(curShares.slices);
+      let pastEnd = null;
+      for (const m of (pfNow.monthly || []).map((x) => x.month)) {
+        if (JSON.stringify(sharesAt(m)) !== curJson) { pastEnd = m; break; }
+      }
+      check('investments UI: the fixture history has a past month whose account split differs from current',
+        !!pastEnd, JSON.stringify({ pastEnd, months: (pfNow.monthly || []).length }));
+      if (pastEnd) {
+        const pickInvestMonth = async (fieldSel, ym) => {
+          await page.click(fieldSel);
+          await page.waitForFunction(() => !document.querySelector('#invMonthPop-investments').classList.contains('hidden'), { timeout: 5000 });
+          const targetYear = Number(ym.slice(0, 4));
+          for (let i = 0; i < 40; i++) {
+            const y = await page.evaluate(() => Number(document.querySelector('#invMonthPop-investments .month-pop-year').textContent));
+            if (y === targetYear) break;
+            await page.click(`#invMonthPop-investments ${y < targetYear ? '[data-pop-next]' : '[data-pop-prev]'}`);
+            await waitI(120);
+          }
+          await page.click(`#invMonthPop-investments button[data-ym="${ym}"]`);
+          await waitI(300);
+        };
+        await pickInvestMonth('#invRangeEnd-investments', pastEnd);
+        const shPast = await shareNow();
+        const wantPast = sharesAt(pastEnd);
+        const monNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const wantTitle = `Account share · ${monNames[Number(pastEnd.slice(5, 7)) - 1]} ${pastEnd.slice(0, 4)}`;
+        check('investments UI: a past range end re-renders the doughnut to that month\'s account shares with its as-of label',
+          JSON.stringify(shPast.slices) === JSON.stringify(wantPast) && shPast.title === wantTitle,
+          JSON.stringify({ slices: shPast.slices, want: wantPast, title: shPast.title, wantTitle }));
+        await page.click('#invRangeBtns-investments button[data-months="0"]');
+        await waitI(400);
+        const shBack = await shareNow();
+        check('investments UI: back to All restores the current shares and the current as-of label',
+          JSON.stringify(shBack.slices) === curJson && shBack.title === curShares.title,
+          JSON.stringify({ slices: shBack.slices, title: shBack.title }));
+      }
+      // Display currency: the doughnut converts with the page.
+      await page.click('#investDisplayBtn');
+      await waitI(800);
+      const pfUsd = (await req('GET', '/api/investments?display=USD')).data;
+      const usdTotal = (pfUsd.accounts || []).reduce((s, a) => s + (a.summary.value > 0 ? a.summary.value : 0), 0);
+      const shUsd = await page.evaluate(() => ({
+        slices: window.__fmCharts.investShare ? window.__fmCharts.investShare.data.datasets[0].data.slice() : [],
+        btn: document.querySelector('#investDisplayBtn').textContent.trim(),
+        strip: document.querySelector('#section-investments .summary-strip').textContent,
+      }));
+      const usdSum = shUsd.slices.reduce((a, b) => a + b, 0);
+      check('investments UI: switching the page to USD converts the doughnut figures with currency labels',
+        shUsd.btn === 'Display: USD' && Math.abs(usdSum - usdTotal) <= 1 && shUsd.strip.includes('USD'),
+        JSON.stringify({ btn: shUsd.btn, sum: usdSum, total: usdTotal }));
+      await page.click('#investDisplayBtn');
+      await waitI(800);
+      await page.setViewport({ width: 800, height: 600 });
 
       // AI panel: a sell-heavy stub round must show both sell
       // proposals (one with the derived-price marker) and the
