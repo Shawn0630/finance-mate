@@ -22,7 +22,7 @@ import {
   listAccounts, getAccount, listHoldings, getHolding, listEvents, rebuildEventPricePoints,
   computeHolding, computeAccount, computePortfolio,
 } from './investments.js';
-import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities } from './prices.js';
+import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
@@ -2531,8 +2531,13 @@ app.put('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
 });
 
 app.delete('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
+  const doomed = listHoldings(db, Number(req.params.id)).map((h) => h.id);
   const info = db.prepare('DELETE FROM invest_accounts WHERE id = ?').run(Number(req.params.id));
   if (!info.changes) return res.status(404).json({ error: 'account not found' });
+  // Holdings cascade away, but their price-fetch stamps are
+  // plain app_meta rows — clear them so a later holding that
+  // reuses an id does not inherit a backoff or stale failure.
+  for (const id of doomed) clearHoldingPriceMeta(db, id);
   res.json({ ok: true });
 });
 
@@ -2601,6 +2606,7 @@ app.put('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
 app.delete('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
   const info = db.prepare('DELETE FROM invest_holdings WHERE id = ?').run(Number(req.params.id));
   if (!info.changes) return res.status(404).json({ error: 'holding not found' });
+  clearHoldingPriceMeta(db, Number(req.params.id));
   res.json({ ok: true });
 });
 

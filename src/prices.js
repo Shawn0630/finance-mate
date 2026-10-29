@@ -290,6 +290,16 @@ function clearMeta(db, key) {
   db.prepare('DELETE FROM app_meta WHERE key = ?').run(key);
 }
 
+// Price-fetch stamps are keyed by holding id, and SQLite
+// reuses a deleted row's id — so a deleted holding's stamps
+// must die with it. Otherwise the next holding to reuse the
+// id inherits a backoff (or a stale failure) and silently
+// skips its first fetch, sitting on event prices. Delete
+// endpoints call this for every holding they remove.
+export function clearHoldingPriceMeta(db, holdingId) {
+  for (const suffix of ['ok', 'try', 'err']) clearMeta(db, `invest_px_${holdingId}_${suffix}`);
+}
+
 const vancouverDateTimeFmt = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', hour12: false,

@@ -8413,6 +8413,11 @@ try {
       await invPost(pageAcctId, { label: 'Page Co', kind: 'exchange', symbol: 'PAGE.TO', currency: 'CAD', events: [
         { date: '2025-01-15', type: 'buy', units: 10, price: 100 },
       ] });
+      // Hop through the portfolio first: the new account may
+      // reuse the deleted banner account's id, and navigating
+      // to an identical hash would not reload the page.
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(500);
       await page.goto(`http://ff.local/#invest-account/${pageAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitI(800);
       const pageState = await page.evaluate(() => {

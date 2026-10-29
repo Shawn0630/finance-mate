@@ -20,7 +20,7 @@ import {
 } from '../src/investments.js';
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices, ensureHoldingPricesDetailed,
-  refreshAllPrices, priceStatusFor,
+  refreshAllPrices, priceStatusFor, clearHoldingPriceMeta,
   parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory,
 } from '../src/prices.js';
 import { handleAiInvestFillChat, normalizeProposedInvestments } from '../src/aiFill.js';
@@ -601,6 +601,46 @@ test('manual refresh retries once on timeout, fetch-on-read does not', async () 
     if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
     if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
     if (savedEnv.fx === undefined) delete process.env.FX_API_URL; else process.env.FX_API_URL = savedEnv.fx;
+    db.close();
+  }
+});
+
+test('deleted holding stamps die with it: a reused id fetches fresh, not the old backoff', async () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));
+  `);
+  const realFetch = globalThis.fetch;
+  const savedEnv = { s: process.env.STOOQ_BASE_URL, y: process.env.YAHOO_BASE_URL };
+  process.env.STOOQ_BASE_URL = 'http://stub.test/stooq/';
+  process.env.YAHOO_BASE_URL = 'http://stub.test/yahoo/';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+    return { ok: false, status: 500, json: async () => ({}) };
+  };
+  try {
+    const holding = { id: 5, kind: 'exchange', symbol: 'GONE.TO' };
+    assert.equal((await ensureHoldingPricesDetailed(db, holding)).ok, false);
+    assert.equal(priceStatusFor(db, holding, null).fetchFailedToday, true);
+    // The holding is deleted; SQLite may hand id 5 to the next
+    // holding. Without cleanup the new holding would inherit
+    // the 15-minute backoff and sit on event prices.
+    clearHoldingPriceMeta(db, 5);
+    assert.equal(priceStatusFor(db, holding, null).fetchFailedToday, false);
+    assert.equal(priceStatusFor(db, holding, null).lastError, null);
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+      const ts = (y, m, d) => Date.UTC(y, m, d) / 1000;
+      return { ok: true, json: async () => ({ chart: { result: [{ timestamp: [ts(2026, 0, 2)], indicators: { quote: [{ close: [42] }] } }], error: null } }) };
+    };
+    const r2 = await ensureHoldingPricesDetailed(db, holding);
+    assert.equal(r2.ok, true);
+    assert.equal(r2.source, 'yahoo');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
+    if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
     db.close();
   }
 });
