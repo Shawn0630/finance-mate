@@ -5403,9 +5403,9 @@ async function loadInvestHoldingImpl(id) {
     ? 'Bank funds have no public price feed here — record the fund\'s NAV from your statement and the charts trace it. Between snapshots the last NAV carries forward.'
     : 'Exchange prices are fetched automatically; a snapshot you add here outranks the fetched close on its date (a hand correction).';
   $('#investNavPriceLabel').textContent = h.kind === 'fund' ? 'NAV / unit' : 'Price / unit';
-  const navRows = data.navPoints.map((p) => `<tr><td>${esc(p.date)}</td>
+  const navRows = data.navPoints.map((p) => `<tr data-nav-row="${p.id}"><td>${esc(p.date)}</td>
       <td class="num">${moneyC(p.price, h.currency)}</td>
-      <td><button class="small danger" onclick="deleteInvestNav(${p.id})">Delete</button></td></tr>`).join('');
+      <td><button class="small" onclick="editInvestNav(${p.id})">Edit</button> <button class="small danger" onclick="deleteInvestNav(${p.id})">Delete</button></td></tr>`).join('');
   $('#investNavWrap').innerHTML = data.navPoints.length
     ? `<table><thead><tr><th>Date</th><th class="num">${h.kind === 'fund' ? 'NAV' : 'Price'}</th><th></th></tr></thead><tbody>${navRows}</tbody></table>`
     : '<div class="note">No snapshots yet.</div>';
@@ -5523,6 +5523,38 @@ async function deleteInvestNav(id) {
   loadInvestHolding(currentInvestHoldingId);
 }
 window.deleteInvestNav = deleteInvestNav;
+
+// Inline row edit. The price input is prefilled with the stored
+// full-precision figure (p.price), never the row's rounded 2dp
+// display — saving a rounded display value would corrupt a 4dp
+// NAV. A failed save leaves the row in edit mode so the error
+// can be fixed in place; Cancel reloads the holding, restoring
+// the row unchanged.
+function editInvestNav(id) {
+  const p = (investHoldingData.navPoints || []).find((x) => x.id === id);
+  const row = document.querySelector(`[data-nav-row="${id}"]`);
+  if (!p || !row) return;
+  row.innerHTML = `<td><input type="date" data-nav-date value="${esc(p.date)}"></td>
+      <td class="num"><input type="text" inputmode="decimal" data-money data-nav-price value="${esc(String(p.price))}" style="width:140px"></td>
+      <td><button class="small" onclick="saveInvestNav(${p.id})">Save</button> <button class="small" onclick="cancelInvestNav()">Cancel</button></td>`;
+  row.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+}
+window.editInvestNav = editInvestNav;
+
+async function saveInvestNav(id) {
+  const row = document.querySelector(`[data-nav-row="${id}"]`);
+  if (!row) return;
+  const date = row.querySelector('[data-nav-date]').value;
+  const price = parseMoneyInput(row.querySelector('[data-nav-price]').value);
+  try {
+    await api(`/api/investments/prices/${id}`, { method: 'PUT', body: { date, price } });
+    loadInvestHolding(currentInvestHoldingId);
+  } catch (err) { showMsg($('#investNavMsg'), 'err', err.message); }
+}
+window.saveInvestNav = saveInvestNav;
+
+function cancelInvestNav() { loadInvestHolding(currentInvestHoldingId); }
+window.cancelInvestNav = cancelInvestNav;
 
 // ------------------------------------------------------------ modals
 function openInvestAccountModal(id) {
@@ -6373,12 +6405,14 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       });
     }
     // NAV snapshots write through the same manual endpoint the
-    // holding page uses — Apply only ever writes checked rows.
+    // holding page uses — Apply only ever writes checked rows, and
+    // a checked conflict row is the user's explicit overwrite
+    // approval, so the flag travels with it.
     for (const n of chosenNav) {
       const { checked, conflict, oldPrice, holdingRef, ...fields } = n;
       const holdingId = n.holdingId != null ? n.holdingId : refToId.get(holdingRef);
       await api(`/api/investments/holdings/${holdingId}/nav`, {
-        method: 'POST', body: { date: fields.date, price: fields.price },
+        method: 'POST', body: { date: fields.date, price: fields.price, overwrite: true },
       });
     }
     const n = chosenHoldings.length + chosenEvents.length + chosenNav.length;

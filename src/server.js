@@ -19,6 +19,7 @@ import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmD
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
+  addNavPoint, updateNavPoint,
   listAccounts, getAccount, listHoldings, getHolding, listEvents, listPricePoints, rebuildEventPricePoints,
   computeHolding, computeAccount, computePortfolio, computeFillPreview,
 } from './investments.js';
@@ -2738,12 +2739,20 @@ app.post('/api/investments/holdings/:id/nav', requireApiAuth, (req, res) => {
   if (!holding) return res.status(404).json({ error: 'holding not found' });
   const v = validNavInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  const ts = nowIso();
-  db.prepare(
-    "INSERT INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, 'manual', ?) ON CONFLICT(holding_id, date, source) DO UPDATE SET price = excluded.price")
-    .run(holding.id, v.date, v.price, ts);
-  res.status(201).json(db.prepare(
-    "SELECT * FROM invest_prices WHERE holding_id = ? AND date = ? AND source = 'manual'").get(holding.id, v.date));
+  const r = addNavPoint(db, holding.id, v, { overwrite: req.body && req.body.overwrite === true });
+  if (r.error) return res.status(400).json({ error: r.error });
+  res.status(201).json(r);
+});
+
+// Inline row edit for a manual snapshot: date and price both
+// changeable, full precision in and out (the row's displayed
+// 2dp figure is never the edit value).
+app.put('/api/investments/prices/:id', requireApiAuth, (req, res) => {
+  const v = validNavInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const r = updateNavPoint(db, Number(req.params.id), v);
+  if (r.error) return res.status(r.notFound ? 404 : 400).json({ error: r.error });
+  res.json(r);
 });
 
 app.delete('/api/investments/prices/:id', requireApiAuth, (req, res) => {

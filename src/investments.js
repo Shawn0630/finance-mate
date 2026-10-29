@@ -298,6 +298,40 @@ export function validNavInput(b) {
   return { date: b.date, price };
 }
 
+// Manual price snapshots live in invest_prices with source
+// 'manual', one per (holding, date). A plain Add on an occupied
+// date must NOT silently overwrite it — the row's own Edit is the
+// way to change it. Only a caller carrying an explicit overwrite
+// (the Fill-with-AI Apply path, where the user checked a row the
+// conflict UI already flagged old → new) may replace in place.
+export function addNavPoint(db, holdingId, { date, price }, { overwrite = false } = {}) {
+  const existing = db.prepare(
+    "SELECT * FROM invest_prices WHERE holding_id = ? AND date = ? AND source = 'manual'").get(holdingId, date);
+  if (existing && !overwrite) {
+    return { error: `a snapshot already exists on ${date} — edit that row to change it` };
+  }
+  db.prepare(
+    "INSERT INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, 'manual', ?) ON CONFLICT(holding_id, date, source) DO UPDATE SET price = excluded.price")
+    .run(holdingId, date, price, new Date().toISOString());
+  return db.prepare(
+    "SELECT * FROM invest_prices WHERE holding_id = ? AND date = ? AND source = 'manual'").get(holdingId, date);
+}
+
+// A date-changing edit needs a real update, not an upsert: an
+// upsert keyed on the new date would strand the old row. Moving
+// onto another snapshot's date is a conflict, never a merge.
+export function updateNavPoint(db, id, { date, price }) {
+  const row = db.prepare('SELECT * FROM invest_prices WHERE id = ?').get(id);
+  if (!row) return { error: 'price point not found', notFound: true };
+  if (row.source !== 'manual') return { error: 'only manual price snapshots can be edited' };
+  const clash = db.prepare(
+    "SELECT id FROM invest_prices WHERE holding_id = ? AND date = ? AND source = 'manual' AND id != ?")
+    .get(row.holding_id, date, id);
+  if (clash) return { error: `a snapshot already exists on ${date} — edit that row instead` };
+  db.prepare('UPDATE invest_prices SET date = ?, price = ? WHERE id = ?').run(date, price, id);
+  return db.prepare('SELECT * FROM invest_prices WHERE id = ?').get(id);
+}
+
 // ------------------------------------------------------------ storage
 // Owners are a SET of usernames, exactly like properties: stored as a
 // JSON array in the `owners` column, read back as an array (empty when

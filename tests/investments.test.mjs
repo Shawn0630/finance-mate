@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import {
   validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
+  addNavPoint, updateNavPoint,
   getAccount, listAccounts,
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints, computeFillPreview,
@@ -225,6 +226,48 @@ test('validEventInput: per-type figures, grant price optional, sell guard', () =
   assert.ok(validEventInput({ date: '2026-01-01', type: 'sell', units: 11, price: 1 }, { events }).error);
   assert.deepEqual(validNavInput({ date: '2026-01-31', price: 31.25 }), { date: '2026-01-31', price: 31.25 });
   assert.ok(validNavInput({ date: '2026-01-31', price: 0 }).error);
+});
+
+// ------------------------------------------------------- NAV snapshots
+test('addNavPoint: an occupied date blocks without overwrite, yields with it', () => {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));`);
+  let r = addNavPoint(db, 5, { date: '2026-06-30', price: 92.0252 });
+  assert.equal(r.price, 92.0252);
+  r = addNavPoint(db, 5, { date: '2026-06-30', price: 94 });
+  assert.ok(r.error);
+  assert.equal(listPricePoints(db, 5).length, 1);
+  assert.equal(listPricePoints(db, 5)[0].price, 92.0252);
+  r = addNavPoint(db, 5, { date: '2026-06-30', price: 94 }, { overwrite: true });
+  assert.equal(r.price, 94);
+  assert.equal(listPricePoints(db, 5).length, 1);
+  db.close();
+});
+
+test('updateNavPoint: value edit, date move, occupied-date conflict, non-manual guard, precision round-trip', () => {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));`);
+  const ts = new Date().toISOString();
+  db.prepare("INSERT INTO invest_prices (holding_id, date, price, source, created_at) VALUES (5, '2026-06-30', 92.0252, 'manual', ?), (5, '2026-09-30', 94.3201, 'manual', ?), (5, '2026-06-30', 90, 'stooq', ?)")
+    .run(ts, ts, ts);
+  const jun = listPricePoints(db, 5).find((p) => p.date === '2026-06-30' && p.source === 'manual');
+  // Precision round-trip: saving a 4dp snapshot unchanged stores the identical value.
+  let r = updateNavPoint(db, jun.id, { date: '2026-06-30', price: 92.0252 });
+  assert.equal(r.price, 92.0252);
+  r = updateNavPoint(db, jun.id, { date: '2026-06-30', price: 92.5 });
+  assert.equal(r.price, 92.5);
+  r = updateNavPoint(db, jun.id, { date: '2026-09-30', price: 92.5 });
+  assert.ok(r.error);
+  assert.equal(listPricePoints(db, 5).filter((p) => p.source === 'manual').length, 2);
+  r = updateNavPoint(db, jun.id, { date: '2026-07-31', price: 92.5 });
+  assert.equal(r.date, '2026-07-31');
+  assert.deepEqual(listPricePoints(db, 5).filter((p) => p.source === 'manual').map((p) => p.date), ['2026-07-31', '2026-09-30']);
+  const stooq = listPricePoints(db, 5).find((p) => p.source === 'stooq');
+  r = updateNavPoint(db, stooq.id, { date: '2026-06-30', price: 91 });
+  assert.ok(r.error);
+  r = updateNavPoint(db, 999999, { date: '2026-06-30', price: 91 });
+  assert.equal(r.notFound, true);
+  db.close();
 });
 
 // ------------------------------------------------- event price rebuild

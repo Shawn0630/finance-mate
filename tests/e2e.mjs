@@ -7885,6 +7885,35 @@ try {
   check('investments: deleting the NAV snapshot restores the earlier value',
     r.status === 200 && r.data.summary.value === 3200, JSON.stringify(r.data.summary));
 
+  // NAV inline edit + occupied-date guard. The block restores the
+  // fund's snapshots exactly, so later totals are unaffected.
+  r = await req('POST', `/api/investments/holdings/${invFundId}/nav`, { date: '2026-02-28', price: 33 });
+  check('investments: Add on an occupied date no longer silently overwrites', r.status === 400, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/holdings/${invFundId}`);
+  check('investments: the blocked Add left the original snapshot untouched',
+    r.data.navPoints.find((p) => p.date === '2026-02-28').price === 32, JSON.stringify(r.data.navPoints));
+  r = await req('POST', `/api/investments/holdings/${invFundId}/nav`, { date: '2026-02-28', price: 33, overwrite: true });
+  check('investments: the AI-Apply overwrite flag still replaces (a checked conflict row)',
+    r.status === 201 && r.data.price === 33, JSON.stringify(r.data));
+  const invNavFebId = r.data.id;
+  r = await req('PUT', `/api/investments/prices/${invNavFebId}`, { date: '2026-02-28', price: 32.1234 });
+  check('investments: NAV edit changes the value at full precision', r.status === 200 && r.data.price === 32.1234, JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/holdings/${invFundId}`);
+  check('investments: the edited NAV reads back at full precision, not the 2dp display',
+    r.data.navPoints.find((p) => p.date === '2026-02-28').price === 32.1234, JSON.stringify(r.data.navPoints));
+  r = await req('PUT', `/api/investments/prices/${invNavFebId}`, { date: '2026-01-31', price: 32.1234 });
+  check('investments: NAV edit onto an occupied date is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/investments/prices/${invNavFebId}`, { date: '2026-03-31', price: 32.1234 });
+  check('investments: NAV edit moves the date (no stranded old row)', r.status === 200 && r.data.date === '2026-03-31', JSON.stringify(r.data));
+  r = await req('GET', `/api/investments/holdings/${invFundId}`);
+  check('investments: after the date move the old date is gone and the new date holds the value',
+    !r.data.navPoints.find((p) => p.date === '2026-02-28') && r.data.navPoints.find((p) => p.date === '2026-03-31').price === 32.1234,
+    JSON.stringify(r.data.navPoints));
+  r = await req('PUT', '/api/investments/prices/999999', { date: '2026-03-31', price: 1 });
+  check('investments: NAV edit of a missing point is a 404', r.status === 404, JSON.stringify(r.data));
+  r = await req('PUT', `/api/investments/prices/${invNavFebId}`, { date: '2026-02-28', price: 32 });
+  check('investments: NAV snapshots restored after the edit checks', r.status === 200 && r.data.price === 32, JSON.stringify(r.data));
+
   // Dividend round trip: returns count it, value does not.
   r = await invEvent(invXqqId, { date: '2026-03-10', type: 'dividend', amount: 25 });
   const invDivId = r.data.id;
@@ -8503,6 +8532,72 @@ try {
           && cibcPage.text.includes('2026-06-30') && cibcPage.text.includes('2026-09-30')
           && cibcPage.text.includes('Position'),
         JSON.stringify({ totalReturn: cibcPage.totalReturn, tail: cibcPage.text.slice(0, 400) }));
+      // NAV inline edit: Edit turns the row into inputs prefilled
+      // at full precision, Cancel restores, Save persists, and Add
+      // on an occupied date surfaces the guard message. The Jun
+      // NAV is restored via API afterwards so the conflict-panel
+      // checks below still see the original 92.0252.
+      const navEdit = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#investNavWrap tr[data-nav-row]')];
+        const jun = rows.find((tr) => tr.cells[0].textContent.trim() === '2026-06-30');
+        [...jun.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Edit').click();
+        return {
+          priceValue: jun.querySelector('[data-nav-price]').value,
+          dateValue: jun.querySelector('[data-nav-date]').value,
+        };
+      });
+      check('investments UI: NAV Edit prefills the stored full-precision price, not the rounded display',
+        navEdit.priceValue === '92.0252' && navEdit.dateValue === '2026-06-30', JSON.stringify(navEdit));
+      await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#investNavWrap tr[data-nav-row]')];
+        const jun = rows.find((tr) => tr.querySelector('[data-nav-date]'));
+        [...jun.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Cancel').click();
+      });
+      await waitI(800);
+      const navAfterCancel = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#investNavWrap tr[data-nav-row]')];
+        const jun = rows.find((tr) => tr.cells[0].textContent.trim() === '2026-06-30');
+        return { text: jun ? jun.textContent : null, editing: !!document.querySelector('[data-nav-price]') };
+      });
+      check('investments UI: NAV Cancel restores the row unchanged',
+        navAfterCancel.text && navAfterCancel.text.includes('92.03') && !navAfterCancel.editing, JSON.stringify(navAfterCancel));
+      await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#investNavWrap tr[data-nav-row]')];
+        const jun = rows.find((tr) => tr.cells[0].textContent.trim() === '2026-06-30');
+        [...jun.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Edit').click();
+        const priceInput = jun.querySelector('[data-nav-price]');
+        priceInput.value = '92.5';
+        priceInput.dispatchEvent(new Event('input', { bubbles: true }));
+        [...jun.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Save').click();
+      });
+      await waitI(800);
+      const navAfterSave = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#investNavWrap tr[data-nav-row]')];
+        const jun = rows.find((tr) => tr.cells[0].textContent.trim() === '2026-06-30');
+        return jun ? jun.textContent : null;
+      });
+      check('investments UI: NAV Save persists the edited value in the row',
+        navAfterSave && navAfterSave.includes('92.50'), JSON.stringify(navAfterSave));
+      await page.evaluate(() => {
+        const form = document.querySelector('#investNavForm');
+        form.elements.date.value = '2026-09-30';
+        form.elements.price.value = '95';
+        form.querySelector('button[type="submit"]').click();
+      });
+      await waitI(800);
+      const navAddGuard = await page.evaluate(() => ({
+        msg: document.querySelector('#investNavMsg').textContent,
+        sep: [...document.querySelectorAll('#investNavWrap tr[data-nav-row]')]
+          .find((tr) => tr.cells[0].textContent.trim() === '2026-09-30').textContent,
+      }));
+      check('investments UI: Add on an occupied date shows the guard message and leaves the row untouched',
+        navAddGuard.msg.includes('already exists') && navAddGuard.msg.includes('edit')
+          && navAddGuard.sep.includes('94.32'), JSON.stringify(navAddGuard));
+      r = await req('GET', `/api/investments/holdings/${invCibcId}`);
+      const cibcJun = r.data.navPoints.find((p) => p.date === '2026-06-30');
+      r = await req('PUT', `/api/investments/prices/${cibcJun.id}`, { date: '2026-06-30', price: 92.0252 });
+      check('investments UI: the edited Jun NAV is restored for the checks below',
+        r.status === 200 && r.data.price === 92.0252, JSON.stringify(r.data));
       // The chat panel renders conflict NAV rows unchecked.
       fs.writeFileSync(aiStubFile, JSON.stringify({
         reply: 'Same statement again.',
