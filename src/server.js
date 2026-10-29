@@ -3060,6 +3060,51 @@ app.delete('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (
 });
 
 // ---------------------------------------------------------------- summary ---
+// Overview asset-composition chart: Property + Stock history.
+// Read-only aggregation for the Overview panel only — it changes
+// no other endpoint's contract and never feeds net worth (stocks
+// stay OUT of /api/summary; this chart is a composition view).
+//   assessedByYear: yearly assessed totals, same carry-forward
+//     rule as /api/properties/portfolio — a property counts from
+//     its first known year on; a property with a stored assessed
+//     value but no history points contributes that one point.
+//   stockSeries: the Stocks engine's portfolio month-end series
+//     in CAD (the /api/investments pipeline, display pinned CAD).
+// No mortgage projection, no prime fetch, no BCA fetch here:
+// assessed points come from stored history, prices/FX refresh
+// under the same day gate as the Stocks page.
+app.get('/api/overview/chart', requireApiAuth, async (req, res) => {
+  const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+  const props = db.prepare('SELECT id, assessed_value, assessed_year FROM properties ORDER BY id').all();
+  const perProperty = props.map((p) => {
+    let points = historyPoints(p.id).map((pt) => ({ year: pt.year, value: pt.value }));
+    if (!points.length && p.assessed_value != null && p.assessed_year) {
+      points = [{ year: p.assessed_year, value: p.assessed_value }];
+    }
+    return points;
+  });
+  const years = [...new Set(perProperty.flatMap((pts) => pts.map((pt) => pt.year)))].sort((a, b) => a - b);
+  const assessedByYear = years.map((year) => {
+    let total = 0;
+    for (const pts of perProperty) {
+      let v = null;
+      for (const pt of pts) { if (pt.year <= year) v = pt.value; else break; }
+      if (v !== null) total += v;
+    }
+    return { year, total: r2(total) };
+  });
+  const holdings = listHoldings(db);
+  const fx = await prepareInvestScope(holdings, 'CAD');
+  const p = computePortfolio(db, fx, vancouverToday(), 'CAD');
+  res.json({
+    assessedByYear,
+    stockSeries: p.series.map((s) => ({ month: s.month, value: s.value })),
+    currentMonth: currentMonthKey(),
+    fxMissing: fx.missing,
+    hasUsdHoldings: holdings.some((h) => h.currency === 'USD'),
+  });
+});
+
 app.get('/api/summary', requireApiAuth, (req, res) => {
   const props = db.prepare('SELECT * FROM properties').all();
   const propertyValue = props.reduce((s, p) => s + (p.assessed_value || 0), 0);

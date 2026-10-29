@@ -7927,6 +7927,25 @@ try {
   r = await req('GET', `/api/investments/holdings/${invXqqId}`);
   check('investments: a CAD holding page opens in CAD',
     r.data.display === 'CAD' && r.data.summary.value === 3300, JSON.stringify(r.data.summary));
+  // ---- overview chart endpoint ----
+  // The Overview panel's data: assessed totals by year must
+  // match the property portfolio's, and the stock series must
+  // match the Stocks portfolio's CAD series — one endpoint,
+  // no recomputation, no net-worth involvement. Portfolio first
+  // (its BCA refresh, if any, lands before both reads).
+  const pfForOv = (await req('GET', '/api/properties/portfolio')).data;
+  r = await req('GET', '/api/overview/chart');
+  const ovChart = r.data;
+  const invForOv = (await req('GET', '/api/investments')).data;
+  check('overview chart: assessed totals match the property portfolio',
+    JSON.stringify(ovChart.assessedByYear) === JSON.stringify(pfForOv.assessedByYear),
+    JSON.stringify({ ov: ovChart.assessedByYear, pf: pfForOv.assessedByYear }));
+  check('overview chart: stock series matches the Stocks portfolio CAD series',
+    JSON.stringify(ovChart.stockSeries) === JSON.stringify((invForOv.series || []).map((s) => ({ month: s.month, value: s.value }))),
+    JSON.stringify({ ov: (ovChart.stockSeries || []).slice(0, 3), inv: (invForOv.series || []).slice(0, 3) }));
+  check('overview chart: current month is a YYYY-MM month',
+    typeof ovChart.currentMonth === 'string' && /^\d{4}-\d{2}$/.test(ovChart.currentMonth),
+    JSON.stringify({ currentMonth: ovChart.currentMonth }));
   // Account defaults derive from the holdings; a stored
   // setting beats the derivation; Auto restores it.
   r = await req('GET', `/api/investments/accounts/${invRsuId}`);
@@ -9324,6 +9343,142 @@ try {
       check('investments UI: on a narrow viewport the row stacks with the chart on top and the doughnut below it',
         narrowGeom.share.top >= narrowGeom.chart.bottom - 1,
         JSON.stringify(narrowGeom));
+      await page.setViewport({ width: 800, height: 600 });
+
+      // Overview chart panel: left share doughnut (Property +
+      // Stock), right history chart (stacked bars + total line),
+      // same range picker driving both; the strip above must
+      // not move (stocks stay out of net worth).
+      await page.goto('http://ff.local/#assets/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.setViewport({ width: 1400, height: 900 });
+      await waitI(600);
+      await page.waitForFunction(() => {
+        const t = document.querySelector('#overviewShareTitle');
+        return t && t.textContent.length > 0;
+      }, { timeout: 10000 });
+      const ovGeom = await page.evaluate(() => {
+        const chart = document.querySelector('#overviewChart').closest('.chart-wrap');
+        const share = document.querySelector('#overviewShareWrap');
+        const cr = chart.getBoundingClientRect();
+        const sr = share.getBoundingClientRect();
+        return {
+          chart: { left: cr.left, right: cr.right, top: cr.top, bottom: cr.bottom },
+          share: { left: sr.left, right: sr.right, top: sr.top, bottom: sr.bottom },
+        };
+      });
+      check('overview UI: the asset share doughnut sits LEFT of the history chart on a wide viewport',
+        ovGeom.share.right <= ovGeom.chart.left + 1 && ovGeom.share.top < ovGeom.chart.bottom && ovGeom.share.bottom > ovGeom.chart.top,
+        JSON.stringify(ovGeom));
+      // Expectations computed from the endpoint's own data with
+      // the same merge rules the panel uses.
+      const ovApi = (await req('GET', '/api/overview/chart')).data;
+      const ovPropAt = (m) => {
+        const y = Number(m.slice(0, 4));
+        let v = 0;
+        for (const row of ovApi.assessedByYear || []) { if (row.year <= y) v = row.total; else break; }
+        return v;
+      };
+      const ovStockAt = (m) => {
+        let v = 0; let best = '';
+        for (const p of ovApi.stockSeries || []) if (p.month <= m && p.month > best) { best = p.month; v = p.value; }
+        return v;
+      };
+      const ovMonths = (() => {
+        const set = new Set((ovApi.stockSeries || []).map((p) => p.month));
+        const years = (ovApi.assessedByYear || []).map((r) => r.year);
+        if (years.length) {
+          let m = `${Math.min(...years)}-01`;
+          while (m <= ovApi.currentMonth) {
+            set.add(m);
+            const y = Number(m.slice(0, 4)); const mo = Number(m.slice(5, 7));
+            m = mo === 12 ? `${y + 1}-01` : `${y}-${String(mo + 1).padStart(2, '0')}`;
+          }
+        }
+        return [...set].sort();
+      })();
+      const ovShareNow = () => page.evaluate(() => ({
+        labels: window.__fmCharts.overviewShare ? window.__fmCharts.overviewShare.data.labels.slice() : [],
+        data: window.__fmCharts.overviewShare ? window.__fmCharts.overviewShare.data.datasets[0].data.slice() : [],
+        title: document.querySelector('#overviewShareTitle') ? document.querySelector('#overviewShareTitle').textContent : '',
+      }));
+      const ovChartData = () => page.evaluate(() => {
+        const c = window.__fmCharts.overview;
+        if (!c) return null;
+        return {
+          labels: c.data.labels.slice(),
+          sets: c.data.datasets.map((d) => ({ label: d.label, type: d.type || 'line', data: d.data.slice() })),
+        };
+      });
+      const ovMonNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const ovTitle = (m) => `Asset share · ${ovMonNames[Number(m.slice(5, 7)) - 1]} ${m.slice(0, 4)}`;
+      const ovLastMonth = ovMonths[ovMonths.length - 1];
+      const ovSh0 = await ovShareNow();
+      const ovWant0 = [];
+      if (ovPropAt(ovLastMonth) > 0) ovWant0.push(['Property', ovPropAt(ovLastMonth)]);
+      if (ovStockAt(ovLastMonth) > 0) ovWant0.push(['Stock', ovStockAt(ovLastMonth)]);
+      check('overview UI: the doughnut has Property + Stock portions at the range-end month with its as-of label',
+        JSON.stringify(ovSh0.labels) === JSON.stringify(ovWant0.map((w) => w[0]))
+          && JSON.stringify(ovSh0.data) === JSON.stringify(ovWant0.map((w) => w[1]))
+          && ovSh0.title === ovTitle(ovLastMonth),
+        JSON.stringify({ labels: ovSh0.labels, data: ovSh0.data, title: ovSh0.title, want: ovWant0, wantTitle: ovTitle(ovLastMonth) }));
+      const ovHd0 = await ovChartData();
+      const ovBarsOk = ovHd0 && ovHd0.sets.length === 3
+        && ovHd0.sets[0].label === 'Property' && ovHd0.sets[1].label === 'Stock'
+        && ovHd0.sets[0].type === 'bar' && ovHd0.sets[1].type === 'bar'
+        && ovHd0.labels.length === ovMonths.length
+        && ovHd0.sets[2].data.every((v, i) => Math.abs(v - (ovHd0.sets[0].data[i] + ovHd0.sets[1].data[i])) < 0.011)
+        && ovHd0.sets[0].data.every((v, i) => Math.abs(v - ovPropAt(ovHd0.labels[i])) < 0.011)
+        && ovHd0.sets[1].data.every((v, i) => Math.abs(v - ovStockAt(ovHd0.labels[i])) < 0.011);
+      check('overview UI: history bars stack Property + Stock and the total line equals their sum',
+        !!ovBarsOk, JSON.stringify(ovHd0 ? { labels: ovHd0.labels.length, sets: ovHd0.sets.map((s) => s.label) } : null));
+      const ovStripBefore = await page.evaluate(() => document.querySelector('#section-overview .summary-strip').textContent);
+      const ovCurShareJson = JSON.stringify(ovSh0.data);
+      let ovPastEnd = null;
+      for (const m of ovMonths) {
+        const w = [];
+        if (ovPropAt(m) > 0) w.push(ovPropAt(m));
+        if (ovStockAt(m) > 0) w.push(ovStockAt(m));
+        if (JSON.stringify(w) !== ovCurShareJson) { ovPastEnd = m; break; }
+      }
+      check('overview UI: the fixture history has a past month whose Property/Stock split differs from current',
+        !!ovPastEnd, JSON.stringify({ ovPastEnd, months: ovMonths.length }));
+      if (ovPastEnd) {
+        const pickOvMonth = async (fieldSel, ym) => {
+          await page.click(fieldSel);
+          await page.waitForFunction(() => !document.querySelector('#invMonthPop-overview').classList.contains('hidden'), { timeout: 5000 });
+          const targetYear = Number(ym.slice(0, 4));
+          for (let i = 0; i < 40; i++) {
+            const y = await page.evaluate(() => Number(document.querySelector('#invMonthPop-overview .month-pop-year').textContent));
+            if (y === targetYear) break;
+            await page.click(`#invMonthPop-overview ${y < targetYear ? '[data-pop-next]' : '[data-pop-prev]'}`);
+            await waitI(120);
+          }
+          await page.click(`#invMonthPop-overview button[data-ym="${ym}"]`);
+          await waitI(300);
+        };
+        await pickOvMonth('#invRangeEnd-overview', ovPastEnd);
+        const shPast = await ovShareNow();
+        const wantPast = [];
+        if (ovPropAt(ovPastEnd) > 0) wantPast.push(ovPropAt(ovPastEnd));
+        if (ovStockAt(ovPastEnd) > 0) wantPast.push(ovStockAt(ovPastEnd));
+        check('overview UI: a past range end re-renders the doughnut to that month\'s Property/Stock split with its as-of label',
+          JSON.stringify(shPast.data) === JSON.stringify(wantPast) && shPast.title === ovTitle(ovPastEnd),
+          JSON.stringify({ data: shPast.data, want: wantPast, title: shPast.title, wantTitle: ovTitle(ovPastEnd) }));
+        await page.click('#invRangeBtns-overview button[data-months="0"]');
+        await waitI(400);
+      }
+      const ovStripAfter = await page.evaluate(() => document.querySelector('#section-overview .summary-strip').textContent);
+      const ovStripCards = await page.evaluate(() => document.querySelectorAll('#section-overview .summary-strip .summary-card').length);
+      const ovSumApi = (await req('GET', '/api/summary')).data;
+      const ovStripNet = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#section-overview .summary-strip .summary-card')];
+        const net = cards.find((c) => c.textContent.includes('Net worth'));
+        const num = net ? Number(net.textContent.replace(/[^0-9.\-]/g, '')) : NaN;
+        return num;
+      });
+      check('overview UI: the net-worth strip is unchanged by the chart panel (stocks still excluded)',
+        ovStripBefore === ovStripAfter && ovStripCards === 4 && Math.abs(ovStripNet - ovSumApi.netWorth) < 0.01,
+        JSON.stringify({ cards: ovStripCards, stripNet: ovStripNet, apiNet: ovSumApi.netWorth }));
       await page.setViewport({ width: 800, height: 600 });
 
       // AI panel: a sell-heavy stub round must show both sell

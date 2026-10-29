@@ -399,6 +399,7 @@ function route() {
     showSection(ASSET_SECTIONS.some((s) => s.key === key) ? key : 'overview');
     loadAssets();
     if (key === 'investments') loadInvestments();
+    if (key === 'overview') loadOverviewChart();
     // Portfolio charts created while the section was hidden have a
     // zero-size canvas; redraw them once it is actually on screen.
     if (key === 'properties') requestAnimationFrame(redrawPortfolioIfCollapsed);
@@ -587,6 +588,55 @@ async function loadEquity(id) { return withLoading(() => loadEquityImpl(id)); }
 async function loadInvestments() { investDisplay.investments = 'CAD'; return withLoading(() => loadInvestmentsImpl()); }
 async function loadInvestAccount(id) { investDisplay.investAccount = null; return withLoading(() => loadInvestAccountImpl(id)); }
 async function loadInvestHolding(id) { investDisplay.investHolding = null; return withLoading(() => loadInvestHoldingImpl(id)); }
+
+// Overview chart panel: rendered on every visit to the Overview
+// section (fresh data each time, like the Stocks page reloads).
+// The summary strip above it is untouched — this panel is an
+// asset-composition view only and never feeds net worth.
+async function loadOverviewChart() { return withLoading(() => loadOverviewChartImpl()); }
+async function loadOverviewChartImpl() {
+  const host = $('#overviewChartPanel');
+  if (!host) return;
+  const old = INVEST_LEVEL_CONF.overview.get();
+  if (old) old.destroy();
+  if (overviewShareChart) { overviewShareChart.destroy(); overviewShareChart = null; }
+  overviewShareCenter = null;
+  window.__fmCharts.overview = null;
+  window.__fmCharts.overviewShare = null;
+  host.innerHTML = `
+    <div class="panel">
+      <h3>Assets over time</h3>
+      ${investRangeControlsHtml('overview')}
+      <div class="invest-charts-row">
+        <div class="invest-share-col">
+          <div class="invest-share-head"><h3 id="overviewShareTitle">Asset share</h3></div>
+          <div class="invest-share-box" id="overviewShareWrap"><div class="chart-wrap invest-share"><canvas id="overviewShareChart"></canvas></div></div>
+          <div class="note hidden" id="overviewShareEmpty">No asset values yet.</div>
+        </div>
+        <div class="invest-main-chart"><div class="chart-wrap tall"><canvas id="overviewChart"></canvas></div></div>
+      </div>
+      <div class="note">Property is assessed values (BC Assessment, not market prices); Stock is holding market values in CAD. This composition view does not change net worth.</div>
+    </div>`;
+  const data = await api('/api/overview/chart');
+  if (currentSection !== 'overview') return;
+  if (data.fxMissing && data.hasUsdHoldings) {
+    const row = host.querySelector('.invest-charts-row');
+    if (row) {
+      const warn = document.createElement('div');
+      warn.className = 'msg warn';
+      warn.textContent = 'USD/CAD rates are unavailable right now — USD holdings are shown unconverted in the Stock totals.';
+      row.before(warn);
+    }
+  }
+  const monthly = overviewMonthly(data.assessedByYear, data.stockSeries, data.currentMonth);
+  investViewData.overview = {
+    series: monthly.map((m) => ({ month: m.month, value: m.total })),
+    monthly, cur: 'CAD',
+    assessedByYear: data.assessedByYear, stockSeries: data.stockSeries,
+  };
+  wireInvestRangeControls('overview');
+  applyInvestRange('overview');
+}
 
 function markAssetsDirty() { assetsLoaded = false; }
 
@@ -4811,6 +4861,7 @@ const investRanges = {
   investments: { months: 0, custom: null },
   investAccount: { months: 0, custom: null },
   investHolding: { months: 0, custom: null },
+  overview: { months: 0, custom: null },
 };
 const investViewData = {}; // level -> { series, monthly, cur, nativePct }
 let invPop = null; // { level, which: 'start'|'end', year }
@@ -4869,6 +4920,10 @@ const INVEST_LEVEL_CONF = {
     canvas: '#investHoldingChart', key: 'investHolding', monthly: '#investHoldingMonthly',
     get: () => investHoldingChart, set: (c) => { investHoldingChart = c; window.__fmCharts.invest = c; },
   },
+  overview: {
+    canvas: '#overviewChart', key: 'overview', monthly: null,
+    get: () => overviewChart, set: (c) => { overviewChart = c; window.__fmCharts.overview = c; },
+  },
 };
 
 // Account colors: one fixed palette shared by the share
@@ -4888,6 +4943,9 @@ const investHiddenAccounts = new Set();
 let investShareChart = null;
 let investShareAccounts = []; // account rows in doughnut order
 let investShareCenter = null; // { total } for the center plugin
+let overviewChart = null;
+let overviewShareChart = null;
+let overviewShareCenter = null; // { total } for the overview center plugin
 
 function toggleInvestAccount(id) {
   if (investHiddenAccounts.has(id)) investHiddenAccounts.delete(id);
@@ -4979,6 +5037,128 @@ function drawInvestPortfolioChart(canvas, data, fSeries, cur = 'CAD') {
   chart.update();
   window.__fmCharts.investments = chart;
   return chart;
+}
+
+// The Overview panel's history chart: per-month stacked bars
+// (Property + Stock segments) under a total line — the Stocks
+// Total return chart's shape with exactly two portions. Hover
+// carries the property charts' vertical dashed guide line; the
+// doughnut below pops its slice out on hover (hoverOffset 10,
+// the property portfolio pie's value). All figures CAD.
+function drawOverviewHistoryChart(canvas, months, cur = 'CAD') {
+  if (!canvas) return null;
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: months.map((r) => r.month),
+      datasets: [
+        { type: 'bar', label: 'Property', data: months.map((r) => r.property), backgroundColor: '#1668c4', stack: 'value', order: 3, maxBarThickness: 28 },
+        { type: 'bar', label: 'Stock', data: months.map((r) => r.stock), backgroundColor: '#d97b29', stack: 'value', order: 3, maxBarThickness: 28 },
+        { label: `Total (${cur})`, data: months.map((r) => r.total), borderColor: '#22303c', backgroundColor: '#22303c', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: moneyTick } } },
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            label: (c) => {
+              const total = months[c.dataIndex] ? months[c.dataIndex].total : 0;
+              if (c.dataset.type === 'bar') {
+                const pct = total ? ((c.parsed.y / total) * 100).toFixed(1) : '0.0';
+                return `${c.dataset.label}: ${moneyC(c.parsed.y, cur)} (${pct}%)`;
+              }
+              return `${c.dataset.label}: ${moneyC(c.parsed.y, cur)}`;
+            },
+          },
+        },
+      },
+    },
+    plugins: [guideLinePlugin],
+  });
+  window.__fmCharts.overview = chart;
+  return chart;
+}
+
+// The Overview panel's center plugin (the costs pie's center
+// plugin, same typography): the range-end total in the hole.
+const overviewShareCenterPlugin = {
+  id: 'overviewShareCenter',
+  afterDraw(chart) {
+    if (!overviewShareCenter || chart !== overviewShareChart) return;
+    const area = chart.chartArea;
+    const x = (area.left + area.right) / 2;
+    const y = (area.top + area.bottom) / 2;
+    const c = chart.ctx;
+    c.save();
+    c.textAlign = 'center';
+    c.fillStyle = '#71808f';
+    c.font = '11px system-ui, sans-serif';
+    c.fillText('Total value', x, y - 4);
+    c.fillStyle = '#22303c';
+    c.font = '700 14px system-ui, sans-serif';
+    c.fillText(moneyC(overviewShareCenter.total, 'CAD'), x, y + 14);
+    c.restore();
+  },
+};
+
+// The Overview share doughnut: Property vs Stock at the END
+// month of the range in force — the Stocks share doughnut's
+// rule, with an as-of month in the heading so a historical
+// split can never be mistaken for current. Zero-value portions
+// are dropped. Values are CAD; nothing here converts or fetches.
+function drawOverviewShareChart(assessedByYear, stockSeries, endMonth = null) {
+  const canvas = $('#overviewShareChart');
+  if (!canvas) return;
+  const { rows, total } = overviewShareAtMonth(assessedByYear, stockSeries, endMonth);
+  const title = $('#overviewShareTitle');
+  if (title) title.textContent = endMonth ? `Asset share · ${formatYM(endMonth)}` : 'Asset share';
+  const empty = $('#overviewShareEmpty');
+  const wrap = $('#overviewShareWrap');
+  if (!rows.length || total <= 0) {
+    if (overviewShareChart) { overviewShareChart.destroy(); overviewShareChart = null; }
+    overviewShareCenter = null;
+    window.__fmCharts.overviewShare = null;
+    if (wrap) wrap.classList.add('hidden');
+    if (empty) empty.classList.remove('hidden');
+    return;
+  }
+  if (wrap) wrap.classList.remove('hidden');
+  if (empty) empty.classList.add('hidden');
+  overviewShareCenter = { total };
+  if (overviewShareChart) overviewShareChart.destroy();
+  overviewShareChart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels: rows.map((r) => r.label),
+      datasets: [{
+        data: rows.map((r) => r.value),
+        backgroundColor: rows.map((r) => (r.label === 'Property' ? '#1668c4' : '#d97b29')),
+        borderColor: '#fff', borderWidth: 1,
+        hoverOffset: 10,
+      }],
+    },
+    plugins: [overviewShareCenterPlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '58%',
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            label: (item) => {
+              const t = item.dataset.data.reduce((a, b) => a + b, 0);
+              const pct = t ? ((item.parsed / t) * 100).toFixed(1) : '0.0';
+              return ` ${item.label}: ${moneyC(item.parsed, 'CAD')} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+  window.__fmCharts.overviewShare = overviewShareChart;
 }
 
 // The portfolio total in the doughnut's hole (the costs pie's
@@ -5082,17 +5262,27 @@ function applyInvestRange(level) {
   const fSeries = (d.series || []).filter((x) => inR(x.month));
   const old = conf.get();
   if (old) old.destroy();
-  conf.set(level === 'investments'
-    ? drawInvestPortfolioChart($(conf.canvas), d, fSeries, d.cur)
-    : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, !!d.gainUnknown));
+  if (level === 'overview') {
+    // The Overview panel has no monthly table: its history
+    // chart draws the filtered monthly rows (Property + Stock
+    // stacked bars under a total line) and its doughnut follows
+    // the same range-end rule as the Stocks share doughnut.
+    const fMonths = (d.monthly || []).filter((x) => inR(x.month));
+    conf.set(drawOverviewHistoryChart($(conf.canvas), fMonths, 'CAD'));
+    drawOverviewShareChart(d.assessedByYear, d.stockSeries, r ? r.end : null);
+  } else {
+    conf.set(level === 'investments'
+      ? drawInvestPortfolioChart($(conf.canvas), d, fSeries, d.cur)
+      : drawInvestChart($(conf.canvas), conf.key, fSeries, d.cur, !!d.gainUnknown));
+  }
   // The portfolio doughnut follows the same range: its shares
   // are the accounts' values at the range-end month.
   if (level === 'investments') drawInvestShareChart(d.accounts, d.cur, r ? r.end : null);
   // A range change re-defaults the table to the latest year
   // in the new range; the year switcher only navigates within
-  // the range in force.
+  // the range in force. Levels without a table (overview) skip it.
   investYearPage[level] = null;
-  renderInvestMonthlyOnly(level);
+  if (conf.monthly) renderInvestMonthlyOnly(level);
   syncInvestRangeInputs(level);
 }
 
