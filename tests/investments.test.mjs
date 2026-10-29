@@ -18,7 +18,8 @@ import {
   splitMultiplier, splitFactorAfter, adjustedUnitsOf,
 } from '../src/investments.js';
 import {
-  parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices,
+  parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices, ensureHoldingPricesDetailed,
+  refreshAllPrices, priceStatusFor,
   parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory,
 } from '../src/prices.js';
 import { handleAiInvestFillChat, normalizeProposedInvestments } from '../src/aiFill.js';
@@ -503,6 +504,102 @@ test('ensureHoldingPrices: Stooq empty falls back to Yahoo; Stooq data never con
     globalThis.fetch = realFetch;
     if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
     if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    db.close();
+  }
+});
+
+test('price failures are loud: detailed result carries the verbatim error and priceStatusFor reports it', async () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));
+  `);
+  const realFetch = globalThis.fetch;
+  const savedEnv = { s: process.env.STOOQ_BASE_URL, y: process.env.YAHOO_BASE_URL };
+  process.env.STOOQ_BASE_URL = 'http://stub.test/stooq/';
+  process.env.YAHOO_BASE_URL = 'http://stub.test/yahoo/';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  try {
+    const holding = { id: 9, kind: 'exchange', symbol: 'ZZFAIL.TO' };
+    const r = await ensureHoldingPricesDetailed(db, holding);
+    assert.equal(r.ok, false);
+    assert.equal(r.source, null);
+    assert.equal(r.error, 'yahoo fetch failed: HTTP 404');
+    // The boolean wrapper keeps its old contract.
+    assert.equal(await ensureHoldingPrices(db, { id: 10, kind: 'exchange', symbol: 'ZZFAIL.TO' }), false);
+    const st = priceStatusFor(db, holding, null);
+    assert.equal(st.fetchFailedToday, true);
+    assert.equal(st.lastError, 'yahoo fetch failed: HTTP 404');
+    assert.match(st.lastAttemptAt, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    // A later success clears the recorded failure.
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+      const ts = (y, m, d) => Date.UTC(y, m, d) / 1000;
+      return { ok: true, json: async () => ({ chart: { result: [{ timestamp: [ts(2026, 0, 2)], indicators: { quote: [{ close: [42] }] } }], error: null } }) };
+    };
+    db.prepare("DELETE FROM app_meta WHERE key = 'invest_px_9_ok'").run();
+    db.prepare("DELETE FROM app_meta WHERE key = 'invest_px_9_try'").run();
+    assert.equal((await ensureHoldingPricesDetailed(db, holding)).ok, true);
+    const st2 = priceStatusFor(db, holding, null);
+    assert.equal(st2.lastError, null);
+    assert.equal(st2.fetchFailedToday, false);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
+    if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    db.close();
+  }
+});
+
+test('manual refresh retries once on timeout, fetch-on-read does not', async () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));
+  `);
+  const realFetch = globalThis.fetch;
+  const savedEnv = { s: process.env.STOOQ_BASE_URL, y: process.env.YAHOO_BASE_URL, fx: process.env.FX_API_URL };
+  process.env.STOOQ_BASE_URL = 'http://stub.test/stooq/';
+  process.env.YAHOO_BASE_URL = 'http://stub.test/yahoo/';
+  process.env.FX_API_URL = 'http://stub.test/fx/';
+  const timeoutErr = () => { const e = new Error('The operation timed out.'); e.name = 'TimeoutError'; return e; };
+  let calls = 0;
+  let failFirstPass = true;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/fx/')) {
+      return { ok: true, json: async () => ({ observations: [{ d: '2026-01-01', FX_USDCAD: { v: '1.3000' } }] }) };
+    }
+    calls++;
+    if (failFirstPass && calls <= 2) throw timeoutErr();
+    if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+    const ts = (y, m, d) => Date.UTC(y, m, d) / 1000;
+    return { ok: true, json: async () => ({ chart: { result: [{ timestamp: [ts(2026, 0, 2)], indicators: { quote: [{ close: [42] }] } }], error: null } }) };
+  };
+  try {
+    const holding = { id: 11, kind: 'exchange', symbol: 'RETRY.TO' };
+    // Manual path (refreshAllPrices): two timeouts, then success on the retry pass.
+    const results = await refreshAllPrices(db, [holding]);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].ok, true);
+    assert.equal(results[0].source, 'yahoo');
+    assert.equal(results[0].error, null);
+    assert.ok(calls >= 4, `expected a retry pass, got ${calls} calls`);
+    // Fetch-on-read path: same first-pass timeouts, no retry.
+    calls = 0;
+    failFirstPass = true;
+    db.prepare("DELETE FROM app_meta WHERE key LIKE 'invest_px_12_%'").run();
+    const r = await ensureHoldingPricesDetailed(db, { id: 12, kind: 'exchange', symbol: 'RETRY.TO' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /timed out/);
+    assert.equal(calls, 2, 'fetch-on-read must not retry');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
+    if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    if (savedEnv.fx === undefined) delete process.env.FX_API_URL; else process.env.FX_API_URL = savedEnv.fx;
     db.close();
   }
 });

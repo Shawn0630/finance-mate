@@ -2668,8 +2668,8 @@ app.delete('/api/investments/prices/:id', requireApiAuth, (req, res) => {
 });
 
 app.post('/api/investments/refresh', requireApiAuth, async (req, res) => {
-  const refreshed = await refreshAllPrices(db, listHoldings(db));
-  res.json({ ok: true, refreshed });
+  const results = await refreshAllPrices(db, listHoldings(db));
+  res.json({ ok: true, refreshed: results.filter((r) => r.ok).map((r) => r.id), results });
 });
 
 // --------------------------------------------------------------- earnings ---

@@ -260,6 +260,45 @@ function backedOff(db, tryKey) {
   return last > 0 && Date.now() - last < FAIL_BACKOFF_MS;
 }
 
+// Manual refresh (the Refresh prices button) gets a longer
+// per-tier timeout than fetch-on-read and one retry on a
+// timeout — a full history fetch on a slow network routinely
+// exceeds the 4s read budget, and a timeout is worth one
+// more attempt while an HTTP error is not.
+const MANUAL_REFRESH_TIMEOUT_MS = 10000;
+
+function isTimeoutError(err) {
+  return !!err && (err.name === 'TimeoutError'
+    || /timeout|timed out|aborted/i.test(err.message || ''));
+}
+
+// One pass over the two tiers. Returns the rows and their
+// source, or the verbatim error of the last tier tried —
+// callers surface that message, never a generic substitute.
+async function tryPriceTiers(symbol, timeoutMs) {
+  let lastErr = null;
+  try {
+    return { rows: await fetchStooqHistory(symbol, timeoutMs), source: 'stooq', error: null };
+  } catch (err) { lastErr = err; } // empty or failed — fall through to Yahoo
+  try {
+    return { rows: await fetchYahooHistory(symbol, timeoutMs), source: 'yahoo', error: null };
+  } catch (err) { lastErr = err; }
+  return { rows: null, source: null, error: lastErr };
+}
+
+function clearMeta(db, key) {
+  db.prepare('DELETE FROM app_meta WHERE key = ?').run(key);
+}
+
+const vancouverDateTimeFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hour12: false,
+});
+function vancouverDateTime(ms) {
+  const parts = Object.fromEntries(vancouverDateTimeFmt.formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
 // Refresh one exchange holding's market prices if stale:
 // Stooq first; when Stooq has nothing for the symbol, Yahoo
 // Finance; both empty → the fetch counts as failed and the
@@ -267,31 +306,39 @@ function backedOff(db, tryKey) {
 // cache keeps exactly ONE market series per holding — a tier
 // switch replaces the other tier's rows wholesale. Fund
 // holdings and symbol-less holdings are a no-op (their prices
-// are manual). Never throws.
-export function ensureHoldingPrices(db, holding) {
-  if (!holding || holding.kind !== 'exchange' || !holding.symbol) return Promise.resolve(false);
+// are manual). Never throws. A failure is recorded verbatim
+// (message + time) in app_meta so the UI can say what failed
+// instead of silently keeping the fallback price; a later
+// success clears it.
+export function ensureHoldingPricesDetailed(db, holding, opts = {}) {
+  if (!holding || holding.kind !== 'exchange' || !holding.symbol) {
+    return Promise.resolve({ ok: false, source: null, error: null });
+  }
   const key = `px${holding.id}`;
   if (inflight.has(key)) return inflight.get(key);
   const okKey = `invest_px_${holding.id}_ok`;
   const tryKey = `invest_px_${holding.id}_try`;
-  if (fetchedToday(db, okKey) || backedOff(db, tryKey)) return Promise.resolve(false);
+  const errKey = `invest_px_${holding.id}_err`;
+  if (fetchedToday(db, okKey) || backedOff(db, tryKey)) {
+    return Promise.resolve({ ok: false, source: null, error: null });
+  }
+  const timeoutMs = opts.timeoutMs || READ_TIMEOUT_MS;
+  const retries = opts.retries || 0;
   const p = (async () => {
     setMeta(db, tryKey, String(Date.now()));
-    let rows = null;
-    let source = 'stooq';
-    try {
-      rows = await fetchStooqHistory(holding.symbol, READ_TIMEOUT_MS);
-    } catch { rows = null; } // empty or failed — fall through to Yahoo
-    if (!rows) {
-      try {
-        rows = await fetchYahooHistory(holding.symbol, READ_TIMEOUT_MS);
-        source = 'yahoo';
-      } catch { rows = null; }
+    let attempt = null;
+    for (let i = 0; ; i++) {
+      attempt = await tryPriceTiers(holding.symbol, timeoutMs);
+      if (attempt.rows) break;
+      if (isTimeoutError(attempt.error) && i < retries) continue;
+      break;
     }
-    if (!rows) {
+    if (!attempt.rows) {
+      const message = attempt.error ? attempt.error.message : 'no market data';
       console.warn(`[prices] no market data for ${holding.symbol} (stooq and yahoo both empty), keeping last known`);
+      setMeta(db, errKey, JSON.stringify({ message, at: new Date().toISOString() }));
       inflight.delete(key);
-      return false;
+      return { ok: false, source: null, error: message };
     }
     try {
       const ts = new Date().toISOString();
@@ -299,19 +346,24 @@ export function ensureHoldingPrices(db, holding) {
         db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo')").run(holding.id);
         const ins = db.prepare(
           'INSERT OR REPLACE INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, ?, ?)');
-        for (const r of rows) ins.run(holding.id, r.date, r.price, source, ts);
+        for (const r of attempt.rows) ins.run(holding.id, r.date, r.price, attempt.source, ts);
       })();
       setMeta(db, okKey, String(Date.now()));
-      return true;
+      clearMeta(db, errKey);
+      return { ok: true, source: attempt.source, error: null };
     } catch (err) {
       console.warn(`[prices] price cache write for ${holding.symbol} failed: ${err.message}`);
-      return false;
+      return { ok: false, source: null, error: err.message };
     } finally {
       inflight.delete(key);
     }
   })();
   inflight.set(key, p);
   return p;
+}
+
+export function ensureHoldingPrices(db, holding, opts) {
+  return ensureHoldingPricesDetailed(db, holding, opts).then((r) => r.ok);
 }
 
 // Refresh the USD/CAD cache if stale. Never throws.
@@ -341,8 +393,12 @@ export function ensureFxRates(db) {
 
 // Manual refresh (the Investments "Refresh prices" button):
 // forces every exchange holding + FX, sharing in-flight work.
-// Resolves to the ids of the holdings that actually got a
-// fresh market series (either tier).
+// Resolves to one result per exchange holding — { id, symbol,
+// ok, source, error } — so the UI can report exactly which
+// holdings refreshed and why the rest did not, instead of a
+// silent no-op. A manual refresh ignores the freshness window
+// (both stamps cleared) and gets the longer timeout with one
+// timeout retry.
 export async function refreshAllPrices(db, holdings) {
   const jobs = [];
   for (const h of holdings || []) {
@@ -351,15 +407,16 @@ export async function refreshAllPrices(db, holdings) {
       // both stamps so ensure* fetches even after a good day.
       setMeta(db, `invest_px_${h.id}_ok`, '0');
       setMeta(db, `invest_px_${h.id}_try`, '0');
-      jobs.push(ensureHoldingPrices(db, h).then((ok) => (ok ? h.id : null)));
+      jobs.push(ensureHoldingPricesDetailed(db, h, { timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, retries: 1 })
+        .then((r) => ({ id: h.id, symbol: h.symbol, ok: r.ok, source: r.source, error: r.error })));
     }
   }
   setMeta(db, 'invest_fx_ok', '0');
   setMeta(db, 'invest_fx_try', '0');
   const fxJob = ensureFxRates(db);
-  const refreshed = (await Promise.all(jobs)).filter((id) => id != null);
+  const results = await Promise.all(jobs);
   await fxJob;
-  return refreshed;
+  return results;
 }
 
 // How a holding is currently priced, for the UI's honesty
@@ -379,12 +436,37 @@ export function priceStatusFor(db, holding, latest) {
   const stale = holding.kind === 'exchange' && !!holding.symbol
     ? !fetchedToday(db, `invest_px_${holding.id}_ok`) && fetched.length > 0
     : false;
+  // A fetch failure is loud, not silent: when the last recorded
+  // failure is newer than the last success, the banner can say
+  // what failed and when it was last tried. fetchFailedToday
+  // gates the banner to a failure from today (Vancouver day);
+  // an older failure stays visible in lastError for callers
+  // that want it, but the banner does not nag about yesterday.
+  let lastError = null;
+  let lastAttemptAt = null;
+  let fetchFailedToday = false;
+  const errRaw = getMeta(db, `invest_px_${holding.id}_err`);
+  const okRaw = Number(getMeta(db, `invest_px_${holding.id}_ok`) || 0);
+  if (errRaw) {
+    try {
+      const parsed = JSON.parse(errRaw);
+      const atMs = parsed && parsed.at ? Date.parse(parsed.at) : NaN;
+      if (parsed && parsed.message && Number.isFinite(atMs) && !(okRaw > 0 && okRaw >= atMs)) {
+        lastError = parsed.message;
+        lastAttemptAt = vancouverDateTime(atMs);
+        fetchFailedToday = vancouverDayFmt.format(new Date(atMs)) === vancouverToday();
+      }
+    } catch { /* a malformed meta row is not a price fact */ }
+  }
   return {
     pricedBy,
     stale,
     hasFetched: fetched.length > 0,
     lastFetchedDate,
     manualPoints: by.manual ? by.manual.n : 0,
+    lastError,
+    lastAttemptAt,
+    fetchFailedToday,
   };
 }
 

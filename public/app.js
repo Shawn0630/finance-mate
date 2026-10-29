@@ -5175,10 +5175,35 @@ async function loadInvestmentsImpl() {
   $('#addInvestAccountBtn').addEventListener('click', () => openInvestAccountModal(null));
   $('#refreshInvestBtn').addEventListener('click', async (e) => {
     e.target.disabled = true;
-    try { await api('/api/investments/refresh', { method: 'POST', body: {} }); await loadInvestmentsImpl(); }
+    try {
+      const r = await api('/api/investments/refresh', { method: 'POST', body: {} });
+      await loadInvestmentsImpl();
+      renderInvestRefreshResult(r.results || []);
+    }
     catch (err) { showMsg($('#investMsg'), 'err', err.message); }
     finally { e.target.disabled = false; }
   });
+}
+
+// The Refresh prices result line: a refresh that silently
+// keeps fallback prices looks identical to one that worked,
+// so the outcome is stated per holding — updated ones with
+// their source, failed ones with the verbatim reason.
+function renderInvestRefreshResult(results) {
+  const el = $('#investMsg');
+  if (!el) return;
+  if (!results.length) { showMsg(el, 'ok', 'No exchange holdings to refresh.'); return; }
+  const ok = results.filter((r) => r.ok);
+  const failed = results.filter((r) => !r.ok);
+  if (!failed.length) {
+    showMsg(el, 'ok', `Prices refreshed — ${ok.length} holding${ok.length === 1 ? '' : 's'} updated.`);
+    return;
+  }
+  el.className = 'msg err';
+  el.innerHTML = [
+    `Prices refreshed — ${ok.length} updated, ${failed.length} failed:`,
+    ...failed.map((r) => `${esc(r.symbol || `#${r.id}`)} — ${esc(r.error || 'fetch failed')}`),
+  ].join('<br>');
 }
 
 // --------------------------------------------------------- account level
@@ -5196,6 +5221,7 @@ async function loadInvestAccountImpl(id) {
     if (st.pricedBy === 'none') notes.push(`“${row.holding.label}” has no price yet — add an event with a price or a price snapshot.`);
     else if (st.pricedBy === 'event') notes.push(`“${row.holding.label}” is priced from its trade prices (no market feed) — figures walk flat between trades.`);
     else if (st.stale) notes.push(`Market prices for “${row.holding.label}” may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
+    if (st.fetchFailedToday) notes.push(`Market price fetch failed for “${row.holding.label}” (${esc(st.lastError)}) — last attempt ${esc(st.lastAttemptAt || '—')}.`);
   }
   if (data.fxMissing && data.holdings.some((r) => r.holding.currency === 'USD')) {
     notes.push('USD/CAD rates are unavailable right now — USD holdings are shown unconverted in the CAD totals.');
@@ -5276,6 +5302,7 @@ async function loadInvestHoldingImpl(id) {
     ? 'Priced from trade prices (no market feed for this holding): the value walks flat between trades. For a bank fund, record NAV snapshots below to trace its real path.'
     : `No market feed found for ${h.symbol || h.label} — value walks flat between trades.`);
   if (st.stale) notes.push(`Market prices may be stale (last fetched ${esc(st.lastFetchedDate || '—')}).`);
+  if (st.fetchFailedToday) notes.push(`Market price fetch failed (${esc(st.lastError)}) — last attempt ${esc(st.lastAttemptAt || '—')}.`);
   if (sm.unpricedGrants) notes.push(`${sm.unpricedGrants} grant(s) had no price on their date and count as $0 contributions.`);
   if (data.fxMissing && h.currency === 'USD') notes.push('USD/CAD rates are unavailable right now — CAD figures show the unconverted amounts.');
   const noteEl = $('#investHoldingPriceNote');
