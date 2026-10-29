@@ -5710,6 +5710,8 @@ let investMapStructure = null;
 let investMapMapping = null;
 let investMapQuestions = [];
 let investMapReply = '';
+let investMapFollowupReply = ''; // latest follow-up reply, shown under the preview
+let investMapFollowupHistory = []; // [{ message, reply }] prior follow-up turns, sent as context
 let investMapReused = false;
 let investMapValueList = []; // raw activity values listed in the editor, in row order
 let investMapPairValues = []; // pair-mode step-4 keys (raw "type / subtype"), from the server
@@ -5748,6 +5750,8 @@ function resetInvestChat(accountId) {
   investMapMapping = null;
   investMapQuestions = [];
   investMapReply = '';
+  investMapFollowupReply = '';
+  investMapFollowupHistory = [];
   investMapReused = false;
   investMapValueList = [];
   investMapPairValues = []; investMapPairLabels = [];
@@ -6698,6 +6702,10 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
           <input type="text" data-wiz-answer-idx="${i}" placeholder="Your answer (optional)" style="flex:2"></div>`).join('')}` : ''}
       <div class="note" style="margin:6px 0 4px">Preview — your first rows in plain words</div>
       <div data-wiz-preview></div>
+      <div class="note" style="margin:6px 0 4px">Preview not matching? Tell AI what's wrong — it revises the mapping and the preview re-renders.</div>
+      ${investMapFollowupReply ? `<div class="note">${esc(investMapFollowupReply)}</div>` : ''}
+      <div class="costs-proposed-row"><input type="text" data-wiz-followup placeholder="e.g. dividends are missing — those rows should be dividends, not skipped" style="flex:1">
+        <button type="button" class="small primary" data-map-followup>Ask AI to fix</button></div>
       <div class="toolbar" style="margin-top:6px">
         <button type="button" class="primary small" data-map-confirm>Confirm mapping</button>
         <button type="button" class="small" data-map-remap>Ask AI to re-map</button>
@@ -6723,7 +6731,8 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   mapHost.addEventListener('click', async (e) => {
     if (e.target.closest('[data-map-cancel]')) {
       investMapCsv = null; investMapStructure = null; investMapMapping = null; investMapWizard = null;
-      investMapQuestions = []; investMapReply = ''; investMapReused = false; investMapValueList = [];
+      investMapQuestions = []; investMapReply = ''; investMapFollowupReply = ''; investMapFollowupHistory = [];
+      investMapReused = false; investMapValueList = [];
       investMapPairValues = []; investMapPairLabels = [];
       investMapPairTruncated = false; investMapPairCount = 0; investMapPairLoaded = false;
       mapHost.innerHTML = '';
@@ -6736,9 +6745,34 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
         const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/analyze`, { method: 'POST', body: { csv: investMapCsv, forceRefresh: true } });
         investMapStructure = r.structure; investMapMapping = r.mapping; investMapWizard = engineToWizard(r.mapping);
         investMapQuestions = r.questions || [];
-        investMapReply = r.reply || ''; investMapReused = !!r.reused;
+        investMapReply = r.reply || ''; investMapFollowupReply = ''; investMapFollowupHistory = []; investMapReused = !!r.reused;
         renderMapEditor();
       } catch (err) { showMsg(msg, 'err', err.message); }
+      return;
+    }
+    if (e.target.closest('[data-map-followup]')) {
+      if (investChatAccountId == null || !investMapCsv) return;
+      const input = mapHost.querySelector('[data-wiz-followup]');
+      const message = input ? input.value.trim() : '';
+      if (!message) { showMsg(msg, 'err', 'Tell AI what is wrong with the preview first.'); return; }
+      const { wizard } = readWizard();
+      const engineMapping = wizardToEngine(wizard);
+      if (engineMapping.columns.activity2 && !investMapPairLoaded) {
+        showMsg(msg, 'err', 'The activity pairs are still loading — wait a moment and try again.'); return;
+      }
+      const btn = e.target.closest('[data-map-followup]');
+      btn.disabled = true;
+      clearInvestChatMsg();
+      try {
+        const r = await api(`/api/investments/accounts/${investChatAccountId}/import-csv-map/followup`, { method: 'POST', body: { csv: investMapCsv, mapping: engineMapping, message, history: investMapFollowupHistory } });
+        investMapFollowupHistory = [...investMapFollowupHistory, { message, reply: r.reply || '' }].slice(-5);
+        investMapFollowupReply = r.reply || '';
+        investMapReply = '';
+        investMapWizard = engineToWizard(r.mapping);
+        investMapQuestions = r.questions || [];
+        renderMapEditor();
+      } catch (err) { showMsg(msg, 'err', err.message); }
+      finally { btn.disabled = false; }
       return;
     }
     if (e.target.closest('[data-map-confirm]')) {
@@ -6795,6 +6829,7 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
       investMapWizard = engineToWizard(r.mapping);
       investMapQuestions = r.questions || [];
       investMapReply = r.reply || '';
+      investMapFollowupReply = ''; investMapFollowupHistory = [];
       investMapReused = !!r.reused;
       renderMapEditor();
     } catch (err) {

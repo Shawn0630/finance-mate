@@ -350,6 +350,20 @@ const MAP_PROMPT = [
 ].join('\n');
 
 export function buildMapMessages(structure) {
+  return [
+    { role: 'system', content: MAP_PROMPT },
+    {
+      role: 'user',
+      content: `CSV structure: ${structure.rowCount} data rows.\n${structureSummary(structure)}`,
+    },
+  ];
+}
+
+// The file summary the model sees: columns, samples, distinct
+// values — never per-row figures. Shared by the first mapping
+// and every follow-up revision so both see exactly the same
+// evidence.
+function structureSummary(structure) {
   const stats = structure.columnStats.map((s) => {
     const bits = [`- ${s.name}: samples [${s.samples.join(', ')}]`];
     if (s.distinctTruncated) bits.push(`(${s.distinctCount} distinct values, too many to list)`);
@@ -357,18 +371,81 @@ export function buildMapMessages(structure) {
     return bits.join(' ');
   }).join('\n');
   const samples = structure.sampleRows.map((r) => JSON.stringify(r)).join('\n');
+  return `Columns: ${structure.columns.join(', ')}\n${stats}\nSample rows:\n${samples}`;
+}
+
+const MAP_FOLLOWUP_PROMPT = [
+  'You revise a CSV column mapping for an unknown broker\'s export, after the user looked at the preview and found something wrong. Reply with ONLY a JSON object — no prose, no code fences.',
+  'Form: {"columns": {"date": "<exact column name>", "symbol": "<exact column name>", "name": "<exact column name>"|null, "activity": "<exact column name>", "activity2": "<exact column name>"|null, "units": "<exact column name>"|null, "price": "<exact column name>"|null, "amount": "<exact column name>"|null, "currency": "<exact column name>"|null, "splitAdded": "<exact column name>"|null, "splitNew": "<exact column name>"|null, "splitOld": "<exact column name>"|null}, "values": {"<exact activity value>": "buy"|"sell"|"grant"|"dividend"|"split"|"skip"}, "defaultCurrency": "CAD"|"USD"|null, "symbolSuffix": {"suffix": ".TO", "whenCurrency": "CAD"|"USD"|null}|null, "questions": ["..."], "reply": "..."}',
+  'Rules:',
+  '- Return the COMPLETE revised mapping, not a delta: every column and value target, including the parts the user did not mention.',
+  '- Keep everything the user did not mention EXACTLY as it is in the current mapping below — same columns, same value targets, same currency, same symbol suffix. Change only what the user\'s message asks to change, plus what that change mechanically requires (if the user says the units live in another column, move the units column; if they say a value means something else, flip that value\'s target).',
+  '- Column names and activity values must be copied EXACTLY from the file summary or from the current mapping; never invent one. Activity keys follow the activity columns you return: plain values for one activity column, "Type / Subtype" pairs for two (a blank second part is written as an empty string after the separator, e.g. "Dividend / "). Never decide a bare "-" or blank sub-type on its own: under a dividend/distribution type it is "dividend", under an interest/cash type it is "skip".',
+  '- A split row either carries ratio columns (map splitNew/splitOld) or an added-units column (map splitAdded) — map whichever the file has, never both.',
+  '- NEVER GUESS: anything the user\'s message raises that you cannot determine from the file summary or the current mapping stays as it is in the current mapping and is asked about in "questions" instead. Asking is always better than inventing.',
+  '- Keep "reply" short and concrete, naming exactly what you changed and why, in the user\'s terms.',
+].join('\n');
+
+// Follow-up messages: the same file summary as the first
+// mapping, the current mapping, the capped prior turns, and the
+// user's latest message. The model never sees per-row figures —
+// only the summary, same as the first proposal.
+export function buildFollowupMessages(structure, currentMapping, message, history = []) {
+  const turns = (Array.isArray(history) ? history : [])
+    .filter((t) => t && typeof t.message === 'string' && t.message.trim() && typeof t.reply === 'string')
+    .slice(-5);
+  const turnsText = turns.length
+    ? `\nEarlier in this conversation:\n${turns.map((t) => `User: ${t.message}\nYou: ${t.reply}`).join('\n')}`
+    : '';
   return [
-    { role: 'system', content: MAP_PROMPT },
+    { role: 'system', content: MAP_FOLLOWUP_PROMPT },
     {
       role: 'user',
-      content: `CSV structure: ${structure.rowCount} data rows.\nColumns: ${structure.columns.join(', ')}\n${stats}\nSample rows:\n${samples}`,
+      content: `CSV structure: ${structure.rowCount} data rows.\n${structureSummary(structure)}\nCurrent mapping:\n${JSON.stringify(currentMapping)}${turnsText}\nUser's latest message: ${message}`,
     },
   ];
 }
 
-// Ask the model for a mapping from the structural summary. The
-// caller supplies the LLM (deps.callLlm) so tests can stub it;
-// the server endpoint checks llmConfigured before calling.
+// Revise a mapping from a follow-up message. Same validation
+// shape as proposeCsvMapping: the reply must be JSON, unknown
+// columns and invalid targets are dropped by normalizeMapping,
+// and anything the model left unidentified becomes a question
+// for the editor instead of a guess.
+export async function reviseCsvMapping(structure, currentMapping, message, history = [], deps = {}) {
+  if (!currentMapping || typeof currentMapping !== 'object' || Array.isArray(currentMapping)) {
+    throw new Error('a current mapping is required');
+  }
+  if (typeof message !== 'string' || !message.trim()) {
+    throw new Error('a follow-up message is required');
+  }
+  const call = deps.callLlm || callLlm;
+  const raw = await call(buildFollowupMessages(structure, currentMapping, message, history), process.env, deps.model || null);
+  const text = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('AI mapping reply was not valid JSON');
+  }
+  const { mapping, error } = normalizeMapping(parsed, structure.columns, { allowMissingCurrency: true });
+  const questions = Array.isArray(parsed.questions)
+    ? parsed.questions.filter((q) => typeof q === 'string' && q.trim()).slice(0, 10)
+    : [];
+  if (error) throw new Error(`AI mapping is unusable: ${error}`);
+  for (const f of MAP_REQUIRED_FIELDS) {
+    if (!mapping.columns[f]) {
+      questions.push(`The model did not identify a ${f} column — please pick it below.`);
+    }
+  }
+  if (!mapping.columns.currency && !mapping.defaultCurrency) {
+    questions.push('No currency column or default currency was identified — please pick one below.');
+  }
+  return {
+    mapping,
+    questions,
+    reply: typeof parsed.reply === 'string' ? parsed.reply : '',
+  };
+}
 export async function proposeCsvMapping(structure, deps = {}) {
   const call = deps.callLlm || callLlm;
   const raw = await call(buildMapMessages(structure), process.env, deps.model || null);

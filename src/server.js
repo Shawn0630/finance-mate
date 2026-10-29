@@ -28,7 +28,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts,
 } from './earnings.js';
-import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, translatePreview } from './csvMapImport.js';
+import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -357,6 +357,41 @@ app.post('/api/investments/accounts/:id/import-csv-map/translate', requireApiAut
     res.json({ sentences: translatePreview(csv, mapping, 5) });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+// AI-map wizard follow-up: the preview did not match, so the
+// user tells the model what is wrong in one sentence and gets a
+// whole revised mapping back. Preview-stage only — nothing is
+// written here; the editor re-renders from the revised mapping
+// and the user still confirms before any preview or apply. The
+// mapping is remembered only at preview-confirm time, as before.
+app.post('/api/investments/accounts/:id/import-csv-map/followup', requireApiAuth, async (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const csv = req.body && typeof req.body.csv === 'string' ? req.body.csv : '';
+  if (!csv) return res.status(400).json({ error: 'csv text is required' });
+  if (csv.length > 1024 * 1024) return res.status(400).json({ error: 'csv is too large (max 1 MB)' });
+  const mapping = req.body.mapping;
+  if (!mapping || typeof mapping !== 'object') return res.status(400).json({ error: 'mapping is required' });
+  const message = req.body.message;
+  if (typeof message !== 'string' || !message.trim()) return res.status(400).json({ error: 'a follow-up message is required' });
+  const history = Array.isArray(req.body.history)
+    ? req.body.history.filter((t) => t && typeof t.message === 'string' && typeof t.reply === 'string').slice(-5)
+    : [];
+  let structure;
+  try {
+    structure = analyzeCsv(csv);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!llmConfigured()) {
+    return res.status(503).json({ error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' });
+  }
+  try {
+    const r = await reviseCsvMapping(structure, mapping, message, history, { model: effectiveAiModel() });
+    res.json({ mapping: r.mapping, questions: r.questions, reply: r.reply });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
   }
 });
 // Pair-mode step-4 list: the distinct activity keys (type / sub-type

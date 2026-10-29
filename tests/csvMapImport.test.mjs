@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   analyzeCsv, fingerprintFor, normalizeMapping, applyMappedCsv, proposeCsvMapping,
+  reviseCsvMapping, buildFollowupMessages,
   wizardToMapping, mappingToWizard, translatePreviewRow, translatePreview, activityValuesFor,
 } from '../src/csvMapImport.js';
 
@@ -452,4 +453,69 @@ test('pair mapping: proposeCsvMapping keeps a model-proposed pair mapping', asyn
   assert.equal(r.mapping.columns.activity2, 'activity_sub_type');
   assert.equal(r.mapping.values['Dividend / -'], 'dividend');
   assert.equal(r.mapping.values['Trade / BUY'], 'buy');
+});
+
+// Follow-up round: the preview did not match, so the user tells
+// the model what is wrong in one sentence and gets a whole
+// revised mapping back. The model sees the same file summary as
+// the first proposal — never per-row figures.
+test('follow-up: messages carry the current mapping, the user message and capped history — not the file', () => {
+  const structure = analyzeCsv(pFixture());
+  const current = {
+    ...P_MAP,
+    values: { ...P_MAP.values, 'Dividend / -': 'skip' },
+  };
+  const history = Array.from({ length: 7 }, (_, i) => ({ message: `msg${i}`, reply: `rep${i}` }));
+  const msgs = buildFollowupMessages(structure, current, 'dividends are missing', history);
+  const text = msgs.map((m) => m.content).join('\n');
+  assert.ok(text.includes('dividends are missing'));
+  assert.ok(text.includes('"Dividend / -":"skip"'));
+  // History is capped at the last five turns.
+  assert.ok(!text.includes('msg0'));
+  assert.ok(!text.includes('msg1'));
+  assert.ok(text.includes('msg6'));
+  // The payload is the summary, not the file: the raw multi-row
+  // text never appears.
+  assert.ok(!text.includes(pFixture()));
+});
+
+test('follow-up: revise flips only what the user asked, keeps the rest, drops invented columns', async () => {
+  const structure = analyzeCsv(pFixture());
+  const current = {
+    ...P_MAP,
+    values: { ...P_MAP.values, 'Dividend / -': 'skip' },
+  };
+  const stub = async () => JSON.stringify({
+    columns: { ...P_MAP.columns, units: 'NoSuchColumn' },
+    values: { ...P_MAP.values, 'Dividend / -': 'dividend' },
+    defaultCurrency: null,
+    symbolSuffix: { suffix: '.TO', whenCurrency: 'CAD' },
+    questions: [],
+    reply: 'Flipped Dividend / - to dividend.',
+  });
+  const r = await reviseCsvMapping(structure, current, 'dividends are missing', [], { callLlm: stub });
+  assert.equal(r.mapping.values['Dividend / -'], 'dividend');
+  assert.equal(r.mapping.values['Trade / BUY'], 'buy');
+  assert.equal(r.mapping.values['Interest / -'], 'skip');
+  // An invented column name is dropped, never trusted.
+  assert.equal(r.mapping.columns.units, undefined);
+  assert.equal(r.reply, 'Flipped Dividend / - to dividend.');
+  await assert.rejects(() => reviseCsvMapping(structure, current, '   ', [], { callLlm: stub }), /follow-up message/);
+  await assert.rejects(() => reviseCsvMapping(structure, current, 'fix it', [], { callLlm: async () => 'not json' }), /not valid JSON/);
+  await assert.rejects(() => reviseCsvMapping(structure, null, 'fix it', [], { callLlm: stub }), /current mapping/);
+});
+
+test('follow-up: a revised mapping that drops a required column asks about it instead of guessing', async () => {
+  const structure = analyzeCsv(pFixture());
+  const stub = async () => JSON.stringify({
+    columns: { date: 'effective_date', activity: 'activity_type', activity2: 'activity_sub_type' },
+    values: { 'Dividend / -': 'dividend' },
+    defaultCurrency: null,
+    symbolSuffix: null,
+    questions: [],
+    reply: '',
+  });
+  const r = await reviseCsvMapping(structure, P_MAP, 'fix the dividend rows', [], { callLlm: stub });
+  assert.equal(r.mapping.values['Dividend / -'], 'dividend');
+  assert.ok(r.questions.some((q) => q.includes('symbol')));
 });
