@@ -4973,13 +4973,16 @@ function investPortfolioVisible(d) {
 }
 
 // Card Hide buttons mirror the hidden set: a hidden card is
-// greyed and its button reads Show. Runs after every render
+// greyed and its eye icon carries a slash (open eye when
+// visible, crossed eye when hidden). Runs after every render
 // that rebuilds the cards and after every toggle, so the
 // legend and the cards can never disagree.
 function syncInvestHideCards() {
   document.querySelectorAll('.invest-hide-btn').forEach((btn) => {
     const hidden = investHiddenAccounts.has(Number(btn.dataset.accountId));
-    btn.textContent = hidden ? 'Show' : 'Hide';
+    btn.classList.toggle('invest-eye-hidden', hidden);
+    btn.title = hidden ? 'Show' : 'Hide';
+    btn.setAttribute('aria-label', btn.title);
     const card = btn.closest('.breakdown-card');
     if (card) card.classList.toggle('invest-hidden-card', hidden);
   });
@@ -5491,11 +5494,11 @@ async function loadInvestmentsImpl() {
     const hidden = investHiddenAccounts.has(a.account.id);
     return `
     <div class="card breakdown-card${hidden ? ' invest-hidden-card' : ''}" data-invest-account-card="${a.account.id}" onclick="location.hash='#invest-account/${a.account.id}'">
+      <button type="button" class="invest-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-account-id="${a.account.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}">👁</button>
       <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
       <div class="v">${moneyC(a.summary.value, cur)}</div>
       <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${a.summary.costUnknown ? '—' : returnText(a.summary.totalReturn, a.summary.totalReturnPct, cur)}${a.summary.costUnknown ? ' · cost unknown' : ''}</div>
       ${a.account.owners && a.account.owners.length ? `<div class="n">${ownerChipsHtml(a.account.owners)}</div>` : ''}
-      <div class="toolbar" style="margin-top:8px"><button type="button" class="small invest-hide-btn" data-account-id="${a.account.id}">${hidden ? 'Show' : 'Hide'}</button></div>
     </div>`;
   }).join('');
   host.innerHTML = `
