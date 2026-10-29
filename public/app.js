@@ -8201,7 +8201,6 @@ function earnRentalCard(r) {
     <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span>
     <div class="spacer"></div>
     <button class="small" onclick="earnAddEntry(${r.id})">+ Rent entry</button>
-    <button class="small" onclick="earnAddYear(${r.id})">+ Year record</button>
     <button class="small" onclick="earnEditRental(${r.id})">Edit</button>
     <button class="small danger" onclick="earnDeleteRental(${r.id})">Delete</button></div>
     ${(r.entries || []).length ? `<div><div class="note">Rent entries</div>${r.entries.map((e) => earnEntryBlock(r, e)).join('')}</div>` : ''}
@@ -8499,18 +8498,18 @@ $('#addEarnRentalBtn').onclick = () => {
   $('#earnRentalForm').reset();
   earnRentalSuggest.reset();
   syncEarnRentalAddressState();
-  $('#earnRentalFormPanel').classList.remove('hidden');
+  showMsg($('#earnRentalModalMsg'), '', '');
+  openModal('earnRentalModal');
 };
-$('#earnRentalCancelBtn').onclick = () => $('#earnRentalFormPanel').classList.add('hidden');
 $('#earnRentalForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
     const body = earnReadForm(e.target);
     if (earnEditRentalId) await api(`/api/earnings/rentals/${earnEditRentalId}`, { method: 'PUT', body });
     else await api('/api/earnings/rentals', { method: 'POST', body });
-    $('#earnRentalFormPanel').classList.add('hidden');
+    closeModalEl($('#earnRentalModal'));
     loadEarnings();
-  } catch (err) { showMsg($('#earnRentalMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#earnRentalModalMsg'), 'err', err.message); }
 };
 window.earnEditRental = (id) => {
   const r = earnData.rentals.find((x) => x.id === id);
@@ -8523,7 +8522,8 @@ window.earnEditRental = (id) => {
   f.is_principal_residence.checked = r.is_principal_residence; f.was_principal_residence.checked = r.was_principal_residence;
   f.structural_change.checked = r.structural_change;
   syncEarnRentalAddressState();
-  $('#earnRentalFormPanel').classList.remove('hidden');
+  showMsg($('#earnRentalModalMsg'), '', '');
+  openModal('earnRentalModal');
 };
 window.earnDeleteRental = async (id) => {
   if (!confirm('Delete this rental and all its year records?')) return;
@@ -8541,16 +8541,6 @@ function earnExpenseRow(line = '', amount = '', direct = false) {
   return wrap;
 }
 $('#earnExpenseAddBtn').onclick = () => $('#earnExpenseRows').appendChild(earnExpenseRow());
-window.earnAddYear = (rentalId) => {
-  earnYearRentalId = rentalId; earnEditYearId = null;
-  $('#earnRentalYearFormTitle').textContent = 'Add year record';
-  $('#earnRentalYearForm').reset();
-  $('#earnExpenseRows').innerHTML = '';
-  $('#earnYearDerived').textContent = 'Gross rents and rented days are calculated from rent entries.';
-  $('#earnYearDerived').classList.remove('hidden');
-  $('#earnRentalYearFormPanel').classList.remove('hidden');
-};
-$('#earnRentalYearCancelBtn').onclick = () => $('#earnRentalYearFormPanel').classList.add('hidden');
 $('#earnRentalYearForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
@@ -8562,9 +8552,9 @@ $('#earnRentalYearForm').onsubmit = async (e) => {
     }));
     if (earnEditYearId) await api(`/api/earnings/rentals/${earnYearRentalId}/years/${earnEditYearId}`, { method: 'PUT', body });
     else await api(`/api/earnings/rentals/${earnYearRentalId}/years`, { method: 'POST', body });
-    $('#earnRentalYearFormPanel').classList.add('hidden');
+    closeModalEl($('#earnRentalYearModal'));
     loadEarnings();
-  } catch (err) { showMsg($('#earnRentalMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#earnRentalYearModalMsg'), 'err', err.message); }
 };
 window.earnEditYear = (rentalId, yearId) => {
   const r = earnData.rentals.find((x) => x.id === rentalId);
@@ -8583,7 +8573,8 @@ window.earnEditYear = (rentalId, yearId) => {
   f.str_compliant_days.value = y.str_compliant_days ?? ''; f.str_non_compliant_days.value = y.str_non_compliant_days ?? '';
   $('#earnExpenseRows').innerHTML = '';
   for (const ex of y.expenses) $('#earnExpenseRows').appendChild(earnExpenseRow(ex.line, ex.amount, ex.direct));
-  $('#earnRentalYearFormPanel').classList.remove('hidden');
+  showMsg($('#earnRentalYearModalMsg'), '', '');
+  openModal('earnRentalYearModal');
 };
 window.earnDeleteYear = async (rentalId, yearId) => {
   if (!confirm('Delete this year record?')) return;
@@ -8598,9 +8589,9 @@ window.earnAddEntry = (rentalId) => {
   earnEntryRentalId = rentalId; earnEditEntryId = null;
   $('#earnRentalEntryFormTitle').textContent = 'Add rent entry';
   $('#earnRentalEntryForm').reset();
-  $('#earnRentalEntryFormPanel').classList.remove('hidden');
+  showMsg($('#earnRentalEntryModalMsg'), '', '');
+  openModal('earnRentalEntryModal');
 };
-$('#earnRentalEntryCancelBtn').onclick = () => $('#earnRentalEntryFormPanel').classList.add('hidden');
 $('#earnRentalEntryForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
@@ -8608,9 +8599,9 @@ $('#earnRentalEntryForm').onsubmit = async (e) => {
     parseMoneyFields(body, ['monthly_rent', 'cash_amount']);
     if (earnEditEntryId) await api(`/api/earnings/rentals/${earnEntryRentalId}/entries/${earnEditEntryId}`, { method: 'PUT', body });
     else await api(`/api/earnings/rentals/${earnEntryRentalId}/entries`, { method: 'POST', body });
-    $('#earnRentalEntryFormPanel').classList.add('hidden');
+    closeModalEl($('#earnRentalEntryModal'));
     loadEarnings();
-  } catch (err) { showMsg($('#earnRentalMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#earnRentalEntryModalMsg'), 'err', err.message); }
 };
 window.earnEditEntry = (rentalId, entryId) => {
   const r = earnData.rentals.find((x) => x.id === rentalId);
@@ -8622,7 +8613,8 @@ window.earnEditEntry = (rentalId, entryId) => {
   f.start_ym.value = en.start_ym; f.end_ym.value = en.end_ym || '';
   setMoneyValue(f.monthly_rent, en.monthly_rent); f.pay_day.value = en.pay_day;
   setMoneyValue(f.cash_amount, en.cash_amount ?? ''); f.tenant_name.value = en.tenant_name || '';
-  $('#earnRentalEntryFormPanel').classList.remove('hidden');
+  showMsg($('#earnRentalEntryModalMsg'), '', '');
+  openModal('earnRentalEntryModal');
 };
 window.earnDeleteEntry = async (rentalId, entryId) => {
   if (!confirm('Delete this rent entry? Year records it created stay.')) return;

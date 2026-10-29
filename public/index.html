@@ -481,52 +481,6 @@
       <div class="chart-colors hidden" data-colors-panel="earnRentals"></div>
       <div class="note hidden" id="earnRentalsEmpty">No rental year records yet.</div>
       <div id="earnRentalList"></div>
-      <div class="panel hidden" id="earnRentalFormPanel">
-        <h3 id="earnRentalFormTitle">Add rental</h3>
-        <form id="earnRentalForm">
-          <div><label>Label *</label><input name="label" required></div>
-          <div><label>Property (optional — link an existing property)</label><select name="property_id" id="earnRentalProperty"><option value="">— Standalone address —</option></select></div>
-          <div><label>Address</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off"><ul class="suggest-list hidden"></ul><p class="suggest-note hidden">Address suggestions are unavailable right now — you can still type the full address.</p></div></div>
-          <div><label>Rental type *</label><select name="rental_type"><option value="long_term">Long-term</option><option value="short_term">Short-term</option><option value="commercial">Commercial</option></select></div>
-          <div><label>Services *</label><select name="services_level"><option value="basic">Basic (T776)</option><option value="hotel_like">Hotel-like (T2125)</option></select></div>
-          <div><label>Ownership % *</label><input name="ownership_pct" type="number" step="0.01" min="0" max="100" value="100" required></div>
-          <div><label><input type="checkbox" name="is_principal_residence"> Is a principal residence</label></div>
-          <div><label><input type="checkbox" name="was_principal_residence"> Was a principal residence</label></div>
-          <div><label><input type="checkbox" name="structural_change"> Structural change made for rental</label></div>
-          <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" id="earnRentalCancelBtn">Cancel</button></div>
-        </form>
-      </div>
-      <div class="panel hidden" id="earnRentalYearFormPanel">
-        <h3 id="earnRentalYearFormTitle">Add year record</h3>
-        <form id="earnRentalYearForm">
-          <div><label>Tax year *</label><input name="tax_year" type="number" value="2026" required></div>
-          <div class="note" id="earnYearDerived">Gross rents and rented days are calculated from rent entries.</div>
-          <div><label>Other rental income (line 8230)</label><input name="other_income" type="number" step="0.01" min="0" value="0"></div>
-          <div><label>Rented area % (partial rentals)</label><input name="area_share_pct" type="number" step="0.01" min="0" max="100" value="100"></div>
-          <div><label>Mortgage interest paid (→ line 8710)</label><input name="mortgage_interest" type="number" step="0.01" min="0" value="0"></div>
-          <div><label>Mortgage principal paid (never deductible)</label><input name="mortgage_principal" type="number" step="0.01" min="0" value="0"></div>
-          <div><label>Expenses (one per line: line, amount, direct?)</label><div id="earnExpenseRows"></div><button type="button" class="small" id="earnExpenseAddBtn">+ Expense row</button></div>
-          <div><label><input type="checkbox" name="claim_cca"> Claim CCA</label></div>
-          <div><label><input type="checkbox" name="cca_acknowledged"> I understand CCA on a (former) principal residence can end its exemption</label></div>
-          <div><label>UCC Class 1 (building, 4%)</label><input name="ucc_class1" type="number" step="0.01" min="0"></div>
-          <div><label>UCC Class 8 (equipment, 20%)</label><input name="ucc_class8" type="number" step="0.01" min="0"></div>
-          <div><label>Short-term compliant days</label><input name="str_compliant_days" type="number" min="0"></div>
-          <div><label>Short-term non-compliant days</label><input name="str_non_compliant_days" type="number" min="0"></div>
-          <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" id="earnRentalYearCancelBtn">Cancel</button></div>
-        </form>
-      </div>
-      <div class="panel hidden" id="earnRentalEntryFormPanel">
-        <h3 id="earnRentalEntryFormTitle">Add rent entry</h3>
-        <form id="earnRentalEntryForm">
-          <div><label>From (year-month) *</label><input name="start_ym" type="month" required></div>
-          <div><label>To (year-month, blank = ongoing)</label><input name="end_ym" type="month"></div>
-          <div><label>Monthly rent *</label><input name="monthly_rent" type="text" inputmode="decimal" data-money required></div>
-          <div><label>Pay day of month (1–31) *</label><input name="pay_day" type="number" min="1" max="31" required></div>
-          <div><label>Cash portion (optional)</label><input name="cash_amount" type="text" inputmode="decimal" data-money></div>
-          <div><label>Tenant (optional)</label><input name="tenant_name" autocomplete="off"></div>
-          <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" id="earnRentalEntryCancelBtn">Cancel</button></div>
-        </form>
-      </div>
     </div>
   </section>
   <section id="view-spending" class="hidden"><div class="placeholder"><h2>Spending</h2><p>This module is planned for a later round.</p></div></section>
@@ -710,6 +664,89 @@
         <button class="primary" type="submit" id="trendSubmitBtn">Add point</button>
         <button type="button" id="trendCancelBtn" class="hidden">Cancel edit</button>
       </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="earnRentalModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="earnRentalFormTitle">Add rental</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="earnRentalModalMsg"></div>
+    <form id="earnRentalForm">
+      <div><label>Label *</label><input name="label" required></div>
+      <div><label>Property (optional — link an existing property)</label><select name="property_id" id="earnRentalProperty"><option value="">— Standalone address —</option></select></div>
+      <div><label>Address</label><div class="suggest-wrap"><input name="address" class="address-input" autocomplete="off"><ul class="suggest-list hidden"></ul><p class="suggest-note hidden">Address suggestions are unavailable right now — you can still type the full address.</p></div></div>
+      <div class="grid2">
+        <div><label>Rental type *</label><select name="rental_type"><option value="long_term">Long-term</option><option value="short_term">Short-term</option><option value="commercial">Commercial</option></select></div>
+        <div><label>Services *</label><select name="services_level"><option value="basic">Basic (T776)</option><option value="hotel_like">Hotel-like (T2125)</option></select></div>
+      </div>
+      <div><label>Ownership % *</label><input name="ownership_pct" type="number" step="0.01" min="0" max="100" value="100" required></div>
+      <div><label><input type="checkbox" name="is_principal_residence"> Is a principal residence</label></div>
+      <div><label><input type="checkbox" name="was_principal_residence"> Was a principal residence</label></div>
+      <div><label><input type="checkbox" name="structural_change"> Structural change made for rental</label></div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" id="earnRentalCancelBtn" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="earnRentalYearModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="earnRentalYearFormTitle">Edit year record</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="earnRentalYearModalMsg"></div>
+    <form id="earnRentalYearForm">
+      <div class="grid2">
+        <div><label>Tax year *</label><input name="tax_year" type="number" value="2026" required></div>
+        <div><label>Other rental income (line 8230)</label><input name="other_income" type="number" step="0.01" min="0" value="0"></div>
+      </div>
+      <div class="note" id="earnYearDerived">Gross rents and rented days are calculated from rent entries.</div>
+      <div class="grid2">
+        <div><label>Rented area % (partial rentals)</label><input name="area_share_pct" type="number" step="0.01" min="0" max="100" value="100"></div>
+        <div><label>Mortgage interest paid (→ line 8710)</label><input name="mortgage_interest" type="number" step="0.01" min="0" value="0"></div>
+      </div>
+      <div><label>Mortgage principal paid (never deductible)</label><input name="mortgage_principal" type="number" step="0.01" min="0" value="0"></div>
+      <div><label>Expenses (one per line: line, amount, direct?)</label><div id="earnExpenseRows"></div><button type="button" class="small" id="earnExpenseAddBtn">+ Expense row</button></div>
+      <div><label><input type="checkbox" name="claim_cca"> Claim CCA</label></div>
+      <div><label><input type="checkbox" name="cca_acknowledged"> I understand CCA on a (former) principal residence can end its exemption</label></div>
+      <div class="grid2">
+        <div><label>UCC Class 1 (building, 4%)</label><input name="ucc_class1" type="number" step="0.01" min="0"></div>
+        <div><label>UCC Class 8 (equipment, 20%)</label><input name="ucc_class8" type="number" step="0.01" min="0"></div>
+      </div>
+      <div class="grid2">
+        <div><label>Short-term compliant days</label><input name="str_compliant_days" type="number" min="0"></div>
+        <div><label>Short-term non-compliant days</label><input name="str_non_compliant_days" type="number" min="0"></div>
+      </div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" id="earnRentalYearCancelBtn" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="earnRentalEntryModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="earnRentalEntryFormTitle">Add rent entry</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="earnRentalEntryModalMsg"></div>
+    <form id="earnRentalEntryForm">
+      <div class="grid2">
+        <div><label>From (year-month) *</label><input name="start_ym" type="month" required></div>
+        <div><label>To (year-month, blank = ongoing)</label><input name="end_ym" type="month"></div>
+      </div>
+      <div class="grid2">
+        <div><label>Monthly rent *</label><input name="monthly_rent" type="text" inputmode="decimal" data-money required></div>
+        <div><label>Pay day of month (1–31) *</label><input name="pay_day" type="number" min="1" max="31" required></div>
+      </div>
+      <div class="grid2">
+        <div><label>Cash portion (optional)</label><input name="cash_amount" type="text" inputmode="decimal" data-money></div>
+        <div><label>Tenant (optional)</label><input name="tenant_name" autocomplete="off"></div>
+      </div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" id="earnRentalEntryCancelBtn" data-close-modal>Cancel</button>
+      </div>
+    </form>
   </div>
 </div>
 

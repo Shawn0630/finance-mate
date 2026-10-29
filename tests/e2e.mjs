@@ -10826,6 +10826,67 @@ try {
       check('earnings UI: monthly-rent input groups thousands while typing',
         entryUi.grouped === '1,234', JSON.stringify(entryUi));
 
+      // Rental modals: + Rent entry opens a modal (not an inline
+      // panel); saving from the modal creates the entry and the
+      // card refreshes with derived years; + Year record is gone;
+      // year edit opens a modal too.
+      r = await req('POST', '/api/earnings/rentals', {
+        label: 'Modal rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+      });
+      check('rental modals setup: rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const modalRentalId = r.data.id;
+      // Same-hash navigation does not reload — go away and back so
+      // loadEarnings renders the new card before clicking its button.
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(500);
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const modalUi = await page.evaluate(() => {
+        const hasYearBtn = [...document.querySelectorAll('#earnRentalList button')].some((b) => b.textContent.includes('Year record'));
+        const inlinePanel = document.querySelector('#earnRentalEntryFormPanel') || document.querySelector('#earnRentalYearFormPanel') || document.querySelector('#earnRentalFormPanel');
+        const card = [...document.querySelectorAll('#earnRentalList .panel')].find((p) => p.textContent.includes('Modal rental'));
+        const btn = card && [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ Rent entry');
+        if (btn) btn.click();
+        const modal = document.querySelector('#earnRentalEntryModal');
+        const open = modal && !modal.classList.contains('hidden') && !!modal.querySelector('.modal-card #earnRentalEntryForm');
+        return { hasYearBtn, inlinePanel: !!inlinePanel, modalOpen: !!open };
+      });
+      check('rental modals: + Rent entry opens a modal, no inline panel remains',
+        modalUi.modalOpen && !modalUi.inlinePanel, JSON.stringify(modalUi));
+      check('rental modals: + Year record button is gone from rental cards',
+        !modalUi.hasYearBtn, JSON.stringify(modalUi));
+      await page.type('#earnRentalEntryForm [name="monthly_rent"]', '1500');
+      await waitE(200);
+      const modalGrouped = await page.evaluate(() => document.querySelector('#earnRentalEntryForm [name="monthly_rent"]').value);
+      check('rental modals: monthly-rent input groups while typing inside the modal',
+        modalGrouped === '1,500', JSON.stringify(modalGrouped));
+      await page.type('#earnRentalEntryForm [name="tenant_name"]', 'Modal Tenant');
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnRentalEntryForm');
+        f.start_ym.value = '2026-01'; f.end_ym.value = '2026-12';
+        f.pay_day.value = '1';
+      });
+      await page.click('#earnRentalEntryForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Modal Tenant'), { timeout: 10000 });
+      r = await req('GET', '/api/earnings');
+      const modalRental = (r.data.rentals || []).find((x) => x.id === modalRentalId);
+      const modalYear = modalRental && modalRental.years.find((y) => y.tax_year === 2026);
+      check('rental modals: saving from the modal creates the entry with derived year figures',
+        !!modalRental && modalRental.entries.some((e) => e.tenant_name === 'Modal Tenant')
+          && !!modalYear && modalYear.rent_derived === true && modalYear.gross_rents === 18000,
+        JSON.stringify(modalYear));
+      await page.evaluate((rid, yid) => window.earnEditYear(rid, yid), modalRentalId, modalYear.id);
+      await waitE(300);
+      const yearModalOpen = await page.evaluate(() => {
+        const m = document.querySelector('#earnRentalYearModal');
+        return m && !m.classList.contains('hidden') && !!m.querySelector('.modal-card #earnRentalYearForm');
+      });
+      check('rental modals: editing a year record opens a modal', yearModalOpen === true, JSON.stringify(yearModalOpen));
+      await page.click('#earnRentalYearCancelBtn');
+      await waitE(200);
+      const yearModalClosed = await page.evaluate(() => document.querySelector('#earnRentalYearModal').classList.contains('hidden'));
+      check('rental modals: year modal Cancel closes it', yearModalClosed === true, JSON.stringify(yearModalClosed));
+
       // Rental form: property dropdown lists app properties (never BCA
       // results); picking one disables + clears Address; Standalone
       // re-enables it; BCA suggest fills standalone text only.
