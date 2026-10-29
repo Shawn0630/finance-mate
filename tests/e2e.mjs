@@ -341,6 +341,36 @@ const yahooStub = http.createServer((req, res) => {
 await new Promise((r) => yahooStub.listen(0, '127.0.0.1', r));
 const yahooStubBase = `http://127.0.0.1:${yahooStub.address().port}/v8/finance/chart/`;
 
+// Nasdaq historical-data stub — the third price tier. Only
+// NTEST has rows here (Stooq returns "No data" for it and the
+// Yahoo stub 404s it), which is exactly the both-tiers-empty
+// scenario the tier exists for; every other symbol 404s.
+const nasdaqStub = http.createServer((req, res) => {
+  const su = new URL(req.url, 'http://x');
+  const parts = su.pathname.split('/').filter(Boolean);
+  const sym = (parts[parts.length - 2] || '').toUpperCase();
+  if (sym === 'NTEST') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      data: {
+        symbol: 'NTEST',
+        totalRecords: 2,
+        tradesTable: {
+          rows: [
+            { date: '02/02/2026', close: '$55.00', volume: '1,000', open: '$54.00', high: '$56.00', low: '$53.00' },
+            { date: '01/02/2026', close: '$50.00', volume: '2,000', open: '$49.00', high: '$51.00', low: '$48.00' },
+          ],
+        },
+      },
+    }));
+    return;
+  }
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ data: null, message: 'No data found' }));
+});
+await new Promise((r) => nasdaqStub.listen(0, '127.0.0.1', r));
+const nasdaqStubBase = `http://127.0.0.1:${nasdaqStub.address().port}/api/quote/`;
+
 // AI Fill test seam: the app reads LLM_STUB_RESPONSE_FILE on
 // every extraction, so the suite points it at a file it rewrites
 // per case — no real key, no network.
@@ -349,7 +379,7 @@ fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
 
 const server = spawn('node', ['src/server.js'], {
   cwd: path.resolve(import.meta.dirname, '..'),
-  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase, STOOQ_BASE_URL: stooqStubBase, FX_API_URL: fxStubBase, YAHOO_BASE_URL: yahooStubBase, LLM_STUB_RESPONSE_FILE: aiStubFile, LLM_MODELS: 'stub-a,stub-b', LLM_MODEL: 'stub-a' },
+  env: { ...process.env, DATA_DIR: dataDir, PORT: String(PORT), BCA_BASE_URL: stubBase, PRIME_API_URL: primeStubBase, HOUSESIGMA_BASE_URL: hsStubBase, STOOQ_BASE_URL: stooqStubBase, FX_API_URL: fxStubBase, YAHOO_BASE_URL: yahooStubBase, NASDAQ_BASE_URL: nasdaqStubBase, LLM_STUB_RESPONSE_FILE: aiStubFile, LLM_MODELS: 'stub-a,stub-b', LLM_MODEL: 'stub-a' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
@@ -7983,6 +8013,28 @@ try {
     JSON.stringify(zzRow && zzRow.priceStatus));
   await req('DELETE', `/api/investments/accounts/${invFailAcctId}`);
 
+  // Nasdaq third tier: a symbol neither Stooq ("No data") nor
+  // Yahoo (404) knows refreshes successfully via the Nasdaq
+  // stub, and the holding reports source nasdaq end to end.
+  r = await req('POST', '/api/investments/accounts', { name: 'NasdaqTier', type: 'Other' });
+  const invNtestAcctId = r.data.id;
+  r = await invPost(invNtestAcctId, { label: 'Nadaq Test', kind: 'exchange', symbol: 'NTEST', currency: 'CAD' });
+  const invNtestId = r.data.id;
+  r = await invEvent(invNtestId, { date: '2026-01-05', type: 'buy', units: 10, price: 48 });
+  check('investments: nasdaq tier holding + buy event created', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', '/api/investments/refresh');
+  const ntestRes = (r.data.results || []).find((x) => x.id === invNtestId);
+  check('investments: refresh via nasdaq tier when stooq and yahoo are empty',
+    r.status === 200 && ntestRes && ntestRes.ok === true && ntestRes.source === 'nasdaq',
+    JSON.stringify(ntestRes));
+  r = await req('GET', `/api/investments/holdings/${invNtestId}`);
+  check('investments: nasdaq-priced holding values at the nasdaq close',
+    r.data.summary.value === 550 && r.data.summary.contributions === 480 && r.data.summary.totalReturn === 70
+      && r.data.summary.latestPrice === 55 && r.data.summary.latestPriceSource === 'nasdaq'
+      && r.data.priceStatus.pricedBy === 'nasdaq',
+    JSON.stringify({ sm: r.data.summary, ps: r.data.priceStatus }));
+  await req('DELETE', `/api/investments/accounts/${invNtestAcctId}`);
+
   // Account edit + delete round trip on a scratch account.
   r = await req('POST', '/api/investments/accounts', { name: 'Scratch', type: 'Other' });
   const invScratchId = r.data.id;
@@ -10258,6 +10310,7 @@ try {
   stooqStub.close();
   fxStub.close();
   yahooStub.close();
+  nasdaqStub.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 console.log(failures === 0 ? 'E2E: ALL PASS' : `E2E: ${failures} FAILURE(S)`);

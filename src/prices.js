@@ -2,7 +2,7 @@
 // invest_prices / invest_fx_rates, behind small interfaces the
 // way src/regions/ hides region providers:
 //
-//   exchange holdings → TWO tiers of daily closes (no key):
+//   exchange holdings → THREE tiers of daily closes (no key):
 //     1. Stooq CSVs. Stored symbols map to Stooq's in
 //        stooqSymbolFor: a TSX symbol keeps its .TO suffix
 //        ('XQQ.TO' → 'xqq.to'); a bare symbol is a US listing
@@ -21,7 +21,23 @@
 //        query1 then query2 — one host throttling a request
 //        must not kill the fallback tier. (An explicit
 //        YAHOO_BASE_URL stays single-host: it is the test seam.)
-//     Both tiers empty → the holding falls back to its event
+//     3. Nasdaq's historical-data API — consulted ONLY when
+//        Stooq and Yahoo both come back empty. It needs no key,
+//        just a browser UA + Accept headers, and returns the
+//        full daily history (verified: META back to 2012 via
+//        fromdate + limit=9999, 1715 rows for 2020-01-01 on).
+//        Nasdaq lists US securities only, so .TO symbols skip
+//        this tier outright and keep Yahoo's error as the
+//        reported one. Price basis, verified 2026-10-29 against
+//        NVDA's 10:1 split (Jun 2024): the pre-split close
+//        reads $120.888 — exactly the $1,208.88 raw close / 10,
+//        continuous into the $121.79 post-split close — so
+//        these closes ARE split-adjusted, the same basis as
+//        Yahoo's close series. Dividend adjustment is NOT
+//        established (Nasdaq's Close/Last is not documented
+//        as dividend-adjusted, same as Yahoo's close), so do
+//        not claim it.
+//     All tiers empty → the holding falls back to its event
 //     prices (see investments.js) and the status says so.
 //   bank funds → NO automatic source in v1 (bank fund NAV
 //     history has no clean public feed): manual NAV snapshots
@@ -40,9 +56,10 @@
 //
 // Test seams (the env pattern the other providers use):
 // STOOQ_BASE_URL replaces https://stooq.com/q/d/l/,
-// YAHOO_BASE_URL replaces the chart API base, and FX_API_URL
-// replaces the Valet URL; the suites point all three at local
-// stubs and never touch the network.
+// YAHOO_BASE_URL replaces the chart API base,
+// NASDAQ_BASE_URL replaces https://api.nasdaq.com/api/quote/,
+// and FX_API_URL replaces the Valet URL; the suites point all
+// four at local stubs and never touch the network.
 
 const READ_TIMEOUT_MS = 4000;
 const FAIL_BACKOFF_MS = 15 * 60 * 1000;
@@ -225,6 +242,50 @@ export async function searchSecurities(query, timeoutMs = 6000) {
   }
 }
 
+// ----------------------------------------------------------- Nasdaq
+// The third tier: Nasdaq's historical-data API, consulted ONLY
+// when Stooq and Yahoo both come back empty. The endpoint
+// returns data.tradesTable.rows[] — newest first — with date
+// "MM/DD/YYYY" and a dollar-prefixed close string ("$612.49").
+// parseNasdaqHistorical normalises that to the same
+// [{ date, price }] ascending shape the other tiers produce.
+// No key: a browser UA + Accept headers suffice (verified
+// live 2026-10-29: META info lastSalePrice $626.88, and the
+// historical endpoint returns full depth with fromdate +
+// limit=9999). US listings only — tryPriceTiers skips this
+// tier for .TO symbols.
+export function parseNasdaqHistorical(json) {
+  const rows = json && json.data && json.data.tradesTable && Array.isArray(json.data.tradesTable.rows)
+    ? json.data.tradesTable.rows : [];
+  const out = [];
+  for (const r of rows) {
+    if (!r || typeof r.date !== 'string') continue;
+    const m = r.date.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!m) continue;
+    const date = `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+    const price = Number(String(r.close || '').replace(/[$,]/g, '').trim());
+    if (!Number.isFinite(price) || price <= 0) continue;
+    out.push({ date, price });
+  }
+  out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return out;
+}
+
+export async function fetchNasdaqHistory(symbol, timeoutMs = 10000) {
+  const sym = String(symbol || '').trim().toUpperCase();
+  if (!sym) throw new Error('no symbol to fetch');
+  const base = process.env.NASDAQ_BASE_URL || 'https://api.nasdaq.com/api/quote/';
+  const url = `${base}${base.endsWith('/') ? '' : '/'}${encodeURIComponent(sym)}/historical?assetclass=stocks&fromdate=2010-01-01&limit=9999`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': BROWSER_UA, 'Accept': 'application/json', 'Accept-Language': 'en-US' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`nasdaq fetch failed: HTTP ${res.status}`);
+  const rows = parseNasdaqHistorical(await res.json());
+  if (!rows.length) throw new Error(`nasdaq returned no data for ${sym}`);
+  return rows;
+}
+
 // ---------------------------------------------------------------- FX
 export const FX_SERIES = 'FX_USDCAD';
 
@@ -272,9 +333,12 @@ function isTimeoutError(err) {
     || /timeout|timed out|aborted/i.test(err.message || ''));
 }
 
-// One pass over the two tiers. Returns the rows and their
+// One pass over the three tiers. Returns the rows and their
 // source, or the verbatim error of the last tier tried —
 // callers surface that message, never a generic substitute.
+// Nasdaq lists US securities only: a .TO symbol can only come
+// back empty there, so the tier is skipped outright and
+// Yahoo's error stays the reported one.
 async function tryPriceTiers(symbol, timeoutMs) {
   let lastErr = null;
   try {
@@ -282,7 +346,12 @@ async function tryPriceTiers(symbol, timeoutMs) {
   } catch (err) { lastErr = err; } // empty or failed — fall through to Yahoo
   try {
     return { rows: await fetchYahooHistory(symbol, timeoutMs), source: 'yahoo', error: null };
-  } catch (err) { lastErr = err; }
+  } catch (err) { lastErr = err; } // empty or failed — fall through to Nasdaq
+  if (!/\.TO$/i.test(String(symbol || '').trim())) {
+    try {
+      return { rows: await fetchNasdaqHistory(symbol, timeoutMs), source: 'nasdaq', error: null };
+    } catch (err) { lastErr = err; }
+  }
   return { rows: null, source: null, error: lastErr };
 }
 
@@ -311,10 +380,11 @@ function vancouverDateTime(ms) {
 
 // Refresh one exchange holding's market prices if stale:
 // Stooq first; when Stooq has nothing for the symbol, Yahoo
-// Finance; both empty → the fetch counts as failed and the
+// Finance; when both are empty, Nasdaq (US listings only);
+// all empty → the fetch counts as failed and the
 // holding keeps whatever it had (event prices included). The
 // cache keeps exactly ONE market series per holding — a tier
-// switch replaces the other tier's rows wholesale. Fund
+// switch replaces the other tiers' rows wholesale. Fund
 // holdings and symbol-less holdings are a no-op (their prices
 // are manual). Never throws. A failure is recorded verbatim
 // (message + time) in app_meta so the UI can say what failed
@@ -345,7 +415,7 @@ export function ensureHoldingPricesDetailed(db, holding, opts = {}) {
     }
     if (!attempt.rows) {
       const message = attempt.error ? attempt.error.message : 'no market data';
-      console.warn(`[prices] no market data for ${holding.symbol} (stooq and yahoo both empty), keeping last known`);
+      console.warn(`[prices] no market data for ${holding.symbol} (all market tiers empty), keeping last known`);
       setMeta(db, errKey, JSON.stringify({ message, at: new Date().toISOString() }));
       inflight.delete(key);
       return { ok: false, source: null, error: message };
@@ -353,7 +423,7 @@ export function ensureHoldingPricesDetailed(db, holding, opts = {}) {
     try {
       const ts = new Date().toISOString();
       db.transaction(() => {
-        db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo')").run(holding.id);
+        db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo', 'nasdaq')").run(holding.id);
         const ins = db.prepare(
           'INSERT OR REPLACE INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, ?, ?)');
         for (const r of attempt.rows) ins.run(holding.id, r.date, r.price, attempt.source, ts);
@@ -440,7 +510,7 @@ export function priceStatusFor(db, holding, latest) {
   const by = Object.fromEntries(counts.map((c) => [c.source, c]));
   let pricedBy = 'none';
   if (latest) pricedBy = latest.source === 'manual' ? 'manual' : latest.source;
-  const fetched = [by.stooq, by.yahoo].filter(Boolean);
+  const fetched = [by.stooq, by.yahoo, by.nasdaq].filter(Boolean);
   const lastFetchedDate = fetched.length
     ? fetched.map((f) => f.last).sort().slice(-1)[0] : null;
   const stale = holding.kind === 'exchange' && !!holding.symbol

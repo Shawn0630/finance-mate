@@ -395,11 +395,15 @@ export function rebuildEventPricePoints(db, holdingId, ts) {
 }
 
 // ------------------------------------------------------ price access
-const SOURCE_PRIORITY = { event: 1, yahoo: 2, stooq: 3, manual: 4 };
+const SOURCE_PRIORITY = { event: 1, nasdaq: 2, yahoo: 3, stooq: 4, manual: 5 };
 
 // The last price point dated ≤ date; same-date ties resolve by
-// source priority (manual > stooq > yahoo > event). Null before the
-// first point — the caller values the holding at 0 there and
+// source priority (manual > stooq > yahoo > nasdaq > event).
+// Market tiers are mutually exclusive in the cache (a tier
+// switch replaces the other tiers' rows wholesale), so a
+// nasdaq/yahoo same-date tie cannot arise from fetching;
+// the rank exists only to keep the ordering total. Null before
+// the first point — the caller values the holding at 0 there and
 // the view's priceStatus says why.
 export function priceOn(points, date) {
   let best = null;

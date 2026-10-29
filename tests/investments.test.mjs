@@ -20,7 +20,7 @@ import {
   monthlyYears, latestMonthlyYear, monthlyRowsForYear,
 } from '../src/investments.js';
 import {
-  parseStooqCsv, stooqSymbolFor, parseYahooChart, ensureHoldingPrices, ensureHoldingPricesDetailed,
+  parseStooqCsv, stooqSymbolFor, parseYahooChart, parseNasdaqHistorical, ensureHoldingPrices, ensureHoldingPricesDetailed,
   refreshAllPrices, priceStatusFor, clearHoldingPriceMeta,
   parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory,
 } from '../src/prices.js';
@@ -548,6 +548,97 @@ test('ensureHoldingPrices: Stooq empty falls back to Yahoo; Stooq data never con
     globalThis.fetch = realFetch;
     if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
     if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    db.close();
+  }
+});
+
+test('parseNasdaqHistorical: real tradesTable shape → ascending closes, $ prefix stripped, junk dropped', () => {
+  // Shape copied from the live endpoint (META, Oct 2026): rows
+  // newest-first, date "MM/DD/YYYY", close "$612.49".
+  const json = {
+    data: {
+      symbol: 'META',
+      totalRecords: 5,
+      tradesTable: {
+        headers: { date: 'Date', close: 'Close/Last' },
+        rows: [
+          { date: '02/02/2026', close: '$55.00', volume: '1,000', open: '$54.00', high: '$56.00', low: '$53.00' },
+          { date: '01/02/2026', close: '$50.00', volume: '2,000', open: '$49.00', high: '$51.00', low: '$48.00' },
+          { date: 'bogus', close: '$1.00' },
+          { date: '01/15/2026', close: '' },
+          { date: '01/16/2026', close: '$0' },
+        ],
+      },
+    },
+  };
+  assert.deepEqual(parseNasdaqHistorical(json), [
+    { date: '2026-01-02', price: 50 },
+    { date: '2026-02-02', price: 55 },
+  ]);
+  assert.deepEqual(parseNasdaqHistorical({}), []);
+  assert.deepEqual(parseNasdaqHistorical({ data: { tradesTable: { rows: null } } }), []);
+});
+
+test('nasdaq third tier: used only when stooq and yahoo are empty, skipped for .TO, verbatim error when all fail', async () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));
+  `);
+  const nasdaqJson = {
+    data: {
+      symbol: 'NTEST',
+      totalRecords: 2,
+      tradesTable: {
+        rows: [
+          { date: '02/02/2026', close: '$55.00', volume: '1,000', open: '$54.00', high: '$56.00', low: '$53.00' },
+          { date: '01/02/2026', close: '$50.00', volume: '2,000', open: '$49.00', high: '$51.00', low: '$48.00' },
+        ],
+      },
+    },
+  };
+  const realFetch = globalThis.fetch;
+  const savedEnv = { s: process.env.STOOQ_BASE_URL, y: process.env.YAHOO_BASE_URL, n: process.env.NASDAQ_BASE_URL };
+  process.env.STOOQ_BASE_URL = 'http://stub.test/stooq/';
+  process.env.YAHOO_BASE_URL = 'http://stub.test/yahoo/';
+  process.env.NASDAQ_BASE_URL = 'http://stub.test/nasdaq/';
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+    if (String(url).includes('/nasdaq/')) return { ok: true, json: async () => nasdaqJson };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  try {
+    // Stooq + Yahoo empty → Nasdaq serves, points cached as nasdaq.
+    const r = await ensureHoldingPricesDetailed(db, { id: 21, kind: 'exchange', symbol: 'NTEST' });
+    assert.equal(r.ok, true);
+    assert.equal(r.source, 'nasdaq');
+    assert.deepEqual(listPricePoints(db, 21).map((p) => [p.date, p.price, p.source]), [
+      ['2026-01-02', 50, 'nasdaq'],
+      ['2026-02-02', 55, 'nasdaq'],
+    ]);
+    // .TO symbols never call Nasdaq: the reported error stays Yahoo's.
+    calls.length = 0;
+    const rTo = await ensureHoldingPricesDetailed(db, { id: 22, kind: 'exchange', symbol: 'ZZFAIL.TO' });
+    assert.equal(rTo.ok, false);
+    assert.equal(rTo.error, 'yahoo fetch failed: HTTP 404');
+    assert.equal(calls.filter((u) => u.includes('/nasdaq/')).length, 0, 'nasdaq must not be called for .TO');
+    // All three fail → the verbatim Nasdaq error is reported.
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/stooq/')) return { ok: true, text: async () => 'No data' };
+      if (String(url).includes('/nasdaq/')) return { ok: false, status: 500, json: async () => ({}) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const rAll = await ensureHoldingPricesDetailed(db, { id: 23, kind: 'exchange', symbol: 'NFAIL' });
+    assert.equal(rAll.ok, false);
+    assert.equal(rAll.error, 'nasdaq fetch failed: HTTP 500');
+    assert.deepEqual(listPricePoints(db, 23), []);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
+    if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    if (savedEnv.n === undefined) delete process.env.NASDAQ_BASE_URL; else process.env.NASDAQ_BASE_URL = savedEnv.n;
     db.close();
   }
 });

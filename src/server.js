@@ -2680,7 +2680,7 @@ app.put('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
     // A new symbol invalidates the closes fetched for the old
     // one; the next read refetches under the new symbol.
     if (v.symbol !== holding.symbol || v.kind !== holding.kind) {
-      db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo')").run(holding.id);
+      db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo', 'nasdaq')").run(holding.id);
       db.prepare("DELETE FROM app_meta WHERE key = ?").run(`invest_px_${holding.id}_ok`);
     }
   })();
