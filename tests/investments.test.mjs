@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import {
   validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
+  getAccount, listAccounts,
   unitsOn, unitsAvailableForSell, priceOn, fxOn,
   computeHoldingSeries, aggregateComputed, rebuildEventPricePoints, listPricePoints,
   splitMultiplier, splitFactorAfter, adjustedUnitsOf,
@@ -809,4 +810,20 @@ test('handleAiInvestFillChat: 404 unknown account, 400 missing input, 503 unconf
   const junk = await handleAiInvestFillChat(
     { accountId: 3, text: 'x' }, { env: AI_ENV, account: ACCT, holdings: [], callLlm: async () => 'not json' });
   assert.equal(junk.status, 502);
+});
+
+// ------------------------------------------------------- account owners
+test('account owners: stored JSON array reads back as an array; NULL reads as []', () => {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE invest_accounts (id INTEGER PRIMARY KEY, name TEXT, type TEXT,
+    institution TEXT, note TEXT, owners TEXT, created_at TEXT, updated_at TEXT)`);
+  const ins = db.prepare('INSERT INTO invest_accounts (name, type, owners) VALUES (?, ?, ?)');
+  ins.run('Joint TFSA', 'TFSA', '["Shawn","Jiaying"]');
+  ins.run('Solo RRSP', 'RRSP', null);
+  ins.run('Broken', 'Other', 'not-json');
+  assert.deepEqual(getAccount(db, 1).owners, ['Shawn', 'Jiaying']);
+  assert.deepEqual(getAccount(db, 2).owners, []);
+  assert.deepEqual(getAccount(db, 3).owners, []);
+  assert.deepEqual(listAccounts(db).map((a) => a.owners), [['Shawn', 'Jiaying'], [], []]);
+  assert.equal(getAccount(db, 99), null);
 });

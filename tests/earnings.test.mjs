@@ -175,3 +175,11 @@ test('rental validation: rejects bad ownership and bad rental type', () => {
   assert.ok(validRentalInput({ label: 'X', rental_type: 'weekly', ownership_pct: 50 }).error);
   assert.ok(!validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 50 }).error);
 });
+
+test('job owner: single earner kept, empty/omitted means unassigned', () => {
+  const base = { employer: 'Acme', province: 'BC', frequency: 'annual', gross_amount: 60000, tax_year: 2026 };
+  assert.equal(validJobInput({ ...base, owner: 'Shawn' }).owner, 'Shawn');
+  assert.equal(validJobInput({ ...base, owner: '' }).owner, null);
+  assert.equal(validJobInput({ ...base }).owner, null);
+  assert.equal(validJobInput({ ...base, owner: '  Jiaying  ' }).owner, 'Jiaying');
+});

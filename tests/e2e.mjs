@@ -566,6 +566,57 @@ try {
   r = await req('DELETE', `/api/assets/${aidOwn}`);
   check('owner fixtures cleaned up', r.status === 200);
 
+  // Investment accounts carry the same owners set as properties.
+  r = await req('POST', '/api/investments/accounts', { name: 'Owner TFSA', type: 'TFSA', owners: ['Shawn', 'Jiaying'] });
+  check('investment account can have two owners', r.status === 201 && JSON.stringify(r.data.owners) === '["Shawn","Jiaying"]', JSON.stringify(r.data));
+  const invAccOwn = r.data.id;
+  r = await req('GET', `/api/investments/accounts/${invAccOwn}`);
+  check('account owners persisted', JSON.stringify(r.data.account.owners) === '["Shawn","Jiaying"]', JSON.stringify(r.data.account));
+  r = await req('PUT', `/api/investments/accounts/${invAccOwn}`, { owners: ['Jiaying'] });
+  check('account owners can be reduced to one', r.status === 200 && JSON.stringify(r.data.owners) === '["Jiaying"]', JSON.stringify(r.data));
+  r = await req('PUT', `/api/investments/accounts/${invAccOwn}`, { owners: [] });
+  check('account owners can be cleared', r.status === 200 && JSON.stringify(r.data.owners) === '[]');
+  r = await req('PUT', `/api/investments/accounts/${invAccOwn}`, { name: 'Owner TFSA renamed' });
+  check('account owners unchanged when omitted from PUT', r.status === 200 && JSON.stringify(r.data.owners) === '[]');
+  r = await req('POST', '/api/investments/accounts', { name: 'Bad Joint', type: 'TFSA', owners: ['Joint'] });
+  check('account with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
+  r = await req('POST', '/api/investments/accounts', { name: 'Bad admin', type: 'TFSA', owners: ['admin'] });
+  check('account with admin owner rejected', r.status === 400 && String(r.data.error || '').includes('admin'), JSON.stringify(r.data));
+  r = await req('POST', '/api/investments/accounts', { name: 'Bad nobody', type: 'TFSA', owners: ['Nobody'] });
+  check('account with unknown owner rejected', r.status === 400);
+  r = await req('POST', '/api/investments/accounts', { name: 'No owner account', type: 'TFSA' });
+  check('account without owners is legal and reads as []', r.status === 201 && JSON.stringify(r.data.owners) === '[]', JSON.stringify(r.data));
+  const invAccNoOwn = r.data.id;
+  r = await req('DELETE', `/api/investments/accounts/${invAccOwn}`);
+  check('owner account fixture cleaned up', r.status === 200);
+  r = await req('DELETE', `/api/investments/accounts/${invAccNoOwn}`);
+  check('no-owner account fixture cleaned up', r.status === 200);
+
+  // A job's owner is ONE earner (T1 is per-person), same candidates.
+  const jobBody = { employer: 'Owner Corp', province: 'BC', frequency: 'annual', gross_amount: 60000, gross_basis: 'annual', tax_year: 2026 };
+  r = await req('POST', '/api/earnings/jobs', { ...jobBody, owner: 'Shawn' });
+  check('job can carry one owner', r.status === 201 && r.data.owner === 'Shawn', JSON.stringify(r.data));
+  const jobOwn = r.data.id;
+  r = await req('PUT', `/api/earnings/jobs/${jobOwn}`, { ...jobBody, owner: 'Jiaying' });
+  check('job owner can change', r.status === 200 && r.data.owner === 'Jiaying', JSON.stringify(r.data));
+  r = await req('PUT', `/api/earnings/jobs/${jobOwn}`, { ...jobBody });
+  check('job owner unchanged when omitted from PUT', r.status === 200 && r.data.owner === 'Jiaying', JSON.stringify(r.data));
+  r = await req('PUT', `/api/earnings/jobs/${jobOwn}`, { ...jobBody, owner: '' });
+  check('job owner clears on explicit empty value', r.status === 200 && r.data.owner === null, JSON.stringify(r.data));
+  r = await req('POST', '/api/earnings/jobs', { ...jobBody, owner: 'Joint' });
+  check('job with Joint owner rejected', r.status === 400 && String(r.data.error || '').includes('Joint'), JSON.stringify(r.data));
+  r = await req('POST', '/api/earnings/jobs', { ...jobBody, owner: 'admin' });
+  check('job with admin owner rejected', r.status === 400 && String(r.data.error || '').includes('admin'), JSON.stringify(r.data));
+  r = await req('POST', '/api/earnings/jobs', { ...jobBody, owner: 'Nobody' });
+  check('job with unknown owner rejected', r.status === 400);
+  r = await req('POST', '/api/earnings/jobs', { ...jobBody });
+  check('job without owner is legal and reads as null', r.status === 201 && r.data.owner === null, JSON.stringify(r.data));
+  const jobNoOwn = r.data.id;
+  r = await req('DELETE', `/api/earnings/jobs/${jobOwn}`);
+  check('owner job fixture cleaned up', r.status === 200);
+  r = await req('DELETE', `/api/earnings/jobs/${jobNoOwn}`);
+  check('no-owner job fixture cleaned up', r.status === 200);
+
   // Value history: the stub fetch above already recorded the 2026 auto
   // point for pid2; manual points fill the earlier years.
   r = await req('GET', `/api/properties/${pid2}/value-history`);
@@ -8167,6 +8218,55 @@ try {
       check('investments UI: the account page head lines up with its panels and points back to Stocks',
         acctGeom.back.includes('Back to Stocks') && acctGeom.leftDelta <= 3 && acctGeom.rightDelta <= 3,
         JSON.stringify(acctGeom));
+      // Account owners: the modal picker, the portfolio card, and
+      // the account page header all show the same owner chips.
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('#addInvestAccountBtn');
+      await page.waitForFunction(() => !document.querySelector('#investAccountModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('#investAccountForm input[name=name]', 'Owner Browser TFSA');
+      await page.evaluate(() => {
+        const btn = [...document.querySelectorAll('#investAccountOwnerPicker .owner-candidate')]
+          .find((b) => b.textContent.includes('Shawn'));
+        if (btn) btn.click();
+      });
+      await page.click('#investAccountForm button[type=submit]');
+      await waitI(800);
+      const ownerOnPage = await page.evaluate(() => document.querySelector('#investAccountTitle').textContent);
+      check('investments UI: picking an owner in the modal shows the chip on the account page',
+        ownerOnPage.includes('Shawn'), ownerOnPage.slice(0, 200));
+      await page.goto('http://ff.local/#assets/investments', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      const ownerOnCard = await page.evaluate(() => document.querySelector('#section-investments').textContent);
+      check('investments UI: the portfolio card shows the account owner',
+        ownerOnCard.includes('Owner Browser TFSA') && ownerOnCard.includes('Shawn'), ownerOnCard.slice(0, 300));
+      // Edit the account back to no owner via the picker chip's ×.
+      const ownerAccId = await page.evaluate(async () => {
+        const d = await (await fetch('/api/investments')).json();
+        return d.accounts.find((a) => a.account.name === 'Owner Browser TFSA').account.id;
+      });
+      await page.goto(`http://ff.local/#invest-account/${ownerAccId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('#editInvestAccountBtn');
+      await page.waitForFunction(() => !document.querySelector('#investAccountModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => {
+        const x = document.querySelector('#investAccountOwnerPicker [data-owner-remove]');
+        if (x) x.click();
+      });
+      await page.click('#investAccountForm button[type=submit]');
+      await waitI(800);
+      const ownerCleared = await page.evaluate(() => document.querySelector('#investAccountTitle').textContent);
+      check('investments UI: removing the owner in edit clears the chip',
+        !ownerCleared.includes('Shawn'), ownerCleared.slice(0, 200));
+      await page.evaluate(async () => {
+        const d = await (await fetch('/api/investments')).json();
+        const a = d.accounts.find((x) => x.account.name === 'Owner Browser TFSA');
+        if (a) await fetch(`/api/investments/accounts/${a.account.id}`, { method: 'DELETE' });
+      });
+      // Back to the seeded account page: the holding flow below
+      // assumes the page is on invTfsaId, not the deleted account.
+      await page.goto(`http://ff.local/#invest-account/${invTfsaId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
       // Add holding through the security autocomplete: type XQQ,
       // pick the TSX candidate, then submit a buy row and a sell
       // row as initial transactions.
@@ -8583,6 +8683,27 @@ try {
           && panelSell.text.includes('Price derived from total amount')
           && panelSell.text.includes('Not included from the statement') && panelSell.text.includes('matched'),
         JSON.stringify(panelSell));
+      // Earnings: a job created with an owner shows the earner
+      // chip on its card in the salary list.
+      await page.goto('http://ff.local/#earnings', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(800);
+      await page.click('#addEarnJobBtn');
+      await page.waitForFunction(() => !document.querySelector('#earnJobFormPanel').classList.contains('hidden'), { timeout: 10000 });
+      await page.type('#earnJobForm input[name=employer]', 'Owner Browser Corp');
+      await page.select('#earnJobForm select[name=province]', 'BC');
+      await page.select('#earnJobForm select[name=frequency]', 'annual');
+      await page.type('#earnJobForm input[name=gross_amount]', '60000');
+      await page.select('#earnJobForm select[name=owner]', 'Shawn');
+      await page.click('#earnJobForm button[type=submit]');
+      await waitI(800);
+      const jobCardText = await page.evaluate(() => document.querySelector('#earnJobList').textContent);
+      check('earnings UI: a job created with an owner shows the earner on its card',
+        jobCardText.includes('Owner Browser Corp') && jobCardText.includes('Shawn'), jobCardText.slice(0, 300));
+      await page.evaluate(async () => {
+        const d = await (await fetch('/api/earnings')).json();
+        const j = d.jobs.find((x) => x.employer === 'Owner Browser Corp');
+        if (j) await fetch(`/api/earnings/jobs/${j.id}`, { method: 'DELETE' });
+      });
     } catch (err) {
       check('investments browser flow runs to completion', false, String((err && err.message) || err));
     } finally {

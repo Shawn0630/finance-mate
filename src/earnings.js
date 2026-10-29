@@ -132,9 +132,13 @@ export function validJobInput(body) {
   const currency = cleanStr(b.currency, 3) || 'CAD';
   // Deliberately no SIN, birth date, bank details, employer payroll
   // account number, or T4 fields: none of them affect this estimate.
+  // Owner is the single earner (T1 is per-person): a bare username,
+  // null when unassigned. Candidate validation (existing non-admin
+  // user, never 'Joint') lives server-side with the users table.
   return {
     employer, province, frequency, gross_amount: grossAmount, gross_basis: grossBasis,
     tax_year: taxYear, currency: currency.toUpperCase(),
+    owner: cleanStr(b.owner, 120),
     td1_federal: optNum(b.td1_federal), td1_provincial: optNum(b.td1_provincial),
     ytd_cpp: numOr(b.ytd_cpp, 0), ytd_cpp2: numOr(b.ytd_cpp2, 0), ytd_ei: numOr(b.ytd_ei, 0),
     cpp_exempt: b.cpp_exempt === true || b.cpp_exempt === 1 || b.cpp_exempt === '1',

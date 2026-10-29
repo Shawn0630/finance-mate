@@ -432,6 +432,7 @@
         <h3 id="earnJobFormTitle">Add job</h3>
         <form id="earnJobForm">
           <div><label>Employer *</label><input name="employer" required></div>
+          <div><label>Earner</label><select name="owner" id="earnJobOwner"></select></div>
           <div><label>Currency</label><input name="currency" value="CAD" maxlength="3"></div>
           <div><label>Province of employment *</label><select name="province" id="earnJobProvince"></select></div>
           <div><label>Pay frequency *</label><select name="frequency" id="earnJobFrequency"></select></div>
@@ -537,6 +538,7 @@
         <div><label>Institution</label><input name="institution" placeholder="CIBC, Scotia, employer plan…" autocomplete="off"></div>
         <div><label>Note</label><input name="note" autocomplete="off"></div>
       </div>
+      <div><label>Owners</label><div class="owner-picker" id="investAccountOwnerPicker"><div class="owner-chips"></div><div class="owner-candidates"></div></div></div>
       <div class="toolbar">
         <button class="primary" type="submit">Save</button>
         <button type="button" data-close-modal>Cancel</button>

@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS invest_fx_rates (
 CREATE TABLE IF NOT EXISTS earn_jobs (
   id INTEGER PRIMARY KEY,
   employer TEXT NOT NULL,
+  owner TEXT,                                   -- single earner username (T1 is per-person); NULL = unassigned
   currency TEXT NOT NULL DEFAULT 'CAD',
   province TEXT NOT NULL,                        -- employment province code (BC, ON, …)
   frequency TEXT NOT NULL,                      -- weekly | biweekly | semimonthly | monthly | annual
@@ -303,6 +304,14 @@ CREATE TABLE IF NOT EXISTS property_photos (
 );
 CREATE INDEX IF NOT EXISTS idx_property_photos ON property_photos(property_id, sort_order, id);
 `);
+
+// Jobs predate the single-earner field; existing rows default to
+// unassigned (NULL). New databases get the column from the CREATE
+// TABLE above.
+const earnJobCols = db.prepare('PRAGMA table_info(earn_jobs)').all().map((c) => c.name);
+if (!earnJobCols.includes('owner')) {
+  db.exec('ALTER TABLE earn_jobs ADD COLUMN owner TEXT');
+}
 
 // Properties used to carry ONE uploaded photo in properties.photo_file;
 // the gallery replaces it. Fold any existing single photo into the
@@ -465,6 +474,7 @@ function migrateOwners(table) {
 }
 migrateOwners('properties');
 migrateOwners('other_assets');
+migrateOwners('invest_accounts');
 
 // ------------------------------------------------------- mortgage terms ---
 // The mortgage is modelled the way Canadian lenders actually run

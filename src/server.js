@@ -447,6 +447,20 @@ function cleanOwners(v) {
   return { value: names };
 }
 
+// A job's owner is ONE person, not a set: a T1 return is per-person,
+// so splitting one salary across several owners would misstate tax.
+// Same candidates as cleanOwners (existing non-admin users, no 'Joint');
+// empty means unassigned, which is legal for pre-existing jobs.
+function cleanJobOwner(v) {
+  if (v === undefined || v === null || v === '') return { value: null };
+  const s = String(v).trim();
+  if (!s) return { value: null };
+  if (s === 'Joint') return { error: '"Joint" is not an owner — a job belongs to one earner' };
+  if (s === adminUsername()) return { error: 'admin cannot be an owner' };
+  if (!ownerCandidates().includes(s)) return { error: `unknown owner "${s}" — pick from the users list` };
+  return { value: s };
+}
+
 // --------------------------------------------------------------- admin ---
 // User management is admin-only. requireAdmin enforces it on the server
 // for every /api/admin route (the UI also hides the Admin nav entry
@@ -500,7 +514,7 @@ app.delete('/api/admin/users/:id', requireApiAuth, requireAdmin, (req, res) => {
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
     // Scrub the name out of every owners list, so owner data never
     // points at a user who no longer exists.
-    for (const table of ['properties', 'other_assets']) {
+    for (const table of ['properties', 'other_assets', 'invest_accounts']) {
       const rows = db.prepare(`SELECT id, owners FROM ${table} WHERE owners IS NOT NULL`).all();
       const upd = db.prepare(`UPDATE ${table} SET owners = ? WHERE id = ?`);
       for (const row of rows) {
@@ -510,6 +524,8 @@ app.delete('/api/admin/users/:id', requireApiAuth, requireAdmin, (req, res) => {
         }
       }
     }
+    // A job's single earner clears to unassigned the same way.
+    db.prepare('UPDATE earn_jobs SET owner = NULL WHERE owner = ?').run(u.username);
     db.prepare('DELETE FROM users WHERE id = ?').run(u.id);
   })();
   if (u.avatar_file) fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
@@ -2457,10 +2473,12 @@ app.get('/api/invest/search', requireApiAuth, async (req, res) => {
 app.post('/api/investments/accounts', requireApiAuth, (req, res) => {
   const v = validAccountInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
+  const own = cleanOwners((req.body || {}).owners);
+  if (own.error) return res.status(400).json({ error: own.error });
   const ts = nowIso();
   const info = db.prepare(
-    'INSERT INTO invest_accounts (name, type, institution, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(v.name, v.type, v.institution, v.note, ts, ts);
+    'INSERT INTO invest_accounts (name, type, institution, note, owners, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(v.name, v.type, v.institution, v.note, JSON.stringify(own.value || []), ts, ts);
   res.status(201).json(getAccount(db, info.lastInsertRowid));
 });
 
@@ -2481,8 +2499,15 @@ app.put('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
   if (!account) return res.status(404).json({ error: 'account not found' });
   const v = validAccountInput(req.body || {}, account);
   if (v.error) return res.status(400).json({ error: v.error });
-  db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, updated_at = ? WHERE id = ?')
-    .run(v.name, v.type, v.institution, v.note, nowIso(), account.id);
+  // Owners follow the property rule: omitted means unchanged.
+  let owners = account.owners || [];
+  if ((req.body || {}).owners !== undefined) {
+    const own = cleanOwners(req.body.owners);
+    if (own.error) return res.status(400).json({ error: own.error });
+    owners = own.value;
+  }
+  db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, owners = ?, updated_at = ? WHERE id = ?')
+    .run(v.name, v.type, v.institution, v.note, JSON.stringify(owners), nowIso(), account.id);
   res.json(getAccount(db, account.id));
 });
 
@@ -2635,6 +2660,7 @@ app.post('/api/investments/refresh', requireApiAuth, async (req, res) => {
 const earnRegion = () => getRegion('CA');
 const earnJobRow = (row) => ({
   ...row,
+  owner: row.owner || null,
   cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
   calc: calcSalary(row, earnRegion().payroll),
 });
@@ -2675,12 +2701,14 @@ app.get('/api/earnings', requireApiAuth, (req, res) => {
 app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
   const v = validJobInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
+  const own = cleanJobOwner((req.body || {}).owner);
+  if (own.error) return res.status(400).json({ error: own.error });
   const ts = nowIso();
   const info = db.prepare(
-    `INSERT INTO earn_jobs (employer, currency, province, frequency, gross_amount, gross_basis, tax_year,
+    `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
      td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    v.employer, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
     v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
     v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, ts, ts);
   res.status(201).json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(info.lastInsertRowid)));
@@ -2689,12 +2717,21 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   const v = validJobInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
   const id = Number(req.params.id);
-  if (!db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(id)) return res.status(404).json({ error: 'job not found' });
+  const existing = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'job not found' });
+  // Owner follows the property rule: omitted means unchanged, an
+  // explicit empty value clears to unassigned.
+  let owner = existing.owner || null;
+  if ((req.body || {}).owner !== undefined) {
+    const own = cleanJobOwner(req.body.owner);
+    if (own.error) return res.status(400).json({ error: own.error });
+    owner = own.value;
+  }
   db.prepare(
-    `UPDATE earn_jobs SET employer = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
+    `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
      tax_year = ?, td1_federal = ?, td1_provincial = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?,
      cpp_exempt = ?, ei_exempt = ?, updated_at = ? WHERE id = ?`).run(
-    v.employer, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+    v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
     v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
     v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, nowIso(), id);
   res.json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));

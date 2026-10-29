@@ -284,11 +284,26 @@ export function validNavInput(b) {
 }
 
 // ------------------------------------------------------------ storage
+// Owners are a SET of usernames, exactly like properties: stored as a
+// JSON array in the `owners` column, read back as an array (empty when
+// the column is NULL, i.e. an account created before owners existed).
+function parseOwnerList(stored) {
+  if (!stored) return [];
+  try {
+    const v = JSON.parse(stored);
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+function accountRow(row) {
+  return row ? { ...row, owners: parseOwnerList(row.owners) } : null;
+}
 export function listAccounts(db) {
-  return db.prepare('SELECT * FROM invest_accounts ORDER BY id').all();
+  return db.prepare('SELECT * FROM invest_accounts ORDER BY id').all().map(accountRow);
 }
 export function getAccount(db, id) {
-  return db.prepare('SELECT * FROM invest_accounts WHERE id = ?').get(id) || null;
+  return accountRow(db.prepare('SELECT * FROM invest_accounts WHERE id = ?').get(id) || null);
 }
 export function listHoldings(db, accountId = null) {
   return accountId == null

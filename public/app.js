@@ -470,7 +470,8 @@ function createOwnerPicker(root) {
 const addPropOwnerPicker = createOwnerPicker($('#addPropOwnerPicker'));
 const propOwnerPicker = createOwnerPicker($('#propOwnerPicker'));
 const assetOwnerPicker = createOwnerPicker($('#assetOwnerPicker'));
-const ownerPickers = [addPropOwnerPicker, propOwnerPicker, assetOwnerPicker];
+const investAccountOwnerPicker = createOwnerPicker($('#investAccountOwnerPicker'));
+const ownerPickers = [addPropOwnerPicker, propOwnerPicker, assetOwnerPicker, investAccountOwnerPicker];
 
 // ------------------------------------------------------------- assets data ---
 let assetsLoaded = false;
@@ -5103,6 +5104,7 @@ async function loadInvestmentsImpl() {
       <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
       <div class="v">${moneyC(a.summary.value)}</div>
       <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${returnText(a.summary.totalReturn, a.summary.totalReturnPct)}</div>
+      ${a.account.owners && a.account.owners.length ? `<div class="n">${ownerChipsHtml(a.account.owners)}</div>` : ''}
     </div>`).join('');
   host.innerHTML = `
     <div class="section-head"><h2>Stocks</h2>
@@ -5146,7 +5148,7 @@ async function loadInvestAccountImpl(id) {
   const a = data.account;
   if (investChatAccountId !== id) resetInvestChat(id);
   $('#investAccountTitle').innerHTML =
-    `${esc(a.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.type] || a.type)}</span>${a.institution ? ` <span class="note" style="margin:0">${esc(a.institution)}</span>` : ''}${a.note ? `<div class="note" style="margin:4px 0 0">${esc(a.note)}</div>` : ''}`;
+    `${esc(a.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.type] || a.type)}</span>${a.institution ? ` <span class="note" style="margin:0">${esc(a.institution)}</span>` : ''}${a.owners && a.owners.length ? `<div style="margin:4px 0 0">${ownerChipsHtml(a.owners)}</div>` : ''}${a.note ? `<div class="note" style="margin:4px 0 0">${esc(a.note)}</div>` : ''}`;
   $('#investAccountStats').innerHTML = investSummaryStrip(data.summary);
   const notes = [];
   for (const row of data.holdings) {
@@ -5363,6 +5365,7 @@ window.deleteInvestNav = deleteInvestNav;
 function openInvestAccountModal(id) {
   const form = $('#investAccountForm');
   form.reset();
+  investAccountOwnerPicker.set([]);
   $('#investAccountModalMsg').className = 'msg';
   form.elements.id.value = id || '';
   $('#investAccountModalTitle').textContent = id ? 'Edit account' : 'Add account';
@@ -5374,6 +5377,7 @@ function openInvestAccountModal(id) {
       form.elements.type.value = acc.type || 'NonRegistered';
       form.elements.institution.value = acc.institution || '';
       form.elements.note.value = acc.note || '';
+      investAccountOwnerPicker.set(acc.owners || []);
     };
     if (a) fill(a);
     else api(`/api/investments/accounts/${id}`).then((d) => fill(d.account)).catch((err) => alert(err.message));
@@ -5386,6 +5390,7 @@ $('#investAccountForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target).entries());
   const id = f.id; delete f.id;
+  f.owners = investAccountOwnerPicker.get();
   try {
     if (id) {
       await api(`/api/investments/accounts/${id}`, { method: 'PUT', body: f });
@@ -7080,6 +7085,7 @@ function earnJobCard(j) {
   const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
   return `<div class="panel">
     <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
+    ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
     <div class="spacer"></div>
     <button class="small" onclick="earnEditJob(${j.id})">Edit</button>
     <button class="small danger" onclick="earnDeleteJob(${j.id})">Delete</button></div>
@@ -7137,9 +7143,12 @@ function earnRentalCard(r) {
 
 async function loadEarnings() {
   try {
+    if (!ownerUsers.length) await loadOwnerUsers();
     earnData = await api('/api/earnings');
     $('#earnJobProvince').innerHTML = earnData.payrollProvinces.map((p) =>
       `<option value="${p.code}">${esc(p.label)}${p.verified ? '' : ' (unverified)'}</option>`).join('');
+    $('#earnJobOwner').innerHTML = `<option value="">No owner</option>` + ownerUsers.map((u) =>
+      `<option value="${esc(u)}">${esc(u)}</option>`).join('');
     $('#earnJobFrequency').innerHTML = earnData.payFrequencies.map((f) =>
       `<option value="${f.key}">${esc(f.label)}</option>`).join('');
     $('#earnJobList').innerHTML = earnData.jobs.length
@@ -7181,7 +7190,7 @@ window.earnEditJob = (id) => {
   earnEditJobId = id;
   $('#earnJobFormTitle').textContent = 'Edit job';
   const f = $('#earnJobForm');
-  f.employer.value = j.employer; f.currency.value = j.currency; f.province.value = j.province;
+  f.employer.value = j.employer; f.owner.value = j.owner || ''; f.currency.value = j.currency; f.province.value = j.province;
   f.frequency.value = j.frequency; f.gross_amount.value = j.gross_amount; f.gross_basis.value = j.gross_basis;
   f.tax_year.value = j.tax_year; f.td1_federal.value = j.td1_federal ?? ''; f.td1_provincial.value = j.td1_provincial ?? '';
   f.ytd_cpp.value = j.ytd_cpp; f.ytd_cpp2.value = j.ytd_cpp2; f.ytd_ei.value = j.ytd_ei;
