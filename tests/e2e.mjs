@@ -9832,6 +9832,9 @@ try {
           openShown: openG ? getComputedStyle(openG).display !== 'none' : false,
           closedShown: closedG ? getComputedStyle(closedG).display !== 'none' : false,
           noSlash: svg ? !svg.querySelector('.eye-slash') : false,
+          strokeWidth: svg ? svg.getAttribute('stroke-width') : null,
+          pupilRing: svg ? (() => { const c = svg.querySelector('.eye-open circle'); return !!c && c.getAttribute('fill') === 'none'; })() : false,
+          lashCount: svg ? svg.querySelectorAll('.eye-closed line').length : 0,
           eyeHidden: btn.classList.contains('invest-eye-hidden'),
           title: btn.title,
           topRight: Math.abs(br.right - cr.right) <= 26 && br.top - cr.top >= 0 && br.top - cr.top <= 26,
@@ -9871,15 +9874,15 @@ try {
       const st0 = await hideState();
       const cardValSum = (pfH.accounts || []).reduce((s, a) => s + a.summary.value, 0);
       const cs0 = await cardSt(hideAcct.account.id);
-      check('investments UI: each account card carries a line-style SVG eye-icon button at its top-right corner, not the emoji glyph or a Hide/Show text button',
-        cs0 && cs0.svg === true && cs0.textEmpty === true && cs0.openShown === true && cs0.closedShown === false && cs0.noSlash === true && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true, JSON.stringify(cs0));
+      check('investments UI: each account card carries a bold-stroke SVG eye-icon button at its top-right corner, not the emoji glyph or a Hide/Show text button',
+        cs0 && cs0.svg === true && cs0.textEmpty === true && cs0.openShown === true && cs0.closedShown === false && cs0.noSlash === true && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true && cs0.strokeWidth === '2.6' && cs0.pupilRing === true && cs0.lashCount === 5, JSON.stringify(cs0));
       await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
       await waitI(400);
       let cs = await cardSt(hideAcct.account.id);
       let hs = await hideState();
       const strip1 = await stripVals();
-      check('investments UI: card Hide greys the card and flips its line eye to the closed-eye form (arc + lashes, no slash)',
-        cs && cs.grey === true && cs.eyeHidden === true && cs.title === 'Show' && cs.svg === true && cs.openShown === false && cs.closedShown === true && cs.noSlash === true, JSON.stringify(cs));
+      check('investments UI: card Hide greys the card and flips its bold eye to the closed-eye form (arc + 5 lashes, no slash)',
+        cs && cs.grey === true && cs.eyeHidden === true && cs.title === 'Show' && cs.svg === true && cs.openShown === false && cs.closedShown === true && cs.noSlash === true && cs.strokeWidth === '2.6' && cs.lashCount === 5, JSON.stringify(cs));
       check('investments UI: hiding an account drops its bar, its doughnut slice, and the total line by its values',
         hs.barVis.find((b) => b.label === hideName).vis === false
           && hs.sliceVis.find((b) => b.label === hideName).vis === false
@@ -11982,13 +11985,17 @@ try {
           cardGrey: card ? card.classList.contains('rent-hidden-card') : false,
           eyeClosed: btn ? btn.classList.contains('invest-eye-hidden') : false,
           eyeSvg: btn ? !!btn.querySelector('svg') : false,
+          eyeStroke: btn && btn.querySelector('svg') ? btn.querySelector('svg').getAttribute('stroke-width') : null,
+          eyeLashes: btn ? btn.querySelectorAll('.eye-closed line').length : 0,
+          eyePupilRing: btn ? (() => { const c = btn.querySelector('.eye-open circle'); return !!c && c.getAttribute('fill') === 'none'; })() : false,
           sliceVisible: idx >= 0 ? c.getDataVisibility(idx) : null,
           center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
           marTotal: totalDs && marIdx >= 0 ? totalDs.data[marIdx] : null,
         };
       });
-      check('rental income panel: eye hide greys the card, closes the eye, drops slice + center + history total',
+      check('rental income panel: bold eye hide greys the card, closes the eye, drops slice + center + history total',
         hiddenState.cardGrey && hiddenState.eyeClosed && hiddenState.eyeSvg
+          && hiddenState.eyeStroke === '2.6' && hiddenState.eyeLashes === 5 && hiddenState.eyePupilRing === true
           && hiddenState.sliceVisible === false && hiddenState.center === expectedCenter - 12000
           && hiddenState.marTotal === mar2025 - 1000,
         JSON.stringify(hiddenState));
