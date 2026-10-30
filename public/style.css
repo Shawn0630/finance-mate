@@ -224,8 +224,9 @@ td.num, th.num { text-align: right; }
 .invest-eye-btn { position: absolute; top: 10px; right: 10px; border: none; background: transparent; padding: 2px 3px; color: #5a6a7a; }
 .invest-eye-btn:hover { background: transparent; color: #1668c4; }
 .invest-eye-btn svg { display: block; width: 20px; height: 20px; }
-.invest-eye-btn .eye-slash { display: none; }
-.invest-eye-btn.invest-eye-hidden .eye-slash { display: block; }
+.invest-eye-btn .eye-closed { display: none; }
+.invest-eye-btn.invest-eye-hidden .eye-open { display: none; }
+.invest-eye-btn.invest-eye-hidden .eye-closed { display: block; }
 .breakdown-card:hover { border-color: #1668c4; }
 .breakdown-card .k { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
 .breakdown-card .v { font-size: 21px; font-weight: 650; margin-top: 4px; }

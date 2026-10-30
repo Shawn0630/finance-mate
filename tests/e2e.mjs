@@ -9396,12 +9396,15 @@ try {
         const cr = card.getBoundingClientRect();
         const br = btn.getBoundingClientRect();
         const svg = btn.querySelector('svg');
-        const slash = svg ? svg.querySelector('.eye-slash') : null;
+        const openG = svg ? svg.querySelector('.eye-open') : null;
+        const closedG = svg ? svg.querySelector('.eye-closed') : null;
         return {
           grey: card.classList.contains('invest-hidden-card'),
           svg: !!svg,
           textEmpty: btn.textContent.trim() === '',
-          slashShown: slash ? getComputedStyle(slash).display !== 'none' : false,
+          openShown: openG ? getComputedStyle(openG).display !== 'none' : false,
+          closedShown: closedG ? getComputedStyle(closedG).display !== 'none' : false,
+          noSlash: svg ? !svg.querySelector('.eye-slash') : false,
           eyeHidden: btn.classList.contains('invest-eye-hidden'),
           title: btn.title,
           topRight: Math.abs(br.right - cr.right) <= 26 && br.top - cr.top >= 0 && br.top - cr.top <= 26,
@@ -9442,14 +9445,14 @@ try {
       const cardValSum = (pfH.accounts || []).reduce((s, a) => s + a.summary.value, 0);
       const cs0 = await cardSt(hideAcct.account.id);
       check('investments UI: each account card carries a line-style SVG eye-icon button at its top-right corner, not the emoji glyph or a Hide/Show text button',
-        cs0 && cs0.svg === true && cs0.textEmpty === true && cs0.slashShown === false && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true, JSON.stringify(cs0));
+        cs0 && cs0.svg === true && cs0.textEmpty === true && cs0.openShown === true && cs0.closedShown === false && cs0.noSlash === true && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true, JSON.stringify(cs0));
       await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
       await waitI(400);
       let cs = await cardSt(hideAcct.account.id);
       let hs = await hideState();
       const strip1 = await stripVals();
-      check('investments UI: card Hide greys the card and flips its line eye to slashed-eye',
-        cs && cs.grey === true && cs.eyeHidden === true && cs.title === 'Show' && cs.svg === true && cs.slashShown === true, JSON.stringify(cs));
+      check('investments UI: card Hide greys the card and flips its line eye to the closed-eye form (arc + lashes, no slash)',
+        cs && cs.grey === true && cs.eyeHidden === true && cs.title === 'Show' && cs.svg === true && cs.openShown === false && cs.closedShown === true && cs.noSlash === true, JSON.stringify(cs));
       check('investments UI: hiding an account drops its bar, its doughnut slice, and the total line by its values',
         hs.barVis.find((b) => b.label === hideName).vis === false
           && hs.sliceVis.find((b) => b.label === hideName).vis === false
