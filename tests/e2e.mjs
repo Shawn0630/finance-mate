@@ -12179,12 +12179,12 @@ try {
         spendOverallUi.hasCatFilter, JSON.stringify(spendOverallUi));
       await page.select('#spendCatFilter', 'Groceries');
       await waitS(300);
-      const spendFiltered = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr')].map((tr) => tr.children[3].textContent.trim()));
+      const spendFiltered = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr:not(.spend-tx-group)')].map((tr) => tr.children[3].textContent.trim()));
       check('spending UI: filtering by Groceries shows only Groceries rows',
         spendFiltered.length === 2 && spendFiltered.every((c) => c === 'Groceries'), JSON.stringify(spendFiltered));
       await page.select('#spendCatFilter', '__uncat__');
       await waitS(300);
-      const spendUncat = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr')].map((tr) => tr.children[2].textContent.trim()));
+      const spendUncat = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr:not(.spend-tx-group)')].map((tr) => tr.children[2].textContent.trim()));
       check('spending UI: filtering by Uncategorized shows only the uncategorized payment row',
         spendUncat.length === 1 && spendUncat[0] === 'PAYMENT - THANK YOU', JSON.stringify(spendUncat));
       await page.select('#spendCatFilter', '');
@@ -12533,6 +12533,205 @@ try {
   check('spending stacked cleanup: card A deleted', r.status === 200);
   r = await req('DELETE', `/api/spending/cards/${stackCardBId}`);
   check('spending stacked cleanup: card B deleted', r.status === 200);
+
+  // Month-paged transaction tables round: the overall and the
+  // card detail tables both paginate by year-month (one month
+  // per page, same pager), the overall page grouping by
+  // category, the range picker constraining pageable months.
+  // Fixture months: 2024-05 (old), 2026-08, 2026-10 — Sep 2026
+  // is deliberately empty so stepping can land on a no-row month.
+  r = await req('POST', '/api/spending/cards', { name: 'MonthA', issuer: 'CIBC', last4: '2001' });
+  check('spending month setup: card A created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const monthCardAId = r.data.id;
+  r = await req('POST', '/api/spending/cards', { name: 'MonthB', issuer: 'Amex', last4: '2002' });
+  check('spending month setup: card B created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const monthCardBId = r.data.id;
+  for (const [cardId, date, merchant, amount, category] of [
+    [monthCardAId, '2024-05-10', 'MONTH OLD A', 5, 'Dining'],
+    [monthCardAId, '2026-08-10', 'MONTH AUG A', 10, 'Dining'],
+    [monthCardBId, '2026-08-12', 'MONTH AUG B', 20, 'Groceries'],
+    [monthCardAId, '2026-10-07', 'MONTH OCT A', 50, 'Dining'],
+    [monthCardBId, '2026-10-08', 'MONTH OCT B', 60, 'Shopping'],
+  ]) {
+    r = await req('POST', `/api/spending/cards/${cardId}/transactions`, { date, merchant, type: 'charge', amount, category });
+    check(`spending month setup: ${merchant} row`, r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  }
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending month browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardM = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResM = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueM = loginResM.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserM = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserM.newPage();
+      page.on('dialog', (d) => d.accept());
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardM({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueM, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitM = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      const readSpendTxPage = () => {
+        const pager = document.querySelector('[data-spend-tx-pager="spending"]');
+        const tbl = document.querySelector('#spendTxTable table');
+        const rows = tbl ? [...tbl.querySelectorAll('tbody tr')] : [];
+        return {
+          label: pager ? pager.querySelector('span').textContent.trim() : null,
+          prevDisabled: pager ? pager.querySelectorAll('button')[0].disabled : null,
+          nextDisabled: pager ? pager.querySelectorAll('button')[1].disabled : null,
+          merchants: rows.filter((tr) => !tr.classList.contains('spend-tx-group')).map((tr) => tr.cells[2].textContent.trim()),
+          groups: rows.filter((tr) => tr.classList.contains('spend-tx-group')).map((tr) => tr.cells[0].textContent.trim()),
+          note: document.querySelector('#spendTxTable .note') ? document.querySelector('#spendTxTable .note').textContent.trim() : null,
+        };
+      };
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1200);
+      const octPage = await page.evaluate(readSpendTxPage);
+      check('spending UI: overall table defaults to the latest month page, grouped by category',
+        octPage.label === 'Oct 2026' && octPage.groups.join(',') === 'Dining,Shopping'
+        && octPage.merchants.join(',') === 'MONTH OCT A,MONTH OCT B' && octPage.nextDisabled === true,
+        JSON.stringify(octPage));
+      await page.evaluate(() => { document.querySelector('[data-spend-tx-pager="spending"] button').click(); });
+      await waitM(600);
+      const sepPage = await page.evaluate(readSpendTxPage);
+      check('spending UI: stepping into an empty month renders empty, not an error',
+        sepPage.label === 'Sep 2026' && sepPage.merchants.length === 0 && sepPage.note === 'No transactions in this month.',
+        JSON.stringify(sepPage));
+      await page.evaluate(() => { document.querySelector('[data-spend-tx-pager="spending"] button').click(); });
+      await waitM(600);
+      const augPage = await page.evaluate(readSpendTxPage);
+      check('spending UI: Aug page groups Dining before Groceries',
+        augPage.label === 'Aug 2026' && augPage.groups.join(',') === 'Dining,Groceries'
+        && augPage.merchants.join(',') === 'MONTH AUG A,MONTH AUG B',
+        JSON.stringify(augPage));
+      // Range constrains pageable months: 1 year from Oct 2026
+      // ends at Nov 2025, so stepping back must stop there and
+      // can never reach the 2024-05 row.
+      await page.click('#invRangeBtns-spending button[data-months="12"]');
+      await waitM(800);
+      const afterPreset = await page.evaluate(readSpendTxPage);
+      check('spending UI: a range change re-defaults the table to the latest month in range',
+        afterPreset.label === 'Oct 2026', JSON.stringify(afterPreset));
+      for (let i = 0; i < 12; i++) {
+        const stepped = await page.evaluate(() => {
+          const pager = document.querySelector('[data-spend-tx-pager="spending"]');
+          const prev = pager.querySelectorAll('button')[0];
+          if (prev.disabled) return false;
+          prev.click();
+          return true;
+        });
+        await waitM(300);
+        if (!stepped) break;
+      }
+      const rangeEdge = await page.evaluate(readSpendTxPage);
+      check('spending UI: pager stops at the range start and never reaches the out-of-range month',
+        rangeEdge.label === 'Nov 2025' && rangeEdge.prevDisabled === true && !rangeEdge.merchants.includes('MONTH OLD A'),
+        JSON.stringify(rangeEdge));
+      await page.click('#invRangeBtns-spending button[data-months="0"]');
+      await waitM(800);
+      // Detail table: the identical month pager on card A.
+      await page.goto(`http://ff.local/#spending/card/${monthCardAId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1200);
+      const readDetailTxPage = () => {
+        const pager = document.querySelector('[data-spend-tx-pager="spendCard"]');
+        const tbl = document.querySelector('#spendDetailTxTable table');
+        const rows = tbl ? [...tbl.querySelectorAll('tbody tr')] : [];
+        return {
+          label: pager ? pager.querySelector('span').textContent.trim() : null,
+          merchants: rows.map((tr) => tr.cells[1].textContent.trim()),
+          note: document.querySelector('#spendDetailTxTable .note') ? document.querySelector('#spendDetailTxTable .note').textContent.trim() : null,
+        };
+      };
+      const detOct = await page.evaluate(readDetailTxPage);
+      check('spending UI: detail table uses the same month pager, latest month first',
+        detOct.label === 'Oct 2026' && detOct.merchants.join(',') === 'MONTH OCT A',
+        JSON.stringify(detOct));
+      await page.evaluate(() => { document.querySelector('[data-spend-tx-pager="spendCard"] button').click(); });
+      await waitM(600);
+      const detSep = await page.evaluate(readDetailTxPage);
+      check('spending UI: detail table stepping into an empty month renders empty',
+        detSep.label === 'Sep 2026' && detSep.merchants.length === 0 && detSep.note === 'No transactions in this month.',
+        JSON.stringify(detSep));
+      await page.evaluate(() => { document.querySelector('[data-spend-tx-pager="spendCard"] button').click(); });
+      await waitM(600);
+      const detAug = await page.evaluate(readDetailTxPage);
+      check('spending UI: detail Aug page shows the card row',
+        detAug.label === 'Aug 2026' && detAug.merchants.join(',') === 'MONTH AUG A',
+        JSON.stringify(detAug));
+      // Edit from the paged detail table, then Delete from it.
+      await page.evaluate(() => {
+        const tbl = document.querySelector('#spendDetailTxTable table');
+        [...tbl.querySelectorAll('tbody tr')].find((tr) => tr.cells[1].textContent.trim() === 'MONTH AUG A')
+          .querySelector('button').click();
+      });
+      await waitM(600);
+      const editOpened = await page.evaluate(() => ({
+        title: document.querySelector('#spendTxFormTitle').textContent.trim(),
+        merchant: document.querySelector('#spendTxForm [name=merchant]').value,
+      }));
+      check('spending UI: Edit opens from the paged detail table with the row values',
+        editOpened.title === 'Edit transaction' && editOpened.merchant === 'MONTH AUG A',
+        JSON.stringify(editOpened));
+      await page.evaluate(() => { document.querySelector('#spendTxForm [name=merchant]').value = 'MONTH AUG A EDITED'; });
+      await page.click('#spendTxForm button[type=submit]');
+      await waitM(1000);
+      const detAugEdited = await page.evaluate(readDetailTxPage);
+      check('spending UI: Edit from the paged table saves and stays on the same month page',
+        detAugEdited.label === 'Aug 2026' && detAugEdited.merchants.join(',') === 'MONTH AUG A EDITED',
+        JSON.stringify(detAugEdited));
+      await page.evaluate(() => {
+        const tbl = document.querySelector('#spendDetailTxTable table');
+        const row = [...tbl.querySelectorAll('tbody tr')].find((tr) => tr.cells[1].textContent.trim() === 'MONTH AUG A EDITED');
+        row.querySelectorAll('button')[1].click();
+      });
+      await waitM(1000);
+      const detAugDeleted = await page.evaluate(readDetailTxPage);
+      check('spending UI: Delete from the paged table removes the row and leaves the month empty',
+        detAugDeleted.label === 'Aug 2026' && detAugDeleted.merchants.length === 0 && detAugDeleted.note === 'No transactions in this month.',
+        JSON.stringify(detAugDeleted));
+    } finally { await browserM.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${monthCardAId}`);
+  check('spending month cleanup: card A deleted', r.status === 200);
+  r = await req('DELETE', `/api/spending/cards/${monthCardBId}`);
+  check('spending month cleanup: card B deleted', r.status === 200);
 
   // Card fields round: credit limit, file balance + balance check
   // with adjustment, type-aware kinds, file-upload import, Fill

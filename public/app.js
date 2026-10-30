@@ -5378,6 +5378,16 @@ function applyInvestRange(level) {
     // the whole range (by card / by category on the overall page,
     // by category on a card page), the history bars the months.
     drawSpendCharts(level, d, r);
+    // A range change re-defaults the transaction table to the
+    // latest month in the new range, like the year pager above.
+    // A data reload with an unchanged range keeps the page: an
+    // Edit save from the Aug page must stay on Aug, not jump to
+    // the latest month.
+    const lastR = spendTxLastRange[level];
+    if (!r || !lastR || lastR.start !== r.start || lastR.end !== r.end) spendTxMonthPage[level] = null;
+    spendTxLastRange[level] = r ? { start: r.start, end: r.end } : null;
+    if (level === 'spending') renderSpendTxTable();
+    else renderSpendDetailTxTable();
   } else if (level === 'overview') {
     // The Overview panel has no monthly table: its history
     // chart draws the filtered monthly rows (Property + Stock
@@ -9498,6 +9508,62 @@ let spendTxModalCtx = null; // { cardId, txId } — txId null = add
 let spendCatFilter = '';
 let spendDetailCatFilter = '';
 
+// Month pager for the two spending transaction tables: one
+// month per page, the SAME method on both (not row-count
+// paging — the import preview's 25-row paging is a different
+// thing and stays as is). Pageable months are every month in
+// the range in force, so stepping can land on a month with no
+// rows — it renders empty, never an error. The default page is
+// the range end (latest month); a range change re-defaults,
+// like the Stocks year pager. A category filter narrows rows
+// within the page but never moves the page.
+const spendTxMonthPage = { spending: null, spendCard: null };
+// Last effective range per spending level: a data reload with an
+// unchanged range must NOT re-default the table page (an Edit save
+// from the Aug page must stay on Aug); only a real range change
+// re-defaults to the latest month in the new range.
+const spendTxLastRange = { spending: null, spendCard: null };
+function spendTxRange(level) {
+  const txs = level === 'spending'
+    ? (spendData && spendData.transactions) : (spendCardData && spendCardData.transactions);
+  const txMonths = (txs || []).map((t) => String(t.date || '').slice(0, 7)).filter((m) => /^\d{4}-\d{2}$/.test(m)).sort();
+  const r = investEffectiveRange(level);
+  if (!r) return txMonths.length ? { start: txMonths[0], end: txMonths[txMonths.length - 1] } : null;
+  // The monthly series skips payment-only months, so under All
+  // (no preset, no custom pair) a transaction month outside the
+  // series span must still be pageable — otherwise those rows
+  // would vanish from the table entirely. Under an explicit
+  // preset/custom pair the range stays exactly as picked.
+  const st = investRanges[level];
+  if (!st.months && !st.custom && txMonths.length) {
+    return {
+      start: r.start < txMonths[0] ? r.start : txMonths[0],
+      end: r.end > txMonths[txMonths.length - 1] ? r.end : txMonths[txMonths.length - 1],
+    };
+  }
+  return r;
+}
+function spendTxPageMonth(level, range) {
+  if (!range) return null;
+  const cur = spendTxMonthPage[level];
+  if (cur && cur >= range.start && cur <= range.end) return cur;
+  spendTxMonthPage[level] = range.end;
+  return range.end;
+}
+function spendTxPagerHtml(level, range, month) {
+  return `<div class="toolbar" data-spend-tx-pager="${level}">\n    <button type="button" class="small" onclick="spendTxMonthStep('${level}', -1)"${month > range.start ? '' : ' disabled'}>&#8249; Prev month</button>\n    <span>${formatYM(month)}</span>\n    <button type="button" class="small" onclick="spendTxMonthStep('${level}', 1)"${month < range.end ? '' : ' disabled'}>Next month &#8250;</button>\n  </div>`;
+}
+window.spendTxMonthStep = (level, dir) => {
+  const range = spendTxRange(level);
+  if (!range) return;
+  const cur = spendTxPageMonth(level, range);
+  const next = addMonthsYM(cur, dir);
+  if (next < range.start || next > range.end) return;
+  spendTxMonthPage[level] = next;
+  if (level === 'spending') renderSpendTxTable();
+  else renderSpendDetailTxTable();
+};
+
 // Per-category view: the filter narrows the table to one
 // category's transactions (or the uncategorized ones). A row's
 // category is changed persistently through its Edit button — the
@@ -9522,9 +9588,22 @@ function renderSpendTxTable() {
     if (![...sel.options].some((o) => o.value === spendCatFilter)) spendCatFilter = '';
     sel.value = spendCatFilter;
   }
-  const filtered = spendFilterTx(spendData.transactions, spendCatFilter);
-  $('#spendTxTable').innerHTML = filtered.length ? spendTxTableHtml(filtered, true)
-    : (spendData.transactions.length ? '<div class="note">No transactions in this category.</div>' : '<div class="note">No transactions yet.</div>');
+  const host = $('#spendTxTable');
+  if (!spendData.transactions.length) { host.innerHTML = '<div class="note">No transactions yet.</div>'; return; }
+  const range = spendTxRange('spending');
+  if (!range) { host.innerHTML = spendTxTableHtml(spendFilterTx(spendData.transactions, spendCatFilter), true); return; }
+  const month = spendTxPageMonth('spending', range);
+  const pageRows = spendFilterTx(spendData.transactions, spendCatFilter)
+    .filter((t) => String(t.date || '').slice(0, 7) === month);
+  const pager = spendTxPagerHtml('spending', range, month);
+  if (!pageRows.length) {
+    const note = spendData.transactions.some((t) => String(t.date || '').slice(0, 7) === month)
+      ? '<div class="note">No transactions in this category.</div>'
+      : '<div class="note">No transactions in this month.</div>';
+    host.innerHTML = pager + note;
+    return;
+  }
+  host.innerHTML = pager + spendTxTableHtmlGrouped(pageRows);
 }
 function renderSpendDetailTxTable() {
   if (!spendCardData) return;
@@ -9534,9 +9613,22 @@ function renderSpendDetailTxTable() {
     if (![...sel.options].some((o) => o.value === spendDetailCatFilter)) spendDetailCatFilter = '';
     sel.value = spendDetailCatFilter;
   }
-  const filtered = spendFilterTx(spendCardData.transactions, spendDetailCatFilter);
-  $('#spendDetailTxTable').innerHTML = filtered.length ? spendTxTableHtml(filtered, false)
-    : (spendCardData.transactions.length ? '<div class="note">No transactions in this category.</div>' : '<div class="note">No transactions yet.</div>');
+  const host = $('#spendDetailTxTable');
+  if (!spendCardData.transactions.length) { host.innerHTML = '<div class="note">No transactions yet.</div>'; return; }
+  const range = spendTxRange('spendCard');
+  if (!range) { host.innerHTML = spendTxTableHtml(spendFilterTx(spendCardData.transactions, spendDetailCatFilter), false); return; }
+  const month = spendTxPageMonth('spendCard', range);
+  const pageRows = spendFilterTx(spendCardData.transactions, spendDetailCatFilter)
+    .filter((t) => String(t.date || '').slice(0, 7) === month);
+  const pager = spendTxPagerHtml('spendCard', range, month);
+  if (!pageRows.length) {
+    const note = spendCardData.transactions.some((t) => String(t.date || '').slice(0, 7) === month)
+      ? '<div class="note">No transactions in this category.</div>'
+      : '<div class="note">No transactions in this month.</div>';
+    host.innerHTML = pager + note;
+    return;
+  }
+  host.innerHTML = pager + spendTxTableHtml(pageRows, false);
 }
 $('#spendCatFilter').addEventListener('change', (e) => { spendCatFilter = e.target.value; renderSpendTxTable(); });
 $('#spendDetailCatFilter').addEventListener('change', (e) => { spendDetailCatFilter = e.target.value; renderSpendDetailTxTable(); });
@@ -9679,15 +9771,13 @@ function spendTxTypeLabel(t) {
   if (t.kind === 'charge') return 'Charge';
   return Number(t.amount) >= 0 ? 'Payment' : 'Charge';
 }
-function spendTxTableHtml(transactions, showCard) {
-  if (!transactions.length) return '<div class="note">No transactions yet.</div>';
-  const rows = transactions.map((t) => {
-    // Charges display as positive spending; payments display
-    // negated; an adjustment displays signed, so it never reads
-    // as spending.
-    const amt = t.kind === 'adjustment' ? money(Number(t.amount))
-      : (Number(t.amount) >= 0 ? '−' + money(Number(t.amount)) : money(-Number(t.amount)));
-    return `<tr>
+function spendTxRowHtml(t, showCard) {
+  // Charges display as positive spending; payments display
+  // negated; an adjustment displays signed, so it never reads
+  // as spending.
+  const amt = t.kind === 'adjustment' ? money(Number(t.amount))
+    : (Number(t.amount) >= 0 ? '−' + money(Number(t.amount)) : money(-Number(t.amount)));
+  return `<tr>
       <td>${esc(t.date)}</td>
       ${showCard ? `<td>${esc(t.card_name || '')}</td>` : ''}
       <td>${esc(t.merchant)}</td>
@@ -9696,8 +9786,27 @@ function spendTxTableHtml(transactions, showCard) {
       <td>${amt}</td>
       <td><button class="small" onclick="spendEditTx(${t.id})">Edit</button> <button class="small" onclick="spendDeleteTx(${t.id})">Delete</button></td>
     </tr>`;
-  }).join('');
+}
+function spendTxTableHtml(transactions, showCard) {
+  if (!transactions.length) return '<div class="note">No transactions yet.</div>';
+  const rows = transactions.map((t) => spendTxRowHtml(t, showCard)).join('');
   return `<table class="tbl"><thead><tr><th>Date</th>${showCard ? '<th>Card</th>' : ''}<th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+// Overall table only: the month page's rows grouped by
+// category under a header row per group (alphabetical,
+// uncategorized last); rows within a group keep server order.
+function spendTxTableHtmlGrouped(transactions) {
+  if (!transactions.length) return '<div class="note">No transactions yet.</div>';
+  const groups = new Map();
+  for (const t of transactions) {
+    const key = (t.category || '').trim() || '—';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t);
+  }
+  const names = [...groups.keys()].sort((a, b) => (a === '—' ? 1 : b === '—' ? -1 : a.localeCompare(b)));
+  const body = names.map((name) => `<tr class="spend-tx-group"><td colspan="7">${esc(name)}</td></tr>`
+    + groups.get(name).map((t) => spendTxRowHtml(t, true)).join('')).join('');
+  return `<table class="tbl"><thead><tr><th>Date</th><th>Card</th><th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 // Transaction form Category combobox: one input + datalist holding the
