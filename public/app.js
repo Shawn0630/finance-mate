@@ -9580,58 +9580,63 @@ function spendFilterTx(transactions, filter) {
   if (filter === '__uncat__') return transactions.filter((t) => !(t.category || '').trim());
   return transactions.filter((t) => (t.category || '').trim() === filter);
 }
+// The category filter and the month pager share one flex row
+// (.spend-tx-controls), rendered inside the table host so the row
+// survives every re-render. The select is rebuilt on each render,
+// so its change listener lives on document (delegation) instead of
+// the element.
+function spendTxControlsHtml(level, transactions, filter, pager) {
+  const id = level === 'spending' ? 'spendCatFilter' : 'spendDetailCatFilter';
+  return `<div class="spend-tx-controls"><label>Category <select id="${id}">${spendCatOptions(transactions, filter)}</select></label>${pager}</div>`;
+}
+function spendTxValidFilter(transactions, filter) {
+  const cats = [...new Set(transactions.map((t) => (t.category || '').trim()).filter(Boolean))];
+  return (filter === '' || filter === '__uncat__' || cats.includes(filter)) ? filter : '';
+}
 function renderSpendTxTable() {
   if (!spendData) return;
-  const sel = $('#spendCatFilter');
-  if (sel) {
-    sel.innerHTML = spendCatOptions(spendData.transactions, spendCatFilter);
-    if (![...sel.options].some((o) => o.value === spendCatFilter)) spendCatFilter = '';
-    sel.value = spendCatFilter;
-  }
+  spendCatFilter = spendTxValidFilter(spendData.transactions, spendCatFilter);
   const host = $('#spendTxTable');
-  if (!spendData.transactions.length) { host.innerHTML = '<div class="note">No transactions yet.</div>'; return; }
+  if (!spendData.transactions.length) { host.innerHTML = spendTxControlsHtml('spending', spendData.transactions, spendCatFilter, '') + '<div class="note">No transactions yet.</div>'; return; }
   const range = spendTxRange('spending');
-  if (!range) { host.innerHTML = spendTxTableHtml(spendFilterTx(spendData.transactions, spendCatFilter), true); return; }
+  if (!range) { host.innerHTML = spendTxControlsHtml('spending', spendData.transactions, spendCatFilter, '') + spendTxTableHtml(spendFilterTx(spendData.transactions, spendCatFilter), true); return; }
   const month = spendTxPageMonth('spending', range);
   const pageRows = spendFilterTx(spendData.transactions, spendCatFilter)
     .filter((t) => String(t.date || '').slice(0, 7) === month);
-  const pager = spendTxPagerHtml('spending', range, month);
+  const controls = spendTxControlsHtml('spending', spendData.transactions, spendCatFilter, spendTxPagerHtml('spending', range, month));
   if (!pageRows.length) {
     const note = spendData.transactions.some((t) => String(t.date || '').slice(0, 7) === month)
       ? '<div class="note">No transactions in this category.</div>'
       : '<div class="note">No transactions in this month.</div>';
-    host.innerHTML = pager + note;
+    host.innerHTML = controls + note;
     return;
   }
-  host.innerHTML = pager + spendTxTableHtmlGrouped(pageRows);
+  host.innerHTML = controls + spendTxTableHtmlGrouped(pageRows);
 }
 function renderSpendDetailTxTable() {
   if (!spendCardData) return;
-  const sel = $('#spendDetailCatFilter');
-  if (sel) {
-    sel.innerHTML = spendCatOptions(spendCardData.transactions, spendDetailCatFilter);
-    if (![...sel.options].some((o) => o.value === spendDetailCatFilter)) spendDetailCatFilter = '';
-    sel.value = spendDetailCatFilter;
-  }
+  spendDetailCatFilter = spendTxValidFilter(spendCardData.transactions, spendDetailCatFilter);
   const host = $('#spendDetailTxTable');
-  if (!spendCardData.transactions.length) { host.innerHTML = '<div class="note">No transactions yet.</div>'; return; }
+  if (!spendCardData.transactions.length) { host.innerHTML = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatFilter, '') + '<div class="note">No transactions yet.</div>'; return; }
   const range = spendTxRange('spendCard');
-  if (!range) { host.innerHTML = spendTxTableHtml(spendFilterTx(spendCardData.transactions, spendDetailCatFilter), false); return; }
+  if (!range) { host.innerHTML = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatFilter, '') + spendTxTableHtml(spendFilterTx(spendCardData.transactions, spendDetailCatFilter), false); return; }
   const month = spendTxPageMonth('spendCard', range);
   const pageRows = spendFilterTx(spendCardData.transactions, spendDetailCatFilter)
     .filter((t) => String(t.date || '').slice(0, 7) === month);
-  const pager = spendTxPagerHtml('spendCard', range, month);
+  const controls = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatFilter, spendTxPagerHtml('spendCard', range, month));
   if (!pageRows.length) {
     const note = spendCardData.transactions.some((t) => String(t.date || '').slice(0, 7) === month)
       ? '<div class="note">No transactions in this category.</div>'
       : '<div class="note">No transactions in this month.</div>';
-    host.innerHTML = pager + note;
+    host.innerHTML = controls + note;
     return;
   }
-  host.innerHTML = pager + spendTxTableHtml(pageRows, false);
+  host.innerHTML = controls + spendTxTableHtml(pageRows, false);
 }
-$('#spendCatFilter').addEventListener('change', (e) => { spendCatFilter = e.target.value; renderSpendTxTable(); });
-$('#spendDetailCatFilter').addEventListener('change', (e) => { spendDetailCatFilter = e.target.value; renderSpendDetailTxTable(); });
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'spendCatFilter') { spendCatFilter = e.target.value; renderSpendTxTable(); }
+  else if (e.target.id === 'spendDetailCatFilter') { spendDetailCatFilter = e.target.value; renderSpendDetailTxTable(); }
+});
 
 const spendShareCenterPlugin = {
   id: 'spendShareCenter',

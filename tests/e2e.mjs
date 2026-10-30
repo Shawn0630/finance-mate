@@ -12641,6 +12641,24 @@ try {
         augPage.label === 'Aug 2026' && augPage.groups.join(',') === 'Dining,Groceries'
         && augPage.merchants.join(',') === 'MONTH AUG A,MONTH AUG B',
         JSON.stringify(augPage));
+      const filterRow = await page.evaluate(() => {
+        const sel = document.querySelector('#spendCatFilter');
+        const pager = document.querySelector('[data-spend-tx-pager="spending"]');
+        const row = sel ? sel.closest('.spend-tx-controls') : null;
+        const s = sel.getBoundingClientRect(), p = pager.getBoundingClientRect();
+        const card = document.querySelector('#spendCardList .breakdown-card');
+        const panel = document.querySelector('#spendTxTable').closest('.panel');
+        const cs = getComputedStyle(card), ps = getComputedStyle(panel);
+        return {
+          sameRow: !!(row && row.contains(pager)),
+          overlap: s.top < p.bottom && p.top < s.bottom,
+          cardPad: [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft].join(' '),
+          panelPad: [ps.paddingTop, ps.paddingRight, ps.paddingBottom, ps.paddingLeft].join(' '),
+        };
+      });
+      check('spending UI: category filter and month pager share one row, transactions panel padding equals credit-card card padding',
+        filterRow.sameRow && filterRow.overlap && filterRow.cardPad === filterRow.panelPad,
+        JSON.stringify(filterRow));
       // Range constrains pageable months: 1 year from Oct 2026
       // ends at Nov 2025, so stepping back must stop there and
       // can never reach the 2024-05 row.
@@ -12695,6 +12713,22 @@ try {
       check('spending UI: detail Aug page shows the card row',
         detAug.label === 'Aug 2026' && detAug.merchants.join(',') === 'MONTH AUG A',
         JSON.stringify(detAug));
+      const detFilterRow = await page.evaluate(() => {
+        const sel = document.querySelector('#spendDetailCatFilter');
+        const pager = document.querySelector('[data-spend-tx-pager="spendCard"]');
+        const row = sel ? sel.closest('.spend-tx-controls') : null;
+        const s = sel.getBoundingClientRect(), p = pager.getBoundingClientRect();
+        const panel = document.querySelector('#spendDetailTxTable').closest('.panel');
+        const ps = getComputedStyle(panel);
+        return {
+          sameRow: !!(row && row.contains(pager)),
+          overlap: s.top < p.bottom && p.top < s.bottom,
+          panelPad: [ps.paddingTop, ps.paddingRight, ps.paddingBottom, ps.paddingLeft].join(' '),
+        };
+      });
+      check('spending UI: detail filter and pager share one row, detail panel padding matches the 16px card standard',
+        detFilterRow.sameRow && detFilterRow.overlap && detFilterRow.panelPad === '16px 16px 16px 16px',
+        JSON.stringify(detFilterRow));
       // Edit from the paged detail table, then Delete from it.
       await page.evaluate(() => {
         const tbl = document.querySelector('#spendDetailTxTable table');
