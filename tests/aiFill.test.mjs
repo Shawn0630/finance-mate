@@ -216,3 +216,48 @@ test('invest chat prompt: a holdings-section draft must pair position with NAVs'
   assert.ok(flat.includes('MUST contain both its position (units) and its NAV snapshots in the same round'));
   assert.ok(flat.includes('never NAVs alone'));
 });
+
+test('normalizeAiFields: job context maps province names, frequency aliases, rows', () => {
+  const out = normalizeAiFields('job', {
+    employer: 'Acme Corp', owner: 'Shawn', currency: 'cad', province: 'British Columbia',
+    frequency: 'bi-weekly', start_date: 'Jan 5, 2026', recent_pay_date: '2026-10-23',
+    recent_pay_value: '$3,000', evil: 'x',
+    pay_changes: [
+      { effective_date: '2026-06-01', value: '3,000' },
+      { effective_date: 'not a date', value: 2500 },
+      { effective_date: '2026-01-05', value: -5 },
+    ],
+    bonuses: [
+      { date: '2026-06-30', amount: 5000 },
+      { date: '2026-13-01', amount: 100 },
+    ],
+  });
+  assert.deepEqual(out, {
+    employer: 'Acme Corp', owner: 'Shawn', currency: 'CAD', province: 'BC',
+    frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-23',
+    recent_pay_value: 3000,
+    pay_changes: [{ effective_date: '2026-06-01', value: 3000 }],
+    bonuses: [{ date: '2026-06-30', amount: 5000 }],
+  });
+  assert.equal(normalizeAiFields('job', { province: 'XX' }).province, undefined);
+  assert.equal(normalizeAiFields('job', { province: 'ON' }).province, 'ON');
+});
+
+test('handleAiFill: job context maps the earner name, drops an unknown one', async () => {
+  const mapOwners = (names) => names.map((n) => (n === 'Shawn' ? 'Shawn' : null)).filter(Boolean);
+  const ok = await handleAiFill(
+    { context: 'job', text: 'pay stub' },
+    { env: CONFIGURED, callLlm: stubCall('{"fields":{"employer":"Acme","owner":"Shawn","frequency":"biweekly"}}'), mapOwners },
+  );
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.fields.employer, 'Acme');
+  assert.equal(ok.body.fields.owner, 'Shawn');
+  const dropped = await handleAiFill(
+    { context: 'job', text: 'pay stub' },
+    { env: CONFIGURED, callLlm: stubCall('{"fields":{"employer":"Acme","owner":"Nobody"}}'), mapOwners },
+  );
+  assert.equal(dropped.status, 200);
+  assert.equal(dropped.body.fields.owner, undefined);
+  const bad = await handleAiFill({ context: 'salary', text: 'x' }, { env: CONFIGURED, callLlm: stubCall('{}') });
+  assert.equal(bad.status, 400);
+});

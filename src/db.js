@@ -325,6 +325,32 @@ const earnJobCols = db.prepare('PRAGMA table_info(earn_jobs)').all().map((c) => 
 if (!earnJobCols.includes('owner')) {
   db.exec('ALTER TABLE earn_jobs ADD COLUMN owner TEXT');
 }
+// The simplified Add job form records the dates the derivation runs
+// from; old rows predate them and keep NULL (a legacy save never
+// touches these columns, so old jobs keep computing as before).
+if (!earnJobCols.includes('start_date')) {
+  db.exec('ALTER TABLE earn_jobs ADD COLUMN start_date TEXT');
+}
+if (!earnJobCols.includes('recent_pay_date')) {
+  db.exec('ALTER TABLE earn_jobs ADD COLUMN recent_pay_date TEXT');
+}
+// Optional dated pay-change rows (effective date + new per-period
+// value) and bonus entries (date + amount) for a job. Both are
+// replaced wholesale on a derived save; deleting the job cascades.
+db.exec(`CREATE TABLE IF NOT EXISTS earn_pay_changes (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES earn_jobs(id) ON DELETE CASCADE,
+  effective_date TEXT NOT NULL,
+  value REAL NOT NULL,
+  created_at TEXT NOT NULL
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS earn_bonuses (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES earn_jobs(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,
+  amount REAL NOT NULL,
+  created_at TEXT NOT NULL
+)`);
 
 // Properties used to carry ONE uploaded photo in properties.photo_file;
 // the gallery replaces it. Fold any existing single photo into the

@@ -28,7 +28,7 @@ import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, m
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
-  calcSalary, calcRentalYear, aggregateEarningsCharts,
+  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd,
   deriveRentalYearFigures, entryCoveredYears,
 } from './earnings.js';
 import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
@@ -2807,12 +2807,22 @@ app.post('/api/investments/refresh', requireApiAuth, async (req, res) => {
 // Salary and rental computations run server-side on read, so an edit
 // always recalculates every derived number it governs.
 const earnRegion = () => getRegion('CA');
-const earnJobRow = (row) => ({
-  ...row,
-  owner: row.owner || null,
-  cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
-  calc: calcSalary(row, earnRegion().payroll),
-});
+const earnJobRow = (row) => {
+  // A job's bonus_total is the bonuses dated in its tax year; the
+  // calc adds it to the year's gross but never to the per-period
+  // rate. Pay-change rows and bonuses ride along for the modal.
+  const payChanges = db.prepare('SELECT effective_date, value FROM earn_pay_changes WHERE job_id = ? ORDER BY effective_date').all(row.id);
+  const bonuses = db.prepare('SELECT date, amount FROM earn_bonuses WHERE job_id = ? ORDER BY date').all(row.id);
+  const bonusTotal = bonuses.filter((b) => Number(String(b.date).slice(0, 4)) === row.tax_year)
+    .reduce((s, b) => s + b.amount, 0);
+  return {
+    ...row,
+    owner: row.owner || null,
+    cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
+    pay_changes: payChanges, bonuses, bonus_total: bonusTotal,
+    calc: calcSalary({ ...row, bonus_total: bonusTotal }, earnRegion().payroll),
+  };
+};
 const earnRentalYearRow = (rental, row) => {
   // Rent figures are derived from entries when any entry covers the
   // year; otherwise the row's stored figures stand (that is what
@@ -2887,12 +2897,45 @@ app.get('/api/earnings', requireApiAuth, (req, res) => {
   });
 });
 
+// A derived save replaces a job's pay-change rows and bonus entries
+// wholesale; a legacy save leaves them (and the derived date
+// columns) untouched, so old jobs keep computing as before.
+const writeJobChildren = (jobId, payChanges, bonuses, ts) => {
+  db.prepare('DELETE FROM earn_pay_changes WHERE job_id = ?').run(jobId);
+  db.prepare('DELETE FROM earn_bonuses WHERE job_id = ?').run(jobId);
+  const insC = db.prepare('INSERT INTO earn_pay_changes (job_id, effective_date, value, created_at) VALUES (?, ?, ?, ?)');
+  const insB = db.prepare('INSERT INTO earn_bonuses (job_id, date, amount, created_at) VALUES (?, ?, ?, ?)');
+  for (const c of payChanges) insC.run(jobId, c.effective_date, c.value, ts);
+  for (const b of bonuses) insB.run(jobId, b.date, b.amount, ts);
+};
+const derivedJobYtd = (v, cppExempt, eiExempt) => deriveJobYtd({
+  frequency: v.frequency, startDate: v.start_date, recentDate: v.recent_pay_date,
+  changes: v.pay_changes, recentValue: v.recent_pay_value,
+  payroll: earnRegion().payroll, cppExempt, eiExempt,
+});
+
 app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
   const v = validJobInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
   const own = cleanJobOwner((req.body || {}).owner);
   if (own.error) return res.status(400).json({ error: own.error });
   const ts = nowIso();
+  if (v.mode === 'derived') {
+    const ytd = derivedJobYtd(v, false, false);
+    const id = db.transaction(() => {
+      const info = db.prepare(
+        `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
+         start_date, recent_pay_date,
+         td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+        v.start_date, v.recent_pay_date,
+        null, null, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, 0, 0, ts, ts);
+      writeJobChildren(info.lastInsertRowid, v.pay_changes, v.bonuses, ts);
+      return info.lastInsertRowid;
+    })();
+    return res.status(201).json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
+  }
   const info = db.prepare(
     `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
      td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
@@ -2915,6 +2958,21 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
     const own = cleanJobOwner(req.body.owner);
     if (own.error) return res.status(400).json({ error: own.error });
     owner = own.value;
+  }
+  if (v.mode === 'derived') {
+    // The new form carries no TD1 / exemption fields: an edit
+    // preserves the stored values, so a job migrated by filling in
+    // dates keeps its claims exactly.
+    const ytd = derivedJobYtd(v, existing.cpp_exempt === 1, existing.ei_exempt === 1);
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
+         tax_year = ?, start_date = ?, recent_pay_date = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?, updated_at = ? WHERE id = ?`).run(
+        v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis,
+        v.tax_year, v.start_date, v.recent_pay_date, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, nowIso(), id);
+      writeJobChildren(id, v.pay_changes, v.bonuses, nowIso());
+    })();
+    return res.json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
   }
   db.prepare(
     `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,

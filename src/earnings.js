@@ -80,6 +80,20 @@ export function bracketTax(brackets, income) {
   return tax;
 }
 
+// Full-year CPP / CPP2 / EI entitlements for an annual gross, before
+// any YTD offset — the same formulas calcSalary subtracts YTD from.
+// Extracted so the simplified job form's YTD derivation prices each
+// elapsed pay period at exactly the rate the engine would.
+export function cppEntitlement(annualGross, cpp) {
+  return Math.min(Math.max(0, Math.min(annualGross, cpp.ympe) - cpp.exemption) * cpp.rate, cpp.max);
+}
+export function cpp2Entitlement(annualGross, cpp) {
+  return Math.min(Math.max(0, annualGross - cpp.ympe) * cpp.cpp2Rate, cpp.max2);
+}
+export function eiEntitlement(annualGross, ei) {
+  return Math.min(annualGross, ei.mie) * ei.rate;
+}
+
 export function federalBpa(income, fed) {
   if (income <= fed.phaseOutStart) return fed.bpaMax;
   if (income >= fed.phaseOutEnd) return fed.bpaBase;
@@ -128,6 +142,172 @@ const optNum = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
+// ------------------------------------------- simplified job derivation --
+// The simplified Add job form asks only for key facts — employer,
+// earner, province, frequency, job start date, recent pay date and
+// that pay's gross value, plus optional dated pay-change rows
+// (effective date + new per-period value) and bonus entries (date +
+// amount). Everything the old form asked for is derived here:
+//
+//   annual gross = current per-period value × periods/year
+//   tax year     = year of the recent payment date
+//   TD1 claims   = blank = basic personal amounts (no fields)
+//   YTD CPP/CPP2/EI = Σ over the pay dates in the YTD window of
+//     (that segment's full-year entitlement ÷ periods/year)
+//
+// YTD means year-to-date, so the window runs from the later of the
+// job start date and January 1 of the recent payment's year through
+// the recent payment date. Pay dates follow the frequency's cadence
+// anchored at the start date (weekly / bi-weekly step 7 / 14 days,
+// monthly steps the start date's day-of-month clamped to month-end);
+// semi-monthly pays on the 15th and month-end; annual pays once, on
+// the recent payment date itself.
+//
+// Segment rule for pay changes: the recent value is the CURRENT
+// segment. A pay date takes the latest change on or before it, or
+// the recent value once past the last change; pay dates before the
+// first listed change take the first change's value (the list is
+// assumed to start at or before the window — a mid-year raise is
+// entered as two rows: the pre-raise rate from the start and the
+// new rate from the raise date). A post-raise rate is therefore
+// never annualised over pre-raise periods.
+
+const JOB_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+export function normJobDate(v) {
+  if (typeof v !== 'string' || !JOB_DATE_RE.test(v)) return null;
+  const [y, m, d] = v.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+  return v;
+}
+
+function jobDayNum(ymd) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  return Date.UTC(y, m - 1, d) / 86400000;
+}
+function jobDayStr(n) {
+  return new Date(n * 86400000).toISOString().slice(0, 10);
+}
+function lastDayOfMonth(y, m) {
+  return new Date(Date.UTC(y, m, 0)).getUTCDate();
+}
+function ymPad(y, m, d) {
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+export function payDatesInWindow(frequency, from, to, anchor) {
+  if (from > to) return [];
+  if (frequency === 'weekly' || frequency === 'biweekly') {
+    const step = frequency === 'weekly' ? 7 : 14;
+    const fromN = jobDayNum(from);
+    const toN = jobDayNum(to);
+    let n = jobDayNum(anchor);
+    if (n < fromN) n += Math.ceil((fromN - n) / step) * step;
+    const out = [];
+    while (n <= toN) { out.push(jobDayStr(n)); n += step; }
+    return out;
+  }
+  if (frequency === 'monthly') {
+    const anchorDay = Number(anchor.slice(8, 10));
+    let y = Number(from.slice(0, 4));
+    let m = Number(from.slice(5, 7));
+    const out = [];
+    for (;;) {
+      const cand = ymPad(y, m, Math.min(anchorDay, lastDayOfMonth(y, m)));
+      if (cand >= from) break;
+      m += 1; if (m > 12) { m = 1; y += 1; }
+    }
+    for (;;) {
+      const cand = ymPad(y, m, Math.min(anchorDay, lastDayOfMonth(y, m)));
+      if (cand > to) break;
+      out.push(cand);
+      m += 1; if (m > 12) { m = 1; y += 1; }
+    }
+    return out;
+  }
+  if (frequency === 'semimonthly') {
+    let y = Number(from.slice(0, 4));
+    let m = Number(from.slice(5, 7));
+    const out = [];
+    for (;;) {
+      const mid = ymPad(y, m, 15);
+      const end = ymPad(y, m, lastDayOfMonth(y, m));
+      if (mid >= from && mid <= to) out.push(mid);
+      if (end >= from && end <= to) out.push(end);
+      if (end > to) break;
+      m += 1; if (m > 12) { m = 1; y += 1; }
+    }
+    return out;
+  }
+  return [to]; // annual: one pay in the window, on the recent date
+}
+
+export function deriveJobYtd({ frequency, startDate, recentDate, changes, recentValue, payroll, cppExempt, eiExempt }) {
+  const periods = PAY_FREQUENCIES[frequency].periods;
+  const taxYear = Number(recentDate.slice(0, 4));
+  const yearStart = `${taxYear}-01-01`;
+  const windowStart = startDate > yearStart ? startDate : yearStart;
+  const pays = payDatesInWindow(frequency, windowStart, recentDate, startDate);
+  const sorted = [...(changes || [])].sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
+  const last = sorted.length ? sorted[sorted.length - 1] : null;
+  const valueAt = (d) => {
+    if (last && d >= last.effective_date) return recentValue;
+    let v = null;
+    for (const c of sorted) { if (c.effective_date <= d) v = c.value; else break; }
+    return v != null ? v : (sorted.length ? sorted[0].value : recentValue);
+  };
+  let ytdCpp = 0;
+  let ytdCpp2 = 0;
+  let ytdEi = 0;
+  for (const d of pays) {
+    const ann = valueAt(d) * periods;
+    if (!cppExempt) {
+      ytdCpp += cppEntitlement(ann, payroll.cpp) / periods;
+      ytdCpp2 += cpp2Entitlement(ann, payroll.cpp) / periods;
+    }
+    if (!eiExempt) ytdEi += eiEntitlement(ann, payroll.ei) / periods;
+  }
+  return {
+    ytd_cpp: round2(Math.min(ytdCpp, payroll.cpp.max)),
+    ytd_cpp2: round2(Math.min(ytdCpp2, payroll.cpp.max2)),
+    ytd_ei: round2(Math.min(ytdEi, payroll.ei.max)),
+    elapsed_periods: pays.length,
+  };
+}
+
+export function validPayChanges(rows, startDate) {
+  if (rows === undefined || rows === null) return [];
+  if (!Array.isArray(rows)) return { error: 'pay changes must be an array.' };
+  const out = [];
+  for (const r of rows) {
+    const d = normJobDate(r && r.effective_date);
+    const rawV = r && r.value;
+    const v = rawV === '' || rawV == null ? NaN : Number(rawV);
+    if (!d) return { error: 'each pay change needs a valid effective date.' };
+    if (!Number.isFinite(v) || v < 0) return { error: 'each pay change needs a per-period value ≥ 0.' };
+    if (startDate && d < startDate) return { error: 'pay change date must be on or after the job start date.' };
+    out.push({ effective_date: d, value: v });
+  }
+  out.sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
+  return out;
+}
+
+export function validBonuses(rows) {
+  if (rows === undefined || rows === null) return [];
+  if (!Array.isArray(rows)) return { error: 'bonuses must be an array.' };
+  const out = [];
+  for (const r of rows) {
+    const d = normJobDate(r && r.date);
+    const rawA = r && r.amount;
+    const a = rawA === '' || rawA == null ? NaN : Number(rawA);
+    if (!d) return { error: 'each bonus needs a valid date.' };
+    if (!Number.isFinite(a) || a < 0) return { error: 'each bonus needs an amount ≥ 0.' };
+    out.push({ date: d, amount: a });
+  }
+  out.sort((a, b) => (a.date < b.date ? -1 : 1));
+  return out;
+}
+
 export function validJobInput(body) {
   const b = body || {};
   const employer = cleanStr(b.employer, 120);
@@ -136,19 +316,53 @@ export function validJobInput(body) {
   if (!PROVINCE_CODES.includes(province)) return { error: 'province must be a Canadian province or territory code.' };
   const frequency = String(b.frequency || '');
   if (!PAY_FREQUENCIES[frequency]) return { error: 'frequency must be weekly, biweekly, semimonthly, monthly or annual.' };
+  const currency = cleanStr(b.currency, 3) || 'CAD';
+  // Simplified mode: any simplified field present means the new form
+  // is in use — start date, recent pay date and recent pay value are
+  // then all required, and gross / tax year / YTD are derived, never
+  // typed. TD1 and exemption flags are not fields of the new form:
+  // new jobs take the defaults, edits preserve the stored values
+  // (the route decides — validJobInput leaves them undefined here).
+  const simplified = b.start_date !== undefined || b.recent_pay_date !== undefined || b.recent_pay_value !== undefined;
+  if (simplified) {
+    const startDate = normJobDate(b.start_date);
+    const recentDate = normJobDate(b.recent_pay_date);
+    const recentValue = b.recent_pay_value === '' || b.recent_pay_value === undefined || b.recent_pay_value === null
+      ? null : Number(b.recent_pay_value);
+    if (!startDate) return { error: 'job start date must be a valid date.' };
+    if (!recentDate) return { error: 'recent payment date must be a valid date.' };
+    if (recentDate < startDate) return { error: 'recent payment date must be on or after the job start date.' };
+    if (recentValue == null || !Number.isFinite(recentValue) || recentValue < 0) return { error: 'recent payment value must be a number ≥ 0.' };
+    const payChanges = validPayChanges(b.pay_changes, startDate);
+    if (payChanges.error) return payChanges;
+    const bonuses = validBonuses(b.bonuses);
+    if (bonuses.error) return bonuses;
+    return {
+      mode: 'derived', employer, province, frequency, currency: currency.toUpperCase(),
+      owner: cleanStr(b.owner, 120),
+      start_date: startDate, recent_pay_date: recentDate, recent_pay_value: recentValue,
+      pay_changes: payChanges, bonuses,
+      gross_amount: recentValue, gross_basis: 'period', tax_year: Number(recentDate.slice(0, 4)),
+      td1_federal: undefined, td1_provincial: undefined, ytd_cpp: null, ytd_cpp2: null, ytd_ei: null,
+      cpp_exempt: undefined, ei_exempt: undefined,
+    };
+  }
+  // Legacy mode: the old form's fields, exactly as before — old rows
+  // and old clients keep working, and old jobs edited without dates
+  // keep their stored gross / tax year / YTD untouched (the route
+  // leaves the derived columns alone on a legacy save).
   const grossAmount = Number(b.gross_amount);
   if (!Number.isFinite(grossAmount) || grossAmount < 0) return { error: 'gross amount must be a number ≥ 0.' };
   const grossBasis = b.gross_basis === 'period' ? 'period' : 'annual';
   const taxYear = Number(b.tax_year);
   if (!Number.isInteger(taxYear) || taxYear < 2000 || taxYear > 2100) return { error: 'tax year must be a valid year.' };
-  const currency = cleanStr(b.currency, 3) || 'CAD';
   // Deliberately no SIN, birth date, bank details, employer payroll
   // account number, or T4 fields: none of them affect this estimate.
   // Owner is the single earner (T1 is per-person): a bare username,
   // null when unassigned. Candidate validation (existing non-admin
   // user, never 'Joint') lives server-side with the users table.
   return {
-    employer, province, frequency, gross_amount: grossAmount, gross_basis: grossBasis,
+    mode: 'legacy', employer, province, frequency, gross_amount: grossAmount, gross_basis: grossBasis,
     tax_year: taxYear, currency: currency.toUpperCase(),
     owner: cleanStr(b.owner, 120),
     td1_federal: optNum(b.td1_federal), td1_provincial: optNum(b.td1_provincial),
@@ -160,19 +374,24 @@ export function validJobInput(body) {
 
 export function calcSalary(job, payroll) {
   const periods = PAY_FREQUENCIES[job.frequency].periods;
-  const annualGross = job.gross_basis === 'period' ? job.gross_amount * periods : job.gross_amount;
-  const perPeriodGross = annualGross / periods;
+  // Salary annualised from the per-period rate; bonuses (job.bonus_total,
+  // default 0) count into the year's gross — pensionable/insurable like
+  // other earnings — but never into the per-period rate, which stays
+  // salary-only. A job without bonuses computes exactly as before.
+  const salaryAnnual = job.gross_basis === 'period' ? job.gross_amount * periods : job.gross_amount;
+  const annualGross = salaryAnnual + (job.bonus_total || 0);
+  const perPeriodGross = salaryAnnual / periods;
   const warnings = [];
   const { cpp, ei, federal } = payroll;
   let cppAnnual = 0;
   let cpp2Annual = 0;
   let eiAnnual = 0;
   if (!job.cpp_exempt) {
-    cppAnnual = Math.max(0, Math.min(Math.max(0, Math.min(annualGross, cpp.ympe) - cpp.exemption) * cpp.rate, cpp.max) - (job.ytd_cpp || 0));
-    cpp2Annual = Math.max(0, Math.min(Math.max(0, annualGross - cpp.ympe) * cpp.cpp2Rate, cpp.max2) - (job.ytd_cpp2 || 0));
+    cppAnnual = Math.max(0, cppEntitlement(annualGross, cpp) - (job.ytd_cpp || 0));
+    cpp2Annual = Math.max(0, cpp2Entitlement(annualGross, cpp) - (job.ytd_cpp2 || 0));
   }
   if (!job.ei_exempt) {
-    eiAnnual = Math.max(0, Math.min(annualGross, ei.mie) * ei.rate - (job.ytd_ei || 0));
+    eiAnnual = Math.max(0, eiEntitlement(annualGross, ei) - (job.ytd_ei || 0));
   }
   const cppBase = job.cpp_exempt ? 0
     : Math.min(Math.max(0, Math.min(annualGross, cpp.ympe) - cpp.exemption) * cpp.baseRate,

@@ -8,6 +8,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
   deriveRentalYearFigures, entryCoveredYears,
+  payDatesInWindow, deriveJobYtd,
 } from '../src/earnings.js';
 
 const job = (over = {}) => ({
@@ -291,4 +292,109 @@ test('rent entries: year input no longer takes gross rents or rented days, but s
   assert.equal(v.gross_rents, undefined);
   assert.equal(v.rental_days, undefined);
   assert.ok(validRentalYearInput({ tax_year: 2026, gross_rents: 1, expenses: [{ line: '8710', amount: 1 }] }, rental.t776Lines).error);
+});
+
+// ------------------------------------------------- simplified job form --
+// The modal asks only for key facts; the rest is derived here.
+test('simplified job: pay-date cadences per frequency', () => {
+  assert.deepEqual(payDatesInWindow('weekly', '2026-01-05', '2026-01-31', '2026-01-05'),
+    ['2026-01-05', '2026-01-12', '2026-01-19', '2026-01-26']);
+  assert.deepEqual(payDatesInWindow('biweekly', '2026-01-05', '2026-01-31', '2026-01-05'),
+    ['2026-01-05', '2026-01-19']);
+  assert.deepEqual(payDatesInWindow('semimonthly', '2026-01-05', '2026-01-31', '2026-01-05'),
+    ['2026-01-15', '2026-01-31']);
+  assert.deepEqual(payDatesInWindow('monthly', '2026-01-05', '2026-01-31', '2026-01-05'), ['2026-01-05']);
+  assert.deepEqual(payDatesInWindow('annual', '2026-01-05', '2026-01-31', '2026-01-05'), ['2026-01-31']);
+  // Monthly anchors clamp to month-end (31st -> Feb 28).
+  assert.deepEqual(payDatesInWindow('monthly', '2026-01-31', '2026-04-30', '2026-01-31'),
+    ['2026-01-31', '2026-02-28', '2026-03-31', '2026-04-30']);
+  assert.deepEqual(payDatesInWindow('biweekly', '2026-02-01', '2026-01-01', '2026-01-05'), []);
+});
+
+test('simplified job: YTD from elapsed periods, bi-weekly $3,000 Jan 5 -> Oct 23', () => {
+  const ytd = deriveJobYtd({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    changes: [], recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(ytd.elapsed_periods, 21);
+  assert.equal(ytd.ytd_cpp, 3416.9); // 21/26 of the $4,230.45 full-year CPP
+  assert.equal(ytd.ytd_cpp2, 109.85); // 21/26 of $136.00
+  assert.equal(ytd.ytd_ei, 907.1); // 21/26 of the $1,123.07 EI cap
+});
+
+test('simplified job: mid-year start counts only this year\'s pays', () => {
+  const ytd = deriveJobYtd({
+    frequency: 'biweekly', startDate: '2026-07-01', recentDate: '2026-10-23',
+    changes: [], recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(ytd.elapsed_periods, 9);
+  assert.equal(ytd.ytd_cpp, 1464.39);
+  assert.equal(ytd.ytd_ei, 388.76);
+});
+
+test('simplified job: a prior-year start still windows YTD at Jan 1', () => {
+  const ytd = deriveJobYtd({
+    frequency: 'biweekly', startDate: '2024-03-04', recentDate: '2026-10-23',
+    changes: [], recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(ytd.elapsed_periods, 21);
+  assert.equal(ytd.ytd_cpp, 3416.9);
+});
+
+test('simplified job: a mid-year raise prices each segment, never the new rate over old pays', () => {
+  const ytd = deriveJobYtd({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    changes: [
+      { effective_date: '2026-01-05', value: 2500 },
+      { effective_date: '2026-06-01', value: 3000 },
+    ],
+    recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(ytd.elapsed_periods, 21);
+  // 11 pays at $2,500 + 10 at $3,000: CPP 1548.15 + 1627.10, EI 448.25 + 431.95.
+  assert.equal(ytd.ytd_cpp, 3175.24);
+  assert.equal(ytd.ytd_cpp2, 52.31);
+  assert.equal(ytd.ytd_ei, 880.2);
+});
+
+test('simplified job: bonus counts into the year\'s gross, never the per-period rate', () => {
+  const base = job({ frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period' });
+  assert.equal(calcSalary({ ...base, bonus_total: 5000 }, payroll).annualGross, 83000);
+  assert.equal(calcSalary({ ...base, bonus_total: 5000 }, payroll).perPeriod.gross, 3000);
+  assert.equal(calcSalary(base, payroll).annualGross, 78000);
+});
+
+test('simplified job: validJobInput derives, legacy input is untouched', () => {
+  const d = validJobInput({
+    employer: 'Acme', province: 'BC', frequency: 'biweekly',
+    start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+    pay_changes: [{ effective_date: '2026-06-01', value: 3000 }],
+    bonuses: [{ date: '2026-06-30', amount: 5000 }],
+  });
+  assert.equal(d.mode, 'derived');
+  assert.equal(d.gross_amount, 3000);
+  assert.equal(d.gross_basis, 'period');
+  assert.equal(d.tax_year, 2026);
+  assert.equal(d.pay_changes.length, 1);
+  assert.equal(d.bonuses.length, 1);
+  const l = validJobInput({
+    employer: 'Acme', province: 'BC', frequency: 'annual',
+    gross_amount: 60000, gross_basis: 'annual', tax_year: 2026, ytd_cpp: 100,
+  });
+  assert.equal(l.mode, 'legacy');
+  assert.equal(l.gross_amount, 60000);
+  assert.equal(l.ytd_cpp, 100);
+  assert.ok(validJobInput({
+    employer: 'Acme', province: 'BC', frequency: 'biweekly',
+    start_date: '2026-10-23', recent_pay_date: '2026-01-05', recent_pay_value: 3000,
+  }).error);
+  assert.ok(validJobInput({
+    employer: 'Acme', province: 'BC', frequency: 'biweekly',
+    start_date: '2026-01-05', recent_pay_date: '2026-10-23',
+  }).error);
+  assert.ok(validJobInput({
+    employer: 'Acme', province: 'BC', frequency: 'biweekly',
+    start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+    pay_changes: [{ effective_date: '2025-01-01', value: 2500 }],
+  }).error);
 });

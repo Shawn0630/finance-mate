@@ -647,6 +647,53 @@ try {
   r = await req('DELETE', `/api/earnings/jobs/${jobNoOwn}`);
   check('no-owner job fixture cleaned up', r.status === 200);
 
+  // Simplified job form: key facts in, everything else derived.
+  const derivedBody = {
+    employer: 'Derived Corp', province: 'BC', frequency: 'biweekly',
+    start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+  };
+  r = await req('POST', '/api/earnings/jobs', derivedBody);
+  check('simplified job creates: period basis, tax year from recent date, annual 78,000',
+    r.status === 201 && r.data.gross_amount === 3000 && r.data.gross_basis === 'period'
+    && r.data.tax_year === 2026 && r.data.calc.annualGross === 78000
+    && r.data.calc.perPeriod.gross === 3000, JSON.stringify(r.data));
+  const derivedJob = r.data.id;
+  check('simplified job YTD derives from elapsed periods (21 pays)',
+    r.data.ytd_cpp === 3416.9 && r.data.ytd_cpp2 === 109.85 && r.data.ytd_ei === 907.1, JSON.stringify(r.data));
+  r = await req('PUT', `/api/earnings/jobs/${derivedJob}`, {
+    ...derivedBody,
+    pay_changes: [
+      { effective_date: '2026-01-05', value: 2500 },
+      { effective_date: '2026-06-01', value: 3000 },
+    ],
+  });
+  check('a mid-year raise re-derives YTD segment by segment, annual stays on the current rate',
+    r.status === 200 && r.data.ytd_cpp === 3175.24 && r.data.ytd_cpp2 === 52.31 && r.data.ytd_ei === 880.2
+    && r.data.calc.annualGross === 78000, JSON.stringify(r.data));
+  r = await req('PUT', `/api/earnings/jobs/${derivedJob}`, {
+    ...derivedBody,
+    pay_changes: [
+      { effective_date: '2026-01-05', value: 2500 },
+      { effective_date: '2026-06-01', value: 3000 },
+    ],
+    bonuses: [{ date: '2026-06-30', amount: 5000 }],
+  });
+  check('a bonus lands in the year\'s gross but not the per-period rate',
+    r.status === 200 && r.data.calc.annualGross === 83000 && r.data.calc.perPeriod.gross === 3000
+    && r.data.bonus_total === 5000, JSON.stringify(r.data));
+  // A legacy save (no dates) on a derived job leaves the derived
+  // columns and child rows alone.
+  r = await req('PUT', `/api/earnings/jobs/${derivedJob}`, { ...jobBody, employer: 'Derived Corp' });
+  check('legacy save without dates preserves derived dates and rows',
+    r.status === 200 && r.data.start_date === '2026-01-05' && r.data.pay_changes.length === 2
+    && r.data.bonuses.length === 1, JSON.stringify(r.data));
+  r = await req('POST', '/api/earnings/jobs', { ...derivedBody, start_date: '2026-10-23', recent_pay_date: '2026-01-05' });
+  check('simplified job rejects a recent date before the start date', r.status === 400);
+  r = await req('POST', '/api/earnings/jobs', { ...derivedBody, recent_pay_value: undefined, start_date: '2026-01-05', recent_pay_date: '2026-10-23' });
+  check('simplified job rejects a missing recent value', r.status === 400);
+  r = await req('DELETE', `/api/earnings/jobs/${derivedJob}`);
+  check('derived job fixture cleaned up', r.status === 200);
+
   // Value history: the stub fetch above already recorded the 2026 auto
   // point for pid2; manual points fill the earlier years.
   r = await req('GET', `/api/properties/${pid2}/value-history`);
@@ -2275,7 +2322,10 @@ try {
     const browser = await puppeteer.launch({
       executablePath: '/opt/meta-chromium/chrome',
       headless: 'new',
-      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      // Extra flags come from the environment (e.g. the Hatch WebGL
+      // domain policy file + hash) so a plain local run stays plain.
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
     });
     try {
     try {
@@ -6656,6 +6706,89 @@ try {
         }));
       await req('DELETE', `/api/properties/${legacyPid}`);
       await req('DELETE', `/api/properties/${costUiPid}`);
+
+      // ---- Simplified Add job: modal, key fields only, derived rest ----
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.click('#addEarnJobBtn');
+      await wait(300);
+      check('Add job opens as a modal, not an inline panel',
+        await page.evaluate(() => {
+          const m = document.querySelector('#earnJobModal');
+          return !!m && !m.classList.contains('hidden') && !document.querySelector('#earnJobFormPanel');
+        }));
+      check('the job modal asks only simplified fields (no gross/basis/year/TD1/YTD inputs)',
+        await page.evaluate(() => ['gross_amount', 'gross_basis', 'tax_year', 'td1_federal', 'td1_provincial', 'ytd_cpp', 'ytd_cpp2', 'ytd_ei']
+          .every((n) => !document.querySelector(`#earnJobForm [name=${n}]`))));
+      check('the job modal carries the ✨ Fill with AI panel',
+        await page.evaluate(() => !!document.querySelector('#earnJobForm [data-ai-toggle]')));
+      await until(() => document.querySelectorAll('#earnJobProvince option').length > 1);
+      await page.type('#earnJobForm [name=employer]', 'Derived Corp');
+      await page.select('#earnJobProvince', 'BC');
+      await page.select('#earnJobFrequency', 'biweekly');
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobForm');
+        f.start_date.value = '2026-01-05';
+        f.recent_pay_date.value = '2026-10-23';
+      });
+      await page.type('#earnJobForm [name=recent_pay_value]', '3000');
+      await page.click('#earnJobModal button[type=submit]');
+      check('saving the simplified job shows annual $78,000.00 on its card',
+        await until(() => {
+          const m = document.querySelector('#earnJobModal');
+          return m && m.classList.contains('hidden')
+            && document.querySelector('#earnJobList').textContent.includes('Derived Corp')
+            && document.querySelector('#earnJobList').textContent.includes('$78,000.00');
+        }));
+      const modalJob = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.employer === 'Derived Corp');
+      check('the saved job carries tax year 2026 from the recent date',
+        !!modalJob && modalJob.tax_year === 2026 && modalJob.gross_basis === 'period', JSON.stringify(modalJob));
+      // Edit: add a mid-year raise and a bonus, then save.
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#earnJobList button')].find((b) => b.textContent.trim() === 'Edit').click();
+      });
+      await wait(300);
+      check('editing pre-fills the simplified fields (grouped recent value)',
+        await page.evaluate(() => {
+          const f = document.querySelector('#earnJobForm');
+          return f.employer.value === 'Derived Corp' && f.start_date.value === '2026-01-05'
+            && f.recent_pay_value.value === '3,000';
+        }));
+      await page.click('#earnJobPayChangeAddBtn');
+      await page.click('#earnJobPayChangeAddBtn');
+      await page.click('#earnJobBonusAddBtn');
+      await page.evaluate(() => {
+        const pcs = [...document.querySelectorAll('#earnJobPayChangeRows > div')];
+        pcs[0].querySelector('[data-pc-date]').value = '2026-01-05';
+        pcs[0].querySelector('[data-pc-value]').value = '2500';
+        pcs[1].querySelector('[data-pc-date]').value = '2026-06-01';
+        pcs[1].querySelector('[data-pc-value]').value = '3000';
+        const b = document.querySelector('#earnJobBonusRows > div');
+        b.querySelector('[data-bonus-date]').value = '2026-06-30';
+        b.querySelector('[data-bonus-amount]').value = '5000';
+      });
+      await page.click('#earnJobModal button[type=submit]');
+      await wait(900);
+      const modalJob2 = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.employer === 'Derived Corp');
+      check('raise + bonus save: YTD re-derives, annual includes the bonus, per-period rate does not',
+        !!modalJob2 && modalJob2.ytd_cpp === 3175.24 && modalJob2.calc.annualGross === 83000
+        && modalJob2.calc.perPeriod.gross === 3000 && modalJob2.bonus_total === 5000, JSON.stringify(modalJob2));
+      check('the card now shows annual $83,000.00',
+        await until(() => document.querySelector('#earnJobList').textContent.includes('$83,000.00')));
+      // An old-form job still renders and computes.
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Legacy Corp', province: 'BC', frequency: 'annual',
+        gross_amount: 60000, gross_basis: 'annual', tax_year: 2026,
+      });
+      const legacyJobId = r.data.id;
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      check('an old-form job still renders with its annual figure',
+        await until(() => {
+          const list = document.querySelector('#earnJobList');
+          return list && list.textContent.includes('Legacy Corp') && list.textContent.includes('$60,000.00');
+        }));
+      await req('DELETE', `/api/earnings/jobs/${modalJob.id}`);
+      await req('DELETE', `/api/earnings/jobs/${legacyJobId}`);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));
@@ -9725,11 +9858,16 @@ try {
       await page.goto('http://ff.local/#earnings', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitI(800);
       await page.click('#addEarnJobBtn');
-      await page.waitForFunction(() => !document.querySelector('#earnJobFormPanel').classList.contains('hidden'), { timeout: 10000 });
+      await page.waitForFunction(() => !document.querySelector('#earnJobModal').classList.contains('hidden'), { timeout: 10000 });
       await page.type('#earnJobForm input[name=employer]', 'Owner Browser Corp');
       await page.select('#earnJobForm select[name=province]', 'BC');
       await page.select('#earnJobForm select[name=frequency]', 'annual');
-      await page.type('#earnJobForm input[name=gross_amount]', '60000');
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobForm');
+        f.start_date.value = '2026-01-05';
+        f.recent_pay_date.value = '2026-10-23';
+      });
+      await page.type('#earnJobForm input[name=recent_pay_value]', '60000');
       await page.select('#earnJobForm select[name=owner]', 'Shawn');
       await page.click('#earnJobForm button[type=submit]');
       await waitI(800);

@@ -962,6 +962,21 @@ function applyAiFields(form, fields, extras = {}) {
       tally(fillOneInput(extras.segForm, key.slice('segment_'.length), value));
       continue;
     }
+    if ((key === 'pay_changes' || key === 'bonuses') && extras.jobRows) {
+      const rows = Array.isArray(value) ? value : [];
+      const existing = key === 'pay_changes' ? extras.jobRows.getPayChanges() : extras.jobRows.getBonuses();
+      // Hand-entered rows are never overwritten — like hand-filled
+      // scalar fields, they count as kept. Row sections carry no
+      // per-row ✨ flag (there is no single input to flag); the
+      // filled rows sit in the form for review, and the panel
+      // summary counts them.
+      if (existing.length || !rows.length) { if (existing.length) kept += 1; continue; }
+      form._aiFilling = true;
+      if (key === 'pay_changes') extras.jobRows.setPayChanges(rows); else extras.jobRows.setBonuses(rows);
+      form._aiFilling = false;
+      filled += 1;
+      continue;
+    }
     tally(fillOneInput(form, key, value));
   }
   renderAiFlags(form);
@@ -8244,11 +8259,15 @@ async function loadEarnings() {
   try {
     if (!ownerUsers.length) await loadOwnerUsers();
     earnData = await api('/api/earnings');
-    $('#earnJobProvince').innerHTML = earnData.payrollProvinces.map((p) =>
+    // Blank first options: a fresh Add form must not silently carry
+    // the first province / frequency, and AI fill must be able to
+    // fill a blank select (a non-empty value counts as hand-filled
+    // and is never overwritten).
+    $('#earnJobProvince').innerHTML = `<option value="">—</option>` + earnData.payrollProvinces.map((p) =>
       `<option value="${p.code}">${esc(p.label)}${p.verified ? '' : ' (unverified)'}</option>`).join('');
     $('#earnJobOwner').innerHTML = `<option value="">No owner</option>` + ownerUsers.map((u) =>
       `<option value="${esc(u)}">${esc(u)}</option>`).join('');
-    $('#earnJobFrequency').innerHTML = earnData.payFrequencies.map((f) =>
+    $('#earnJobFrequency').innerHTML = `<option value="">—</option>` + earnData.payFrequencies.map((f) =>
       `<option value="${f.key}">${esc(f.label)}</option>`).join('');
     // Rental property dropdown: the app's own properties, never BCA
     // search results. The standalone option stays first; a refill
@@ -8473,36 +8492,147 @@ function earnReadForm(form) {
   return data;
 }
 
+// ------------------------------------------------------------ job modal --
+// The simplified form asks only for key facts; annual gross, tax
+// year and YTD CPP / CPP2 / EI are derived server-side from the
+// start date, recent pay date and recent pay value. Pay-change rows
+// (raises) and bonus rows are repeatable lists inside the modal.
+// A job edited without dates keeps its stored gross / tax year /
+// YTD untouched (the server leaves derived columns alone on a
+// legacy save), so old jobs keep computing exactly as before.
+let earnEditJobOrig = null;
+
+function earnJobRepeatRow(kind, values) {
+  const wrap = document.createElement('div');
+  if (kind === 'pay_change') {
+    wrap.innerHTML = `<input type="date" data-pc-date value="${esc(values?.effective_date || '')}">
+      <input type="text" inputmode="decimal" data-money data-pc-value placeholder="New per-period value" value="${values?.value == null ? '' : esc(formatMoneyInput(values.value))}">
+      <button type="button" class="small" onclick="this.parentElement.remove()">Remove</button>`;
+  } else {
+    wrap.innerHTML = `<input type="date" data-bonus-date value="${esc(values?.date || '')}">
+      <input type="text" inputmode="decimal" data-money data-bonus-amount placeholder="Amount" value="${values?.amount == null ? '' : esc(formatMoneyInput(values.amount))}">
+      <button type="button" class="small" onclick="this.parentElement.remove()">Remove</button>`;
+  }
+  wrap.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  return wrap;
+}
+const earnJobPayChanges = () => [...document.querySelectorAll('#earnJobPayChangeRows > div')].map((row) => ({
+  effective_date: row.querySelector('[data-pc-date]').value,
+  value: parseMoneyInput(row.querySelector('[data-pc-value]').value),
+}));
+const earnJobBonuses = () => [...document.querySelectorAll('#earnJobBonusRows > div')].map((row) => ({
+  date: row.querySelector('[data-bonus-date]').value,
+  amount: parseMoneyInput(row.querySelector('[data-bonus-amount]').value),
+}));
+$('#earnJobPayChangeAddBtn').onclick = () => $('#earnJobPayChangeRows').appendChild(earnJobRepeatRow('pay_change'));
+$('#earnJobBonusAddBtn').onclick = () => $('#earnJobBonusRows').appendChild(earnJobRepeatRow('bonus'));
+
+function earnJobResetModal(title) {
+  $('#earnJobFormTitle').textContent = title;
+  $('#earnJobForm').reset();
+  $('#earnJobPayChangeRows').innerHTML = '';
+  $('#earnJobBonusRows').innerHTML = '';
+  showMsg($('#earnJobModalMsg'), '', '');
+}
+
 $('#addEarnJobBtn').onclick = () => {
   earnEditJobId = null;
-  $('#earnJobFormTitle').textContent = 'Add job';
-  $('#earnJobForm').reset();
-  $('#earnJobFormPanel').classList.remove('hidden');
+  earnEditJobOrig = null;
+  earnJobResetModal('Add job');
+  openModal('earnJobModal');
 };
-$('#earnJobCancelBtn').onclick = () => $('#earnJobFormPanel').classList.add('hidden');
 $('#earnJobForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
-    const body = earnReadForm(e.target);
+    const f = e.target;
+    const data = earnReadForm(f);
+    parseMoneyFields(data, ['recent_pay_value']);
+    const start = data.start_date || '';
+    const recent = data.recent_pay_date || '';
+    const value = data.recent_pay_value;
+    const hasAny = !!(start || recent || (value !== '' && value != null));
+    // Rows: fully-empty rows are dropped; partially-filled rows are
+    // an error (the server would otherwise read a blank value as 0).
+    const dropEmpty = (rows, dateKey, valKey, label) => {
+      const kept = [];
+      for (const r of rows) {
+        const d = r[dateKey];
+        const v = r[valKey];
+        if (!d && (v === '' || v == null)) continue;
+        if (!d || v === '' || v == null) throw new Error(`Each ${label} needs a date and an amount.`);
+        kept.push(r);
+      }
+      return kept;
+    };
+    const payChanges = dropEmpty(earnJobPayChanges(), 'effective_date', 'value', 'pay change');
+    const bonuses = dropEmpty(earnJobBonuses(), 'date', 'amount', 'bonus');
+    let body;
+    if (earnEditJobId == null || hasAny) {
+      if (!start || !recent || value === '' || value == null) {
+        showMsg($('#earnJobModalMsg'), 'err', 'Job start date, recent payment date and recent payment value are all required.');
+        return;
+      }
+      body = {
+        employer: data.employer, owner: data.owner, currency: data.currency || 'CAD',
+        province: data.province, frequency: data.frequency,
+        start_date: start, recent_pay_date: recent, recent_pay_value: value,
+        pay_changes: payChanges, bonuses,
+      };
+    } else {
+      // Edit without dates: preserve the stored gross / tax year /
+      // YTD / TD1 / exemptions verbatim — the server leaves the
+      // derived columns and child rows alone on a legacy save.
+      const o = earnEditJobOrig;
+      body = {
+        employer: data.employer, owner: data.owner, currency: data.currency || 'CAD',
+        province: data.province, frequency: data.frequency,
+        gross_amount: o.gross_amount, gross_basis: o.gross_basis, tax_year: o.tax_year,
+        td1_federal: o.td1_federal ?? '', td1_provincial: o.td1_provincial ?? '',
+        ytd_cpp: o.ytd_cpp, ytd_cpp2: o.ytd_cpp2, ytd_ei: o.ytd_ei,
+        cpp_exempt: o.cpp_exempt, ei_exempt: o.ei_exempt,
+      };
+    }
     if (earnEditJobId) await api(`/api/earnings/jobs/${earnEditJobId}`, { method: 'PUT', body });
     else await api('/api/earnings/jobs', { method: 'POST', body });
-    $('#earnJobFormPanel').classList.add('hidden');
+    closeModalEl($('#earnJobModal'));
     loadEarnings();
-  } catch (err) { showMsg($('#earnSalaryMsg'), 'err', err.message); }
+  } catch (err) { showMsg($('#earnJobModalMsg'), 'err', err.message); }
 };
 window.earnEditJob = (id) => {
   const j = earnData.jobs.find((x) => x.id === id);
   if (!j) return;
+  earnJobResetModal('Edit job');
   earnEditJobId = id;
-  $('#earnJobFormTitle').textContent = 'Edit job';
+  earnEditJobOrig = j;
   const f = $('#earnJobForm');
   f.employer.value = j.employer; f.owner.value = j.owner || ''; f.currency.value = j.currency; f.province.value = j.province;
-  f.frequency.value = j.frequency; f.gross_amount.value = j.gross_amount; f.gross_basis.value = j.gross_basis;
-  f.tax_year.value = j.tax_year; f.td1_federal.value = j.td1_federal ?? ''; f.td1_provincial.value = j.td1_provincial ?? '';
-  f.ytd_cpp.value = j.ytd_cpp; f.ytd_cpp2.value = j.ytd_cpp2; f.ytd_ei.value = j.ytd_ei;
-  f.cpp_exempt.checked = j.cpp_exempt; f.ei_exempt.checked = j.ei_exempt;
-  $('#earnJobFormPanel').classList.remove('hidden');
+  f.frequency.value = j.frequency; f.start_date.value = j.start_date || ''; f.recent_pay_date.value = j.recent_pay_date || '';
+  // Recent value is the current per-period rate; for an old
+  // annual-basis job, the per-period equivalent, so the field
+  // always shows a rate.
+  const periods = (earnData.payFrequencies.find((x) => x.key === j.frequency) || {}).periods || 1;
+  const perPeriod = j.gross_basis === 'period' ? j.gross_amount : j.gross_amount / periods;
+  setMoneyValue(f.recent_pay_value, perPeriod);
+  for (const c of j.pay_changes || []) $('#earnJobPayChangeRows').appendChild(earnJobRepeatRow('pay_change', c));
+  for (const b of j.bonuses || []) $('#earnJobBonusRows').appendChild(earnJobRepeatRow('bonus', b));
+  openModal('earnJobModal');
 };
+attachAiFill($('#earnJobForm'), 'job', {
+  jobRows: {
+    getPayChanges: earnJobPayChanges,
+    getBonuses: earnJobBonuses,
+    setPayChanges: (rows) => {
+      const c = $('#earnJobPayChangeRows');
+      c.innerHTML = '';
+      rows.forEach((r) => c.appendChild(earnJobRepeatRow('pay_change', r)));
+    },
+    setBonuses: (rows) => {
+      const c = $('#earnJobBonusRows');
+      c.innerHTML = '';
+      rows.forEach((r) => c.appendChild(earnJobRepeatRow('bonus', r)));
+    },
+  },
+});
 window.earnDeleteJob = async (id) => {
   if (!confirm('Delete this job?')) return;
   await api(`/api/earnings/jobs/${id}`, { method: 'DELETE' });

@@ -29,6 +29,10 @@ export const TERM_FIELDS = [
   'segment_start_date', 'segment_rate_type', 'segment_rate_mode',
   'segment_annual_rate', 'segment_spread', 'segment_compounding',
 ];
+export const JOB_FIELDS = [
+  'employer', 'owner', 'currency', 'province', 'frequency',
+  'start_date', 'recent_pay_date', 'recent_pay_value', 'pay_changes', 'bonuses',
+];
 
 // The selectable models, from LLM_MODELS (comma-separated). When
 // it is not set, the list is just LLM_MODEL. Same variables and
@@ -55,7 +59,7 @@ export function llmConfigured(env = process.env) {
 // ------------------------------------------------------------- LLM call
 
 const SYSTEM_PROMPT = [
-  'You extract structured form fields from mortgage documents and user notes.',
+  'You extract structured form fields from documents and user notes.',
   'Reply with ONLY a JSON object of the form {"fields": {...}} — no prose, no code fences.',
   'Use only the keys listed for the form; omit keys you cannot determine from the source.',
   'Normalization: dates as YYYY-MM-DD; money and rates as plain numbers (no $, commas or % signs);',
@@ -78,6 +82,16 @@ const FORM_SPECS = {
     'segment_rate_mode (absolute | prime_spread), segment_annual_rate (fixed or absolute segments),',
     'segment_spread (prime_spread segments), segment_compounding (semi_annual | monthly — use monthly',
     'when the document says interest is calculated at the same frequency as the payments, or compounded monthly).',
+  ].join('\n'),
+  job: [
+    'Form: salary job (simplified form).',
+    'Keys: employer, owner (the earner, a person name), currency (3-letter code, default CAD),',
+    'province (province code BC | AB | ON | …, or the province name),',
+    'frequency (weekly | biweekly | semimonthly | monthly | annual — the pay cadence),',
+    'start_date (job start date), recent_pay_date (most recent pay date),',
+    'recent_pay_value (gross of one pay period, a plain number).',
+    'Optional: pay_changes (array of {effective_date, value} — dated raises, the new per-period gross',
+    'from that date), bonuses (array of {date, amount} — one-time bonus payments).',
   ].join('\n'),
 };
 
@@ -307,6 +321,33 @@ export function normalizeAiFields(context, raw) {
     }
     return out;
   }
+  if (context === 'job') {
+    put('employer', normStr(raw.employer, 120));
+    put('owner', normStr(raw.owner, 120));
+    const cur = normStr(raw.currency, 3);
+    put('currency', cur && /^[A-Za-z]{3}$/.test(cur) ? cur.toUpperCase() : null);
+    put('province', normJobProvince(raw.province));
+    put('frequency', normEnum(raw.frequency,
+      ['weekly', 'biweekly', 'semimonthly', 'monthly', 'annual'],
+      { bi_weekly: 'biweekly', semi_monthly: 'semimonthly', twice_monthly: 'semimonthly' }));
+    put('start_date', normDate(raw.start_date));
+    put('recent_pay_date', normDate(raw.recent_pay_date));
+    const rv = normNum(raw.recent_pay_value);
+    put('recent_pay_value', rv != null && rv >= 0 ? rv : null);
+    if (Array.isArray(raw.pay_changes)) {
+      const rows = raw.pay_changes
+        .map((r) => ({ effective_date: normDate(r && r.effective_date), value: normNum(r && r.value) }))
+        .filter((r) => r.effective_date && r.value != null && r.value >= 0);
+      if (rows.length) out.pay_changes = rows;
+    }
+    if (Array.isArray(raw.bonuses)) {
+      const rows = raw.bonuses
+        .map((r) => ({ date: normDate(r && r.date), amount: normNum(r && r.amount) }))
+        .filter((r) => r.date && r.amount != null && r.amount >= 0);
+      if (rows.length) out.bonuses = rows;
+    }
+    return out;
+  }
   // context === 'term'
   put('lender', normStr(raw.lender, 120));
   put('start_date', normDate(raw.start_date));
@@ -395,12 +436,26 @@ export function validateFile(file) {
 // The whole endpoint as a pure-ish function (deps injectable for
 // tests): validates input, checks configuration, calls the model,
 // normalizes. Returns { status, body }.
+const JOB_PROVINCE_CODES = ['BC', 'AB', 'ON', 'MB', 'SK', 'QC', 'NB', 'NS', 'PE', 'NL', 'YT', 'NT', 'NU'];
+const JOB_PROVINCE_BY_NAME = {
+  'british columbia': 'BC', alberta: 'AB', ontario: 'ON', manitoba: 'MB', saskatchewan: 'SK',
+  quebec: 'QC', 'new brunswick': 'NB', 'nova scotia': 'NS', 'prince edward island': 'PE',
+  'newfoundland and labrador': 'NL', newfoundland: 'NL', labrador: 'NL',
+  yukon: 'YT', 'northwest territories': 'NT', nunavut: 'NU',
+};
+function normJobProvince(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  if (JOB_PROVINCE_CODES.includes(s.toUpperCase())) return s.toUpperCase();
+  return JOB_PROVINCE_BY_NAME[s.toLowerCase()] || null;
+}
+
 export async function handleAiFill(input, deps = {}) {
   const env = deps.env || process.env;
   const call = deps.callLlm || callLlm;
   const { context, text, file } = input || {};
-  if (context !== 'property' && context !== 'term') {
-    return { status: 400, body: { error: "context must be 'property' or 'term'." } };
+  if (context !== 'property' && context !== 'term' && context !== 'job') {
+    return { status: 400, body: { error: "context must be 'property', 'term' or 'job'." } };
   }
   if (!llmConfigured(env)) {
     return {
@@ -449,6 +504,13 @@ export async function handleAiFill(input, deps = {}) {
     const mapped = deps.mapOwners(fields.owners);
     if (mapped && mapped.length) fields.owners = mapped;
     else delete fields.owners;
+  }
+  // A job's earner is one person: map the model's name to a known
+  // username the same way, and drop it when it matches nobody.
+  if (context === 'job' && fields.owner && deps.mapOwners) {
+    const mapped = deps.mapOwners([fields.owner]);
+    if (mapped && mapped.length) fields.owner = mapped[0];
+    else delete fields.owner;
   }
   return { status: 200, body: { fields, model } };
 }

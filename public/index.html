@@ -446,27 +446,6 @@
       <div class="chart-colors hidden" data-colors-panel="earnSalary"></div>
       <div class="note hidden" id="earnSalaryEmpty">No jobs yet.</div>
       <div id="earnJobList"></div>
-      <div class="panel hidden" id="earnJobFormPanel">
-        <h3 id="earnJobFormTitle">Add job</h3>
-        <form id="earnJobForm">
-          <div><label>Employer *</label><input name="employer" required></div>
-          <div><label>Earner</label><select name="owner" id="earnJobOwner"></select></div>
-          <div><label>Currency</label><input name="currency" value="CAD" maxlength="3"></div>
-          <div><label>Province of employment *</label><select name="province" id="earnJobProvince"></select></div>
-          <div><label>Pay frequency *</label><select name="frequency" id="earnJobFrequency"></select></div>
-          <div><label>Gross amount *</label><input name="gross_amount" type="number" step="0.01" min="0" required></div>
-          <div><label>Gross basis *</label><select name="gross_basis"><option value="annual">Annual salary</option><option value="period">Per pay period</option></select></div>
-          <div><label>Tax year *</label><input name="tax_year" type="number" value="2026" required></div>
-          <div><label>TD1 federal claim (blank = basic personal amount)</label><input name="td1_federal" type="number" step="0.01" min="0"></div>
-          <div><label>TD1 provincial claim (blank = provincial basic personal amount)</label><input name="td1_provincial" type="number" step="0.01" min="0"></div>
-          <div><label>YTD CPP already paid</label><input name="ytd_cpp" type="number" step="0.01" min="0" value="0"></div>
-          <div><label>YTD CPP2 already paid</label><input name="ytd_cpp2" type="number" step="0.01" min="0" value="0"></div>
-          <div><label>YTD EI already paid</label><input name="ytd_ei" type="number" step="0.01" min="0" value="0"></div>
-          <div><label><input type="checkbox" name="cpp_exempt"> CPP exempt</label></div>
-          <div><label><input type="checkbox" name="ei_exempt"> EI exempt</label></div>
-          <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" id="earnJobCancelBtn">Cancel</button></div>
-        </form>
-      </div>
     </div>
     <div id="earn-rentals" class="asset-section hidden">
       <div class="section-head"><h2>Rentals</h2><div class="spacer"></div><button class="primary" id="addEarnRentalBtn">+ Add rental</button></div>
@@ -686,6 +665,36 @@
       <div class="toolbar">
         <button type="submit" class="primary">Save</button>
         <button type="button" id="earnRentalCancelBtn" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="earnJobModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="earnJobFormTitle">Add job</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="earnJobModalMsg"></div>
+    <form id="earnJobForm">
+      <div class="grid2">
+        <div><label>Employer *</label><input name="employer" required></div>
+        <div><label>Earner</label><select name="owner" id="earnJobOwner"></select></div>
+      </div>
+      <div class="grid2">
+        <div><label>Currency</label><input name="currency" placeholder="CAD" maxlength="3"></div>
+        <div><label>Province of employment *</label><select name="province" id="earnJobProvince"></select></div>
+      </div>
+      <div><label>Pay frequency *</label><select name="frequency" id="earnJobFrequency"></select></div>
+      <div class="grid2">
+        <div><label>Job start date *</label><input name="start_date" type="date"></div>
+        <div><label>Recent payment date *</label><input name="recent_pay_date" type="date"></div>
+      </div>
+      <div><label>Recent payment gross value * (one pay period)</label><input name="recent_pay_value" type="text" inputmode="decimal" data-money></div>
+      <div class="note">Annual gross, tax year and YTD CPP / CPP2 / EI are derived from these — the tax year is the recent payment's year, and YTD counts the pay periods from the start date through the recent payment.</div>
+      <div><label>Pay changes (raises)</label><div class="note">Each row is the new per-period gross from its date. List each rate from the start — the first row's rate covers earlier pays in the year.</div><div id="earnJobPayChangeRows"></div><button type="button" class="small" id="earnJobPayChangeAddBtn">+ Pay change</button></div>
+      <div><label>Bonuses</label><div class="note">Bonuses count into the year's gross, not the per-period rate.</div><div id="earnJobBonusRows"></div><button type="button" class="small" id="earnJobBonusAddBtn">+ Bonus</button></div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>
   </div>
