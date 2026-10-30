@@ -9570,7 +9570,7 @@ function spendGroupByCard(tx, cards) {
     totals.set(t.card_id, (totals.get(t.card_id) || 0) + -Number(t.amount));
   }
   return [...totals.entries()]
-    .map(([id, total]) => ({ label: names.get(id) || 'Card', total: Math.round(total * 100) / 100, color: INVEST_ACCOUNT_COLORS[Math.abs(Number(id) || 0) % INVEST_ACCOUNT_COLORS.length] }))
+    .map(([id, total]) => ({ key: id, label: names.get(id) || 'Card', total: Math.round(total * 100) / 100, color: INVEST_ACCOUNT_COLORS[Math.abs(Number(id) || 0) % INVEST_ACCOUNT_COLORS.length] }))
     .filter((s) => s.total > 0)
     .sort((a, b) => b.total - a.total);
 }
@@ -9583,7 +9583,7 @@ function spendGroupByCategory(tx) {
     totals.set(label, (totals.get(label) || 0) + -Number(t.amount));
   }
   return [...totals.entries()]
-    .map(([label, total], i) => ({ label, total: Math.round(total * 100) / 100, color: INVEST_ACCOUNT_COLORS[i % INVEST_ACCOUNT_COLORS.length] }))
+    .map(([label, total], i) => ({ key: label, label, total: Math.round(total * 100) / 100, color: INVEST_ACCOUNT_COLORS[i % INVEST_ACCOUNT_COLORS.length] }))
     .filter((s) => s.total > 0)
     .sort((a, b) => b.total - a.total);
 }
@@ -9628,12 +9628,46 @@ function drawSpendCharts(level, d, r) {
     if (isDetail) { spendDetailShareChart = chart; window.__fmCharts.spendCardShare = chart; }
     else { spendShareChart = chart; window.__fmCharts.spendShare = chart; }
   }
-  const hist = new Chart(histCanvas, {
-    type: 'bar',
-    data: { labels: months.map((m) => m.month), datasets: [{ label: 'Spending', data: months.map((m) => m.total), backgroundColor: '#1668c4' }] },
-    plugins: [guideLinePlugin],
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } } },
-  });
+  // The overall history chart breaks each month's bar down by the
+  // same portion the doughnut shows (By card / By category): one
+  // stacked segment per share row, reusing the doughnut's colors,
+  // under a total line — the property/Stocks stacked-bars +
+  // total-line shape. The total line sums the stack values, so the
+  // stacks and the line agree to the cent by construction. The
+  // detail chart keeps its single-series shape (one card only).
+  let hist;
+  if (isDetail) {
+    hist = new Chart(histCanvas, {
+      type: 'bar',
+      data: { labels: months.map((m) => m.month), datasets: [{ label: 'Spending', data: months.map((m) => m.total), backgroundColor: '#1668c4' }] },
+      plugins: [guideLinePlugin],
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } } },
+    });
+  } else {
+    const monthIdx = new Map(months.map((m, i) => [m.month, i]));
+    const byKey = new Map(shareRows.map((s) => [s.key, months.map(() => 0)]));
+    for (const t of tx) {
+      if (t.kind === 'adjustment' || !(Number(t.amount) < 0)) continue;
+      const mi = monthIdx.get(String(t.date).slice(0, 7));
+      if (mi === undefined) continue;
+      const key = spendShareMode === 'card' ? t.card_id : ((t.category || '').trim() || 'Uncategorized');
+      const arr = byKey.get(key);
+      if (arr) arr[mi] = Math.round((arr[mi] + -Number(t.amount)) * 100) / 100;
+    }
+    const totals = months.map((_, i) => Math.round(shareRows.reduce((s, row) => s + byKey.get(row.key)[i], 0) * 100) / 100);
+    hist = new Chart(histCanvas, {
+      type: 'line',
+      data: {
+        labels: months.map((m) => m.month),
+        datasets: [
+          ...shareRows.map((s) => ({ type: 'bar', label: s.label, data: byKey.get(s.key), backgroundColor: s.color, stack: 'spend', order: 3, maxBarThickness: 28 })),
+          { label: 'Total', data: totals, borderColor: '#22303c', backgroundColor: '#22303c', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+        ],
+      },
+      plugins: [guideLinePlugin],
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: (v) => money(v) } } }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } } },
+    });
+  }
   if (isDetail) { spendDetailChart = hist; window.__fmCharts.spendCard = hist; }
   else { spendChart = hist; window.__fmCharts.spend = hist; }
 }

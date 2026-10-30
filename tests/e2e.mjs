@@ -12373,6 +12373,125 @@ try {
   r = await req('GET', '/api/spending');
   check('spending: cleanup leaves no cards', r.status === 200 && r.data.cards.length === 0);
 
+  // Stacked history round: the overall monthly bars break down by
+  // the share toggle's portion (By card / By category) under a
+  // total line, with the doughnut's colors; toggling re-stacks
+  // without a reload. Self-contained fixtures + browser block.
+  r = await req('POST', '/api/spending/cards', { name: 'StackA', issuer: 'CIBC', last4: '1001' });
+  check('spending stacked setup: card A created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const stackCardAId = r.data.id;
+  r = await req('POST', '/api/spending/cards', { name: 'StackB', issuer: 'Amex', last4: '1002' });
+  check('spending stacked setup: card B created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const stackCardBId = r.data.id;
+  for (const [cardId, date, merchant, amount, category] of [
+    [stackCardAId, '2026-10-05', 'STACK DINING A', 30, 'Dining'],
+    [stackCardAId, '2026-10-06', 'STACK GROCERY A', 50, 'Groceries'],
+    [stackCardBId, '2026-10-07', 'STACK DINING B', 20, 'Dining'],
+    [stackCardBId, '2026-10-08', 'STACK SHOP B', 40, 'Shopping'],
+  ]) {
+    r = await req('POST', `/api/spending/cards/${cardId}/transactions`, { date, merchant, type: 'charge', amount, category });
+    check(`spending stacked setup: ${merchant} row`, r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  }
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending stacked browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardK = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResK = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueK = loginResK.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserK = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserK.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardK({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueK, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitK = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitK(1200);
+      const readSpendHist = () => {
+        const hist = window.__fmCharts.spend;
+        const share = window.__fmCharts.spendShare;
+        if (!hist || !share) return null;
+        const mi = hist.data.labels.indexOf('2026-10');
+        const bars = hist.data.datasets.filter((d) => d.type === 'bar');
+        const line = hist.data.datasets.find((d) => d.type !== 'bar');
+        const shareColors = {};
+        share.data.labels.forEach((l, i) => { shareColors[l] = share.data.datasets[0].backgroundColor[i]; });
+        return {
+          monthIdx: mi,
+          barLabels: bars.map((d) => d.label),
+          barValues: bars.map((d) => (mi >= 0 ? d.data[mi] : null)),
+          barColors: bars.map((d) => d.backgroundColor),
+          barStacks: bars.map((d) => d.stack),
+          lineLabel: line ? line.label : null,
+          lineValue: line && mi >= 0 ? line.data[mi] : null,
+          shareColors,
+        };
+      };
+      const byCard = await page.evaluate(readSpendHist);
+      check('spending UI: history stacks by card under a total line',
+        !!byCard && byCard.monthIdx >= 0
+        && byCard.barLabels.join(',') === 'StackA,StackB'
+        && byCard.barValues.join(',') === '80,60'
+        && byCard.barValues.reduce((s, v) => s + v, 0) === byCard.lineValue && byCard.lineValue === 140
+        && byCard.barStacks.every((s) => s === 'spend')
+        && byCard.barColors.every((c, i) => c === byCard.shareColors[byCard.barLabels[i]]),
+        JSON.stringify(byCard));
+      await page.click('#spendShareModeBtns button[data-mode="category"]');
+      await waitK(800);
+      const byCat = await page.evaluate(readSpendHist);
+      check('spending UI: toggling to By category re-stacks without reload',
+        !!byCat && byCat.monthIdx >= 0
+        && byCat.barLabels.join(',') === 'Dining,Groceries,Shopping'
+        && byCat.barValues.join(',') === '50,50,40'
+        && byCat.barValues.reduce((s, v) => s + v, 0) === byCat.lineValue && byCat.lineValue === 140
+        && byCat.barStacks.every((s) => s === 'spend')
+        && byCat.barColors.every((c, i) => c === byCat.shareColors[byCat.barLabels[i]]),
+        JSON.stringify(byCat));
+    } finally { await browserK.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${stackCardAId}`);
+  check('spending stacked cleanup: card A deleted', r.status === 200);
+  r = await req('DELETE', `/api/spending/cards/${stackCardBId}`);
+  check('spending stacked cleanup: card B deleted', r.status === 200);
+
   // Card fields round: credit limit, file balance + balance check
   // with adjustment, type-aware kinds, file-upload import, Fill
   // placement, danger Delete. Synthetic QFX only — the shape
