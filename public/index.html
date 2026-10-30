@@ -490,12 +490,13 @@
       </div>
       <div class="panel">
         <h3>✨ Category analysis</h3>
-        <div class="toolbar"><button class="primary" id="spendAiAnalyzeBtn">✨ Analyze categories</button><button id="spendImportBtn">Import QFX</button></div>
+        <div class="toolbar"><button class="primary" id="spendAiAnalyzeBtn">✨ Analyze categories</button></div>
         <div class="msg" id="spendAiMsg"></div>
         <div id="spendAiProposals"></div>
       </div>
       <div class="cards" id="spendCardList"></div>
       <h3>Transactions</h3>
+      <div class="toolbar"><label>Category <select id="spendCatFilter"></select></label></div>
       <div id="spendTxTable"></div>
     </div>
     <div id="spendCardDetail" class="hidden">
@@ -522,6 +523,7 @@
         <div id="spendFillProposals"></div>
       </div>
       <div class="toolbar"><button class="primary" id="spendDetailAddTxBtn">+ Add transaction</button></div>
+      <div class="toolbar"><label>Category <select id="spendDetailCatFilter"></select></label></div>
       <div id="spendDetailTxTable"></div>
     </div>
     <datalist id="spendCategoryList">

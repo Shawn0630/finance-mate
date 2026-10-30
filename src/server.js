@@ -3361,48 +3361,69 @@ app.post('/api/spending/cards/:id/import-qfx/apply', requireApiAuth, (req, res) 
   }
   res.status(201).json({ inserted: v.valid.length, skipped: v.skipped.length, dropped: v.dropped });
 });
-// AI category analysis (overall level): propose a category for each
-// merchant with uncategorized transactions and no remembered mapping.
-// Writes nothing — Apply saves the mappings and categorizes.
+// AI category analysis (SPENDING-GLOBAL): one pass over ALL
+// existing uncategorized transactions across ALL cards. Merchants
+// with no remembered mapping get an AI proposal; merchants WITH a
+// remembered mapping come back as remembered proposals (no LLM
+// call needed) so the run still covers them. Writes nothing —
+// Apply saves the mappings and categorizes. Each proposal carries
+// its transactions so the preview can group by category and let
+// each row's category be edited before Apply.
 app.post('/api/spending/ai-categories', requireApiAuth, async (req, res) => {
-  if (!llmConfigured()) return res.status(503).json({ error: SPEND_AI_UNCONFIGURED });
   const mappings = spendMerchantMappings(req.user.id);
+  const cards = new Map(listSpendCards().map((c) => [c.id, c.name]));
   const uncategorized = listAllSpendTx().filter((t) => !(t.category || '').trim());
   const byMerchant = new Map();
   for (const t of uncategorized) {
     const key = normalizeMerchant(t.merchant);
-    if (!key || mappings[key]) continue;
-    const entry = byMerchant.get(key) || { merchant: t.merchant, txCount: 0 };
+    if (!key) continue;
+    const entry = byMerchant.get(key) || { merchant: t.merchant, txCount: 0, transactions: [] };
     entry.txCount += 1;
+    entry.transactions.push({ id: t.id, date: t.date, merchant: t.merchant, cardId: t.card_id, cardName: cards.get(t.card_id) || 'Card', amount: t.amount });
     byMerchant.set(key, entry);
   }
-  const merchants = [...byMerchant.values()];
-  if (!merchants.length) return res.json({ proposals: [] });
-  const prompt = `Assign each merchant one category from this list: ${SPEND_CATEGORIES.join(', ')}.
-Reply with ONLY this JSON, no other text: {"proposals": [{"merchant": "<merchant as given>", "category": "<one of the list>"}]}.
-Merchants: ${JSON.stringify(merchants.map((m) => m.merchant))}`;
-  let raw;
-  try {
-    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
-  } catch {
-    return res.status(502).json({ error: 'The AI service could not complete the analysis.' });
-  }
-  const parsed = parseModelJson(raw);
   const proposals = [];
-  if (parsed && Array.isArray(parsed.proposals)) {
-    for (const p of parsed.proposals) {
-      if (!p || typeof p.merchant !== 'string') continue;
-      const key = normalizeMerchant(p.merchant);
-      const entry = byMerchant.get(key);
-      if (!entry || !SPEND_CATEGORIES.includes(p.category)) continue;
-      proposals.push({ merchant: entry.merchant, category: p.category, txCount: entry.txCount });
+  const unmapped = [];
+  for (const [key, entry] of byMerchant) {
+    if (mappings[key]) proposals.push({ merchant: entry.merchant, category: mappings[key], txCount: entry.txCount, source: 'remembered', transactions: entry.transactions });
+    else unmapped.push(entry);
+  }
+  if (unmapped.length) {
+    if (!llmConfigured()) return res.status(503).json({ error: SPEND_AI_UNCONFIGURED });
+    const prompt = `Assign each merchant one category from this list: ${SPEND_CATEGORIES.join(', ')}.
+Reply with ONLY this JSON, no other text: {"proposals": [{"merchant": "<merchant as given>", "category": "<one of the list>"}]}.
+Merchants: ${JSON.stringify(unmapped.map((m) => m.merchant))}`;
+    let raw;
+    try {
+      raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+    } catch {
+      return res.status(502).json({ error: 'The AI service could not complete the analysis.' });
+    }
+    const parsed = parseModelJson(raw);
+    if (parsed && Array.isArray(parsed.proposals)) {
+      for (const p of parsed.proposals) {
+        if (!p || typeof p.merchant !== 'string') continue;
+        const key = normalizeMerchant(p.merchant);
+        const entry = byMerchant.get(key);
+        if (!entry || mappings[key] || !SPEND_CATEGORIES.includes(p.category)) continue;
+        proposals.push({ merchant: entry.merchant, category: p.category, txCount: entry.txCount, source: 'ai', transactions: entry.transactions });
+      }
     }
   }
   res.json({ proposals });
 });
 app.post('/api/spending/ai-categories/apply', requireApiAuth, (req, res) => {
   const proposals = Array.isArray((req.body || {}).proposals) ? req.body.proposals : [];
+  const overrides = Array.isArray((req.body || {}).overrides) ? req.body.overrides : [];
   const mappings = spendMerchantMappings(req.user.id);
+  // A per-transaction override changes ONLY that row: it never
+  // writes or rewrites a merchant mapping, and it wins over the
+  // merchant bulk update below.
+  const overrideById = new Map();
+  for (const o of overrides) {
+    if (!o || !Number.isFinite(Number(o.txId)) || !SPEND_CATEGORIES.includes(o.category)) continue;
+    overrideById.set(Number(o.txId), o.category);
+  }
   let updated = 0;
   db.transaction(() => {
     for (const p of proposals) {
@@ -3417,10 +3438,13 @@ app.post('/api/spending/ai-categories/apply', requireApiAuth, (req, res) => {
       const key = normalizeMerchant(p.merchant);
       const rows = db.prepare("SELECT id, merchant FROM spend_transactions WHERE category IS NULL OR category = ''").all();
       for (const r of rows) {
-        if (normalizeMerchant(r.merchant) === key) {
+        if (normalizeMerchant(r.merchant) === key && !overrideById.has(r.id)) {
           updated += db.prepare('UPDATE spend_transactions SET category = ? WHERE id = ?').run(p.category, r.id).changes;
         }
       }
+    }
+    for (const [txId, category] of overrideById) {
+      updated += db.prepare('UPDATE spend_transactions SET category = ? WHERE id = ?').run(category, txId).changes;
     }
   })();
   res.json({ mapped: proposals.length, updated });

@@ -9913,6 +9913,52 @@ try {
         await page.click('#invRangeBtns-overview button[data-months="0"]');
         await waitI(400);
       }
+      // Invest picker anchoring (2026-10-29 screenshots): the
+      // invest popovers are position:fixed, so they must anchor
+      // from the field's viewport rect — the old offsetTop /
+      // offsetLeft math stranded them at the viewport top while
+      // the field sat mid-page.
+      await page.evaluate(() => document.querySelector('#invRangeStart-overview').scrollIntoView({ block: 'center' }));
+      await waitI(200);
+      await page.click('#invRangeStart-overview');
+      await waitI(200);
+      const invPopRect = () => page.evaluate(() => {
+        const f = document.querySelector('#invRangeStart-overview').getBoundingClientRect();
+        const p = document.querySelector('#invMonthPop-overview');
+        const pr = p.getBoundingClientRect();
+        return { hidden: p.classList.contains('hidden'), fTop: f.top, fBottom: f.bottom, fLeft: f.left, pTop: pr.top, pLeft: pr.left, pWidth: p.offsetWidth, vw: window.innerWidth };
+      });
+      const invBefore = await invPopRect();
+      await page.evaluate(() => window.scrollBy(0, 200));
+      await waitI(300);
+      const invAfter = await invPopRect();
+      const invWantLeft = Math.max(4, Math.min(invAfter.fLeft, invAfter.vw - invAfter.pWidth - 4));
+      const invWantLeftBefore = Math.max(4, Math.min(invBefore.fLeft, invBefore.vw - invBefore.pWidth - 4));
+      check('invest picker: the popover opens glued to its field (not at viewport top) and follows it on scroll',
+        !invBefore.hidden && Math.abs(invBefore.pTop - (invBefore.fBottom + 6)) <= 2 && Math.abs(invBefore.pLeft - invWantLeftBefore) <= 2
+        && !invAfter.hidden && invBefore.fTop - invAfter.fTop > 0
+        && Math.abs(invAfter.pTop - (invAfter.fBottom + 6)) <= 2 && Math.abs(invAfter.pLeft - invWantLeft) <= 2,
+        JSON.stringify({ before: invBefore, after: invAfter, wantLeft: invWantLeft }));
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await waitI(200);
+      await page.keyboard.press('Escape');
+      // Close-on-out-of-view needs scroll room the tall-enough
+      // Overview page lacks at full height, so shrink the
+      // viewport, drive the field out the top, then restore.
+      const vpBefore = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+      await page.setViewport({ width: vpBefore.w, height: 400 });
+      await page.evaluate(() => document.querySelector('#invRangeStart-overview').scrollIntoView({ block: 'center' }));
+      await waitI(200);
+      await page.click('#invRangeStart-overview');
+      await waitI(200);
+      const invOpenAgain = await page.evaluate(() => !document.querySelector('#invMonthPop-overview').classList.contains('hidden'));
+      await page.evaluate(() => window.scrollBy(0, 1000));
+      await waitI(300);
+      const invOut = await page.evaluate(() => document.querySelector('#invMonthPop-overview').classList.contains('hidden'));
+      check('invest picker: scrolling the field out of view closes the picker',
+        invOpenAgain && invOut, JSON.stringify({ openAgain: invOpenAgain, closed: invOut }));
+      await page.setViewport({ width: vpBefore.w, height: vpBefore.h });
+      await waitI(200);
       // Overview redesign (2026-10-29): the top summary strip is
       // gone; breakdown cards incl. Stocks; the Properties card
       // shows assessed + total equity; one standard 14px gap to
@@ -11120,6 +11166,44 @@ try {
       check('earnings charts: salary trend shows gross + net series',
         salInfo && salInfo.labels.includes('2026') && salInfo.keys.includes('gross') && salInfo.keys.includes('net'),
         JSON.stringify(salInfo));
+      // Earnings range bars use the shared month picker now, not
+      // native year selects (whose popup rendered detached from
+      // the panel). The picked month's YEAR drives the year filter.
+      const earnRangeUi = await page.evaluate(() => {
+        const bar = document.querySelector('[data-earn-range="salary"]');
+        return {
+          hasSelect: !!bar.querySelector('select'),
+          hasFromBtn: !!bar.querySelector('[data-earn-month="from"]'),
+          hasToBtn: !!bar.querySelector('[data-earn-month="to"]'),
+        };
+      });
+      check('earnings UI: salary range bar uses month-field buttons, no native year selects',
+        !earnRangeUi.hasSelect && earnRangeUi.hasFromBtn && earnRangeUi.hasToBtn, JSON.stringify(earnRangeUi));
+      await page.click('[data-earn-range="salary"] [data-earn-month="from"]');
+      await waitE(300);
+      const earnPopRect = await page.evaluate(() => {
+        const f = document.querySelector('[data-earn-range="salary"] [data-earn-month="from"]').getBoundingClientRect();
+        const p = document.querySelector('#monthPop');
+        const pr = p.getBoundingClientRect();
+        return { hidden: p.classList.contains('hidden'), fBottom: f.bottom, fLeft: f.left, pTop: pr.top, pLeft: pr.left, pWidth: p.offsetWidth, vw: window.innerWidth };
+      });
+      check('earnings UI: the month picker opens glued to its salary From button',
+        !earnPopRect.hidden && Math.abs(earnPopRect.pTop - (earnPopRect.fBottom + 6)) <= 2
+        && Math.abs(earnPopRect.pLeft - Math.max(4, Math.min(earnPopRect.fLeft, earnPopRect.vw - earnPopRect.pWidth - 4))) <= 2,
+        JSON.stringify(earnPopRect));
+      await page.click('#monthPop button[data-ym="2026-06"]');
+      await waitE(600);
+      const earnPick = await page.evaluate(() => {
+        const c = window.__fmCharts.earnSalary;
+        const btn = document.querySelector('[data-earn-range="salary"] [data-earn-month="from"]');
+        return { labels: c ? c.data.labels : null, btnText: btn ? btn.textContent : null, btnVal: btn ? btn.dataset.value : null };
+      });
+      check('earnings UI: picking Jun 2026 filters the salary chart to 2026 and labels the button',
+        earnPick.labels && earnPick.labels.length === 1 && earnPick.labels[0] === '2026'
+        && earnPick.btnText === 'Jun 2026' && earnPick.btnVal === '2026-06',
+        JSON.stringify(earnPick));
+      await page.click('[data-earn-range="salary"] [data-years="0"]');
+      await waitE(500);
       await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
       const rentInfo = await page.evaluate(() => {
@@ -11687,6 +11771,244 @@ try {
   check('spending: overall page carries cards, transactions and monthly series',
     r.status === 200 && r.data.cards.length === 1 && r.data.transactions.length === 5 && r.data.monthly.length === 1,
     JSON.stringify({ cards: r.data.cards.length, tx: r.data.transactions.length, months: r.data.monthly.length }));
+
+  // Corrections round: import lives on card detail pages only;
+  // the overall page carries no import entry. Category filter
+  // narrows the table to one category's transactions.
+  // (Its own browser: the section-level `page` is out of scope
+  // this late in the script, like the other late browser blocks.)
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardS = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResS = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueS = loginResS.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserS = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserS.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardS({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueS, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitS = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitS(1200);
+      const spendOverallUi = await page.evaluate(() => {
+        const list = document.querySelector('#spendList');
+        const importBtns = [...list.querySelectorAll('button')].filter((b) => b.textContent.includes('Import QFX'));
+        const visibleImport = importBtns.filter((b) => b.getBoundingClientRect().height > 0);
+        return { hasSpendImportBtn: !!document.querySelector('#spendImportBtn'), visibleImport: visibleImport.length, hasCatFilter: !!document.querySelector('#spendCatFilter') };
+      });
+      check('spending UI: the overall page has no Import QFX entry',
+        !spendOverallUi.hasSpendImportBtn && spendOverallUi.visibleImport === 0, JSON.stringify(spendOverallUi));
+      check('spending UI: the overall transactions table has a category filter',
+        spendOverallUi.hasCatFilter, JSON.stringify(spendOverallUi));
+      await page.select('#spendCatFilter', 'Groceries');
+      await waitS(300);
+      const spendFiltered = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr')].map((tr) => tr.children[3].textContent.trim()));
+      check('spending UI: filtering by Groceries shows only Groceries rows',
+        spendFiltered.length === 2 && spendFiltered.every((c) => c === 'Groceries'), JSON.stringify(spendFiltered));
+      await page.select('#spendCatFilter', '__uncat__');
+      await waitS(300);
+      const spendUncat = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr')].map((tr) => tr.children[2].textContent.trim()));
+      check('spending UI: filtering by Uncategorized shows only the uncategorized payment row',
+        spendUncat.length === 1 && spendUncat[0] === 'PAYMENT - THANK YOU', JSON.stringify(spendUncat));
+      await page.select('#spendCatFilter', '');
+      await waitS(300);
+      await page.goto(`http://ff.local/#spending/card/${spendCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitS(1200);
+      const spendDetailUi = await page.evaluate(() => {
+        const b = document.querySelector('#spendDetailImportBtn');
+        return { present: !!b, visible: !!b && b.getBoundingClientRect().height > 0 };
+      });
+      check('spending UI: the card detail page keeps its Import QFX button',
+        spendDetailUi.present && spendDetailUi.visible, JSON.stringify(spendDetailUi));
+    } finally { await browserS.close(); }
+  }
+
+  // Global analyze: one run covers transactions on TWO cards;
+  // a preview override changes only its row, never the mapping.
+  r = await req('POST', '/api/spending/cards', { name: 'Amex', issuer: 'Amex', last4: '5678' });
+  check('spending corrections setup: second card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const spendCard2Id = r.data.id;
+  r = await req('POST', `/api/spending/cards/${spendCardId}/transactions`, { date: '2026-10-11', merchant: 'WAYNE', type: 'charge', amount: 10, category: '' });
+  check('spending corrections setup: WAYNE row on card 1', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const wayneTxId = r.data.id;
+  r = await req('POST', `/api/spending/cards/${spendCard2Id}/transactions`, { date: '2026-10-11', merchant: 'ACME', type: 'charge', amount: 20, category: '' });
+  check('spending corrections setup: ACME row on card 2', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ proposals: [{ merchant: 'WAYNE', category: 'Shopping' }, { merchant: 'ACME', category: 'Groceries' }] }));
+  r = await req('POST', '/api/spending/ai-categories', {});
+  check('spending: one global analyze run covers merchants on two different cards',
+    r.status === 200 && r.data.proposals.length === 2
+    && r.data.proposals.some((p) => p.merchant === 'WAYNE' && p.transactions.some((t) => t.cardName === 'Visa'))
+    && r.data.proposals.some((p) => p.merchant === 'ACME' && p.transactions.some((t) => t.cardName === 'Amex')),
+    JSON.stringify(r.data.proposals.map((p) => ({ merchant: p.merchant, category: p.category, source: p.source }))));
+  r = await req('POST', '/api/spending/ai-categories/apply', {
+    proposals: [{ merchant: 'WAYNE', category: 'Shopping' }, { merchant: 'ACME', category: 'Groceries' }],
+    overrides: [{ txId: wayneTxId, category: 'Dining' }],
+  });
+  check('spending: apply with a preview override categorizes both rows',
+    r.status === 200 && r.data.updated === 2, JSON.stringify(r.data));
+  r = await req('GET', `/api/spending/cards/${spendCardId}`);
+  const wayneRow = (r.data.transactions || []).find((t) => t.id === wayneTxId);
+  check('spending: the overridden row takes the override, not the merchant proposal',
+    !!wayneRow && wayneRow.category === 'Dining', JSON.stringify(wayneRow));
+  r = await req('GET', `/api/spending/cards/${spendCard2Id}`);
+  const acmeRow = (r.data.transactions || []).find((t) => t.merchant === 'ACME');
+  check('spending: the other card row takes the merchant proposal',
+    !!acmeRow && acmeRow.category === 'Groceries', JSON.stringify(acmeRow));
+  // The override must not rewrite the mapping: a new WAYNE row
+  // still proposes Shopping (the confirmed mapping), not Dining.
+  r = await req('POST', `/api/spending/cards/${spendCardId}/transactions`, { date: '2026-10-12', merchant: 'WAYNE', type: 'charge', amount: 11, category: '' });
+  check('spending corrections setup: second WAYNE row', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ proposals: [] }));
+  r = await req('POST', '/api/spending/ai-categories', {});
+  check('spending: a manual override does not rewrite the merchant mapping',
+    r.status === 200 && r.data.proposals.some((p) => p.merchant === 'WAYNE' && p.category === 'Shopping' && p.source === 'remembered'),
+    JSON.stringify(r.data.proposals.map((p) => ({ merchant: p.merchant, category: p.category, source: p.source }))));
+  r = await req('POST', '/api/spending/ai-categories/apply', { proposals: [{ merchant: 'WAYNE', category: 'Shopping' }] });
+  check('spending: second WAYNE row takes the mapping', r.status === 200 && r.data.updated === 1, JSON.stringify(r.data));
+  // Remembered mappings join the same global run: a new ACME row
+  // comes back as a remembered proposal with no LLM proposal.
+  r = await req('POST', `/api/spending/cards/${spendCard2Id}/transactions`, { date: '2026-10-12', merchant: 'ACME', type: 'charge', amount: 21, category: '' });
+  check('spending corrections setup: second ACME row', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ proposals: [] }));
+  r = await req('POST', '/api/spending/ai-categories', {});
+  check('spending: a mapped merchant returns as a remembered proposal in the global run',
+    r.status === 200 && r.data.proposals.some((p) => p.merchant === 'ACME' && p.category === 'Groceries' && p.source === 'remembered'),
+    JSON.stringify(r.data.proposals.map((p) => ({ merchant: p.merchant, category: p.category, source: p.source }))));
+  r = await req('POST', '/api/spending/ai-categories/apply', { proposals: r.data.proposals.filter((p) => p.merchant === 'ACME') });
+  check('spending: remembered proposal categorizes the row', r.status === 200 && r.data.updated === 1, JSON.stringify(r.data));
+  // Preview UI: groups by category, expandable to transactions,
+  // each row's category editable before Apply.
+  r = await req('POST', `/api/spending/cards/${spendCard2Id}/transactions`, { date: '2026-10-13', merchant: 'PREVIEWA', type: 'charge', amount: 5, category: '' });
+  check('spending corrections setup: PREVIEWA row', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const previewATxId = r.data.id;
+  r = await req('POST', `/api/spending/cards/${spendCard2Id}/transactions`, { date: '2026-10-13', merchant: 'PREVIEWB', type: 'charge', amount: 7, category: '' });
+  check('spending corrections setup: PREVIEWB row', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ proposals: [{ merchant: 'PREVIEWA', category: 'Dining' }, { merchant: 'PREVIEWB', category: 'Shopping' }] }));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending preview browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardS = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResS = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueS = loginResS.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserS = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserS.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardS({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueS, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitS = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitS(1200);
+      await page.click('#spendAiAnalyzeBtn');
+      await page.waitForFunction(() => !!document.querySelector('[data-ai-group]'), { timeout: 10000 });
+      const previewUi = await page.evaluate(() => {
+        const groups = [...document.querySelectorAll('[data-ai-group]')].map((g) => g.textContent);
+        return { groups, hasDining: groups.some((t) => t.includes('Dining')), hasShopping: groups.some((t) => t.includes('Shopping')) };
+      });
+      check('spending UI: analyze preview groups proposals by category',
+        previewUi.hasDining && previewUi.hasShopping, JSON.stringify(previewUi.groups));
+      await page.evaluate(() => { document.querySelector('[data-ai-group-toggle]').click(); });
+      await waitS(300);
+      const previewRows = await page.evaluate(() => {
+        const rows = document.querySelector('[data-ai-group-rows]');
+        return { visible: !!rows && !rows.classList.contains('hidden'), rowSels: rows ? rows.querySelectorAll('select[data-ai-row-cat]').length : 0 };
+      });
+      check('spending UI: expanding a category group shows its transactions with editable categories',
+        previewRows.visible && previewRows.rowSels > 0, JSON.stringify(previewRows));
+      await page.evaluate((txId) => {
+        const sel = document.querySelector(`select[data-ai-row-cat="${txId}"]`);
+        if (sel) { sel.value = 'Groceries'; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+      }, previewATxId);
+      await page.click('#spendAiApplyBtn');
+      await waitS(800);
+    } finally { await browserS.close(); }
+  }
+  r = await req('GET', `/api/spending/cards/${spendCard2Id}`);
+  const previewARow = (r.data.transactions || []).find((t) => t.id === previewATxId);
+  const previewBRow = (r.data.transactions || []).find((t) => t.merchant === 'PREVIEWB');
+  check('spending UI: a preview row edit changes only that row on Apply',
+    !!previewARow && previewARow.category === 'Groceries' && !!previewBRow && previewBRow.category === 'Shopping',
+    JSON.stringify({ a: previewARow && previewARow.category, b: previewBRow && previewBRow.category }));
+  r = await req('DELETE', `/api/spending/cards/${spendCard2Id}`);
+  check('spending corrections cleanup: second card deleted', r.status === 200);
   r = await req('DELETE', `/api/spending/transactions/${spendTxId}`);
   check('spending: transaction deletes', r.status === 200);
   r = await req('DELETE', `/api/spending/cards/${spendCardId}`);

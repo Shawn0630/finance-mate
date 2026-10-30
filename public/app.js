@@ -5441,12 +5441,26 @@ function openInvMonthPop(level, which) {
   if (!invPop) return; // no span — render closed it
   const pop = document.getElementById(`invMonthPop-${level}`);
   pop.classList.remove('hidden');
-  const bar = document.getElementById(`invRangeBtns-${level}`);
-  const left = Math.max(0, Math.min(field.offsetLeft, bar.clientWidth - pop.offsetWidth - 4));
-  pop.style.left = `${left}px`;
-  pop.style.top = `${field.offsetTop + field.offsetHeight + 6}px`;
+  anchorInvMonthPop();
   document.getElementById(`invRangeStart-${level}`).setAttribute('aria-expanded', String(which === 'start'));
   document.getElementById(`invRangeEnd-${level}`).setAttribute('aria-expanded', String(which === 'end'));
+}
+
+// The invest popovers share the .month-pop CSS (position:fixed),
+// so their left/top are VIEWPORT coordinates: anchor from the
+// field's viewport rect, never from offsetTop/offsetLeft — those
+// are toolbar-relative, and feeding them to a fixed element used
+// to strand the picker at the viewport top while its field sat
+// mid-page (the Overview/Stocks screenshots of 2026-10-29).
+function anchorInvMonthPop() {
+  if (!invPop) return;
+  const pop = document.getElementById(`invMonthPop-${invPop.level}`);
+  const field = document.getElementById(`invRange${invPop.which === 'start' ? 'Start' : 'End'}-${invPop.level}`);
+  if (!pop || !field) return;
+  const r = field.getBoundingClientRect();
+  const left = Math.max(4, Math.min(r.left, window.innerWidth - pop.offsetWidth - 4));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${r.bottom + 6}px`;
 }
 
 function closeInvMonthPop() {
@@ -8106,6 +8120,13 @@ $('#rangeBtns').addEventListener('click', (e) => {
 // hidden YYYY-MM input) — no pair logic, no refetch — and every
 // month in the server's valid 2000–2100 range is enabled.
 function monthPopField() {
+  // Earnings panels resolve through their range bar (re-rendered
+  // by loadEarnings, so the element is looked up live each time).
+  if (monthPopFor && monthPopFor.startsWith('earn:')) {
+    const [, key, which] = monthPopFor.split(':');
+    const wrap = document.querySelector(`[data-earn-range="${key}"]`);
+    return wrap ? wrap.querySelector(`[data-earn-month="${which}"]`) : null;
+  }
   return { start: $('#rangeStart'), end: $('#rangeEnd'), entryStart: $('#earnEntryStartBtn'), entryEnd: $('#earnEntryEndBtn') }[monthPopFor] || null;
 }
 function monthPopIsEntry() {
@@ -8113,6 +8134,14 @@ function monthPopIsEntry() {
 }
 function monthPopSpan() {
   if (monthPopIsEntry()) return { start: '2000-01', end: '2100-12' };
+  // Earnings data is yearly (tax years): the picker browses the
+  // data years as months; the picked month's YEAR drives the
+  // filter, the button keeps the month label.
+  if (monthPopFor && monthPopFor.startsWith('earn:')) {
+    const years = (earnChartData && earnChartData.years) || [];
+    if (!years.length) return null;
+    return { start: `${years[0]}-01`, end: `${years[years.length - 1]}-12` };
+  }
   return dataSpanMonths();
 }
 // Rent entry modal fields: a pick fills that field only — the
@@ -8177,6 +8206,10 @@ function openMonthPop(which) {
   for (const [key, el] of [['start', $('#rangeStart')], ['end', $('#rangeEnd')], ['entryStart', $('#earnEntryStartBtn')], ['entryEnd', $('#earnEntryEndBtn')]]) {
     if (el) el.setAttribute('aria-expanded', String(which === key));
   }
+  document.querySelectorAll('[data-earn-month]').forEach((b) => {
+    const wrap = b.closest('[data-earn-range]');
+    b.setAttribute('aria-expanded', String(!!wrap && monthPopFor === `earn:${wrap.dataset.earnRange}:${b.dataset.earnMonth}`));
+  });
 }
 
 function closeMonthPop() {
@@ -8186,6 +8219,7 @@ function closeMonthPop() {
   for (const el of [$('#rangeStart'), $('#rangeEnd'), $('#earnEntryStartBtn'), $('#earnEntryEndBtn')]) {
     if (el) el.setAttribute('aria-expanded', 'false');
   }
+  document.querySelectorAll('[data-earn-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
 }
 
 function onMonthFieldClick(which) {
@@ -8203,6 +8237,22 @@ $('#monthPop').addEventListener('click', (e) => {
   const cell = e.target.closest('button[data-ym]');
   if (!cell || cell.disabled || !monthPopFor) return;
   if (monthPopIsEntry()) { setEntryMonth(monthPopFor, cell.dataset.ym); closeMonthPop(); return; }
+  // Earnings: the picked month's YEAR drives the year filter; the
+  // button keeps the month label like every other picker.
+  if (monthPopFor.startsWith('earn:')) {
+    const [, key, which] = monthPopFor.split(':');
+    const st = earnChartRanges[key];
+    const btn = monthPopField();
+    const ym = cell.dataset.ym;
+    closeMonthPop();
+    if (!st || !ym) return;
+    const yr = Number(ym.slice(0, 4));
+    if (which === 'from') { st.from = yr; st.fromYm = ym; } else { st.to = yr; st.toYm = ym; }
+    if (btn) { btn.dataset.value = ym; btn.textContent = formatYM(ym); }
+    document.querySelectorAll(`[data-earn-range="${key}"] [data-years]`).forEach((b) => b.classList.remove('active'));
+    drawEarnVisibleChart();
+    return;
+  }
   const start = monthPopFor === 'start' ? cell.dataset.ym : $('#rangeStart').dataset.value;
   const end = monthPopFor === 'end' ? cell.dataset.ym : $('#rangeEnd').dataset.value;
   closeMonthPop();
@@ -8221,16 +8271,30 @@ $('#monthPop').addEventListener('click', (e) => {
 // viewport closes it. Capture phase catches scrolls from any
 // container, including the modal overlay's own scroll.
 window.addEventListener('scroll', () => {
-  if (!monthPopFor) return;
-  const field = monthPopField();
-  if (!field) { closeMonthPop(); return; }
-  const r = field.getBoundingClientRect();
-  if (r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) { closeMonthPop(); return; }
-  anchorMonthPop();
+  if (monthPopFor) {
+    const field = monthPopField();
+    if (!field) { closeMonthPop(); }
+    else {
+      const r = field.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) { closeMonthPop(); }
+      else anchorMonthPop();
+    }
+  }
+  // The invest popovers follow the same rule: glued to their field
+  // while it is visible, closed once it scrolls out of view.
+  if (invPop) {
+    const field = document.getElementById(`invRange${invPop.which === 'start' ? 'Start' : 'End'}-${invPop.level}`);
+    if (!field) { closeInvMonthPop(); }
+    else {
+      const r = field.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) { closeInvMonthPop(); }
+      else anchorInvMonthPop();
+    }
+  }
 }, { capture: true, passive: true });
 document.addEventListener('click', (e) => {
   if (!monthPopFor) return;
-  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn')) return;
+  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]')) return;
   closeMonthPop();
 });
 document.addEventListener('keydown', (e) => {
@@ -8487,20 +8551,23 @@ let earnSalaryChart = null;
 let earnRentalsChart = null;
 let earnRentalsView = 'net';
 const earnChartRanges = {
-  overview: { years: 0, from: null, to: null },
-  salary: { years: 0, from: null, to: null },
-  rentals: { years: 0, from: null, to: null },
+  overview: { years: 0, from: null, to: null, fromYm: null, toYm: null },
+  salary: { years: 0, from: null, to: null, fromYm: null, toYm: null },
+  rentals: { years: 0, from: null, to: null, fromYm: null, toYm: null },
 };
 
 function earnRangeControlsHtml(key) {
-  const years = (earnChartData && earnChartData.years) || [];
-  const opts = '<option value="">—</option>' + years.map((y) => `<option value="${y}">${y}</option>`).join('');
   const st = earnChartRanges[key];
   const presets = [[1, '1 year'], [2, '2 years'], [5, '5 years'], [10, '10 years'], [0, 'All']];
+  // The same month-field buttons + shared #monthPop the
+  // property-detail panel uses (never native year selects: their
+  // popup renders detached from the panel). The button keeps the
+  // picked month's label; the picked month's YEAR drives the
+  // existing year filter below.
   return `<div class="toolbar range-btns" data-earn-range="${key}">`
     + presets.map(([n, label]) => `<button type="button" data-years="${n}" class="${st.years === n && st.from == null && st.to == null ? 'active' : ''}">${label}</button>`).join('')
-    + `<span class="range-pick">From <select data-earn-from>${opts}</select></span>`
-    + `<span class="range-pick">To <select data-earn-to>${opts}</select></span></div>`;
+    + `<span class="range-pick">From <button type="button" data-earn-month="from" class="month-field" data-value="${st.fromYm || ''}" aria-haspopup="dialog" aria-expanded="false" aria-label="Range start month">${formatYM(st.fromYm)}</button></span>`
+    + `<span class="range-pick">To <button type="button" data-earn-month="to" class="month-field" data-value="${st.toYm || ''}" aria-haspopup="dialog" aria-expanded="false" aria-label="Range end month">${formatYM(st.toYm)}</button></span></div>`;
 }
 
 function earnWireRange(key) {
@@ -8509,22 +8576,21 @@ function earnWireRange(key) {
   const st = earnChartRanges[key];
   wrap.querySelectorAll('[data-years]').forEach((b) => {
     b.onclick = () => {
-      st.years = Number(b.dataset.years); st.from = null; st.to = null;
-      wrap.querySelectorAll('[data-earn-from],[data-earn-to]').forEach((s) => { s.value = ''; });
+      st.years = Number(b.dataset.years); st.from = null; st.to = null; st.fromYm = null; st.toYm = null;
+      wrap.querySelectorAll('[data-earn-month]').forEach((f) => { f.dataset.value = ''; f.textContent = '—'; f.setAttribute('aria-expanded', 'false'); });
       drawEarnVisibleChart();
     };
   });
-  const from = wrap.querySelector('[data-earn-from]');
-  const to = wrap.querySelector('[data-earn-to]');
-  if (from) from.value = st.from == null ? '' : String(st.from);
-  if (to) to.value = st.to == null ? '' : String(st.to);
-  const custom = () => {
-    st.from = from && from.value ? Number(from.value) : null;
-    st.to = to && to.value ? Number(to.value) : null;
-    drawEarnVisibleChart();
-  };
-  if (from) from.onchange = custom;
-  if (to) to.onchange = custom;
+  const from = wrap.querySelector('[data-earn-month="from"]');
+  const to = wrap.querySelector('[data-earn-month="to"]');
+  if (from) from.onclick = () => earnMonthFieldClick(key, 'from');
+  if (to) to.onclick = () => earnMonthFieldClick(key, 'to');
+}
+
+function earnMonthFieldClick(key, which) {
+  const k = `earn:${key}:${which}`;
+  if (monthPopFor === k) { closeMonthPop(); return; }
+  openMonthPop(k);
 }
 
 function earnEffectiveYears(key) {
@@ -9204,6 +9270,51 @@ let spendCardData = null;
 let spendShareMode = 'card';
 let spendImportParsed = null;
 let spendTxModalCtx = null; // { cardId, txId } — txId null = add
+let spendCatFilter = '';
+let spendDetailCatFilter = '';
+
+// Per-category view: the filter narrows the table to one
+// category's transactions (or the uncategorized ones). A row's
+// category is changed persistently through its Edit button — the
+// modal's category input carries the category datalist — and a
+// manual move changes ONLY that row, never the remembered
+// merchant→category mapping.
+function spendCatOptions(transactions, current) {
+  const cats = [...new Set(transactions.map((t) => (t.category || '').trim()).filter(Boolean))].sort();
+  const opts = [['', 'All categories'], ['__uncat__', 'Uncategorized'], ...cats.map((c) => [c, c])];
+  return opts.map(([v, l]) => `<option value="${esc(v)}"${v === current ? ' selected' : ''}>${esc(l)}</option>`).join('');
+}
+function spendFilterTx(transactions, filter) {
+  if (!filter) return transactions;
+  if (filter === '__uncat__') return transactions.filter((t) => !(t.category || '').trim());
+  return transactions.filter((t) => (t.category || '').trim() === filter);
+}
+function renderSpendTxTable() {
+  if (!spendData) return;
+  const sel = $('#spendCatFilter');
+  if (sel) {
+    sel.innerHTML = spendCatOptions(spendData.transactions, spendCatFilter);
+    if (![...sel.options].some((o) => o.value === spendCatFilter)) spendCatFilter = '';
+    sel.value = spendCatFilter;
+  }
+  const filtered = spendFilterTx(spendData.transactions, spendCatFilter);
+  $('#spendTxTable').innerHTML = filtered.length ? spendTxTableHtml(filtered, true)
+    : (spendData.transactions.length ? '<div class="note">No transactions in this category.</div>' : '<div class="note">No transactions yet.</div>');
+}
+function renderSpendDetailTxTable() {
+  if (!spendCardData) return;
+  const sel = $('#spendDetailCatFilter');
+  if (sel) {
+    sel.innerHTML = spendCatOptions(spendCardData.transactions, spendDetailCatFilter);
+    if (![...sel.options].some((o) => o.value === spendDetailCatFilter)) spendDetailCatFilter = '';
+    sel.value = spendDetailCatFilter;
+  }
+  const filtered = spendFilterTx(spendCardData.transactions, spendDetailCatFilter);
+  $('#spendDetailTxTable').innerHTML = filtered.length ? spendTxTableHtml(filtered, false)
+    : (spendCardData.transactions.length ? '<div class="note">No transactions in this category.</div>' : '<div class="note">No transactions yet.</div>');
+}
+$('#spendCatFilter').addEventListener('change', (e) => { spendCatFilter = e.target.value; renderSpendTxTable(); });
+$('#spendDetailCatFilter').addEventListener('change', (e) => { spendDetailCatFilter = e.target.value; renderSpendDetailTxTable(); });
 
 const spendShareCenterPlugin = {
   id: 'spendShareCenter',
@@ -9330,7 +9441,7 @@ async function loadSpending() {
       <div class="v">${money(c.totalSpent)}</div>
       <div class="n">${c.txCount} transactions${c.lastTxDate ? ' · last ' + esc(c.lastTxDate) : ''}</div>
     </div>`).join('') : '<div class="note">No cards yet — add one above.</div>';
-  $('#spendTxTable').innerHTML = spendTxTableHtml(data.transactions, true);
+  renderSpendTxTable();
   $('#spendRange').innerHTML = investRangeControlsHtml('spending');
   wireInvestRangeControls('spending');
   applyInvestRange('spending');
@@ -9341,7 +9452,7 @@ async function loadSpendCard(id) {
   spendCardData = data;
   investViewData.spendCard = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: [data.card] };
   $('#spendDetailTitle').textContent = `${data.card.name} · ••••${data.card.last4}`;
-  $('#spendDetailTxTable').innerHTML = spendTxTableHtml(data.transactions, false);
+  renderSpendDetailTxTable();
   $('#spendDetailRange').innerHTML = investRangeControlsHtml('spendCard');
   wireInvestRangeControls('spendCard');
   applyInvestRange('spendCard');
@@ -9449,13 +9560,14 @@ $('#spendShareModeBtns').addEventListener('click', (e) => {
   applyInvestRange('spending');
 });
 
-// QFX import, shared by the overall page (card picker) and a card
-// page (preselected card): parse previews, Apply writes atomically.
+// QFX import lives on each card's detail page only (targeting
+// that card): parse previews, Apply writes atomically.
 function openSpendImport(preselectCardId) {
-  const cards = spendData ? spendData.cards : (spendCardData ? [spendCardData.card] : []);
+  const card = (spendCardData && spendCardData.card && spendCardData.card.id === preselectCardId ? spendCardData.card : null)
+    || (spendData ? spendData.cards.find((c) => c.id === preselectCardId) : null);
+  if (!card) return;
   const sel = $('#spendImportCard');
-  sel.innerHTML = cards.map((c) => `<option value="${c.id}">${esc(c.name)} · ••••${esc(c.last4)}</option>`).join('');
-  if (preselectCardId) sel.value = String(preselectCardId);
+  sel.innerHTML = `<option value="${card.id}">${esc(card.name)} · ••••${esc(card.last4)}</option>`;
   $('#spendImportText').value = '';
   $('#spendImportPreview').innerHTML = '';
   $('#spendImportModalMsg').className = 'msg';
@@ -9463,7 +9575,6 @@ function openSpendImport(preselectCardId) {
   spendImportParsed = null;
   openModal('spendImportModal');
 }
-$('#spendImportBtn').addEventListener('click', () => openSpendImport(null));
 $('#spendDetailImportBtn').addEventListener('click', () => openSpendImport(currentSpendCardId));
 
 $('#spendImportParseBtn').addEventListener('click', async () => {
@@ -9499,28 +9610,66 @@ $('#spendImportParseBtn').addEventListener('click', async () => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
-// AI category analysis (overall level): propose, preview, Apply;
-// confirmed mappings are remembered for future imports.
+// AI category analysis (SPENDING-GLOBAL, overall page): one pass
+// over ALL existing uncategorized transactions across ALL cards.
+// Preview groups proposals by category; each group expands to its
+// transactions, and each row's category is editable before Apply.
+// A row edited in preview changes ONLY that row on Apply — the
+// merchant mapping still takes the group's proposed category.
 $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
   const msg = $('#spendAiMsg');
   const host = $('#spendAiProposals');
   try {
     const data = await api('/api/spending/ai-categories', { method: 'POST', body: {} });
     if (!data.proposals.length) {
-      host.innerHTML = '<div class="note">Nothing to categorize — every merchant already has a category or a remembered mapping.</div>';
+      host.innerHTML = '<div class="note">Nothing to categorize — every transaction already has a category.</div>';
       return;
     }
-    host.innerHTML = `
-      <table class="tbl"><thead><tr><th></th><th>Merchant</th><th>Proposed category</th><th>Transactions</th></tr></thead><tbody>
-      ${data.proposals.map((p, i) => `<tr>
-        <td><input type="checkbox" data-ai-cat="${i}" checked></td>
-        <td>${esc(p.merchant)}</td><td>${esc(p.category)}</td><td>${p.txCount}</td></tr>`).join('')}
-      </tbody></table>
-      <div class="toolbar"><button class="primary" id="spendAiApplyBtn">Apply categories</button></div>`;
+    const cats = [...document.querySelectorAll('#spendCategoryList option')].map((o) => o.value);
+    const groups = new Map();
+    for (const p of data.proposals) {
+      const g = groups.get(p.category) || { category: p.category, merchants: [] };
+      g.merchants.push(p);
+      groups.set(p.category, g);
+    }
+    const rowHtml = (t, cat) => {
+      const isPay = Number(t.amount) >= 0;
+      const amt = isPay ? '−' + money(Number(t.amount)) : money(-Number(t.amount));
+      return `<tr>
+        <td>${esc(t.date)}</td><td>${esc(t.merchant)}</td><td>${esc(t.cardName || '')}</td><td>${amt}</td>
+        <td><select data-ai-row-cat="${t.id}">${cats.map((c) => `<option value="${esc(c)}"${c === cat ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></td></tr>`;
+    };
+    host.innerHTML = [...groups.values()].map((g, gi) => `
+      <div class="panel" data-ai-group="${gi}">
+        <div class="toolbar"><label><input type="checkbox" data-ai-group-check="${gi}" checked> ${esc(g.category)}</label>
+        <span class="note">${g.merchants.length} merchants · ${g.merchants.reduce((n, m) => n + m.txCount, 0)} transactions${g.merchants.some((m) => m.source === 'remembered') ? ' · remembered mapping' : ''}</span>
+        <button class="small" data-ai-group-toggle="${gi}">Show transactions</button></div>
+        <div class="hidden" data-ai-group-rows="${gi}">
+          <table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Card</th><th>Amount</th><th>Category</th></tr></thead><tbody>
+          ${g.merchants.map((m) => (m.transactions || []).map((t) => rowHtml(t, g.category)).join('')).join('')}
+          </tbody></table>
+        </div>
+      </div>`).join('')
+      + `<div class="toolbar"><button class="primary" id="spendAiApplyBtn">Apply categories</button></div>`;
+    host.querySelectorAll('[data-ai-group-toggle]').forEach((b) => {
+      b.onclick = () => {
+        const rows = host.querySelector(`[data-ai-group-rows="${b.dataset.aiGroupToggle}"]`);
+        if (rows) { rows.classList.toggle('hidden'); b.textContent = rows.classList.contains('hidden') ? 'Show transactions' : 'Hide transactions'; }
+      };
+    });
     $('#spendAiApplyBtn').addEventListener('click', async () => {
-      const selected = data.proposals.filter((p, i) => host.querySelector(`[data-ai-cat="${i}"]`).checked);
+      const proposals = [];
+      const overrides = [];
+      [...groups.values()].forEach((g, gi) => {
+        if (!host.querySelector(`[data-ai-group-check="${gi}"]`).checked) return;
+        for (const m of g.merchants) proposals.push({ merchant: m.merchant, category: g.category });
+        const rowsEl = host.querySelector(`[data-ai-group-rows="${gi}"]`);
+        if (rowsEl) rowsEl.querySelectorAll('[data-ai-row-cat]').forEach((sel) => {
+          if (sel.value !== g.category) overrides.push({ txId: Number(sel.dataset.aiRowCat), category: sel.value });
+        });
+      });
       try {
-        const result = await api('/api/spending/ai-categories/apply', { method: 'POST', body: { proposals: selected } });
+        const result = await api('/api/spending/ai-categories/apply', { method: 'POST', body: { proposals, overrides } });
         showMsg(msg, 'ok', `Applied ${result.mapped} merchant mappings, categorized ${result.updated} transactions. Mappings are remembered.`);
         host.innerHTML = '';
         reloadSpendView();
