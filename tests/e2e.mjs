@@ -12322,6 +12322,41 @@ try {
       });
       check('spending UI: header holds ✨ Analyze categories beside + Add card',
         aiHeader.btnVisible && aiHeader.sameHead && /Analyze categories/.test(aiHeader.btnText), JSON.stringify(aiHeader));
+      // Spending head row: the same standard as Properties/Stocks —
+      // title and + Add card align with the chart panel's content
+      // edges (panel border 1px + padding 16px = a 17px inset), and
+      // the row leaves 16px of air above the chart panel instead of
+      // sitting flush on it.
+      const spendHeadGeom = await page.evaluate(() => {
+        const head = document.querySelector('#spendList .section-head');
+        const title = head.querySelector('h2');
+        const btn = document.querySelector('#addSpendCardBtn');
+        const panel = document.querySelector('#spendPanel');
+        const hr = head.getBoundingClientRect();
+        const tr = title.getBoundingClientRect();
+        const br = btn.getBoundingClientRect();
+        const pr = panel.getBoundingClientRect();
+        return {
+          titleLeftDelta: Math.abs(tr.left - (pr.left + 17)),
+          btnRightDelta: Math.abs(br.right - (pr.right - 17)),
+          btnTopGap: br.top - hr.top,
+          btnPanelGap: pr.top - br.bottom,
+        };
+      });
+      check('spending head: title left edge aligns with the chart panel content left edge',
+        spendHeadGeom.titleLeftDelta <= 3, JSON.stringify(spendHeadGeom));
+      check('spending head: + Add card right edge aligns with the panel content right edge',
+        spendHeadGeom.btnRightDelta <= 3, JSON.stringify(spendHeadGeom));
+      check('spending head: the button has the standard 16px padding of space above it',
+        spendHeadGeom.btnTopGap > 0 && Math.abs(spendHeadGeom.btnTopGap - 16) <= 3, JSON.stringify(spendHeadGeom));
+      check('spending head: the button leaves the standard 16px gap above the chart panel (not flush)',
+        Math.abs(spendHeadGeom.btnPanelGap - 16) <= 3, JSON.stringify(spendHeadGeom));
+      const headPadRef = await page.evaluate(() => ({
+        prop: getComputedStyle(document.querySelector('#section-properties .section-head')).padding,
+        spend: getComputedStyle(document.querySelector('#spendList .section-head')).padding,
+      }));
+      check('spending head: padding matches the Properties section-head standard',
+        headPadRef.prop === headPadRef.spend, JSON.stringify(headPadRef));
       const inlineGone = await page.evaluate(() => ({
         inlineHost: !!document.querySelector('#spendList #spendAiProposals'),
         inlineHeading: [...document.querySelectorAll('#spendList h3')].some((h) => h.textContent.includes('Category analysis')),

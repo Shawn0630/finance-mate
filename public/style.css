@@ -197,6 +197,12 @@ td.num, th.num { text-align: right; }
    padding) with 16px of air above and below the row. */
 #section-investments .section-head { padding: 16px 17px; }
 #section-investments .section-head h2 { margin-top: 0; }
+/* Spending list head: the same standard as Properties/Stocks — inset
+   to the panel's content edges (1px border + 16px padding) with 16px
+   of air above and below the row, so the + Add card / Analyze
+   buttons never sit flush on the chart panel below. */
+#spendList .section-head { padding: 16px 17px; }
+#spendList .section-head h2 { margin-top: 0; }
 /* Stocks detail pages (account / holding): their head band is
    the back-link toolbar — same inset so the back link and the
    Edit/Delete buttons line up with the panels below, and the
