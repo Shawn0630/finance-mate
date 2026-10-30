@@ -9008,7 +9008,19 @@ function earnJobResetModal(title) {
   $('#earnJobPayChangeRows').innerHTML = '';
   $('#earnJobBonusRows').innerHTML = '';
   showMsg($('#earnJobModalMsg'), '', '');
+  earnJobPayBasisLabel();
 }
+
+// The payment field takes a gross or a take-home value; the label
+// follows the toggle so the mode is never ambiguous. Editing a job
+// always shows the gross field (the toggle resets to Gross).
+function earnJobPayBasisLabel() {
+  const basis = document.querySelector('#earnJobForm [name=pay_value_basis]:checked')?.value || 'gross';
+  $('#earnJobPayValueLabel').textContent = basis === 'takehome'
+    ? 'Recent payment take-home value * (one pay period)'
+    : 'Recent payment gross value * (one pay period)';
+}
+document.querySelectorAll('#earnJobForm [name=pay_value_basis]').forEach((r) => r.addEventListener('change', earnJobPayBasisLabel));
 
 $('#addEarnJobBtn').onclick = () => {
   earnEditJobId = null;
@@ -9057,6 +9069,7 @@ $('#earnJobForm').onsubmit = async (e) => {
         employer: data.employer, owner: data.owner, currency: data.currency || 'CAD',
         province: data.province, frequency: data.frequency,
         start_date: start, recent_pay_date: recent, recent_pay_value: value,
+        pay_value_basis: data.pay_value_basis || 'gross',
         pay_changes: payChanges, bonuses,
       };
     } else {
@@ -9091,10 +9104,12 @@ window.earnEditJob = (id) => {
   f.frequency.value = j.frequency; f.start_date.value = j.start_date || ''; f.recent_pay_date.value = j.recent_pay_date || '';
   // Recent value is the current per-period rate; for an old
   // annual-basis job, the per-period equivalent, so the field
-  // always shows a rate.
+  // always shows a rate. Editing always shows the gross field.
   const periods = (earnData.payFrequencies.find((x) => x.key === j.frequency) || {}).periods || 1;
   const perPeriod = j.gross_basis === 'period' ? j.gross_amount : j.gross_amount / periods;
   setMoneyValue(f.recent_pay_value, perPeriod);
+  f.querySelector('[name=pay_value_basis][value=gross]').checked = true;
+  earnJobPayBasisLabel();
   for (const c of j.pay_changes || []) $('#earnJobPayChangeRows').appendChild(earnJobRepeatRow('pay_change', c));
   for (const b of j.bonuses || []) $('#earnJobBonusRows').appendChild(earnJobRepeatRow('bonus', b));
   openModal('earnJobModal');

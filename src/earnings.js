@@ -275,6 +275,59 @@ export function deriveJobYtd({ frequency, startDate, recentDate, changes, recent
   };
 }
 
+// Take-home input: back-solve the per-period gross whose computed
+// per-period net equals the entered take-home pay, to the cent.
+// The solve inverts the existing pipeline — deriveJobYtd for the YTD
+// (the current segment priced at the candidate gross) and calcSalary
+// for the per-period net — no tax formula is reimplemented here. The
+// per-period net is non-decreasing in the gross (deductions are
+// floored at 0 and marginal rates stay below 100%), so bisection
+// over the candidate gross converges; the returned gross is the
+// smallest value, to the cent, whose computed net equals the target.
+// A target no gross yields (e.g. below the net of a bonus-only job)
+// is an error, never a silent fallback.
+export function solveGrossForTakeHome({ targetNet, frequency, province, startDate, recentDate,
+  changes, bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt }) {
+  const target = Number(targetNet);
+  if (!Number.isFinite(target) || target < 0) return { error: 'take-home pay must be a number ≥ 0.' };
+  if (!PAY_FREQUENCIES[frequency] || !payroll) return { error: 'take-home pay needs a valid pay frequency.' };
+  const bonusTotal = (bonuses || []).reduce((a, b) => a + (Number(b.amount) || 0), 0);
+  const netAt = (gross) => {
+    const ytd = deriveJobYtd({
+      frequency, startDate, recentDate, changes, recentValue: gross, payroll, cppExempt, eiExempt,
+    });
+    return calcSalary({
+      frequency, gross_amount: gross, gross_basis: 'period', province, bonus_total: bonusTotal,
+      ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
+      td1_federal: td1Federal ?? null, td1_provincial: td1Provincial ?? null,
+      cpp_exempt: !!cppExempt, ei_exempt: !!eiExempt,
+    }, payroll).perPeriod.net;
+  };
+  const unreachable = 'no per-period gross produces that take-home pay.';
+  if (netAt(0) > target) return { error: unreachable };
+  if (netAt(0) === target) return { gross: 0 };
+  let lo = 0;
+  let hi = Math.max(target, 1);
+  while (netAt(hi) < target) {
+    hi *= 2;
+    if (hi > 1e9) return { error: unreachable };
+  }
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    if (netAt(mid) >= target) hi = mid; else lo = mid;
+  }
+  // Bisection lands within a fraction of a cent; round to cents and
+  // step by cents to the exact match (the rounded net moves at most
+  // one cent per cent of gross, so no cent value is skipped).
+  let g = round2(hi);
+  let guard = 0;
+  while (netAt(g) < target && guard++ < 1000) g = round2(g + 0.01);
+  guard = 0;
+  while (netAt(g) > target && guard++ < 1000) g = round2(g - 0.01);
+  if (g < 0 || netAt(g) !== target) return { error: unreachable };
+  return { gross: g };
+}
+
 export function validPayChanges(rows, startDate) {
   if (rows === undefined || rows === null) return [];
   if (!Array.isArray(rows)) return { error: 'pay changes must be an array.' };

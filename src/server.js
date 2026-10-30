@@ -28,7 +28,7 @@ import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, m
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
-  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd,
+  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome,
   deriveRentalYearFigures, entryCoveredYears,
 } from './earnings.js';
 import {
@@ -2998,9 +2998,35 @@ const derivedJobYtd = (v, cppExempt, eiExempt) => deriveJobYtd({
   payroll: earnRegion().payroll, cppExempt, eiExempt,
 });
 
+// Take-home input: the form's value is a per-period net, not a gross.
+// Back-solve the gross through the same derived path the gross value
+// takes, so the stored job is indistinguishable from one entered as
+// gross. Returns an error string, or null after rewriting v in place.
+const resolveTakeHome = (body, v, existing) => {
+  const basis = body.pay_value_basis;
+  if (basis !== undefined && basis !== 'gross' && basis !== 'takehome') return 'pay value basis must be gross or takehome.';
+  if (basis !== 'takehome') return null;
+  if (v.mode !== 'derived') return 'take-home pay needs a job start date and recent payment date.';
+  const solved = solveGrossForTakeHome({
+    targetNet: v.recent_pay_value, frequency: v.frequency, province: v.province,
+    startDate: v.start_date, recentDate: v.recent_pay_date, changes: v.pay_changes, bonuses: v.bonuses,
+    payroll: earnRegion().payroll,
+    td1Federal: existing ? existing.td1_federal : null,
+    td1Provincial: existing ? existing.td1_provincial : null,
+    cppExempt: existing ? existing.cpp_exempt === 1 : false,
+    eiExempt: existing ? existing.ei_exempt === 1 : false,
+  });
+  if (solved.error) return solved.error;
+  v.recent_pay_value = solved.gross;
+  v.gross_amount = solved.gross;
+  return null;
+};
+
 app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
   const v = validJobInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
+  const takeErr = resolveTakeHome(req.body || {}, v, null);
+  if (takeErr) return res.status(400).json({ error: takeErr });
   const own = cleanJobOwner((req.body || {}).owner);
   if (own.error) return res.status(400).json({ error: own.error });
   const ts = nowIso();
@@ -3035,6 +3061,8 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'job not found' });
+  const takeErr = resolveTakeHome(req.body || {}, v, existing);
+  if (takeErr) return res.status(400).json({ error: takeErr });
   // Owner follows the property rule: omitted means unchanged, an
   // explicit empty value clears to unassigned.
   let owner = existing.owner || null;

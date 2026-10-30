@@ -694,6 +694,57 @@ try {
   r = await req('DELETE', `/api/earnings/jobs/${derivedJob}`);
   check('derived job fixture cleaned up', r.status === 200);
 
+  // Take-home input: the form value is a per-period net; the server
+  // back-solves the gross through the same derived path, so the
+  // stored job is indistinguishable from one entered as gross.
+  const grossTakeBody = {
+    employer: 'Gross Corp', province: 'BC', frequency: 'biweekly',
+    start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+  };
+  r = await req('POST', '/api/earnings/jobs', grossTakeBody);
+  check('take-home fixture: gross job created', r.status === 201);
+  const grossTakeJob = r.data;
+  r = await req('POST', '/api/earnings/jobs', {
+    ...grossTakeBody, employer: 'Takehome Corp',
+    recent_pay_value: grossTakeJob.calc.perPeriod.net, pay_value_basis: 'takehome',
+  });
+  check('take-home save back-solves the gross: per-period net matches to the cent, annual is solved gross x periods',
+    r.status === 201 && r.data.calc.perPeriod.net === grossTakeJob.calc.perPeriod.net
+    && r.data.calc.annualGross === Math.round(r.data.gross_amount * 26 * 100) / 100, JSON.stringify(r.data));
+  const takeJob = r.data;
+  r = await req('POST', '/api/earnings/jobs', { ...grossTakeBody, employer: 'Gross Twin', recent_pay_value: takeJob.gross_amount });
+  check('take-home job computes exactly like the equivalent gross job',
+    r.status === 201 && JSON.stringify(r.data.calc) === JSON.stringify(takeJob.calc)
+    && r.data.ytd_cpp === takeJob.ytd_cpp && r.data.ytd_cpp2 === takeJob.ytd_cpp2
+    && r.data.ytd_ei === takeJob.ytd_ei, JSON.stringify(r.data));
+  const grossTwin = r.data.id;
+  r = await req('PUT', `/api/earnings/jobs/${takeJob.id}`, {
+    ...grossTakeBody, employer: 'Takehome Corp',
+    recent_pay_value: grossTakeJob.calc.perPeriod.net, pay_value_basis: 'takehome',
+  });
+  check('take-home edit re-solves the same gross',
+    r.status === 200 && r.data.gross_amount === takeJob.gross_amount
+    && r.data.calc.perPeriod.net === grossTakeJob.calc.perPeriod.net, JSON.stringify(r.data));
+  r = await req('POST', '/api/earnings/jobs', {
+    ...grossTakeBody, employer: 'Takehome Bad', recent_pay_value: 0.01, pay_value_basis: 'takehome',
+    bonuses: [{ date: '2026-06-30', amount: 50000 }],
+  });
+  check('unreachable take-home target is a 400, never a silent fallback',
+    r.status === 400 && /no per-period gross/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await req('POST', '/api/earnings/jobs', { ...grossTakeBody, pay_value_basis: 'bogus' });
+  check('unknown pay value basis is a 400', r.status === 400);
+  r = await req('POST', '/api/earnings/jobs', {
+    employer: 'Legacy Takehome', province: 'BC', frequency: 'biweekly',
+    gross_amount: 78000, gross_basis: 'annual', tax_year: 2026, pay_value_basis: 'takehome',
+  });
+  check('take-home without dates is a 400', r.status === 400);
+  r = await req('DELETE', `/api/earnings/jobs/${grossTakeJob.id}`);
+  check('take-home gross fixture cleaned up', r.status === 200);
+  r = await req('DELETE', `/api/earnings/jobs/${takeJob.id}`);
+  check('take-home fixture cleaned up', r.status === 200);
+  r = await req('DELETE', `/api/earnings/jobs/${grossTwin}`);
+  check('take-home gross twin cleaned up', r.status === 200);
+
   // Value history: the stub fetch above already recorded the 2026 auto
   // point for pid2; manual points fill the earlier years.
   r = await req('GET', `/api/properties/${pid2}/value-history`);
@@ -6822,6 +6873,23 @@ try {
       await req('DELETE', `/api/earnings/jobs/${modalJob.id}`);
       await req('DELETE', `/api/earnings/jobs/${legacyJobId}`);
 
+      // ---- Job form take-home toggle: Gross default, label follows ----
+      await page.click('#addEarnJobBtn');
+      await wait(300);
+      check('job form payment toggle defaults to Gross',
+        await page.evaluate(() => {
+          const f = document.querySelector('#earnJobForm');
+          return f.querySelector('[name=pay_value_basis]:checked')?.value === 'gross'
+            && document.querySelector('#earnJobPayValueLabel').textContent.includes('gross');
+        }));
+      await page.click('#earnJobForm [name=pay_value_basis][value=takehome]');
+      check('switching to Take-home relabels the payment field',
+        await page.evaluate(() => document.querySelector('#earnJobPayValueLabel').textContent.includes('take-home')));
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#earnJobModal button')].find((b) => b.textContent.trim() === 'Cancel').click();
+      });
+      await wait(300);
+
       // ---- Job detail page: click in, manage pay changes/bonuses inside ----
       r = await req('POST', '/api/earnings/jobs', {
         employer: 'Detail Corp', province: 'BC', frequency: 'biweekly',
@@ -6891,6 +6959,20 @@ try {
           const d = document.querySelector('#earnJobDetail');
           return d && d.textContent.includes('Detail Corp II') && d.textContent.includes('$96,000.00');
         }));
+      // The detail edit uses the same shared form: it shows the gross
+      // field with the toggle back at Gross, never a take-home value.
+      await page.click('#earnJobDetailEditBtn');
+      await wait(300);
+      check('detail edit shows the gross field (toggle back at Gross)',
+        await page.evaluate(() => {
+          const f = document.querySelector('#earnJobForm');
+          return f.querySelector('[name=pay_value_basis]:checked')?.value === 'gross'
+            && parseFloat(f.recent_pay_value.value.replace(/,/g, '')) === 3500;
+        }));
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#earnJobModal button')].find((b) => b.textContent.trim() === 'Cancel').click();
+      });
+      await wait(300);
       // Delete from the detail page returns to the salary list.
       // (The page-wide dialog handler registered earlier accepts the confirm.)
       await page.click('#earnJobDetailDeleteBtn');

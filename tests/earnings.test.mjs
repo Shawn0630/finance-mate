@@ -8,7 +8,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
   deriveRentalYearFigures, entryCoveredYears,
-  payDatesInWindow, deriveJobYtd,
+  payDatesInWindow, deriveJobYtd, solveGrossForTakeHome,
 } from '../src/earnings.js';
 
 const job = (over = {}) => ({
@@ -397,4 +397,62 @@ test('simplified job: validJobInput derives, legacy input is untouched', () => {
     start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
     pay_changes: [{ effective_date: '2025-01-01', value: 2500 }],
   }).error);
+});
+
+// Take-home input: back-solving the per-period gross from a net.
+const takeHomeNetAt = (gross, over = {}) => {
+  const { frequency = 'biweekly', province = 'BC', startDate = '2026-01-05', recentDate = '2026-10-23',
+    changes = [], bonuses = [], cppExempt = false, eiExempt = false,
+    td1Federal = null, td1Provincial = null } = over;
+  const ytd = deriveJobYtd({
+    frequency, startDate, recentDate, changes, recentValue: gross, payroll, cppExempt, eiExempt,
+  });
+  return calcSalary({
+    frequency, gross_amount: gross, gross_basis: 'period', province,
+    bonus_total: bonuses.reduce((a, b) => a + b.amount, 0),
+    ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
+    td1_federal: td1Federal, td1_provincial: td1Provincial, cpp_exempt: cppExempt, ei_exempt: eiExempt,
+  }, payroll).perPeriod.net;
+};
+const solveTakeHome = (targetNet, over = {}) => solveGrossForTakeHome({
+  targetNet, frequency: 'biweekly', province: 'BC', startDate: '2026-01-05', recentDate: '2026-10-23',
+  changes: [], bonuses: [], payroll, td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false,
+  ...over,
+});
+
+test('take-home: BC biweekly $3,000 gross round-trips exactly, and the solve is minimal', () => {
+  const target = takeHomeNetAt(3000);
+  assert.equal(target, 2469.7);
+  const s = solveTakeHome(target);
+  assert.equal(s.gross, 3000);
+  assert.equal(takeHomeNetAt(s.gross), target);
+  assert.ok(takeHomeNetAt(2999.99) < target, 'one cent less gross must net below the target');
+});
+
+test('take-home: pay changes + bonus round-trip to the cent (within rounding granularity of the true gross)', () => {
+  const over = {
+    changes: [{ effective_date: '2026-01-05', value: 2500 }, { effective_date: '2026-06-01', value: 3000 }],
+    bonuses: [{ date: '2026-06-30', amount: 5000 }],
+  };
+  const target = takeHomeNetAt(3000, over);
+  const s = solveTakeHome(target, over);
+  assert.equal(takeHomeNetAt(s.gross, over), target);
+  assert.ok(Math.abs(s.gross - 3000) <= 0.1, `solved ${s.gross} should be within 10 cents of 3000`);
+});
+
+test('take-home: annual frequency and CPP/EI-exempt jobs round-trip', () => {
+  const annual = { frequency: 'annual', startDate: '2026-01-01', recentDate: '2026-10-23' };
+  assert.equal(solveTakeHome(takeHomeNetAt(60000, annual), annual).gross, 60000);
+  const ex = { cppExempt: true, eiExempt: true };
+  const s = solveTakeHome(takeHomeNetAt(3000, ex), ex);
+  assert.equal(takeHomeNetAt(s.gross, ex), takeHomeNetAt(3000, ex));
+});
+
+test('take-home: unreachable targets are errors, never silent fallbacks', () => {
+  const bonus = { bonuses: [{ date: '2026-06-30', amount: 50000 }] };
+  assert.ok(solveTakeHome(0.01, bonus).error);
+  assert.ok(solveTakeHome(0, bonus).error);
+  assert.ok(solveTakeHome(-5).error);
+  assert.ok(solveTakeHome(100, { frequency: 'bogus' }).error);
+  assert.equal(solveTakeHome(0).gross, 0);
 });

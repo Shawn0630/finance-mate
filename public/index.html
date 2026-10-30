@@ -780,7 +780,7 @@
         <div><label>Job start date *</label><input name="start_date" type="date"></div>
         <div><label>Recent payment date *</label><input name="recent_pay_date" type="date"></div>
       </div>
-      <div><label>Recent payment gross value * (one pay period)</label><input name="recent_pay_value" type="text" inputmode="decimal" data-money></div>
+      <div><label id="earnJobPayValueLabel">Recent payment gross value * (one pay period)</label><div><label class="btnlike"><input type="radio" name="pay_value_basis" value="gross" checked> Gross</label> <label class="btnlike"><input type="radio" name="pay_value_basis" value="takehome"> Take-home</label></div><input name="recent_pay_value" type="text" inputmode="decimal" data-money></div>
       <div class="note">Annual gross, tax year and YTD CPP / CPP2 / EI are derived from these — the tax year is the recent payment's year, and YTD counts the pay periods from the start date through the recent payment.</div>
       <div><label>Pay changes (raises)</label><div class="note">Each row is the new per-period gross from its date. List each rate from the start — the first row's rate covers earlier pays in the year.</div><div id="earnJobPayChangeRows"></div><button type="button" class="small" id="earnJobPayChangeAddBtn">+ Pay change</button></div>
       <div><label>Bonuses</label><div class="note">Bonuses count into the year's gross, not the per-period rate.</div><div id="earnJobBonusRows"></div><button type="button" class="small" id="earnJobBonusAddBtn">+ Bonus</button></div>
