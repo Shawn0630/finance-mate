@@ -467,6 +467,7 @@
       <div class="note hidden" id="earnRentalsEmpty">No rental year records yet.</div>
       <div id="earnRentalList"></div>
     </div>
+    <div id="earnJobDetail" class="asset-section hidden"></div>
   </section>
   <section id="view-spending" class="hidden">
     <div id="spendList">
@@ -783,6 +784,23 @@
       <div class="note">Annual gross, tax year and YTD CPP / CPP2 / EI are derived from these — the tax year is the recent payment's year, and YTD counts the pay periods from the start date through the recent payment.</div>
       <div><label>Pay changes (raises)</label><div class="note">Each row is the new per-period gross from its date. List each rate from the start — the first row's rate covers earlier pays in the year.</div><div id="earnJobPayChangeRows"></div><button type="button" class="small" id="earnJobPayChangeAddBtn">+ Pay change</button></div>
       <div><label>Bonuses</label><div class="note">Bonuses count into the year's gross, not the per-period rate.</div><div id="earnJobBonusRows"></div><button type="button" class="small" id="earnJobBonusAddBtn">+ Bonus</button></div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="earnJobRowModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="earnJobRowFormTitle">Add pay change</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="earnJobRowModalMsg"></div>
+    <form id="earnJobRowForm">
+      <div class="grid2">
+        <div><label id="earnJobRowDateLabel">Effective date *</label><input name="row_date" type="date" required></div>
+        <div><label id="earnJobRowValueLabel">New per-period value *</label><input name="row_value" type="text" inputmode="decimal" data-money required></div>
+      </div>
       <div class="toolbar">
         <button type="submit" class="primary">Save</button>
         <button type="button" data-close-modal>Cancel</button>

@@ -6821,6 +6821,87 @@ try {
         }));
       await req('DELETE', `/api/earnings/jobs/${modalJob.id}`);
       await req('DELETE', `/api/earnings/jobs/${legacyJobId}`);
+
+      // ---- Job detail page: click in, manage pay changes/bonuses inside ----
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Detail Corp', province: 'BC', frequency: 'biweekly',
+        start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+      });
+      const detailJobId = r.data.id;
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        if (card) card.click();
+      }, detailJobId);
+      check('clicking a job card lands on its detail page',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return location.hash.startsWith('#earnings/job/')
+            && d && !d.classList.contains('hidden')
+            && d.textContent.includes('Detail Corp')
+            && d.textContent.includes('$78,000.00');
+        }));
+      // Add a raise from the detail page: it applies to the recent pay
+      // period, so it becomes the current rate and the annual gross moves.
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-06-01';
+        f.row_value.value = '3500';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      check('adding a pay change from the detail page updates the annual gross',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes('$91,000.00');
+        }));
+      const detailJob2 = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailJobId);
+      check('raise from detail: per-period rate is the new value',
+        !!detailJob2 && detailJob2.calc.annualGross === 91000 && detailJob2.calc.perPeriod.gross === 3500
+        && detailJob2.pay_changes.length === 1, JSON.stringify(detailJob2));
+      // Add a bonus from the detail page: gross moves, per-period rate does not.
+      await page.click('#earnJobDetailAddBonus');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-06-30';
+        f.row_value.value = '5000';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      check('adding a bonus from the detail page updates the gross, not the per-period rate',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes('$96,000.00');
+        }));
+      const detailJob3 = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailJobId);
+      check('bonus from detail: bonus total 5000, per-period rate still 3500',
+        !!detailJob3 && detailJob3.calc.annualGross === 96000 && detailJob3.calc.perPeriod.gross === 3500
+        && detailJob3.bonus_total === 5000, JSON.stringify(detailJob3));
+      // Edit job fields from the detail page: the detail refreshes.
+      await page.click('#earnJobDetailEditBtn');
+      await wait(300);
+      await page.evaluate(() => {
+        document.querySelector('#earnJobForm [name=employer]').value = 'Detail Corp II';
+      });
+      await page.click('#earnJobModal button[type=submit]');
+      check('editing job fields from the detail page persists on the detail page',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes('Detail Corp II') && d.textContent.includes('$96,000.00');
+        }));
+      // Delete from the detail page returns to the salary list.
+      // (The page-wide dialog handler registered earlier accepts the confirm.)
+      await page.click('#earnJobDetailDeleteBtn');
+      check('deleting from the detail page returns to the salary list',
+        await until(() => {
+          const list = document.querySelector('#earnJobList');
+          return location.hash === '#earnings/salary'
+            && list && !list.textContent.includes('Detail Corp II');
+        }));
+      const detailGone = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailJobId);
+      check('the deleted job is gone server-side', !detailGone);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

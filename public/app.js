@@ -376,12 +376,24 @@ function route() {
   } else if (hash === '#admin') {
     showView('admin');
     loadAdmin();
+  } else if (hash.startsWith('#earnings/job/')) {
+    // Job detail page: its own route, Salary tab active, list hidden.
+    currentEarnJobId = Number(hash.split('/')[2]);
+    showView('earnings');
+    $('#earn-overview').classList.add('hidden');
+    $('#earn-salary').classList.add('hidden');
+    $('#earn-rentals').classList.add('hidden');
+    $('#earnJobDetail').classList.remove('hidden');
+    document.querySelectorAll('#earningsNav a').forEach((a) =>
+      a.classList.toggle('active', a.dataset.section === 'salary'));
+    loadEarnJobDetail(currentEarnJobId);
   } else if (hash === '#earnings' || hash.startsWith('#earnings/')) {
     showView('earnings');
     const sub = hash.split('/')[1] || 'salary';
     $('#earn-overview').classList.toggle('hidden', sub !== 'overview');
     $('#earn-salary').classList.toggle('hidden', sub !== 'salary');
     $('#earn-rentals').classList.toggle('hidden', sub !== 'rentals');
+    $('#earnJobDetail').classList.add('hidden');
     document.querySelectorAll('#earningsNav a').forEach((a) =>
       a.classList.toggle('active', a.dataset.section === sub));
     loadEarnings();
@@ -8425,7 +8437,7 @@ let earnEditYearId = null;
 function earnJobCard(j) {
   const c = j.calc;
   const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
-  return `<div class="panel">
+  return `<div class="panel earn-job-card" data-job-id="${j.id}" style="cursor:pointer">
     <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
     ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
     <div class="spacer"></div>
@@ -9004,6 +9016,12 @@ $('#addEarnJobBtn').onclick = () => {
   earnJobResetModal('Add job');
   openModal('earnJobModal');
 };
+// Clicking a job card (anywhere but its buttons) opens its detail page.
+$('#earnJobList').addEventListener('click', (e) => {
+  if (e.target.closest('button')) return;
+  const card = e.target.closest('.earn-job-card');
+  if (card) location.hash = '#earnings/job/' + card.dataset.jobId;
+});
 $('#earnJobForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
@@ -9058,7 +9076,8 @@ $('#earnJobForm').onsubmit = async (e) => {
     if (earnEditJobId) await api(`/api/earnings/jobs/${earnEditJobId}`, { method: 'PUT', body });
     else await api('/api/earnings/jobs', { method: 'POST', body });
     closeModalEl($('#earnJobModal'));
-    loadEarnings();
+    await loadEarnings();
+    if (location.hash.startsWith('#earnings/job/')) loadEarnJobDetail(Number(location.hash.split('/')[2]));
   } catch (err) { showMsg($('#earnJobModalMsg'), 'err', err.message); }
 };
 window.earnEditJob = (id) => {
@@ -9098,8 +9117,187 @@ attachAiFill($('#earnJobForm'), 'job', {
 });
 window.earnDeleteJob = async (id) => {
   if (!confirm('Delete this job?')) return;
-  await api(`/api/earnings/jobs/${id}`, { method: 'DELETE' });
-  loadEarnings();
+  try {
+    await api(`/api/earnings/jobs/${id}`, { method: 'DELETE' });
+  } catch (err) {
+    // A linked-plan guard (400) must surface instead of failing silently.
+    const detailVisible = !$('#earnJobDetail').classList.contains('hidden');
+    const m = detailVisible ? $('#earnJobDetailMsg') : $('#earnSalaryMsg');
+    if (m) showMsg(m, 'err', err.message);
+    return;
+  }
+  await loadEarnings();
+  if (location.hash.startsWith('#earnings/job/')) location.hash = '#earnings/salary';
+};
+
+// ------------------------------------------------------- job detail --
+// A job card opens its own detail page (property/account detail
+// pattern). The detail page is where the job is managed: pay changes
+// and bonuses are added, edited and deleted here, and Edit job /
+// Delete job live here too. Card-level Edit/Delete stay as shortcuts
+// to the same modals.
+let currentEarnJobId = null;
+
+function earnJobPerPeriod(j) {
+  const periods = (earnData.payFrequencies.find((x) => x.key === j.frequency) || {}).periods || 1;
+  return j.gross_basis === 'period' ? j.gross_amount : j.gross_amount / periods;
+}
+
+function earnJobDateLabel(iso) {
+  if (!iso) return '—';
+  const [y, m, d] = iso.split('-').map(Number);
+  return `${MONTH_NAMES[m - 1]} ${d}, ${y}`;
+}
+
+function earnJobDetailHtml(j) {
+  const c = j.calc;
+  const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
+  const pcRows = (j.pay_changes || []).map((r, i) => `<div class="note">${earnJobDateLabel(r.effective_date)} · ${money2(r.value)}/period
+    <button class="small" onclick="earnJobDetailOpenRow('pay_change', ${i})">Edit</button>
+    <button class="small danger" onclick="earnJobDetailDeleteRow('pay_change', ${i})">Delete</button></div>`).join('');
+  const bonusRows = (j.bonuses || []).map((b, i) => `<div class="note">${earnJobDateLabel(b.date)} · ${money2(b.amount)}
+    <button class="small" onclick="earnJobDetailOpenRow('bonus', ${i})">Edit</button>
+    <button class="small danger" onclick="earnJobDetailDeleteRow('bonus', ${i})">Delete</button></div>`).join('');
+  return `<div class="section-head"><button class="small" onclick="location.hash='#earnings/salary'">← Back to Salary</button><div class="spacer"></div></div>
+    <div class="msg" id="earnJobDetailMsg"></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
+      ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
+      <div class="spacer"></div>
+      <button class="small" id="earnJobDetailEditBtn" onclick="earnEditJob(${j.id})">Edit job</button>
+      <button class="small danger" id="earnJobDetailDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete job</button></div>
+      <div class="summary-strip">
+        <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
+        <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(c.netAnnual)}</div></div>
+        <div class="summary-card"><div class="k">Net per pay period</div><div class="v">${money2(c.perPeriod.net)}</div></div>
+        <div class="summary-card"><div class="k">Total tax</div><div class="v">${money2(c.totalTax)}</div></div>
+      </div>
+      <table><tbody>
+        <tr><td>Federal tax</td><td>${money2(c.federalTax)}</td><td>CPP</td><td>${money2(c.cpp)}</td></tr>
+        <tr><td>Provincial tax (${esc(c.provinceLabel)})</td><td>${c.provincialTax == null ? '—' : money2(c.provincialTax)}</td><td>CPP2</td><td>${money2(c.cpp2)}</td></tr>
+        <tr><td>Taxable income</td><td>${money2(c.taxableIncome)}</td><td>EI</td><td>${money2(c.ei)}</td></tr>
+      </tbody></table>
+      ${c.provincialTax == null ? `<div class="msg warn">Provincial table unverified — provincial tax is not computed for ${esc(j.province)}.</div>` : ''}
+      ${c.warnings.map((w) => `<div class="msg warn">${esc(w)}</div>`).join('')}
+      <div class="note">${esc(c.estimateNote)}</div>
+      <div class="note">Job start ${esc(j.start_date || '—')} · Recent payment ${esc(j.recent_pay_date || '—')} · Current per-period value ${money2(earnJobPerPeriod(j))}</div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Pay changes</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddPayChange" onclick="earnJobDetailOpenRow('pay_change', null)">+ Pay change</button></div>
+      ${pcRows || '<div class="note">No pay changes yet.</div>'}
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Bonuses</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddBonus" onclick="earnJobDetailOpenRow('bonus', null)">+ Bonus</button></div>
+      ${bonusRows || '<div class="note">No bonuses yet.</div>'}
+    </div>`;
+}
+
+async function loadEarnJobDetail(id) {
+  try {
+    await loadEarnings();
+    const j = earnData.jobs.find((x) => x.id === id);
+    if (!j) { location.hash = '#earnings/salary'; return; }
+    currentEarnJobId = id;
+    $('#earnJobDetail').innerHTML = earnJobDetailHtml(j);
+  } catch (e) {
+    const m = $('#earnJobDetailMsg');
+    if (m) showMsg(m, 'err', e.message);
+  }
+}
+
+// Row add/edit/delete on the detail page go through the same PUT the
+// job modal uses: the full derived body (dates + current per-period
+// rate + whole child lists), so the server re-derives annual gross,
+// tax year and YTD exactly as a modal save would. A job without dates
+// has no derived shape, so its row buttons open the full Edit modal
+// instead (which preserves a legacy save).
+function earnJobDetailDerivedBody(j, payChanges, bonuses, recentValue) {
+  return {
+    employer: j.employer, owner: j.owner ?? '', currency: j.currency || 'CAD',
+    province: j.province, frequency: j.frequency,
+    start_date: j.start_date, recent_pay_date: j.recent_pay_date, recent_pay_value: recentValue,
+    pay_changes: payChanges, bonuses,
+  };
+}
+
+async function earnJobDetailPut(j, payChanges, bonuses, recentValue) {
+  await api(`/api/earnings/jobs/${j.id}`, {
+    method: 'PUT',
+    body: earnJobDetailDerivedBody(j, payChanges, bonuses, recentValue),
+  });
+  loadEarnJobDetail(j.id);
+}
+
+let earnJobRowState = null; // { kind: 'pay_change'|'bonus', index: number|null }
+window.earnJobDetailOpenRow = (kind, index) => {
+  const j = earnData.jobs.find((x) => x.id === currentEarnJobId);
+  if (!j) return;
+  if (!j.start_date || !j.recent_pay_date) { earnEditJob(j.id); return; }
+  const list = kind === 'pay_change' ? (j.pay_changes || []) : (j.bonuses || []);
+  const row = index == null ? null : list[index];
+  earnJobRowState = { kind, index };
+  $('#earnJobRowFormTitle').textContent = kind === 'pay_change'
+    ? (index == null ? 'Add pay change' : 'Edit pay change')
+    : (index == null ? 'Add bonus' : 'Edit bonus');
+  $('#earnJobRowDateLabel').textContent = kind === 'pay_change' ? 'Effective date *' : 'Date *';
+  $('#earnJobRowValueLabel').textContent = kind === 'pay_change' ? 'New per-period value *' : 'Amount *';
+  const f = $('#earnJobRowForm');
+  f.reset();
+  if (row) {
+    f.row_date.value = kind === 'pay_change' ? row.effective_date : row.date;
+    setMoneyValue(f.row_value, kind === 'pay_change' ? row.value : row.amount);
+  }
+  showMsg($('#earnJobRowModalMsg'), '', '');
+  openModal('earnJobRowModal');
+};
+
+$('#earnJobRowForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const j = earnData.jobs.find((x) => x.id === currentEarnJobId);
+    if (!j || !earnJobRowState) return;
+    const f = e.target;
+    const date = f.row_date.value;
+    const value = parseMoneyInput(f.row_value.value);
+    if (!date || value === '' || value == null || Number.isNaN(value)) {
+      showMsg($('#earnJobRowModalMsg'), 'err', 'A date and an amount are required.');
+      return;
+    }
+    const { kind, index } = earnJobRowState;
+    const payChanges = (j.pay_changes || []).map((r) => ({ effective_date: r.effective_date, value: r.value }));
+    const bonuses = (j.bonuses || []).map((b) => ({ date: b.date, amount: b.amount }));
+    // A raise that applies to the recent pay period becomes the current
+    // rate: the latest pay-change row on or before the recent date sets
+    // recent_pay_value, so adding a raise updates the annual gross.
+    let recentValue = earnJobPerPeriod(j);
+    if (kind === 'pay_change') {
+      if (index == null) payChanges.push({ effective_date: date, value });
+      else payChanges[index] = { effective_date: date, value };
+      payChanges.sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
+      const applicable = payChanges.filter((r) => r.effective_date <= j.recent_pay_date);
+      if (applicable.length && applicable[applicable.length - 1].effective_date === date) recentValue = value;
+    } else {
+      if (index == null) bonuses.push({ date, amount: value });
+      else bonuses[index] = { date, amount: value };
+    }
+    closeModalEl($('#earnJobRowModal'));
+    await earnJobDetailPut(j, payChanges, bonuses, recentValue);
+  } catch (err) { showMsg($('#earnJobRowModalMsg'), 'err', err.message); }
+};
+
+window.earnJobDetailDeleteRow = async (kind, index) => {
+  const j = earnData.jobs.find((x) => x.id === currentEarnJobId);
+  if (!j) return;
+  if (!j.start_date || !j.recent_pay_date) { earnEditJob(j.id); return; }
+  if (!confirm('Delete this row?')) return;
+  try {
+    const payChanges = (j.pay_changes || []).map((r) => ({ effective_date: r.effective_date, value: r.value }));
+    const bonuses = (j.bonuses || []).map((b) => ({ date: b.date, amount: b.amount }));
+    if (kind === 'pay_change') payChanges.splice(index, 1);
+    else bonuses.splice(index, 1);
+    // Deleting a row never moves the current rate on its own.
+    await earnJobDetailPut(j, payChanges, bonuses, earnJobPerPeriod(j));
+  } catch (err) { showMsg($('#earnJobDetailMsg'), 'err', err.message); }
 };
 
 // Linked property vs standalone address are mutually exclusive: picking
