@@ -5494,7 +5494,7 @@ async function loadInvestmentsImpl() {
     const hidden = investHiddenAccounts.has(a.account.id);
     return `
     <div class="card breakdown-card${hidden ? ' invest-hidden-card' : ''}" data-invest-account-card="${a.account.id}" onclick="location.hash='#invest-account/${a.account.id}'">
-      <button type="button" class="invest-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-account-id="${a.account.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}">👁</button>
+      <button type="button" class="invest-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-account-id="${a.account.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 12 18.5 2.5 12Z"/><circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none"/><line class="eye-slash" x1="3.5" y1="20.5" x2="20.5" y2="3.5"/></svg></button>
       <div class="k">${esc(a.account.name)} <span class="badge">${esc(ACCOUNT_TYPE_LABELS[a.account.type] || a.account.type)}</span>${a.account.institution ? ` <span class="note" style="margin:0">${esc(a.account.institution)}</span>` : ''}</div>
       <div class="v">${moneyC(a.summary.value, cur)}</div>
       <div class="n">${a.holdings.length} ${a.holdings.length === 1 ? 'holding' : 'holdings'} · return ${a.summary.costUnknown ? '—' : returnText(a.summary.totalReturn, a.summary.totalReturnPct, cur)}${a.summary.costUnknown ? ' · cost unknown' : ''}</div>

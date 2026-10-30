@@ -9262,9 +9262,13 @@ try {
         if (!btn) return { grey: card.classList.contains('invest-hidden-card'), btn: null };
         const cr = card.getBoundingClientRect();
         const br = btn.getBoundingClientRect();
+        const svg = btn.querySelector('svg');
+        const slash = svg ? svg.querySelector('.eye-slash') : null;
         return {
           grey: card.classList.contains('invest-hidden-card'),
-          glyph: btn.textContent,
+          svg: !!svg,
+          textEmpty: btn.textContent.trim() === '',
+          slashShown: slash ? getComputedStyle(slash).display !== 'none' : false,
           eyeHidden: btn.classList.contains('invest-eye-hidden'),
           title: btn.title,
           topRight: Math.abs(br.right - cr.right) <= 26 && br.top - cr.top >= 0 && br.top - cr.top <= 26,
@@ -9304,15 +9308,15 @@ try {
       const st0 = await hideState();
       const cardValSum = (pfH.accounts || []).reduce((s, a) => s + a.summary.value, 0);
       const cs0 = await cardSt(hideAcct.account.id);
-      check('investments UI: each account card carries an eye-icon button at its top-right corner, not a Hide/Show text button',
-        cs0 && cs0.glyph === '👁' && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true, JSON.stringify(cs0));
+      check('investments UI: each account card carries a line-style SVG eye-icon button at its top-right corner, not the emoji glyph or a Hide/Show text button',
+        cs0 && cs0.svg === true && cs0.textEmpty === true && cs0.slashShown === false && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true, JSON.stringify(cs0));
       await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
       await waitI(400);
       let cs = await cardSt(hideAcct.account.id);
       let hs = await hideState();
       const strip1 = await stripVals();
-      check('investments UI: card Hide greys the card and flips its eye icon to crossed-eye',
-        cs && cs.grey === true && cs.eyeHidden === true && cs.title === 'Show' && cs.glyph === '👁', JSON.stringify(cs));
+      check('investments UI: card Hide greys the card and flips its line eye to slashed-eye',
+        cs && cs.grey === true && cs.eyeHidden === true && cs.title === 'Show' && cs.svg === true && cs.slashShown === true, JSON.stringify(cs));
       check('investments UI: hiding an account drops its bar, its doughnut slice, and the total line by its values',
         hs.barVis.find((b) => b.label === hideName).vis === false
           && hs.sliceVis.find((b) => b.label === hideName).vis === false
