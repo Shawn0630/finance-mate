@@ -8109,6 +8109,83 @@ try {
     r.data.display === 'CAD' && r.data.defaultCurrency === 'CAD', JSON.stringify({ d: r.data.display, dc: r.data.defaultCurrency }));
   await req('DELETE', `/api/investments/accounts/${invMixedId}`);
 
+  // ---------------------------------------------------------------
+  // Contribution plans: salary-linked recurring buys on an RRSP
+  // account — frequency from the job, employer match RRSP-only,
+  // one buy per due period priced at the last NAV ≤ due date,
+  // skipped periods listed, deleted periods never recreated,
+  // and a linked job that cannot be deleted.
+  // ---------------------------------------------------------------
+  const vToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const step14 = (from, to) => {
+    const out = [];
+    let d = new Date(`${from}T00:00:00Z`);
+    const end = new Date(`${to}T00:00:00Z`);
+    while (d <= end) { out.push(d.toISOString().slice(0, 10)); d = new Date(d.getTime() + 14 * 86400000); }
+    return out;
+  };
+  r = await req('POST', '/api/earnings/jobs', { employer: 'Plan Corp', province: 'BC', frequency: 'biweekly', gross_amount: 2000, gross_basis: 'period', tax_year: 2026 });
+  const planJobId = r.data.id;
+  check('plans: linked salary job created', r.status === 201 && !!planJobId, JSON.stringify(r.data));
+  r = await req('POST', '/api/investments/accounts', { name: 'Plan RRSP', type: 'RRSP' });
+  const planRrspId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${planRrspId}/holdings`, { label: 'Plan Fund', kind: 'fund', currency: 'CAD' });
+  const planFundId = r.data.id;
+  await req('POST', `/api/investments/holdings/${planFundId}/nav`, { date: '2025-12-31', price: 10 });
+  const planDues = step14('2026-01-05', vToday);
+  r = await req('POST', `/api/investments/accounts/${planRrspId}/plans`, { job_id: planJobId, target_holding_id: planFundId, start_date: '2026-01-05', own_amount: 100, employer_amount: 50 });
+  const planId = r.data.id;
+  check('plans: RRSP plan created and due periods generated at price 10',
+    r.status === 201 && !!planId && r.data.frequency === 'biweekly' && r.data.employer === 'Plan Corp'
+      && r.data.generated_count === planDues.length && r.data.own_total === 100 * planDues.length
+      && r.data.employer_total === 50 * planDues.length && r.data.skipped.length === 0,
+    JSON.stringify({ gen: r.data.generated_count, dues: planDues.length, own: r.data.own_total, emp: r.data.employer_total, skipped: r.data.skipped }));
+  r = await req('GET', `/api/investments/holdings/${planFundId}`);
+  const planEvents = r.data.events.filter((e) => e.source === 'plan');
+  check('plans: one buy per due period, split columns on the event',
+    planEvents.length === planDues.length && planEvents.every((e) => e.type === 'buy' && e.units === 15 && e.price === 10 && e.own_amount === 100 && e.employer_amount === 50),
+    JSON.stringify(planEvents.slice(0, 2)));
+  // TFSA rejects an employer match; a holding from another account is rejected too.
+  r = await req('POST', `/api/investments/accounts/${invTfsaId}/plans`, { job_id: planJobId, target_holding_id: planFundId, start_date: '2026-01-05', own_amount: 100, employer_amount: 50 });
+  check('plans: employer amount on a TFSA account is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/accounts/${planRrspId}/plans`, { job_id: planJobId, target_holding_id: invXqqId, start_date: '2026-01-05', own_amount: 100 });
+  check('plans: a target holding from another account is a 400', r.status === 400, JSON.stringify(r.data));
+  // Skipped periods: a holding with no price at all generates nothing and lists every due period.
+  r = await req('POST', `/api/investments/accounts/${planRrspId}/holdings`, { label: 'Unpriced Fund', kind: 'fund', currency: 'CAD' });
+  const planUnpricedId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${planRrspId}/plans`, { job_id: planJobId, target_holding_id: planUnpricedId, start_date: '2026-01-05', own_amount: 100 });
+  const planSkipId = r.data.id;
+  check('plans: periods with no price are skipped, never guessed',
+    r.status === 201 && r.data.generated_count === 0 && r.data.skipped.length === planDues.length
+      && r.data.skipped.every((s) => s.reason === 'no price on or before this date'),
+    JSON.stringify({ skipped: (r.data.skipped || []).length, dues: planDues.length }));
+  // Deleted period: delete one generated buy, regenerate, and it must not come back.
+  const doomedPlanEvent = planEvents[0];
+  await req('DELETE', `/api/investments/events/${doomedPlanEvent.id}`);
+  r = await req('POST', `/api/investments/plans/${planId}/generate`, {});
+  const afterDel = (await req('GET', `/api/investments/holdings/${planFundId}`)).data.events.filter((e) => e.source === 'plan');
+  check('plans: a deleted generated period is never recreated',
+    r.data.generation.created.length === 0 && afterDel.length === planDues.length - 1
+      && !afterDel.some((e) => e.date === doomedPlanEvent.date),
+    JSON.stringify({ createdThisRun: r.data.generation.created.length, left: afterDel.length }));
+  // Frequency follows the job: biweekly -> monthly moves the plan's read frequency.
+  await req('PUT', `/api/earnings/jobs/${planJobId}`, { employer: 'Plan Corp', province: 'BC', frequency: 'monthly', gross_amount: 2000, gross_basis: 'period', tax_year: 2026 });
+  r = await req('GET', `/api/investments/accounts/${planRrspId}/plans`);
+  const planAfterFreq = (r.data.plans || []).find((p) => p.id === planId);
+  check('plans: frequency follows the linked job',
+    planAfterFreq && planAfterFreq.frequency === 'monthly' && planAfterFreq.frequency_label === 'Monthly',
+    JSON.stringify(planAfterFreq));
+  // A job with linked plans cannot be deleted.
+  r = await req('DELETE', `/api/earnings/jobs/${planJobId}`);
+  check('plans: deleting a job with linked plans is a 400', r.status === 400 && /contribution plan/.test(r.data.error || ''), JSON.stringify(r.data));
+  // Cleanup: plans, then the job, then the account.
+  await req('DELETE', `/api/investments/plans/${planId}`);
+  await req('DELETE', `/api/investments/plans/${planSkipId}`);
+  r = await req('DELETE', `/api/earnings/jobs/${planJobId}`);
+  check('plans: job deletes once its plans are gone', r.status === 200, JSON.stringify(r.data));
+  r = await req('DELETE', `/api/investments/accounts/${planRrspId}`);
+  check('plans: RRSP fixture account cleaned up', r.status === 200, JSON.stringify(r.data));
+
   r = await req('GET', `/api/investments/holdings/${invFundId}`);
   check('investments: the fund rides its manual NAV snapshots',
     r.data.priceStatus.pricedBy === 'manual' && r.data.summary.value === 3200
@@ -10267,7 +10344,13 @@ try {
         && wizGroups.groups.some((t) => t.includes('Sell') && t.includes('1 rows')),
       JSON.stringify(wizGroups));
     // A collapsed group expands, and its header checkbox toggles
-    // the whole group without touching the others.
+    // the whole group without touching the others. Centre the
+    // head in the viewport first: after the map editor collapses
+    // the page clamps to max scroll, which can leave the head's
+    // centre under the 52px sticky topbar — a click there lands
+    // on the topbar, not the head, exactly as a user would scroll
+    // first before clicking a half-hidden row.
+    await pageWiz.evaluate(() => document.querySelector('[data-ie-group-head="Buy"]').scrollIntoView({ block: 'center' }));
     await pageWiz.click('[data-ie-group-head="Buy"]');
     await pageWiz.click('[data-ie-group-check="Buy"]');
     const wizToggle = await pageWiz.evaluate(() => ({

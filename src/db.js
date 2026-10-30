@@ -213,6 +213,29 @@ CREATE TABLE IF NOT EXISTS invest_prices (
   created_at TEXT NOT NULL,
   UNIQUE (holding_id, date, source)
 );
+-- Contribution plans (salary-linked recurring buys): one plan
+-- per account + job + target holding. Frequency is NOT stored
+-- — it derives from the linked job at read time. A generated
+-- buy event carries plan_id + the own/employer split; a deleted
+-- generated event leaves a tombstone row so generation never
+-- recreates that due period (see src/plans.js).
+CREATE TABLE IF NOT EXISTS invest_plans (
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES invest_accounts(id) ON DELETE CASCADE,
+  job_id INTEGER NOT NULL REFERENCES earn_jobs(id),
+  target_holding_id INTEGER REFERENCES invest_holdings(id) ON DELETE SET NULL,
+  start_date TEXT NOT NULL,                   -- 'YYYY-MM-DD', first due period
+  own_amount REAL NOT NULL,                   -- payroll deduction per period, holding currency
+  employer_amount REAL,                       -- employer match per period; RRSP only, NULL = none
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invest_plan_deleted (
+  plan_id INTEGER NOT NULL REFERENCES invest_plans(id) ON DELETE CASCADE,
+  due_date TEXT NOT NULL,                     -- 'YYYY-MM-DD' the user deleted
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (plan_id, due_date)
+);
 CREATE INDEX IF NOT EXISTS idx_invest_holdings_account ON invest_holdings(account_id);
 CREATE INDEX IF NOT EXISTS idx_invest_events_holding ON invest_events(holding_id, date, id);
 CREATE INDEX IF NOT EXISTS idx_invest_prices_holding ON invest_prices(holding_id, date);
@@ -467,6 +490,24 @@ if (!propCols.includes('hs_id_address')) {
   }
   if (evCols.length && !evCols.includes('split_old')) {
     db.exec('ALTER TABLE invest_events ADD COLUMN split_old REAL');
+  }
+}
+// invest_events: databases created before contribution plans
+// have no plan link or own/employer split columns. Existing
+// rows keep NULL — they are not plan events, exactly how they
+// were always interpreted. The plan link is app-enforced (a
+// plan delete clears it on its events, keeping the buys as
+// ordinary history); no FK is declared on the added column.
+{
+  const evCols2 = db.prepare('PRAGMA table_info(invest_events)').all().map((c) => c.name);
+  if (evCols2.length && !evCols2.includes('plan_id')) {
+    db.exec('ALTER TABLE invest_events ADD COLUMN plan_id INTEGER');
+  }
+  if (evCols2.length && !evCols2.includes('own_amount')) {
+    db.exec('ALTER TABLE invest_events ADD COLUMN own_amount REAL');
+  }
+  if (evCols2.length && !evCols2.includes('employer_amount')) {
+    db.exec('ALTER TABLE invest_events ADD COLUMN employer_amount REAL');
   }
 }
 // rate_segments: databases created before prime-spread pricing have

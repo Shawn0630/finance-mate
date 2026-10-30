@@ -5675,7 +5675,122 @@ async function loadInvestAccountImpl(id) {
   $('#addHoldingBtn').onclick = () => openInvestHoldingModal(null);
   $('#editInvestAccountBtn').onclick = () => openInvestAccountModal(id);
   $('#deleteInvestAccountBtn').onclick = () => deleteInvestAccount(id);
+  renderInvestPlans(data);
+  $('#addPlanBtn').onclick = () => openInvestPlanModal(null);
 }
+
+// Contribution plans on the account page: frequency and
+// employer name come live from the linked job (the server
+// derives them at read time); totals split own vs employer
+// from the generated events' portion columns; skipped periods
+// list their due date and reason.
+function renderInvestPlans(data) {
+  const plans = data.plans || [];
+  const holdings = data.holdings || [];
+  const curOf = (p) => {
+    const h = holdings.find((r) => r.holding.id === p.target_holding_id);
+    return h ? h.holding.currency : data.display || 'CAD';
+  };
+  if (!plans.length) {
+    $('#investPlansWrap').innerHTML = '<div class="note">No contribution plans yet.</div>';
+    return;
+  }
+  const totOwn = plans.reduce((s, p) => s + (p.own_total || 0), 0);
+  const totEmp = plans.reduce((s, p) => s + (p.employer_total || 0), 0);
+  const rows = plans.map((p) => {
+    const cur = curOf(p);
+    const skipped = (p.skipped || []).length
+      ? `<div class="note" style="margin:4px 0 0">Skipped: ${(p.skipped || []).map((s) => `${esc(s.due_date)} — ${esc(s.reason)}`).join('; ')}</div>`
+      : '';
+    return `<tr>
+      <td>${esc(p.employer || '—')}<div class="note" style="margin:0">${esc(p.frequency_label || p.frequency || '—')} · ${esc(p.target_holding_label || '—')}</div></td>
+      <td>${esc(p.start_date)}</td>
+      <td class="num">${moneyC(p.own_amount, cur)}</td>
+      <td class="num">${p.employer_amount != null ? moneyC(p.employer_amount, cur) : '—'}</td>
+      <td class="num">${p.generated_count}</td>
+      <td class="num">${moneyC(p.own_total, cur)}${p.employer_total ? ` + ${moneyC(p.employer_total, cur)} employer` : ''}</td>
+      <td style="white-space:nowrap">
+        <button class="small" onclick="generateInvestPlan(${p.id})">Generate</button>
+        <button class="small" onclick="openInvestPlanModal(${p.id})">Edit</button>
+        <button class="small danger" onclick="deleteInvestPlan(${p.id})">Delete</button>
+      </td></tr>${skipped ? `<tr><td colspan="7">${skipped}</td></tr>` : ''}`;
+  }).join('');
+  $('#investPlansWrap').innerHTML =
+    `<table><thead><tr><th>Employer</th><th>Start</th><th class="num">Own / period</th><th class="num">Employer / period</th><th class="num">Generated</th><th class="num">Contributed (own + employer)</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+     <div class="note" style="margin:8px 0 0">Total contributed: own ${moneyC(totOwn, data.display || 'CAD')}${totEmp ? ` · employer ${moneyC(totEmp, data.display || 'CAD')}` : ''} (display currency; per-plan figures are in the target holding's currency).</div>`;
+}
+
+let investPlanJobs = [];
+function syncInvestPlanFrequency() {
+  const job = investPlanJobs.find((j) => String(j.id) === String($('#investPlanJob').value));
+  $('#investPlanFrequency').value = job ? `${job.frequencyLabel || job.frequency} — ${job.employer}` : '';
+}
+async function openInvestPlanModal(id) {
+  const form = $('#investPlanForm');
+  form.reset();
+  $('#investPlanModalMsg').className = 'msg';
+  form.elements.id.value = id || '';
+  $('#investPlanModalTitle').textContent = id ? 'Edit plan' : 'Add plan';
+  const account = investAccountData ? investAccountData.account : null;
+  const isRrsp = account && account.type === 'RRSP';
+  $('#investPlanEmployerWrap').classList.toggle('hidden', !isRrsp);
+  const holdings = investAccountData ? investAccountData.holdings : [];
+  $('#investPlanHolding').innerHTML = holdings.map((r) =>
+    `<option value="${r.holding.id}">${esc(r.holding.label)} (${esc(r.holding.currency)})</option>`).join('');
+  try {
+    const earn = await api('/api/earnings');
+    investPlanJobs = (earn.jobs || []).map((j) => ({
+      id: j.id, employer: j.employer, frequency: j.frequency,
+      frequencyLabel: (earn.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency,
+    }));
+  } catch { investPlanJobs = []; }
+  $('#investPlanJob').innerHTML = investPlanJobs.length
+    ? investPlanJobs.map((j) => `<option value="${j.id}">${esc(j.employer)} — ${esc(j.frequencyLabel)}</option>`).join('')
+    : '<option value="">No salary jobs — add one under Earnings first</option>';
+  $('#investPlanJob').onchange = syncInvestPlanFrequency;
+  if (id) {
+    const p = (investAccountData.plans || []).find((x) => x.id === id);
+    if (p) {
+      form.elements.job_id.value = p.job_id;
+      form.elements.target_holding_id.value = p.target_holding_id;
+      form.elements.start_date.value = p.start_date || '';
+      setMoneyValue(form.elements.own_amount, p.own_amount);
+      setMoneyValue(form.elements.employer_amount, p.employer_amount);
+      syncInvestPlanFrequency();
+    }
+  } else {
+    syncInvestPlanFrequency();
+  }
+  openModal('investPlanModal');
+}
+window.openInvestPlanModal = openInvestPlanModal;
+
+$('#investPlanForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  parseMoneyFields(f, ['own_amount', 'employer_amount']);
+  const id = f.id; delete f.id;
+  if (f.employer_amount === '') f.employer_amount = null;
+  try {
+    if (id) await api(`/api/investments/plans/${id}`, { method: 'PUT', body: f });
+    else await api(`/api/investments/accounts/${investAccountData.account.id}/plans`, { method: 'POST', body: f });
+    closeModalEl($('#investPlanModal'));
+    loadInvestAccount(investAccountData.account.id);
+  } catch (err) { showMsg($('#investPlanModalMsg'), 'err', err.message); }
+});
+
+async function generateInvestPlan(id) {
+  await api(`/api/investments/plans/${id}/generate`, { method: 'POST' });
+  loadInvestAccount(investAccountData.account.id);
+}
+window.generateInvestPlan = generateInvestPlan;
+
+async function deleteInvestPlan(id) {
+  if (!confirm('Delete this plan? Its generated buy events stay as ordinary history.')) return;
+  await api(`/api/investments/plans/${id}`, { method: 'DELETE' });
+  loadInvestAccount(investAccountData.account.id);
+}
+window.deleteInvestPlan = deleteInvestPlan;
 
 async function deleteInvestAccount(id) {
   if (!confirm('Delete this account and all its holdings and events?')) return;
@@ -5757,7 +5872,7 @@ async function loadInvestHoldingImpl(id) {
   applyInvestRange('investHolding');
   const typeLabels = { buy: 'Buy', sell: 'Sell', grant: 'Grant', dividend: 'Dividend', split: 'Split', position: 'Position' };
   const rows = data.events.map((e) => `<tr>
-      <td>${esc(e.date)}</td><td>${e.type === 'split' ? `Split · ${splitRatioText(e)}` : (typeLabels[e.type] || esc(e.type))}${aiBadge(e.source)}</td>
+      <td>${esc(e.date)}</td><td>${e.type === 'split' ? `Split · ${splitRatioText(e)}` : (typeLabels[e.type] || esc(e.type))}${aiBadge(e.source)}${e.own_amount != null ? `<div class="note" style="margin:0">Own ${moneyC(e.own_amount, h.currency)}${e.employer_amount ? ` · Employer ${moneyC(e.employer_amount, h.currency)}` : ''}</div>` : ''}</td>
       <td class="num">${e.units != null ? fmtUnits(e.units) : '—'}</td>
       <td class="num">${e.price != null ? moneyC(e.price, h.currency) : (e.type === 'grant' ? '<span class="note" style="margin:0">market</span>' : '—')}</td>
       <td class="num">${e.amount != null ? moneyC(e.amount, h.currency) : '—'}</td>

@@ -31,6 +31,10 @@ import {
   calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd,
   deriveRentalYearFigures, entryCoveredYears,
 } from './earnings.js';
+import {
+  validPlanInput, listPlans, getPlan, planView, generatePlan, generatePlansForAccount,
+  recordPlanEventDeletion,
+} from './plans.js';
 import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -2614,14 +2618,85 @@ app.get('/api/investments/accounts/:id', requireApiAuth, async (req, res) => {
   const defaultCurrency = effectiveAccountDefaultCurrency(account, holdings);
   const display = parseInvestDisplay(req.query.display, defaultCurrency);
   const fx = await prepareInvestScope(holdings, display);
+  // Contribution plans auto-generate on the account read (the
+  // same fetch-on-read shape as prices): past due periods land
+  // as buy events, newly priced skips fill in, and deleted
+  // periods stay deleted. A generation failure never fails the
+  // read — the plan view still lists its skipped periods.
+  try { generatePlansForAccount(db, account.id, { today: vancouverToday(), ts: nowIso() }); } catch { /* plans still render below */ }
   const a = computeAccount(db, account, fx, vancouverToday(), display);
   if (display === 'USD') pinCadReturnPct(a, computeAccount(db, account, fx, vancouverToday(), 'CAD'));
   res.json({
     account: a.account, defaultCurrency, display,
     summary: a.summary, monthly: a.monthly, series: a.series,
     holdings: a.holdings.map((c) => ({ ...investHoldingRow(c), events: c.events })),
+    plans: listPlans(db, account.id).map((p) => planView(db, p, vancouverToday())),
     fxMissing: fx.missing,
   });
+});
+
+// Contribution plans (see src/plans.js): frequency derives from
+// the linked job, employer match is RRSP-only, due periods
+// generate one buy event each on the target holding.
+app.get('/api/investments/accounts/:id/plans', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  res.json({ plans: listPlans(db, account.id).map((p) => planView(db, p, vancouverToday())) });
+});
+
+app.post('/api/investments/accounts/:id/plans', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const v = validPlanInput(req.body || {}, { accountType: account.type });
+  if (v.error) return res.status(400).json({ error: v.error });
+  const job = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(v.jobId);
+  if (!job) return res.status(400).json({ error: 'salary job not found' });
+  const holding = getHolding(db, v.holdingId);
+  if (!holding || holding.account_id !== account.id) return res.status(400).json({ error: 'target holding must belong to this account' });
+  const ts = nowIso();
+  const info = db.prepare(
+    'INSERT INTO invest_plans (account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(account.id, v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, ts, ts);
+  const plan = getPlan(db, info.lastInsertRowid);
+  const gen = generatePlan(db, plan, { today: vancouverToday(), ts });
+  res.status(201).json({ ...planView(db, plan, vancouverToday()), generation: gen });
+});
+
+app.put('/api/investments/plans/:id', requireApiAuth, (req, res) => {
+  const plan = getPlan(db, Number(req.params.id));
+  if (!plan) return res.status(404).json({ error: 'plan not found' });
+  const account = getAccount(db, plan.account_id);
+  const v = validPlanInput(req.body || {}, { accountType: account.type });
+  if (v.error) return res.status(400).json({ error: v.error });
+  const job = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(v.jobId);
+  if (!job) return res.status(400).json({ error: 'salary job not found' });
+  const holding = getHolding(db, v.holdingId);
+  if (!holding || holding.account_id !== account.id) return res.status(400).json({ error: 'target holding must belong to this account' });
+  db.prepare('UPDATE invest_plans SET job_id = ?, target_holding_id = ?, start_date = ?, own_amount = ?, employer_amount = ?, updated_at = ? WHERE id = ?')
+    .run(v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, nowIso(), plan.id);
+  const updated = getPlan(db, plan.id);
+  const gen = generatePlan(db, updated, { today: vancouverToday(), ts: nowIso() });
+  res.json({ ...planView(db, updated, vancouverToday()), generation: gen });
+});
+
+app.delete('/api/investments/plans/:id', requireApiAuth, (req, res) => {
+  const plan = getPlan(db, Number(req.params.id));
+  if (!plan) return res.status(404).json({ error: 'plan not found' });
+  // Generated buys stay as ordinary history (their plan link
+  // clears); only the plan and its tombstones go.
+  db.transaction(() => {
+    db.prepare('UPDATE invest_events SET plan_id = NULL WHERE plan_id = ?').run(plan.id);
+    db.prepare('DELETE FROM invest_plans WHERE id = ?').run(plan.id);
+  })();
+  res.json({ ok: true });
+});
+
+app.post('/api/investments/plans/:id/generate', requireApiAuth, (req, res) => {
+  const plan = getPlan(db, Number(req.params.id));
+  if (!plan) return res.status(404).json({ error: 'plan not found' });
+  const gen = generatePlan(db, plan, { today: vancouverToday(), ts: nowIso() });
+  if (gen.error) return res.status(400).json({ error: gen.error });
+  res.json({ ...planView(db, plan, vancouverToday()), generation: gen });
 });
 
 app.put('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
@@ -2757,7 +2832,12 @@ app.put('/api/investments/events/:id', requireApiAuth, (req, res) => {
 app.delete('/api/investments/events/:id', requireApiAuth, (req, res) => {
   const ev = db.prepare('SELECT * FROM invest_events WHERE id = ?').get(Number(req.params.id));
   if (!ev) return res.status(404).json({ error: 'event not found' });
-  db.prepare('DELETE FROM invest_events WHERE id = ?').run(ev.id);
+  // A deleted plan-generated event tombstones its due period
+  // so later generation runs never recreate it (see src/plans.js).
+  db.transaction(() => {
+    recordPlanEventDeletion(db, ev);
+    db.prepare('DELETE FROM invest_events WHERE id = ?').run(ev.id);
+  })();
   rebuildEventPricePoints(db, ev.holding_id, nowIso());
   res.json({ ok: true });
 });
@@ -2984,8 +3064,16 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   res.json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
 });
 app.delete('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(Number(req.params.id));
-  if (!info.changes) return res.status(404).json({ error: 'job not found' });
+  const id = Number(req.params.id);
+  if (!db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)) return res.status(404).json({ error: 'job not found' });
+  // A job with linked contribution plans cannot go: plans
+  // derive their frequency from it, so deleting it would
+  // strand them. Delete the plans first, then the job.
+  const linked = db.prepare('SELECT COUNT(*) AS n FROM invest_plans WHERE job_id = ?').get(id).n;
+  if (linked > 0) {
+    return res.status(400).json({ error: `cannot delete this job — ${linked} contribution plan${linked === 1 ? '' : 's'} link to it; delete the plan${linked === 1 ? '' : 's'} first` });
+  }
+  db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(id);
   res.json({ ok: true });
 });
 

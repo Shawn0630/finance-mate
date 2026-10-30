@@ -156,6 +156,14 @@
       <div id="investHoldingsWrap"></div>
     </div>
     <div class="panel">
+      <div class="panel-head">
+        <h3>Contribution plans</h3>
+        <div class="spacer"></div>
+        <button class="primary small" id="addPlanBtn">+ Add plan</button>
+      </div>
+      <div id="investPlansWrap"></div>
+    </div>
+    <div class="panel">
       <h3>Monthly returns</h3>
       <div id="investAccountMonthly"></div>
       <div class="note" style="margin-left:0">All figures in CAD. Dividends count in the month's return, not in its end value. A grant counts as a contribution at its cost (or that day's market) price, never as profit.</div>
@@ -552,6 +560,30 @@
         <div data-init-rows></div>
         <button type="button" class="small" data-add-init-row>+ Add another</button>
       </div>
+      <div class="toolbar">
+        <button class="primary" type="submit">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="investPlanModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="investPlanModalTitle">Add plan</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="investPlanModalMsg"></div>
+    <form id="investPlanForm">
+      <input type="hidden" name="id">
+      <div class="grid2">
+        <div><label>Salary job *</label><select name="job_id" id="investPlanJob" required></select></div>
+        <div><label>Target holding *</label><select name="target_holding_id" id="investPlanHolding" required></select></div>
+      </div>
+      <div><label>Frequency</label><input id="investPlanFrequency" readonly disabled></div>
+      <div class="grid2">
+        <div><label>Start date *</label><input name="start_date" type="date" required></div>
+        <div><label>Own amount / period *</label><input name="own_amount" type="text" inputmode="decimal" data-money required></div>
+      </div>
+      <div id="investPlanEmployerWrap"><label>Employer amount / period</label><input name="employer_amount" type="text" inputmode="decimal" data-money></div>
       <div class="toolbar">
         <button class="primary" type="submit">Save</button>
         <button type="button" data-close-modal>Cancel</button>
