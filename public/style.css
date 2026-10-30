@@ -72,9 +72,10 @@ td.num, th.num { text-align: right; }
 /* From/To month fields: buttons that read like inputs and open the
    shared month-picker popover below. */
 .month-field { min-width: 118px; text-align: left; color: #1c2733; }
+#earnRentalEntryForm .month-field { width: 100%; height: 32px; box-sizing: border-box; }
 .month-field::after { content: "▾"; float: right; color: #71808f; margin-left: 8px; }
 .month-field:disabled { opacity: .5; cursor: default; }
-.month-pop { position: absolute; z-index: 30; width: 248px; background: #fff; border: 1px solid #c9d2dc; border-radius: 10px; box-shadow: 0 10px 28px rgba(22, 34, 46, .18); padding: 10px; }
+.month-pop { position: fixed; z-index: 150; width: 248px; background: #fff; border: 1px solid #c9d2dc; border-radius: 10px; box-shadow: 0 10px 28px rgba(22, 34, 46, .18); padding: 10px; }
 .month-pop-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .month-pop-year { font-weight: 650; font-size: 15px; }
 .month-pop-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }

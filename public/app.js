@@ -1822,7 +1822,7 @@ let chartBarsBasis = null; // 'monthly' | 'yearly' | null — set by drawCombine
 let scheduleYear = null; // the monthly schedule's open year page; null = automatic
 let schedulePageFirst = false; // a range change reopens the schedule on the range's FIRST year page
 let customRange = null; // detail chart range the user picked by month { start, end } ('YYYY-MM'); null = a preset rules
-let monthPopFor = null; // which From/To field the month picker is open for: 'start' | 'end' | null
+let monthPopFor = null; // which From/To field the month picker is open for: 'start' | 'end' (property range) | 'entryStart' | 'entryEnd' (rent entry modal) | null
 let monthPopYear = null; // the year the open month picker is browsing
 let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
@@ -7920,19 +7920,41 @@ $('#rangeBtns').addEventListener('click', (e) => {
 });
 // ------------------------------------------------------ month picker ---
 // From/To are button fields; one shared popover (a year stepper
-// over a 12-month grid) serves both. Picking a month applies the
-// pair exactly as the pickers' state machine always has: the
-// preset highlight clears, the pair clamps into the data span (a
-// start past the end pulls the end up to the start) and the
-// projection refetches. Months outside the data span render
-// disabled in the grid, and the year stepper stops at the span's
-// first/last years.
+// over a 12-month grid) serves them all. For the property range
+// pickers, picking a month applies the pair exactly as the
+// pickers' state machine always has: the preset highlight clears,
+// the pair clamps into the data span (a start past the end pulls
+// the end up to the start) and the projection refetches. Months
+// outside the data span render disabled in the grid, and the year
+// stepper stops at the span's first/last years. For the rent entry
+// modal's fields, a pick only fills that field (button label +
+// hidden YYYY-MM input) — no pair logic, no refetch — and every
+// month in the server's valid 2000–2100 range is enabled.
+function monthPopField() {
+  return { start: $('#rangeStart'), end: $('#rangeEnd'), entryStart: $('#earnEntryStartBtn'), entryEnd: $('#earnEntryEndBtn') }[monthPopFor] || null;
+}
+function monthPopIsEntry() {
+  return monthPopFor === 'entryStart' || monthPopFor === 'entryEnd';
+}
+function monthPopSpan() {
+  if (monthPopIsEntry()) return { start: '2000-01', end: '2100-12' };
+  return dataSpanMonths();
+}
+// Rent entry modal fields: a pick fills that field only — the
+// button label (formatted month) and the hidden form input
+// (YYYY-MM) — with no pair clamping and no refetch.
+function setEntryMonth(which, ym) {
+  const btn = which === 'entryStart' ? $('#earnEntryStartBtn') : $('#earnEntryEndBtn');
+  const form = $('#earnRentalEntryForm');
+  if (btn) { btn.dataset.value = ym || ''; btn.textContent = formatYM(ym); }
+  if (form) form[which === 'entryStart' ? 'start_ym' : 'end_ym'].value = ym || '';
+}
 function renderMonthPop() {
   const pop = $('#monthPop');
   if (!pop || !monthPopFor) return;
-  const span = dataSpanMonths();
+  const span = monthPopSpan();
   if (!span) { closeMonthPop(); return; }
-  const field = monthPopFor === 'start' ? $('#rangeStart') : $('#rangeEnd');
+  const field = monthPopField();
   const selected = field ? field.dataset.value : '';
   // The stepper's bounds are the span's years, widened to include
   // the field's own year when a preset filled a pair reaching
@@ -7941,7 +7963,9 @@ function renderMonthPop() {
   const selYear = selected ? Number(selected.slice(0, 4)) : null;
   const minYear = Math.min(Number(span.start.slice(0, 4)), selYear ?? Infinity);
   const maxYear = Math.max(Number(span.end.slice(0, 4)), selYear ?? -Infinity);
-  if (monthPopYear == null) monthPopYear = selected ? Number(selected.slice(0, 4)) : maxYear;
+  // An empty entry field opens on the current year, not on the
+  // span's last year (2100 would be a long step back).
+  if (monthPopYear == null) monthPopYear = selected ? Number(selected.slice(0, 4)) : (monthPopIsEntry() ? new Date().getFullYear() : maxYear);
   monthPopYear = Math.min(Math.max(monthPopYear, minYear), maxYear);
   $('#monthPopYear').textContent = String(monthPopYear);
   $('#monthPopPrev').disabled = monthPopYear <= minYear;
@@ -7954,30 +7978,32 @@ function renderMonthPop() {
 }
 
 function openMonthPop(which) {
-  const field = which === 'start' ? $('#rangeStart') : $('#rangeEnd');
-  if (!field || field.disabled) return;
   monthPopFor = which;
+  const field = monthPopField();
+  if (!field || field.disabled) { monthPopFor = null; return; }
   monthPopYear = field.dataset.value ? Number(field.dataset.value.slice(0, 4)) : null;
   renderMonthPop();
   if (!monthPopFor) return; // no data span — renderMonthPop closed it
   const pop = $('#monthPop');
   pop.classList.remove('hidden');
-  const bar = $('#rangeBtns');
-  const left = Math.max(0, Math.min(field.offsetLeft, bar.clientWidth - pop.offsetWidth - 4));
+  // Fixed positioning: the popover sits above modals too, so anchor
+  // it to the field's viewport rect, clamped inside the viewport.
+  const r = field.getBoundingClientRect();
+  const left = Math.max(4, Math.min(r.left, window.innerWidth - pop.offsetWidth - 4));
   pop.style.left = `${left}px`;
-  pop.style.top = `${field.offsetTop + field.offsetHeight + 6}px`;
-  $('#rangeStart').setAttribute('aria-expanded', String(which === 'start'));
-  $('#rangeEnd').setAttribute('aria-expanded', String(which === 'end'));
+  pop.style.top = `${r.bottom + 6}px`;
+  for (const [key, el] of [['start', $('#rangeStart')], ['end', $('#rangeEnd')], ['entryStart', $('#earnEntryStartBtn')], ['entryEnd', $('#earnEntryEndBtn')]]) {
+    if (el) el.setAttribute('aria-expanded', String(which === key));
+  }
 }
 
 function closeMonthPop() {
   monthPopFor = null;
   const pop = $('#monthPop');
   if (pop) pop.classList.add('hidden');
-  const s = $('#rangeStart');
-  const e = $('#rangeEnd');
-  if (s) s.setAttribute('aria-expanded', 'false');
-  if (e) e.setAttribute('aria-expanded', 'false');
+  for (const el of [$('#rangeStart'), $('#rangeEnd'), $('#earnEntryStartBtn'), $('#earnEntryEndBtn')]) {
+    if (el) el.setAttribute('aria-expanded', 'false');
+  }
 }
 
 function onMonthFieldClick(which) {
@@ -7986,12 +8012,15 @@ function onMonthFieldClick(which) {
 }
 $('#rangeStart').addEventListener('click', () => onMonthFieldClick('start'));
 $('#rangeEnd').addEventListener('click', () => onMonthFieldClick('end'));
+$('#earnEntryStartBtn').addEventListener('click', () => onMonthFieldClick('entryStart'));
+$('#earnEntryEndBtn').addEventListener('click', () => onMonthFieldClick('entryEnd'));
 
 $('#monthPop').addEventListener('click', (e) => {
   if (e.target.closest('#monthPopPrev')) { monthPopYear -= 1; renderMonthPop(); return; }
   if (e.target.closest('#monthPopNext')) { monthPopYear += 1; renderMonthPop(); return; }
   const cell = e.target.closest('button[data-ym]');
   if (!cell || cell.disabled || !monthPopFor) return;
+  if (monthPopIsEntry()) { setEntryMonth(monthPopFor, cell.dataset.ym); closeMonthPop(); return; }
   const start = monthPopFor === 'start' ? cell.dataset.ym : $('#rangeStart').dataset.value;
   const end = monthPopFor === 'end' ? cell.dataset.ym : $('#rangeEnd').dataset.value;
   closeMonthPop();
@@ -8006,7 +8035,7 @@ $('#monthPop').addEventListener('click', (e) => {
 // it; only one is ever open — the other field's click retargets it.
 document.addEventListener('click', (e) => {
   if (!monthPopFor) return;
-  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd')) return;
+  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn')) return;
   closeMonthPop();
 });
 document.addEventListener('keydown', (e) => {
@@ -8592,6 +8621,7 @@ window.earnAddEntry = (rentalId) => {
   earnEntryRentalId = rentalId; earnEditEntryId = null;
   $('#earnRentalEntryFormTitle').textContent = 'Add rent entry';
   $('#earnRentalEntryForm').reset();
+  setEntryMonth('entryStart', ''); setEntryMonth('entryEnd', '');
   showMsg($('#earnRentalEntryModalMsg'), '', '');
   openModal('earnRentalEntryModal');
 };
@@ -8599,6 +8629,10 @@ $('#earnRentalEntryForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
     const body = earnReadForm(e.target);
+    // The From field is a picker button now, not a required native
+    // input, so its emptiness is caught here with the server's
+    // message instead of a browser bubble.
+    if (!body.start_ym) { showMsg($('#earnRentalEntryModalMsg'), 'err', 'start month must be a year-month (YYYY-MM).'); return; }
     parseMoneyFields(body, ['monthly_rent', 'cash_amount']);
     if (earnEditEntryId) await api(`/api/earnings/rentals/${earnEntryRentalId}/entries/${earnEditEntryId}`, { method: 'PUT', body });
     else await api(`/api/earnings/rentals/${earnEntryRentalId}/entries`, { method: 'POST', body });
@@ -8613,7 +8647,7 @@ window.earnEditEntry = (rentalId, entryId) => {
   earnEntryRentalId = rentalId; earnEditEntryId = entryId;
   $('#earnRentalEntryFormTitle').textContent = 'Edit rent entry';
   const f = $('#earnRentalEntryForm');
-  f.start_ym.value = en.start_ym; f.end_ym.value = en.end_ym || '';
+  setEntryMonth('entryStart', en.start_ym); setEntryMonth('entryEnd', en.end_ym || '');
   setMoneyValue(f.monthly_rent, en.monthly_rent); f.pay_day.value = en.pay_day;
   setMoneyValue(f.cash_amount, en.cash_amount ?? ''); f.tenant_name.value = en.tenant_name || '';
   showMsg($('#earnRentalEntryModalMsg'), '', '');

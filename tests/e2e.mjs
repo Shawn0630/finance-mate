@@ -10867,17 +10867,60 @@ try {
         modalUi.modalOpen && !modalUi.inlinePanel, JSON.stringify(modalUi));
       check('rental modals: + Year record button is gone from rental cards',
         !modalUi.hasYearBtn, JSON.stringify(modalUi));
+      // The entry From/To fields are the app's month-field picker
+      // (same popover as the range pickers), not native month inputs.
+      const entryPicker = await page.evaluate(() => {
+        const f = document.querySelector('#earnRentalEntryForm');
+        const startBtn = document.querySelector('#earnEntryStartBtn');
+        const endBtn = document.querySelector('#earnEntryEndBtn');
+        return {
+          nativeMonth: !!f.querySelector('input[type="month"]'),
+          startIsField: !!startBtn && startBtn.classList.contains('month-field'),
+          endIsField: !!endBtn && endBtn.classList.contains('month-field'),
+        };
+      });
+      check('rental modals: entry From/To are month-field picker buttons, no native month inputs',
+        !entryPicker.nativeMonth && entryPicker.startIsField && entryPicker.endIsField, JSON.stringify(entryPicker));
+      // Pick both months through the popup: open, step the year,
+      // click the cell — the same interaction as the range picker.
+      const pickEntryMonth = (btnSel, ym) => page.evaluate(([sel, target]) => {
+        document.querySelector(sel).click();
+        const ty = Number(target.slice(0, 4));
+        const yearEl = document.querySelector('#monthPopYear');
+        let guard = 0;
+        while (Number(yearEl.textContent) !== ty && guard++ < 120) {
+          const btn = ty < Number(yearEl.textContent)
+            ? document.querySelector('#monthPopPrev') : document.querySelector('#monthPopNext');
+          if (!btn || btn.disabled) break;
+          btn.click();
+        }
+        const cell = document.querySelector(`#monthPopGrid button[data-ym="${target}"]`);
+        if (!cell || cell.disabled) throw new Error(`month cell ${target} not pickable`);
+        cell.click();
+      }, [btnSel, ym]);
+      await pickEntryMonth('#earnEntryStartBtn', '2026-01');
+      await waitE(200);
+      await pickEntryMonth('#earnEntryEndBtn', '2026-12');
+      await waitE(200);
+      const pickedEntry = await page.evaluate(() => {
+        const f = document.querySelector('#earnRentalEntryForm');
+        return {
+          startVal: f.start_ym.value, startLabel: document.querySelector('#earnEntryStartBtn').textContent,
+          endVal: f.end_ym.value, endLabel: document.querySelector('#earnEntryEndBtn').textContent,
+          popHidden: document.querySelector('#monthPop').classList.contains('hidden'),
+        };
+      });
+      check('rental modals: picking through the popup sets YYYY-MM values and formatted labels',
+        pickedEntry.startVal === '2026-01' && pickedEntry.startLabel === 'Jan 2026'
+          && pickedEntry.endVal === '2026-12' && pickedEntry.endLabel === 'Dec 2026' && pickedEntry.popHidden,
+        JSON.stringify(pickedEntry));
       await page.type('#earnRentalEntryForm [name="monthly_rent"]', '1500');
       await waitE(200);
       const modalGrouped = await page.evaluate(() => document.querySelector('#earnRentalEntryForm [name="monthly_rent"]').value);
       check('rental modals: monthly-rent input groups while typing inside the modal',
         modalGrouped === '1,500', JSON.stringify(modalGrouped));
       await page.type('#earnRentalEntryForm [name="tenant_name"]', 'Modal Tenant');
-      await page.evaluate(() => {
-        const f = document.querySelector('#earnRentalEntryForm');
-        f.start_ym.value = '2026-01'; f.end_ym.value = '2026-12';
-        f.pay_day.value = '1';
-      });
+      await page.evaluate(() => { document.querySelector('#earnRentalEntryForm').pay_day.value = '1'; });
       await page.click('#earnRentalEntryForm button[type="submit"]');
       await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Modal Tenant'), { timeout: 10000 });
       r = await req('GET', '/api/earnings');
@@ -10898,6 +10941,28 @@ try {
       await waitE(200);
       const yearModalClosed = await page.evaluate(() => document.querySelector('#earnRentalYearModal').classList.contains('hidden'));
       check('rental modals: year modal Cancel closes it', yearModalClosed === true, JSON.stringify(yearModalClosed));
+
+      // Blank To still means ongoing: pick only a start month and
+      // save; the entry stores a null end and the card shows it.
+      await page.evaluate((rid) => window.earnAddEntry(rid), modalRentalId);
+      await waitE(300);
+      await pickEntryMonth('#earnEntryStartBtn', '2025-06');
+      await waitE(200);
+      const blankTo = await page.evaluate(() => {
+        const f = document.querySelector('#earnRentalEntryForm');
+        return { startVal: f.start_ym.value, endVal: f.end_ym.value, endLabel: document.querySelector('#earnEntryEndBtn').textContent };
+      });
+      check('rental modals: leaving To unpicked keeps it blank (ongoing)',
+        blankTo.startVal === '2025-06' && blankTo.endVal === '' && blankTo.endLabel === '—', JSON.stringify(blankTo));
+      await page.type('#earnRentalEntryForm [name="monthly_rent"]', '2000');
+      await page.evaluate(() => { document.querySelector('#earnRentalEntryForm').pay_day.value = '5'; });
+      await page.click('#earnRentalEntryForm button[type="submit"]');
+      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Jun 2025 – Ongoing'), { timeout: 10000 });
+      r = await req('GET', '/api/earnings');
+      const ongoingRental = (r.data.rentals || []).find((x) => x.id === modalRentalId);
+      const ongoingEntry = ongoingRental && ongoingRental.entries.find((e) => e.start_ym === '2025-06');
+      check('rental modals: blank-To entry saves with a null end',
+        !!ongoingEntry && ongoingEntry.end_ym === null, JSON.stringify(ongoingEntry));
 
       // Rental form: property dropdown lists app properties (never BCA
       // results); picking one disables + clears Address; Standalone

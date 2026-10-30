@@ -731,8 +731,8 @@
     <div class="msg" id="earnRentalEntryModalMsg"></div>
     <form id="earnRentalEntryForm">
       <div class="grid2">
-        <div><label>From (year-month) *</label><input name="start_ym" type="month" required></div>
-        <div><label>To (year-month, blank = ongoing)</label><input name="end_ym" type="month"></div>
+        <div><label>From (year-month) *</label><button type="button" id="earnEntryStartBtn" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Entry start month">—</button><input type="hidden" name="start_ym"></div>
+        <div><label>To (year-month, blank = ongoing)</label><button type="button" id="earnEntryEndBtn" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Entry end month">—</button><input type="hidden" name="end_ym"></div>
       </div>
       <div class="grid2">
         <div><label>Monthly rent *</label><input name="monthly_rent" type="text" inputmode="decimal" data-money required></div>
