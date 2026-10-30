@@ -246,7 +246,7 @@ td.num, th.num { text-align: right; }
    Stocks account. */
 .rent-card { position: relative; padding-right: 44px; }
 .rent-hidden-card { opacity: .55; }
-.invest-eye-btn { position: absolute; top: 10px; right: 10px; border: none; background: transparent; padding: 2px 3px; color: #5a6a7a; }
+.invest-eye-btn { position: absolute; top: 10px; right: 10px; border: none; background: transparent; padding: 2px 3px; color: #000; }
 .invest-eye-btn:hover { background: transparent; color: #1668c4; }
 .invest-eye-btn svg { display: block; width: 20px; height: 20px; }
 .invest-eye-btn .eye-closed { display: none; }

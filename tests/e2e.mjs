@@ -9838,6 +9838,19 @@ try {
           eyeHidden: btn.classList.contains('invest-eye-hidden'),
           title: btn.title,
           topRight: Math.abs(br.right - cr.right) <= 26 && br.top - cr.top >= 0 && br.top - cr.top <= 26,
+          // The open eye must be the symmetric two-curve almond
+          // (the old path dropped a trailing segment, so its
+          // bottom-left edge rendered as a straight line).
+          openPath: openG ? openG.querySelector('path').getAttribute('d') : null,
+          eyeColor: getComputedStyle(btn).color,
+          eyeSym: svg ? (() => {
+            const p = svg.querySelector('.eye-open path');
+            if (!p) return false;
+            const len = p.getTotalLength();
+            const a = p.getPointAtLength(len * 0.25);
+            const b = p.getPointAtLength(len * 0.75);
+            return Math.abs(a.x - b.x) < 1 && Math.abs(a.y + b.y - 24) < 1;
+          })() : false,
         };
       }, id);
       const hideState = () => page.evaluate(() => {
@@ -9876,6 +9889,8 @@ try {
       const cs0 = await cardSt(hideAcct.account.id);
       check('investments UI: each account card carries a bold-stroke SVG eye-icon button at its top-right corner, not the emoji glyph or a Hide/Show text button',
         cs0 && cs0.svg === true && cs0.textEmpty === true && cs0.openShown === true && cs0.closedShown === false && cs0.noSlash === true && cs0.eyeHidden === false && cs0.title === 'Hide' && cs0.topRight === true && cs0.strokeWidth === '2.6' && cs0.pupilRing === true && cs0.lashCount === 5, JSON.stringify(cs0));
+      check('investments UI: the open eye is the symmetric two-curve almond in black, not the old straight-edged path',
+        cs0 && cs0.openPath === 'M2 12C6 5.5 18 5.5 22 12C18 18.5 6 18.5 2 12Z' && cs0.eyeSym === true && cs0.eyeColor === 'rgb(0, 0, 0)', JSON.stringify({ openPath: cs0 && cs0.openPath, eyeSym: cs0 && cs0.eyeSym, eyeColor: cs0 && cs0.eyeColor }));
       await page.click(`[data-invest-account-card="${hideAcct.account.id}"] .invest-hide-btn`);
       await waitI(400);
       let cs = await cardSt(hideAcct.account.id);
@@ -11988,6 +12003,15 @@ try {
           eyeStroke: btn && btn.querySelector('svg') ? btn.querySelector('svg').getAttribute('stroke-width') : null,
           eyeLashes: btn ? btn.querySelectorAll('.eye-closed line').length : 0,
           eyePupilRing: btn ? (() => { const c = btn.querySelector('.eye-open circle'); return !!c && c.getAttribute('fill') === 'none'; })() : false,
+          eyeOpenPath: btn ? (btn.querySelector('.eye-open path') ? btn.querySelector('.eye-open path').getAttribute('d') : null) : null,
+          eyeSym: btn ? (() => {
+            const p = btn.querySelector('.eye-open path');
+            if (!p) return false;
+            const len = p.getTotalLength();
+            const a = p.getPointAtLength(len * 0.25);
+            const b = p.getPointAtLength(len * 0.75);
+            return Math.abs(a.x - b.x) < 1 && Math.abs(a.y + b.y - 24) < 1;
+          })() : false,
           sliceVisible: idx >= 0 ? c.getDataVisibility(idx) : null,
           center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
           marTotal: totalDs && marIdx >= 0 ? totalDs.data[marIdx] : null,
@@ -11996,6 +12020,7 @@ try {
       check('rental income panel: bold eye hide greys the card, closes the eye, drops slice + center + history total',
         hiddenState.cardGrey && hiddenState.eyeClosed && hiddenState.eyeSvg
           && hiddenState.eyeStroke === '2.6' && hiddenState.eyeLashes === 5 && hiddenState.eyePupilRing === true
+          && hiddenState.eyeOpenPath === 'M2 12C6 5.5 18 5.5 22 12C18 18.5 6 18.5 2 12Z' && hiddenState.eyeSym === true
           && hiddenState.sliceVisible === false && hiddenState.center === expectedCenter - 12000
           && hiddenState.marTotal === mar2025 - 1000,
         JSON.stringify(hiddenState));
