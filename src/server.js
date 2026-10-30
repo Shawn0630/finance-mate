@@ -3553,40 +3553,74 @@ app.post('/api/spending/cards/:id/fill/apply', requireApiAuth, (req, res) => {
 // Read-only aggregation for the Overview panel only — it changes
 // no other endpoint's contract and never feeds net worth (stocks
 // stay OUT of /api/summary; this chart is a composition view).
-//   assessedByYear: yearly assessed totals, same carry-forward
-//     rule as /api/properties/portfolio — a property counts from
-//     its first known year on; a property with a stored assessed
-//     value but no history points contributes that one point.
+//   propertyByMonth: monthly EQUITY (assessed minus outstanding
+//     principal), one point per month from January of the first
+//     assessed year through the current month. A property counts
+//     from its first known year on (same carry-forward rule as
+//     /api/properties/portfolio); a property with a stored
+//     assessed value but no history points contributes that one
+//     point. Outstanding follows the detail page exactly: the
+//     projection's balance at the month (remainingBalanceAt),
+//     the anchor when the mortgage cannot project, 0 with no
+//     mortgage — so a mortgage-free property contributes its
+//     assessed value. No BCA fetch here: assessed points come
+//     from stored history; prime refreshes under the same day
+//     gate as every other computation entry, since projections
+//     price variable segments off the prime history.
 //   stockSeries: the Stocks engine's portfolio month-end series
 //     in CAD (the /api/investments pipeline, display pinned CAD).
-// No mortgage projection, no prime fetch, no BCA fetch here:
-// assessed points come from stored history, prices/FX refresh
-// under the same day gate as the Stocks page.
 app.get('/api/overview/chart', requireApiAuth, async (req, res) => {
   const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
-  const props = db.prepare('SELECT id, assessed_value, assessed_year FROM properties ORDER BY id').all();
+  await ensureFreshPrime();
+  const cur = currentMonthKey();
+  const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
   const perProperty = props.map((p) => {
     let points = historyPoints(p.id).map((pt) => ({ year: pt.year, value: pt.value }));
     if (!points.length && p.assessed_value != null && p.assessed_year) {
       points = [{ year: p.assessed_year, value: p.assessed_value }];
     }
-    return points;
-  });
-  const years = [...new Set(perProperty.flatMap((pts) => pts.map((pt) => pt.year)))].sort((a, b) => a - b);
-  const assessedByYear = years.map((year) => {
-    let total = 0;
-    for (const pts of perProperty) {
-      let v = null;
-      for (const pt of pts) { if (pt.year <= year) v = pt.value; else break; }
-      if (v !== null) total += v;
+    if (!points.length) return null;
+    const proj = projectionFor(p);
+    return {
+      firstYear: points[0].year,
+      assessedInForce: (year) => {
+        let v = null;
+        for (const pt of points) { if (pt.year <= year) v = pt.value; else break; }
+        return v;
+      },
+      outstandingAt: (month) => {
+        if (!proj) return p.mortgage_balance ?? 0;
+        return remainingBalanceAt(proj.series, month, p.mortgage_balance ?? null, proj.payoffMonth).balance ?? 0;
+      },
+    };
+  }).filter(Boolean);
+  const propertyByMonth = [];
+  if (perProperty.length) {
+    const nextMonth = (m) => {
+      const y = Number(m.slice(0, 4)); const mo = Number(m.slice(5, 7));
+      return mo === 12 ? `${y + 1}-01` : `${y}-${String(mo + 1).padStart(2, '0')}`;
+    };
+    let m = `${Math.min(...perProperty.map((x) => x.firstYear))}-01`;
+    let guard = 0;
+    while (m <= cur && guard < 1200) {
+      const y = Number(m.slice(0, 4));
+      let total = 0;
+      for (const pp of perProperty) {
+        if (pp.firstYear > y) continue;
+        const av = pp.assessedInForce(y);
+        if (av === null) continue;
+        total += av - pp.outstandingAt(m);
+      }
+      propertyByMonth.push({ month: m, value: r2(total) });
+      m = nextMonth(m);
+      guard++;
     }
-    return { year, total: r2(total) };
-  });
+  }
   const holdings = listHoldings(db);
   const fx = await prepareInvestScope(holdings, 'CAD');
   const p = computePortfolio(db, fx, vancouverToday(), 'CAD');
   res.json({
-    assessedByYear,
+    propertyByMonth,
     stockSeries: p.series.map((s) => ({ month: s.month, value: s.value })),
     currentMonth: currentMonthKey(),
     fxMissing: fx.missing,

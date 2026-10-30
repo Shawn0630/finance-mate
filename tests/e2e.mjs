@@ -8256,24 +8256,82 @@ try {
   check('investments: a CAD holding page opens in CAD',
     r.data.display === 'CAD' && r.data.summary.value === 3300, JSON.stringify(r.data.summary));
   // ---- overview chart endpoint ----
-  // The Overview panel's data: assessed totals by year must
-  // match the property portfolio's, and the stock series must
-  // match the Stocks portfolio's CAD series — one endpoint,
-  // no recomputation, no net-worth involvement. Portfolio first
-  // (its BCA refresh, if any, lands before both reads).
+  // The Overview panel's data: the Property series is monthly
+  // EQUITY (assessed minus outstanding principal), and the stock
+  // series must match the Stocks portfolio's CAD series — one
+  // endpoint, no recomputation, no net-worth involvement.
+  // Portfolio first (its BCA refresh, if any, lands before
+  // both reads).
   const pfForOv = (await req('GET', '/api/properties/portfolio')).data;
   r = await req('GET', '/api/overview/chart');
   const ovChart = r.data;
   const invForOv = (await req('GET', '/api/investments')).data;
-  check('overview chart: assessed totals match the property portfolio',
-    JSON.stringify(ovChart.assessedByYear) === JSON.stringify(pfForOv.assessedByYear),
-    JSON.stringify({ ov: ovChart.assessedByYear, pf: pfForOv.assessedByYear }));
+  // Structural equity pin: months run contiguously from January
+  // of the first assessed year through the current month, and no
+  // month's equity exceeds that year's assessed total (every
+  // outstanding balance is >= 0). The exact assessed-minus-
+  // balance arithmetic is pinned by the fixture block below.
+  const ovPfYears = (pfForOv.assessedByYear || []).map((a) => a.year);
+  const ovAssessedInForce = (y) => {
+    let v = 0;
+    for (const a of pfForOv.assessedByYear || []) { if (a.year <= y) v = a.total; else break; }
+    return v;
+  };
+  const ovNextM = (m) => {
+    const y = Number(m.slice(0, 4)); const mo = Number(m.slice(5, 7));
+    return mo === 12 ? `${y + 1}-01` : `${y}-${String(mo + 1).padStart(2, '0')}`;
+  };
+  const ovPropMonths = (ovChart.propertyByMonth || []).map((p) => p.month);
+  let ovContig = true;
+  for (let i = 1; i < ovPropMonths.length; i++) if (ovNextM(ovPropMonths[i - 1]) !== ovPropMonths[i]) ovContig = false;
+  check('overview chart: property series is monthly equity spanning first assessed year through current month, never above assessed',
+    Array.isArray(ovChart.propertyByMonth) && !('assessedByYear' in ovChart)
+      && (ovPfYears.length === 0 ? ovPropMonths.length === 0
+        : ovPropMonths[0] === `${Math.min(...ovPfYears)}-01`
+          && ovPropMonths[ovPropMonths.length - 1] === ovChart.currentMonth && ovContig)
+      && (ovChart.propertyByMonth || []).every((p) => p.value <= ovAssessedInForce(Number(p.month.slice(0, 4))) + 0.011),
+    JSON.stringify({ first: ovPropMonths[0], last: ovPropMonths[ovPropMonths.length - 1], cur: ovChart.currentMonth, pfYears: ovPfYears }));
   check('overview chart: stock series matches the Stocks portfolio CAD series',
     JSON.stringify(ovChart.stockSeries) === JSON.stringify((invForOv.series || []).map((s) => ({ month: s.month, value: s.value }))),
     JSON.stringify({ ov: (ovChart.stockSeries || []).slice(0, 3), inv: (invForOv.series || []).slice(0, 3) }));
   check('overview chart: current month is a YYYY-MM month',
     typeof ovChart.currentMonth === 'string' && /^\d{4}-\d{2}$/.test(ovChart.currentMonth),
     JSON.stringify({ currentMonth: ovChart.currentMonth }));
+  // Equity arithmetic, exact: a dedicated mortgaged fixture with
+  // known assessed points and a fixed-rate schedule. The delta
+  // between two adjacent endpoint reads isolates this property
+  // (nothing else writes in between), and the amortization
+  // endpoint supplies the independent outstanding series.
+  const ovBefore = new Map((ovChart.propertyByMonth || []).map((p) => [p.month, p.value]));
+  r = await req('POST', '/api/properties', {
+    address: 'Equity Chart Lane, Victoria, BC',
+    mortgage_balance: 240000, mortgage_balance_date: '2024-01-15', purchase_date: '2024-01-15',
+  });
+  const ovEqPid = r.data.id;
+  await req('POST', `/api/properties/${ovEqPid}/value-history`, { year: 2024, value: 500000 });
+  await req('POST', `/api/properties/${ovEqPid}/value-history`, { year: 2025, value: 600000 });
+  await req('POST', `/api/properties/${ovEqPid}/rates`, { start_date: '2024-01-15', rate_type: 'fixed', annual_rate: 5 });
+  await req('PUT', `/api/properties/${ovEqPid}`, { amortization_years: 25 });
+  const ovEqAmort = (await req('GET', `/api/properties/${ovEqPid}/amortization`)).data;
+  const ovEqAfter = (await req('GET', '/api/overview/chart')).data;
+  const ovEqAfterMap = new Map((ovEqAfter.propertyByMonth || []).map((p) => [p.month, p.value]));
+  const ovEqRows = (ovEqAmort.series || []).filter((s) => s.month <= ovEqAfter.currentMonth);
+  const ovEqM1 = ovEqRows.length > 6 ? ovEqRows[6].month : null;
+  const ovEqM2 = ovEqRows.length > 18 ? ovEqRows[18].month : null;
+  const ovEqBal = (m) => {
+    let bal = 240000;
+    for (const s of ovEqAmort.series || []) { if (s.month <= m) bal = s.balance; else break; }
+    if (ovEqAmort.payoffMonth && ovEqAmort.payoffMonth <= m) bal = 0;
+    return bal;
+  };
+  const ovEqAssessed = (m) => (Number(m.slice(0, 4)) >= 2025 ? 600000 : 500000);
+  check('overview chart: a mortgaged property contributes assessed minus outstanding at two months where the balance moved',
+    !!ovEqM1 && !!ovEqM2 && ovEqBal(ovEqM2) < ovEqBal(ovEqM1)
+      && Math.abs((ovEqAfterMap.get(ovEqM1) - (ovBefore.get(ovEqM1) || 0)) - (ovEqAssessed(ovEqM1) - ovEqBal(ovEqM1))) < 0.011
+      && Math.abs((ovEqAfterMap.get(ovEqM2) - (ovBefore.get(ovEqM2) || 0)) - (ovEqAssessed(ovEqM2) - ovEqBal(ovEqM2))) < 0.011,
+    JSON.stringify({ m1: ovEqM1, m2: ovEqM2, bal1: ovEqM1 && ovEqBal(ovEqM1), bal2: ovEqM2 && ovEqBal(ovEqM2) }));
+  r = await req('DELETE', `/api/properties/${ovEqPid}`);
+  check('overview chart: equity fixture cleaned up', r.status === 200);
   // Account defaults derive from the holdings; a stored
   // setting beats the derivation; Auto restores it.
   r = await req('GET', `/api/investments/accounts/${invRsuId}`);
@@ -9980,12 +10038,12 @@ try {
         ovGeom.share.right <= ovGeom.chart.left + 1 && ovGeom.share.top < ovGeom.chart.bottom && ovGeom.share.bottom > ovGeom.chart.top,
         JSON.stringify(ovGeom));
       // Expectations computed from the endpoint's own data with
-      // the same merge rules the panel uses.
+      // the same merge rules the panel uses (Property = last
+      // monthly equity point at or before the month).
       const ovApi = (await req('GET', '/api/overview/chart')).data;
       const ovPropAt = (m) => {
-        const y = Number(m.slice(0, 4));
         let v = 0;
-        for (const row of ovApi.assessedByYear || []) { if (row.year <= y) v = row.total; else break; }
+        for (const p of ovApi.propertyByMonth || []) { if (p.month <= m) v = p.value; else break; }
         return v;
       };
       const ovStockAt = (m) => {
@@ -9995,9 +10053,9 @@ try {
       };
       const ovMonths = (() => {
         const set = new Set((ovApi.stockSeries || []).map((p) => p.month));
-        const years = (ovApi.assessedByYear || []).map((r) => r.year);
-        if (years.length) {
-          let m = `${Math.min(...years)}-01`;
+        const propMonths = (ovApi.propertyByMonth || []).map((r) => r.month);
+        if (propMonths.length) {
+          let m = [...propMonths].sort()[0];
           while (m <= ovApi.currentMonth) {
             set.add(m);
             const y = Number(m.slice(0, 4)); const mo = Number(m.slice(5, 7));
@@ -10031,6 +10089,18 @@ try {
           && JSON.stringify(ovSh0.data) === JSON.stringify(ovWant0.map((w) => w[1]))
           && ovSh0.title === ovTitle(ovLastMonth),
         JSON.stringify({ labels: ovSh0.labels, data: ovSh0.data, title: ovSh0.title, want: ovWant0, wantTitle: ovTitle(ovLastMonth) }));
+      // The doughnut's hole draws the rows' sum, so the dataset
+      // sum IS the center total: it must equal equity + stock.
+      check('overview UI: the doughnut center total equals equity + stock at the range-end month',
+        Math.abs(ovSh0.data.reduce((a, b) => a + b, 0) - (ovPropAt(ovLastMonth) + ovStockAt(ovLastMonth))) < 0.011,
+        JSON.stringify({ data: ovSh0.data, prop: ovPropAt(ovLastMonth), stock: ovStockAt(ovLastMonth) }));
+      const ovNoteText = await page.evaluate(() => {
+        const s = document.querySelector('#section-overview');
+        return s ? s.textContent : '';
+      });
+      check('overview UI: both deleted note lines are absent from the Overview',
+        !ovNoteText.includes('Pick a section above') && !ovNoteText.includes('This composition view does not change net worth'),
+        JSON.stringify(ovNoteText.slice(0, 300)));
       const ovHd0 = await ovChartData();
       const ovBarsOk = ovHd0 && ovHd0.sets.length === 3
         && ovHd0.sets[0].label === 'Property' && ovHd0.sets[1].label === 'Stock'

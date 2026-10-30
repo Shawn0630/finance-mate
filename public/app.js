@@ -640,7 +640,6 @@ async function loadOverviewChartImpl() {
         </div>
         <div class="invest-main-chart"><div class="chart-wrap tall"><canvas id="overviewChart"></canvas></div></div>
       </div>
-      <div class="note">Property is assessed values (BC Assessment, not market prices); Stock is holding market values in CAD. This composition view does not change net worth.</div>
     </div>`;
   const data = await api('/api/overview/chart');
   if (currentSection !== 'overview') return;
@@ -653,11 +652,11 @@ async function loadOverviewChartImpl() {
       row.before(warn);
     }
   }
-  const monthly = overviewMonthly(data.assessedByYear, data.stockSeries, data.currentMonth);
+  const monthly = overviewMonthly(data.propertyByMonth, data.stockSeries, data.currentMonth);
   investViewData.overview = {
     series: monthly.map((m) => ({ month: m.month, value: m.total })),
     monthly, cur: 'CAD',
-    assessedByYear: data.assessedByYear, stockSeries: data.stockSeries,
+    propertyByMonth: data.propertyByMonth, stockSeries: data.stockSeries,
   };
   wireInvestRangeControls('overview');
   applyInvestRange('overview');
@@ -5205,10 +5204,10 @@ const overviewShareCenterPlugin = {
 // rule, with an as-of month in the heading so a historical
 // split can never be mistaken for current. Zero-value portions
 // are dropped. Values are CAD; nothing here converts or fetches.
-function drawOverviewShareChart(assessedByYear, stockSeries, endMonth = null) {
+function drawOverviewShareChart(propertyByMonth, stockSeries, endMonth = null) {
   const canvas = $('#overviewShareChart');
   if (!canvas) return;
-  const { rows, total } = overviewShareAtMonth(assessedByYear, stockSeries, endMonth);
+  const { rows, total } = overviewShareAtMonth(propertyByMonth, stockSeries, endMonth);
   const title = $('#overviewShareTitle');
   if (title) title.textContent = endMonth ? `Asset share · ${formatYM(endMonth)}` : 'Asset share';
   const empty = $('#overviewShareEmpty');
@@ -5386,7 +5385,7 @@ function applyInvestRange(level) {
     // the same range-end rule as the Stocks share doughnut.
     const fMonths = (d.monthly || []).filter((x) => inR(x.month));
     conf.set(drawOverviewHistoryChart($(conf.canvas), fMonths, 'CAD'));
-    drawOverviewShareChart(d.assessedByYear, d.stockSeries, r ? r.end : null);
+    drawOverviewShareChart(d.propertyByMonth, d.stockSeries, r ? r.end : null);
   } else {
     conf.set(level === 'investments'
       ? drawInvestPortfolioChart($(conf.canvas), vis ? { ...d, gainUnknown: vis.gainUnknown } : d, fSeries, d.cur)
