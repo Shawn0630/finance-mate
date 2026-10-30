@@ -9666,9 +9666,27 @@ function spendTxTableHtml(transactions, showCard) {
   return `<table class="tbl"><thead><tr><th>Date</th>${showCard ? '<th>Card</th>' : ''}<th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// Transaction form Category combobox: one input + datalist holding the
+// presets plus every category already used in stored transactions, so a
+// custom category typed once is offered next time. Presets are captured
+// from the static markup on first call; used customs append after them.
+let spendPresetCategories = null;
+function renderSpendCategoryList(used) {
+  const dl = $('#spendCategoryList');
+  if (!dl) return;
+  if (!spendPresetCategories) spendPresetCategories = [...dl.querySelectorAll('option')].map((o) => o.value);
+  const all = [...spendPresetCategories];
+  for (const c of used || []) {
+    const v = String(c || '').trim();
+    if (v && !all.includes(v)) all.push(v);
+  }
+  dl.innerHTML = all.map((c) => `<option value="${esc(c)}">`).join('');
+}
+
 async function loadSpending() {
   const data = await api('/api/spending');
   spendData = data;
+  renderSpendCategoryList(data.categories);
   investViewData.spending = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: data.cards };
   $('#spendCardList').innerHTML = data.cards.length ? data.cards.map((c) => `
     <div class="card breakdown-card" onclick="location.hash='#spending/card/${c.id}'">
@@ -9687,6 +9705,7 @@ async function loadSpending() {
 async function loadSpendCard(id) {
   const data = await api(`/api/spending/cards/${id}`);
   spendCardData = data;
+  renderSpendCategoryList(data.categories);
   investViewData.spendCard = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: [data.card] };
   $('#spendDetailTitle').textContent = `${data.card.name} · ••••${data.card.last4}`;
   const infoLines = [];

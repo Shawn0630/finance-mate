@@ -3260,6 +3260,14 @@ function listAllSpendTx() {
     `SELECT t.*, c.name AS card_name FROM spend_transactions t
      JOIN spend_cards c ON c.id = t.card_id ORDER BY t.date DESC, t.id DESC LIMIT 2000`).all();
 }
+// Distinct categories already used in stored transactions, for the
+// transaction form's combobox (presets + used customs, merged client-side).
+function listSpendCategories() {
+  return db.prepare(
+    `SELECT DISTINCT category FROM spend_transactions
+     WHERE category IS NOT NULL AND TRIM(category) != '' ORDER BY category`).all()
+    .map((r) => r.category);
+}
 function spendCardView(card) {
   const tx = listSpendTx(card.id);
   const charges = tx.filter((t) => Number(t.amount) < 0);
@@ -3300,7 +3308,7 @@ const SPEND_AI_UNCONFIGURED = 'The server has no LLM configured. Set LLM_BASE_UR
 app.get('/api/spending', requireApiAuth, (req, res) => {
   const cards = listSpendCards().map(spendCardView);
   const transactions = listAllSpendTx();
-  res.json({ cards, transactions, monthly: spendMonthly(transactions) });
+  res.json({ cards, transactions, monthly: spendMonthly(transactions), categories: listSpendCategories() });
 });
 app.post('/api/spending/cards', requireApiAuth, (req, res) => {
   const v = validSpendCardInput(req.body || {});
@@ -3328,7 +3336,7 @@ app.get('/api/spending/cards/:id', requireApiAuth, (req, res) => {
   const card = getSpendCard(Number(req.params.id));
   if (!card) return res.status(404).json({ error: 'card not found' });
   const transactions = listSpendTx(card.id);
-  res.json({ card: spendCardView(card), transactions, monthly: spendMonthly(transactions) });
+  res.json({ card: spendCardView(card), transactions, monthly: spendMonthly(transactions), categories: listSpendCategories() });
 });
 app.post('/api/spending/cards/:id/transactions', requireApiAuth, (req, res) => {
   const card = getSpendCard(Number(req.params.id));

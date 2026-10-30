@@ -12678,6 +12678,122 @@ try {
   check('import preview cleanup: card deleted', r.status === 200);
   fs.rmSync(prevTmpDir, { recursive: true, force: true });
 
+  // Transaction form Category combobox: one input + datalist holding
+  // the presets plus categories already used; a custom name typed once
+  // is offered next time. Synthetic data only.
+  r = await req('POST', '/api/spending/cards', { name: 'Combo', issuer: 'CIBC', last4: '4242' });
+  check('category combobox: card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const comboCardId = r.data.id;
+  r = await req('POST', `/api/spending/cards/${comboCardId}/transactions`, { date: '2026-10-19', merchant: 'PET STORE', type: 'charge', amount: 20, category: 'PetCareX' });
+  check('category combobox: custom-category transaction created', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', '/api/spending');
+  check('category combobox: API lists the used custom category', r.status === 200 && Array.isArray(r.data.categories) && r.data.categories.includes('PetCareX'), JSON.stringify({ categories: r.data.categories }));
+
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('category combobox browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardP = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResP = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueP = loginResP.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserP = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserP.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardP({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueP, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#spending/card/${comboCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1200);
+      await page.click('#spendDetailAddTxBtn');
+      await waitP(300);
+      const comboUi = await page.evaluate(() => {
+        const input = document.querySelector('#spendTxForm input[name=category]');
+        const opts = [...document.querySelectorAll('#spendCategoryList option')].map((o) => o.value);
+        return {
+          inputs: document.querySelectorAll('#spendTxForm input[name=category]').length,
+          selects: document.querySelectorAll('#spendTxForm select[name=category]').length,
+          listAttr: input ? input.getAttribute('list') : null,
+          hasDining: opts.includes('Dining'),
+          hasPetCareX: opts.includes('PetCareX'),
+        };
+      });
+      check('category combobox: single input + datalist offers presets and the used custom category',
+        comboUi.inputs === 1 && comboUi.selects === 0 && comboUi.listAttr === 'spendCategoryList' && comboUi.hasDining && comboUi.hasPetCareX,
+        JSON.stringify(comboUi));
+      await page.evaluate(() => { document.querySelector('#spendTxForm [name=date]').value = '2026-10-20'; });
+      await page.type('#spendTxForm [name=merchant]', 'GARDEN SHOP');
+      await page.select('#spendTxForm [name=type]', 'charge');
+      await page.type('#spendTxForm [name=amount]', '12.34');
+      await page.type('#spendTxForm [name=category]', 'GardenY');
+      await page.click('#spendTxForm button[type=submit]');
+      await waitP(1500);
+      await page.click('#spendDetailAddTxBtn');
+      await waitP(300);
+      const comboUi2 = await page.evaluate(() => {
+        const opts = [...document.querySelectorAll('#spendCategoryList option')].map((o) => o.value);
+        return { hasGardenY: opts.includes('GardenY'), hasPetCareX: opts.includes('PetCareX') };
+      });
+      check('category combobox: a typed custom name is offered afterwards',
+        comboUi2.hasGardenY && comboUi2.hasPetCareX, JSON.stringify(comboUi2));
+      r = await req('GET', `/api/spending/cards/${comboCardId}`);
+      const gardenTx = (r.data.transactions || []).find((t) => t.merchant === 'GARDEN SHOP');
+      check('category combobox: UI-saved transaction stored with the custom category',
+        !!gardenTx && gardenTx.category === 'GardenY', JSON.stringify(gardenTx));
+      if (gardenTx) {
+        await page.evaluate((id) => {
+          const btn = document.querySelector(`button[onclick="spendEditTx(${id})"]`);
+          if (btn) btn.click();
+        }, gardenTx.id);
+        await waitP(300);
+        const editVal = await page.evaluate(() => {
+          const input = document.querySelector('#spendTxForm input[name=category]');
+          return input ? input.value : null;
+        });
+        check('category combobox: editing shows the stored category in the field', editVal === 'GardenY', JSON.stringify({ editVal }));
+      }
+    } finally { await browserP.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${comboCardId}`);
+  check('category combobox cleanup: card deleted', r.status === 200);
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
