@@ -12249,6 +12249,186 @@ try {
   r = await req('GET', '/api/spending');
   check('spending: cleanup leaves no cards', r.status === 200 && r.data.cards.length === 0);
 
+  // Card fields round: credit limit, file balance + balance check
+  // with adjustment, type-aware kinds, file-upload import, Fill
+  // placement, danger Delete. Synthetic QFX only — the shape
+  // mirrors a real CIBC file (LEDGERBAL -309.85, DTASOF
+  // 2026-10-30) without using it.
+  r = await req('POST', '/api/spending/cards', { name: 'Limit', issuer: 'RBC', last4: '1111', credit_limit: 5000 });
+  check('spending: card created with a credit limit', r.status === 201 && r.data.credit_limit === 5000, JSON.stringify(r.data));
+  const limCardId = r.data.id;
+  r = await req('PUT', `/api/spending/cards/${limCardId}`, { name: 'Limit', issuer: 'RBC', last4: '1111', credit_limit: 7500 });
+  check('spending: credit limit edits', r.status === 200 && r.data.credit_limit === 7500, JSON.stringify(r.data));
+  r = await req('PUT', `/api/spending/cards/${limCardId}`, { name: 'Limit', issuer: 'RBC', last4: '1111', credit_limit: null });
+  check('spending: blank credit limit clears to null', r.status === 200 && r.data.credit_limit === null, JSON.stringify(r.data));
+  r = await req('POST', '/api/spending/cards', { name: 'Bad', issuer: 'RBC', last4: '2222', credit_limit: -100 });
+  check('spending: a negative credit limit is rejected', r.status === 400 && /positive/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await req('POST', '/api/spending/cards', { name: 'Plain', issuer: 'RBC', last4: '3333' });
+  check('spending: a card without a limit stores null', r.status === 201 && r.data.credit_limit === null, JSON.stringify(r.data));
+  const plainCardId = r.data.id;
+  r = await req('POST', '/api/spending/cards', { name: 'CIBC', issuer: 'CIBC', last4: '9586', credit_limit: 5000 });
+  check('spending: balance-check card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const balCardId = r.data.id;
+  const balQfx = `<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CCACCTFROM><ACCTID>9999888877776666</ACCTID></CCACCTFROM>`
+    + `<LEDGERBAL><BALAMT>-309.85</BALAMT><DTASOF>20261030125401</DTASOF></LEDGERBAL><BANKTRANLIST>`
+    + `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261005</DTPOSTED><TRNAMT>-100.00</TRNAMT><FITID>CB1</FITID><NAME>WHOLE FOODS</NAME></STMTTRN>`
+    + `<STMTTRN><TRNTYPE>CREDIT</TRNTYPE><DTPOSTED>20261006</DTPOSTED><TRNAMT>40.00</TRNAMT><FITID>CB2</FITID><NAME>PAYMENT - THANK YOU</NAME></STMTTRN>`
+    + `<STMTTRN><TRNTYPE>CREDIT</TRNTYPE><DTPOSTED>20261007</DTPOSTED><TRNAMT>25.00</TRNAMT><FITID>CB3</FITID><NAME>AMAZON</NAME></STMTTRN>`
+    + `</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`;
+  r = await req('POST', `/api/spending/cards/${balCardId}/import-qfx/parse`, { qfxText: balQfx });
+  check('spending: parse reads the file balance and type-aware kinds',
+    r.status === 200 && r.data.balance && r.data.balance.owed === 309.85 && r.data.balance.asof === '2026-10-30'
+    && r.data.rows.map((x) => x.kind).join(',') === 'charge,payment,refund', JSON.stringify(r.data));
+  check('spending: balance check shows both figures, difference and the reconciling adjustment',
+    r.status === 200 && r.data.balanceCheck && r.data.balanceCheck.fileOwed === 309.85 && r.data.balanceCheck.computedOwed === 35
+    && r.data.balanceCheck.difference === 274.85 && r.data.balanceCheck.adjustmentAmount === -274.85,
+    JSON.stringify(r.data.balanceCheck));
+  const balParsedRows = r.data.rows;
+  const balCheck = r.data.balanceCheck;
+  r = await req('POST', `/api/spending/cards/${balCardId}/import-qfx/apply`, {
+    rows: balParsedRows, fileOwed: balCheck.fileOwed, balanceAsof: balCheck.asof, includeAdjustment: true,
+  });
+  check('spending: apply writes the rows plus exactly one adjustment and refreshes the balance',
+    r.status === 201 && r.data.inserted === 3 && r.data.adjustment && r.data.adjustment.amount === -274.85
+    && r.data.balance && r.data.balance.owed === 309.85 && r.data.balance.asof === '2026-10-30', JSON.stringify(r.data));
+  r = await req('GET', `/api/spending/cards/${balCardId}`);
+  const balTx = r.data.transactions || [];
+  const balAdj = balTx.find((t) => t.kind === 'adjustment');
+  const balOwed = Math.round(-balTx.reduce((n, t) => n + Number(t.amount), 0) * 100) / 100;
+  check('spending: adjustment reconciles the balance while spending totals exclude it',
+    r.status === 200 && r.data.card.totalSpent === 100 && r.data.card.balance_owed === 309.85 && r.data.card.balance_asof === '2026-10-30'
+    && !!balAdj && balAdj.amount === -274.85 && balOwed === 309.85,
+    JSON.stringify({ totalSpent: r.data.card.totalSpent, owed: r.data.card.balance_owed, adj: balAdj, recomputed: balOwed }));
+  r = await req('POST', `/api/spending/cards/${balCardId}/import-qfx/parse`, { qfxText: balQfx });
+  check('spending: re-parse after reconciliation shows no difference',
+    r.status === 200 && r.data.balanceCheck && r.data.balanceCheck.difference === 0, JSON.stringify(r.data.balanceCheck));
+  r = await req('POST', '/api/spending/cards', { name: 'NoAdj', issuer: 'CIBC', last4: '4444' });
+  check('spending: no-adjustment card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const noAdjCardId = r.data.id;
+  r = await req('POST', `/api/spending/cards/${noAdjCardId}/import-qfx/parse`, { qfxText: balQfx });
+  const noAdjParsed = r.data.rows;
+  const noAdjCheck = r.data.balanceCheck;
+  r = await req('POST', `/api/spending/cards/${noAdjCardId}/import-qfx/apply`, {
+    rows: noAdjParsed, fileOwed: noAdjCheck.fileOwed, balanceAsof: noAdjCheck.asof, includeAdjustment: false,
+  });
+  check('spending: declining the adjustment still refreshes the balance and writes no adjustment row',
+    r.status === 201 && r.data.adjustment === null && r.data.balance && r.data.balance.owed === 309.85, JSON.stringify(r.data));
+  r = await req('GET', `/api/spending/cards/${noAdjCardId}`);
+  check('spending: declined-adjustment card has no adjustment row',
+    !(r.data.transactions || []).some((t) => t.kind === 'adjustment') && r.data.card.balance_owed === 309.85,
+    JSON.stringify(r.data.transactions.map((t) => t.kind)));
+  r = await req('POST', `/api/spending/cards/${noAdjCardId}/transactions`, { date: '2026-10-08', merchant: 'SHOP', type: 'payment', amount: 50, category: '' });
+  check('spending: manual payment stores kind payment', r.status === 201 && r.data.kind === 'payment', JSON.stringify(r.data));
+  r = await req('POST', `/api/spending/cards/${noAdjCardId}/transactions`, { date: '2026-10-09', merchant: 'SHOP', type: 'charge', amount: 10, category: '' });
+  check('spending: manual charge stores kind charge', r.status === 201 && r.data.kind === 'charge', JSON.stringify(r.data));
+
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending card-fields browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardF = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResF = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueF = loginResF.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserF = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserF.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardF({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueF, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitF = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#spending/card/${balCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1200);
+      const balUi = await page.evaluate(() => {
+        const info = document.querySelector('#spendDetailCardInfo');
+        const fillBtn = document.querySelector('#spendFillToggleBtn');
+        const importBtn = document.querySelector('#spendDetailImportBtn');
+        const panel = document.querySelector('#spendFillPanel');
+        const delBtn = document.querySelector('#spendDetailDeleteBtn');
+        return {
+          info: info ? info.textContent : null,
+          fillPresent: !!fillBtn, fillVisible: !!fillBtn && fillBtn.getBoundingClientRect().height > 0,
+          sameHead: !!fillBtn && !!importBtn && fillBtn.closest('.section-head') === importBtn.closest('.section-head'),
+          panelHiddenBefore: !!panel && panel.classList.contains('hidden'),
+          delDanger: !!delBtn && delBtn.classList.contains('danger'),
+        };
+      });
+      check('spending UI: detail page shows limit + balance with as-of, Fill beside Import, danger Delete',
+        balUi.info && balUi.info.includes('Credit limit $5,000.00') && balUi.info.includes('Balance owed $309.85') && balUi.info.includes('as of 2026-10-30')
+        && balUi.fillPresent && balUi.fillVisible && balUi.sameHead && balUi.panelHiddenBefore && balUi.delDanger,
+        JSON.stringify(balUi));
+      await page.click('#spendFillToggleBtn');
+      await waitF(300);
+      const fillOpen = await page.evaluate(() => {
+        const panel = document.querySelector('#spendFillPanel');
+        return !!panel && !panel.classList.contains('hidden') && panel.getBoundingClientRect().height > 0;
+      });
+      check('spending UI: clicking Fill with AI expands the Fill panel', fillOpen, JSON.stringify({ fillOpen }));
+      await page.click('#spendDetailImportBtn');
+      await waitF(300);
+      const importUi = await page.evaluate(() => {
+        const fileInput = document.querySelector('#spendImportFile');
+        return { hasFile: !!fileInput && fileInput.type === 'file', hasTextarea: !!document.querySelector('#spendImportText') };
+      });
+      check('spending UI: import modal has a file input and no paste textarea',
+        importUi.hasFile && !importUi.hasTextarea, JSON.stringify(importUi));
+      await page.goto(`http://ff.local/#spending/card/${plainCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1200);
+      const plainInfo = await page.evaluate(() => {
+        const info = document.querySelector('#spendDetailCardInfo');
+        return info ? info.textContent.trim() : null;
+      });
+      check('spending UI: a card with no limit and no balance shows no info line',
+        plainInfo === '', JSON.stringify({ plainInfo }));
+    } finally { await browserF.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${limCardId}`);
+  check('spending card-fields cleanup: limit card deleted', r.status === 200);
+  r = await req('DELETE', `/api/spending/cards/${plainCardId}`);
+  check('spending card-fields cleanup: plain card deleted', r.status === 200);
+  r = await req('DELETE', `/api/spending/cards/${balCardId}`);
+  check('spending card-fields cleanup: balance card deleted', r.status === 200);
+  r = await req('DELETE', `/api/spending/cards/${noAdjCardId}`);
+  check('spending card-fields cleanup: no-adjustment card deleted', r.status === 200);
+  r = await req('GET', '/api/spending');
+  check('spending card-fields cleanup leaves no cards', r.status === 200 && r.data.cards.length === 0);
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above

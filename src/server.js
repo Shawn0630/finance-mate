@@ -38,7 +38,7 @@ import {
 import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
 import {
   SPEND_CATEGORIES, parseQfx, validateSpendApply, normalizeMerchant, validSpendDate,
-  spendMonthly, spendTotal,
+  spendMonthly, spendTotal, spendBalance,
 } from './spending.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -3275,7 +3275,14 @@ function validSpendCardInput(b) {
   const last4 = String((b && b.last4) || '').trim();
   if (!/^\d{4}$/.test(last4)) return { error: 'Enter only the last 4 digits of the card number.' };
   const issuer = b && b.issuer != null ? String(b.issuer).trim() : '';
-  return { name, issuer: issuer || null, last4 };
+  // Credit limit is optional: blank stays NULL, a figure must be
+  // a positive number.
+  let creditLimit = null;
+  if (b && b.credit_limit != null && String(b.credit_limit).trim() !== '') {
+    creditLimit = Number(b.credit_limit);
+    if (!Number.isFinite(creditLimit) || creditLimit <= 0) return { error: 'Credit limit must be a positive number.' };
+  }
+  return { name, issuer: issuer || null, last4, credit_limit: creditLimit };
 }
 function spendMerchantMappings(userId) {
   const row = db.prepare("SELECT value FROM user_preferences WHERE user_id = ? AND key = 'spend_merchant_categories'").get(userId);
@@ -3297,8 +3304,8 @@ app.post('/api/spending/cards', requireApiAuth, (req, res) => {
   const v = validSpendCardInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
   const ts = nowIso();
-  const info = db.prepare('INSERT INTO spend_cards (name, issuer, last4, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
-    .run(v.name, v.issuer, v.last4, ts, ts);
+  const info = db.prepare('INSERT INTO spend_cards (name, issuer, last4, credit_limit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(v.name, v.issuer, v.last4, v.credit_limit, ts, ts);
   res.status(201).json(spendCardView(getSpendCard(info.lastInsertRowid)));
 });
 app.put('/api/spending/cards/:id', requireApiAuth, (req, res) => {
@@ -3306,8 +3313,8 @@ app.put('/api/spending/cards/:id', requireApiAuth, (req, res) => {
   if (!card) return res.status(404).json({ error: 'card not found' });
   const v = validSpendCardInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  db.prepare('UPDATE spend_cards SET name = ?, issuer = ?, last4 = ?, updated_at = ? WHERE id = ?')
-    .run(v.name, v.issuer, v.last4, nowIso(), card.id);
+  db.prepare('UPDATE spend_cards SET name = ?, issuer = ?, last4 = ?, credit_limit = ?, updated_at = ? WHERE id = ?')
+    .run(v.name, v.issuer, v.last4, v.credit_limit, nowIso(), card.id);
   res.json(spendCardView(getSpendCard(card.id)));
 });
 app.delete('/api/spending/cards/:id', requireApiAuth, (req, res) => {
@@ -3331,11 +3338,12 @@ app.post('/api/spending/cards/:id/transactions', requireApiAuth, (req, res) => {
   const raw = Number(b.amount);
   if (!Number.isFinite(raw) || raw === 0) return res.status(400).json({ error: 'amount must be a non-zero number.' });
   const amount = b.type === 'payment' ? Math.abs(raw) : -Math.abs(raw);
+  const kind = b.type === 'payment' ? 'payment' : 'charge';
   const category = b.category != null ? String(b.category).trim() : '';
   const info = db.prepare(
-    `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, 'manual', ?)`).run(
-    card.id, b.date, merchant, b.memo != null ? String(b.memo) : null, category || null, amount, nowIso());
+    `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, 'manual', ?, ?)`).run(
+    card.id, b.date, merchant, b.memo != null ? String(b.memo) : null, category || null, amount, kind, nowIso());
   res.status(201).json(db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(info.lastInsertRowid));
 });
 app.put('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
@@ -3356,38 +3364,96 @@ app.delete('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
 });
 // QFX import, step 1: parse writes nothing. Rows already on the card
 // are flagged existing so the preview can show what Apply will skip.
+// When the file carries a ledger balance, the preview also carries
+// the balance check: the file's owed figure against the owed figure
+// computed from stored rows plus the new rows this import would
+// insert (adjustments included). A mismatch is normal on a first
+// import — the file covers only its window, so the difference is
+// the pre-window owed — and the preview proposes exactly one
+// adjustment row for it; the prompt precedes any write.
 app.post('/api/spending/cards/:id/import-qfx/parse', requireApiAuth, (req, res) => {
   const card = getSpendCard(Number(req.params.id));
   if (!card) return res.status(404).json({ error: 'card not found' });
   const text = req.body && typeof req.body.qfxText === 'string' ? req.body.qfxText : '';
-  if (!text.trim()) return res.status(400).json({ error: 'Paste QFX file contents to parse.' });
+  if (!text.trim()) return res.status(400).json({ error: 'Choose a QFX file to parse.' });
   const parsed = parseQfx(text);
   const existing = new Set(listSpendTx(card.id).map((t) => t.fitid).filter(Boolean));
+  let balanceCheck = null;
+  if (parsed.balance) {
+    // The check is framed post-import: the new rows are what Apply
+    // will insert, so the computed figure includes them and the
+    // proposed adjustment equals minus the difference exactly —
+    // the preview number is the number Apply will write. On a
+    // first import the difference is the pre-window owed.
+    const newRows = parsed.rows.filter((r) => !existing.has(r.fitid));
+    const computedOwed = spendBalance([...listSpendTx(card.id), ...newRows]);
+    const difference = Math.round((parsed.balance.owed - computedOwed) * 100) / 100;
+    balanceCheck = {
+      fileOwed: parsed.balance.owed,
+      asof: parsed.balance.asof,
+      computedOwed,
+      difference,
+      adjustmentAmount: Math.round((computedOwed - parsed.balance.owed) * 100) / 100,
+    };
+  }
   res.json({
     accountId: parsed.accountId,
+    balance: parsed.balance,
+    balanceCheck,
     rows: parsed.rows.map((r) => ({ ...r, existing: existing.has(r.fitid) })),
     dropped: parsed.dropped,
   });
 });
 // QFX import, step 2: one atomic transaction. Rows are re-validated
-// here — the preview is client state, never trusted.
+// here — the preview is client state, never trusted. When the
+// client passes the file balance, the card's stored balance is
+// refreshed from it; when it also confirms the adjustment, the
+// server recomputes the adjustment from stored rows + the new
+// rows (never trusting a client amount) and inserts exactly one
+// adjustment row when the recomputed figure is non-zero. The
+// adjustment is kind 'adjustment': excluded from spending totals,
+// included in the balance computation.
 app.post('/api/spending/cards/:id/import-qfx/apply', requireApiAuth, (req, res) => {
   const card = getSpendCard(Number(req.params.id));
   if (!card) return res.status(404).json({ error: 'card not found' });
   const existing = new Set(listSpendTx(card.id).map((t) => t.fitid).filter(Boolean));
   const v = validateSpendApply((req.body || {}).rows, existing);
+  const b = req.body || {};
+  const fileOwed = Number(b.fileOwed);
+  const hasFileBalance = Number.isFinite(fileOwed);
+  const balanceAsof = validSpendDate(b.balanceAsof) ? b.balanceAsof : null;
   const ts = nowIso();
+  let adjustment = null;
   try {
     db.transaction(() => {
       const ins = db.prepare(
-        `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'qfx', ?)`);
-      for (const r of v.valid) ins.run(card.id, r.date, r.merchant, r.memo, null, r.amount, r.fitid, ts);
+        `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'qfx', ?, ?)`);
+      for (const r of v.valid) ins.run(card.id, r.date, r.merchant, r.memo, null, r.amount, r.fitid, r.kind, ts);
+      if (hasFileBalance) {
+        db.prepare('UPDATE spend_cards SET balance_owed = ?, balance_asof = ?, updated_at = ? WHERE id = ?')
+          .run(fileOwed, balanceAsof, ts, card.id);
+        if (b.includeAdjustment) {
+          const postOwed = spendBalance(listSpendTx(card.id));
+          const adj = Math.round((postOwed - fileOwed) * 100) / 100;
+          if (adj !== 0) {
+            db.prepare(
+              `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
+               VALUES (?, ?, 'Balance adjustment', NULL, NULL, ?, NULL, 'qfx', 'adjustment', ?)`)
+              .run(card.id, balanceAsof || ts.slice(0, 10), adj, ts);
+            adjustment = { amount: adj };
+          }
+        }
+      }
     })();
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
-  res.status(201).json({ inserted: v.valid.length, skipped: v.skipped.length, dropped: v.dropped });
+  res.status(201).json({
+    inserted: v.valid.length, skipped: v.skipped.length, dropped: v.dropped,
+    adjustment,
+    balance: hasFileBalance ? { owed: fileOwed, asof: balanceAsof } : null,
+  });
 });
 // AI category analysis (SPENDING-GLOBAL): one pass over ALL
 // existing uncategorized transactions across ALL cards. Merchants
@@ -3541,8 +3607,8 @@ app.post('/api/spending/cards/:id/fill/apply', requireApiAuth, (req, res) => {
   const ts = nowIso();
   db.transaction(() => {
     const ins = db.prepare(
-      `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, 'ai', ?)`);
+      `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'ai', 'charge', ?)`);
     for (const r of valid) ins.run(card.id, r.date, r.merchant, r.memo, r.category, r.amount, ts);
   })();
   res.status(201).json({ inserted: valid.length, dropped });

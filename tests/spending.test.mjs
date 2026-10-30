@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import {
   SPEND_CATEGORIES, parseQfx, validateSpendApply, normalizeMerchant,
   maskAccountId, validSpendDate, spendMonthly, spendShareByCard,
-  spendShareByCategory, spendTotal,
+  spendShareByCategory, spendTotal, spendBalance, spendKind,
+  isPaymentMerchant,
 } from '../src/spending.js';
 
 const QFX_CLOSED = `OFXHEADER:100
@@ -108,4 +109,53 @@ test('validateSpendApply: skips existing, drops malformed', () => {
 test('category list is stable for AI prompts', () => {
   assert.ok(SPEND_CATEGORIES.includes('Groceries'));
   assert.ok(SPEND_CATEGORIES.includes('Other'));
+});
+
+test('parseQfx: LEDGERBAL balance (owed = -BALAMT, DTASOF date)', () => {
+  const withBal = `<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CCACCTFROM><ACCTID>1111</ACCTID></CCACCTFROM>`
+    + `<LEDGERBAL><BALAMT>-309.85</BALAMT><DTASOF>20261030125401</DTASOF></LEDGERBAL><BANKTRANLIST></BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`;
+  const p = parseQfx(withBal);
+  assert.deepEqual(p.balance, { owed: 309.85, asof: '2026-10-30' });
+  // SGML dialect: unclosed tags, AVAILBAL after LEDGERBAL.
+  const sgmlBal = `<OFX><STMTRS><LEDGERBAL><BALAMT>-50<DTASOF>20261001<AVAILBAL><BALAMT>100<BANKTRANLIST></STMTRS></OFX>`;
+  assert.deepEqual(parseQfx(sgmlBal).balance, { owed: 50, asof: '2026-10-01' });
+  assert.equal(parseQfx(QFX_CLOSED).balance, null);
+});
+
+test('spendKind: a positive amount is a payment only for a payment merchant', () => {
+  assert.equal(spendKind({ amount: 100, merchant: 'PAYMENT - THANK YOU' }), 'payment');
+  assert.equal(spendKind({ amount: 100, merchant: 'PAYMENT THANK YOU/PAIEMEN' }), 'payment');
+  assert.equal(spendKind({ amount: 100, merchant: 'PAIEMENT' }), 'payment');
+  assert.equal(spendKind({ amount: 25, merchant: 'AMAZON' }), 'refund');
+  assert.equal(spendKind({ amount: 25, merchant: 'COSTCO REFUND' }), 'refund');
+  assert.equal(spendKind({ amount: -10, merchant: 'PAYMENT - THANK YOU' }), 'charge');
+  assert.equal(isPaymentMerchant('PAYMENTUS'), false);
+});
+
+test('parseQfx: merchant refund rows carry kind refund, not payment', () => {
+  const f = `<OFX><STMTRS><BANKTRANLIST>`
+    + `<STMTTRN><TRNTYPE>CREDIT</TRNTYPE><DTPOSTED>20261007</DTPOSTED><TRNAMT>25.00</TRNAMT><FITID>R1</FITID><NAME>AMAZON</NAME></STMTTRN>`
+    + `</BANKTRANLIST></STMTRS></OFX>`;
+  const p = parseQfx(f);
+  assert.equal(p.rows.length, 1);
+  assert.equal(p.rows[0].kind, 'refund');
+  const v = validateSpendApply(p.rows, new Set());
+  assert.equal(v.valid[0].kind, 'refund');
+});
+
+test('spendBalance and adjustment exclusion: balance reconciles, totals ignore adjustments', () => {
+  const tx = [
+    { date: '2026-10-01', amount: -100, kind: 'charge' },
+    { date: '2026-10-02', amount: 40, kind: 'payment' },
+    { date: '2026-10-03', amount: 25, kind: 'refund' },
+    { date: '2026-10-30', amount: -274.85, kind: 'adjustment' },
+  ];
+  // Stored sum -309.85 → owed 309.85 (the file balance).
+  assert.equal(spendBalance(tx), 309.85);
+  // Spending totals count the charge only: not the payment,
+  // not the refund, not the adjustment.
+  assert.equal(spendTotal(tx), 100);
+  assert.deepEqual(spendMonthly(tx), [{ month: '2026-10', total: 100 }]);
+  assert.deepEqual(spendShareByCategory(tx).map((s) => [s.label, s.total]), [['Uncategorized', 100]]);
+  assert.deepEqual(spendShareByCategory([{ ...tx[0], category: 'Groceries' }]).map((s) => [s.label, s.total]), [['Groceries', 100]]);
 });

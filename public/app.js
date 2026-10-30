@@ -9553,7 +9553,7 @@ function spendGroupByCard(tx, cards) {
   const names = new Map((cards || []).map((c) => [c.id, c.name]));
   const totals = new Map();
   for (const t of tx) {
-    if (!(Number(t.amount) < 0)) continue;
+    if (t.kind === 'adjustment' || !(Number(t.amount) < 0)) continue;
     totals.set(t.card_id, (totals.get(t.card_id) || 0) + -Number(t.amount));
   }
   return [...totals.entries()]
@@ -9565,7 +9565,7 @@ function spendGroupByCard(tx, cards) {
 function spendGroupByCategory(tx) {
   const totals = new Map();
   for (const t of tx) {
-    if (!(Number(t.amount) < 0)) continue;
+    if (t.kind === 'adjustment' || !(Number(t.amount) < 0)) continue;
     const label = (t.category || '').trim() || 'Uncategorized';
     totals.set(label, (totals.get(label) || 0) + -Number(t.amount));
   }
@@ -9625,17 +9625,27 @@ function drawSpendCharts(level, d, r) {
   else { spendChart = hist; window.__fmCharts.spend = hist; }
 }
 
+function spendTxTypeLabel(t) {
+  if (t.kind === 'adjustment') return 'Adjustment';
+  if (t.kind === 'refund') return 'Refund';
+  if (t.kind === 'payment') return 'Payment';
+  if (t.kind === 'charge') return 'Charge';
+  return Number(t.amount) >= 0 ? 'Payment' : 'Charge';
+}
 function spendTxTableHtml(transactions, showCard) {
   if (!transactions.length) return '<div class="note">No transactions yet.</div>';
   const rows = transactions.map((t) => {
-    const isPayment = Number(t.amount) >= 0;
-    const amt = isPayment ? '−' + money(Number(t.amount)) : money(-Number(t.amount));
+    // Charges display as positive spending; payments display
+    // negated; an adjustment displays signed, so it never reads
+    // as spending.
+    const amt = t.kind === 'adjustment' ? money(Number(t.amount))
+      : (Number(t.amount) >= 0 ? '−' + money(Number(t.amount)) : money(-Number(t.amount)));
     return `<tr>
       <td>${esc(t.date)}</td>
       ${showCard ? `<td>${esc(t.card_name || '')}</td>` : ''}
       <td>${esc(t.merchant)}</td>
       <td>${esc(t.category || '—')}</td>
-      <td>${isPayment ? 'Payment' : 'Charge'}</td>
+      <td>${spendTxTypeLabel(t)}</td>
       <td>${amt}</td>
       <td><button class="small" onclick="spendEditTx(${t.id})">Edit</button> <button class="small" onclick="spendDeleteTx(${t.id})">Delete</button></td>
     </tr>`;
@@ -9652,6 +9662,8 @@ async function loadSpending() {
       <div class="k">${esc(c.name)}${c.issuer ? ' · ' + esc(c.issuer) : ''} · ••••${esc(c.last4)}</div>
       <div class="v">${money(c.totalSpent)}</div>
       <div class="n">${c.txCount} transactions${c.lastTxDate ? ' · last ' + esc(c.lastTxDate) : ''}</div>
+      ${c.credit_limit != null ? `<div class="n">Credit limit ${money2(c.credit_limit)}</div>` : ''}
+      ${c.balance_owed != null ? `<div class="n">Balance owed ${money2(c.balance_owed)}${c.balance_asof ? ' · as of ' + esc(c.balance_asof) : ''}</div>` : ''}
     </div>`).join('') : '<div class="note">No cards yet — add one above.</div>';
   renderSpendTxTable();
   $('#spendRange').innerHTML = investRangeControlsHtml('spending');
@@ -9664,6 +9676,10 @@ async function loadSpendCard(id) {
   spendCardData = data;
   investViewData.spendCard = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: [data.card] };
   $('#spendDetailTitle').textContent = `${data.card.name} · ••••${data.card.last4}`;
+  const infoLines = [];
+  if (data.card.credit_limit != null) infoLines.push(`Credit limit ${money2(data.card.credit_limit)}`);
+  if (data.card.balance_owed != null) infoLines.push(`Balance owed ${money2(data.card.balance_owed)}${data.card.balance_asof ? ' · as of ' + esc(data.card.balance_asof) : ''}`);
+  $('#spendDetailCardInfo').innerHTML = infoLines.length ? `<div class="note">${infoLines.join(' · ')}</div>` : '';
   renderSpendDetailTxTable();
   $('#spendDetailRange').innerHTML = investRangeControlsHtml('spendCard');
   wireInvestRangeControls('spendCard');
@@ -9743,10 +9759,31 @@ $('#addSpendCardBtn').addEventListener('click', () => {
   openModal('spendCardModal');
 });
 
+// Edit opens the same form prefilled (this is also how the
+// credit limit is changed after the card exists).
+$('#spendDetailEditBtn').addEventListener('click', () => {
+  if (!spendCardData || !spendCardData.card) return;
+  const c = spendCardData.card;
+  spendCardEditId = c.id;
+  $('#spendCardFormTitle').textContent = 'Edit card';
+  const f = $('#spendCardForm');
+  f.name.value = c.name;
+  f.issuer.value = c.issuer || '';
+  f.last4.value = c.last4;
+  setMoneyValue(f.credit_limit, c.credit_limit);
+  $('#spendCardModalMsg').className = 'msg';
+  $('#spendCardModalMsg').textContent = '';
+  openModal('spendCardModal');
+});
+
 $('#spendCardForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
-  const body = { name: f.name.value.trim(), issuer: f.issuer.value.trim(), last4: f.last4.value.trim() };
+  const limit = parseMoneyInput(f.credit_limit.value);
+  const body = {
+    name: f.name.value.trim(), issuer: f.issuer.value.trim(), last4: f.last4.value.trim(),
+    credit_limit: limit === '' ? null : limit,
+  };
   const msg = $('#spendCardModalMsg');
   try {
     if (spendCardEditId) await api(`/api/spending/cards/${spendCardEditId}`, { method: 'PUT', body });
@@ -9780,7 +9817,7 @@ function openSpendImport(preselectCardId) {
   if (!card) return;
   const sel = $('#spendImportCard');
   sel.innerHTML = `<option value="${card.id}">${esc(card.name)} · ••••${esc(card.last4)}</option>`;
-  $('#spendImportText').value = '';
+  $('#spendImportFile').value = '';
   $('#spendImportPreview').innerHTML = '';
   $('#spendImportModalMsg').className = 'msg';
   $('#spendImportModalMsg').textContent = '';
@@ -9791,10 +9828,12 @@ $('#spendDetailImportBtn').addEventListener('click', () => openSpendImport(curre
 
 $('#spendImportParseBtn').addEventListener('click', async () => {
   const cardId = Number($('#spendImportCard').value);
-  const text = $('#spendImportText').value;
+  const file = $('#spendImportFile').files[0];
   const msg = $('#spendImportModalMsg');
   const preview = $('#spendImportPreview');
   try {
+    if (!file) throw new Error('Choose a QFX file to parse.');
+    const text = await file.text();
     const data = await api(`/api/spending/cards/${cardId}/import-qfx/parse`, { method: 'POST', body: { qfxText: text } });
     spendImportParsed = data;
     const newRows = data.rows.filter((r) => !r.existing);
@@ -9803,17 +9842,33 @@ $('#spendImportParseBtn').addEventListener('click', async () => {
       <td>${r.kind === 'charge' ? money(-r.amount) : '−' + money(r.amount)}</td>
       <td>${r.existing ? 'Already imported' : 'New'}</td></tr>`).join('');
     const droppedHtml = data.dropped.map((d) => `<li>${esc(d.reason)}${d.merchant ? ' — ' + esc(d.merchant) : ''}</li>`).join('');
+    // Balance check: the file balance against the computed
+    // balance, with the difference and the one proposed
+    // adjustment row. Nothing writes until Apply — the checkbox
+    // only opts the adjustment out of the Apply below.
+    const bc = data.balanceCheck;
+    const balanceHtml = bc ? `<div class="note">File balance: owed ${money2(bc.fileOwed)}${bc.asof ? ' · as of ' + esc(bc.asof) : ''} · Computed: owed ${money2(bc.computedOwed)} · Difference: ${money2(bc.difference)}</div>` : '';
+    const adjHtml = (bc && bc.difference !== 0)
+      ? `<div class="toolbar"><label><input type="checkbox" id="spendImportAdjCheck" checked> Add adjustment transaction of ${money2(bc.adjustmentAmount)} to reconcile</label></div>` : '';
     preview.innerHTML = `
       ${data.accountId ? `<div class="note">File account: ${esc(data.accountId)}</div>` : ''}
       <div class="note">${data.rows.length} transactions parsed (${newRows.length} new, ${data.rows.length - newRows.length} already imported), ${data.dropped.length} dropped.</div>
+      ${balanceHtml}
+      ${adjHtml}
       ${rowsHtml ? `<table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Amount</th><th>Status</th></tr></thead><tbody>${rowsHtml}</tbody></table>` : '<div class="note">No transactions found in this file.</div>'}
       ${droppedHtml ? `<div class="note">Dropped items:</div><ul>${droppedHtml}</ul>` : ''}
-      ${newRows.length ? '<div class="toolbar"><button class="primary" id="spendImportApplyBtn">Apply import</button></div>' : ''}`;
+      ${newRows.length || (bc && bc.difference !== 0) ? '<div class="toolbar"><button class="primary" id="spendImportApplyBtn">Apply import</button></div>' : ''}`;
     const applyBtn = $('#spendImportApplyBtn');
     if (applyBtn) applyBtn.addEventListener('click', async () => {
       try {
-        const result = await api(`/api/spending/cards/${cardId}/import-qfx/apply`, { method: 'POST', body: { rows: data.rows } });
-        showMsg(msg, 'ok', `Imported ${result.inserted} transactions, skipped ${result.skipped} already imported${result.dropped.length ? `, dropped ${result.dropped.length}` : ''}.`);
+        const adjCheck = $('#spendImportAdjCheck');
+        const result = await api(`/api/spending/cards/${cardId}/import-qfx/apply`, { method: 'POST', body: {
+          rows: data.rows,
+          fileOwed: bc ? bc.fileOwed : undefined,
+          balanceAsof: bc ? bc.asof : undefined,
+          includeAdjustment: adjCheck ? adjCheck.checked : false,
+        } });
+        showMsg(msg, 'ok', `Imported ${result.inserted} transactions, skipped ${result.skipped} already imported${result.dropped.length ? `, dropped ${result.dropped.length}` : ''}${result.adjustment ? `, adjustment ${money2(result.adjustment.amount)} added` : ''}.`);
         preview.innerHTML = '';
         spendImportParsed = null;
         reloadSpendView();
@@ -9890,8 +9945,12 @@ $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
-// Card detail ✨ Fill with AI: propose transaction rows from pasted
-// text; only Apply writes.
+// Card detail ✨ Fill with AI: the header button expands the
+// panel; the panel itself proposes transaction rows from pasted
+// text, and only Apply writes.
+$('#spendFillToggleBtn').addEventListener('click', () => {
+  $('#spendFillPanel').classList.toggle('hidden');
+});
 $('#spendFillBtn').addEventListener('click', async () => {
   const msg = $('#spendFillMsg');
   const host = $('#spendFillProposals');

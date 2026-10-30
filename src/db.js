@@ -403,6 +403,28 @@ db.exec(`CREATE TABLE IF NOT EXISTS spend_transactions (
 )`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_spend_tx_card_date ON spend_transactions(card_id, date)`);
 
+// Spending card fields + transaction kinds, added after the
+// prototype: a nullable credit limit and the last imported file
+// balance (owed + as-of date) on the card; a kind column on
+// transactions (charge | payment | refund | adjustment). Idempotent:
+// existing rows backfill their kind from amount + merchant evidence
+// (the same rule as spendKind — a positive amount is a payment only
+// for a payment merchant, otherwise a refund).
+{
+  const cols = (t) => new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name));
+  const cardCols = cols('spend_cards');
+  if (!cardCols.has('credit_limit')) db.exec('ALTER TABLE spend_cards ADD COLUMN credit_limit REAL');
+  if (!cardCols.has('balance_owed')) db.exec('ALTER TABLE spend_cards ADD COLUMN balance_owed REAL');
+  if (!cardCols.has('balance_asof')) db.exec('ALTER TABLE spend_cards ADD COLUMN balance_asof TEXT');
+  if (!cols('spend_transactions').has('kind')) {
+    db.exec('ALTER TABLE spend_transactions ADD COLUMN kind TEXT');
+    db.prepare(`UPDATE spend_transactions SET kind = CASE
+      WHEN amount < 0 THEN 'charge'
+      WHEN UPPER(merchant) LIKE '%PAYMENT%' OR UPPER(merchant) LIKE '%PAIEMEN%' OR UPPER(merchant) LIKE '%THANK YOU%' THEN 'payment'
+      ELSE 'refund' END WHERE kind IS NULL`).run();
+  }
+}
+
 // Properties used to carry ONE uploaded photo in properties.photo_file;
 // the gallery replaces it. Fold any existing single photo into the
 // gallery as a photo of that property (keeping its place as the first
