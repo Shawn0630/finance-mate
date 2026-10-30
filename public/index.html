@@ -449,6 +449,18 @@
     </div>
     <div id="earn-rentals" class="asset-section hidden">
       <div class="section-head"><h2>Rentals</h2><div class="spacer"></div><button class="primary" id="addEarnRentalBtn">+ Add rental</button></div>
+      <div class="panel" id="rentIncomePanel">
+        <h3>Total income</h3>
+        <div id="rentIncomeRange"></div>
+        <div class="invest-charts-row">
+          <div class="invest-share-col">
+            <div class="invest-share-head"><h3 id="rentIncomeShareTitle">Income share</h3></div>
+            <div class="invest-share-box" id="rentIncomeShareWrap"><div class="chart-wrap invest-share"><canvas id="rentIncomeShareChart"></canvas></div></div>
+            <div class="note hidden" id="rentIncomeShareEmpty">No rental income in this range yet.</div>
+          </div>
+          <div class="invest-main-chart" id="rentIncomeMainWrap"><div class="chart-wrap tall"><canvas id="rentIncomeChart"></canvas></div></div>
+        </div>
+      </div>
       <div class="msg" id="earnRentalMsg"></div>
       <div class="note">Rental income is a flow, not an asset — it never enters the net-worth summary. Mortgage interest and principal are separate fields; only interest is deductible.</div>
       <div id="earnRentalsRange"></div>
@@ -765,6 +777,7 @@
 
 <script src="/invest-share.js"></script>
 <script src="/invest-visible.js"></script>
+<script src="/rent-income.js"></script>
 <script src="/overview-chart.js"></script>
 <script src="/app.js"></script>
 </body>

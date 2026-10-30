@@ -221,6 +221,12 @@ td.num, th.num { text-align: right; }
    padding keeps long account names from running under
    the button. */
 .breakdown-card[data-invest-account-card] { position: relative; padding-right: 44px; }
+/* Rental cards carry the same top-right eye button as Stocks cards:
+   the card is positioned and padded so the eye never covers the
+   head row's buttons, and a hidden rental greys out like a hidden
+   Stocks account. */
+.rent-card { position: relative; padding-right: 44px; }
+.rent-hidden-card { opacity: .55; }
 .invest-eye-btn { position: absolute; top: 10px; right: 10px; border: none; background: transparent; padding: 2px 3px; color: #5a6a7a; }
 .invest-eye-btn:hover { background: transparent; color: #1668c4; }
 .invest-eye-btn svg { display: block; width: 20px; height: 20px; }

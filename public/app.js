@@ -4880,6 +4880,7 @@ const investRanges = {
   investAccount: { months: 0, custom: null },
   investHolding: { months: 0, custom: null },
   overview: { months: 0, custom: null },
+  rentIncome: { months: 0, custom: null },
 };
 const investViewData = {}; // level -> { series, monthly, cur, nativePct }
 let invPop = null; // { level, which: 'start'|'end', year }
@@ -4941,6 +4942,10 @@ const INVEST_LEVEL_CONF = {
   overview: {
     canvas: '#overviewChart', key: 'overview', monthly: null,
     get: () => overviewChart, set: (c) => { overviewChart = c; window.__fmCharts.overview = c; },
+  },
+  rentIncome: {
+    canvas: '#rentIncomeChart', key: 'rentIncome', monthly: null,
+    get: () => rentIncomeChart, set: (c) => { rentIncomeChart = c; window.__fmCharts.rentIncome = c; },
   },
 };
 
@@ -5322,7 +5327,13 @@ function applyInvestRange(level) {
   const fSeries = (vis ? vis.series : d.series || []).filter((x) => inR(x.month));
   const old = conf.get();
   if (old) old.destroy();
-  if (level === 'overview') {
+  if (level === 'rentIncome') {
+    // The Rentals income panel draws its own two charts from the
+    // range-filtered entry income; the share draw reports empty
+    // (no income in range) by hiding both chart wraps.
+    if (drawRentIncomeShareChart(d, r)) conf.set(drawRentIncomeHistoryChart($(conf.canvas), d, r));
+    else { rentIncomeChart = null; window.__fmCharts.rentIncome = null; }
+  } else if (level === 'overview') {
     // The Overview panel has no monthly table: its history
     // chart draws the filtered monthly rows (Property + Stock
     // stacked bars under a total line) and its doughnut follows
@@ -8244,7 +8255,9 @@ function earnEntryBlock(r, e) {
 }
 
 function earnRentalCard(r) {
-  return `<div class="panel">
+  const hidden = rentHiddenRentals.has(r.id);
+  return `<div class="panel rent-card">
+    <button type="button" class="rent-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-rental-id="${r.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}" onclick="toggleRentRental(${r.id})">${RENT_EYE_SVG}</button>
     <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span>
     <div class="spacer"></div>
     <button class="small" onclick="earnAddEntry(${r.id})">+ Rent entry</button>
@@ -8284,6 +8297,8 @@ async function loadEarnings() {
     $('#earnRentalList').innerHTML = earnData.rentals.length
       ? earnData.rentals.map(earnRentalCard).join('')
       : '<div class="note">No rentals yet.</div>';
+    investViewData.rentIncome = buildRentIncomeView(earnData.rentals);
+    syncRentHideCards();
     try { earnChartData = await api('/api/earnings/charts'); } catch { earnChartData = null; }
     drawEarnVisibleChart();
   } catch (e) { showMsg($('#earnSalaryMsg'), 'err', e.message); }
@@ -8470,11 +8485,224 @@ function drawEarnVisibleChart() {
     $('#earnRentalsRange').innerHTML = earnRangeControlsHtml('rentals');
     earnWireRange('rentals');
     drawEarnRentalsChart();
+    drawRentIncomePanel();
   } else {
     $('#earnSalaryRange').innerHTML = earnRangeControlsHtml('salary');
     earnWireRange('salary');
     drawEarnSalaryChart();
   }
+}
+
+// ------------------------------------------------- rentals income panel --
+// Total income over the selected range, from rent entries only: LEFT
+// share doughnut (one slice per rental, share of range income —
+// income is a flow, so this is deliberately NOT the Stocks
+// range-end point-in-time share) + RIGHT monthly history (stacked
+// bars per rental + total line), driven by the Stocks range picker
+// (same presets + month popover machinery, level 'rentIncome').
+// Year-record other income (8230), expenses and the T776
+// computation never enter this panel. Per-rental Hide mirrors
+// Stocks exactly: the same open/closed eye-pair button at the
+// card's top-right corner, one per-visit hidden set shared with
+// both charts' legends, card greys out. Hide affects this panel
+// only — never entries, years or tax calcs.
+let rentIncomeChart = null;
+let rentIncomeShareChart = null;
+let rentIncomeShareRentals = []; // rentals in doughnut order
+let rentIncomeShareCenter = null; // { total } for the center plugin
+const rentHiddenRentals = new Set();
+const RENT_INCOME_COLORS = ['#8d6e00', '#5d4037', '#283593', '#00695c', '#ad1457', '#4527a0', '#558b2f', '#6a1b9a', '#37474f', '#9e9d24'];
+function rentRentalColor(rental) {
+  const id = Math.abs(Number(rental && rental.id) || 0);
+  return RENT_INCOME_COLORS[id % RENT_INCOME_COLORS.length];
+}
+// The Stocks eye button's SVG, verbatim: open eye (almond + dot
+// pupil) and closed eye (downward arc + lashes); the shared
+// .invest-eye-btn / .invest-eye-hidden CSS flips between them.
+const RENT_EYE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g class="eye-open"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 12 18.5 2.5 12Z"/><circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none"/></g><g class="eye-closed"><path d="M4 8.5Q12 17 20 8.5"/><line x1="5.5" y1="12" x2="4" y2="14.5"/><line x1="8.5" y1="14.5" x2="7.5" y2="17"/><line x1="12" y1="15.5" x2="12" y2="18"/><line x1="15.5" y1="14.5" x2="16.5" y2="17"/><line x1="18.5" y1="12" x2="20" y2="14.5"/></g></svg>`;
+
+const rentIncomeShareCenterPlugin = {
+  id: 'rentIncomeShareCenter',
+  afterDraw(chart) {
+    if (!rentIncomeShareCenter || chart !== rentIncomeShareChart) return;
+    const area = chart.chartArea;
+    const x = (area.left + area.right) / 2;
+    const y = (area.top + area.bottom) / 2;
+    const c = chart.ctx;
+    c.save();
+    c.textAlign = 'center';
+    c.fillStyle = '#71808f';
+    c.font = '11px system-ui, sans-serif';
+    c.fillText('Total income', x, y - 4);
+    c.fillStyle = '#22303c';
+    c.font = '700 14px system-ui, sans-serif';
+    c.fillText(moneyC(rentIncomeShareCenter.total, 'CAD'), x, y + 14);
+    c.restore();
+  },
+};
+
+function drawRentIncomeShareChart(d, r) {
+  const canvas = $('#rentIncomeShareChart');
+  if (!canvas) return false;
+  const { rows, visibleTotal } = rentRangeShare(d.rentSeries, r, rentHiddenRentals);
+  rentIncomeShareRentals = rows.map((x) => x.rental);
+  const title = $('#rentIncomeShareTitle');
+  if (title) title.textContent = r ? `Income share · ${formatYM(r.start)} – ${formatYM(r.end)}` : 'Income share';
+  const empty = $('#rentIncomeShareEmpty');
+  const wrap = $('#rentIncomeShareWrap');
+  const mainWrap = $('#rentIncomeMainWrap');
+  if (!rows.length) {
+    if (rentIncomeShareChart) { rentIncomeShareChart.destroy(); rentIncomeShareChart = null; }
+    rentIncomeShareCenter = null;
+    window.__fmCharts.rentIncomeShare = null;
+    window.__fmCharts.rentIncomeShareCenter = null;
+    if (wrap) wrap.classList.add('hidden');
+    if (mainWrap) mainWrap.classList.add('hidden');
+    if (empty) empty.classList.remove('hidden');
+    return false;
+  }
+  if (wrap) wrap.classList.remove('hidden');
+  if (mainWrap) mainWrap.classList.remove('hidden');
+  if (empty) empty.classList.add('hidden');
+  rentIncomeShareCenter = { total: visibleTotal };
+  if (rentIncomeShareChart) rentIncomeShareChart.destroy();
+  rentIncomeShareChart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels: rows.map((x) => x.rental.label),
+      datasets: [{
+        data: rows.map((x) => x.value),
+        backgroundColor: rows.map((x) => rentRentalColor(x.rental)),
+        borderColor: '#fff', borderWidth: 1,
+        hoverOffset: 10, // Property/invest doughnut parity: the slice pops out on hover.
+      }],
+    },
+    plugins: [rentIncomeShareCenterPlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '58%',
+      plugins: {
+        legend: {
+          position: 'bottom', labels: { boxWidth: 12 },
+          onClick: (e, item) => { const x = rentIncomeShareRentals[item.index]; if (x) toggleRentRental(x.id); },
+        },
+        tooltip: {
+          callbacks: {
+            label: (item) => {
+              // The % is over the VISIBLE slices only, matching the center total.
+              const t = item.dataset.data.reduce((s, v, i) => s + (item.chart.getDataVisibility(i) ? v : 0), 0);
+              const pct = t ? ((item.parsed / t) * 100).toFixed(1) : '0.0';
+              return ` ${item.label}: ${moneyC(item.parsed, 'CAD')} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+  rentIncomeShareRentals.forEach((x, i) => {
+    if (rentHiddenRentals.has(x.id) && rentIncomeShareChart.getDataVisibility(i)) rentIncomeShareChart.toggleDataVisibility(i);
+  });
+  rentIncomeShareChart.update();
+  window.__fmCharts.rentIncomeShare = rentIncomeShareChart;
+  window.__fmCharts.rentIncomeShareCenter = rentIncomeShareCenter;
+  return true;
+}
+
+function drawRentIncomeHistoryChart(canvas, d, r) {
+  if (!canvas) return null;
+  const hist = rentHistoryData(d.rentSeries, r, rentHiddenRentals);
+  const bars = hist.perRental.map((p) => ({
+    type: 'bar', label: p.rental.label, rentalId: p.rental.id, data: p.values,
+    backgroundColor: rentRentalColor(p.rental), stack: 'income', order: 3, maxBarThickness: 28,
+  }));
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: hist.months,
+      datasets: [
+        ...bars,
+        { label: 'Total (CAD)', data: hist.totals, borderColor: '#22303c', backgroundColor: '#22303c', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: moneyTick } } },
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12 }, onClick: rentLegendClick },
+        tooltip: {
+          callbacks: {
+            label: (c) => {
+              const ds = c.dataset;
+              if (ds.rentalId != null) {
+                const total = c.chart.data.datasets.reduce((s, dd, i) => s + (dd.rentalId != null && c.chart.isDatasetVisible(i) ? (dd.data[c.dataIndex] || 0) : 0), 0);
+                const pct = total ? ((c.parsed.y / total) * 100).toFixed(1) : '0.0';
+                return `${ds.label}: ${moneyC(c.parsed.y, 'CAD')} (${pct}%)`;
+              }
+              return `${c.dataset.label}: ${moneyC(c.parsed.y, 'CAD')}`;
+            },
+          },
+        },
+      },
+    },
+    plugins: [guideLinePlugin],
+  });
+  bars.forEach((ds, i) => { if (rentHiddenRentals.has(ds.rentalId)) chart.setDatasetVisibility(i, false); });
+  chart.update();
+  window.__fmCharts.rentIncome = chart;
+  return chart;
+}
+
+function toggleRentRental(id) {
+  if (rentHiddenRentals.has(id)) rentHiddenRentals.delete(id);
+  else rentHiddenRentals.add(id);
+  syncRentHideCards();
+  applyInvestRange('rentIncome');
+}
+
+// Card eye buttons mirror the hidden set: a hidden card is greyed
+// and its eye icon closes (open eye when visible, closed eye when
+// hidden). Runs after every render that rebuilds the cards and
+// after every toggle, so the legend and the cards can never
+// disagree. NOTE: rental buttons carry .rent-hide-btn, never
+// .invest-hide-btn — the invest sync queries the latter globally
+// and would otherwise clobber rental state.
+function syncRentHideCards() {
+  document.querySelectorAll('.rent-hide-btn').forEach((btn) => {
+    const hidden = rentHiddenRentals.has(Number(btn.dataset.rentalId));
+    btn.classList.toggle('invest-eye-hidden', hidden);
+    btn.title = hidden ? 'Show' : 'Hide';
+    btn.setAttribute('aria-label', btn.title);
+    const card = btn.closest('.rent-card');
+    if (card) card.classList.toggle('rent-hidden-card', hidden);
+  });
+}
+
+function rentLegendClick(e, item, legend) {
+  const chart = legend.chart;
+  const ds = chart.data.datasets[item.datasetIndex];
+  if (ds && ds.rentalId != null) { toggleRentRental(ds.rentalId); return; }
+  chart.setDatasetVisibility(item.datasetIndex, !chart.isDatasetVisible(item.datasetIndex));
+  chart.update();
+}
+
+function buildRentIncomeView(rentals) {
+  const now = new Date();
+  const nowYm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const rentSeries = rentMonthlySeries(rentals, nowYm);
+  return {
+    monthly: rentSeries.flatMap((s) => s.months.map((m) => ({ month: m.month, rentalId: s.rental.id, value: m.value }))),
+    series: [],
+    rentSeries,
+  };
+}
+
+function drawRentIncomePanel() {
+  const wrap = $('#rentIncomeRange');
+  if (wrap && !wrap.innerHTML.trim()) {
+    wrap.innerHTML = investRangeControlsHtml('rentIncome');
+    wireInvestRangeControls('rentIncome');
+  }
+  applyInvestRange('rentIncome');
 }
 
 document.addEventListener('click', (e) => {

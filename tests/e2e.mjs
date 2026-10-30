@@ -11204,6 +11204,218 @@ try {
       check('rental form: BCA down still saves free-text standalone address',
         suiteTyped && suiteTyped.address === '34 Typed Rd', JSON.stringify(suiteTyped));
       stubBcaDown = false;
+
+      // Rentals income panel: share-left / history-right above the
+      // cards, range share from entries only, per-rental eye hide.
+      r = await req('POST', '/api/earnings/rentals', {
+        label: 'Chart A', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+      });
+      check('rental income panel setup: Chart A created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const chartAId = r.data.id;
+      // A year record carrying other income (8230) first: the panel
+      // must still count entries only, never this 5000.
+      r = await req('POST', `/api/earnings/rentals/${chartAId}/years`, {
+        tax_year: 2025, other_income: 5000, area_share_pct: 100,
+        mortgage_interest: 0, mortgage_principal: 0, expenses: [],
+      });
+      check('rental income panel setup: Chart A year with other income', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', `/api/earnings/rentals/${chartAId}/entries`, {
+        start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 1000, pay_day: 1,
+      });
+      check('rental income panel setup: Chart A entry', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', '/api/earnings/rentals', {
+        label: 'Chart B', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+      });
+      check('rental income panel setup: Chart B created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const chartBId = r.data.id;
+      r = await req('POST', `/api/earnings/rentals/${chartBId}/entries`, {
+        start_ym: '2025-01', end_ym: '2025-06', monthly_rent: 3000, pay_day: 1,
+      });
+      check('rental income panel setup: Chart B entry', r.status === 201, JSON.stringify(r.data));
+      // Expected figures recomputed from the live API payload with
+      // the same entry rules (month granularity, ongoing through
+      // the current month) — never hand-typed totals.
+      const earnAll = (await req('GET', '/api/earnings')).data;
+      const nowD = new Date();
+      const nowYm = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}`;
+      const ymIdx = (ym) => { const [y, m] = ym.split('-').map(Number); return y * 12 + (m - 1); };
+      const ymFromIdx = (k) => `${Math.floor(k / 12)}-${String((k % 12) + 1).padStart(2, '0')}`;
+      const addM = (ym, n) => ymFromIdx(ymIdx(ym) + n);
+      const entryMonths = (e) => {
+        const end = e.end_ym || nowYm;
+        if (end < e.start_ym) return [];
+        const out = [];
+        for (let k = ymIdx(e.start_ym); k <= ymIdx(e.end_ym || nowYm); k++) out.push(ymFromIdx(k));
+        return out;
+      };
+      const rentalTotal = (rental, from, to) => (rental.entries || []).reduce((s, e) => {
+        const n = entryMonths(e).filter((m) => (!from || m >= from) && (!to || m <= to)).length;
+        return s + n * e.monthly_rent;
+      }, 0);
+      const allMonths = new Set();
+      for (const rt of earnAll.rentals) for (const e of rt.entries || []) for (const m of entryMonths(e)) allMonths.add(m);
+      const sortedMonths = [...allMonths].sort();
+      const span = { start: sortedMonths[0], end: sortedMonths[sortedMonths.length - 1] };
+      const expectedAll = {};
+      let expectedCenter = 0;
+      for (const rt of earnAll.rentals) { expectedAll[rt.label] = rentalTotal(rt); expectedCenter += expectedAll[rt.label]; }
+      const mar2025 = earnAll.rentals.reduce((s, rt) => s + (rt.entries || []).reduce((t, e) =>
+        t + (entryMonths(e).includes('2025-03') ? e.monthly_rent : 0), 0), 0);
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(500);
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const panelPlace = await page.evaluate(() => {
+        const panel = document.querySelector('#rentIncomePanel');
+        const list = document.querySelector('#earnRentalList');
+        const oldChart = document.querySelector('#earnRentalsChart');
+        const row = panel && panel.querySelector('.invest-charts-row');
+        const shareFirst = row && (row.children[0].querySelector('#rentIncomeShareChart') ? true : false);
+        return {
+          panel: !!panel,
+          beforeList: !!(panel && list && (panel.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING)),
+          beforeOldChart: !!(panel && oldChart && (panel.compareDocumentPosition(oldChart) & Node.DOCUMENT_POSITION_FOLLOWING)),
+          shareLeft: !!shareFirst,
+          rangeBtns: !!document.querySelector('#invRangeBtns-rentIncome'),
+        };
+      });
+      check('rental income panel: sits at the top of the section, share-left layout, own range picker',
+        panelPlace.panel && panelPlace.beforeList && panelPlace.beforeOldChart && panelPlace.shareLeft && panelPlace.rangeBtns,
+        JSON.stringify(panelPlace));
+      const shareAll = await page.evaluate(() => {
+        const c = window.__fmCharts.rentIncomeShare;
+        const h = window.__fmCharts.rentIncome;
+        if (!c || !h) return null;
+        const byLabel = {};
+        c.data.labels.forEach((l, i) => { byLabel[l] = c.data.datasets[0].data[i]; });
+        const totalDs = h.data.datasets.find((d) => d.label === 'Total (CAD)');
+        const marIdx = h.data.labels.indexOf('2025-03');
+        return {
+          labels: c.data.labels, byLabel,
+          center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
+          hoverOffset: c.data.datasets[0].hoverOffset,
+          guideLine: (h.config.plugins || []).some((p) => p && p.id === 'guideLine'),
+          marTotal: totalDs && marIdx >= 0 ? totalDs.data[marIdx] : null,
+        };
+      });
+      check('rental income panel: share slices are range totals from entries only (Chart A 12000, Chart B 18000)',
+        shareAll && shareAll.byLabel['Chart A'] === 12000 && shareAll.byLabel['Chart B'] === 18000,
+        JSON.stringify(shareAll && shareAll.byLabel));
+      check('rental income panel: center total is entries-only (excludes the 5000 other income)',
+        shareAll && shareAll.center === expectedCenter,
+        JSON.stringify({ center: shareAll && shareAll.center, expected: expectedCenter }));
+      check('rental income panel: doughnut pops on hover + history has the guide line',
+        shareAll && shareAll.hoverOffset === 10 && shareAll.guideLine === true, JSON.stringify(shareAll));
+      check('rental income panel: history total line matches March 2025 entries',
+        shareAll && shareAll.marTotal === mar2025, JSON.stringify({ marTotal: shareAll && shareAll.marTotal, expected: mar2025 }));
+      // Range change: 1 year = last 12 months of the span. Chart A
+      // and Chart B (both 2025-only) must drop out of the share.
+      await page.click('#invRangeBtns-rentIncome button[data-months="12"]');
+      await waitE(600);
+      const winStart = ymIdx(span.end) - 11 >= ymIdx(span.start) ? addM(span.end, -11) : span.start;
+      const expectedWin = {};
+      let expectedWinCenter = 0;
+      for (const rt of earnAll.rentals) { expectedWin[rt.label] = rentalTotal(rt, winStart, span.end); expectedWinCenter += expectedWin[rt.label]; }
+      const shareWin = await page.evaluate(() => {
+        const c = window.__fmCharts.rentIncomeShare;
+        if (!c) return null;
+        const byLabel = {};
+        c.data.labels.forEach((l, i) => { byLabel[l] = c.data.datasets[0].data[i]; });
+        return {
+          labels: c.data.labels, byLabel,
+          center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
+          fromLabel: document.querySelector('#invRangeStart-rentIncome') ? document.querySelector('#invRangeStart-rentIncome').textContent : null,
+          toLabel: document.querySelector('#invRangeEnd-rentIncome') ? document.querySelector('#invRangeEnd-rentIncome').textContent : null,
+        };
+      });
+      check('rental income panel: 1-year range drops 2025-only rentals and recomputes the center',
+        shareWin && !('Chart A' in shareWin.byLabel) && !('Chart B' in shareWin.byLabel)
+          && shareWin.center === expectedWinCenter,
+        JSON.stringify({ labels: shareWin && shareWin.labels, center: shareWin && shareWin.center, expected: expectedWinCenter }));
+      await page.click('#invRangeBtns-rentIncome button[data-months="0"]');
+      await waitE(600);
+      const backAll = await page.evaluate(() => {
+        const c = window.__fmCharts.rentIncomeShare;
+        return c ? c.data.labels.includes('Chart A') : false;
+      });
+      check('rental income panel: All range restores the 2025 rentals', backAll === true, JSON.stringify(backAll));
+      // Eye hide: Chart A's card greys, its slice flips off, the
+      // center total and the March history total drop by its income.
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .rent-card')].find((p) => p.textContent.includes('Chart A'));
+        const btn = card && card.querySelector('.rent-hide-btn');
+        if (btn) btn.click();
+      });
+      await waitE(600);
+      const hiddenState = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .rent-card')].find((p) => p.textContent.includes('Chart A'));
+        const btn = card && card.querySelector('.rent-hide-btn');
+        const c = window.__fmCharts.rentIncomeShare;
+        const h = window.__fmCharts.rentIncome;
+        const idx = c ? c.data.labels.indexOf('Chart A') : -1;
+        const totalDs = h ? h.data.datasets.find((d) => d.label === 'Total (CAD)') : null;
+        const marIdx = h ? h.data.labels.indexOf('2025-03') : -1;
+        return {
+          cardGrey: card ? card.classList.contains('rent-hidden-card') : false,
+          eyeClosed: btn ? btn.classList.contains('invest-eye-hidden') : false,
+          eyeSvg: btn ? !!btn.querySelector('svg') : false,
+          sliceVisible: idx >= 0 ? c.getDataVisibility(idx) : null,
+          center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
+          marTotal: totalDs && marIdx >= 0 ? totalDs.data[marIdx] : null,
+        };
+      });
+      check('rental income panel: eye hide greys the card, closes the eye, drops slice + center + history total',
+        hiddenState.cardGrey && hiddenState.eyeClosed && hiddenState.eyeSvg
+          && hiddenState.sliceVisible === false && hiddenState.center === expectedCenter - 12000
+          && hiddenState.marTotal === mar2025 - 1000,
+        JSON.stringify(hiddenState));
+      // Legend click restores it (same shared hidden set, other way).
+      await page.evaluate(() => {
+        const c = window.__fmCharts.rentIncomeShare;
+        const i = c.legend.legendItems.findIndex((it) => c.data.labels[it.index] === 'Chart A');
+        const b = c.legend.legendHitBoxes[i];
+        const r = c.canvas.getBoundingClientRect();
+        c.canvas.dispatchEvent(new MouseEvent('click', {
+          bubbles: true, cancelable: true,
+          clientX: r.left + b.left + b.width / 2, clientY: r.top + b.top + b.height / 2,
+        }));
+      });
+      await waitE(600);
+      const restored = await page.evaluate(() => {
+        const c = window.__fmCharts.rentIncomeShare;
+        const idx = c ? c.data.labels.indexOf('Chart A') : -1;
+        return {
+          sliceVisible: idx >= 0 ? c.getDataVisibility(idx) : null,
+          center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
+        };
+      });
+      check('rental income panel: legend click restores the hidden rental',
+        restored.sliceVisible === true && restored.center === expectedCenter, JSON.stringify(restored));
+      // Per-visit: a reload restores everything.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const afterReload = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .rent-card')].find((p) => p.textContent.includes('Chart A'));
+        const btn = card && card.querySelector('.rent-hide-btn');
+        const c = window.__fmCharts.rentIncomeShare;
+        const idx = c ? c.data.labels.indexOf('Chart A') : -1;
+        return {
+          cardGrey: card ? card.classList.contains('rent-hidden-card') : false,
+          eyeClosed: btn ? btn.classList.contains('invest-eye-hidden') : false,
+          sliceVisible: idx >= 0 ? c.getDataVisibility(idx) : null,
+          center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
+        };
+      });
+      check('rental income panel: reload restores hidden rentals (per-visit)',
+        afterReload.cardGrey === false && afterReload.eyeClosed === false
+          && afterReload.sliceVisible === true && afterReload.center === expectedCenter,
+        JSON.stringify(afterReload));
+      // Cleanup: remove the fixture rentals so later checks see the
+      // pre-existing rentals only.
+      r = await req('DELETE', `/api/earnings/rentals/${chartAId}`);
+      check('rental income panel cleanup: Chart A deleted', r.status === 200, JSON.stringify(r.data));
+      r = await req('DELETE', `/api/earnings/rentals/${chartBId}`);
+      check('rental income panel cleanup: Chart B deleted', r.status === 200, JSON.stringify(r.data));
     } finally {
       await browserE.close();
     }
