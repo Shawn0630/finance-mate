@@ -204,6 +204,12 @@ td.num, th.num { text-align: right; }
    buttons never sit flush on the chart panel below. */
 #spendList .section-head { padding: 16px 17px; }
 #spendList .section-head h2 { margin-top: 0; }
+/* Spending card detail head: the same standard as the overall
+   Spending head (and Properties/Stocks) — the spacing round
+   deliberately left this header for the unification round, so the
+   back button, title and card buttons line up with the panels below. */
+#spendCardDetail .section-head { padding: 16px 17px; }
+#spendCardDetail .section-head h2 { margin-top: 0; }
 /* Stocks detail pages (account / holding): their head band is
    the back-link toolbar — same inset so the back link and the
    Edit/Delete buttons line up with the panels below, and the

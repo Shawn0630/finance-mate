@@ -9727,15 +9727,24 @@ function drawSpendCharts(level, d, r) {
   // total-line shape. The total line sums the stack values, so the
   // stacks and the line agree to the cent by construction. The
   // detail chart keeps its single-series shape (one card only).
-  let hist;
-  if (isDetail) {
+  // An empty history must not render with Chart.js's default $0/$1
+  // axis ticks: like the share doughnut above, the chart hides and
+  // a note shows instead. (The share already hid on empty; the
+  // history previously rendered its empty axes.)
+  const histEmpty = !months.length || months.every((m) => !m.total);
+  const histWrap = histCanvas ? histCanvas.closest('.chart-wrap') : null;
+  const histEmptyEl = $(isDetail ? '#spendDetailHistEmpty' : '#spendHistEmpty');
+  if (histWrap) histWrap.classList.toggle('hidden', histEmpty);
+  if (histEmptyEl) histEmptyEl.classList.toggle('hidden', !histEmpty);
+  let hist = null;
+  if (!histEmpty && isDetail) {
     hist = new Chart(histCanvas, {
       type: 'bar',
       data: { labels: months.map((m) => m.month), datasets: [{ label: 'Spending', data: months.map((m) => m.total), backgroundColor: '#1668c4' }] },
       plugins: [guideLinePlugin],
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } } },
     });
-  } else {
+  } else if (!histEmpty) {
     const monthIdx = new Map(months.map((m, i) => [m.month, i]));
     const byKey = new Map(shareRows.map((s) => [s.key, months.map(() => 0)]));
     for (const t of tx) {

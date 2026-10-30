@@ -12733,6 +12733,148 @@ try {
   r = await req('DELETE', `/api/spending/cards/${monthCardBId}`);
   check('spending month cleanup: card B deleted', r.status === 200);
 
+  // UI unification round: the whole Spending section uses the
+  // property/Stocks visual language — standard section-head
+  // padding (overall + card detail), share-left chart row
+  // proportions, breakdown-card figures, panel-wrapped tables,
+  // and an empty history that hides instead of rendering
+  // Chart.js's default $0/$1 axis ticks. Styling only: no data,
+  // totals or flows change.
+  r = await req('POST', '/api/spending/cards', { name: 'Uni', issuer: 'CIBC', last4: '3001' });
+  check('spending unification setup: empty card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const uniCardId = r.data.id;
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending unification browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardU = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResU = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueU = loginResU.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserU = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserU.newPage();
+      page.on('dialog', (d) => d.accept());
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardU({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueU, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitU = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitU(1200);
+      const uniOverall = await page.evaluate(() => {
+        const head = document.querySelector('#spendList .section-head');
+        const row = document.querySelector('#spendPanel .invest-charts-row');
+        const shareCol = document.querySelector('#spendPanel .invest-share-col');
+        const mainCol = document.querySelector('#spendPanel .invest-main-chart');
+        const card = document.querySelector('#spendCardList .breakdown-card');
+        const v = card ? card.querySelector('.v') : null;
+        return {
+          headPad: head ? getComputedStyle(head).padding : null,
+          rowGap: row ? getComputedStyle(row).gap : null,
+          shareBasis: shareCol ? getComputedStyle(shareCol).flexBasis : null,
+          mainBasis: mainCol ? getComputedStyle(mainCol).flexBasis : null,
+          mainGrow: mainCol ? getComputedStyle(mainCol).flexGrow : null,
+          txInPanel: !!document.querySelector('#spendTxTable').closest('.panel'),
+          cardPad: card ? getComputedStyle(card).padding : null,
+          vSize: v ? getComputedStyle(v).fontSize : null,
+          vWeight: v ? getComputedStyle(v).fontWeight : null,
+        };
+      });
+      check('spending UI: overall head padding, share-left proportions, card figures and panel-wrapped table match the Stocks standard',
+        uniOverall.headPad === '16px 17px' && uniOverall.rowGap === '18px'
+        && uniOverall.shareBasis === '300px' && uniOverall.mainBasis === '430px' && uniOverall.mainGrow === '1'
+        && uniOverall.txInPanel === true && uniOverall.cardPad === '16px'
+        && uniOverall.vSize === '21px' && uniOverall.vWeight === '650',
+        JSON.stringify(uniOverall));
+      await page.goto(`http://ff.local/#spending/card/${uniCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitU(1200);
+      const uniDetailEmpty = await page.evaluate(() => {
+        const head = document.querySelector('#spendCardDetail .section-head');
+        const h2 = document.querySelector('#spendDetailTitle');
+        const panel = document.querySelector('#spendDetailPanel');
+        const backBtn = document.querySelector('#spendCardDetail .section-head button');
+        const wrap = document.querySelector('#spendDetailMainWrap .chart-wrap');
+        const note = document.querySelector('#spendDetailHistEmpty');
+        const shareNote = document.querySelector('#spendDetailShareEmpty');
+        return {
+          headPad: head ? getComputedStyle(head).padding : null,
+          h2MarginTop: h2 ? getComputedStyle(h2).marginTop : null,
+          headFirstLeftDelta: (backBtn && panel) ? Math.round(backBtn.getBoundingClientRect().left - (panel.getBoundingClientRect().left + 17)) : null,
+          detailTxInPanel: !!document.querySelector('#spendDetailTxTable').closest('.panel'),
+          histWrapHidden: wrap ? wrap.classList.contains('hidden') : null,
+          histNoteVisible: note ? !note.classList.contains('hidden') : null,
+          histChartNull: window.__fmCharts ? window.__fmCharts.spendCard === null : null,
+          shareNoteVisible: shareNote ? !shareNote.classList.contains('hidden') : null,
+        };
+      });
+      check('spending UI: detail head matches the overall head, table in a panel, empty history hides with a note and no chart',
+        uniDetailEmpty.headPad === '16px 17px' && uniDetailEmpty.h2MarginTop === '0px'
+        && uniDetailEmpty.headFirstLeftDelta === 0 && uniDetailEmpty.detailTxInPanel === true
+        && uniDetailEmpty.histWrapHidden === true && uniDetailEmpty.histNoteVisible === true
+        && uniDetailEmpty.histChartNull === true && uniDetailEmpty.shareNoteVisible === true,
+        JSON.stringify(uniDetailEmpty));
+      // One charge restores the history chart (the empty branch
+      // must not break normal rendering).
+      r = await req('POST', `/api/spending/cards/${uniCardId}/transactions`, { date: '2026-10-15', merchant: 'UNI SHOP', type: 'charge', amount: 25, category: 'Shopping' });
+      check('spending unification setup: charge added', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      // The page is already on this card's hash, and a goto to the
+      // already-current hash is a no-op in Puppeteer — reload so
+      // the detail view re-fetches with the new charge.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await waitU(1200);
+      const uniDetailFull = await page.evaluate(() => {
+        const wrap = document.querySelector('#spendDetailMainWrap .chart-wrap');
+        const note = document.querySelector('#spendDetailHistEmpty');
+        return {
+          histWrapHidden: wrap ? wrap.classList.contains('hidden') : null,
+          histNoteVisible: note ? !note.classList.contains('hidden') : null,
+          histChartLive: !!(window.__fmCharts && window.__fmCharts.spendCard),
+        };
+      });
+      check('spending UI: one charge restores the detail history chart',
+        uniDetailFull.histWrapHidden === false && uniDetailFull.histNoteVisible === false && uniDetailFull.histChartLive === true,
+        JSON.stringify(uniDetailFull));
+    } finally { await browserU.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${uniCardId}`);
+  check('spending unification cleanup: card deleted', r.status === 200);
+
   // Card fields round: credit limit, file balance + balance check
   // with adjustment, type-aware kinds, file-upload import, Fill
   // placement, danger Delete. Synthetic QFX only — the shape

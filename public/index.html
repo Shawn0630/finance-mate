@@ -485,13 +485,15 @@
             <div class="invest-share-box" id="spendShareWrap"><div class="chart-wrap invest-share"><canvas id="spendShareChart"></canvas></div></div>
             <div class="note hidden" id="spendShareEmpty">No spending in this range yet.</div>
           </div>
-          <div class="invest-main-chart" id="spendMainWrap"><div class="chart-wrap tall"><canvas id="spendChart"></canvas></div></div>
+          <div class="invest-main-chart" id="spendMainWrap"><div class="chart-wrap tall"><canvas id="spendChart"></canvas></div><div class="note hidden" id="spendHistEmpty">No spending in this range yet.</div></div>
         </div>
       </div>
       <div class="cards" id="spendCardList"></div>
-      <h3>Transactions</h3>
-      <div class="toolbar"><label>Category <select id="spendCatFilter"></select></label></div>
-      <div id="spendTxTable"></div>
+      <div class="panel">
+        <h3>Transactions</h3>
+        <div class="toolbar"><label>Category <select id="spendCatFilter"></select></label></div>
+        <div id="spendTxTable"></div>
+      </div>
     </div>
     <div id="spendCardDetail" class="hidden">
       <div class="section-head"><button class="small" id="spendBackBtn">← All cards</button><h2 id="spendDetailTitle"></h2><div class="spacer"></div><button id="spendFillToggleBtn">✨ Fill with AI</button><button id="spendDetailImportBtn">Import QFX</button><button class="small" id="spendDetailEditBtn">Edit card</button><button class="danger" id="spendDetailDeleteBtn">Delete card</button></div>
@@ -506,7 +508,7 @@
             <div class="invest-share-box" id="spendDetailShareWrap"><div class="chart-wrap invest-share"><canvas id="spendDetailShareChart"></canvas></div></div>
             <div class="note hidden" id="spendDetailShareEmpty">No spending in this range yet.</div>
           </div>
-          <div class="invest-main-chart" id="spendDetailMainWrap"><div class="chart-wrap tall"><canvas id="spendDetailChart"></canvas></div></div>
+          <div class="invest-main-chart" id="spendDetailMainWrap"><div class="chart-wrap tall"><canvas id="spendDetailChart"></canvas></div><div class="note hidden" id="spendDetailHistEmpty">No spending in this range yet.</div></div>
         </div>
       </div>
       <div class="panel hidden" id="spendFillPanel">
@@ -517,9 +519,11 @@
         <div class="msg" id="spendFillMsg"></div>
         <div id="spendFillProposals"></div>
       </div>
-      <div class="toolbar"><button class="primary" id="spendDetailAddTxBtn">+ Add transaction</button></div>
-      <div class="toolbar"><label>Category <select id="spendDetailCatFilter"></select></label></div>
-      <div id="spendDetailTxTable"></div>
+      <div class="panel">
+        <div class="toolbar"><button class="primary" id="spendDetailAddTxBtn">+ Add transaction</button></div>
+        <div class="toolbar"><label>Category <select id="spendDetailCatFilter"></select></label></div>
+        <div id="spendDetailTxTable"></div>
+      </div>
     </div>
     <datalist id="spendCategoryList">
       <option value="Groceries"><option value="Dining"><option value="Transport"><option value="Housing"><option value="Utilities"><option value="Health"><option value="Entertainment"><option value="Shopping"><option value="Travel"><option value="Education"><option value="Fees &amp; interest"><option value="Other">
