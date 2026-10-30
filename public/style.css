@@ -240,6 +240,10 @@ td.num, th.num { text-align: right; }
 .breakdown-card .k { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
 .breakdown-card .v { font-size: 21px; font-weight: 650; margin-top: 4px; }
 .breakdown-card .n { color: #71808f; font-size: 12px; margin-top: 2px; }
+/* Properties card: Assessed and Equity as parallel figures — same
+   .k/.v sizing as a single-figure card, side by side. */
+.breakdown-figures { display: flex; gap: 16px; }
+.breakdown-figure { flex: 1 1 0; min-width: 0; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: #f2f7fc; }
 .owner-chip { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: #eef4ea; color: #43602c; white-space: nowrap; }

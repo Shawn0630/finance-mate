@@ -3785,6 +3785,38 @@ try {
       await wait(200);
       const outsideClosed = await page.evaluate(() => document.querySelector('#monthPop').classList.contains('hidden'));
       check('clicking outside closes the month picker', outsideClosed);
+      // Scroll re-anchoring: a fixed popover must follow its field,
+      // not strand over other content once the page moves.
+      await page.evaluate(() => document.querySelector('#rangeStart').scrollIntoView({ block: 'center' }));
+      await wait(200);
+      await page.evaluate(() => document.querySelector('#rangeStart').click());
+      await wait(200);
+      const popRect = () => page.evaluate(() => {
+        const f = document.querySelector('#rangeStart').getBoundingClientRect();
+        const p = document.querySelector('#monthPop');
+        const pr = p.getBoundingClientRect();
+        return {
+          hidden: p.classList.contains('hidden'),
+          fTop: f.top, fBottom: f.bottom, fLeft: f.left,
+          pTop: pr.top, pLeft: pr.left, pWidth: p.offsetWidth, vw: window.innerWidth,
+        };
+      });
+      const popBefore = await popRect();
+      await page.evaluate(() => window.scrollBy(0, 200));
+      await wait(300);
+      const popAfter = await popRect();
+      const wantLeft = Math.max(4, Math.min(popAfter.fLeft, popAfter.vw - popAfter.pWidth - 4));
+      check('scrolling re-anchors the open month picker to its field instead of stranding it',
+        !popAfter.hidden && popBefore.fTop - popAfter.fTop > 0
+        && Math.abs(popAfter.pTop - (popAfter.fBottom + 6)) <= 2
+        && Math.abs(popAfter.pLeft - wantLeft) <= 2,
+        JSON.stringify({ before: popBefore, after: popAfter, wantLeft }));
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await wait(300);
+      const popOut = await page.evaluate(() => document.querySelector('#monthPop').classList.contains('hidden'));
+      check('scrolling the field out of view closes the month picker', popOut);
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await wait(200);
       // A full pick through the popover moves the field value, its
       // display text, the chart bars and the Total together.
       await pickMonthUI('#rangeStart', '2025-01');
@@ -9891,6 +9923,7 @@ try {
           label: txt(c.querySelector('.k')),
           value: txt(c.querySelector('.v')),
           note: txt(c.querySelector('.n')),
+          figures: [...c.querySelectorAll('.breakdown-figure')].map((f) => ({ label: txt(f.querySelector('.k')), value: txt(f.querySelector('.v')) })),
           onclick: c.getAttribute('onclick') || '',
         }));
         const bc = document.querySelector('#breakdownCards').getBoundingClientRect();
@@ -9909,18 +9942,29 @@ try {
       const ovPropCard = ovLayout.cards.find((c) => c.label === 'Properties');
       const ovStockCard = ovLayout.cards.find((c) => c.label === 'Stocks');
       const ovEquity = ovSumApi.propertyValue - ovSumApi.mortgageBalance;
-      const ovEqMatch = ovPropCard ? ovPropCard.note.match(/equity[^0-9\-]*([0-9,]+(?:\.[0-9]+)?)/) : null;
-      const ovEqVal = ovEqMatch ? Number(ovEqMatch[1].replace(/,/g, '')) : NaN;
+      const ovFig = (label) => (ovPropCard ? ovPropCard.figures.find((f) => f.label === label) : null);
+      const ovAssessedVal = ovFig('Assessed') ? Number(ovFig('Assessed').value.replace(/[^0-9.\-]/g, '')) : NaN;
+      const ovEqVal = ovFig('Equity') ? Number(ovFig('Equity').value.replace(/[^0-9.\-]/g, '')) : NaN;
       const ovCtMatch = ovStockCard ? ovStockCard.note.match(/(\d+)\s+accounts? · (\d+)\s+holdings?/) : null;
       const ovHoldings = (ovInvApi.accounts || []).reduce((n, a) => n + (a.holdings || []).length, 0);
       check('overview UI: the four top summary cards are gone and the breakdown cards incl. Stocks remain',
         ovLayout.strip === false && ovLayout.sumIds.length === 0
         && ovLayout.cards.map((c) => c.label).join('|') === 'Properties|Stocks|Fixed assets|Term deposits|Other',
         JSON.stringify({ strip: ovLayout.strip, sumIds: ovLayout.sumIds, labels: ovLayout.cards.map((c) => c.label) }));
-      check('overview UI: the Properties card shows assessed value + total equity (assessed − outstanding) with the property count',
-        !!ovPropCard && Math.abs(Number(ovPropCard.value.replace(/[^0-9.\-]/g, '')) - ovSumApi.propertyValue) < 0.01
+      check('overview UI: the Properties card shows assessed and equity as parallel figures with the property count',
+        !!ovPropCard && ovPropCard.figures.length === 2
+        && Math.abs(ovAssessedVal - ovSumApi.propertyValue) < 0.01
         && Math.abs(ovEqVal - ovEquity) < 0.01 && ovPropCard.note.includes(String(ovSumApi.propertyCount)),
         JSON.stringify({ card: ovPropCard, apiValue: ovSumApi.propertyValue, apiEquity: ovEquity }));
+      check('overview UI: the parallel figures share one font size and weight',
+        await page.evaluate(() => {
+          const figs = [...document.querySelectorAll('#breakdownCards .breakdown-card .breakdown-figure .v')];
+          if (figs.length !== 2) return false;
+          const s0 = getComputedStyle(figs[0]);
+          const s1 = getComputedStyle(figs[1]);
+          return s0.fontSize === s1.fontSize && s0.fontWeight === s1.fontWeight;
+        }),
+        'parallel-figure style parity');
       check('overview UI: the Stocks card shows the CAD portfolio total with account/holding counts',
         !!ovStockCard && Math.abs(Number(ovStockCard.value.replace(/[^0-9.\-]/g, '')) - Math.round(ovInvApi.summary.value)) < 0.01
         && !!ovCtMatch && Number(ovCtMatch[1]) === ovInvApi.accounts.length && Number(ovCtMatch[2]) === ovHoldings,
@@ -11193,6 +11237,37 @@ try {
         pickedEntry.startVal === '2026-01' && pickedEntry.startLabel === 'Jan 2026'
           && pickedEntry.endVal === '2026-12' && pickedEntry.endLabel === 'Dec 2026' && pickedEntry.popHidden,
         JSON.stringify(pickedEntry));
+      // Scroll safety for the modal fields: the same fixed popover
+      // serves the entry buttons, and the modal overlay is itself
+      // a scroll container — scrolling must neither strand the
+      // picker nor close it while its button stays in view.
+      await page.evaluate(() => document.querySelector('#earnEntryStartBtn').click());
+      await waitE(200);
+      const entryPopRect = () => page.evaluate(() => {
+        const b = document.querySelector('#earnEntryStartBtn').getBoundingClientRect();
+        const p = document.querySelector('#monthPop');
+        const pr = p.getBoundingClientRect();
+        return { hidden: p.classList.contains('hidden'), bBottom: b.bottom, bLeft: b.left, pTop: pr.top, pLeft: pr.left, pWidth: p.offsetWidth, vw: window.innerWidth };
+      });
+      const entryBefore = await entryPopRect();
+      await page.evaluate(() => {
+        const ov = document.querySelector('#earnRentalEntryModal');
+        if (ov) ov.scrollBy(0, 150);
+        window.scrollBy(0, 150);
+      });
+      await waitE(300);
+      const entryAfter = await entryPopRect();
+      const entryWantLeft = Math.max(4, Math.min(entryAfter.bLeft, entryAfter.vw - entryAfter.pWidth - 4));
+      check('rental modals: scrolling with the entry picker open keeps it anchored to its button',
+        !entryAfter.hidden
+        && Math.abs(entryAfter.pTop - (entryAfter.bBottom + 6)) <= 2
+        && Math.abs(entryAfter.pLeft - entryWantLeft) <= 2,
+        JSON.stringify({ before: entryBefore, after: entryAfter, wantLeft: entryWantLeft }));
+      // Close the picker by toggling its own button: a global Esc
+      // would also close the modal (app.js:311), which the steps
+      // below still need open.
+      await page.evaluate(() => document.querySelector('#earnEntryStartBtn').click());
+      await waitE(150);
       await page.type('#earnRentalEntryForm [name="monthly_rent"]', '1500');
       await waitE(200);
       const modalGrouped = await page.evaluate(() => document.querySelector('#earnRentalEntryForm [name="monthly_rent"]').value);

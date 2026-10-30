@@ -312,14 +312,6 @@
         <button data-months="0">All (to payoff)</button>
         <span class="range-pick">From <button type="button" id="rangeStart" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range start month">—</button></span>
         <span class="range-pick">To <button type="button" id="rangeEnd" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range end month">—</button></span>
-        <div class="month-pop hidden" id="monthPop" role="dialog" aria-label="Choose a month">
-          <div class="month-pop-head">
-            <button type="button" class="small" id="monthPopPrev" aria-label="Previous year">&#8249;</button>
-            <span class="month-pop-year" id="monthPopYear"></span>
-            <button type="button" class="small" id="monthPopNext" aria-label="Next year">&#8250;</button>
-          </div>
-          <div class="month-pop-grid" id="monthPopGrid"></div>
-        </div>
       </div>
       <div class="msg" id="combinedMsg"></div>
       <div class="msg" id="monthlyMsg"></div>
@@ -799,6 +791,20 @@
 
 <div id="globalLoading" class="loading-veil hidden" role="status" aria-label="Loading">
   <div class="loading-spinner" aria-hidden="true"></div>
+</div>
+
+<!-- Month picker popover: body-level, not nested in any section —
+     sections hide with display:none, which would zero the rect of
+     a nested fixed popover on every other page (e.g. the rent
+     entry modal on Earnings). Fixed positioning + viewport
+     anchoring make the DOM location irrelevant to placement. -->
+<div class="month-pop hidden" id="monthPop" role="dialog" aria-label="Choose a month">
+  <div class="month-pop-head">
+    <button type="button" class="small" id="monthPopPrev" aria-label="Previous year">&#8249;</button>
+    <span class="month-pop-year" id="monthPopYear"></span>
+    <button type="button" class="small" id="monthPopNext" aria-label="Next year">&#8250;</button>
+  </div>
+  <div class="month-pop-grid" id="monthPopGrid"></div>
 </div>
 
 <script src="/invest-share.js"></script>

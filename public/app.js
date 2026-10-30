@@ -665,7 +665,7 @@ async function loadAssetsImpl(force = false) {
   const investAccounts = investData ? investData.accounts || [] : [];
   const investHoldings = investAccounts.reduce((n, a) => n + (a.holdings || []).length, 0);
   const breakdown = [
-    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · equity ${money2(propertyEquity)}` },
+    { key: 'properties', label: 'Properties', figures: [{ label: 'Assessed', value: summary.propertyValue, cents: false }, { label: 'Equity', value: propertyEquity, cents: true }], note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'}` },
     ...(investData ? [{ key: 'investments', label: 'Stocks', value: investData.summary ? investData.summary.value : 0, note: `${investAccounts.length} ${investAccounts.length === 1 ? 'account' : 'accounts'} · ${investHoldings} ${investHoldings === 1 ? 'holding' : 'holdings'}` }] : []),
     ...ASSET_SECTIONS.filter((s) => s.category).map((s) => {
       const cats = SECTION_CATEGORIES(s);
@@ -678,7 +678,7 @@ async function loadAssetsImpl(force = false) {
   ];
   $('#breakdownCards').innerHTML = breakdown.map((b) => `
     <div class="card breakdown-card" onclick="location.hash='#assets/${b.key}'">
-      <div class="k">${b.label}</div><div class="v">${money(b.value)}</div><div class="n">${esc(b.note)}</div>
+      <div class="k">${b.label}</div>${b.figures ? `<div class="breakdown-figures">${b.figures.map((f) => `<div class="breakdown-figure"><div class="k">${f.label}</div><div class="v">${f.cents ? money2(f.value) : money(f.value)}</div></div>`).join('')}</div>` : `<div class="v">${money(b.value)}</div>`}<div class="n">${esc(b.note)}</div>
     </div>`).join('');
 
   // Properties listing. Each card's cover is the same
@@ -8123,6 +8123,18 @@ function renderMonthPop() {
   }).join('');
 }
 
+function anchorMonthPop() {
+  const pop = $('#monthPop');
+  const field = monthPopField();
+  if (!pop || !field) return;
+  // Fixed positioning: the popover sits above modals too, so anchor
+  // it to the field's viewport rect, clamped inside the viewport.
+  const r = field.getBoundingClientRect();
+  const left = Math.max(4, Math.min(r.left, window.innerWidth - pop.offsetWidth - 4));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${r.bottom + 6}px`;
+}
+
 function openMonthPop(which) {
   monthPopFor = which;
   const field = monthPopField();
@@ -8132,12 +8144,7 @@ function openMonthPop(which) {
   if (!monthPopFor) return; // no data span — renderMonthPop closed it
   const pop = $('#monthPop');
   pop.classList.remove('hidden');
-  // Fixed positioning: the popover sits above modals too, so anchor
-  // it to the field's viewport rect, clamped inside the viewport.
-  const r = field.getBoundingClientRect();
-  const left = Math.max(4, Math.min(r.left, window.innerWidth - pop.offsetWidth - 4));
-  pop.style.left = `${left}px`;
-  pop.style.top = `${r.bottom + 6}px`;
+  anchorMonthPop();
   for (const [key, el] of [['start', $('#rangeStart')], ['end', $('#rangeEnd')], ['entryStart', $('#earnEntryStartBtn')], ['entryEnd', $('#earnEntryEndBtn')]]) {
     if (el) el.setAttribute('aria-expanded', String(which === key));
   }
@@ -8179,6 +8186,19 @@ $('#monthPop').addEventListener('click', (e) => {
 
 // Popover etiquette: a click anywhere outside it (or Esc) closes
 // it; only one is ever open — the other field's click retargets it.
+// Scrolling re-anchors the open popover to its field's current rect
+// (same clamping as open), so it follows the field instead of
+// stranding over other content; a field scrolled fully out of the
+// viewport closes it. Capture phase catches scrolls from any
+// container, including the modal overlay's own scroll.
+window.addEventListener('scroll', () => {
+  if (!monthPopFor) return;
+  const field = monthPopField();
+  if (!field) { closeMonthPop(); return; }
+  const r = field.getBoundingClientRect();
+  if (r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) { closeMonthPop(); return; }
+  anchorMonthPop();
+}, { capture: true, passive: true });
 document.addEventListener('click', (e) => {
   if (!monthPopFor) return;
   if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn')) return;
