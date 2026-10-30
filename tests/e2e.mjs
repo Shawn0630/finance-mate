@@ -6947,23 +6947,77 @@ try {
       check('bonus from detail: bonus total 5000, per-period rate still 3500',
         !!detailJob3 && detailJob3.calc.annualGross === 96000 && detailJob3.calc.perPeriod.gross === 3500
         && detailJob3.bonus_total === 5000, JSON.stringify(detailJob3));
-      // Edit job fields from the detail page: the detail refreshes.
-      await page.click('#earnJobDetailEditBtn');
+      // Next pay date: the card, the detail page and the API agree on
+      // one date, and the detail header carries no Edit/Delete buttons
+      // while the card still offers both. (until() predicates run in
+      // the browser, so values cross over as evaluate args, never as
+      // closed-over Node variables.)
+      const untilEval = async (fn, arg, tries = 40) => {
+        for (let i = 0; i < tries; i++) {
+          if (await page.evaluate(fn, arg)) return true;
+          await wait(300);
+        }
+        return false;
+      };
+      const apiDetailJob = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailJobId);
+      // earnJobDateLabel uses abbreviated month names (Nov 6, 2026).
+      const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul',
+        'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const [ny, nm, nd] = (apiDetailJob.next_pay_date || '').split('-').map(Number);
+      const nextLabel = `Next pay date · ${MONTHS[nm - 1]} ${nd}, ${ny}`;
+      check('detail page shows the next pay date from the API',
+        !!apiDetailJob.next_pay_date
+        && await untilEval((label) => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes(label);
+        }, nextLabel));
+      check('detail header has no Edit/Delete buttons',
+        await page.evaluate(() => !document.querySelector('#earnJobDetailEditBtn')
+          && !document.querySelector('#earnJobDetailDeleteBtn')));
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('card shows the same next pay date as the detail page',
+        await untilEval((args) => {
+          const card = document.querySelector(`.earn-job-card[data-job-id="${args.id}"]`);
+          return card && card.textContent.includes(args.label);
+        }, { id: detailJobId, label: nextLabel }));
+      check('card still offers Edit and Delete',
+        await page.evaluate((id) => {
+          const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+          if (!card) return false;
+          const labels = [...card.querySelectorAll('button')].map((b) => b.textContent.trim());
+          return labels.includes('Edit') && labels.includes('Delete');
+        }, detailJobId));
+      // Edit from the card: the detail page refreshes with the new name.
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Edit').click();
+      }, detailJobId);
       await wait(300);
       await page.evaluate(() => {
         document.querySelector('#earnJobForm [name=employer]').value = 'Detail Corp II';
       });
       await page.click('#earnJobModal button[type=submit]');
-      check('editing job fields from the detail page persists on the detail page',
+      await wait(900);
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        if (card) card.click();
+      }, detailJobId);
+      check('editing job fields from the card persists on the detail page',
         await until(() => {
           const d = document.querySelector('#earnJobDetail');
           return d && d.textContent.includes('Detail Corp II') && d.textContent.includes('$96,000.00');
         }));
-      // The detail edit uses the same shared form: it shows the gross
+      // The card edit uses the same shared form: it shows the gross
       // field with the toggle back at Gross, never a take-home value.
-      await page.click('#earnJobDetailEditBtn');
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Edit').click();
+      }, detailJobId);
       await wait(300);
-      check('detail edit shows the gross field (toggle back at Gross)',
+      check('card edit shows the gross field (toggle back at Gross)',
         await page.evaluate(() => {
           const f = document.querySelector('#earnJobForm');
           return f.querySelector('[name=pay_value_basis]:checked')?.value === 'gross'
@@ -6973,10 +7027,13 @@ try {
         [...document.querySelectorAll('#earnJobModal button')].find((b) => b.textContent.trim() === 'Cancel').click();
       });
       await wait(300);
-      // Delete from the detail page returns to the salary list.
+      // Delete from the card returns to a list without the job.
       // (The page-wide dialog handler registered earlier accepts the confirm.)
-      await page.click('#earnJobDetailDeleteBtn');
-      check('deleting from the detail page returns to the salary list',
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Delete').click();
+      }, detailJobId);
+      check('deleting from the card removes the job from the salary list',
         await until(() => {
           const list = document.querySelector('#earnJobList');
           return location.hash === '#earnings/salary'
@@ -6984,6 +7041,46 @@ try {
         }));
       const detailGone = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailJobId);
       check('the deleted job is gone server-side', !detailGone);
+      // A dateless legacy job shows no next-pay-date highlight anywhere.
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Legacy Corp', province: 'BC', frequency: 'biweekly',
+        gross_amount: 3000, gross_basis: 'period', tax_year: 2026,
+      });
+      const datelessJobId = r.data.id;
+      check('legacy job carries no next pay date from the API', !r.data.next_pay_date);
+      // Already on the salary hash: goto to the same URL is a no-op,
+      // so reload to pick up the server-side fixture.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('legacy job card shows no next pay date highlight',
+        await untilEval((id) => {
+          const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+          return card && !card.querySelector('.earn-next-pay');
+        }, datelessJobId));
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        if (card) card.click();
+      }, datelessJobId);
+      check('legacy job detail shows no next pay date highlight',
+        await untilEval(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && !d.classList.contains('hidden') && !d.querySelector('.earn-next-pay');
+        }, null));
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Delete').click();
+      }, datelessJobId);
+      // The delete is async (confirm -> API -> reload): poll the API
+      // instead of racing a single read right after the click.
+      let legacyGone = false;
+      for (let i = 0; i < 40 && !legacyGone; i++) {
+        const jobs = (await req('GET', '/api/earnings')).data.jobs;
+        legacyGone = !jobs.find((j) => j.id === datelessJobId);
+        if (!legacyGone) await wait(300);
+      }
+      check('the legacy fixture job is gone server-side', legacyGone);
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

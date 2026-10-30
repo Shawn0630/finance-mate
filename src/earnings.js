@@ -242,6 +242,31 @@ export function payDatesInWindow(frequency, from, to, anchor) {
   return [to]; // annual: one pay in the window, on the recent date
 }
 
+// Next scheduled pay date on or after today, from the same cadence
+// the YTD derivation uses — weekly / bi-weekly step from the start
+// date, monthly steps the start date's day-of-month clamped to
+// month-end, semi-monthly pays on the 15th and month-end, annual on
+// the recent payment date's anniversary. A pay date falling today
+// counts as the next one. Jobs without dates (legacy, no start or
+// recent date) get null — never a guessed date.
+export function nextPayDate({ frequency, startDate, recentDate }, today) {
+  if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today)) return null;
+  if (frequency === 'annual') {
+    const [, m, d] = recentDate.split('-').map(Number);
+    const y = Number(today.slice(0, 4));
+    const cand = ymPad(y, m, Math.min(d, lastDayOfMonth(y, m)));
+    if (cand >= today) return cand;
+    return ymPad(y + 1, m, Math.min(d, lastDayOfMonth(y + 1, m)));
+  }
+  // A future start date is its own first pay date for the anchored
+  // cadences (weekly / bi-weekly step from it, monthly on its day);
+  // semi-monthly ignores the anchor, so the window below covers it.
+  if (startDate > today && frequency !== 'semimonthly') return startDate;
+  const far = jobDayStr(jobDayNum(today) + 62);
+  const dates = payDatesInWindow(frequency, today, far, startDate);
+  return dates.length ? dates[0] : null;
+}
+
 export function deriveJobYtd({ frequency, startDate, recentDate, changes, recentValue, payroll, cppExempt, eiExempt }) {
   const periods = PAY_FREQUENCIES[frequency].periods;
   const taxYear = Number(recentDate.slice(0, 4));

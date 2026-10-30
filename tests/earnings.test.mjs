@@ -8,7 +8,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
   deriveRentalYearFigures, entryCoveredYears,
-  payDatesInWindow, deriveJobYtd, solveGrossForTakeHome,
+  payDatesInWindow, deriveJobYtd, solveGrossForTakeHome, nextPayDate,
 } from '../src/earnings.js';
 
 const job = (over = {}) => ({
@@ -309,6 +309,33 @@ test('simplified job: pay-date cadences per frequency', () => {
   assert.deepEqual(payDatesInWindow('monthly', '2026-01-31', '2026-04-30', '2026-01-31'),
     ['2026-01-31', '2026-02-28', '2026-03-31', '2026-04-30']);
   assert.deepEqual(payDatesInWindow('biweekly', '2026-02-01', '2026-01-01', '2026-01-05'), []);
+});
+
+test('next pay date: same cadence as YTD, today counts, dateless is null', () => {
+  const npd = (frequency, startDate, recentDate, today) => nextPayDate({ frequency, startDate, recentDate }, today);
+  // Bi-weekly Mondays from Jan 5: today itself counts, next is +14d.
+  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-05'), '2026-01-05');
+  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-06'), '2026-01-19');
+  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-19'), '2026-01-19');
+  // Weekly: Wednesday -> next Monday.
+  assert.equal(npd('weekly', '2026-01-05', '2026-10-23', '2026-01-07'), '2026-01-12');
+  // Monthly: day-of-month, today counts; 31st clamps to month-end.
+  assert.equal(npd('monthly', '2026-01-15', '2026-10-15', '2026-01-15'), '2026-01-15');
+  assert.equal(npd('monthly', '2026-01-15', '2026-10-15', '2026-01-16'), '2026-02-15');
+  assert.equal(npd('monthly', '2026-01-31', '2026-10-31', '2026-02-01'), '2026-02-28');
+  // Semi-monthly: 15th and month-end.
+  assert.equal(npd('semimonthly', '2026-01-05', '2026-10-23', '2026-01-15'), '2026-01-15');
+  assert.equal(npd('semimonthly', '2026-01-05', '2026-10-23', '2026-01-16'), '2026-01-31');
+  // Annual: the recent date's anniversary.
+  assert.equal(npd('annual', '2026-01-05', '2026-03-10', '2026-03-10'), '2026-03-10');
+  assert.equal(npd('annual', '2026-01-05', '2026-03-10', '2026-10-29'), '2027-03-10');
+  // A future start date is its own first pay date.
+  assert.equal(npd('biweekly', '2026-06-01', '2026-06-01', '2026-01-06'), '2026-06-01');
+  // Dateless legacy jobs and bad inputs: no guessed date.
+  assert.equal(npd('biweekly', null, null, '2026-01-06'), null);
+  assert.equal(npd('biweekly', '2026-01-05', null, '2026-01-06'), null);
+  assert.equal(npd('biweekly', null, '2026-10-23', '2026-01-06'), null);
+  assert.equal(npd('fortnightly', '2026-01-05', '2026-10-23', '2026-01-06'), null);
 });
 
 test('simplified job: YTD from elapsed periods, bi-weekly $3,000 Jan 5 -> Oct 23', () => {

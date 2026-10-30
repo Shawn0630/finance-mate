@@ -28,7 +28,7 @@ import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, m
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
-  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome,
+  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome, nextPayDate,
   deriveRentalYearFigures, entryCoveredYears,
 } from './earnings.js';
 import {
@@ -2904,6 +2904,8 @@ const earnJobRow = (row) => {
     owner: row.owner || null,
     cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
     pay_changes: payChanges, bonuses, bonus_total: bonusTotal,
+    next_pay_date: nextPayDate(
+      { frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date }, vancouverToday()),
     calc: calcSalary({ ...row, bonus_total: bonusTotal }, earnRegion().payroll),
   };
 };

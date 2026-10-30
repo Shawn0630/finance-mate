@@ -8433,6 +8433,14 @@ let earnEditRentalId = null;
 let earnYearRentalId = null;
 let earnEditYearId = null;
 
+// Next pay date highlight, shared by the job card and the job detail
+// page: one rendering, one style. Dateless jobs get no line at all.
+function earnNextPayHtml(j) {
+  return j.next_pay_date
+    ? `<div class="note earn-next-pay">Next pay date · ${esc(earnJobDateLabel(j.next_pay_date))}</div>`
+    : '';
+}
+
 function earnJobCard(j) {
   const c = j.calc;
   const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
@@ -8442,6 +8450,7 @@ function earnJobCard(j) {
     <div class="spacer"></div>
     <button class="small" onclick="earnEditJob(${j.id})">Edit</button>
     <button class="small danger" onclick="earnDeleteJob(${j.id})">Delete</button></div>
+    ${earnNextPayHtml(j)}
     <div class="summary-strip">
       <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
       <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(c.netAnnual)}</div></div>
@@ -9146,10 +9155,9 @@ window.earnDeleteJob = async (id) => {
 
 // ------------------------------------------------------- job detail --
 // A job card opens its own detail page (property/account detail
-// pattern). The detail page is where the job is managed: pay changes
-// and bonuses are added, edited and deleted here, and Edit job /
-// Delete job live here too. Card-level Edit/Delete stay as shortcuts
-// to the same modals.
+// pattern). Pay changes and bonuses are added, edited and deleted
+// here; the job itself is edited and deleted from its card, so the
+// detail header carries no Edit/Delete buttons.
 let currentEarnJobId = null;
 
 function earnJobPerPeriod(j) {
@@ -9177,9 +9185,8 @@ function earnJobDetailHtml(j) {
     <div class="panel">
       <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
       ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
-      <div class="spacer"></div>
-      <button class="small" id="earnJobDetailEditBtn" onclick="earnEditJob(${j.id})">Edit job</button>
-      <button class="small danger" id="earnJobDetailDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete job</button></div>
+      <div class="spacer"></div></div>
+      ${earnNextPayHtml(j)}
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
         <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(c.netAnnual)}</div></div>
