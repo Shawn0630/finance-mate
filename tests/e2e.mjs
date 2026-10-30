@@ -12307,8 +12307,29 @@ try {
       const waitS = (ms) => new Promise((res2) => setTimeout(res2, ms));
       await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitS(1200);
+      const aiHeader = await page.evaluate(() => {
+        const btn = document.querySelector('#spendAiAnalyzeBtn');
+        const add = document.querySelector('#addSpendCardBtn');
+        const head = btn ? btn.closest('.section-head') : null;
+        return { btnVisible: !!btn && btn.offsetParent !== null, sameHead: !!head && !!add && head.contains(add), btnText: btn ? btn.textContent : '' };
+      });
+      check('spending UI: header holds ✨ Analyze categories beside + Add card',
+        aiHeader.btnVisible && aiHeader.sameHead && /Analyze categories/.test(aiHeader.btnText), JSON.stringify(aiHeader));
+      const inlineGone = await page.evaluate(() => ({
+        inlineHost: !!document.querySelector('#spendList #spendAiProposals'),
+        inlineHeading: [...document.querySelectorAll('#spendList h3')].some((h) => h.textContent.includes('Category analysis')),
+      }));
+      check('spending UI: the inline analysis panel is gone from the overall page',
+        !inlineGone.inlineHost && !inlineGone.inlineHeading, JSON.stringify(inlineGone));
       await page.click('#spendAiAnalyzeBtn');
       await page.waitForFunction(() => !!document.querySelector('[data-ai-group]'), { timeout: 10000 });
+      const modalOpen = await page.evaluate(() => {
+        const modal = document.querySelector('#spendAiModal');
+        const groupsInModal = modal ? modal.querySelectorAll('[data-ai-group]').length : 0;
+        return { modalVisible: !!modal && !modal.classList.contains('hidden'), groupsInModal };
+      });
+      check('spending UI: clicking Analyze opens the modal with the category groups',
+        modalOpen.modalVisible && modalOpen.groupsInModal > 0, JSON.stringify(modalOpen));
       const previewUi = await page.evaluate(() => {
         const groups = [...document.querySelectorAll('[data-ai-group]')].map((g) => g.textContent);
         return { groups, hasDining: groups.some((t) => t.includes('Dining')), hasShopping: groups.some((t) => t.includes('Shopping')) };
@@ -12319,16 +12340,22 @@ try {
       await waitS(300);
       const previewRows = await page.evaluate(() => {
         const rows = document.querySelector('[data-ai-group-rows]');
-        return { visible: !!rows && !rows.classList.contains('hidden'), rowSels: rows ? rows.querySelectorAll('select[data-ai-row-cat]').length : 0 };
+        const modal = document.querySelector('#spendAiModal');
+        return { visible: !!rows && !rows.classList.contains('hidden'), rowSels: rows ? rows.querySelectorAll('select[data-ai-row-cat]').length : 0, rowsInModal: !!(modal && rows && modal.contains(rows)) };
       });
       check('spending UI: expanding a category group shows its transactions with editable categories',
-        previewRows.visible && previewRows.rowSels > 0, JSON.stringify(previewRows));
+        previewRows.visible && previewRows.rowSels > 0 && previewRows.rowsInModal, JSON.stringify(previewRows));
       await page.evaluate((txId) => {
         const sel = document.querySelector(`select[data-ai-row-cat="${txId}"]`);
         if (sel) { sel.value = 'Groceries'; sel.dispatchEvent(new Event('change', { bubbles: true })); }
       }, previewATxId);
       await page.click('#spendAiApplyBtn');
       await waitS(800);
+      const modalClosed = await page.evaluate(() => {
+        const modal = document.querySelector('#spendAiModal');
+        return { modalHidden: !!modal && modal.classList.contains('hidden') };
+      });
+      check('spending UI: Apply closes the analysis modal', modalClosed.modalHidden, JSON.stringify(modalClosed));
     } finally { await browserS.close(); }
   }
   r = await req('GET', `/api/spending/cards/${spendCard2Id}`);

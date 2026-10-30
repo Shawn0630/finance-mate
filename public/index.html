@@ -470,7 +470,7 @@
   </section>
   <section id="view-spending" class="hidden">
     <div id="spendList">
-      <div class="section-head"><h2>Spending</h2><div class="spacer"></div><button class="primary" id="addSpendCardBtn">+ Add card</button></div>
+      <div class="section-head"><h2>Spending</h2><div class="spacer"></div><button id="spendAiAnalyzeBtn">✨ Analyze categories</button><button class="primary" id="addSpendCardBtn">+ Add card</button></div>
       <div class="msg" id="spendMsg"></div>
       <div class="panel" id="spendPanel">
         <h3>Spending over time</h3>
@@ -487,12 +487,6 @@
           </div>
           <div class="invest-main-chart" id="spendMainWrap"><div class="chart-wrap tall"><canvas id="spendChart"></canvas></div></div>
         </div>
-      </div>
-      <div class="panel">
-        <h3>✨ Category analysis</h3>
-        <div class="toolbar"><button class="primary" id="spendAiAnalyzeBtn">✨ Analyze categories</button></div>
-        <div class="msg" id="spendAiMsg"></div>
-        <div id="spendAiProposals"></div>
       </div>
       <div class="cards" id="spendCardList"></div>
       <h3>Transactions</h3>
@@ -923,6 +917,14 @@
         <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="spendAiModal">
+  <div class="modal-card wide">
+    <div class="modal-head"><h3>✨ Category analysis</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="spendAiMsg"></div>
+    <div id="spendAiProposals"></div>
   </div>
 </div>
 

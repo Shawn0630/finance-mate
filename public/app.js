@@ -9940,13 +9940,19 @@ $('#spendImportParseBtn').addEventListener('click', async () => {
 
 // AI category analysis (SPENDING-GLOBAL, overall page): one pass
 // over ALL existing uncategorized transactions across ALL cards.
-// Preview groups proposals by category; each group expands to its
-// transactions, and each row's category is editable before Apply.
-// A row edited in preview changes ONLY that row on Apply — the
-// merchant mapping still takes the group's proposed category.
+// The trigger sits in the section header beside + Add card; the
+// preview lives in its own modal. Preview groups proposals by
+// category; each group expands to its transactions, and each row's
+// category is editable before Apply. A row edited in preview
+// changes ONLY that row on Apply — the merchant mapping still
+// takes the group's proposed category.
 $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
   const msg = $('#spendAiMsg');
   const host = $('#spendAiProposals');
+  msg.className = 'msg';
+  msg.textContent = '';
+  host.innerHTML = '';
+  openModal('spendAiModal');
   try {
     const data = await api('/api/spending/ai-categories', { method: 'POST', body: {} });
     if (!data.proposals.length) {
@@ -10000,6 +10006,7 @@ $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
         const result = await api('/api/spending/ai-categories/apply', { method: 'POST', body: { proposals, overrides } });
         showMsg(msg, 'ok', `Applied ${result.mapped} merchant mappings, categorized ${result.updated} transactions. Mappings are remembered.`);
         host.innerHTML = '';
+        closeModalEl($('#spendAiModal'));
         reloadSpendView();
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
