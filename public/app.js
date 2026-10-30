@@ -9488,6 +9488,12 @@ let spendData = null;
 let spendCardData = null;
 let spendShareMode = 'card';
 let spendImportParsed = null;
+// Import preview paging: one page of rows at a time; the
+// already-imported section stays collapsed until expanded.
+const SPEND_IMPORT_PAGE_SIZE = 25;
+let spendImportPage = 0;
+let spendImportOldOpen = false;
+let spendImportOldPage = 0;
 let spendTxModalCtx = null; // { cardId, txId } — txId null = add
 let spendCatFilter = '';
 let spendDetailCatFilter = '';
@@ -9833,54 +9839,102 @@ function openSpendImport(preselectCardId) {
 }
 $('#spendDetailImportBtn').addEventListener('click', () => openSpendImport(currentSpendCardId));
 
+// Import preview rendering: new rows first, one page at a time;
+// already-imported rows stay collapsed behind a count + toggle,
+// so a file with hundreds of rows no longer renders them all.
+// Apply still posts the full parsed rows — the server
+// re-validates and dedupes by FITID, so paging changes nothing
+// about what Apply writes.
+function spendImportRowHtml(r) {
+  return `<tr>
+      <td>${esc(r.date)}</td><td>${esc(r.merchant)}</td>
+      <td>${r.kind === 'charge' ? money(-r.amount) : '−' + money(r.amount)}</td>
+      <td>${r.existing ? 'Already imported' : 'New'}</td></tr>`;
+}
+function spendImportPagerHtml(page, total, prevId, nextId) {
+  const pages = Math.max(1, Math.ceil(total / SPEND_IMPORT_PAGE_SIZE));
+  const from = total ? page * SPEND_IMPORT_PAGE_SIZE + 1 : 0;
+  const to = Math.min(total, (page + 1) * SPEND_IMPORT_PAGE_SIZE);
+  return `<div class="toolbar"><span class="note">Showing ${from}–${to} of ${total}</span>`
+    + `<button class="small" id="${prevId}"${page <= 0 ? ' disabled' : ''}>&#8249; Prev</button>`
+    + `<button class="small" id="${nextId}"${page >= pages - 1 ? ' disabled' : ''}>Next &#8250;</button></div>`;
+}
+function renderSpendImportPreview(cardId, data) {
+  const preview = $('#spendImportPreview');
+  const msg = $('#spendImportModalMsg');
+  const newRows = data.rows.filter((r) => !r.existing);
+  const oldRows = data.rows.filter((r) => r.existing);
+  const droppedHtml = data.dropped.map((d) => `<li>${esc(d.reason)}${d.merchant ? ' — ' + esc(d.merchant) : ''}</li>`).join('');
+  // Balance check: the file balance against the computed
+  // balance, with the difference and the one proposed
+  // adjustment row. Nothing writes until Apply — the checkbox
+  // only opts the adjustment out of the Apply below.
+  const bc = data.balanceCheck;
+  const balanceHtml = bc ? `<div class="note">File balance: owed ${money2(bc.fileOwed)}${bc.asof ? ' · as of ' + esc(bc.asof) : ''} · Computed: owed ${money2(bc.computedOwed)} · Difference: ${money2(bc.difference)}</div>` : '';
+  const adjHtml = (bc && bc.difference !== 0)
+    ? `<div class="toolbar"><label><input type="checkbox" id="spendImportAdjCheck" checked> Add adjustment transaction of ${money2(bc.adjustmentAmount)} to reconcile</label></div>` : '';
+  const pageSlice = (rows, page) => rows.slice(page * SPEND_IMPORT_PAGE_SIZE, (page + 1) * SPEND_IMPORT_PAGE_SIZE);
+  const newTable = newRows.length
+    ? `<table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Amount</th><th>Status</th></tr></thead><tbody id="spendImportNewRows">${pageSlice(newRows, spendImportPage).map(spendImportRowHtml).join('')}</tbody></table>`
+      + (newRows.length > SPEND_IMPORT_PAGE_SIZE ? spendImportPagerHtml(spendImportPage, newRows.length, 'spendImportNewPrev', 'spendImportNewNext') : '')
+    : '';
+  const oldTable = spendImportOldOpen
+    ? `<div id="spendImportOldRows"><table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Amount</th><th>Status</th></tr></thead><tbody>${pageSlice(oldRows, spendImportOldPage).map(spendImportRowHtml).join('')}</tbody></table>`
+      + (oldRows.length > SPEND_IMPORT_PAGE_SIZE ? spendImportPagerHtml(spendImportOldPage, oldRows.length, 'spendImportOldPrev', 'spendImportOldNext') : '') + '</div>'
+    : '';
+  const oldSection = oldRows.length
+    ? `<div class="toolbar"><button class="small" id="spendImportOldToggle">${spendImportOldOpen ? 'Hide' : 'Show'} already imported (${oldRows.length})</button></div>${oldTable}`
+    : '';
+  preview.innerHTML = `
+      ${data.accountId ? `<div class="note">File account: ${esc(data.accountId)}</div>` : ''}
+      <div class="note">${data.rows.length} transactions parsed (${newRows.length} new, ${data.rows.length - newRows.length} already imported), ${data.dropped.length} dropped.</div>
+      ${balanceHtml}
+      ${adjHtml}
+      ${newTable || (!data.rows.length ? '<div class="note">No transactions found in this file.</div>' : '')}
+      ${oldSection}
+      ${droppedHtml ? `<div class="note">Dropped items:</div><ul>${droppedHtml}</ul>` : ''}
+      ${newRows.length || (bc && bc.difference !== 0) ? '<div class="toolbar"><button class="primary" id="spendImportApplyBtn">Apply import</button></div>' : ''}`;
+  const bindPager = (prevId, nextId, get, set) => {
+    const prev = $('#' + prevId);
+    const next = $('#' + nextId);
+    if (prev) prev.addEventListener('click', () => { set(Math.max(0, get() - 1)); renderSpendImportPreview(cardId, data); });
+    if (next) next.addEventListener('click', () => { set(get() + 1); renderSpendImportPreview(cardId, data); });
+  };
+  bindPager('spendImportNewPrev', 'spendImportNewNext', () => spendImportPage, (v) => { spendImportPage = v; });
+  bindPager('spendImportOldPrev', 'spendImportOldNext', () => spendImportOldPage, (v) => { spendImportOldPage = v; });
+  const oldToggle = $('#spendImportOldToggle');
+  if (oldToggle) oldToggle.addEventListener('click', () => { spendImportOldOpen = !spendImportOldOpen; spendImportOldPage = 0; renderSpendImportPreview(cardId, data); });
+  const applyBtn = $('#spendImportApplyBtn');
+  if (applyBtn) applyBtn.addEventListener('click', async () => {
+    try {
+      const adjCheck = $('#spendImportAdjCheck');
+      const result = await api(`/api/spending/cards/${cardId}/import-qfx/apply`, { method: 'POST', body: {
+        rows: data.rows,
+        fileOwed: bc ? bc.fileOwed : undefined,
+        balanceAsof: bc ? bc.asof : undefined,
+        includeAdjustment: adjCheck ? adjCheck.checked : false,
+      } });
+      showMsg(msg, 'ok', `Imported ${result.inserted} transactions, skipped ${result.skipped} already imported${result.dropped.length ? `, dropped ${result.dropped.length}` : ''}${result.adjustment ? `, adjustment ${money2(result.adjustment.amount)} added` : ''}.`);
+      preview.innerHTML = '';
+      spendImportParsed = null;
+      reloadSpendView();
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+}
+
 $('#spendImportParseBtn').addEventListener('click', async () => {
   const cardId = Number($('#spendImportCard').value);
   const file = $('#spendImportFile').files[0];
   const msg = $('#spendImportModalMsg');
-  const preview = $('#spendImportPreview');
   try {
     if (!file) throw new Error('Choose a QFX file to parse.');
     const text = await file.text();
     const data = await api(`/api/spending/cards/${cardId}/import-qfx/parse`, { method: 'POST', body: { qfxText: text } });
     spendImportParsed = data;
-    const newRows = data.rows.filter((r) => !r.existing);
-    const rowsHtml = data.rows.map((r) => `<tr>
-      <td>${esc(r.date)}</td><td>${esc(r.merchant)}</td>
-      <td>${r.kind === 'charge' ? money(-r.amount) : '−' + money(r.amount)}</td>
-      <td>${r.existing ? 'Already imported' : 'New'}</td></tr>`).join('');
-    const droppedHtml = data.dropped.map((d) => `<li>${esc(d.reason)}${d.merchant ? ' — ' + esc(d.merchant) : ''}</li>`).join('');
-    // Balance check: the file balance against the computed
-    // balance, with the difference and the one proposed
-    // adjustment row. Nothing writes until Apply — the checkbox
-    // only opts the adjustment out of the Apply below.
-    const bc = data.balanceCheck;
-    const balanceHtml = bc ? `<div class="note">File balance: owed ${money2(bc.fileOwed)}${bc.asof ? ' · as of ' + esc(bc.asof) : ''} · Computed: owed ${money2(bc.computedOwed)} · Difference: ${money2(bc.difference)}</div>` : '';
-    const adjHtml = (bc && bc.difference !== 0)
-      ? `<div class="toolbar"><label><input type="checkbox" id="spendImportAdjCheck" checked> Add adjustment transaction of ${money2(bc.adjustmentAmount)} to reconcile</label></div>` : '';
-    preview.innerHTML = `
-      ${data.accountId ? `<div class="note">File account: ${esc(data.accountId)}</div>` : ''}
-      <div class="note">${data.rows.length} transactions parsed (${newRows.length} new, ${data.rows.length - newRows.length} already imported), ${data.dropped.length} dropped.</div>
-      ${balanceHtml}
-      ${adjHtml}
-      ${rowsHtml ? `<table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Amount</th><th>Status</th></tr></thead><tbody>${rowsHtml}</tbody></table>` : '<div class="note">No transactions found in this file.</div>'}
-      ${droppedHtml ? `<div class="note">Dropped items:</div><ul>${droppedHtml}</ul>` : ''}
-      ${newRows.length || (bc && bc.difference !== 0) ? '<div class="toolbar"><button class="primary" id="spendImportApplyBtn">Apply import</button></div>' : ''}`;
-    const applyBtn = $('#spendImportApplyBtn');
-    if (applyBtn) applyBtn.addEventListener('click', async () => {
-      try {
-        const adjCheck = $('#spendImportAdjCheck');
-        const result = await api(`/api/spending/cards/${cardId}/import-qfx/apply`, { method: 'POST', body: {
-          rows: data.rows,
-          fileOwed: bc ? bc.fileOwed : undefined,
-          balanceAsof: bc ? bc.asof : undefined,
-          includeAdjustment: adjCheck ? adjCheck.checked : false,
-        } });
-        showMsg(msg, 'ok', `Imported ${result.inserted} transactions, skipped ${result.skipped} already imported${result.dropped.length ? `, dropped ${result.dropped.length}` : ''}${result.adjustment ? `, adjustment ${money2(result.adjustment.amount)} added` : ''}.`);
-        preview.innerHTML = '';
-        spendImportParsed = null;
-        reloadSpendView();
-      } catch (err) { showMsg(msg, 'err', err.message); }
-    });
+    spendImportPage = 0;
+    spendImportOldOpen = false;
+    spendImportOldPage = 0;
+    renderSpendImportPreview(cardId, data);
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 

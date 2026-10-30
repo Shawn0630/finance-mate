@@ -12526,6 +12526,131 @@ try {
   r = await req('GET', '/api/spending');
   check('spending card-fields cleanup leaves no cards', r.status === 200 && r.data.cards.length === 0);
 
+  // Import preview pagination: a 140-row file renders one page
+  // of new rows first; already-imported rows stay collapsed
+  // behind a count + toggle. Synthetic QFX only.
+  r = await req('POST', '/api/spending/cards', { name: 'Preview', issuer: 'CIBC', last4: '7777' });
+  check('import preview: card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const prevCardId = r.data.id;
+  const prevOldRow = (i) => `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261005</DTPOSTED><TRNAMT>-1.00</TRNAMT><FITID>OLD${i}</FITID><NAME>OLD MERCHANT ${i}</NAME></STMTTRN>`;
+  const prevOldQfx = `<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CCACCTFROM><ACCTID>7777666655554444</ACCTID></CCACCTFROM><BANKTRANLIST>`
+    + Array.from({ length: 110 }, (_, i) => prevOldRow(i + 1)).join('')
+    + `</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`;
+  r = await req('POST', `/api/spending/cards/${prevCardId}/import-qfx/parse`, { qfxText: prevOldQfx });
+  check('import preview: first parse sees 110 rows', r.status === 200 && r.data.rows.length === 110, JSON.stringify({ n: r.data.rows && r.data.rows.length }));
+  const prevOldParsed = r.data.rows;
+  r = await req('POST', `/api/spending/cards/${prevCardId}/import-qfx/apply`, { rows: prevOldParsed });
+  check('import preview: first apply inserts 110 rows', r.status === 201 && r.data.inserted === 110, JSON.stringify(r.data));
+  const prevNewRows = Array.from({ length: 30 }, (_, i) =>
+    `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261006</DTPOSTED><TRNAMT>-2.00</TRNAMT><FITID>NEW${i + 1}</FITID><NAME>NEW MERCHANT ${i + 1}</NAME></STMTTRN>`).join('');
+  // Stored sum is -110, new sum is -60: file owed 170 matches
+  // computed owed, so the balance line shows difference 0 and
+  // no adjustment is proposed.
+  const prevBigQfx = `<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CCACCTFROM><ACCTID>7777666655554444</ACCTID></CCACCTFROM>`
+    + `<LEDGERBAL><BALAMT>-170.00</BALAMT><DTASOF>20261030120000</DTASOF></LEDGERBAL><BANKTRANLIST>`
+    + Array.from({ length: 110 }, (_, i) => prevOldRow(i + 1)).join('') + prevNewRows
+    + `</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`;
+  const prevTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-prev-'));
+  const prevTmpFile = path.join(prevTmpDir, 'big.qfx');
+  fs.writeFileSync(prevTmpFile, prevBigQfx);
+
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('import preview browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardP = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResP = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueP = loginResP.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserP = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserP.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardP({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueP, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#spending/card/${prevCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1200);
+      await page.click('#spendDetailImportBtn');
+      await waitP(300);
+      const fileHandle = await page.$('#spendImportFile');
+      await fileHandle.uploadFile(prevTmpFile);
+      await page.click('#spendImportParseBtn');
+      await waitP(1200);
+      const prevUi = await page.evaluate(() => {
+        const newRows = [...document.querySelectorAll('#spendImportNewRows tr')];
+        const oldToggle = document.querySelector('#spendImportOldToggle');
+        const preview = document.querySelector('#spendImportPreview');
+        return {
+          newCount: newRows.length,
+          firstNewStatus: newRows[0] ? newRows[0].children[3].textContent.trim() : null,
+          oldToggleText: oldToggle ? oldToggle.textContent.trim() : null,
+          oldVisible: !!document.querySelector('#spendImportOldRows'),
+          balanceLine: preview ? preview.textContent.includes('File balance') && preview.textContent.includes('Difference:') : false,
+        };
+      });
+      check('import preview: one page of new rows first, old rows collapsed behind count + toggle',
+        prevUi.newCount === 25 && prevUi.firstNewStatus === 'New' && prevUi.oldToggleText && prevUi.oldToggleText.includes('110') && !prevUi.oldVisible && prevUi.balanceLine,
+        JSON.stringify(prevUi));
+      await page.click('#spendImportNewNext');
+      await waitP(300);
+      const prevPage2 = await page.evaluate(() => [...document.querySelectorAll('#spendImportNewRows tr')].length);
+      check('import preview: pager Next shows the second page of new rows', prevPage2 === 5, JSON.stringify({ prevPage2 }));
+      await page.click('#spendImportOldToggle');
+      await waitP(300);
+      const prevOldCount = await page.evaluate(() => [...document.querySelectorAll('#spendImportOldRows tbody tr')].length);
+      check('import preview: expanding shows one page of already-imported rows', prevOldCount === 25, JSON.stringify({ prevOldCount }));
+      await page.click('#spendImportApplyBtn');
+      await waitP(1200);
+      const prevMsg = await page.evaluate(() => {
+        const m = document.querySelector('#spendImportModalMsg');
+        return m ? m.textContent.trim() : null;
+      });
+      check('import preview: Apply message reports 30 imported', prevMsg && prevMsg.includes('Imported 30 transactions'), JSON.stringify({ prevMsg }));
+    } finally { await browserP.close(); }
+  }
+  r = await req('GET', `/api/spending/cards/${prevCardId}`);
+  check('import preview: Apply imported exactly the 30 new rows', r.status === 200 && r.data.transactions.length === 140, JSON.stringify({ n: r.data.transactions && r.data.transactions.length }));
+  r = await req('DELETE', `/api/spending/cards/${prevCardId}`);
+  check('import preview cleanup: card deleted', r.status === 200);
+  fs.rmSync(prevTmpDir, { recursive: true, force: true });
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
