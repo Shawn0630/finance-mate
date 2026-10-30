@@ -9685,8 +9685,8 @@ try {
 
       // Overview chart panel: left share doughnut (Property +
       // Stock), right history chart (stacked bars + total line),
-      // same range picker driving both; the strip above must
-      // not move (stocks stay out of net worth).
+      // same range picker driving both; above it the breakdown
+      // cards (no top summary strip since the 2026-10-29 redesign).
       await page.goto('http://ff.local/#assets/overview', { waitUntil: 'networkidle0', timeout: 30000 });
       await page.setViewport({ width: 1400, height: 900 });
       await waitI(600);
@@ -9769,7 +9769,6 @@ try {
         && ovHd0.sets[1].data.every((v, i) => Math.abs(v - ovStockAt(ovHd0.labels[i])) < 0.011);
       check('overview UI: history bars stack Property + Stock and the total line equals their sum',
         !!ovBarsOk, JSON.stringify(ovHd0 ? { labels: ovHd0.labels.length, sets: ovHd0.sets.map((s) => s.label) } : null));
-      const ovStripBefore = await page.evaluate(() => document.querySelector('#section-overview .summary-strip').textContent);
       const ovCurShareJson = JSON.stringify(ovSh0.data);
       let ovPastEnd = null;
       for (const m of ovMonths) {
@@ -9805,18 +9804,70 @@ try {
         await page.click('#invRangeBtns-overview button[data-months="0"]');
         await waitI(400);
       }
-      const ovStripAfter = await page.evaluate(() => document.querySelector('#section-overview .summary-strip').textContent);
-      const ovStripCards = await page.evaluate(() => document.querySelectorAll('#section-overview .summary-strip .summary-card').length);
-      const ovSumApi = (await req('GET', '/api/summary')).data;
-      const ovStripNet = await page.evaluate(() => {
-        const cards = [...document.querySelectorAll('#section-overview .summary-strip .summary-card')];
-        const net = cards.find((c) => c.textContent.includes('Net worth'));
-        const num = net ? Number(net.textContent.replace(/[^0-9.\-]/g, '')) : NaN;
-        return num;
+      // Overview redesign (2026-10-29): the top summary strip is
+      // gone; breakdown cards incl. Stocks; the Properties card
+      // shows assessed + total equity; one standard 14px gap to
+      // the chart panel below.
+      const ovLayout = await page.evaluate(() => {
+        const txt = (el) => (el ? el.textContent.trim() : '');
+        const cards = [...document.querySelectorAll('#breakdownCards .breakdown-card')].map((c) => ({
+          label: txt(c.querySelector('.k')),
+          value: txt(c.querySelector('.v')),
+          note: txt(c.querySelector('.n')),
+          onclick: c.getAttribute('onclick') || '',
+        }));
+        const bc = document.querySelector('#breakdownCards').getBoundingClientRect();
+        const panel = document.querySelector('#overviewChartPanel .panel');
+        const pr = panel ? panel.getBoundingClientRect() : null;
+        return {
+          strip: !!document.querySelector('#section-overview .summary-strip'),
+          sumIds: ['sumProperty', 'sumMortgage', 'sumOther', 'sumNet'].filter((id) => document.getElementById(id)),
+          cards,
+          gap: pr ? Math.round(pr.top - bc.bottom) : null,
+          chartHead: !!document.querySelector('#overviewChartPanel h3'),
+        };
       });
-      check('overview UI: the net-worth strip is unchanged by the chart panel (stocks still excluded)',
-        ovStripBefore === ovStripAfter && ovStripCards === 4 && Math.abs(ovStripNet - ovSumApi.netWorth) < 0.01,
-        JSON.stringify({ cards: ovStripCards, stripNet: ovStripNet, apiNet: ovSumApi.netWorth }));
+      const ovSumApi = (await req('GET', '/api/summary')).data;
+      const ovInvApi = (await req('GET', '/api/investments?display=CAD')).data;
+      const ovPropCard = ovLayout.cards.find((c) => c.label === 'Properties');
+      const ovStockCard = ovLayout.cards.find((c) => c.label === 'Stocks');
+      const ovEquity = ovSumApi.propertyValue - ovSumApi.mortgageBalance;
+      const ovEqMatch = ovPropCard ? ovPropCard.note.match(/equity[^0-9\-]*([0-9,]+(?:\.[0-9]+)?)/) : null;
+      const ovEqVal = ovEqMatch ? Number(ovEqMatch[1].replace(/,/g, '')) : NaN;
+      const ovCtMatch = ovStockCard ? ovStockCard.note.match(/(\d+)\s+accounts? · (\d+)\s+holdings?/) : null;
+      const ovHoldings = (ovInvApi.accounts || []).reduce((n, a) => n + (a.holdings || []).length, 0);
+      check('overview UI: the four top summary cards are gone and the breakdown cards incl. Stocks remain',
+        ovLayout.strip === false && ovLayout.sumIds.length === 0
+        && ovLayout.cards.map((c) => c.label).join('|') === 'Properties|Stocks|Fixed assets|Term deposits|Other',
+        JSON.stringify({ strip: ovLayout.strip, sumIds: ovLayout.sumIds, labels: ovLayout.cards.map((c) => c.label) }));
+      check('overview UI: the Properties card shows assessed value + total equity (assessed − outstanding) with the property count',
+        !!ovPropCard && Math.abs(Number(ovPropCard.value.replace(/[^0-9.\-]/g, '')) - ovSumApi.propertyValue) < 0.01
+        && Math.abs(ovEqVal - ovEquity) < 0.01 && ovPropCard.note.includes(String(ovSumApi.propertyCount)),
+        JSON.stringify({ card: ovPropCard, apiValue: ovSumApi.propertyValue, apiEquity: ovEquity }));
+      check('overview UI: the Stocks card shows the CAD portfolio total with account/holding counts',
+        !!ovStockCard && Math.abs(Number(ovStockCard.value.replace(/[^0-9.\-]/g, '')) - Math.round(ovInvApi.summary.value)) < 0.01
+        && !!ovCtMatch && Number(ovCtMatch[1]) === ovInvApi.accounts.length && Number(ovCtMatch[2]) === ovHoldings,
+        JSON.stringify({ card: ovStockCard, apiValue: ovInvApi.summary.value, apiAccounts: ovInvApi.accounts.length, apiHoldings: ovHoldings }));
+      check('overview UI: the cards-to-chart gap is the standard 14px spacing and the chart panel still renders below',
+        ovLayout.gap === 14 && ovLayout.chartHead === true,
+        JSON.stringify({ gap: ovLayout.gap, chartHead: ovLayout.chartHead }));
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#breakdownCards .breakdown-card')].find((c) => {
+          const k = c.querySelector('.k');
+          return k && k.textContent.trim() === 'Stocks';
+        });
+        if (card) card.click();
+      });
+      await page.waitForFunction(() => !document.querySelector('#section-investments').classList.contains('hidden'), { timeout: 10000 });
+      const ovHash = await page.evaluate(() => location.hash);
+      check('overview UI: clicking the Stocks card lands on the Stocks section',
+        ovHash === '#assets/investments', JSON.stringify({ hash: ovHash }));
+      await page.goto('http://ff.local/#assets/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitI(600);
+      await page.waitForFunction(() => {
+        const t = document.querySelector('#overviewShareTitle');
+        return t && t.textContent.length > 0;
+      }, { timeout: 10000 });
       await page.setViewport({ width: 800, height: 600 });
 
       // AI panel: a sell-heavy stub round must show both sell

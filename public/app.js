@@ -643,25 +643,30 @@ function markAssetsDirty() { assetsLoaded = false; }
 async function loadAssetsImpl(force = false) {
   if (assetsLoaded && !force) return;
   assetsLoaded = true;
-  const [summary, properties, assets] = await Promise.all([
+  const [summary, properties, assets, investData] = await Promise.all([
     api('/api/summary'), api('/api/properties'), api('/api/assets'),
+    // Stocks card (CAD): the same endpoint the Stocks page reads.
+    // A failure must never break the assets pages, so the card is
+    // simply omitted when the read fails.
+    api('/api/investments?display=CAD').catch(() => null),
   ]);
 
-  // Overview: totals + per-category breakdown cards.
-  $('#sumProperty').textContent = money(summary.propertyValue);
-  $('#sumMortgage').textContent = money2(summary.mortgageBalance);
-  $('#sumOther').textContent = money(summary.otherAssets);
-  const net = $('#sumNet');
-  net.textContent = money2(summary.netWorth);
-  net.classList.toggle('negative', summary.netWorth < 0);
+  // Overview: per-section breakdown cards. The top summary strip
+  // is gone (2026-10-29 redesign): the Properties card carries
+  // assessed value + total equity, and Stocks joins as its own
+  // card (CAD total + counts, same click-through as the rest).
   const byCategory = {};
   for (const a of assets) {
     byCategory[a.category] = byCategory[a.category] || { count: 0, total: 0 };
     byCategory[a.category].count++;
     byCategory[a.category].total += Number(a.value || 0);
   }
+  const propertyEquity = summary.propertyValue - summary.mortgageBalance;
+  const investAccounts = investData ? investData.accounts || [] : [];
+  const investHoldings = investAccounts.reduce((n, a) => n + (a.holdings || []).length, 0);
   const breakdown = [
-    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · principal ${money2(summary.mortgageBalance)}` },
+    { key: 'properties', label: 'Properties', value: summary.propertyValue, note: `${summary.propertyCount} ${summary.propertyCount === 1 ? 'property' : 'properties'} · equity ${money2(propertyEquity)}` },
+    ...(investData ? [{ key: 'investments', label: 'Stocks', value: investData.summary ? investData.summary.value : 0, note: `${investAccounts.length} ${investAccounts.length === 1 ? 'account' : 'accounts'} · ${investHoldings} ${investHoldings === 1 ? 'holding' : 'holdings'}` }] : []),
     ...ASSET_SECTIONS.filter((s) => s.category).map((s) => {
       const cats = SECTION_CATEGORIES(s);
       return {

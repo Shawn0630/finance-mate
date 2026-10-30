@@ -34,6 +34,9 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px; }
 .note { color: #71808f; font-size: 12px; margin: 6px 2px 16px; }
 h2 { font-size: 16px; margin: 22px 0 10px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+/* Overview: the chart panel below the breakdown cards sits one
+   standard block gap (the .panel margin-bottom rhythm) under them. */
+#overviewChartPanel { margin-top: 14px; }
 .card { background: #fff; border: 1px solid #dde4ec; border-radius: 10px; overflow: hidden; }
 .card .photo { height: 150px; background: #dbe4ee; display: flex; align-items: center; justify-content: center; color: #71808f; font-size: 13px; position: relative; overflow: hidden; }
 .card .photo img { width: 100%; height: 100%; object-fit: cover; }
