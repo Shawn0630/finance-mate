@@ -11630,6 +11630,70 @@ try {
     }
   }
 
+  // ---------------------------------------------------------------
+  // Spending prototype: credit cards, QFX import, AI categories,
+  // card-detail AI fill. Synthetic QFX only — no real bank file.
+  r = await req('POST', '/api/spending/cards', { name: 'Visa', issuer: 'RBC', last4: '12345' });
+  check('spending: a full card number is rejected (last 4 only)', r.status === 400 && /last 4/.test(r.data.error || ''));
+  r = await req('POST', '/api/spending/cards', { name: 'Visa', issuer: 'RBC', last4: '1234' });
+  check('spending: card created with last 4', r.status === 201 && r.data.last4 === '1234' && r.data.name === 'Visa', JSON.stringify(r.data));
+  const spendCardId = r.data.id;
+  const spendQfx = `<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CCACCTFROM><ACCTID>1111222233334444</ACCTID></CCACCTFROM><BANKTRANLIST>`
+    + `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261005</DTPOSTED><TRNAMT>-42.50</TRNAMT><FITID>SP1</FITID><NAME>WHOLE FOODS</NAME></STMTTRN>`
+    + `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261006</DTPOSTED><TRNAMT>-15.00</TRNAMT><FITID>SP2</FITID><NAME>SHELL</NAME></STMTTRN>`
+    + `<STMTTRN><TRNTYPE>CREDIT</TRNTYPE><DTPOSTED>20261007</DTPOSTED><TRNAMT>100.00</TRNAMT><FITID>SP3</FITID><NAME>PAYMENT - THANK YOU</NAME></STMTTRN>`
+    + `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261008</DTPOSTED><TRNAMT>-9.00</TRNAMT><FITID>SP1</FITID><NAME>DUP</NAME></STMTTRN>`
+    + `<STMTTRN><TRNTYPE>DEBIT</TRNTYPE><DTPOSTED>20261009</DTPOSTED><TRNAMT>-9.00</TRNAMT><NAME>NO FITID</NAME></STMTTRN>`
+    + `</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`;
+  r = await req('POST', `/api/spending/cards/${spendCardId}/import-qfx/parse`, { qfxText: spendQfx });
+  check('spending: QFX parse previews 3 rows + 2 dropped with reasons, account masked',
+    r.status === 200 && r.data.rows.length === 3 && r.data.dropped.length === 2 && r.data.accountId === '••••4444',
+    JSON.stringify(r.data));
+  const spendParsedRows = r.data.rows;
+  r = await req('GET', '/api/spending');
+  check('spending: parse wrote nothing', r.status === 200 && r.data.transactions.length === 0);
+  r = await req('POST', `/api/spending/cards/${spendCardId}/import-qfx/apply`, { rows: spendParsedRows });
+  check('spending: QFX apply inserts all three rows',
+    r.status === 201 && r.data.inserted === 3 && r.data.skipped === 0, JSON.stringify(r.data));
+  r = await req('POST', `/api/spending/cards/${spendCardId}/import-qfx/apply`, { rows: spendParsedRows });
+  check('spending: re-apply skips every existing FITID',
+    r.status === 201 && r.data.inserted === 0 && r.data.skipped === 3, JSON.stringify(r.data));
+  r = await req('GET', `/api/spending/cards/${spendCardId}`);
+  check('spending: card detail carries charges-only total and monthly series',
+    r.status === 200 && r.data.card.totalSpent === 57.5 && r.data.monthly.length === 1 && r.data.monthly[0].total === 57.5,
+    JSON.stringify({ total: r.data.card.totalSpent, monthly: r.data.monthly }));
+  r = await req('POST', `/api/spending/cards/${spendCardId}/transactions`, { date: '2026-10-10', merchant: 'COSTCO', type: 'charge', amount: 80, category: '' });
+  check('spending: manual charge stored negative', r.status === 201 && r.data.amount === -80, JSON.stringify(r.data));
+  const spendTxId = r.data.id;
+  r = await req('PUT', `/api/spending/transactions/${spendTxId}`, { category: 'Groceries' });
+  check('spending: transaction category edits', r.status === 200 && r.data.category === 'Groceries');
+  fs.writeFileSync(aiStubFile, JSON.stringify({ proposals: [{ merchant: 'WHOLE FOODS', category: 'Groceries' }, { merchant: 'SHELL', category: 'Transport' }] }));
+  r = await req('POST', '/api/spending/ai-categories', {});
+  check('spending: AI category proposals cover uncategorized merchants',
+    r.status === 200 && r.data.proposals.length === 2, JSON.stringify(r.data));
+  r = await req('POST', '/api/spending/ai-categories/apply', { proposals: r.data.proposals });
+  check('spending: AI category apply categorizes rows',
+    r.status === 200 && r.data.updated === 2, JSON.stringify(r.data));
+  r = await req('GET', `/api/spending/cards/${spendCardId}`);
+  const wholeFoods = (r.data.transactions || []).find((t) => t.merchant === 'WHOLE FOODS');
+  check('spending: applied category lands on the transaction', !!wholeFoods && wholeFoods.category === 'Groceries');
+  fs.writeFileSync(aiStubFile, JSON.stringify({ transactions: [{ date: '2026-10-20', merchant: 'STARBUCKS', amount: 6.5, category: 'Dining', memo: null }] }));
+  r = await req('POST', `/api/spending/cards/${spendCardId}/fill`, { text: 'Oct 20 Starbucks 6.50' });
+  check('spending: AI fill proposes a charge row, writes nothing',
+    r.status === 200 && r.data.proposals.length === 1 && r.data.proposals[0].amount === -6.5, JSON.stringify(r.data));
+  r = await req('POST', `/api/spending/cards/${spendCardId}/fill/apply`, { rows: r.data.proposals });
+  check('spending: AI fill apply inserts the row', r.status === 201 && r.data.inserted === 1, JSON.stringify(r.data));
+  r = await req('GET', '/api/spending');
+  check('spending: overall page carries cards, transactions and monthly series',
+    r.status === 200 && r.data.cards.length === 1 && r.data.transactions.length === 5 && r.data.monthly.length === 1,
+    JSON.stringify({ cards: r.data.cards.length, tx: r.data.transactions.length, months: r.data.monthly.length }));
+  r = await req('DELETE', `/api/spending/transactions/${spendTxId}`);
+  check('spending: transaction deletes', r.status === 200);
+  r = await req('DELETE', `/api/spending/cards/${spendCardId}`);
+  check('spending: card deletes', r.status === 200);
+  r = await req('GET', '/api/spending');
+  check('spending: cleanup leaves no cards', r.status === 200 && r.data.cards.length === 0);
+
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above

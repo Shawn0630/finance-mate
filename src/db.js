@@ -375,6 +375,34 @@ db.exec(`CREATE TABLE IF NOT EXISTS earn_bonuses (
   created_at TEXT NOT NULL
 )`);
 
+// Spending (credit cards): a card stores its last 4 digits ONLY —
+// never a full PAN. Transactions carry the file's signed amount
+// (charges negative, payments positive); a FITID is unique per
+// card, which is what QFX dedupe keys on. Merchant→category
+// mappings live in user_preferences ('spend_merchant_categories').
+db.exec(`CREATE TABLE IF NOT EXISTS spend_cards (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  issuer TEXT,
+  last4 TEXT NOT NULL,               -- exactly 4 digits, enforced server-side
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS spend_transactions (
+  id INTEGER PRIMARY KEY,
+  card_id INTEGER NOT NULL REFERENCES spend_cards(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,                -- 'YYYY-MM-DD'
+  merchant TEXT NOT NULL,
+  memo TEXT,
+  category TEXT,
+  amount REAL NOT NULL,              -- signed: charges negative, payments positive
+  fitid TEXT,                        -- QFX FITID; NULL on manual / AI rows
+  source TEXT NOT NULL DEFAULT 'manual',  -- 'qfx' | 'manual' | 'ai'
+  created_at TEXT NOT NULL,
+  UNIQUE (card_id, fitid)
+)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_spend_tx_card_date ON spend_transactions(card_id, date)`);
+
 // Properties used to carry ONE uploaded photo in properties.photo_file;
 // the gallery replaces it. Fold any existing single photo into the
 // gallery as a photo of that property (keeping its place as the first

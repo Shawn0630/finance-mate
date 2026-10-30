@@ -173,7 +173,8 @@ function attachAddressSuggest(input, list) {
     clearTimeout(timer);
     const q = input.value.trim();
     if (q.length < 4) { close(); return; }
-    timer = setTimeout(async () => {
+    timer = setTimeout
+(async () => {
       const my = ++seq;
       try {
         const data = await api('/api/address/suggest?q=' + encodeURIComponent(q));
@@ -384,7 +385,19 @@ function route() {
     document.querySelectorAll('#earningsNav a').forEach((a) =>
       a.classList.toggle('active', a.dataset.section === sub));
     loadEarnings();
-  } else if (['#spending', '#planning', '#tax'].includes(hash)) {
+  } else if (hash === '#spending' || hash.startsWith('#spending/')) {
+    showView('spending');
+    if (hash.startsWith('#spending/card/')) {
+      currentSpendCardId = Number(hash.split('/')[2]);
+      $('#spendList').classList.add('hidden');
+      $('#spendCardDetail').classList.remove('hidden');
+      loadSpendCard(currentSpendCardId);
+    } else {
+      $('#spendCardDetail').classList.add('hidden');
+      $('#spendList').classList.remove('hidden');
+      loadSpending();
+    }
+  } else if (['#planning', '#tax'].includes(hash)) {
     showView(hash.slice(1));
   } else {
     // '#assets' or '#assets/<section>'
@@ -4886,6 +4899,8 @@ const investRanges = {
   investHolding: { months: 0, custom: null },
   overview: { months: 0, custom: null },
   rentIncome: { months: 0, custom: null },
+  spending: { months: 0, custom: null },
+  spendCard: { months: 0, custom: null },
 };
 const investViewData = {}; // level -> { series, monthly, cur, nativePct }
 let invPop = null; // { level, which: 'start'|'end', year }
@@ -4951,6 +4966,14 @@ const INVEST_LEVEL_CONF = {
   rentIncome: {
     canvas: '#rentIncomeChart', key: 'rentIncome', monthly: null,
     get: () => rentIncomeChart, set: (c) => { rentIncomeChart = c; window.__fmCharts.rentIncome = c; },
+  },
+  spending: {
+    canvas: '#spendChart', key: 'spending', monthly: null,
+    get: () => spendChart, set: (c) => { spendChart = c; window.__fmCharts.spend = c; },
+  },
+  spendCard: {
+    canvas: '#spendDetailChart', key: 'spendCard', monthly: null,
+    get: () => spendDetailChart, set: (c) => { spendDetailChart = c; window.__fmCharts.spendCard = c; },
   },
 };
 
@@ -5338,6 +5361,12 @@ function applyInvestRange(level) {
     // (no income in range) by hiding both chart wraps.
     if (drawRentIncomeShareChart(d, r)) conf.set(drawRentIncomeHistoryChart($(conf.canvas), d, r));
     else { rentIncomeChart = null; window.__fmCharts.rentIncome = null; }
+  } else if (level === 'spending' || level === 'spendCard') {
+    // Spending draws its own two charts from the range-filtered
+    // monthly rows and transactions: the share doughnut covers
+    // the whole range (by card / by category on the overall page,
+    // by category on a card page), the history bars the months.
+    drawSpendCharts(level, d, r);
   } else if (level === 'overview') {
     // The Overview panel has no monthly table: its history
     // chart draws the filtered monthly rows (Property + Stock
@@ -9156,6 +9185,382 @@ window.earnDeleteEntry = async (rentalId, entryId) => {
   await api(`/api/earnings/rentals/${rentalId}/entries/${entryId}`, { method: 'DELETE' });
   loadEarnings();
 };
+
+// ------------------------------------------------------------- spending ---
+// Credit cards: overall page (share by card / by category + monthly
+// history + transactions) and per-card detail pages (share by
+// category + history + transactions, QFX import, ✨ Fill with AI).
+// The share doughnut covers the whole range in force (a flow,
+// unlike Stocks' range-end point-in-time share); the history bars
+// are the monthly spending series. Charges are negative server-side
+// and display as positive spending; payments display negated.
+let currentSpendCardId = null;
+let spendChart = null;
+let spendShareChart = null;
+let spendDetailChart = null;
+let spendDetailShareChart = null;
+let spendData = null;
+let spendCardData = null;
+let spendShareMode = 'card';
+let spendImportParsed = null;
+let spendTxModalCtx = null; // { cardId, txId } — txId null = add
+
+const spendShareCenterPlugin = {
+  id: 'spendShareCenter',
+  afterDraw(chart) {
+    const c = chart.$spendCenter;
+    if (!c) return;
+    const area = chart.chartArea;
+    const x = (area.left + area.right) / 2;
+    const y = (area.top + area.bottom) / 2;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#71808f';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.fillText('Total spent', x, y - 4);
+    ctx.fillStyle = '#22303c';
+    ctx.font = '700 14px system-ui, sans-serif';
+    ctx.fillText(money2(c.total), x, y + 14);
+    ctx.restore();
+  },
+};
+
+function spendGroupByCard(tx, cards) {
+  const names = new Map((cards || []).map((c) => [c.id, c.name]));
+  const totals = new Map();
+  for (const t of tx) {
+    if (!(Number(t.amount) < 0)) continue;
+    totals.set(t.card_id, (totals.get(t.card_id) || 0) + -Number(t.amount));
+  }
+  return [...totals.entries()]
+    .map(([id, total]) => ({ label: names.get(id) || 'Card', total: Math.round(total * 100) / 100, color: INVEST_ACCOUNT_COLORS[Math.abs(Number(id) || 0) % INVEST_ACCOUNT_COLORS.length] }))
+    .filter((s) => s.total > 0)
+    .sort((a, b) => b.total - a.total);
+}
+
+function spendGroupByCategory(tx) {
+  const totals = new Map();
+  for (const t of tx) {
+    if (!(Number(t.amount) < 0)) continue;
+    const label = (t.category || '').trim() || 'Uncategorized';
+    totals.set(label, (totals.get(label) || 0) + -Number(t.amount));
+  }
+  return [...totals.entries()]
+    .map(([label, total], i) => ({ label, total: Math.round(total * 100) / 100, color: INVEST_ACCOUNT_COLORS[i % INVEST_ACCOUNT_COLORS.length] }))
+    .filter((s) => s.total > 0)
+    .sort((a, b) => b.total - a.total);
+}
+
+function drawSpendCharts(level, d, r) {
+  const inR = (m) => !r || (m >= r.start && m <= r.end);
+  const isDetail = level === 'spendCard';
+  const months = (d.monthly || []).filter((x) => inR(x.month));
+  const tx = (d.transactions || []).filter((t) => inR(String(t.date).slice(0, 7)));
+  const shareRows = isDetail
+    ? spendGroupByCategory(tx)
+    : (spendShareMode === 'card' ? spendGroupByCard(tx, d.cards || []) : spendGroupByCategory(tx));
+  const total = shareRows.reduce((s, x) => s + x.total, 0);
+  const shareCanvas = $(isDetail ? '#spendDetailShareChart' : '#spendShareChart');
+  const histCanvas = $(isDetail ? '#spendDetailChart' : '#spendChart');
+  const shareWrap = $(isDetail ? '#spendDetailShareWrap' : '#spendShareWrap');
+  const shareEmpty = $(isDetail ? '#spendDetailShareEmpty' : '#spendShareEmpty');
+  const title = $(isDetail ? '#spendDetailShareTitle' : '#spendShareTitle');
+  if (title) title.textContent = isDetail ? 'Category share' : (spendShareMode === 'card' ? 'Spending share · by card' : 'Spending share · by category');
+  const oldShare = isDetail ? spendDetailShareChart : spendShareChart;
+  if (oldShare) oldShare.destroy();
+  const oldHist = isDetail ? spendDetailChart : spendChart;
+  if (oldHist) oldHist.destroy();
+  if (!shareRows.length || total <= 0) {
+    if (isDetail) { spendDetailShareChart = null; window.__fmCharts.spendCardShare = null; }
+    else { spendShareChart = null; window.__fmCharts.spendShare = null; }
+    if (shareWrap) shareWrap.classList.add('hidden');
+    if (shareEmpty) shareEmpty.classList.remove('hidden');
+  } else {
+    if (shareWrap) shareWrap.classList.remove('hidden');
+    if (shareEmpty) shareEmpty.classList.add('hidden');
+    const chart = new Chart(shareCanvas, {
+      type: 'doughnut',
+      data: {
+        labels: shareRows.map((s) => s.label),
+        datasets: [{ data: shareRows.map((s) => s.total), backgroundColor: shareRows.map((s) => s.color), borderColor: '#fff', borderWidth: 1, hoverOffset: 10 }],
+      },
+      plugins: [spendShareCenterPlugin],
+      options: { responsive: true, maintainAspectRatio: false, cutout: '58%', plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } } },
+    });
+    chart.$spendCenter = { total };
+    if (isDetail) { spendDetailShareChart = chart; window.__fmCharts.spendCardShare = chart; }
+    else { spendShareChart = chart; window.__fmCharts.spendShare = chart; }
+  }
+  const hist = new Chart(histCanvas, {
+    type: 'bar',
+    data: { labels: months.map((m) => m.month), datasets: [{ label: 'Spending', data: months.map((m) => m.total), backgroundColor: '#1668c4' }] },
+    plugins: [guideLinePlugin],
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } } },
+  });
+  if (isDetail) { spendDetailChart = hist; window.__fmCharts.spendCard = hist; }
+  else { spendChart = hist; window.__fmCharts.spend = hist; }
+}
+
+function spendTxTableHtml(transactions, showCard) {
+  if (!transactions.length) return '<div class="note">No transactions yet.</div>';
+  const rows = transactions.map((t) => {
+    const isPayment = Number(t.amount) >= 0;
+    const amt = isPayment ? '−' + money(Number(t.amount)) : money(-Number(t.amount));
+    return `<tr>
+      <td>${esc(t.date)}</td>
+      ${showCard ? `<td>${esc(t.card_name || '')}</td>` : ''}
+      <td>${esc(t.merchant)}</td>
+      <td>${esc(t.category || '—')}</td>
+      <td>${isPayment ? 'Payment' : 'Charge'}</td>
+      <td>${amt}</td>
+      <td><button class="small" onclick="spendEditTx(${t.id})">Edit</button> <button class="small" onclick="spendDeleteTx(${t.id})">Delete</button></td>
+    </tr>`;
+  }).join('');
+  return `<table class="tbl"><thead><tr><th>Date</th>${showCard ? '<th>Card</th>' : ''}<th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadSpending() {
+  const data = await api('/api/spending');
+  spendData = data;
+  investViewData.spending = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: data.cards };
+  $('#spendCardList').innerHTML = data.cards.length ? data.cards.map((c) => `
+    <div class="card breakdown-card" onclick="location.hash='#spending/card/${c.id}'">
+      <div class="k">${esc(c.name)}${c.issuer ? ' · ' + esc(c.issuer) : ''} · ••••${esc(c.last4)}</div>
+      <div class="v">${money(c.totalSpent)}</div>
+      <div class="n">${c.txCount} transactions${c.lastTxDate ? ' · last ' + esc(c.lastTxDate) : ''}</div>
+    </div>`).join('') : '<div class="note">No cards yet — add one above.</div>';
+  $('#spendTxTable').innerHTML = spendTxTableHtml(data.transactions, true);
+  $('#spendRange').innerHTML = investRangeControlsHtml('spending');
+  wireInvestRangeControls('spending');
+  applyInvestRange('spending');
+}
+
+async function loadSpendCard(id) {
+  const data = await api(`/api/spending/cards/${id}`);
+  spendCardData = data;
+  investViewData.spendCard = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: [data.card] };
+  $('#spendDetailTitle').textContent = `${data.card.name} · ••••${data.card.last4}`;
+  $('#spendDetailTxTable').innerHTML = spendTxTableHtml(data.transactions, false);
+  $('#spendDetailRange').innerHTML = investRangeControlsHtml('spendCard');
+  wireInvestRangeControls('spendCard');
+  applyInvestRange('spendCard');
+}
+
+function reloadSpendView() {
+  if (currentSpendCardId && !$('#spendCardDetail').classList.contains('hidden')) loadSpendCard(currentSpendCardId);
+  else loadSpending();
+}
+
+window.spendDeleteTx = async (id) => {
+  if (!confirm('Delete this transaction?')) return;
+  await api(`/api/spending/transactions/${id}`, { method: 'DELETE' });
+  reloadSpendView();
+};
+
+window.spendEditTx = (id) => {
+  const all = [...(spendData ? spendData.transactions : []), ...(spendCardData ? spendCardData.transactions : [])];
+  const t = all.find((x) => x.id === id);
+  if (!t) return;
+  spendTxModalCtx = { cardId: t.card_id, txId: t.id };
+  $('#spendTxFormTitle').textContent = 'Edit transaction';
+  const f = $('#spendTxForm');
+  f.date.value = t.date;
+  f.type.value = Number(t.amount) >= 0 ? 'payment' : 'charge';
+  f.merchant.value = t.merchant;
+  setMoneyValue(f.amount, Math.abs(Number(t.amount)));
+  f.category.value = t.category || '';
+  f.memo.value = t.memo || '';
+  $('#spendTxModalMsg').className = 'msg';
+  $('#spendTxModalMsg').textContent = '';
+  openModal('spendTxModal');
+};
+
+function openSpendTxAdd(cardId) {
+  spendTxModalCtx = { cardId, txId: null };
+  $('#spendTxFormTitle').textContent = 'Add transaction';
+  const f = $('#spendTxForm');
+  f.reset();
+  f.type.value = 'charge';
+  $('#spendTxModalMsg').className = 'msg';
+  $('#spendTxModalMsg').textContent = '';
+  openModal('spendTxModal');
+}
+
+$('#spendTxForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    date: f.date.value,
+    merchant: f.merchant.value.trim(),
+    type: f.type.value,
+    amount: parseMoneyInput(f.amount.value),
+    category: f.category.value.trim(),
+    memo: f.memo.value.trim(),
+  };
+  const msg = $('#spendTxModalMsg');
+  try {
+    if (spendTxModalCtx.txId) {
+      await api(`/api/spending/transactions/${spendTxModalCtx.txId}`, { method: 'PUT', body });
+    } else {
+      await api(`/api/spending/cards/${spendTxModalCtx.cardId}/transactions`, { method: 'POST', body });
+    }
+    $('#spendTxModal').classList.add('hidden');
+    reloadSpendView();
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+let spendCardEditId = null;
+$('#addSpendCardBtn').addEventListener('click', () => {
+  spendCardEditId = null;
+  $('#spendCardFormTitle').textContent = 'Add card';
+  $('#spendCardForm').reset();
+  $('#spendCardModalMsg').className = 'msg';
+  $('#spendCardModalMsg').textContent = '';
+  openModal('spendCardModal');
+});
+
+$('#spendCardForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = { name: f.name.value.trim(), issuer: f.issuer.value.trim(), last4: f.last4.value.trim() };
+  const msg = $('#spendCardModalMsg');
+  try {
+    if (spendCardEditId) await api(`/api/spending/cards/${spendCardEditId}`, { method: 'PUT', body });
+    else await api('/api/spending/cards', { method: 'POST', body });
+    $('#spendCardModal').classList.add('hidden');
+    reloadSpendView();
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+$('#spendBackBtn').addEventListener('click', () => { location.hash = '#spending'; });
+
+$('#spendDetailDeleteBtn').addEventListener('click', async () => {
+  if (!currentSpendCardId || !confirm('Delete this card and all its transactions?')) return;
+  await api(`/api/spending/cards/${currentSpendCardId}`, { method: 'DELETE' });
+  location.hash = '#spending';
+});
+
+$('#spendShareModeBtns').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if (!btn) return;
+  spendShareMode = btn.dataset.mode;
+  $('#spendShareModeBtns').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+  applyInvestRange('spending');
+});
+
+// QFX import, shared by the overall page (card picker) and a card
+// page (preselected card): parse previews, Apply writes atomically.
+function openSpendImport(preselectCardId) {
+  const cards = spendData ? spendData.cards : (spendCardData ? [spendCardData.card] : []);
+  const sel = $('#spendImportCard');
+  sel.innerHTML = cards.map((c) => `<option value="${c.id}">${esc(c.name)} · ••••${esc(c.last4)}</option>`).join('');
+  if (preselectCardId) sel.value = String(preselectCardId);
+  $('#spendImportText').value = '';
+  $('#spendImportPreview').innerHTML = '';
+  $('#spendImportModalMsg').className = 'msg';
+  $('#spendImportModalMsg').textContent = '';
+  spendImportParsed = null;
+  openModal('spendImportModal');
+}
+$('#spendImportBtn').addEventListener('click', () => openSpendImport(null));
+$('#spendDetailImportBtn').addEventListener('click', () => openSpendImport(currentSpendCardId));
+
+$('#spendImportParseBtn').addEventListener('click', async () => {
+  const cardId = Number($('#spendImportCard').value);
+  const text = $('#spendImportText').value;
+  const msg = $('#spendImportModalMsg');
+  const preview = $('#spendImportPreview');
+  try {
+    const data = await api(`/api/spending/cards/${cardId}/import-qfx/parse`, { method: 'POST', body: { qfxText: text } });
+    spendImportParsed = data;
+    const newRows = data.rows.filter((r) => !r.existing);
+    const rowsHtml = data.rows.map((r) => `<tr>
+      <td>${esc(r.date)}</td><td>${esc(r.merchant)}</td>
+      <td>${r.kind === 'charge' ? money(-r.amount) : '−' + money(r.amount)}</td>
+      <td>${r.existing ? 'Already imported' : 'New'}</td></tr>`).join('');
+    const droppedHtml = data.dropped.map((d) => `<li>${esc(d.reason)}${d.merchant ? ' — ' + esc(d.merchant) : ''}</li>`).join('');
+    preview.innerHTML = `
+      ${data.accountId ? `<div class="note">File account: ${esc(data.accountId)}</div>` : ''}
+      <div class="note">${data.rows.length} transactions parsed (${newRows.length} new, ${data.rows.length - newRows.length} already imported), ${data.dropped.length} dropped.</div>
+      ${rowsHtml ? `<table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Amount</th><th>Status</th></tr></thead><tbody>${rowsHtml}</tbody></table>` : '<div class="note">No transactions found in this file.</div>'}
+      ${droppedHtml ? `<div class="note">Dropped items:</div><ul>${droppedHtml}</ul>` : ''}
+      ${newRows.length ? '<div class="toolbar"><button class="primary" id="spendImportApplyBtn">Apply import</button></div>' : ''}`;
+    const applyBtn = $('#spendImportApplyBtn');
+    if (applyBtn) applyBtn.addEventListener('click', async () => {
+      try {
+        const result = await api(`/api/spending/cards/${cardId}/import-qfx/apply`, { method: 'POST', body: { rows: data.rows } });
+        showMsg(msg, 'ok', `Imported ${result.inserted} transactions, skipped ${result.skipped} already imported${result.dropped.length ? `, dropped ${result.dropped.length}` : ''}.`);
+        preview.innerHTML = '';
+        spendImportParsed = null;
+        reloadSpendView();
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+// AI category analysis (overall level): propose, preview, Apply;
+// confirmed mappings are remembered for future imports.
+$('#spendAiAnalyzeBtn').addEventListener('click', async () => {
+  const msg = $('#spendAiMsg');
+  const host = $('#spendAiProposals');
+  try {
+    const data = await api('/api/spending/ai-categories', { method: 'POST', body: {} });
+    if (!data.proposals.length) {
+      host.innerHTML = '<div class="note">Nothing to categorize — every merchant already has a category or a remembered mapping.</div>';
+      return;
+    }
+    host.innerHTML = `
+      <table class="tbl"><thead><tr><th></th><th>Merchant</th><th>Proposed category</th><th>Transactions</th></tr></thead><tbody>
+      ${data.proposals.map((p, i) => `<tr>
+        <td><input type="checkbox" data-ai-cat="${i}" checked></td>
+        <td>${esc(p.merchant)}</td><td>${esc(p.category)}</td><td>${p.txCount}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="toolbar"><button class="primary" id="spendAiApplyBtn">Apply categories</button></div>`;
+    $('#spendAiApplyBtn').addEventListener('click', async () => {
+      const selected = data.proposals.filter((p, i) => host.querySelector(`[data-ai-cat="${i}"]`).checked);
+      try {
+        const result = await api('/api/spending/ai-categories/apply', { method: 'POST', body: { proposals: selected } });
+        showMsg(msg, 'ok', `Applied ${result.mapped} merchant mappings, categorized ${result.updated} transactions. Mappings are remembered.`);
+        host.innerHTML = '';
+        reloadSpendView();
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+// Card detail ✨ Fill with AI: propose transaction rows from pasted
+// text; only Apply writes.
+$('#spendFillBtn').addEventListener('click', async () => {
+  const msg = $('#spendFillMsg');
+  const host = $('#spendFillProposals');
+  try {
+    const data = await api(`/api/spending/cards/${currentSpendCardId}/fill`, { method: 'POST', body: { text: $('#spendFillText').value } });
+    if (!data.proposals.length) {
+      host.innerHTML = '<div class="note">No transactions extracted from this text.</div>';
+      return;
+    }
+    host.innerHTML = `
+      <table class="tbl"><thead><tr><th></th><th>Date</th><th>Merchant</th><th>Amount</th><th>Category</th></tr></thead><tbody>
+      ${data.proposals.map((p, i) => `<tr>
+        <td><input type="checkbox" data-fill-row="${i}" checked></td>
+        <td>${esc(p.date)}</td><td>${esc(p.merchant)}</td><td>${money(-p.amount)}</td><td>${esc(p.category || '—')}</td></tr>`).join('')}
+      </tbody></table>
+      ${data.dropped.length ? `<div class="note">Dropped ${data.dropped.length} unparseable rows.</div>` : ''}
+      <div class="toolbar"><button class="primary" id="spendFillApplyBtn">Apply transactions</button></div>`;
+    $('#spendFillApplyBtn').addEventListener('click', async () => {
+      const selected = data.proposals.filter((p, i) => host.querySelector(`[data-fill-row="${i}"]`).checked);
+      try {
+        const result = await api(`/api/spending/cards/${currentSpendCardId}/fill/apply`, { method: 'POST', body: { rows: selected } });
+        showMsg(msg, 'ok', `Added ${result.inserted} transactions${result.dropped.length ? `, dropped ${result.dropped.length}` : ''}.`);
+        host.innerHTML = '';
+        loadSpendCard(currentSpendCardId);
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+$('#spendDetailAddTxBtn').addEventListener('click', () => openSpendTxAdd(currentSpendCardId));
 
 (async () => {
   try {

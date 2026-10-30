@@ -468,7 +468,66 @@
       <div id="earnRentalList"></div>
     </div>
   </section>
-  <section id="view-spending" class="hidden"><div class="placeholder"><h2>Spending</h2><p>This module is planned for a later round.</p></div></section>
+  <section id="view-spending" class="hidden">
+    <div id="spendList">
+      <div class="section-head"><h2>Spending</h2><div class="spacer"></div><button class="primary" id="addSpendCardBtn">+ Add card</button></div>
+      <div class="msg" id="spendMsg"></div>
+      <div class="panel" id="spendPanel">
+        <h3>Spending over time</h3>
+        <div id="spendRange"></div>
+        <div class="toolbar range-btns" id="spendShareModeBtns">
+          <button type="button" data-mode="card" class="active">By card</button>
+          <button type="button" data-mode="category">By category</button>
+        </div>
+        <div class="invest-charts-row">
+          <div class="invest-share-col">
+            <div class="invest-share-head"><h3 id="spendShareTitle">Spending share</h3></div>
+            <div class="invest-share-box" id="spendShareWrap"><div class="chart-wrap invest-share"><canvas id="spendShareChart"></canvas></div></div>
+            <div class="note hidden" id="spendShareEmpty">No spending in this range yet.</div>
+          </div>
+          <div class="invest-main-chart" id="spendMainWrap"><div class="chart-wrap tall"><canvas id="spendChart"></canvas></div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>✨ Category analysis</h3>
+        <div class="toolbar"><button class="primary" id="spendAiAnalyzeBtn">✨ Analyze categories</button><button id="spendImportBtn">Import QFX</button></div>
+        <div class="msg" id="spendAiMsg"></div>
+        <div id="spendAiProposals"></div>
+      </div>
+      <div class="cards" id="spendCardList"></div>
+      <h3>Transactions</h3>
+      <div id="spendTxTable"></div>
+    </div>
+    <div id="spendCardDetail" class="hidden">
+      <div class="section-head"><button class="small" id="spendBackBtn">← All cards</button><h2 id="spendDetailTitle"></h2><div class="spacer"></div><button id="spendDetailImportBtn">Import QFX</button><button class="small" id="spendDetailDeleteBtn">Delete card</button></div>
+      <div class="msg" id="spendDetailMsg"></div>
+      <div class="panel" id="spendDetailPanel">
+        <h3>Spending over time</h3>
+        <div id="spendDetailRange"></div>
+        <div class="invest-charts-row">
+          <div class="invest-share-col">
+            <div class="invest-share-head"><h3 id="spendDetailShareTitle">Category share</h3></div>
+            <div class="invest-share-box" id="spendDetailShareWrap"><div class="chart-wrap invest-share"><canvas id="spendDetailShareChart"></canvas></div></div>
+            <div class="note hidden" id="spendDetailShareEmpty">No spending in this range yet.</div>
+          </div>
+          <div class="invest-main-chart" id="spendDetailMainWrap"><div class="chart-wrap tall"><canvas id="spendDetailChart"></canvas></div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>✨ Fill with AI</h3>
+        <div class="note">Paste transaction text — the proposal is a preview; only Apply writes.</div>
+        <textarea id="spendFillText" rows="4" placeholder="Paste statement text with dates, merchants and amounts"></textarea>
+        <div class="toolbar"><button class="primary" id="spendFillBtn">✨ Extract transactions</button></div>
+        <div class="msg" id="spendFillMsg"></div>
+        <div id="spendFillProposals"></div>
+      </div>
+      <div class="toolbar"><button class="primary" id="spendDetailAddTxBtn">+ Add transaction</button></div>
+      <div id="spendDetailTxTable"></div>
+    </div>
+    <datalist id="spendCategoryList">
+      <option value="Groceries"><option value="Dining"><option value="Transport"><option value="Housing"><option value="Utilities"><option value="Health"><option value="Entertainment"><option value="Shopping"><option value="Travel"><option value="Education"><option value="Fees &amp; interest"><option value="Other">
+    </datalist>
+  </section>
   <section id="view-planning" class="hidden"><div class="placeholder"><h2>Planning</h2><p>This module is planned for a later round.</p></div></section>
   <section id="view-tax" class="hidden"><div class="placeholder"><h2>Tax</h2><p>This module is planned for a later round.</p></div></section>
 </main>
@@ -784,6 +843,63 @@
       <div class="toolbar">
         <button type="submit" class="primary">Save</button>
         <button type="button" id="earnRentalEntryCancelBtn" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="spendCardModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="spendCardFormTitle">Add card</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="spendCardModalMsg"></div>
+    <form id="spendCardForm">
+      <div class="grid2">
+        <div><label>Card name *</label><input name="name" required></div>
+        <div><label>Issuer</label><input name="issuer" autocomplete="off"></div>
+      </div>
+      <div><label>Last 4 digits *</label><input name="last4" inputmode="numeric" maxlength="4" required><div class="note">Only the last 4 digits are stored — never enter a full card number.</div></div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="spendImportModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Import QFX</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="spendImportModalMsg"></div>
+    <div><label>Card *</label><select id="spendImportCard"></select></div>
+    <div><label>QFX file contents *</label><textarea id="spendImportText" rows="8" placeholder="Paste the contents of a .qfx file"></textarea></div>
+    <div class="toolbar">
+      <button class="primary" id="spendImportParseBtn">Parse preview</button>
+      <button type="button" data-close-modal>Cancel</button>
+    </div>
+    <div id="spendImportPreview"></div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="spendTxModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="spendTxFormTitle">Add transaction</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="spendTxModalMsg"></div>
+    <form id="spendTxForm">
+      <div class="grid2">
+        <div><label>Date *</label><input name="date" type="date" required></div>
+        <div><label>Type *</label><select name="type"><option value="charge">Charge</option><option value="payment">Payment</option></select></div>
+      </div>
+      <div class="grid2">
+        <div><label>Merchant *</label><input name="merchant" required autocomplete="off"></div>
+        <div><label>Amount *</label><input name="amount" type="text" inputmode="decimal" data-money required></div>
+      </div>
+      <div class="grid2">
+        <div><label>Category</label><input name="category" list="spendCategoryList" autocomplete="off"></div>
+        <div><label>Memo</label><input name="memo" autocomplete="off"></div>
+      </div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>
   </div>

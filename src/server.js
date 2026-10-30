@@ -15,7 +15,7 @@ import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
-import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured } from './aiFill.js';
+import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured, callLlm, parseModelJson } from './aiFill.js';
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
@@ -36,6 +36,10 @@ import {
   recordPlanEventDeletion,
 } from './plans.js';
 import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
+import {
+  SPEND_CATEGORIES, parseQfx, validateSpendApply, normalizeMerchant, validSpendDate,
+  spendMonthly, spendTotal,
+} from './spending.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -3203,6 +3207,293 @@ app.delete('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (
     .run(Number(req.params.entryId), Number(req.params.rentalId));
   if (!info.changes) return res.status(404).json({ error: 'entry not found' });
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------- spending ---
+// Credit cards: cards (last 4 digits ONLY — a full PAN is rejected),
+// transactions, QFX import (parse → preview → Apply), and AI
+// category analysis. Spending is a flow, like Earnings: nothing here
+// feeds /api/summary or net worth.
+//   Sign rule: charges store NEGATIVE, payments positive; totals sum
+//   -amount over charges only.
+function getSpendCard(id) {
+  return db.prepare('SELECT * FROM spend_cards WHERE id = ?').get(id) || null;
+}
+function listSpendCards() {
+  return db.prepare('SELECT * FROM spend_cards ORDER BY name').all();
+}
+function listSpendTx(cardId) {
+  return db.prepare('SELECT * FROM spend_transactions WHERE card_id = ? ORDER BY date DESC, id DESC').all(cardId);
+}
+function listAllSpendTx() {
+  return db.prepare(
+    `SELECT t.*, c.name AS card_name FROM spend_transactions t
+     JOIN spend_cards c ON c.id = t.card_id ORDER BY t.date DESC, t.id DESC LIMIT 2000`).all();
+}
+function spendCardView(card) {
+  const tx = listSpendTx(card.id);
+  const charges = tx.filter((t) => Number(t.amount) < 0);
+  return {
+    ...card,
+    txCount: tx.length,
+    totalSpent: spendTotal(tx),
+    lastTxDate: tx.length ? tx[0].date : null,
+    chargeCount: charges.length,
+  };
+}
+function validSpendCardInput(b) {
+  const name = String((b && b.name) || '').trim();
+  if (!name) return { error: 'Card name is required.' };
+  const last4 = String((b && b.last4) || '').trim();
+  if (!/^\d{4}$/.test(last4)) return { error: 'Enter only the last 4 digits of the card number.' };
+  const issuer = b && b.issuer != null ? String(b.issuer).trim() : '';
+  return { name, issuer: issuer || null, last4 };
+}
+function spendMerchantMappings(userId) {
+  const row = db.prepare("SELECT value FROM user_preferences WHERE user_id = ? AND key = 'spend_merchant_categories'").get(userId);
+  try { return row ? JSON.parse(row.value) : {}; } catch { return {}; }
+}
+function saveSpendMerchantMappings(userId, mappings) {
+  db.prepare(`INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES (?, 'spend_merchant_categories', ?, ?)
+    ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+    .run(userId, JSON.stringify(mappings), nowIso());
+}
+const SPEND_AI_UNCONFIGURED = 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.';
+
+app.get('/api/spending', requireApiAuth, (req, res) => {
+  const cards = listSpendCards().map(spendCardView);
+  const transactions = listAllSpendTx();
+  res.json({ cards, transactions, monthly: spendMonthly(transactions) });
+});
+app.post('/api/spending/cards', requireApiAuth, (req, res) => {
+  const v = validSpendCardInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  const ts = nowIso();
+  const info = db.prepare('INSERT INTO spend_cards (name, issuer, last4, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+    .run(v.name, v.issuer, v.last4, ts, ts);
+  res.status(201).json(spendCardView(getSpendCard(info.lastInsertRowid)));
+});
+app.put('/api/spending/cards/:id', requireApiAuth, (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  const v = validSpendCardInput(req.body || {});
+  if (v.error) return res.status(400).json({ error: v.error });
+  db.prepare('UPDATE spend_cards SET name = ?, issuer = ?, last4 = ?, updated_at = ? WHERE id = ?')
+    .run(v.name, v.issuer, v.last4, nowIso(), card.id);
+  res.json(spendCardView(getSpendCard(card.id)));
+});
+app.delete('/api/spending/cards/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM spend_cards WHERE id = ?').run(Number(req.params.id));
+  if (!info.changes) return res.status(404).json({ error: 'card not found' });
+  res.json({ ok: true });
+});
+app.get('/api/spending/cards/:id', requireApiAuth, (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  const transactions = listSpendTx(card.id);
+  res.json({ card: spendCardView(card), transactions, monthly: spendMonthly(transactions) });
+});
+app.post('/api/spending/cards/:id/transactions', requireApiAuth, (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  const b = req.body || {};
+  if (!validSpendDate(b.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD.' });
+  const merchant = String(b.merchant || '').trim();
+  if (!merchant) return res.status(400).json({ error: 'merchant is required.' });
+  const raw = Number(b.amount);
+  if (!Number.isFinite(raw) || raw === 0) return res.status(400).json({ error: 'amount must be a non-zero number.' });
+  const amount = b.type === 'payment' ? Math.abs(raw) : -Math.abs(raw);
+  const category = b.category != null ? String(b.category).trim() : '';
+  const info = db.prepare(
+    `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, 'manual', ?)`).run(
+    card.id, b.date, merchant, b.memo != null ? String(b.memo) : null, category || null, amount, nowIso());
+  res.status(201).json(db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(info.lastInsertRowid));
+});
+app.put('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'transaction not found' });
+  const b = req.body || {};
+  const merchant = b.merchant != null ? String(b.merchant).trim() : row.merchant;
+  if (!merchant) return res.status(400).json({ error: 'merchant is required.' });
+  const category = b.category != null ? String(b.category).trim() : row.category;
+  db.prepare('UPDATE spend_transactions SET merchant = ?, memo = ?, category = ? WHERE id = ?')
+    .run(merchant, b.memo != null ? String(b.memo) : row.memo, category || null, row.id);
+  res.json(db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(row.id));
+});
+app.delete('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
+  const info = db.prepare('DELETE FROM spend_transactions WHERE id = ?').run(Number(req.params.id));
+  if (!info.changes) return res.status(404).json({ error: 'transaction not found' });
+  res.json({ ok: true });
+});
+// QFX import, step 1: parse writes nothing. Rows already on the card
+// are flagged existing so the preview can show what Apply will skip.
+app.post('/api/spending/cards/:id/import-qfx/parse', requireApiAuth, (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  const text = req.body && typeof req.body.qfxText === 'string' ? req.body.qfxText : '';
+  if (!text.trim()) return res.status(400).json({ error: 'Paste QFX file contents to parse.' });
+  const parsed = parseQfx(text);
+  const existing = new Set(listSpendTx(card.id).map((t) => t.fitid).filter(Boolean));
+  res.json({
+    accountId: parsed.accountId,
+    rows: parsed.rows.map((r) => ({ ...r, existing: existing.has(r.fitid) })),
+    dropped: parsed.dropped,
+  });
+});
+// QFX import, step 2: one atomic transaction. Rows are re-validated
+// here — the preview is client state, never trusted.
+app.post('/api/spending/cards/:id/import-qfx/apply', requireApiAuth, (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  const existing = new Set(listSpendTx(card.id).map((t) => t.fitid).filter(Boolean));
+  const v = validateSpendApply((req.body || {}).rows, existing);
+  const ts = nowIso();
+  try {
+    db.transaction(() => {
+      const ins = db.prepare(
+        `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'qfx', ?)`);
+      for (const r of v.valid) ins.run(card.id, r.date, r.merchant, r.memo, null, r.amount, r.fitid, ts);
+    })();
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  res.status(201).json({ inserted: v.valid.length, skipped: v.skipped.length, dropped: v.dropped });
+});
+// AI category analysis (overall level): propose a category for each
+// merchant with uncategorized transactions and no remembered mapping.
+// Writes nothing — Apply saves the mappings and categorizes.
+app.post('/api/spending/ai-categories', requireApiAuth, async (req, res) => {
+  if (!llmConfigured()) return res.status(503).json({ error: SPEND_AI_UNCONFIGURED });
+  const mappings = spendMerchantMappings(req.user.id);
+  const uncategorized = listAllSpendTx().filter((t) => !(t.category || '').trim());
+  const byMerchant = new Map();
+  for (const t of uncategorized) {
+    const key = normalizeMerchant(t.merchant);
+    if (!key || mappings[key]) continue;
+    const entry = byMerchant.get(key) || { merchant: t.merchant, txCount: 0 };
+    entry.txCount += 1;
+    byMerchant.set(key, entry);
+  }
+  const merchants = [...byMerchant.values()];
+  if (!merchants.length) return res.json({ proposals: [] });
+  const prompt = `Assign each merchant one category from this list: ${SPEND_CATEGORIES.join(', ')}.
+Reply with ONLY this JSON, no other text: {"proposals": [{"merchant": "<merchant as given>", "category": "<one of the list>"}]}.
+Merchants: ${JSON.stringify(merchants.map((m) => m.merchant))}`;
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch {
+    return res.status(502).json({ error: 'The AI service could not complete the analysis.' });
+  }
+  const parsed = parseModelJson(raw);
+  const proposals = [];
+  if (parsed && Array.isArray(parsed.proposals)) {
+    for (const p of parsed.proposals) {
+      if (!p || typeof p.merchant !== 'string') continue;
+      const key = normalizeMerchant(p.merchant);
+      const entry = byMerchant.get(key);
+      if (!entry || !SPEND_CATEGORIES.includes(p.category)) continue;
+      proposals.push({ merchant: entry.merchant, category: p.category, txCount: entry.txCount });
+    }
+  }
+  res.json({ proposals });
+});
+app.post('/api/spending/ai-categories/apply', requireApiAuth, (req, res) => {
+  const proposals = Array.isArray((req.body || {}).proposals) ? req.body.proposals : [];
+  const mappings = spendMerchantMappings(req.user.id);
+  let updated = 0;
+  db.transaction(() => {
+    for (const p of proposals) {
+      if (!p || typeof p.merchant !== 'string' || !SPEND_CATEGORIES.includes(p.category)) continue;
+      mappings[normalizeMerchant(p.merchant)] = p.category;
+    }
+    saveSpendMerchantMappings(req.user.id, mappings);
+    // Per-merchant updates (a mapping keys on the normalized name, so
+    // each merchant's rows update under its own category).
+    for (const p of proposals) {
+      if (!p || typeof p.merchant !== 'string' || !SPEND_CATEGORIES.includes(p.category)) continue;
+      const key = normalizeMerchant(p.merchant);
+      const rows = db.prepare("SELECT id, merchant FROM spend_transactions WHERE category IS NULL OR category = ''").all();
+      for (const r of rows) {
+        if (normalizeMerchant(r.merchant) === key) {
+          updated += db.prepare('UPDATE spend_transactions SET category = ? WHERE id = ?').run(p.category, r.id).changes;
+        }
+      }
+    }
+  })();
+  res.json({ mapped: proposals.length, updated });
+});
+// Card detail ✨ Fill with AI: propose transaction rows from pasted
+// text. Writes nothing — Apply inserts the confirmed rows.
+app.post('/api/spending/cards/:id/fill', requireApiAuth, async (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: SPEND_AI_UNCONFIGURED });
+  const text = req.body && typeof req.body.text === 'string' ? req.body.text : '';
+  if (!text.trim()) return res.status(400).json({ error: 'Paste transaction text to extract from.' });
+  const prompt = `Extract credit card transactions from this text. Amounts are positive spending amounts.
+Categories, when clear, come from this list, else null: ${SPEND_CATEGORIES.join(', ')}.
+Reply with ONLY this JSON, no other text: {"transactions": [{"date": "YYYY-MM-DD", "merchant": "...", "amount": 0, "category": null, "memo": null}]}.
+Text: ${text.slice(0, 20000)}`;
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch {
+    return res.status(502).json({ error: 'The AI service could not complete the extraction.' });
+  }
+  const parsed = parseModelJson(raw);
+  const proposals = [];
+  const dropped = [];
+  if (parsed && Array.isArray(parsed.transactions)) {
+    for (const t of parsed.transactions) {
+      const merchant = t && typeof t.merchant === 'string' ? t.merchant.trim() : '';
+      const amount = t ? Number(t.amount) : NaN;
+      if (!t || !validSpendDate(t.date) || !merchant || !Number.isFinite(amount) || amount === 0) {
+        dropped.push({ reason: 'invalid date, merchant or amount', merchant: merchant || null });
+        continue;
+      }
+      proposals.push({
+        date: t.date,
+        merchant,
+        amount: -Math.abs(amount),
+        category: SPEND_CATEGORIES.includes(t.category) ? t.category : null,
+        memo: t.memo != null ? String(t.memo) : null,
+      });
+    }
+  }
+  res.json({ proposals, dropped });
+});
+app.post('/api/spending/cards/:id/fill/apply', requireApiAuth, (req, res) => {
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  const rows = Array.isArray((req.body || {}).rows) ? req.body.rows : [];
+  const valid = [];
+  const dropped = [];
+  for (const r of rows) {
+    const merchant = r && typeof r.merchant === 'string' ? r.merchant.trim() : '';
+    const amount = r ? Number(r.amount) : NaN;
+    if (!r || !validSpendDate(r.date) || !merchant || !Number.isFinite(amount) || amount === 0) {
+      dropped.push({ reason: 'invalid date, merchant or amount', merchant: merchant || null });
+      continue;
+    }
+    valid.push({
+      date: r.date,
+      merchant,
+      memo: r.memo != null ? String(r.memo) : null,
+      category: SPEND_CATEGORIES.includes(r.category) ? r.category : null,
+      amount: -Math.abs(amount),
+    });
+  }
+  const ts = nowIso();
+  db.transaction(() => {
+    const ins = db.prepare(
+      `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'ai', ?)`);
+    for (const r of valid) ins.run(card.id, r.date, r.merchant, r.memo, r.category, r.amount, ts);
+  })();
+  res.status(201).json({ inserted: valid.length, dropped });
 });
 
 // ---------------------------------------------------------------- summary ---
