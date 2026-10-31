@@ -9166,9 +9166,10 @@ window.earnDeleteJob = async (id) => {
 // ------------------------------------------------------- job detail --
 // A job card opens its own detail page (property/account detail
 // pattern). Pay changes and bonuses are added, edited and deleted
-// here; the job itself is edited and deleted from its card, so the
-// detail header carries no Edit/Delete buttons — only a plain
-// assetBackLink-style Back to Salary link above the card.
+// here; the detail header carries no job-level Edit/Delete buttons —
+// only a plain assetBackLink-style Back to Salary link above the
+// card — and the job itself is edited and deleted from a bottom
+// actions row inside the detail body, reusing the card handlers.
 let currentEarnJobId = null;
 
 function earnJobPerPeriod(j) {
@@ -9197,11 +9198,12 @@ function earnJobDetailHtml(j) {
       <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
       ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
       <div class="spacer"></div></div>
-      ${earnNextPayHtml(j)}
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
         <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(c.netAnnual)}</div></div>
-        <div class="summary-card"><div class="k">Net per pay period</div><div class="v">${money2(c.perPeriod.net)}</div></div>
+        ${j.next_pay_date
+          ? `<div class="summary-card"><div class="k">Next net pay date</div><div class="v">${esc(earnJobDateLabel(j.next_pay_date))}</div><div class="n">${money2(c.perPeriod.net)}</div></div>`
+          : `<div class="summary-card"><div class="k">Net per pay period</div><div class="v">${money2(c.perPeriod.net)}</div></div>`}
         <div class="summary-card"><div class="k">Total tax</div><div class="v">${money2(c.totalTax)}</div></div>
       </div>
       <table><tbody>
@@ -9221,7 +9223,8 @@ function earnJobDetailHtml(j) {
     <div class="panel">
       <div class="section-head"><h3>Bonuses</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddBonus" onclick="earnJobDetailOpenRow('bonus', null)">+ Bonus</button></div>
       ${bonusRows || '<div class="note">No bonuses yet.</div>'}
-    </div>`;
+    </div>
+    <div class="toolbar" id="earnJobDetailActions"><div class="spacer"></div><button class="small" id="earnJobDetailBodyEditBtn" onclick="earnEditJob(${j.id})">Edit</button><button class="small danger" id="earnJobDetailBodyDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete</button></div>`;
 }
 
 async function loadEarnJobDetail(id) {

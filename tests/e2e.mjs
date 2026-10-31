@@ -6947,11 +6947,13 @@ try {
       check('bonus from detail: bonus total 5000, per-period rate still 3500',
         !!detailJob3 && detailJob3.calc.annualGross === 96000 && detailJob3.calc.perPeriod.gross === 3500
         && detailJob3.bonus_total === 5000, JSON.stringify(detailJob3));
-      // Next pay date: the card, the detail page and the API agree on
-      // one date, and the detail header carries no Edit/Delete buttons
-      // while the card still offers both. (until() predicates run in
-      // the browser, so values cross over as evaluate args, never as
-      // closed-over Node variables.)
+      // Next pay date: the card and the API agree on one date; the
+      // detail page folds it into a combined NEXT NET PAY DATE card
+      // (date + per-period net) with no standalone line. The detail
+      // header carries no Edit/Delete buttons, while the card still
+      // offers both and the detail body bottom row offers both too.
+      // (until() predicates run in the browser, so values cross over
+      // as evaluate args, never as closed-over Node variables.)
       const untilEval = async (fn, arg, tries = 40) => {
         for (let i = 0; i < tries; i++) {
           if (await page.evaluate(fn, arg)) return true;
@@ -6965,12 +6967,27 @@ try {
         'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
       const [ny, nm, nd] = (apiDetailJob.next_pay_date || '').split('-').map(Number);
       const nextLabel = `Next pay date · ${MONTHS[nm - 1]} ${nd}, ${ny}`;
-      check('detail page shows the next pay date from the API',
-        !!apiDetailJob.next_pay_date
-        && await untilEval((label) => {
-          const d = document.querySelector('#earnJobDetail');
-          return d && d.textContent.includes(label);
-        }, nextLabel));
+      const nextNet = Number(apiDetailJob.calc.perPeriod.net).toLocaleString('en-CA',
+        { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const nextDateLabel = `${MONTHS[nm - 1]} ${nd}, ${ny}`;
+      const detailCombo = await page.evaluate(() => {
+        const d = document.querySelector('#earnJobDetail');
+        if (!d) return null;
+        const cards = [...d.querySelectorAll('.summary-card')];
+        const combo = cards.find((c) => (c.querySelector('.k')?.textContent.trim()) === 'Next net pay date');
+        return {
+          hasStandalone: !!d.querySelector('.earn-next-pay'),
+          comboK: combo ? combo.querySelector('.k').textContent.trim() : null,
+          comboV: combo ? combo.querySelector('.v').textContent.trim() : null,
+          comboN: combo ? combo.querySelector('.n')?.textContent.trim() : null,
+          plainNetCard: cards.some((c) => (c.querySelector('.k')?.textContent.trim()) === 'Net per pay period'),
+        };
+      });
+      check('detail page folds next pay into one NEXT NET PAY DATE card (date + net), no standalone line',
+        !!apiDetailJob.next_pay_date && !detailCombo.hasStandalone
+          && detailCombo.comboK === 'Next net pay date' && detailCombo.comboV === nextDateLabel
+          && detailCombo.comboN === nextNet && !detailCombo.plainNetCard,
+        JSON.stringify(detailCombo));
       check('detail header has no Edit/Delete buttons',
         await page.evaluate(() => !document.querySelector('#earnJobDetailEditBtn')
           && !document.querySelector('#earnJobDetailDeleteBtn')));
@@ -6997,6 +7014,39 @@ try {
         jobHead.backTag === 'A' && jobHead.backText === '← Back to Salary' && jobHead.backHref === '#earnings/salary'
           && jobHead.backClass === '' && jobHead.headButtons === 0 && jobHead.headIsToolbar && jobHead.rowBtns > 0,
         JSON.stringify(jobHead));
+      const detailActions = await page.evaluate(() => {
+        const d = document.querySelector('#earnJobDetail');
+        const row = document.querySelector('#earnJobDetailActions');
+        const head = d ? d.firstElementChild : null;
+        return {
+          rowExists: !!row,
+          rowIsLast: !!row && d.lastElementChild === row,
+          rowInHead: !!head && !!head.querySelector('#earnJobDetailActions'),
+          editBtn: !!document.querySelector('#earnJobDetailBodyEditBtn'),
+          deleteBtn: !!document.querySelector('#earnJobDetailBodyDeleteBtn'),
+          editClass: document.querySelector('#earnJobDetailBodyEditBtn')?.className || null,
+          deleteClass: document.querySelector('#earnJobDetailBodyDeleteBtn')?.className || null,
+        };
+      });
+      check('detail body bottom row has Edit + Delete, header stays button-free',
+        detailActions.rowExists && detailActions.rowIsLast && !detailActions.rowInHead
+          && detailActions.editBtn && detailActions.deleteBtn
+          && detailActions.editClass.includes('small') && !detailActions.editClass.includes('danger')
+          && detailActions.deleteClass.includes('small') && detailActions.deleteClass.includes('danger'),
+        JSON.stringify(detailActions));
+      // Edit from the detail body opens the shared modal prefilled.
+      await page.click('#earnJobDetailBodyEditBtn');
+      await wait(300);
+      check('detail body Edit opens the prefilled job modal',
+        await page.evaluate((employer) => {
+          const m = document.querySelector('#earnJobModal');
+          const f = document.querySelector('#earnJobForm');
+          return m && !m.classList.contains('hidden') && f && f.employer.value === employer;
+        }, apiDetailJob.employer));
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#earnJobModal button')].find((b) => b.textContent.trim() === 'Cancel').click();
+      });
+      await wait(300);
       await page.keyboard.press('Escape');
       await wait(300);
       await page.click('#earnJobBackLink');
@@ -7074,6 +7124,35 @@ try {
         }));
       const detailGone = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailJobId);
       check('the deleted job is gone server-side', !detailGone);
+      // Delete from the detail body returns to the list without the job.
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Detail Delete Corp', province: 'BC', frequency: 'biweekly',
+        start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+      });
+      const detailDeleteJobId = r.data.id;
+      // Already on the salary hash: goto to the same URL is a no-op,
+      // so reload to pick up the server-side fixture (legacy pattern).
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        if (card) card.click();
+      }, detailDeleteJobId);
+      check('detail-delete fixture card lands on its detail page',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return location.hash.startsWith('#earnings/job/')
+            && d && !d.classList.contains('hidden') && d.textContent.includes('Detail Delete Corp');
+        }));
+      await page.click('#earnJobDetailBodyDeleteBtn');
+      check('deleting from the detail body returns to the salary list without the job',
+        await until(() => {
+          const list = document.querySelector('#earnJobList');
+          return location.hash === '#earnings/salary'
+            && list && !list.textContent.includes('Detail Delete Corp');
+        }));
+      const detailDeleteGone = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === detailDeleteJobId);
+      check('the detail-deleted job is gone server-side', !detailDeleteGone);
       // A dateless legacy job shows no next-pay-date highlight anywhere.
       r = await req('POST', '/api/earnings/jobs', {
         employer: 'Legacy Corp', province: 'BC', frequency: 'biweekly',
@@ -7098,6 +7177,14 @@ try {
         await untilEval(() => {
           const d = document.querySelector('#earnJobDetail');
           return d && !d.classList.contains('hidden') && !d.querySelector('.earn-next-pay');
+        }, null));
+      check('legacy job detail falls back to the plain Net per pay period card',
+        await untilEval(() => {
+          const d = document.querySelector('#earnJobDetail');
+          if (!d || d.classList.contains('hidden') || !d.textContent.includes('Legacy Corp')) return false;
+          const cards = [...d.querySelectorAll('.summary-card')];
+          return cards.some((c) => (c.querySelector('.k')?.textContent.trim()) === 'Net per pay period')
+            && !cards.some((c) => (c.querySelector('.k')?.textContent.trim()) === 'Next net pay date');
         }, null));
       await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
