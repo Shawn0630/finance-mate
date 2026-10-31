@@ -9505,8 +9505,16 @@ let spendImportPage = 0;
 let spendImportOldOpen = false;
 let spendImportOldPage = 0;
 let spendTxModalCtx = null; // { cardId, txId } — txId null = add
-let spendCatFilter = '';
-let spendDetailCatFilter = '';
+// Category multi-select state per transactions table: null = all
+// categories selected; a Set = the explicitly selected keys
+// (an empty Set = Select none). '__uncat__' stands for rows with
+// no category, mirroring the old single-select's option values.
+let spendCatSel = null;
+let spendDetailCatSel = null;
+// Whether the multi-select panel is open per table: the panel
+// is rebuilt on every render, so open state lives here and the
+// render re-opens it after a checkbox toggle.
+let spendCatPanelOpen = { spending: false, spendCard: false };
 
 // Month pager for the two spending transaction tables: one
 // month per page, the SAME method on both (not row-count
@@ -9564,46 +9572,82 @@ window.spendTxMonthStep = (level, dir) => {
   else renderSpendDetailTxTable();
 };
 
-// Per-category view: the filter narrows the table to one
-// category's transactions (or the uncategorized ones). A row's
-// category is changed persistently through its Edit button — the
-// modal's category input carries the category datalist — and a
-// manual move changes ONLY that row, never the remembered
-// merchant→category mapping.
-function spendCatOptions(transactions, current) {
+// Per-category view: the filter is a checkbox multi-select —
+// one box per used category plus Uncategorized — with Select all
+// / Select none. A row's category is changed persistently through
+// its Edit button — the modal's category input carries the
+// category datalist — and a manual move changes ONLY that row,
+// never the remembered merchant→category mapping.
+function spendCatKeys(transactions) {
   const cats = [...new Set(transactions.map((t) => (t.category || '').trim()).filter(Boolean))].sort();
-  const opts = [['', 'All categories'], ['__uncat__', 'Uncategorized'], ...cats.map((c) => [c, c])];
-  return opts.map(([v, l]) => `<option value="${esc(v)}"${v === current ? ' selected' : ''}>${esc(l)}</option>`).join('');
+  return ['__uncat__', ...cats];
 }
-function spendFilterTx(transactions, filter) {
-  if (!filter) return transactions;
-  if (filter === '__uncat__') return transactions.filter((t) => !(t.category || '').trim());
-  return transactions.filter((t) => (t.category || '').trim() === filter);
+function spendCatLabel(key) {
+  return key === '__uncat__' ? 'Uncategorized' : key;
+}
+function spendCatSummary(sel) {
+  if (sel === null) return 'All categories';
+  if (sel.size === 0) return 'None';
+  if (sel.size === 1) return spendCatLabel([...sel][0]);
+  return `${sel.size} categories`;
+}
+function spendFilterTx(transactions, sel) {
+  if (sel === null) return transactions;
+  return transactions.filter((t) => sel.has((t.category || '').trim() || '__uncat__'));
 }
 // The category filter and the month pager share one flex row
 // (.spend-tx-controls), rendered inside the table host so the row
-// survives every re-render. The select is rebuilt on each render,
-// so its change listener lives on document (delegation) instead of
-// the element.
-function spendTxControlsHtml(level, transactions, filter, pager) {
-  const id = level === 'spending' ? 'spendCatFilter' : 'spendDetailCatFilter';
-  return `<div class="spend-tx-controls"><label>Category <select id="${id}">${spendCatOptions(transactions, filter)}</select></label>${pager}</div>`;
+// survives every re-render. The filter control is a single button
+// (class small, like the pager buttons, so both share one height
+// and one vertical center) whose label carries the word Category
+// inline — there is no separate label line above it. Its dropdown
+// panel is rebuilt on each render, so every listener lives on
+// document (delegation) instead of the elements.
+function spendTxControlsHtml(level, transactions, sel, pager) {
+  const btnId = level === 'spending' ? 'spendCatBtn' : 'spendDetailCatBtn';
+  const panelId = level === 'spending' ? 'spendCatPanel' : 'spendDetailCatPanel';
+  const checks = spendCatKeys(transactions).map((k) => {
+    const checked = sel === null || sel.has(k);
+    return `<label><input type="checkbox" data-spend-cat="${esc(k)}" data-spend-cat-level="${level}"${checked ? ' checked' : ''}> ${esc(spendCatLabel(k))}</label>`;
+  }).join('');
+  const panel = spendCatPanelOpen[level] ? `<div class="spend-tx-catpanel" id="${panelId}">
+    <div class="spend-tx-catpanel-actions">
+      <button type="button" class="small" data-spend-cat-all="${level}">Select all</button>
+      <button type="button" class="small" data-spend-cat-none="${level}">Select none</button>
+      <span class="spacer"></span>
+      <button type="button" class="small" data-spend-cat-done="${level}">Done</button>
+    </div>
+    ${checks}
+  </div>` : '';
+  return `<div class="spend-tx-controls"><div class="spend-tx-catwrap"><button type="button" class="small" id="${btnId}" data-spend-cat-toggle="${level}">Category: ${esc(spendCatSummary(sel))}</button>${panel}</div>${pager}</div>`;
 }
-function spendTxValidFilter(transactions, filter) {
-  const cats = [...new Set(transactions.map((t) => (t.category || '').trim()).filter(Boolean))];
-  return (filter === '' || filter === '__uncat__' || cats.includes(filter)) ? filter : '';
+function spendTxValidSel(transactions, sel) {
+  if (sel === null) return null;
+  const valid = new Set(spendCatKeys(transactions));
+  const pruned = new Set([...sel].filter((k) => valid.has(k)));
+  // A selection that vanished entirely (its categories no longer
+  // exist) falls back to all, like the old single-select reset;
+  // an explicit Select none (empty set) is left alone.
+  if (sel.size > 0 && pruned.size === 0) return null;
+  return pruned;
+}
+function spendTxSetSel(level, sel) {
+  if (level === 'spending') spendCatSel = sel;
+  else spendDetailCatSel = sel;
+  if (level === 'spending') renderSpendTxTable();
+  else renderSpendDetailTxTable();
 }
 function renderSpendTxTable() {
   if (!spendData) return;
-  spendCatFilter = spendTxValidFilter(spendData.transactions, spendCatFilter);
+  spendCatSel = spendTxValidSel(spendData.transactions, spendCatSel);
   const host = $('#spendTxTable');
-  if (!spendData.transactions.length) { host.innerHTML = spendTxControlsHtml('spending', spendData.transactions, spendCatFilter, '') + '<div class="note">No transactions yet.</div>'; return; }
+  if (!spendData.transactions.length) { host.innerHTML = spendTxControlsHtml('spending', spendData.transactions, spendCatSel, '') + '<div class="note">No transactions yet.</div>'; return; }
   const range = spendTxRange('spending');
-  if (!range) { host.innerHTML = spendTxControlsHtml('spending', spendData.transactions, spendCatFilter, '') + spendTxTableHtml(spendFilterTx(spendData.transactions, spendCatFilter), true); return; }
+  if (!range) { host.innerHTML = spendTxControlsHtml('spending', spendData.transactions, spendCatSel, '') + spendTxTableHtml(spendFilterTx(spendData.transactions, spendCatSel), true); return; }
   const month = spendTxPageMonth('spending', range);
-  const pageRows = spendFilterTx(spendData.transactions, spendCatFilter)
+  const pageRows = spendFilterTx(spendData.transactions, spendCatSel)
     .filter((t) => String(t.date || '').slice(0, 7) === month);
-  const controls = spendTxControlsHtml('spending', spendData.transactions, spendCatFilter, spendTxPagerHtml('spending', range, month));
+  const controls = spendTxControlsHtml('spending', spendData.transactions, spendCatSel, spendTxPagerHtml('spending', range, month));
   if (!pageRows.length) {
     const note = spendData.transactions.some((t) => String(t.date || '').slice(0, 7) === month)
       ? '<div class="note">No transactions in this category.</div>'
@@ -9615,15 +9659,15 @@ function renderSpendTxTable() {
 }
 function renderSpendDetailTxTable() {
   if (!spendCardData) return;
-  spendDetailCatFilter = spendTxValidFilter(spendCardData.transactions, spendDetailCatFilter);
+  spendDetailCatSel = spendTxValidSel(spendCardData.transactions, spendDetailCatSel);
   const host = $('#spendDetailTxTable');
-  if (!spendCardData.transactions.length) { host.innerHTML = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatFilter, '') + '<div class="note">No transactions yet.</div>'; return; }
+  if (!spendCardData.transactions.length) { host.innerHTML = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatSel, '') + '<div class="note">No transactions yet.</div>'; return; }
   const range = spendTxRange('spendCard');
-  if (!range) { host.innerHTML = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatFilter, '') + spendTxTableHtml(spendFilterTx(spendCardData.transactions, spendDetailCatFilter), false); return; }
+  if (!range) { host.innerHTML = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatSel, '') + spendTxTableHtml(spendFilterTx(spendCardData.transactions, spendDetailCatSel), false); return; }
   const month = spendTxPageMonth('spendCard', range);
-  const pageRows = spendFilterTx(spendCardData.transactions, spendDetailCatFilter)
+  const pageRows = spendFilterTx(spendCardData.transactions, spendDetailCatSel)
     .filter((t) => String(t.date || '').slice(0, 7) === month);
-  const controls = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatFilter, spendTxPagerHtml('spendCard', range, month));
+  const controls = spendTxControlsHtml('spendCard', spendCardData.transactions, spendDetailCatSel, spendTxPagerHtml('spendCard', range, month));
   if (!pageRows.length) {
     const note = spendCardData.transactions.some((t) => String(t.date || '').slice(0, 7) === month)
       ? '<div class="note">No transactions in this category.</div>'
@@ -9634,8 +9678,53 @@ function renderSpendDetailTxTable() {
   host.innerHTML = controls + spendTxTableHtml(pageRows, false);
 }
 document.addEventListener('change', (e) => {
-  if (e.target.id === 'spendCatFilter') { spendCatFilter = e.target.value; renderSpendTxTable(); }
-  else if (e.target.id === 'spendDetailCatFilter') { spendDetailCatFilter = e.target.value; renderSpendDetailTxTable(); }
+  const box = e.target.closest('[data-spend-cat]');
+  if (!box) return;
+  const level = box.dataset.spendCatLevel;
+  const key = box.dataset.spendCat;
+  const txs = level === 'spending' ? (spendData ? spendData.transactions : []) : (spendCardData ? spendCardData.transactions : []);
+  let sel = level === 'spending' ? spendCatSel : spendDetailCatSel;
+  // Toggling off one box from "all" materializes the full set
+  // first, so the result is all-minus-one, not just that box.
+  if (sel === null) sel = new Set(spendCatKeys(txs));
+  else sel = new Set(sel);
+  if (box.checked) sel.add(key);
+  else sel.delete(key);
+  spendTxSetSel(level, sel);
+});
+document.addEventListener('click', (e) => {
+  const toggle = e.target.closest('[data-spend-cat-toggle]');
+  if (toggle) {
+    const level = toggle.dataset.spendCatToggle;
+    spendCatPanelOpen[level] = !spendCatPanelOpen[level];
+    if (level === 'spending') renderSpendTxTable();
+    else renderSpendDetailTxTable();
+    return;
+  }
+  const all = e.target.closest('[data-spend-cat-all]');
+  if (all) { spendTxSetSel(all.dataset.spendCatAll, null); return; }
+  const none = e.target.closest('[data-spend-cat-none]');
+  if (none) { spendTxSetSel(none.dataset.spendCatNone, new Set()); return; }
+  const done = e.target.closest('[data-spend-cat-done]');
+  if (done) {
+    const level = done.dataset.spendCatDone;
+    spendCatPanelOpen[level] = false;
+    if (level === 'spending') renderSpendTxTable();
+    else renderSpendDetailTxTable();
+    return;
+  }
+  // A click anywhere outside the filter wrap closes an open
+  // panel; the re-render after it is harmless (pager steps and
+  // modal opens fire their own handlers first).
+  if (!e.target.closest('.spend-tx-catwrap')) {
+    for (const level of ['spending', 'spendCard']) {
+      if (spendCatPanelOpen[level]) {
+        spendCatPanelOpen[level] = false;
+        if (level === 'spending') renderSpendTxTable();
+        else renderSpendDetailTxTable();
+      }
+    }
+  }
 });
 
 const spendShareCenterPlugin = {
@@ -9801,10 +9890,24 @@ function spendTxRowHtml(t, showCard) {
       <td><button class="small" onclick="spendEditTx(${t.id})">Edit</button> <button class="small" onclick="spendDeleteTx(${t.id})">Delete</button></td>
     </tr>`;
 }
+// A row's DISPLAYED amount: charges read positive, payments
+// negated, adjustments signed as stored — the sum row below
+// adds exactly what the Amount column shows.
+function spendTxDisplayedAmount(t) {
+  return t.kind === 'adjustment' ? Number(t.amount) : -Number(t.amount);
+}
+// One total row at the bottom of the table: the sum of the rows
+// actually displayed (the builders only ever receive the filtered
+// page), to the cent. It lives in <tfoot> so the tbody row
+// readers (pager tests, Edit/Delete flows) never see it as data.
+function spendTxSumFoot(transactions, showCard) {
+  const sum = Math.round(transactions.reduce((s, t) => s + spendTxDisplayedAmount(t), 0) * 100) / 100;
+  return `<tfoot><tr class="spend-tx-sum"><td colspan="${showCard ? 5 : 4}">Total</td><td>${money2(sum)}</td><td></td></tr></tfoot>`;
+}
 function spendTxTableHtml(transactions, showCard) {
   if (!transactions.length) return '<div class="note">No transactions yet.</div>';
   const rows = transactions.map((t) => spendTxRowHtml(t, showCard)).join('');
-  return `<table class="tbl"><thead><tr><th>Date</th>${showCard ? '<th>Card</th>' : ''}<th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table class="tbl"><thead><tr><th>Date</th>${showCard ? '<th>Card</th>' : ''}<th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${rows}</tbody>${spendTxSumFoot(transactions, showCard)}</table>`;
 }
 // Overall table only: the month page's rows grouped by
 // category under a header row per group (alphabetical,
@@ -9820,7 +9923,7 @@ function spendTxTableHtmlGrouped(transactions) {
   const names = [...groups.keys()].sort((a, b) => (a === '—' ? 1 : b === '—' ? -1 : a.localeCompare(b)));
   const body = names.map((name) => `<tr class="spend-tx-group"><td colspan="7">${esc(name)}</td></tr>`
     + groups.get(name).map((t) => spendTxRowHtml(t, true)).join('')).join('');
-  return `<table class="tbl"><thead><tr><th>Date</th><th>Card</th><th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${body}</tbody></table>`;
+  return `<table class="tbl"><thead><tr><th>Date</th><th>Card</th><th>Merchant</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody>${body}</tbody>${spendTxSumFoot(transactions, true)}</table>`;
 }
 
 // Transaction form Category combobox: one input + datalist holding the
@@ -9841,6 +9944,7 @@ function renderSpendCategoryList(used) {
 }
 
 async function loadSpending() {
+  spendCatPanelOpen.spending = false;
   const data = await api('/api/spending');
   spendData = data;
   renderSpendCategoryList(data.categories);
@@ -9860,6 +9964,7 @@ async function loadSpending() {
 }
 
 async function loadSpendCard(id) {
+  spendCatPanelOpen.spendCard = false;
   const data = await api(`/api/spending/cards/${id}`);
   spendCardData = data;
   renderSpendCategoryList(data.categories);

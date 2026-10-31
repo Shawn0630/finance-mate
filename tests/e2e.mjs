@@ -12196,23 +12196,39 @@ try {
         const list = document.querySelector('#spendList');
         const importBtns = [...list.querySelectorAll('button')].filter((b) => b.textContent.includes('Import QFX'));
         const visibleImport = importBtns.filter((b) => b.getBoundingClientRect().height > 0);
-        return { hasSpendImportBtn: !!document.querySelector('#spendImportBtn'), visibleImport: visibleImport.length, hasCatFilter: !!document.querySelector('#spendCatFilter') };
+        return { hasSpendImportBtn: !!document.querySelector('#spendImportBtn'), visibleImport: visibleImport.length, hasCatFilter: !!document.querySelector('#spendCatBtn') };
       });
       check('spending UI: the overall page has no Import QFX entry',
         !spendOverallUi.hasSpendImportBtn && spendOverallUi.visibleImport === 0, JSON.stringify(spendOverallUi));
       check('spending UI: the overall transactions table has a category filter',
         spendOverallUi.hasCatFilter, JSON.stringify(spendOverallUi));
-      await page.select('#spendCatFilter', 'Groceries');
+      // Multi-select: the panel opens from the button, Select
+      // none + one box narrows to that category, Select all
+      // restores the page. (The panel rebuilds on every render,
+      // so each click re-queries its controls.)
+      await page.click('#spendCatBtn');
+      await waitS(300);
+      const spendPanelOpen = await page.evaluate(() => {
+        const p = document.querySelector('#spendCatPanel');
+        return !!p && p.getBoundingClientRect().height > 0;
+      });
+      check('spending UI: clicking the category filter opens the checkbox panel',
+        spendPanelOpen, JSON.stringify({ spendPanelOpen }));
+      await page.evaluate(() => { document.querySelector('[data-spend-cat-none="spending"]').click(); });
+      await waitS(300);
+      await page.evaluate(() => { document.querySelector('#spendCatPanel input[data-spend-cat="Groceries"]').click(); });
       await waitS(300);
       const spendFiltered = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr:not(.spend-tx-group)')].map((tr) => tr.children[3].textContent.trim()));
       check('spending UI: filtering by Groceries shows only Groceries rows',
         spendFiltered.length === 2 && spendFiltered.every((c) => c === 'Groceries'), JSON.stringify(spendFiltered));
-      await page.select('#spendCatFilter', '__uncat__');
+      await page.evaluate(() => { document.querySelector('[data-spend-cat-none="spending"]').click(); });
+      await waitS(300);
+      await page.evaluate(() => { document.querySelector('#spendCatPanel input[data-spend-cat="__uncat__"]').click(); });
       await waitS(300);
       const spendUncat = await page.evaluate(() => [...document.querySelectorAll('#spendTxTable tbody tr:not(.spend-tx-group)')].map((tr) => tr.children[2].textContent.trim()));
       check('spending UI: filtering by Uncategorized shows only the uncategorized payment row',
         spendUncat.length === 1 && spendUncat[0] === 'PAYMENT - THANK YOU', JSON.stringify(spendUncat));
-      await page.select('#spendCatFilter', '');
+      await page.evaluate(() => { document.querySelector('[data-spend-cat-all="spending"]').click(); });
       await waitS(300);
       await page.goto(`http://ff.local/#spending/card/${spendCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitS(1200);
@@ -12667,22 +12683,27 @@ try {
         && augPage.merchants.join(',') === 'MONTH AUG A,MONTH AUG B',
         JSON.stringify(augPage));
       const filterRow = await page.evaluate(() => {
-        const sel = document.querySelector('#spendCatFilter');
+        const btn = document.querySelector('#spendCatBtn');
         const pager = document.querySelector('[data-spend-tx-pager="spending"]');
-        const row = sel ? sel.closest('.spend-tx-controls') : null;
-        const s = sel.getBoundingClientRect(), p = pager.getBoundingClientRect();
+        const row = btn ? btn.closest('.spend-tx-controls') : null;
+        const s = btn.getBoundingClientRect(), p = pager.getBoundingClientRect();
+        const pb = pager.querySelector('button').getBoundingClientRect();
         const card = document.querySelector('#spendCardList .breakdown-card');
         const panel = document.querySelector('#spendTxTable').closest('.panel');
         const cs = getComputedStyle(card), ps = getComputedStyle(panel);
         return {
           sameRow: !!(row && row.contains(pager)),
           overlap: s.top < p.bottom && p.top < s.bottom,
+          // One clean band: the filter button and the pager
+          // buttons share one vertical center and one height.
+          centerDiff: Math.abs((s.top + s.height / 2) - (pb.top + pb.height / 2)),
+          heightDiff: Math.abs(s.height - pb.height),
           cardPad: [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft].join(' '),
           panelPad: [ps.paddingTop, ps.paddingRight, ps.paddingBottom, ps.paddingLeft].join(' '),
         };
       });
       check('spending UI: category filter and month pager share one row, transactions panel padding equals credit-card card padding',
-        filterRow.sameRow && filterRow.overlap && filterRow.cardPad === filterRow.panelPad,
+        filterRow.sameRow && filterRow.overlap && filterRow.centerDiff <= 2 && filterRow.heightDiff <= 2 && filterRow.cardPad === filterRow.panelPad,
         JSON.stringify(filterRow));
       // Range constrains pageable months: 1 year from Oct 2026
       // ends at Nov 2025, so stepping back must stop there and
@@ -12739,20 +12760,23 @@ try {
         detAug.label === 'Aug 2026' && detAug.merchants.join(',') === 'MONTH AUG A',
         JSON.stringify(detAug));
       const detFilterRow = await page.evaluate(() => {
-        const sel = document.querySelector('#spendDetailCatFilter');
+        const btn = document.querySelector('#spendDetailCatBtn');
         const pager = document.querySelector('[data-spend-tx-pager="spendCard"]');
-        const row = sel ? sel.closest('.spend-tx-controls') : null;
-        const s = sel.getBoundingClientRect(), p = pager.getBoundingClientRect();
+        const row = btn ? btn.closest('.spend-tx-controls') : null;
+        const s = btn.getBoundingClientRect(), p = pager.getBoundingClientRect();
+        const pb = pager.querySelector('button').getBoundingClientRect();
         const panel = document.querySelector('#spendDetailTxTable').closest('.panel');
         const ps = getComputedStyle(panel);
         return {
           sameRow: !!(row && row.contains(pager)),
           overlap: s.top < p.bottom && p.top < s.bottom,
+          centerDiff: Math.abs((s.top + s.height / 2) - (pb.top + pb.height / 2)),
+          heightDiff: Math.abs(s.height - pb.height),
           panelPad: [ps.paddingTop, ps.paddingRight, ps.paddingBottom, ps.paddingLeft].join(' '),
         };
       });
       check('spending UI: detail filter and pager share one row, detail panel padding matches the 16px card standard',
-        detFilterRow.sameRow && detFilterRow.overlap && detFilterRow.panelPad === '16px 16px 16px 16px',
+        detFilterRow.sameRow && detFilterRow.overlap && detFilterRow.centerDiff <= 2 && detFilterRow.heightDiff <= 2 && detFilterRow.panelPad === '16px 16px 16px 16px',
         JSON.stringify(detFilterRow));
       // Edit from the paged detail table, then Delete from it.
       await page.evaluate(() => {
@@ -12791,6 +12815,220 @@ try {
   check('spending month cleanup: card A deleted', r.status === 200);
   r = await req('DELETE', `/api/spending/cards/${monthCardBId}`);
   check('spending month cleanup: card B deleted', r.status === 200);
+
+  // Multi-select + sum row round: the category filter is a
+  // checkbox multi-select (Select all / Select none, live
+  // filtering) on both tables, and each table carries one sum
+  // row in <tfoot> equal to the displayed rows to the cent.
+  // Spacing rides along: the Spending gaps must equal the
+  // app-wide standards (panel 16px / 14px, section-head
+  // 16px 17px, h3-to-controls 8px, controls-to-table 10px,
+  // last-row-to-panel-bottom 16px, cards gap 12px).
+  r = await req('POST', '/api/spending/cards', { name: 'Sum', issuer: 'CIBC', last4: '7001' });
+  check('spending sum setup: card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const sumCardId = r.data.id;
+  for (const [date, merchant, type, amount, category] of [
+    ['2026-10-05', 'SUM DIN A', 'charge', 50, 'Dining'],
+    ['2026-10-06', 'SUM DIN B', 'charge', 30, 'Dining'],
+    ['2026-10-07', 'SUM GRO', 'charge', 20, 'Groceries'],
+    ['2026-10-08', 'SUM PAY', 'payment', 40, ''],
+  ]) {
+    r = await req('POST', `/api/spending/cards/${sumCardId}/transactions`, { date, merchant, type, amount, category });
+    check(`spending sum setup: ${merchant} row`, r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  }
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending sum browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardN = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResN = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueN = loginResN.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserN = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserN.newPage();
+      page.on('dialog', (d) => d.accept());
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardN({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueN, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitN = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      // Overall page: the sum row must equal the displayed
+      // month page recomputed from the API (other cards' rows
+      // share the page, so the expectation is computed, not
+      // hardcoded). The displayed amount of a row is the charge
+      // negated, the payment negated, the adjustment as stored.
+      const apiAll = (await req('GET', '/api/spending')).data;
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitN(1200);
+      const overallSum = await page.evaluate(() => {
+        const pager = document.querySelector('[data-spend-tx-pager="spending"]');
+        const foot = document.querySelector('#spendTxTable tfoot tr.spend-tx-sum');
+        const panel = document.querySelector('#spendTxTable').closest('.panel');
+        const h3 = panel.querySelector('h3');
+        const controls = document.querySelector('#spendTxTable .spend-tx-controls');
+        const table = document.querySelector('#spendTxTable table');
+        // Measure from the TABLE's bottom, not the last row's:
+        // in the collapsed-border model a tr rect stops 1px short
+        // of its cells' bottom border, which would read 17px
+        // against a true 16px padding. The table box includes
+        // the collapsed bottom border, so it reads exactly 16.
+        const lastRow = table; // bottom edge of the whole table
+        const pr = panel.getBoundingClientRect();
+        const ps = getComputedStyle(panel);
+        const head = document.querySelector('#spendList .section-head');
+        const hs = getComputedStyle(head);
+        const btn = document.querySelector('#spendCatBtn');
+        const pb = pager.querySelector('button').getBoundingClientRect();
+        const br = btn.getBoundingClientRect();
+        const cards = document.querySelector('#spendCardList');
+        const round = (v) => Math.round(v);
+        return {
+          label: pager ? pager.querySelector('span').textContent.trim() : null,
+          foot: foot ? foot.cells[1].textContent.trim() : null,
+          panelPad: [ps.paddingTop, ps.paddingRight, ps.paddingBottom, ps.paddingLeft].join(' '),
+          panelMarginBottom: ps.marginBottom,
+          headPad: [hs.paddingTop, hs.paddingRight, hs.paddingBottom, hs.paddingLeft].join(' '),
+          h3ToControls: round(controls.getBoundingClientRect().top - h3.getBoundingClientRect().bottom),
+          controlsToTable: round(table.getBoundingClientRect().top - controls.getBoundingClientRect().bottom),
+          lastToPanel: round(pr.bottom - lastRow.getBoundingClientRect().bottom - parseFloat(ps.borderBottomWidth)),
+          centerDiff: Math.abs((br.top + br.height / 2) - (pb.top + pb.height / 2)),
+          heightDiff: Math.abs(br.height - pb.height),
+          cardsGap: getComputedStyle(cards).gap,
+        };
+      });
+      const shownMonth = overallSum.label === 'Oct 2026' ? '2026-10' : null;
+      const expectedOverall = Math.round((apiAll.transactions || [])
+        .filter((t) => String(t.date).slice(0, 7) === shownMonth)
+        .reduce((s, t) => s + (t.kind === 'adjustment' ? Number(t.amount) : -Number(t.amount)), 0) * 100) / 100;
+      const expectedOverallText = expectedOverall.toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      check('spending UI: overall sum row equals the displayed month page to the cent',
+        shownMonth !== null && overallSum.foot === expectedOverallText,
+        JSON.stringify({ foot: overallSum.foot, expected: expectedOverallText, label: overallSum.label }));
+      check('spending UI: overall spacing matches the app-wide standards',
+        overallSum.panelPad === '16px 16px 16px 16px' && overallSum.panelMarginBottom === '14px'
+          && overallSum.headPad === '16px 17px 16px 17px' && overallSum.h3ToControls === 8
+          && overallSum.controlsToTable === 10 && overallSum.lastToPanel === 16
+          && overallSum.centerDiff <= 2 && overallSum.heightDiff <= 2 && overallSum.cardsGap === '12px',
+        JSON.stringify(overallSum));
+      // Overall multi-select: Select none empties the table
+      // (note, no sum row); Select all restores page + sum.
+      await page.click('#spendCatBtn');
+      await waitN(300);
+      await page.evaluate(() => { document.querySelector('[data-spend-cat-none="spending"]').click(); });
+      await waitN(300);
+      const noneState = await page.evaluate(() => ({
+        table: !!document.querySelector('#spendTxTable table'),
+        foot: !!document.querySelector('#spendTxTable tfoot'),
+        note: document.querySelector('#spendTxTable .note') ? document.querySelector('#spendTxTable .note').textContent.trim() : null,
+        btnText: document.querySelector('#spendCatBtn').textContent.trim(),
+      }));
+      check('spending UI: Select none empties the table with the category note and no sum row',
+        noneState.table === false && noneState.foot === false && noneState.note === 'No transactions in this category.' && noneState.btnText === 'Category: None',
+        JSON.stringify(noneState));
+      await page.evaluate(() => { document.querySelector('[data-spend-cat-all="spending"]').click(); });
+      await waitN(300);
+      const allState = await page.evaluate(() => ({
+        foot: document.querySelector('#spendTxTable tfoot tr.spend-tx-sum') ? document.querySelector('#spendTxTable tfoot tr.spend-tx-sum').cells[1].textContent.trim() : null,
+        btnText: document.querySelector('#spendCatBtn').textContent.trim(),
+      }));
+      check('spending UI: Select all restores the full page and its sum',
+        allState.foot === expectedOverallText && allState.btnText === 'Category: All categories',
+        JSON.stringify(allState));
+      // Detail page: this card alone, so the sums are exact.
+      // (The API serves transactions newest-first, so the row
+      // order below is reverse-chronological, not insertion order.)
+      await page.goto(`http://ff.local/#spending/card/${sumCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitN(1200);
+      const detSum = await page.evaluate(() => {
+        const foot = document.querySelector('#spendDetailTxTable tfoot tr.spend-tx-sum');
+        const rows = [...document.querySelectorAll('#spendDetailTxTable tbody tr')].map((tr) => tr.cells[1].textContent.trim());
+        return { foot: foot ? foot.cells[1].textContent.trim() : null, rows };
+      });
+      check('spending UI: detail sum row equals the card month page to the cent',
+        detSum.foot === '$60.00' && detSum.rows.join(',') === 'SUM PAY,SUM GRO,SUM DIN B,SUM DIN A',
+        JSON.stringify(detSum));
+      // Toggling Groceries off removes exactly its rows and
+      // re-sums the rest (50 + 30 - 40 = 40.00).
+      await page.click('#spendDetailCatBtn');
+      await waitN(300);
+      await page.evaluate(() => { document.querySelector('#spendDetailCatPanel input[data-spend-cat="Groceries"]').click(); });
+      await waitN(300);
+      const detNoGro = await page.evaluate(() => {
+        const foot = document.querySelector('#spendDetailTxTable tfoot tr.spend-tx-sum');
+        const rows = [...document.querySelectorAll('#spendDetailTxTable tbody tr')].map((tr) => tr.cells[1].textContent.trim());
+        return { foot: foot ? foot.cells[1].textContent.trim() : null, rows };
+      });
+      check('spending UI: toggling one category off removes exactly its rows and re-sums',
+        detNoGro.foot === '$40.00' && detNoGro.rows.join(',') === 'SUM PAY,SUM DIN B,SUM DIN A',
+        JSON.stringify(detNoGro));
+      // Outside click closes the panel; detail spacing matches.
+      await page.evaluate(() => { document.querySelector('#spendDetailTxTable').closest('.panel').querySelector('h3, .toolbar').click(); });
+      await waitN(300);
+      const detSpace = await page.evaluate(() => {
+        const panel = document.querySelector('#spendDetailTxTable').closest('.panel');
+        const ps = getComputedStyle(panel);
+        const controls = document.querySelector('#spendDetailTxTable .spend-tx-controls');
+        const table = document.querySelector('#spendDetailTxTable table');
+        const toolbar = panel.querySelector('.toolbar');
+        const pager = document.querySelector('[data-spend-tx-pager="spendCard"]');
+        const btn = document.querySelector('#spendDetailCatBtn');
+        const pb = pager.querySelector('button').getBoundingClientRect();
+        const br = btn.getBoundingClientRect();
+        const round = (v) => Math.round(v);
+        return {
+          panelOpen: !!document.querySelector('#spendDetailCatPanel'),
+          panelPad: [ps.paddingTop, ps.paddingRight, ps.paddingBottom, ps.paddingLeft].join(' '),
+          toolbarToControls: round(controls.getBoundingClientRect().top - toolbar.getBoundingClientRect().bottom),
+          controlsToTable: round(table.getBoundingClientRect().top - controls.getBoundingClientRect().bottom),
+          centerDiff: Math.abs((br.top + br.height / 2) - (pb.top + pb.height / 2)),
+          heightDiff: Math.abs(br.height - pb.height),
+        };
+      });
+      check('spending UI: outside click closes the filter panel and detail spacing matches',
+        detSpace.panelOpen === false && detSpace.panelPad === '16px 16px 16px 16px'
+          && detSpace.toolbarToControls === 10 && detSpace.controlsToTable === 10
+          && detSpace.centerDiff <= 2 && detSpace.heightDiff <= 2,
+        JSON.stringify(detSpace));
+    } finally { await browserN.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${sumCardId}`);
+  check('spending sum cleanup: card deleted', r.status === 200);
 
   // UI unification round: the whole Spending section uses the
   // property/Stocks visual language — standard section-head
