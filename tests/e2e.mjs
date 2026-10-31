@@ -13192,6 +13192,117 @@ try {
   r = await req('DELETE', `/api/spending/cards/${barCardId}`);
   check('spending bar-click cleanup: card deleted', r.status === 200);
 
+  // Detail stacked chart round: the card-detail history chart
+  // stacks each month's bar by category (same convention as the
+  // overall By-category chart), with the doughnut's colors and a
+  // total line equal to the stack sums.
+  r = await req('POST', '/api/spending/cards', { name: 'Stack', issuer: 'CIBC', last4: '7003' });
+  check('spending stack setup: card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const stackCardId = r.data.id;
+  for (const [date, merchant, amount, category] of [
+    ['2026-10-05', 'STK DIN A', 50, 'Dining'],
+    ['2026-10-06', 'STK DIN B', 30, 'Dining'],
+    ['2026-10-07', 'STK GRO', 20, 'Groceries'],
+    ['2026-08-10', 'STK AUG', 15, 'Dining'],
+  ]) {
+    r = await req('POST', `/api/spending/cards/${stackCardId}/transactions`, { date, merchant, type: 'charge', amount, category });
+    check(`spending stack setup: ${merchant} row`, r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  }
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending stack browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardK = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResK = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueK = loginResK.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserK = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserK.newPage();
+      page.on('dialog', (d) => d.accept());
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardK({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueK, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitK = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#spending/card/${stackCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitK(1200);
+      const stackState = await page.evaluate(() => {
+        const hist = window.__fmCharts.spendCard;
+        const dough = window.__fmCharts.spendCardShare;
+        if (!hist || !dough) return null;
+        const bars = hist.data.datasets.filter((d) => d.type === 'bar');
+        const total = hist.data.datasets.find((d) => d.label === 'Total');
+        const dLabels = [...dough.data.labels];
+        const dColors = [...dough.data.datasets[0].backgroundColor];
+        const at = (arr, label) => {
+          const i = hist.data.labels.indexOf(label);
+          return i < 0 ? null : arr[i];
+        };
+        const colorMatch = bars.every((b) => {
+          const di = dLabels.indexOf(b.label);
+          return di >= 0 && dColors[di] === b.backgroundColor;
+        });
+        const sumsMatch = hist.data.labels.every((_, i) => {
+          const s = Math.round(bars.reduce((t, b) => t + (b.data[i] || 0), 0) * 100) / 100;
+          return Math.abs(s - total.data[i]) < 0.005;
+        });
+        return {
+          chartType: hist.config.type,
+          barLabels: bars.map((b) => b.label),
+          barStacked: bars.every((b) => b.stack === 'spend'),
+          colorMatch,
+          sumsMatch,
+          oct: { dining: at(bars.find((b) => b.label === 'Dining').data, '2026-10'), gro: at(bars.find((b) => b.label === 'Groceries').data, '2026-10'), total: at(total.data, '2026-10') },
+          aug: { dining: at(bars.find((b) => b.label === 'Dining').data, '2026-08'), gro: at(bars.find((b) => b.label === 'Groceries').data, '2026-08'), total: at(total.data, '2026-08') },
+        };
+      });
+      check('spending UI: detail history stacks by category with the doughnut colors and a stack-sum total line',
+        stackState && stackState.barLabels.join(',') === 'Dining,Groceries' && stackState.barStacked
+          && stackState.colorMatch && stackState.sumsMatch
+          && stackState.oct.dining === 80 && stackState.oct.gro === 20 && stackState.oct.total === 100
+          && stackState.aug.dining === 15 && stackState.aug.gro === 0 && stackState.aug.total === 15,
+        JSON.stringify(stackState));
+    } finally { await browserK.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${stackCardId}`);
+  check('spending stack cleanup: card deleted', r.status === 200);
+
   // UI unification round: the whole Spending section uses the
   // property/Stocks visual language — standard section-head
   // padding (overall + card detail), share-left chart row

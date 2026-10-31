@@ -9855,12 +9855,36 @@ function drawSpendCharts(level, d, r) {
   if (histWrap) histWrap.classList.toggle('hidden', histEmpty);
   if (histEmptyEl) histEmptyEl.classList.toggle('hidden', !histEmpty);
   let hist = null;
+  // The detail chart stacks each month's bar by category, exactly
+  // like the overall page's By-category stacking (same segment
+  // colors as the detail Category-share doughnut, since both read
+  // the same shareRows, and a total line summing the stack values
+  // themselves). No By-card toggle on detail — one card only, so
+  // it is always stacked by category. Computed client-side from
+  // the card's transactions, like the overall chart; no new API.
   if (!histEmpty && isDetail) {
+    const monthIdx = new Map(months.map((m, i) => [m.month, i]));
+    const byKey = new Map(shareRows.map((s) => [s.key, months.map(() => 0)]));
+    for (const t of tx) {
+      if (t.kind === 'adjustment' || !(Number(t.amount) < 0)) continue;
+      const mi = monthIdx.get(String(t.date).slice(0, 7));
+      if (mi === undefined) continue;
+      const key = (t.category || '').trim() || 'Uncategorized';
+      const arr = byKey.get(key);
+      if (arr) arr[mi] = Math.round((arr[mi] + -Number(t.amount)) * 100) / 100;
+    }
+    const totals = months.map((_, i) => Math.round(shareRows.reduce((s, row) => s + byKey.get(row.key)[i], 0) * 100) / 100);
     hist = new Chart(histCanvas, {
-      type: 'bar',
-      data: { labels: months.map((m) => m.month), datasets: [{ label: 'Spending', data: months.map((m) => m.total), backgroundColor: '#1668c4' }] },
+      type: 'line',
+      data: {
+        labels: months.map((m) => m.month),
+        datasets: [
+          ...shareRows.map((s) => ({ type: 'bar', label: s.label, data: byKey.get(s.key), backgroundColor: s.color, stack: 'spend', order: 3, maxBarThickness: 28 })),
+          { label: 'Total', data: totals, borderColor: '#22303c', backgroundColor: '#22303c', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
+        ],
+      },
       plugins: [guideLinePlugin],
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } }, onClick: (evt, els, chart) => spendHistBarClick(level, chart, evt) },
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: (v) => money(v) } } }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }, onClick: (evt, els, chart) => spendHistBarClick(level, chart, evt) },
     });
   } else if (!histEmpty) {
     const monthIdx = new Map(months.map((m, i) => [m.month, i]));
