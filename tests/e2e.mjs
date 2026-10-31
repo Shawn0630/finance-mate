@@ -12452,19 +12452,90 @@ try {
       });
       check('spending UI: analyze preview groups proposals by category',
         previewUi.hasDining && previewUi.hasShopping, JSON.stringify(previewUi.groups));
-      await page.evaluate(() => { document.querySelector('[data-ai-group-toggle]').click(); });
+      // Card grid: one card per group, each with a checkbox, an
+      // icon, a per-category color and a source tag.
+      const gridUi = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#spendAiModal [data-ai-group]')];
+        return {
+          grid: !!document.querySelector('#spendAiModal .spend-ai-grid'),
+          cards: cards.map((c) => ({
+            name: c.querySelector('.ai-name') ? c.querySelector('.ai-name').textContent.trim() : null,
+            hasCheck: !!c.querySelector('[data-ai-group-check]'),
+            checkChecked: c.querySelector('[data-ai-group-check]') ? c.querySelector('[data-ai-group-check]').checked : null,
+            hasIcon: !!c.querySelector('.ai-icon svg'),
+            color: c.style.getPropertyValue('--ai-color').trim(),
+            hasTag: !!c.querySelector('.badge'),
+          })),
+        };
+      });
+      check('spending UI: analysis groups render as cards with checkbox, icon, color and source tag',
+        gridUi.grid && gridUi.cards.length > 0 && gridUi.cards.every((c) => c.name && c.hasCheck && c.checkChecked && c.hasIcon && c.color && c.hasTag),
+        JSON.stringify(gridUi));
+      // Clicking a card's checkbox must NOT open the detail modal;
+      // toggling it twice leaves the group included for Apply.
+      await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#spendAiModal [data-ai-group]')];
+        cards[cards.length - 1].querySelector('[data-ai-group-check]').click();
+      });
+      await waitS(300);
+      const checkNoOpen = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#spendAiModal [data-ai-group]')];
+        const last = cards[cards.length - 1];
+        return {
+          detailHidden: document.querySelector('#spendAiDetailModal').classList.contains('hidden'),
+          unchecked: last.querySelector('[data-ai-group-check]').checked === false,
+        };
+      });
+      check('spending UI: clicking a card checkbox does not open the detail modal',
+        checkNoOpen.detailHidden && checkNoOpen.unchecked, JSON.stringify(checkNoOpen));
+      await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#spendAiModal [data-ai-group]')];
+        cards[cards.length - 1].querySelector('[data-ai-group-check]').click();
+      });
+      await waitS(200);
+      // The preview row lives in exactly one group's detail table;
+      // open that group's card (not just the first card).
+      const previewAGroup = await page.evaluate((txId) => {
+        const sel = document.querySelector(`select[data-ai-row-cat="${txId}"]`);
+        const grp = sel ? sel.closest('[data-ai-detail-group]') : null;
+        return grp ? grp.dataset.aiDetailGroup : null;
+      }, previewATxId);
+      check('spending UI: the preview row belongs to one analysis group', previewAGroup !== null, JSON.stringify({ previewAGroup }));
+      await page.evaluate((gi) => { document.querySelector(`#spendAiModal [data-ai-group="${gi}"]`).click(); }, previewAGroup);
       await waitS(300);
       const previewRows = await page.evaluate(() => {
-        const rows = document.querySelector('[data-ai-group-rows]');
-        const modal = document.querySelector('#spendAiModal');
-        return { visible: !!rows && !rows.classList.contains('hidden'), rowSels: rows ? rows.querySelectorAll('select[data-ai-row-cat]').length : 0, rowsInModal: !!(modal && rows && modal.contains(rows)) };
+        const modal = document.querySelector('#spendAiDetailModal');
+        const rows = modal ? modal.querySelector('[data-ai-detail-group]:not(.hidden)') : null;
+        return {
+          visible: !!modal && !modal.classList.contains('hidden'),
+          title: document.querySelector('#spendAiDetailTitle') ? document.querySelector('#spendAiDetailTitle').textContent : null,
+          rowSels: rows ? rows.querySelectorAll('select[data-ai-row-cat]').length : 0,
+        };
       });
-      check('spending UI: expanding a category group shows its transactions with editable categories',
-        previewRows.visible && previewRows.rowSels > 0 && previewRows.rowsInModal, JSON.stringify(previewRows));
+      check('spending UI: clicking a category card opens its detail modal with editable transaction rows',
+        previewRows.visible && previewRows.rowSels > 0 && !!previewRows.title, JSON.stringify(previewRows));
       await page.evaluate((txId) => {
         const sel = document.querySelector(`select[data-ai-row-cat="${txId}"]`);
         if (sel) { sel.value = 'Groceries'; sel.dispatchEvent(new Event('change', { bubbles: true })); }
       }, previewATxId);
+      // Close the detail modal; the edit is held, not written, and
+      // reopening the same card still shows it.
+      await page.evaluate(() => {
+        document.querySelector('#spendAiDetailModal [data-close-modal]').click();
+      });
+      await waitS(300);
+      await page.evaluate((gi) => { document.querySelector(`#spendAiModal [data-ai-group="${gi}"]`).click(); }, previewAGroup);
+      await waitS(300);
+      const heldEdit = await page.evaluate((txId) => {
+        const sel = document.querySelector(`select[data-ai-row-cat="${txId}"]`);
+        return { held: sel ? sel.value : null, detailVisible: !document.querySelector('#spendAiDetailModal').classList.contains('hidden') };
+      }, previewATxId);
+      check('spending UI: a detail-modal edit is held across close and reopen, before Apply',
+        heldEdit.held === 'Groceries' && heldEdit.detailVisible, JSON.stringify(heldEdit));
+      await page.evaluate(() => {
+        document.querySelector('#spendAiDetailModal [data-close-modal]').click();
+      });
+      await waitS(300);
       await page.click('#spendAiApplyBtn');
       await waitS(800);
       const modalClosed = await page.evaluate(() => {

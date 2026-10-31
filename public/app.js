@@ -10273,16 +10273,41 @@ $('#spendImportParseBtn').addEventListener('click', async () => {
 // over ALL existing uncategorized transactions across ALL cards.
 // The trigger sits in the section header beside + Add card; the
 // preview lives in its own modal. Preview groups proposals by
-// category; each group expands to its transactions, and each row's
-// category is editable before Apply. A row edited in preview
-// changes ONLY that row on Apply — the merchant mapping still
-// takes the group's proposed category.
+// category into a card grid; clicking a card opens a second modal
+// with that group's transactions, and each row's category is
+// editable before Apply. A row edited in preview changes ONLY
+// that row on Apply — the merchant mapping still takes the group's
+// proposed category. Edits are held in the detail modal's tables
+// and nothing writes until the main modal's Apply.
+// One inline SVG per preset category (a custom category gets the
+// generic tag); colors reuse the Spending doughnut palette
+// (INVEST_ACCOUNT_COLORS, in preset order), custom gray — the
+// doughnut's own colors are never changed.
+const SPEND_AI_ICONS = (() => {
+  const svg = (inner) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+  return {
+    Groceries: svg('<path d="M3 8h18M5 8l2 12h10l2-12M9 8l1-4h4l1 4"/>'),
+    Dining: svg('<path d="M4 17h16M5 17a7 7 0 0 1 14 0M12 10V8M9 8h6"/>'),
+    Transport: svg('<path d="M3 13l1.5-4.5A2 2 0 0 1 6.4 7h9.2a2 2 0 0 1 1.9 1.5L19 13v3h-2.5M3 16h2.5"/><circle cx="7" cy="16" r="1.6"/><circle cx="17" cy="16" r="1.6"/>'),
+    Housing: svg('<path d="M4 11L12 4l8 7M6 10v10h12V10M10 20v-6h4v6"/>'),
+    Utilities: svg('<path d="M13 2L5 14h6l-1 8 8-12h-6l1-8z"/>'),
+    Health: svg('<path d="M12 20s-7-4.5-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.5-9 9-9 9z"/>'),
+    Entertainment: svg('<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M10 10l5 3-5 3z"/>'),
+    Shopping: svg('<path d="M6 8h12l-1 13H7L6 8zM9 8a3 3 0 0 1 6 0"/>'),
+    Travel: svg('<path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>'),
+    Education: svg('<path d="M12 5C10 3.5 7 3 4 3v16c3 0 6 .5 8 2 2-1.5 5-2 8-2V3c-3 0-6 .5-8 2zM12 5v16"/>'),
+    'Fees & interest': svg('<path d="M19 5L5 19"/><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/>'),
+    Other: svg('<path d="M3 12V4h8l8 8-8 8-8-8z"/><circle cx="8" cy="9" r="1.5"/>'),
+  };
+})();
 $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
   const msg = $('#spendAiMsg');
   const host = $('#spendAiProposals');
+  const detailHost = $('#spendAiDetailRows');
   msg.className = 'msg';
   msg.textContent = '';
   host.innerHTML = '';
+  detailHost.innerHTML = '';
   openModal('spendAiModal');
   try {
     const data = await api('/api/spending/ai-categories', { method: 'POST', body: {} });
@@ -10304,23 +10329,50 @@ $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
         <td>${esc(t.date)}</td><td>${esc(t.merchant)}</td><td>${esc(t.cardName || '')}</td><td>${amt}</td>
         <td><select data-ai-row-cat="${t.id}">${cats.map((c) => `<option value="${esc(c)}"${c === cat ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></td></tr>`;
     };
-    host.innerHTML = [...groups.values()].map((g, gi) => `
-      <div class="panel" data-ai-group="${gi}">
-        <div class="toolbar"><label><input type="checkbox" data-ai-group-check="${gi}" checked> ${esc(g.category)}</label>
-        <span class="note">${g.merchants.length} merchants · ${g.merchants.reduce((n, m) => n + m.txCount, 0)} transactions${g.merchants.some((m) => m.source === 'remembered') ? ' · remembered mapping' : ''}</span>
-        <button class="small" data-ai-group-toggle="${gi}">Show transactions</button></div>
-        <div class="hidden" data-ai-group-rows="${gi}">
-          <table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Card</th><th>Amount</th><th>Category</th></tr></thead><tbody>
-          ${g.merchants.map((m) => (m.transactions || []).map((t) => rowHtml(t, g.category)).join('')).join('')}
-          </tbody></table>
-        </div>
-      </div>`).join('')
+    const aiColorFor = (cat) => {
+      // Presets keep their palette slot in preset order; anything
+      // else (a custom category) is neutral gray, never a palette
+      // color — spendPresetCategories is the static preset list
+      // captured before used customs are appended to the datalist.
+      const presets = spendPresetCategories || cats.slice(0, 12);
+      const i = presets.indexOf(cat);
+      return i >= 0 ? INVEST_ACCOUNT_COLORS[i % INVEST_ACCOUNT_COLORS.length] : '#71808f';
+    };
+    const aiTxCount = (g) => g.merchants.reduce((n, m) => n + m.txCount, 0);
+    const aiSourceTag = (g) => [...new Set(g.merchants.map((m) => m.source))]
+      .map((s) => (s === 'remembered' ? 'remembered' : 'AI')).join(' + ');
+    host.innerHTML = `<div class="spend-ai-grid">${[...groups.values()].map((g, gi) => `
+      <div class="spend-ai-card" data-ai-group="${gi}" style="--ai-color: ${aiColorFor(g.category)}">
+        <input type="checkbox" data-ai-group-check="${gi}" checked>
+        <span class="ai-icon">${SPEND_AI_ICONS[g.category] || SPEND_AI_ICONS.Other}</span>
+        <span class="ai-text"><span class="ai-name">${esc(g.category)}</span>
+        <span class="ai-meta">${aiTxCount(g)} transactions · ${g.merchants.length} merchants</span>
+        <span class="badge">${esc(aiSourceTag(g))}</span></span>
+      </div>`).join('')}</div>`
       + `<div class="toolbar"><button class="primary" id="spendAiApplyBtn">Apply categories</button></div>`;
-    host.querySelectorAll('[data-ai-group-toggle]').forEach((b) => {
-      b.onclick = () => {
-        const rows = host.querySelector(`[data-ai-group-rows="${b.dataset.aiGroupToggle}"]`);
-        if (rows) { rows.classList.toggle('hidden'); b.textContent = rows.classList.contains('hidden') ? 'Show transactions' : 'Hide transactions'; }
-      };
+    // Detail modal: one hidden row table per group, built once so
+    // edits survive closing and reopening the detail modal. Apply
+    // below reads these tables, so nothing writes before Apply.
+    detailHost.innerHTML = [...groups.values()].map((g, gi) => `
+      <div class="hidden" data-ai-detail-group="${gi}">
+        <table class="tbl"><thead><tr><th>Date</th><th>Merchant</th><th>Card</th><th>Amount</th><th>Category</th></tr></thead><tbody>
+        ${g.merchants.map((m) => (m.transactions || []).map((t) => rowHtml(t, g.category)).join('')).join('')}
+        </tbody></table>
+      </div>`).join('');
+    host.querySelectorAll('[data-ai-group]').forEach((card) => {
+      card.addEventListener('click', (e) => {
+        // The group checkbox toggles inclusion; it must not open
+        // the detail modal.
+        if (e.target.closest('[data-ai-group-check]')) return;
+        const gi = Number(card.dataset.aiGroup);
+        const g = [...groups.values()][gi];
+        if (!g) return;
+        $('#spendAiDetailTitle').textContent = `${g.category} · ${aiTxCount(g)} transactions`;
+        detailHost.querySelectorAll('[data-ai-detail-group]').forEach((d) => {
+          d.classList.toggle('hidden', Number(d.dataset.aiDetailGroup) !== gi);
+        });
+        openModal('spendAiDetailModal');
+      });
     });
     $('#spendAiApplyBtn').addEventListener('click', async () => {
       const proposals = [];
@@ -10328,7 +10380,7 @@ $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
       [...groups.values()].forEach((g, gi) => {
         if (!host.querySelector(`[data-ai-group-check="${gi}"]`).checked) return;
         for (const m of g.merchants) proposals.push({ merchant: m.merchant, category: g.category });
-        const rowsEl = host.querySelector(`[data-ai-group-rows="${gi}"]`);
+        const rowsEl = detailHost.querySelector(`[data-ai-detail-group="${gi}"]`);
         if (rowsEl) rowsEl.querySelectorAll('[data-ai-row-cat]').forEach((sel) => {
           if (sel.value !== g.category) overrides.push({ txId: Number(sel.dataset.aiRowCat), category: sel.value });
         });
@@ -10337,7 +10389,9 @@ $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
         const result = await api('/api/spending/ai-categories/apply', { method: 'POST', body: { proposals, overrides } });
         showMsg(msg, 'ok', `Applied ${result.mapped} merchant mappings, categorized ${result.updated} transactions. Mappings are remembered.`);
         host.innerHTML = '';
+        detailHost.innerHTML = '';
         closeModalEl($('#spendAiModal'));
+        closeModalEl($('#spendAiDetailModal'));
         reloadSpendView();
       } catch (err) { showMsg(msg, 'err', err.message); }
     });

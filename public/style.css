@@ -69,6 +69,23 @@ h2 { font-size: 16px; margin: 22px 0 10px; }
 #spendFillPanel .spend-fill-inner { overflow: hidden; min-height: 0; }
 #spendFillPanel .spend-fill-inner .panel { margin-bottom: 0; }
 @media (prefers-reduced-motion: reduce) { #spendFillPanel { transition: none; } }
+/* Category analysis: one card per proposed category, 4 columns
+   (2 below 815px, 1 when very narrow). Each card carries its group
+   checkbox, an icon and its per-category color, the name, the
+   transaction count and the source tag; clicking the card (not its
+   checkbox) opens the detail modal for that group. */
+.spend-ai-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 815px) { .spend-ai-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 480px) { .spend-ai-grid { grid-template-columns: 1fr; } }
+.spend-ai-card { background: #fff; border: 1px solid #dde4ec; border-left: 4px solid var(--ai-color); border-radius: 10px; padding: 12px 14px; cursor: pointer; display: flex; gap: 10px; align-items: flex-start; }
+.spend-ai-card:hover { background: #f0f4f9; }
+.spend-ai-card input[type="checkbox"] { width: auto; height: auto; margin-top: 4px; flex: none; }
+.spend-ai-card .ai-icon { color: var(--ai-color); flex: none; }
+.spend-ai-card .ai-icon svg { display: block; width: 24px; height: 24px; }
+.spend-ai-card .ai-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.spend-ai-card .ai-name { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+.spend-ai-card .ai-meta { font-size: 12px; color: #71808f; }
+.spend-ai-card .badge { align-self: flex-start; }
 .panel h3 { margin: 0 0 8px; font-size: 15px; }
 /* Panel head: title left, actions (Edit / modal openers) top-right. */
 .panel-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
