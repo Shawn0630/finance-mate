@@ -13402,7 +13402,7 @@ try {
         const head = document.querySelector('#spendCardDetail .section-head');
         const h2 = document.querySelector('#spendDetailTitle');
         const panel = document.querySelector('#spendDetailPanel');
-        const backBtn = document.querySelector('#spendCardDetail .section-head button');
+        const backBtn = document.querySelector('#spendBackBtn');
         const wrap = document.querySelector('#spendDetailMainWrap .chart-wrap');
         const note = document.querySelector('#spendDetailHistEmpty');
         const shareNote = document.querySelector('#spendDetailShareEmpty');
@@ -13636,6 +13636,60 @@ try {
           && !listCards.bal.text.includes('transactions') && !listCards.bal.text.includes('Credit limit') && !listCards.bal.text.includes('Balance owed')
           && listCards.plain && listCards.plain.figure === null && listCards.plain.note === null,
         JSON.stringify(listCards));
+      // Detail header: back is a plain property-style link and
+      // Edit matches Fill/Import height and padding exactly.
+      await page.goto(`http://ff.local/#spending/card/${balCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1200);
+      const detHead = await page.evaluate(() => {
+        const back = document.querySelector('#spendBackBtn');
+        const ref = document.createElement('a');
+        ref.textContent = 'ref';
+        document.body.appendChild(ref);
+        // Read the values BEFORE detaching: a live computed-style
+        // object goes blank once its element leaves the document.
+        const refStyle = getComputedStyle(ref);
+        const refLinkStyle = { color: refStyle.color, deco: refStyle.textDecorationLine, size: refStyle.fontSize };
+        const backStyle = back ? getComputedStyle(back) : null;
+        document.body.removeChild(ref);
+        const btn = (id) => document.querySelector(id);
+        const dims = (el) => el ? {
+          h: Math.round(el.getBoundingClientRect().height),
+          pad: getComputedStyle(el).padding,
+        } : null;
+        return {
+          backTag: back ? back.tagName : null,
+          backText: back ? back.textContent.trim() : null,
+          backHref: back ? back.getAttribute('href') : null,
+          backClass: back ? back.className : null,
+          backLinkStyle: backStyle ? {
+            color: backStyle.color, deco: backStyle.textDecorationLine, size: backStyle.fontSize,
+          } : null,
+          refLinkStyle,
+          edit: dims(btn('#spendDetailEditBtn')),
+          fill: dims(btn('#spendFillToggleBtn')),
+          imp: dims(btn('#spendDetailImportBtn')),
+        };
+      });
+      check('spending UI: detail back is a plain link styled like any link, Edit/Fill/Import share height and padding',
+        detHead.backTag === 'A' && detHead.backText === '← Back to Spending' && detHead.backHref === '#spending'
+          && detHead.backClass === '' && JSON.stringify(detHead.backLinkStyle) === JSON.stringify(detHead.refLinkStyle)
+          && detHead.edit && detHead.fill && detHead.imp
+          && detHead.edit.h === detHead.fill.h && detHead.edit.h === detHead.imp.h
+          && detHead.edit.pad === detHead.fill.pad && detHead.edit.pad === detHead.imp.pad,
+        JSON.stringify(detHead));
+      // The Import modal opened above is still up: a hash-only goto
+      // never reloads the SPA, so its overlay would swallow this
+      // click (and just close itself) instead of following the link.
+      await page.keyboard.press('Escape');
+      await waitF(300);
+      await page.click('#spendBackBtn');
+      try { await page.waitForFunction(() => location.hash === '#spending', { timeout: 5000 }); } catch {}
+      const backNav = await page.evaluate(() => ({
+        hash: location.hash,
+        detailHidden: document.querySelector('#spendCardDetail').classList.contains('hidden'),
+      }));
+      check('spending UI: clicking the detail back link returns to the Spending list',
+        backNav.hash === '#spending' && backNav.detailHidden === true, JSON.stringify(backNav));
     } finally { await browserF.close(); }
   }
   r = await req('DELETE', `/api/spending/cards/${limCardId}`);

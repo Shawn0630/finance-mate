@@ -10138,8 +10138,6 @@ $('#spendCardForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
-$('#spendBackBtn').addEventListener('click', () => { location.hash = '#spending'; });
-
 $('#spendDetailDeleteBtn').addEventListener('click', async () => {
   if (!currentSpendCardId || !confirm('Delete this card and all its transactions?')) return;
   await api(`/api/spending/cards/${currentSpendCardId}`, { method: 'DELETE' });
