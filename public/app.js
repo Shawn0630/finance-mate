@@ -9167,7 +9167,8 @@ window.earnDeleteJob = async (id) => {
 // A job card opens its own detail page (property/account detail
 // pattern). Pay changes and bonuses are added, edited and deleted
 // here; the job itself is edited and deleted from its card, so the
-// detail header carries no Edit/Delete buttons.
+// detail header carries no Edit/Delete buttons — only a plain
+// assetBackLink-style Back to Salary link above the card.
 let currentEarnJobId = null;
 
 function earnJobPerPeriod(j) {
@@ -9190,7 +9191,7 @@ function earnJobDetailHtml(j) {
   const bonusRows = (j.bonuses || []).map((b, i) => `<div class="note">${earnJobDateLabel(b.date)} · ${money2(b.amount)}
     <button class="small" onclick="earnJobDetailOpenRow('bonus', ${i})">Edit</button>
     <button class="small danger" onclick="earnJobDetailDeleteRow('bonus', ${i})">Delete</button></div>`).join('');
-  return `<div class="section-head"><button class="small" onclick="location.hash='#earnings/salary'">← Back to Salary</button><div class="spacer"></div></div>
+  return `<div class="toolbar"><a id="earnJobBackLink" href="#earnings/salary">← Back to Salary</a><div class="spacer"></div></div>
     <div class="msg" id="earnJobDetailMsg"></div>
     <div class="panel">
       <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>

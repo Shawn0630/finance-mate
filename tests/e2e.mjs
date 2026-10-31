@@ -6974,6 +6974,39 @@ try {
       check('detail header has no Edit/Delete buttons',
         await page.evaluate(() => !document.querySelector('#earnJobDetailEditBtn')
           && !document.querySelector('#earnJobDetailDeleteBtn')));
+      // Rendered header, not just missing ids: the header row above
+      // the card is a toolbar with one plain link and zero buttons,
+      // while the pay-change/bonus row buttons below stay in place.
+      const jobHead = await page.evaluate(() => {
+        const d = document.querySelector('#earnJobDetail');
+        const head = d ? d.firstElementChild : null;
+        const back = document.querySelector('#earnJobBackLink');
+        const rowBtns = [...document.querySelectorAll('#earnJobDetail button')]
+          .filter((b) => (b.getAttribute('onclick') || '').includes('earnJobDetail'));
+        return {
+          backTag: back ? back.tagName : null,
+          backText: back ? back.textContent.trim() : null,
+          backHref: back ? back.getAttribute('href') : null,
+          backClass: back ? back.className : null,
+          headButtons: head ? head.querySelectorAll('button').length : null,
+          headIsToolbar: !!head && head.classList.contains('toolbar'),
+          rowBtns: rowBtns.length,
+        };
+      });
+      check('detail header back is a plain link above the card with no buttons, row buttons stay',
+        jobHead.backTag === 'A' && jobHead.backText === '← Back to Salary' && jobHead.backHref === '#earnings/salary'
+          && jobHead.backClass === '' && jobHead.headButtons === 0 && jobHead.headIsToolbar && jobHead.rowBtns > 0,
+        JSON.stringify(jobHead));
+      await page.keyboard.press('Escape');
+      await wait(300);
+      await page.click('#earnJobBackLink');
+      try { await page.waitForFunction(() => location.hash === '#earnings/salary', { timeout: 5000 }); } catch {}
+      const jobBackNav = await page.evaluate(() => ({
+        hash: location.hash,
+        detailHidden: document.querySelector('#earnJobDetail').classList.contains('hidden'),
+      }));
+      check('clicking the job detail back link returns to the Salary list',
+        jobBackNav.hash === '#earnings/salary' && jobBackNav.detailHidden === true, JSON.stringify(jobBackNav));
       await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
       check('card shows the same next pay date as the detail page',
