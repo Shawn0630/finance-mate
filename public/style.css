@@ -56,6 +56,19 @@ h2 { font-size: 16px; margin: 22px 0 10px; }
 .badge.usd { background: #e8f5ee; color: #1e7a46; }
 .badge.ai { background: #f3e8fd; color: #6d28a8; }
 .panel { background: #fff; border: 1px solid #dde4ec; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+/* Fill with AI panel: in-flow height reveal, not an instant
+   hidden toggle and not an overlay — grid-template-rows animates
+   0fr -> 1fr so the panel grows with its own content height and
+   pushes the transactions panel below it down. Closed it takes
+   zero space: the middle layer carries no padding or border (a
+   grid item's own padding/border would leak ~34px when collapsed),
+   so the whole panel — padding, border and all — is clipped
+   inside it; the gap lives on the outer collapse. */
+#spendFillPanel { display: grid; grid-template-rows: 0fr; margin-bottom: 0; transition: grid-template-rows .35s ease-out, margin-bottom .35s ease-out; }
+#spendFillPanel.fill-open { grid-template-rows: 1fr; margin-bottom: 14px; }
+#spendFillPanel .spend-fill-inner { overflow: hidden; min-height: 0; }
+#spendFillPanel .spend-fill-inner .panel { margin-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { #spendFillPanel { transition: none; } }
 .panel h3 { margin: 0 0 8px; font-size: 15px; }
 /* Panel head: title left, actions (Edit / modal openers) top-right. */
 .panel-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }

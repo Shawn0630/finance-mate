@@ -510,13 +510,17 @@
           <div class="invest-main-chart" id="spendDetailMainWrap"><div class="chart-wrap tall"><canvas id="spendDetailChart"></canvas></div><div class="note hidden" id="spendDetailHistEmpty">No spending in this range yet.</div></div>
         </div>
       </div>
-      <div class="panel hidden" id="spendFillPanel">
-        <h3>✨ Fill with AI</h3>
-        <div class="note">Paste transaction text — the proposal is a preview; only Apply writes.</div>
-        <textarea id="spendFillText" rows="4" placeholder="Paste statement text with dates, merchants and amounts"></textarea>
-        <div class="toolbar"><button class="primary" id="spendFillBtn">✨ Extract transactions</button></div>
-        <div class="msg" id="spendFillMsg"></div>
-        <div id="spendFillProposals"></div>
+      <div id="spendFillPanel" class="spend-fill-collapse">
+        <div class="spend-fill-inner">
+        <div class="panel">
+          <h3>✨ Fill with AI</h3>
+          <div class="note">Paste transaction text — the proposal is a preview; only Apply writes.</div>
+          <textarea id="spendFillText" rows="4" placeholder="Paste statement text with dates, merchants and amounts"></textarea>
+          <div class="toolbar"><button class="primary" id="spendFillBtn">✨ Extract transactions</button></div>
+          <div class="msg" id="spendFillMsg"></div>
+          <div id="spendFillProposals"></div>
+        </div>
+        </div>
       </div>
       <div class="panel">
         <div class="toolbar"><button class="primary" id="spendDetailAddTxBtn">+ Add transaction</button></div>

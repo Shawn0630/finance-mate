@@ -10345,9 +10345,11 @@ $('#spendAiAnalyzeBtn').addEventListener('click', async () => {
 
 // Card detail ✨ Fill with AI: the header button expands the
 // panel; the panel itself proposes transaction rows from pasted
-// text, and only Apply writes.
+// text, and only Apply writes. The reveal is an in-flow grid-rows
+// height animation (see style.css), so opening pushes the
+// transactions panel down and closing leaves zero space.
 $('#spendFillToggleBtn').addEventListener('click', () => {
-  $('#spendFillPanel').classList.toggle('hidden');
+  $('#spendFillPanel').classList.toggle('fill-open');
 });
 $('#spendFillBtn').addEventListener('click', async () => {
   const msg = $('#spendFillMsg');

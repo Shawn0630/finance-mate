@@ -641,10 +641,12 @@ app.post('/api/admin/users/:id/avatar', requireApiAuth, requireAdmin, (req, res)
   res.json(userView(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id)));
 });
 
-app.delete('/api/admin/users/:id/avatar', requireApiAuth, requireAdmin, (req, res) => {
+app.delete('/api/admin/users/:id/avatar', requireApiAuth, requireAdmin, async (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!u) return res.status(404).json({ error: 'user not found' });
-  if (u.avatar_file) fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
+  // Await the unlink: a fire-and-forget delete raced the next
+  // fetch, which could still see the file and report it served.
+  if (u.avatar_file) await fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
   db.prepare('UPDATE users SET avatar_file = NULL WHERE id = ?').run(u.id);
   res.json(userView(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id)));
 });

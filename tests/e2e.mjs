@@ -13585,21 +13585,48 @@ try {
           info: info ? info.textContent : null,
           fillPresent: !!fillBtn, fillVisible: !!fillBtn && fillBtn.getBoundingClientRect().height > 0,
           sameHead: !!fillBtn && !!importBtn && fillBtn.closest('.section-head') === importBtn.closest('.section-head'),
-          panelHiddenBefore: !!panel && panel.classList.contains('hidden'),
+          panelCollapsedBefore: !!panel && !panel.classList.contains('fill-open') && panel.getBoundingClientRect().height === 0,
           delDanger: !!delBtn && delBtn.classList.contains('danger'),
         };
       });
       check('spending UI: detail page shows limit + balance with as-of, Fill beside Import, danger Delete',
         balUi.info && balUi.info.includes('Credit limit $5,000.00') && balUi.info.includes('Balance owed $309.85') && balUi.info.includes('as of 2026-10-30')
-        && balUi.fillPresent && balUi.fillVisible && balUi.sameHead && balUi.panelHiddenBefore && balUi.delDanger,
+        && balUi.fillPresent && balUi.fillVisible && balUi.sameHead && balUi.panelCollapsedBefore && balUi.delDanger,
         JSON.stringify(balUi));
+      const fillTxTopBefore = await page.evaluate(() => {
+        const tx = document.querySelector('#spendFillPanel + .panel');
+        return tx ? Math.round(tx.getBoundingClientRect().top + window.scrollY) : null;
+      });
       await page.click('#spendFillToggleBtn');
-      await waitF(300);
+      await waitF(650);
       const fillOpen = await page.evaluate(() => {
         const panel = document.querySelector('#spendFillPanel');
-        return !!panel && !panel.classList.contains('hidden') && panel.getBoundingClientRect().height > 0;
+        const tx = document.querySelector('#spendFillPanel + .panel');
+        return {
+          open: !!panel && panel.classList.contains('fill-open') && panel.getBoundingClientRect().height > 0,
+          txTop: tx ? Math.round(tx.getBoundingClientRect().top + window.scrollY) : null,
+          hasPaste: !!document.querySelector('#spendFillText'),
+          hasExtract: !!document.querySelector('#spendFillBtn'),
+          hasProposals: !!document.querySelector('#spendFillProposals'),
+        };
       });
-      check('spending UI: clicking Fill with AI expands the Fill panel', fillOpen, JSON.stringify({ fillOpen }));
+      check('spending UI: clicking Fill with AI expands the Fill panel and pushes the transactions panel down',
+        fillOpen.open && fillTxTopBefore !== null && fillOpen.txTop !== null && fillOpen.txTop > fillTxTopBefore
+          && fillOpen.hasPaste && fillOpen.hasExtract && fillOpen.hasProposals,
+        JSON.stringify({ before: fillTxTopBefore, ...fillOpen }));
+      await page.click('#spendFillToggleBtn');
+      await waitF(650);
+      const fillClosed = await page.evaluate(() => {
+        const panel = document.querySelector('#spendFillPanel');
+        const tx = document.querySelector('#spendFillPanel + .panel');
+        return {
+          closed: !!panel && !panel.classList.contains('fill-open') && panel.getBoundingClientRect().height === 0,
+          txTop: tx ? Math.round(tx.getBoundingClientRect().top + window.scrollY) : null,
+        };
+      });
+      check('spending UI: closing Fill with AI collapses it to zero space and pulls the transactions panel back',
+        fillClosed.closed && fillClosed.txTop === fillTxTopBefore,
+        JSON.stringify({ before: fillTxTopBefore, ...fillClosed }));
       await page.click('#spendDetailImportBtn');
       await waitF(300);
       const importUi = await page.evaluate(() => {
