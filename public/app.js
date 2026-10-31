@@ -10022,10 +10022,10 @@ async function loadSpendCard(id) {
   renderSpendCategoryList(data.categories);
   investViewData.spendCard = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: [data.card] };
   $('#spendDetailTitle').textContent = `${data.card.name} · ••••${data.card.last4}`;
-  const infoLines = [];
-  if (data.card.credit_limit != null) infoLines.push(`Credit limit ${money2(data.card.credit_limit)}`);
-  if (data.card.balance_owed != null) infoLines.push(`Balance owed ${money2(data.card.balance_owed)}${data.card.balance_asof ? ' · as of ' + esc(data.card.balance_asof) : ''}`);
-  $('#spendDetailCardInfo').innerHTML = infoLines.length ? `<div class="note">${infoLines.join(' · ')}</div>` : '';
+  const infoParts = [];
+  if (data.card.credit_limit != null) infoParts.push(`Credit limit ${money2(data.card.credit_limit)}`);
+  if (data.card.balance_owed != null) infoParts.push(`Balance owed <span class="spend-balance-figure">${money2(data.card.balance_owed)}</span>${data.card.balance_asof ? ` <span class="spend-balance-asof">· as of ${esc(data.card.balance_asof)}</span>` : ''}`);
+  $('#spendDetailCardInfo').innerHTML = infoParts.length ? `<div class="note spend-detail-info">${infoParts.join(' · ')}</div>` : '';
   renderSpendDetailTxTable();
   $('#spendDetailRange').innerHTML = investRangeControlsHtml('spendCard');
   wireInvestRangeControls('spendCard');

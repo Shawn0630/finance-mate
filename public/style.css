@@ -256,8 +256,16 @@ td.num, th.num { text-align: right; }
    Spending head (and Properties/Stocks) — the spacing round
    deliberately left this header for the unification round, so the
    back button, title and card buttons line up with the panels below. */
-#spendCardDetail .section-head { padding: 16px 17px; }
+/* Rearranged: the Back link takes its own line above (no class is
+   added to it — the plain-link check requires class ''), and the
+   title shares its line with the four action buttons on the right. */
+#spendCardDetail .section-head { padding: 16px 17px; flex-wrap: wrap; }
 #spendCardDetail .section-head h2 { margin-top: 0; }
+#spendBackBtn { flex-basis: 100%; }
+/* Card-detail balance line: the owed figure is bold and enlarged
+   against the small muted line; the as-of stays small. */
+.spend-balance-figure { font-size: 18px; font-weight: 700; color: #1c2733; }
+.spend-balance-asof { font-size: 12px; }
 /* Stocks detail pages (account / holding): their head band is
    the back-link toolbar — same inset so the back link and the
    Edit/Delete buttons line up with the panels below, and the

@@ -13732,6 +13732,34 @@ try {
         balUi.info && balUi.info.includes('Credit limit $5,000.00') && balUi.info.includes('Balance owed $309.85') && balUi.info.includes('as of 2026-10-30')
         && balUi.fillPresent && balUi.fillVisible && balUi.sameHead && balUi.panelCollapsedBefore && balUi.delDanger,
         JSON.stringify(balUi));
+      // Rearranged header: Back on its own line above; the title
+      // shares its line with all four action buttons on the right;
+      // the Balance owed figure is bold and larger, as-of small.
+      const detHeadLayout = await page.evaluate(() => {
+        const back = document.querySelector('#spendBackBtn');
+        const title = document.querySelector('#spendDetailTitle');
+        const center = (el) => { const r = el.getBoundingClientRect(); return (r.top + r.bottom) / 2; };
+        const btns = ['#spendFillToggleBtn', '#spendDetailImportBtn', '#spendDetailEditBtn', '#spendDetailDeleteBtn']
+          .map((id) => document.querySelector(id));
+        const fig = document.querySelector('#spendDetailCardInfo .spend-balance-figure');
+        const asof = document.querySelector('#spendDetailCardInfo .spend-balance-asof');
+        const figStyle = fig ? getComputedStyle(fig) : null;
+        const asofStyle = asof ? getComputedStyle(asof) : null;
+        return {
+          backTop: back ? Math.round(back.getBoundingClientRect().top) : null,
+          titleTop: title ? Math.round(title.getBoundingClientRect().top) : null,
+          titleCenter: title ? Math.round(center(title)) : null,
+          btnCenters: btns.map((b) => b ? Math.round(center(b)) : null),
+          figWeight: figStyle ? figStyle.fontWeight : null,
+          figSize: figStyle ? figStyle.fontSize : null,
+          asofSize: asofStyle ? asofStyle.fontSize : null,
+        };
+      });
+      check('spending UI: detail header has Back above, title with four buttons on one line, bold enlarged balance figure',
+        detHeadLayout.backTop !== null && detHeadLayout.titleTop !== null && detHeadLayout.backTop < detHeadLayout.titleTop
+          && detHeadLayout.btnCenters.every((c) => c !== null && Math.abs(c - detHeadLayout.titleCenter) <= 6)
+          && Number(detHeadLayout.figWeight) >= 700 && detHeadLayout.figSize === '18px' && detHeadLayout.asofSize === '12px',
+        JSON.stringify(detHeadLayout));
       // The Fill panel now sits ABOVE the Spending-over-time panel,
       // so opening it pushes both that panel and the transactions
       // panel down; closing pulls both back.
