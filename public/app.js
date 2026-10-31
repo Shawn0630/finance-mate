@@ -9949,13 +9949,16 @@ async function loadSpending() {
   spendData = data;
   renderSpendCategoryList(data.categories);
   investViewData.spending = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: data.cards };
+  // List cards show ONLY the current balance: the name line, then
+  // the balance figure and its as-of line. No total spent, no
+  // transaction count/last date, no credit limit — those live on
+  // the card detail page. A card with no balance shows its name
+  // only; a balance is never invented.
   $('#spendCardList').innerHTML = data.cards.length ? data.cards.map((c) => `
     <div class="card breakdown-card" onclick="location.hash='#spending/card/${c.id}'">
       <div class="k">${esc(c.name)}${c.issuer ? ' · ' + esc(c.issuer) : ''} · ••••${esc(c.last4)}</div>
-      <div class="v">${money(c.totalSpent)}</div>
-      <div class="n">${c.txCount} transactions${c.lastTxDate ? ' · last ' + esc(c.lastTxDate) : ''}</div>
-      ${c.credit_limit != null ? `<div class="n">Credit limit ${money2(c.credit_limit)}</div>` : ''}
-      ${c.balance_owed != null ? `<div class="n">Balance owed ${money2(c.balance_owed)}${c.balance_asof ? ' · as of ' + esc(c.balance_asof) : ''}</div>` : ''}
+      ${c.balance_owed != null ? `<div class="v">${money2(c.balance_owed)}</div>
+      <div class="n">Current balance${c.balance_asof ? ' · as of ' + esc(c.balance_asof) : ''}</div>` : ''}
     </div>`).join('') : '<div class="note">No cards yet — add one above.</div>';
   renderSpendTxTable();
   $('#spendRange').innerHTML = investRangeControlsHtml('spending');

@@ -13100,7 +13100,11 @@ try {
         const shareCol = document.querySelector('#spendPanel .invest-share-col');
         const mainCol = document.querySelector('#spendPanel .invest-main-chart');
         const card = document.querySelector('#spendCardList .breakdown-card');
-        const v = card ? card.querySelector('.v') : null;
+        // List cards with no balance render no figure (current
+        // balance only), so the figure style is pinned via the
+        // shared .breakdown-card .v rule instead of a rendered card.
+        const vRule = [...document.styleSheets].flatMap((s) => { try { return [...s.cssRules]; } catch { return []; } })
+          .find((r) => r.selectorText && r.selectorText.split(',').map((x) => x.trim()).includes('.breakdown-card .v'));
         return {
           headPad: head ? getComputedStyle(head).padding : null,
           rowGap: row ? getComputedStyle(row).gap : null,
@@ -13109,8 +13113,8 @@ try {
           mainGrow: mainCol ? getComputedStyle(mainCol).flexGrow : null,
           txInPanel: !!document.querySelector('#spendTxTable').closest('.panel'),
           cardPad: card ? getComputedStyle(card).padding : null,
-          vSize: v ? getComputedStyle(v).fontSize : null,
-          vWeight: v ? getComputedStyle(v).fontWeight : null,
+          vSize: vRule ? vRule.style.fontSize : null,
+          vWeight: vRule ? vRule.style.fontWeight : null,
         };
       });
       check('spending UI: overall head padding, share-left proportions, card figures and panel-wrapped table match the Stocks standard',
@@ -13339,6 +13343,26 @@ try {
       });
       check('spending UI: a card with no limit and no balance shows no info line',
         plainInfo === '', JSON.stringify({ plainInfo }));
+      // List cards show ONLY the current balance: the balance
+      // card carries its figure + as-of and none of the removed
+      // lines; the no-balance card shows its name only.
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1200);
+      const listCards = await page.evaluate(() => {
+        const find = (last4) => [...document.querySelectorAll('#spendCardList .breakdown-card')]
+          .find((c) => c.textContent.includes(`••••${last4}`));
+        const read = (c) => c ? {
+          text: c.textContent.replace(/\s+/g, ' ').trim(),
+          figure: c.querySelector('.v') ? c.querySelector('.v').textContent.trim() : null,
+          note: c.querySelector('.n') ? c.querySelector('.n').textContent.trim() : null,
+        } : null;
+        return { bal: read(find('9586')), plain: read(find('3333')) };
+      });
+      check('spending UI: list cards show only the current balance, no spent/count/limit lines',
+        listCards.bal && listCards.bal.figure === '$309.85' && listCards.bal.note === 'Current balance · as of 2026-10-30'
+          && !listCards.bal.text.includes('transactions') && !listCards.bal.text.includes('Credit limit') && !listCards.bal.text.includes('Balance owed')
+          && listCards.plain && listCards.plain.figure === null && listCards.plain.note === null,
+        JSON.stringify(listCards));
     } finally { await browserF.close(); }
   }
   r = await req('DELETE', `/api/spending/cards/${limCardId}`);
