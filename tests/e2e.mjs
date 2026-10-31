@@ -13093,6 +13093,29 @@ try {
       check('spending UI: category filter and month pager share one row, transactions panel padding equals credit-card card padding',
         filterRow.sameRow && filterRow.overlap && filterRow.centerDiff <= 2 && filterRow.heightDiff <= 2 && filterRow.cardPad === filterRow.panelPad,
         JSON.stringify(filterRow));
+      // Padding alignment: the transactions table's text edges sit
+      // on the same vertical line as the credit-card titles above
+      // (panel 16px + border 1px = 17px inset), not 8px deeper from
+      // cell padding stacking on panel padding; group bars still
+      // span the full table width.
+      const spendAlign = await page.evaluate(() => {
+        const cardTitle = document.querySelector('#spendCardList .breakdown-card .k');
+        const tbl = document.querySelector('#spendTxTable table');
+        const dataRow = tbl ? [...tbl.querySelectorAll('tbody tr')].find((tr) => !tr.classList.contains('spend-tx-group')) : null;
+        const groupCell = tbl ? tbl.querySelector('tbody tr.spend-tx-group td') : null;
+        return {
+          cardX: cardTitle ? cardTitle.getBoundingClientRect().left : null,
+          cellX: dataRow ? dataRow.cells[0].getBoundingClientRect().left : null,
+          groupX: groupCell ? groupCell.getBoundingClientRect().left : null,
+          groupW: groupCell ? groupCell.getBoundingClientRect().width : null,
+          tableW: tbl ? tbl.getBoundingClientRect().width : null,
+        };
+      });
+      check('spending UI: table first-column text aligns with the credit-card title, group bars span the table width',
+        spendAlign.cardX != null && spendAlign.cellX != null && Math.abs(spendAlign.cardX - spendAlign.cellX) <= 1
+        && spendAlign.groupX != null && Math.abs(spendAlign.groupX - spendAlign.cellX) <= 1
+        && spendAlign.groupW != null && spendAlign.tableW != null && Math.abs(spendAlign.groupW - spendAlign.tableW) <= 1,
+        JSON.stringify(spendAlign));
       // Range constrains pageable months: 1 year from Oct 2026
       // ends at Nov 2025, so stepping back must stop there and
       // can never reach the 2024-05 row.
@@ -13166,6 +13189,21 @@ try {
       check('spending UI: detail filter and pager share one row, detail panel padding matches the 16px card standard',
         detFilterRow.sameRow && detFilterRow.overlap && detFilterRow.centerDiff <= 2 && detFilterRow.heightDiff <= 2 && detFilterRow.panelPad === '16px 16px 16px 16px',
         JSON.stringify(detFilterRow));
+      // Detail table: same alignment — first-column text sits on
+      // the panel's 17px content inset, matching the detail page's
+      // own panel headings (not 8px deeper).
+      const detAlign = await page.evaluate(() => {
+        const tbl = document.querySelector('#spendDetailTxTable table');
+        const row = tbl ? tbl.querySelector('tbody tr') : null;
+        const head = document.querySelector('#spendDetailPanel h3');
+        return {
+          cellX: row ? row.cells[0].getBoundingClientRect().left : null,
+          headX: head ? head.getBoundingClientRect().left : null,
+        };
+      });
+      check('spending UI: detail table first-column text aligns with the detail panel heading',
+        detAlign.cellX != null && detAlign.headX != null && Math.abs(detAlign.cellX - detAlign.headX) <= 1,
+        JSON.stringify(detAlign));
       // Edit from the paged detail table, then Delete from it.
       await page.evaluate(() => {
         const tbl = document.querySelector('#spendDetailTxTable table');
