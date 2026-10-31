@@ -12247,6 +12247,41 @@ try {
       });
       check('spending UI: clicking the category filter opens the checkbox panel',
         spendPanelOpen, JSON.stringify({ spendPanelOpen }));
+      // Beautification (screenshot): the action row is one line
+      // with equal-height buttons, every checkbox shares one left
+      // edge, and every name starts at one left edge tight against
+      // its checkbox; panel padding matches the app panels (16px).
+      const catPanelGeo = await page.evaluate(() => {
+        const p = document.querySelector('#spendCatPanel');
+        if (!p) return null;
+        const cs = getComputedStyle(p);
+        const btns = [...p.querySelectorAll('.spend-tx-catpanel-actions button')].map((b) => {
+          const r = b.getBoundingClientRect();
+          return { text: b.textContent.trim(), top: Math.round(r.top), h: Math.round(r.height), wrapped: b.scrollWidth > b.clientWidth + 1 };
+        });
+        const labels = [...p.querySelectorAll('label')].map((l) => {
+          const box = l.querySelector('input[type="checkbox"]');
+          const textNode = [...l.childNodes].find((n) => n.nodeType === 3 && n.textContent.trim());
+          const range = document.createRange();
+          range.selectNodeContents(textNode);
+          const tr = range.getBoundingClientRect();
+          const br = box.getBoundingClientRect();
+          return { boxLeft: Math.round(br.left), boxRight: Math.round(br.right), nameLeft: Math.round(tr.left) };
+        });
+        return {
+          pad: [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft],
+          btns,
+          labels,
+        };
+      });
+      check('spending UI: category dropdown actions share one line and height, checkbox and name columns align, panel padding is 16px',
+        catPanelGeo && catPanelGeo.pad.every((v) => v === '16px')
+          && catPanelGeo.btns.length === 3 && catPanelGeo.btns.every((b) => !b.wrapped)
+          && new Set(catPanelGeo.btns.map((b) => b.top)).size === 1 && new Set(catPanelGeo.btns.map((b) => b.h)).size === 1
+          && catPanelGeo.labels.length > 0 && new Set(catPanelGeo.labels.map((l) => l.boxLeft)).size === 1
+          && new Set(catPanelGeo.labels.map((l) => l.nameLeft)).size === 1
+          && catPanelGeo.labels.every((l) => l.nameLeft - l.boxRight >= 4 && l.nameLeft - l.boxRight <= 10),
+        JSON.stringify(catPanelGeo));
       await page.evaluate(() => { document.querySelector('[data-spend-cat-none="spending"]').click(); });
       await waitS(300);
       await page.evaluate(() => { document.querySelector('#spendCatPanel input[data-spend-cat="Groceries"]').click(); });

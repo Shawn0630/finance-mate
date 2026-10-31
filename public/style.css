@@ -101,10 +101,20 @@ th { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing:
 .spend-tx-sum td { font-weight: 700; border-top: 2px solid #c3cfdb; }
 .spend-tx-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 10px; }
 .spend-tx-catwrap { position: relative; }
-.spend-tx-catpanel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 50; background: #fff; border: 1px solid #c9d2dc; border-radius: 10px; box-shadow: 0 10px 28px rgba(22, 34, 46, .18); padding: 10px; min-width: 210px; }
-.spend-tx-catpanel-actions { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+/* Category multi-select dropdown: the action row never wraps
+   (Select all / Select none / Done share one line and one
+   height), and each row's name sits left-aligned tight against
+   its checkbox. The checkbox needs width:auto + flex:none here:
+   the global input width:100% rule otherwise stretches it
+   inside the flex label and pushes the name to the panel's
+   right edge (the screenshot's right-aligned names). Panel
+   padding is the app-wide panel 16px. */
+.spend-tx-catpanel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 50; background: #fff; border: 1px solid #c9d2dc; border-radius: 10px; box-shadow: 0 10px 28px rgba(22, 34, 46, .18); padding: 16px; min-width: 210px; }
+.spend-tx-catpanel-actions { display: flex; gap: 6px; align-items: center; flex-wrap: nowrap; margin-bottom: 6px; }
 .spend-tx-catpanel-actions .spacer { flex: 1; }
-.spend-tx-catpanel label { display: flex; gap: 6px; align-items: center; padding: 3px 0; cursor: pointer; }
+.spend-tx-catpanel-actions button { white-space: nowrap; }
+.spend-tx-catpanel label { display: flex; gap: 6px; align-items: center; justify-content: flex-start; text-align: left; padding: 3px 0; cursor: pointer; }
+.spend-tx-catpanel label input[type="checkbox"] { width: auto; flex: none; margin: 0; padding: 0; }
 .spend-tx-controls .toolbar { margin: 0; }
 td.num, th.num { text-align: right; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
