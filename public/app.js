@@ -9774,6 +9774,30 @@ function spendGroupByCategory(tx) {
     .sort((a, b) => b.total - a.total);
 }
 
+// Clicking a history BAR selects that month in the page's range
+// picker (From = To = the bar's month). The preset clears to a
+// custom single-month range, and the existing applyInvestRange
+// path re-renders the share, the history and the table — the
+// table re-defaults to the range end, i.e. the clicked month.
+// Bars only: the click resolves with intersect:true, and a
+// dataset counts only if it is a bar dataset (the overall
+// chart's Total line dataset is not), so clicking the line or
+// empty space does nothing. Hover/tooltip behavior is untouched.
+function spendHistBarClick(level, chart, evt) {
+  const els = chart.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, false);
+  const bar = els.find((el) => {
+    const ds = chart.data.datasets[el.datasetIndex];
+    return ds && (ds.type === 'bar' || (ds.type === undefined && chart.config.type === 'bar'));
+  });
+  if (!bar) return;
+  const month = chart.data.labels[bar.index];
+  if (!month || !/^\d{4}-\d{2}$/.test(month)) return;
+  const span = investSpan(level);
+  if (!span) return;
+  investRanges[level].custom = clampRange({ start: month, end: month }, span);
+  applyInvestRange(level);
+}
+
 function drawSpendCharts(level, d, r) {
   const inR = (m) => !r || (m >= r.start && m <= r.end);
   const isDetail = level === 'spendCard';
@@ -9836,7 +9860,7 @@ function drawSpendCharts(level, d, r) {
       type: 'bar',
       data: { labels: months.map((m) => m.month), datasets: [{ label: 'Spending', data: months.map((m) => m.total), backgroundColor: '#1668c4' }] },
       plugins: [guideLinePlugin],
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } } },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => money(v) } } }, onClick: (evt, els, chart) => spendHistBarClick(level, chart, evt) },
     });
   } else if (!histEmpty) {
     const monthIdx = new Map(months.map((m, i) => [m.month, i]));
@@ -9860,7 +9884,7 @@ function drawSpendCharts(level, d, r) {
         ],
       },
       plugins: [guideLinePlugin],
-      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: (v) => money(v) } } }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } } },
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: (v) => money(v) } } }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }, onClick: (evt, els, chart) => spendHistBarClick(level, chart, evt) },
     });
   }
   if (isDetail) { spendDetailChart = hist; window.__fmCharts.spendCard = hist; }

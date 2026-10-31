@@ -13030,6 +13030,168 @@ try {
   r = await req('DELETE', `/api/spending/cards/${sumCardId}`);
   check('spending sum cleanup: card deleted', r.status === 200);
 
+  // History bar-click round: clicking a bar in the monthly
+  // history chart sets that page's range to From = To = the
+  // bar's month (a custom range — no preset stays active) and
+  // the share, the history and the transactions table update in
+  // sync, the table landing on the clicked month's page.
+  r = await req('POST', '/api/spending/cards', { name: 'Bar', issuer: 'CIBC', last4: '7002' });
+  check('spending bar-click setup: card created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const barCardId = r.data.id;
+  for (const [date, merchant, amount, category] of [
+    ['2026-10-10', 'BAR OCT', 70, 'Dining'],
+    ['2026-08-10', 'BAR AUG A', 40, 'Dining'],
+    ['2026-08-11', 'BAR AUG B', 25, 'Groceries'],
+  ]) {
+    r = await req('POST', `/api/spending/cards/${barCardId}/transactions`, { date, merchant, type: 'charge', amount, category });
+    check(`spending bar-click setup: ${merchant} row`, r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  }
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('spending bar-click browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardB = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResB = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueB = loginResB.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserB = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserB.newPage();
+      page.on('dialog', (d) => d.accept());
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardB({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueB, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitB = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      // Click a bar: resolve a non-zero bar segment's center in
+      // CSS pixels, scroll the canvas into view, click it.
+      const clickBar = async (chartKey, canvasSel, month) => {
+        const pos = await page.evaluate((ck, cs, mo) => {
+          const chart = window.__fmCharts[ck];
+          const canvas = document.querySelector(cs);
+          canvas.scrollIntoView();
+          const idx = chart.data.labels.indexOf(mo);
+          if (idx < 0) return null;
+          for (let d = 0; d < chart.data.datasets.length; d++) {
+            const ds = chart.data.datasets[d];
+            const isBar = ds.type === 'bar' || (ds.type === undefined && chart.config.type === 'bar');
+            if (!isBar) continue;
+            const el = chart.getDatasetMeta(d).data[idx];
+            if (!el) continue;
+            const p = el.getProps(['x', 'y', 'base'], true);
+            if (p.y === p.base) continue;
+            const r = canvas.getBoundingClientRect();
+            return { x: r.left + p.x, y: r.top + (p.y + p.base) / 2 };
+          }
+          return null;
+        }, chartKey, canvasSel, month);
+        if (!pos) return null;
+        await waitB(200);
+        await page.mouse.click(pos.x, pos.y);
+        await waitB(800);
+        return true;
+      };
+      const apiBar = (await req('GET', '/api/spending')).data;
+      const augTotal = Math.round((apiBar.transactions || [])
+        .filter((t) => String(t.date).slice(0, 7) === '2026-08')
+        .reduce((s, t) => s + (t.kind === 'adjustment' ? Number(t.amount) : -Number(t.amount)), 0) * 100) / 100;
+      await page.goto('http://ff.local/#spending', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitB(1200);
+      const clickedAug = await clickBar('spend', '#spendChart', '2026-08');
+      check('spending UI: the Aug bar resolves to a clickable segment', clickedAug === true, JSON.stringify({ clickedAug }));
+      const afterAug = await page.evaluate(() => {
+        const pager = document.querySelector('[data-spend-tx-pager="spending"]');
+        const share = window.__fmCharts.spendShare;
+        const hist = window.__fmCharts.spend;
+        const activePreset = document.querySelector('#invRangeBtns-spending button.active');
+        return {
+          from: document.querySelector('#invRangeStart-spending').textContent.trim(),
+          to: document.querySelector('#invRangeEnd-spending').textContent.trim(),
+          pager: pager ? pager.querySelector('span').textContent.trim() : null,
+          histLabels: hist ? [...hist.data.labels] : null,
+          shareSum: share ? Math.round(share.data.datasets[0].data.reduce((s, v) => s + v, 0) * 100) / 100 : null,
+          activePreset: activePreset ? activePreset.textContent.trim() : null,
+        };
+      });
+      check('spending UI: clicking a history bar selects that month everywhere in sync',
+        afterAug.from === 'Aug 2026' && afterAug.to === 'Aug 2026' && afterAug.pager === 'Aug 2026'
+          && JSON.stringify(afterAug.histLabels) === JSON.stringify(['2026-08'])
+          && Math.abs(afterAug.shareSum - augTotal) < 0.005 && afterAug.activePreset === null,
+        JSON.stringify({ ...afterAug, augTotal }));
+      // Clicking empty plot space above the bars changes nothing.
+      await page.evaluate(() => {
+        const chart = window.__fmCharts.spend;
+        const canvas = document.querySelector('#spendChart');
+        canvas.scrollIntoView();
+        const area = chart.chartArea;
+        const r = canvas.getBoundingClientRect();
+        return { x: r.left + area.left + 5, y: r.top + area.top + 5 };
+      }).then(async (pt) => { await waitB(200); await page.mouse.click(pt.x, pt.y); await waitB(600); });
+      const afterEmpty = await page.evaluate(() => ({
+        from: document.querySelector('#invRangeStart-spending').textContent.trim(),
+        to: document.querySelector('#invRangeEnd-spending').textContent.trim(),
+      }));
+      check('spending UI: clicking empty chart space leaves the range alone',
+        afterEmpty.from === 'Aug 2026' && afterEmpty.to === 'Aug 2026', JSON.stringify(afterEmpty));
+      // Detail chart: the same mechanism on the card's own page.
+      await page.goto(`http://ff.local/#spending/card/${barCardId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitB(1200);
+      const clickedOct = await clickBar('spendCard', '#spendDetailChart', '2026-10');
+      check('spending UI: the detail Oct bar resolves to a clickable segment', clickedOct === true, JSON.stringify({ clickedOct }));
+      const afterDet = await page.evaluate(() => {
+        const pager = document.querySelector('[data-spend-tx-pager="spendCard"]');
+        const hist = window.__fmCharts.spendCard;
+        return {
+          from: document.querySelector('#invRangeStart-spendCard').textContent.trim(),
+          to: document.querySelector('#invRangeEnd-spendCard').textContent.trim(),
+          pager: pager ? pager.querySelector('span').textContent.trim() : null,
+          histLabels: hist ? [...hist.data.labels] : null,
+        };
+      });
+      check('spending UI: clicking a detail history bar selects that month on the card page',
+        afterDet.from === 'Oct 2026' && afterDet.to === 'Oct 2026' && afterDet.pager === 'Oct 2026'
+          && JSON.stringify(afterDet.histLabels) === JSON.stringify(['2026-10']),
+        JSON.stringify(afterDet));
+    } finally { await browserB.close(); }
+  }
+  r = await req('DELETE', `/api/spending/cards/${barCardId}`);
+  check('spending bar-click cleanup: card deleted', r.status === 200);
+
   // UI unification round: the whole Spending section uses the
   // property/Stocks visual language — standard section-head
   // padding (overall + card detail), share-left chart row
