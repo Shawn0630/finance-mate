@@ -9,7 +9,7 @@ const src = fs.readFileSync(new URL('../public/rent-income.js', import.meta.url)
 const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox);
-const { rentMonthlySeries, rentRangeShare, rentHistoryData, rentEntryMonths } = sandbox;
+const { rentMonthlySeries, rentRangeShare, rentEntryMonths, rentAnnualYears, rentAnnualEmpty } = sandbox;
 // Arrays built inside the vm context carry that realm's
 // Array.prototype, which deepStrictEqual rejects against host
 // arrays — normalize through JSON before asserting.
@@ -82,17 +82,6 @@ test('rentRangeShare: zero-income rentals get no slice', () => {
   assert.deepEqual(plain(rentRangeShare(s, { start: '2025-01', end: '2025-12' }, new Set()).rows), []);
 });
 
-test('rentHistoryData: months zero-filled, totals visible-only', () => {
-  const s = rentMonthlySeries(rentals, '2026-10');
-  const h = rentHistoryData(s, { start: '2025-01', end: '2025-03' }, new Set([2]));
-  assert.deepEqual(plain(h.months), ['2025-01', '2025-02', '2025-03']);
-  const b = h.perRental.find((p) => p.rental.id === 2);
-  assert.deepEqual(plain(b.values), [3000, 3000, 3000]);
-  assert.equal(b.hidden, true);
-  // Totals exclude hidden B: Jan 1000 (A only), Mar 1000 + 1500 (A + C).
-  assert.deepEqual(plain(h.totals), [1000, 1000, 2500]);
-});
-
 test('rentRangeShare ignores non-entry fields: year-record other income never enters', () => {
   const s = rentMonthlySeries(
     [{ id: 7, label: 'D', entries: [{ start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 1000 }],
@@ -101,4 +90,24 @@ test('rentRangeShare ignores non-entry fields: year-record other income never en
   const r = rentRangeShare(s, { start: '2025-01', end: '2025-12' }, new Set());
   assert.deepEqual(plain(r.rows.map((x) => [x.rental.label, x.value])), [['D', 12000]]);
   assert.equal(r.total, 12000);
+});
+
+test('rentAnnualYears: All or no range shows every year; a range shows only its years', () => {
+  assert.deepEqual(plain(rentAnnualYears([2024, 2025, 2026], null, true)), [2024, 2025, 2026]);
+  assert.deepEqual(plain(rentAnnualYears([2024, 2025, 2026], null, false)), [2024, 2025, 2026]);
+  assert.deepEqual(plain(rentAnnualYears([2024, 2025, 2026], { start: '2025-12', end: '2026-11' }, true)), [2024, 2025, 2026]);
+  // A 1-year preset spanning December/January legitimately shows two tax years.
+  assert.deepEqual(plain(rentAnnualYears([2024, 2025, 2026], { start: '2025-12', end: '2026-11' }, false)), [2025, 2026]);
+  assert.deepEqual(plain(rentAnnualYears([2024, 2025, 2026], { start: '2025-03', end: '2025-10' }, false)), [2025]);
+  assert.deepEqual(plain(rentAnnualYears([2024, 2025, 2026], { start: '2023-01', end: '2023-12' }, false)), []);
+});
+
+test('rentAnnualEmpty: empty only when no filtered year has a year record', () => {
+  const byYear = { 2025: { gross: 12000 }, 2026: { gross: 24000 } };
+  assert.equal(rentAnnualEmpty(byYear, [2025, 2026]), false);
+  assert.equal(rentAnnualEmpty(byYear, [2024]), true);
+  assert.equal(rentAnnualEmpty(byYear, []), true);
+  assert.equal(rentAnnualEmpty(null, [2025]), true);
+  // Job-only years in the shared list must not keep a record-less chart alive.
+  assert.equal(rentAnnualEmpty({}, [2026]), true);
 });

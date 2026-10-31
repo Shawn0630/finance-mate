@@ -4978,9 +4978,12 @@ const INVEST_LEVEL_CONF = {
     canvas: '#overviewChart', key: 'overview', monthly: null,
     get: () => overviewChart, set: (c) => { overviewChart = c; window.__fmCharts.overview = c; },
   },
+  // The combined Total income panel's chart is the annual chart
+  // (the monthly history chart was removed by the restructure), so
+  // the generic destroy in applyInvestRange targets it.
   rentIncome: {
-    canvas: '#rentIncomeChart', key: 'rentIncome', monthly: null,
-    get: () => rentIncomeChart, set: (c) => { rentIncomeChart = c; window.__fmCharts.rentIncome = c; },
+    canvas: '#earnRentalsChart', key: 'rentIncome', monthly: null,
+    get: () => earnRentalsChart, set: (c) => { earnRentalsChart = c; window.__fmCharts.earnRentals = c; },
   },
   spending: {
     canvas: '#spendChart', key: 'spending', monthly: null,
@@ -5371,11 +5374,16 @@ function applyInvestRange(level) {
   const old = conf.get();
   if (old) old.destroy();
   if (level === 'rentIncome') {
-    // The Rentals income panel draws its own two charts from the
-    // range-filtered entry income; the share draw reports empty
-    // (no income in range) by hiding both chart wraps.
-    if (drawRentIncomeShareChart(d, r)) conf.set(drawRentIncomeHistoryChart($(conf.canvas), d, r));
-    else { rentIncomeChart = null; window.__fmCharts.rentIncome = null; }
+    // The combined Total income panel: the share (flow semantics)
+    // plus the annual chart, both from the same range. The generic
+    // destroy above already destroyed the old annual chart
+    // instance, so null the variable first — drawEarnRentalsChart's
+    // own destroy-guard must not double-destroy it. An empty share
+    // hides only the share; the annual chart's visibility follows
+    // its own empty rule. The monthly history chart is gone.
+    drawRentIncomeShareChart(d, r);
+    earnRentalsChart = null; window.__fmCharts.earnRentals = null; window.__fmCharts.rentIncome = null;
+    conf.set(drawEarnRentalsChart());
   } else if (level === 'spending' || level === 'spendCard') {
     // Spending draws its own two charts from the range-filtered
     // monthly rows and transactions: the share doughnut covers
@@ -8582,8 +8590,9 @@ let earnOverviewChart = null;
 let earnRentalsChart = null;
 let earnRentalsView = 'net';
 const earnChartRanges = {
+  // Overview only now: the rentals summary is driven by the shared
+  // invest-range picker (level 'rentIncome'), not by this state.
   overview: { years: 0, from: null, to: null, fromYm: null, toYm: null },
-  rentals: { years: 0, from: null, to: null, fromYm: null, toYm: null },
 };
 
 function earnRangeControlsHtml(key) {
@@ -8682,13 +8691,33 @@ function drawEarnOverviewChart() {
   window.__fmCharts.earnOverview = earnOverviewChart;
 }
 
+// The combined Total income panel's RIGHT chart: the annual chart
+// with its Net by property / Income vs expenses toggle, now driven
+// by the SAME invest-range picker as the share (level 'rentIncome'),
+// not by its own year picker. Years come from the shared years list
+// filtered to the picker's effective month range; All (or no range)
+// shows every year, preserving the old default view. A 1-year
+// preset can span two tax years — that is inherent to sharing a
+// month picker, not a bug.
+// Bars = the breakdown; the line = the total, in both modes: net
+// mode's line is 'Total net' (sum of the per-rental bars), income
+// mode's line is 'Net' (gross minus expenses — the stack sum would
+// double-count). The line dataset carries no key, so the Colors
+// panel ignores it; legend clicks recompute it from the VISIBLE
+// bar series only, so it can never disagree with the bars.
+// The monthly history chart this panel used to carry is gone: the
+// combined panel has exactly one chart. Eye-hide affects the share
+// only, never this chart (its own legend toggles are its
+// mechanism).
 function drawEarnRentalsChart() {
-  const years = earnEffectiveYears('rentals');
+  const st = investRanges.rentIncome;
+  const years = rentAnnualYears((earnChartData && earnChartData.years) || [],
+    investEffectiveRange('rentIncome'), !st.custom && !st.months);
   if (earnRentalsChart) { earnRentalsChart.destroy(); earnRentalsChart = null; window.__fmCharts.earnRentals = null; }
-  const empty = !earnChartData || !years.length || !earnChartData.properties.length;
+  const r = earnChartData && earnChartData.rentals;
+  const empty = rentAnnualEmpty(r, years);
   earnSetEmpty('earnRentalsChart', 'earnRentalsEmpty', empty);
-  if (empty) return;
-  const r = earnChartData.rentals;
+  if (empty) return null;
   const ds = (key, values, stack) => {
     const def = seriesDefFor('earnRentals', key);
     const c = seriesColors('earnRentals', def);
@@ -8708,10 +8737,42 @@ function drawEarnRentalsChart() {
     datasets = earnChartData.properties.map((p) => ds(`rental:${p.id}`,
       years.map((y) => (r[y] && r[y].properties && r[y].properties[p.id] ? r[y].properties[p.id].net : 0))));
   }
+  // Total line, drawn on top of the bars (order beats the bars'
+  // default 0). No key: the Colors panel must not offer it.
+  const lineData = earnRentalsView === 'income'
+    ? years.map((y) => Math.round((((r[y] && r[y].gross) || 0) - ((r[y] && r[y].expenses) || 0)) * 100) / 100)
+    : years.map((y) => Math.round(earnChartData.properties.reduce((s, p) => s + ((r[y] && r[y].properties && r[y].properties[p.id] ? r[y].properties[p.id].net : 0)), 0) * 100) / 100);
+  datasets.push({ type: 'line', label: earnRentalsView === 'income' ? 'Net' : 'Total net', data: lineData, borderColor: '#22303c', backgroundColor: '#22303c', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 });
   const base = earnChartBase();
   if (earnRentalsView === 'income') { base.options.scales.x.stacked = true; base.options.scales.y.stacked = true; }
+  base.options.plugins.legend.onClick = earnRentalsLegendClick;
   earnRentalsChart = new Chart($('#earnRentalsChart'), { type: 'bar', data: { labels: years.map(String), datasets }, ...base });
   window.__fmCharts.earnRentals = earnRentalsChart;
+  return earnRentalsChart;
+}
+
+// Legend clicks toggle a series AND recompute the total line from
+// the visible bar series only, so the line can never disagree with
+// the bars on screen. Income mode: visible gross minus visible
+// expenses; net mode: sum of the visible per-rental bars.
+function earnRentalsLegendClick(e, item, legend) {
+  const chart = legend.chart;
+  const idx = item.datasetIndex;
+  chart.setDatasetVisibility(idx, !chart.isDatasetVisible(idx));
+  const line = chart.data.datasets.find((d) => d.type === 'line');
+  if (line) {
+    line.data = chart.data.labels.map((_, i) => {
+      let t = 0;
+      chart.data.datasets.forEach((d, j) => {
+        if (d.type === 'line' || !chart.isDatasetVisible(j)) return;
+        const v = Number(d.data[i]) || 0;
+        if (earnRentalsView === 'income') t += (d.key === 'gross' ? v : d.key === 'expenses' ? -v : 0);
+        else t += v;
+      });
+      return Math.round(t * 100) / 100;
+    });
+  }
+  chart.update();
 }
 
 function drawEarnVisibleChart() {
@@ -8724,9 +8785,9 @@ function drawEarnVisibleChart() {
     earnWireRange('overview');
     drawEarnOverviewChart();
   } else if (sub === 'rentals') {
-    $('#earnRentalsRange').innerHTML = earnRangeControlsHtml('rentals');
-    earnWireRange('rentals');
-    drawEarnRentalsChart();
+    // The Rentals summary is ONE combined panel: the rentIncome
+    // picker drives both the share and the annual chart, so there
+    // is no separate earn-range picker for rentals anymore.
     drawRentIncomePanel();
   }
 }
@@ -8735,16 +8796,16 @@ function drawEarnVisibleChart() {
 // Total income over the selected range, from rent entries only: LEFT
 // share doughnut (one slice per rental, share of range income —
 // income is a flow, so this is deliberately NOT the Stocks
-// range-end point-in-time share) + RIGHT monthly history (stacked
-// bars per rental + total line), driven by the Stocks range picker
-// (same presets + month popover machinery, level 'rentIncome').
-// Year-record other income (8230), expenses and the T776
-// computation never enter this panel. Per-rental Hide mirrors
-// Stocks exactly: the same open/closed eye-pair button at the
-// card's top-right corner, one per-visit hidden set shared with
-// both charts' legends, card greys out. Hide affects this panel
-// only — never entries, years or tax calcs.
-let rentIncomeChart = null;
+// range-end point-in-time share) + RIGHT annual chart (bars =
+// breakdown, line = total, Net by property / Income vs expenses
+// toggle), both driven by the Stocks range picker (same presets +
+// month popover machinery, level 'rentIncome'). Year-record other
+// income (8230), expenses and the T776 computation never enter the
+// share. Per-rental Hide mirrors Stocks exactly: the same
+// open/closed eye-pair button at the card's top-right corner, one
+// per-visit hidden set shared with the share legend, card greys out.
+// Hide affects the share only — never the annual chart, entries,
+// years or tax calcs.
 let rentIncomeShareChart = null;
 let rentIncomeShareRentals = []; // rentals in doughnut order
 let rentIncomeShareCenter = null; // { total } for the center plugin
@@ -8788,19 +8849,19 @@ function drawRentIncomeShareChart(d, r) {
   if (title) title.textContent = r ? `Income share · ${formatYM(r.start)} – ${formatYM(r.end)}` : 'Income share';
   const empty = $('#rentIncomeShareEmpty');
   const wrap = $('#rentIncomeShareWrap');
-  const mainWrap = $('#rentIncomeMainWrap');
+  // The annual chart column's visibility is governed by the annual
+  // chart's own empty rule, never by the share's: an empty share no
+  // longer hides the chart (the old code hid both wraps).
   if (!rows.length) {
     if (rentIncomeShareChart) { rentIncomeShareChart.destroy(); rentIncomeShareChart = null; }
     rentIncomeShareCenter = null;
     window.__fmCharts.rentIncomeShare = null;
     window.__fmCharts.rentIncomeShareCenter = null;
     if (wrap) wrap.classList.add('hidden');
-    if (mainWrap) mainWrap.classList.add('hidden');
     if (empty) empty.classList.remove('hidden');
     return false;
   }
   if (wrap) wrap.classList.remove('hidden');
-  if (mainWrap) mainWrap.classList.remove('hidden');
   if (empty) empty.classList.add('hidden');
   rentIncomeShareCenter = { total: visibleTotal };
   if (rentIncomeShareChart) rentIncomeShareChart.destroy();
@@ -8845,51 +8906,6 @@ function drawRentIncomeShareChart(d, r) {
   return true;
 }
 
-function drawRentIncomeHistoryChart(canvas, d, r) {
-  if (!canvas) return null;
-  const hist = rentHistoryData(d.rentSeries, r, rentHiddenRentals);
-  const bars = hist.perRental.map((p) => ({
-    type: 'bar', label: p.rental.label, rentalId: p.rental.id, data: p.values,
-    backgroundColor: rentRentalColor(p.rental), stack: 'income', order: 3, maxBarThickness: 28,
-  }));
-  const chart = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels: hist.months,
-      datasets: [
-        ...bars,
-        { label: 'Total (CAD)', data: hist.totals, borderColor: '#22303c', backgroundColor: '#22303c', tension: 0.15, pointRadius: 0, borderWidth: 2, order: 1 },
-      ],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: moneyTick } } },
-      plugins: {
-        legend: { position: 'bottom', labels: { boxWidth: 12 }, onClick: rentLegendClick },
-        tooltip: {
-          callbacks: {
-            label: (c) => {
-              const ds = c.dataset;
-              if (ds.rentalId != null) {
-                const total = c.chart.data.datasets.reduce((s, dd, i) => s + (dd.rentalId != null && c.chart.isDatasetVisible(i) ? (dd.data[c.dataIndex] || 0) : 0), 0);
-                const pct = total ? ((c.parsed.y / total) * 100).toFixed(1) : '0.0';
-                return `${ds.label}: ${moneyC(c.parsed.y, 'CAD')} (${pct}%)`;
-              }
-              return `${c.dataset.label}: ${moneyC(c.parsed.y, 'CAD')}`;
-            },
-          },
-        },
-      },
-    },
-    plugins: [guideLinePlugin],
-  });
-  bars.forEach((ds, i) => { if (rentHiddenRentals.has(ds.rentalId)) chart.setDatasetVisibility(i, false); });
-  chart.update();
-  window.__fmCharts.rentIncome = chart;
-  return chart;
-}
-
 function toggleRentRental(id) {
   if (rentHiddenRentals.has(id)) rentHiddenRentals.delete(id);
   else rentHiddenRentals.add(id);
@@ -8913,14 +8929,6 @@ function syncRentHideCards() {
     const card = btn.closest('.rent-card');
     if (card) card.classList.toggle('rent-hidden-card', hidden);
   });
-}
-
-function rentLegendClick(e, item, legend) {
-  const chart = legend.chart;
-  const ds = chart.data.datasets[item.datasetIndex];
-  if (ds && ds.rentalId != null) { toggleRentRental(ds.rentalId); return; }
-  chart.setDatasetVisibility(item.datasetIndex, !chart.isDatasetVisible(item.datasetIndex));
-  chart.update();
 }
 
 function buildRentIncomeView(rentals) {

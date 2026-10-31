@@ -11838,19 +11838,38 @@ try {
       await waitE(800);
       const rentInfo = await page.evaluate(() => {
         const c = window.__fmCharts.earnRentals;
-        return c ? { labels: c.data.labels, keys: c.data.datasets.map((d) => d.key) } : null;
+        if (!c) return null;
+        const line = c.data.datasets.find((d) => d.type === 'line');
+        return {
+          labels: c.data.labels, keys: c.data.datasets.map((d) => d.key),
+          bars: c.data.datasets.filter((d) => d.type !== 'line').map((d) => d.data),
+          line: line ? { label: line.label, data: line.data } : null,
+        };
       });
-      check('earnings charts: rentals chart shows the property net series',
-        rentInfo && rentInfo.labels.includes('2026') && rentInfo.keys.some((k) => k.startsWith('rental:')),
+      const rentLineOk = rentInfo && rentInfo.line && rentInfo.line.label === 'Total net'
+        && rentInfo.line.data.every((v, i) => Math.abs(v - rentInfo.bars.reduce((s, arr) => s + (arr[i] || 0), 0)) < 0.011);
+      check('earnings charts: rentals chart shows the property net series + Total net line',
+        rentInfo && rentInfo.labels.includes('2026') && rentInfo.keys.some((k) => k.startsWith('rental:')) && rentLineOk,
         JSON.stringify(rentInfo));
       await page.click('#earnRentalsViewBtns [data-view="income"]');
       await waitE(500);
       const rentIncomeInfo = await page.evaluate(() => {
         const c = window.__fmCharts.earnRentals;
-        return c ? c.data.datasets.map((d) => d.key) : null;
+        if (!c) return null;
+        const line = c.data.datasets.find((d) => d.type === 'line');
+        const bars = c.data.datasets.filter((d) => d.type !== 'line');
+        return {
+          keys: c.data.datasets.map((d) => d.key),
+          gross: bars.find((d) => d.key === 'gross') ? bars.find((d) => d.key === 'gross').data : null,
+          expenses: bars.find((d) => d.key === 'expenses') ? bars.find((d) => d.key === 'expenses').data : null,
+          line: line ? { label: line.label, data: line.data } : null,
+        };
       });
-      check('earnings charts: income vs expenses view swaps in gross + expenses series',
-        rentIncomeInfo && rentIncomeInfo.includes('gross') && rentIncomeInfo.includes('expenses'),
+      const rentIncomeLineOk = rentIncomeInfo && rentIncomeInfo.line && rentIncomeInfo.line.label === 'Net'
+        && rentIncomeInfo.gross && rentIncomeInfo.expenses
+        && rentIncomeInfo.line.data.every((v, i) => Math.abs(v - Math.round((rentIncomeInfo.gross[i] - rentIncomeInfo.expenses[i]) * 100) / 100) < 0.011);
+      check('earnings charts: income vs expenses view swaps in gross + expenses series + Net line',
+        rentIncomeInfo && rentIncomeInfo.keys.includes('gross') && rentIncomeInfo.keys.includes('expenses') && rentIncomeLineOk,
         JSON.stringify(rentIncomeInfo));
 
       // Rent entries UI: the rental card lists the entry (tenant as a
@@ -12413,43 +12432,61 @@ try {
       const expectedAll = {};
       let expectedCenter = 0;
       for (const rt of earnAll.rentals) { expectedAll[rt.label] = rentalTotal(rt); expectedCenter += expectedAll[rt.label]; }
-      const mar2025 = earnAll.rentals.reduce((s, rt) => s + (rt.entries || []).reduce((t, e) =>
-        t + (entryMonths(e).includes('2025-03') ? e.monthly_rent : 0), 0), 0);
       await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(500);
       await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
+      // Normalize: an earlier chart pin leaves the toggle on income;
+      // this block's annual checks assume net mode.
+      await page.click('#earnRentalsViewBtns [data-view="net"]');
+      await waitE(500);
       const panelPlace = await page.evaluate(() => {
         const panel = document.querySelector('#rentIncomePanel');
         const list = document.querySelector('#earnRentalList');
-        const oldChart = document.querySelector('#earnRentalsChart');
+        const chart = document.querySelector('#earnRentalsChart');
         const row = panel && panel.querySelector('.invest-charts-row');
         const shareFirst = row && (row.children[0].querySelector('#rentIncomeShareChart') ? true : false);
+        const chartSecond = row && row.children.length > 1 && !!row.children[1].querySelector('#earnRentalsChart');
+        const toggle = document.querySelector('#earnRentalsViewBtns');
+        const shareEmpty = document.querySelector('#rentIncomeShareEmpty');
+        const annualEmpty = document.querySelector('#earnRentalsEmpty');
         return {
           panel: !!panel,
           beforeList: !!(panel && list && (panel.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING)),
-          beforeOldChart: !!(panel && oldChart && (panel.compareDocumentPosition(oldChart) & Node.DOCUMENT_POSITION_FOLLOWING)),
+          chartInsidePanel: !!(panel && chart && panel.contains(chart)),
+          toggleInsidePanel: !!(panel && toggle && panel.contains(toggle)),
+          onePresetRow: document.querySelectorAll('#invRangeBtns-rentIncome').length === 1,
+          noSecondPicker: !document.querySelector('#earnRentalsRange') && !document.querySelector('[data-earn-range="rentals"]'),
           shareLeft: !!shareFirst,
+          chartRight: !!chartSecond,
           rangeBtns: !!document.querySelector('#invRangeBtns-rentIncome'),
+          shareEmptyText: shareEmpty ? shareEmpty.textContent : null,
+          annualEmptyText: annualEmpty ? annualEmpty.textContent : null,
+          annualEmptyHidden: annualEmpty ? annualEmpty.classList.contains('hidden') : null,
         };
       });
-      check('rental income panel: sits at the top of the section, share-left layout, own range picker',
-        panelPlace.panel && panelPlace.beforeList && panelPlace.beforeOldChart && panelPlace.shareLeft && panelPlace.rangeBtns,
+      check('rental income panel: ONE combined panel — share left, annual chart right, one preset row, no second picker',
+        panelPlace.panel && panelPlace.beforeList && panelPlace.chartInsidePanel && panelPlace.toggleInsidePanel
+          && panelPlace.onePresetRow && panelPlace.noSecondPicker && panelPlace.shareLeft && panelPlace.chartRight
+          && panelPlace.rangeBtns && panelPlace.shareEmptyText === 'No rental income in this range yet.'
+          && panelPlace.annualEmptyText === 'No rental year records yet.' && panelPlace.annualEmptyHidden === true,
         JSON.stringify(panelPlace));
+      const chartsApi = await req('GET', '/api/earnings/charts');
+      const apiYears = chartsApi.data.years.map(String);
       const shareAll = await page.evaluate(() => {
         const c = window.__fmCharts.rentIncomeShare;
-        const h = window.__fmCharts.rentIncome;
-        if (!c || !h) return null;
+        const a = window.__fmCharts.earnRentals;
+        if (!c || !a) return null;
         const byLabel = {};
         c.data.labels.forEach((l, i) => { byLabel[l] = c.data.datasets[0].data[i]; });
-        const totalDs = h.data.datasets.find((d) => d.label === 'Total (CAD)');
-        const marIdx = h.data.labels.indexOf('2025-03');
+        const line = a.data.datasets.find((d) => d.type === 'line');
         return {
           labels: c.data.labels, byLabel,
           center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
           hoverOffset: c.data.datasets[0].hoverOffset,
-          guideLine: (h.config.plugins || []).some((p) => p && p.id === 'guideLine'),
-          marTotal: totalDs && marIdx >= 0 ? totalDs.data[marIdx] : null,
+          annualLabels: a.data.labels,
+          annualBars: a.data.datasets.filter((d) => d.type !== 'line').map((d) => ({ key: d.key, data: d.data })),
+          annualLine: line ? { label: line.label, data: line.data } : null,
         };
       });
       check('rental income panel: share slices are range totals from entries only (Chart A 12000, Chart B 18000)',
@@ -12458,10 +12495,22 @@ try {
       check('rental income panel: center total is entries-only (excludes the 5000 other income)',
         shareAll && shareAll.center === expectedCenter,
         JSON.stringify({ center: shareAll && shareAll.center, expected: expectedCenter }));
-      check('rental income panel: doughnut pops on hover + history has the guide line',
-        shareAll && shareAll.hoverOffset === 10 && shareAll.guideLine === true, JSON.stringify(shareAll));
-      check('rental income panel: history total line matches March 2025 entries',
-        shareAll && shareAll.marTotal === mar2025, JSON.stringify({ marTotal: shareAll && shareAll.marTotal, expected: mar2025 }));
+      check('rental income panel: doughnut pops on hover',
+        shareAll && shareAll.hoverOffset === 10, JSON.stringify(shareAll && shareAll.hoverOffset));
+      const idx2025 = shareAll ? shareAll.annualLabels.indexOf('2025') : -1;
+      const annualBarsOk = shareAll && idx2025 >= 0
+        && shareAll.annualBars.every((b) => b.key && b.key.startsWith('rental:'))
+        && chartsApi.data.properties.every((p) => {
+          const b = shareAll.annualBars.find((x) => x.key === `rental:${p.id}`);
+          const rec = chartsApi.data.rentals['2025'] && chartsApi.data.rentals['2025'].properties
+            ? chartsApi.data.rentals['2025'].properties[p.id] : null;
+          return b && b.data[idx2025] === (rec ? rec.net : 0);
+        });
+      const annualLineOk = shareAll && shareAll.annualLine && shareAll.annualLine.label === 'Total net'
+        && shareAll.annualLine.data.every((v, i) => Math.abs(v - shareAll.annualBars.reduce((s, b) => s + (b.data[i] || 0), 0)) < 0.011);
+      check('rental income panel: annual chart (net mode) shows per-rental bars + Total net line matching the API',
+        shareAll && JSON.stringify(shareAll.annualLabels) === JSON.stringify(apiYears) && annualBarsOk && annualLineOk,
+        JSON.stringify({ labels: shareAll && shareAll.annualLabels, apiYears, bars: shareAll && shareAll.annualBars, line: shareAll && shareAll.annualLine }));
       // Range change: 1 year = last 12 months of the span. Chart A
       // and Chart B (both 2025-only) must drop out of the share.
       await page.click('#invRangeBtns-rentIncome button[data-months="12"]');
@@ -12472,29 +12521,106 @@ try {
       for (const rt of earnAll.rentals) { expectedWin[rt.label] = rentalTotal(rt, winStart, span.end); expectedWinCenter += expectedWin[rt.label]; }
       const shareWin = await page.evaluate(() => {
         const c = window.__fmCharts.rentIncomeShare;
+        const a = window.__fmCharts.earnRentals;
         if (!c) return null;
         const byLabel = {};
         c.data.labels.forEach((l, i) => { byLabel[l] = c.data.datasets[0].data[i]; });
         return {
           labels: c.data.labels, byLabel,
           center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
-          fromLabel: document.querySelector('#invRangeStart-rentIncome') ? document.querySelector('#invRangeStart-rentIncome').textContent : null,
-          toLabel: document.querySelector('#invRangeEnd-rentIncome') ? document.querySelector('#invRangeEnd-rentIncome').textContent : null,
+          fromVal: document.querySelector('#invRangeStart-rentIncome') ? document.querySelector('#invRangeStart-rentIncome').dataset.value : null,
+          toVal: document.querySelector('#invRangeEnd-rentIncome') ? document.querySelector('#invRangeEnd-rentIncome').dataset.value : null,
+          annualLabels: a ? a.data.labels : null,
         };
       });
       check('rental income panel: 1-year range drops 2025-only rentals and recomputes the center',
         shareWin && !('Chart A' in shareWin.byLabel) && !('Chart B' in shareWin.byLabel)
           && shareWin.center === expectedWinCenter,
         JSON.stringify({ labels: shareWin && shareWin.labels, center: shareWin && shareWin.center, expected: expectedWinCenter }));
+      const winYears = shareWin ? chartsApi.data.years.filter((y) => y >= Number(shareWin.fromVal.slice(0, 4)) && y <= Number(shareWin.toVal.slice(0, 4))).map(String) : [];
+      check('rental income panel: 1-year range drives the annual chart years too',
+        shareWin && JSON.stringify(shareWin.annualLabels) === JSON.stringify(winYears),
+        JSON.stringify({ annual: shareWin && shareWin.annualLabels, expected: winYears, from: shareWin && shareWin.fromVal, to: shareWin && shareWin.toVal }));
       await page.click('#invRangeBtns-rentIncome button[data-months="0"]');
       await waitE(600);
       const backAll = await page.evaluate(() => {
         const c = window.__fmCharts.rentIncomeShare;
-        return c ? c.data.labels.includes('Chart A') : false;
+        const a = window.__fmCharts.earnRentals;
+        return { share: c ? c.data.labels.includes('Chart A') : false, annual: a ? a.data.labels : null };
       });
-      check('rental income panel: All range restores the 2025 rentals', backAll === true, JSON.stringify(backAll));
+      check('rental income panel: All range restores the 2025 rentals + all annual years',
+        backAll.share === true && JSON.stringify(backAll.annual) === JSON.stringify(apiYears), JSON.stringify(backAll));
+      // Toggle: Income vs expenses swaps in gross + expenses bars
+      // with a Net line (gross minus expenses) from the same range.
+      await page.click('#earnRentalsViewBtns [data-view="income"]');
+      await waitE(500);
+      const incomeView = await page.evaluate(() => {
+        const a = window.__fmCharts.earnRentals;
+        if (!a) return null;
+        const line = a.data.datasets.find((d) => d.type === 'line');
+        return {
+          labels: a.data.labels,
+          bars: a.data.datasets.filter((d) => d.type !== 'line').map((d) => ({ key: d.key, data: d.data })),
+          line: line ? { label: line.label, data: line.data } : null,
+        };
+      });
+      const incomeOk = incomeView && incomeView.bars.some((b) => b.key === 'gross') && incomeView.bars.some((b) => b.key === 'expenses')
+        && incomeView.line && incomeView.line.label === 'Net'
+        && incomeView.labels.every((y, i) => {
+          const rec = chartsApi.data.rentals[y] || {};
+          const g = incomeView.bars.find((b) => b.key === 'gross').data[i] || 0;
+          const e = incomeView.bars.find((b) => b.key === 'expenses').data[i] || 0;
+          return g === (rec.gross || 0) && e === (rec.expenses || 0)
+            && Math.abs(incomeView.line.data[i] - Math.round((g - e) * 100) / 100) < 0.011;
+        });
+      check('rental income panel: Income vs expenses shows gross + expenses bars + Net line matching the API',
+        incomeOk, JSON.stringify(incomeView));
+      // Back to net mode for the legend pin below.
+      await page.click('#earnRentalsViewBtns [data-view="net"]');
+      await waitE(500);
+      // Legend click on a rental bar toggles it AND recomputes the
+      // Total net line from the visible bars only.
+      const beforeLegend = await page.evaluate(() => {
+        const a = window.__fmCharts.earnRentals;
+        const line = a.data.datasets.find((d) => d.type === 'line');
+        return { labels: a.data.labels, line: line ? line.data : null };
+      });
+      const idxA = beforeLegend.labels.indexOf('2025');
+      const chartANet2025 = (chartsApi.data.rentals['2025'] && chartsApi.data.rentals['2025'].properties
+        && chartsApi.data.rentals['2025'].properties[chartAId])
+        ? chartsApi.data.rentals['2025'].properties[chartAId].net : 0;
+      const clickAnnualLegend = async (key) => {
+        await page.evaluate((k) => {
+          const a = window.__fmCharts.earnRentals;
+          const i = a.data.datasets.findIndex((d) => d.key === k);
+          const b = a.legend.legendHitBoxes[i];
+          const r = a.canvas.getBoundingClientRect();
+          a.canvas.dispatchEvent(new MouseEvent('click', {
+            bubbles: true, cancelable: true,
+            clientX: r.left + b.left + b.width / 2, clientY: r.top + b.top + b.height / 2,
+          }));
+        }, key);
+        await waitE(500);
+      };
+      await clickAnnualLegend(`rental:${chartAId}`);
+      const afterLegend = await page.evaluate(() => {
+        const a = window.__fmCharts.earnRentals;
+        const line = a.data.datasets.find((d) => d.type === 'line');
+        return { line: line ? line.data : null };
+      });
+      check('rental income panel: legend toggle drops the rental from the Total net line',
+        idxA >= 0 && afterLegend.line && Math.abs(afterLegend.line[idxA] - (beforeLegend.line[idxA] - chartANet2025)) < 0.011,
+        JSON.stringify({ before: beforeLegend.line, after: afterLegend.line, chartANet2025 }));
+      // Restore it for the eye pins below.
+      await clickAnnualLegend(`rental:${chartAId}`);
+      // Annual chart snapshot before hiding: eye-hide must not move it.
+      const annualBeforeHide = await page.evaluate(() => {
+        const a = window.__fmCharts.earnRentals;
+        return a ? { labels: a.data.labels, sets: a.data.datasets.map((d) => ({ key: d.key || null, label: d.label, data: d.data })) } : null;
+      });
       // Eye hide: Chart A's card greys, its slice flips off, the
-      // center total and the March history total drop by its income.
+      // center total drops by its income — but the annual chart
+      // never moves (eye-hide affects the share only).
       await page.evaluate(() => {
         const card = [...document.querySelectorAll('#earnRentalList .rent-card')].find((p) => p.textContent.includes('Chart A'));
         const btn = card && card.querySelector('.rent-hide-btn');
@@ -12505,10 +12631,8 @@ try {
         const card = [...document.querySelectorAll('#earnRentalList .rent-card')].find((p) => p.textContent.includes('Chart A'));
         const btn = card && card.querySelector('.rent-hide-btn');
         const c = window.__fmCharts.rentIncomeShare;
-        const h = window.__fmCharts.rentIncome;
+        const a = window.__fmCharts.earnRentals;
         const idx = c ? c.data.labels.indexOf('Chart A') : -1;
-        const totalDs = h ? h.data.datasets.find((d) => d.label === 'Total (CAD)') : null;
-        const marIdx = h ? h.data.labels.indexOf('2025-03') : -1;
         return {
           cardGrey: card ? card.classList.contains('rent-hidden-card') : false,
           eyeClosed: btn ? btn.classList.contains('invest-eye-hidden') : false,
@@ -12527,15 +12651,15 @@ try {
           })() : false,
           sliceVisible: idx >= 0 ? c.getDataVisibility(idx) : null,
           center: window.__fmCharts.rentIncomeShareCenter ? window.__fmCharts.rentIncomeShareCenter.total : null,
-          marTotal: totalDs && marIdx >= 0 ? totalDs.data[marIdx] : null,
+          annual: a ? { labels: a.data.labels, sets: a.data.datasets.map((d) => ({ key: d.key || null, label: d.label, data: d.data })) } : null,
         };
       });
-      check('rental income panel: bold eye hide greys the card, closes the eye, drops slice + center + history total',
+      check('rental income panel: bold eye hide greys the card, closes the eye, drops slice + center, annual chart unchanged',
         hiddenState.cardGrey && hiddenState.eyeClosed && hiddenState.eyeSvg
           && hiddenState.eyeStroke === '2.6' && hiddenState.eyeLashes === 5 && hiddenState.eyePupilRing === true
           && hiddenState.eyeOpenPath === 'M2 12C6 5.5 18 5.5 22 12C18 18.5 6 18.5 2 12Z' && hiddenState.eyeSym === true
           && hiddenState.sliceVisible === false && hiddenState.center === expectedCenter - 12000
-          && hiddenState.marTotal === mar2025 - 1000,
+          && JSON.stringify(hiddenState.annual) === JSON.stringify(annualBeforeHide),
         JSON.stringify(hiddenState));
       // Legend click restores it (same shared hidden set, other way).
       await page.evaluate(() => {

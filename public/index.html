@@ -447,19 +447,19 @@
             <div class="invest-share-box" id="rentIncomeShareWrap"><div class="chart-wrap invest-share"><canvas id="rentIncomeShareChart"></canvas></div></div>
             <div class="note hidden" id="rentIncomeShareEmpty">No rental income in this range yet.</div>
           </div>
-          <div class="invest-main-chart" id="rentIncomeMainWrap"><div class="chart-wrap tall"><canvas id="rentIncomeChart"></canvas></div></div>
+          <div class="invest-main-chart" id="rentIncomeMainWrap">
+            <div class="toolbar range-btns" id="earnRentalsViewBtns">
+              <button type="button" data-view="net" class="active">Net by property</button>
+              <button type="button" data-view="income">Income vs expenses</button>
+            </div>
+            <div class="chart-wrap tall"><canvas id="earnRentalsChart"></canvas></div>
+            <div class="chart-colors hidden" data-colors-panel="earnRentals"></div>
+            <div class="note hidden" id="earnRentalsEmpty">No rental year records yet.</div>
+          </div>
         </div>
       </div>
       <div class="msg" id="earnRentalMsg"></div>
       <div class="note">Rental income is a flow, not an asset — it never enters the net-worth summary. Mortgage interest and principal are separate fields; only interest is deductible.</div>
-      <div id="earnRentalsRange"></div>
-      <div class="toolbar range-btns" id="earnRentalsViewBtns">
-        <button type="button" data-view="net" class="active">Net by property</button>
-        <button type="button" data-view="income">Income vs expenses</button>
-      </div>
-      <div class="panel"><canvas id="earnRentalsChart"></canvas></div>
-      <div class="chart-colors hidden" data-colors-panel="earnRentals"></div>
-      <div class="note hidden" id="earnRentalsEmpty">No rental year records yet.</div>
       <div id="earnRentalList"></div>
     </div>
     <div id="earnJobDetail" class="asset-section hidden"></div>

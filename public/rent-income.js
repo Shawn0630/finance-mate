@@ -85,38 +85,37 @@ function rentRangeShare(series, range, hiddenIds) {
   return { rows, total: Math.round(total * 100) / 100, visibleTotal: Math.round(visibleTotal * 100) / 100 };
 }
 
-// History data for the stacked-bars + total-line chart: months is the
-// range's full month list (zero-filled), perRental values are zero-
-// filled to it, totals are visible-only sums per month.
-function rentHistoryData(series, range, hiddenIds) {
-  const hidden = new Set(hiddenIds || []);
-  let months = [];
-  if (range && range.start && range.end) {
-    months = rentYmList(range.start, range.end);
-  } else {
-    const all = new Set();
-    for (const s of series || []) for (const p of s.months || []) all.add(p.month);
-    const sorted = [...all].sort();
-    if (sorted.length) months = rentYmList(sorted[0], sorted[sorted.length - 1]);
-  }
-  const perRental = (series || []).map((s) => {
-    const byMonth = new Map((s.months || []).map((p) => [p.month, p.value]));
-    return { rental: s.rental, values: months.map((m) => byMonth.get(m) || 0), hidden: hidden.has(s.rental.id) };
-  });
-  const totals = months.map((_, i) => {
-    let t = 0;
-    for (const p of perRental) if (!p.hidden) t += p.values[i] || 0;
-    return Math.round(t * 100) / 100;
-  });
-  return { months, perRental, totals };
+// Annual-chart years for the combined Total income panel: the
+// shared invest-range picker drives both the share and the chart.
+// All (or no range) shows every year; a preset/custom range shows
+// only the tax years the range's months touch — so a 1-year preset
+// spanning December/January legitimately shows two tax years.
+function rentAnnualYears(allYears, range, isAll) {
+  const years = [...(allYears || [])];
+  if (!range || !range.start || !range.end || isAll) return years;
+  const sy = Number(String(range.start).slice(0, 4));
+  const ey = Number(String(range.end).slice(0, 4));
+  if (!Number.isFinite(sy) || !Number.isFinite(ey)) return years;
+  return years.filter((y) => y >= sy && y <= ey);
+}
+
+// The annual chart's empty rule: hidden with a note when no rental
+// year-record data exists for the filtered years — NOT merely when
+// the shared years list is empty (that list also carries job tax
+// years, which used to render a $0/$1-ticked all-zero chart for
+// rentals with no year records).
+function rentAnnualEmpty(rentalsByYear, years) {
+  if (!rentalsByYear || !years || !years.length) return true;
+  return !years.some((y) => rentalsByYear[y]);
 }
 
 if (typeof window !== 'undefined') {
   window.rentMonthlySeries = rentMonthlySeries;
   window.rentRangeShare = rentRangeShare;
-  window.rentHistoryData = rentHistoryData;
+  window.rentAnnualYears = rentAnnualYears;
+  window.rentAnnualEmpty = rentAnnualEmpty;
   window.rentYmList = rentYmList;
 }
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { rentMonthlySeries, rentRangeShare, rentHistoryData, rentYmList, rentEntryMonths };
+  module.exports = { rentMonthlySeries, rentRangeShare, rentYmList, rentEntryMonths, rentAnnualYears, rentAnnualEmpty };
 }
