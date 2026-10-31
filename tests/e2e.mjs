@@ -12032,6 +12032,237 @@ try {
       check('rental modals: blank-To entry saves with a null end',
         !!ongoingEntry && ongoingEntry.end_ym === null, JSON.stringify(ongoingEntry));
 
+      // Rental detail page: card click navigates; eye and + Rent
+      // entry do not; the detail carries header + summary + chart +
+      // both history panels + a bottom Edit/Delete row; the cards
+      // no longer show rental Edit/Delete; Total income stays.
+      page.on('dialog', (d) => d.accept());
+      r = await req('POST', '/api/earnings/rentals', {
+        label: 'Detail rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 66.67,
+      });
+      check('rental detail setup: rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const detailRentalId = r.data.id;
+      r = await req('POST', `/api/earnings/rentals/${detailRentalId}/years`, {
+        tax_year: 2025, other_income: 0, area_share_pct: 100,
+        mortgage_interest: 0, mortgage_principal: 0,
+        expenses: [{ line: '9180', amount: 4000, direct: false }],
+      });
+      check('rental detail setup: 2025 year with expenses created', r.status === 201 && r.data.tax_year === 2025, JSON.stringify(r.data));
+      r = await req('POST', `/api/earnings/rentals/${detailRentalId}/entries`, {
+        start_ym: '2024-01', end_ym: '2024-12', monthly_rent: 1000, pay_day: 1,
+      });
+      check('rental detail setup: 2024 entry created', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', `/api/earnings/rentals/${detailRentalId}/entries`, {
+        start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 2000, pay_day: 1,
+      });
+      check('rental detail setup: 2025 entry created', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', '/api/earnings/rentals', {
+        label: 'Empty rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+      });
+      check('rental detail setup: empty rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const emptyRentalId = r.data.id;
+      // Same-hash navigation does not reload — go away and back so
+      // loadEarnings renders the new cards before clicking one.
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(500);
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const detailCardHead = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Detail rental'));
+        if (!card) return null;
+        const head = card.querySelector('.section-head');
+        return {
+          headBtns: [...head.querySelectorAll('button')].map((b) => b.textContent.trim()),
+          hasEye: !!card.querySelector('.rent-hide-btn'),
+        };
+      });
+      check('rental card header keeps only + Rent entry, no rental Edit/Delete, eye stays',
+        detailCardHead && detailCardHead.headBtns.length === 1 && detailCardHead.headBtns[0] === '+ Rent entry'
+          && detailCardHead.hasEye,
+        JSON.stringify(detailCardHead));
+      // Eye and + Rent entry clicks must not navigate.
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Detail rental'));
+        card.querySelector('.rent-hide-btn').click();
+      });
+      await waitE(300);
+      check('rental card eye click does not navigate to a detail page',
+        await page.evaluate(() => location.hash === '#earnings/rentals'));
+      // Restore visibility for the steps below.
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Detail rental'));
+        card.querySelector('.rent-hide-btn').click();
+      });
+      await waitE(300);
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Detail rental'));
+        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ Rent entry').click();
+      });
+      await waitE(300);
+      const entryModalNav = await page.evaluate(() => ({
+        hash: location.hash,
+        open: !document.querySelector('#earnRentalEntryModal').classList.contains('hidden'),
+      }));
+      check('rental card + Rent entry click opens the modal without navigating',
+        entryModalNav.hash === '#earnings/rentals' && entryModalNav.open === true, JSON.stringify(entryModalNav));
+      await page.click('#earnRentalEntryCancelBtn');
+      await waitE(200);
+      // Card click (on the heading, not a button) navigates.
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Detail rental'));
+        card.querySelector('h3').click();
+      });
+      try { await page.waitForFunction((id) => location.hash === `#earnings/rental/${id}`, { timeout: 10000 }, detailRentalId); } catch {}
+      const detailNav = await page.evaluate(() => ({
+        hash: location.hash,
+        detailHidden: document.querySelector('#earnRentalDetail').classList.contains('hidden'),
+        listHidden: document.querySelector('#earn-rentals').classList.contains('hidden'),
+      }));
+      check('rental card click navigates to the detail page',
+        detailNav.hash === `#earnings/rental/${detailRentalId}` && !detailNav.detailHidden && detailNav.listHidden,
+        JSON.stringify(detailNav));
+      // The hash changes before the async detail load finishes — wait
+      // for the rendered back link, not just the hash, before reading.
+      await page.waitForFunction(() => !!document.querySelector('#earnRentalBackLink'), { timeout: 10000 });
+      const apiDetailRental = (await req('GET', '/api/earnings')).data.rentals.find((x) => x.id === detailRentalId);
+      const sortedDetailYears = [...apiDetailRental.years].sort((a, b) => a.tax_year - b.tax_year);
+      const latestDetailYear = sortedDetailYears[sortedDetailYears.length - 1];
+      const cad = (v) => Number(v).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const detailInfo = await page.evaluate(() => {
+        const d = document.querySelector('#earnRentalDetail');
+        const head = d ? d.firstElementChild : null;
+        const back = document.querySelector('#earnRentalBackLink');
+        const chart = window.__fmCharts && window.__fmCharts.earnRentalDetail;
+        return {
+          backTag: back ? back.tagName : null,
+          backText: back ? back.textContent.trim() : null,
+          backHref: back ? back.getAttribute('href') : null,
+          backClass: back ? back.className : null,
+          headButtons: head ? head.querySelectorAll('button').length : null,
+          headIsToolbar: !!head && head.classList.contains('toolbar'),
+          header: d ? (d.querySelector('.panel .section-head')?.textContent || null) : null,
+          cards: [...d.querySelectorAll('.summary-card')].map((c) => [
+            c.querySelector('.k')?.textContent.trim(), c.querySelector('.v')?.textContent.trim()]),
+          chartLabels: chart ? chart.data.labels : null,
+          chartSets: chart ? chart.data.datasets.map((s) => ({ label: s.label, data: s.data })) : null,
+          hasYearPanel: !!([...d.querySelectorAll('.panel .section-head h3')].find((h) => h.textContent.trim() === 'Year records')),
+          hasEntryPanel: !!([...d.querySelectorAll('.panel .section-head h3')].find((h) => h.textContent.trim() === 'Rent entries')),
+          yearText: d.textContent.includes('2024') && d.textContent.includes('2025'),
+          entryText: d.textContent.includes('$1,000.00/mo') && d.textContent.includes('$2,000.00/mo'),
+          detailAddEntry: !!document.querySelector('#earnRentalDetailAddEntry'),
+          actionsLast: !!document.querySelector('#earnRentalDetailActions') && d.lastElementChild === document.querySelector('#earnRentalDetailActions'),
+          bodyEdit: !!document.querySelector('#earnRentalDetailBodyEditBtn'),
+          bodyDelete: !!document.querySelector('#earnRentalDetailBodyDeleteBtn'),
+        };
+      });
+      check('rental detail back is a plain link above the card with no buttons',
+        detailInfo.backTag === 'A' && detailInfo.backText === '← Back to Rentals' && detailInfo.backHref === '#earnings/rentals'
+          && detailInfo.backClass === '' && detailInfo.headButtons === 0 && detailInfo.headIsToolbar,
+        JSON.stringify(detailInfo));
+      check('rental detail header shows label + type and ownership',
+        detailInfo.header && detailInfo.header.includes('Detail rental') && detailInfo.header.includes('long_term')
+          && detailInfo.header.includes('basic') && detailInfo.header.includes('66.67% owned'),
+        JSON.stringify(detailInfo.header));
+      const wantDetailCards = [
+        ['Gross rents', cad(latestDetailYear.calc.grossWhole)],
+        ['Deductible expenses', cad(latestDetailYear.calc.deductibleExpenses)],
+        ['Net, whole property (9946)', cad(latestDetailYear.calc.netWhole9946)],
+        ['Owner share', cad(latestDetailYear.calc.ownerShareNet)],
+      ];
+      check('rental detail summary strip shows the latest year calc figures',
+        JSON.stringify(detailInfo.cards) === JSON.stringify(wantDetailCards),
+        JSON.stringify({ got: detailInfo.cards, want: wantDetailCards }));
+      check('rental detail chart shows annual gross vs net bars per tax year',
+        detailInfo.chartLabels && detailInfo.chartLabels.join(',') === '2024,2025'
+          && detailInfo.chartSets && detailInfo.chartSets.length === 2
+          && detailInfo.chartSets[0].label === 'Gross rents'
+          && JSON.stringify(detailInfo.chartSets[0].data) === JSON.stringify(sortedDetailYears.map((y) => y.calc.grossWhole))
+          && detailInfo.chartSets[1].label === 'Net (9946)'
+          && JSON.stringify(detailInfo.chartSets[1].data) === JSON.stringify(sortedDetailYears.map((y) => y.calc.netWhole9946)),
+        JSON.stringify({ labels: detailInfo.chartLabels, sets: detailInfo.chartSets }));
+      check('rental detail history shows year records and rent entries panels',
+        detailInfo.hasYearPanel && detailInfo.hasEntryPanel && detailInfo.yearText && detailInfo.entryText && detailInfo.detailAddEntry,
+        JSON.stringify(detailInfo));
+      check('rental detail body bottom row has Edit + Delete as the last element',
+        detailInfo.actionsLast && detailInfo.bodyEdit && detailInfo.bodyDelete, JSON.stringify(detailInfo));
+      // Edit from the detail body opens the shared modal prefilled.
+      await page.click('#earnRentalDetailBodyEditBtn');
+      await waitE(300);
+      check('rental detail body Edit opens the prefilled rental modal',
+        await page.evaluate(() => {
+          const m = document.querySelector('#earnRentalModal');
+          const f = document.querySelector('#earnRentalForm');
+          return m && !m.classList.contains('hidden') && f && f.label.value === 'Detail rental';
+        }));
+      await page.click('#earnRentalCancelBtn');
+      await waitE(200);
+      // Back link returns to the Rentals list.
+      await page.click('#earnRentalBackLink');
+      try { await page.waitForFunction(() => location.hash === '#earnings/rentals', { timeout: 5000 }); } catch {}
+      const rentalBackNav = await page.evaluate(() => ({
+        hash: location.hash,
+        detailHidden: document.querySelector('#earnRentalDetail').classList.contains('hidden'),
+      }));
+      check('clicking the rental detail back link returns to the Rentals list',
+        rentalBackNav.hash === '#earnings/rentals' && rentalBackNav.detailHidden === true, JSON.stringify(rentalBackNav));
+      // Delete from the detail body round-trips back to Rentals.
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Detail rental'));
+        card.querySelector('h3').click();
+      });
+      try { await page.waitForFunction((id) => location.hash === `#earnings/rental/${id}`, { timeout: 10000 }, detailRentalId); } catch {}
+      await page.waitForFunction(() => !!document.querySelector('#earnRentalDetailBodyDeleteBtn'), { timeout: 10000 });
+      await waitE(300);
+      // In-page click, not page.click: the button arrives with the
+      // async detail load, and page.click's scroll step can catch it
+      // mid-re-render and throw "detached from document".
+      await page.evaluate(() => document.querySelector('#earnRentalDetailBodyDeleteBtn').click());
+      try { await page.waitForFunction(() => location.hash === '#earnings/rentals', { timeout: 10000 }); } catch {}
+      const rentalDelNav = await page.evaluate(() => ({
+        hash: location.hash,
+        detailHidden: document.querySelector('#earnRentalDetail').classList.contains('hidden'),
+        cardGone: ![...document.querySelectorAll('#earnRentalList .earn-rental-card')].some((c) => c.textContent.includes('Detail rental')),
+      }));
+      check('rental detail body Delete removes the rental and returns to Rentals',
+        rentalDelNav.hash === '#earnings/rentals' && rentalDelNav.detailHidden && rentalDelNav.cardGone,
+        JSON.stringify(rentalDelNav));
+      // No-year-records rental: detail renders with entry facts only,
+      // no chart panel, no invented figures.
+      await page.goto(`http://ff.local/#earnings/rental/${emptyRentalId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      await page.waitForFunction(() => !!document.querySelector('#earnRentalBackLink'), { timeout: 10000 });
+      const emptyInfo = await page.evaluate(() => {
+        const d = document.querySelector('#earnRentalDetail');
+        const panel = document.querySelector('#earnRentalDetailChartPanel');
+        return {
+          cards: [...d.querySelectorAll('.summary-card')].map((c) => [
+            c.querySelector('.k')?.textContent.trim(), c.querySelector('.v')?.textContent.trim()]),
+          chartPanelHidden: !!panel && panel.classList.contains('hidden'),
+          chartInstance: !!(window.__fmCharts && window.__fmCharts.earnRentalDetail),
+          noYearsNote: d.textContent.includes('No year records yet.'),
+        };
+      });
+      check('no-year-records rental detail shows entry facts, no chart, no invented figures',
+        emptyInfo.chartPanelHidden && !emptyInfo.chartInstance && emptyInfo.noYearsNote
+          && JSON.stringify(emptyInfo.cards) === JSON.stringify([['Monthly rent', '—'], ['Rent entries', '0'], ['Coverage', '—'], ['Owned', '100%']]),
+        JSON.stringify(emptyInfo));
+      // Total income panel is untouched by the detail-page work.
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const incomePanel = await page.evaluate(() => {
+        const p = document.querySelector('#rentIncomePanel');
+        return p ? { title: p.querySelector('h3')?.textContent.trim(), share: document.querySelector('#rentIncomeShareTitle')?.textContent.trim() } : null;
+      });
+      check('rentals Total income panel is untouched',
+        incomePanel && incomePanel.title === 'Total income' && incomePanel.share.startsWith('Income share'),
+        JSON.stringify(incomePanel));
+
       // Rental form: property dropdown lists app properties (never BCA
       // results); picking one disables + clears Address; Standalone
       // re-enables it; BCA suggest fills standalone text only.

@@ -383,10 +383,23 @@ function route() {
     $('#earn-overview').classList.add('hidden');
     $('#earn-salary').classList.add('hidden');
     $('#earn-rentals').classList.add('hidden');
+    $('#earnRentalDetail').classList.add('hidden');
     $('#earnJobDetail').classList.remove('hidden');
     document.querySelectorAll('#earningsNav a').forEach((a) =>
       a.classList.toggle('active', a.dataset.section === 'salary'));
     loadEarnJobDetail(currentEarnJobId);
+  } else if (hash.startsWith('#earnings/rental/')) {
+    // Rental detail page: its own route, Rentals tab active, list hidden.
+    currentEarnRentalId = Number(hash.split('/')[2]);
+    showView('earnings');
+    $('#earn-overview').classList.add('hidden');
+    $('#earn-salary').classList.add('hidden');
+    $('#earn-rentals').classList.add('hidden');
+    $('#earnJobDetail').classList.add('hidden');
+    $('#earnRentalDetail').classList.remove('hidden');
+    document.querySelectorAll('#earningsNav a').forEach((a) =>
+      a.classList.toggle('active', a.dataset.section === 'rentals'));
+    loadEarnRentalDetail(currentEarnRentalId);
   } else if (hash === '#earnings' || hash.startsWith('#earnings/')) {
     showView('earnings');
     const sub = hash.split('/')[1] || 'salary';
@@ -394,6 +407,7 @@ function route() {
     $('#earn-salary').classList.toggle('hidden', sub !== 'salary');
     $('#earn-rentals').classList.toggle('hidden', sub !== 'rentals');
     $('#earnJobDetail').classList.add('hidden');
+    $('#earnRentalDetail').classList.add('hidden');
     document.querySelectorAll('#earningsNav a').forEach((a) =>
       a.classList.toggle('active', a.dataset.section === sub));
     loadEarnings();
@@ -1862,7 +1876,7 @@ let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
 // Test/debug hook: lets the screenshot script read the live chart configs.
-window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null, earnOverview: null, earnRentals: null, earnJobMonthly: null });
+window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null, earnOverview: null, earnRentals: null, earnJobMonthly: null, earnRentalDetail: null });
 
 // ------------------------------------------------------------ photos ---
 // The detail page's gallery: a carousel over the property's photos
@@ -8509,13 +8523,11 @@ function earnEntryBlock(r, e) {
 
 function earnRentalCard(r) {
   const hidden = rentHiddenRentals.has(r.id);
-  return `<div class="panel rent-card">
+  return `<div class="panel rent-card earn-rental-card" data-rental-id="${r.id}" style="cursor:pointer">
     <button type="button" class="rent-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-rental-id="${r.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}" onclick="toggleRentRental(${r.id})">${RENT_EYE_SVG}</button>
     <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span>
     <div class="spacer"></div>
-    <button class="small" onclick="earnAddEntry(${r.id})">+ Rent entry</button>
-    <button class="small" onclick="earnEditRental(${r.id})">Edit</button>
-    <button class="small danger" onclick="earnDeleteRental(${r.id})">Delete</button></div>
+    <button class="small" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
     ${(r.entries || []).length ? `<div><div class="note">Rent entries</div>${r.entries.map((e) => earnEntryBlock(r, e)).join('')}</div>` : ''}
     ${r.years.length ? r.years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
   </div>`;
@@ -9013,6 +9025,12 @@ $('#earnJobList').addEventListener('click', (e) => {
   const card = e.target.closest('.earn-job-card');
   if (card) location.hash = '#earnings/job/' + card.dataset.jobId;
 });
+// Clicking a rental card (anywhere but its buttons) opens its detail page.
+$('#earnRentalList').addEventListener('click', (e) => {
+  if (e.target.closest('button')) return;
+  const card = e.target.closest('.earn-rental-card');
+  if (card) location.hash = '#earnings/rental/' + card.dataset.rentalId;
+});
 $('#earnJobForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
@@ -9372,7 +9390,7 @@ $('#earnRentalForm').onsubmit = async (e) => {
     if (earnEditRentalId) await api(`/api/earnings/rentals/${earnEditRentalId}`, { method: 'PUT', body });
     else await api('/api/earnings/rentals', { method: 'POST', body });
     closeModalEl($('#earnRentalModal'));
-    loadEarnings();
+    earnRefreshRentalView(earnEditRentalId);
   } catch (err) { showMsg($('#earnRentalModalMsg'), 'err', err.message); }
 };
 window.earnEditRental = (id) => {
@@ -9391,9 +9409,129 @@ window.earnEditRental = (id) => {
 };
 window.earnDeleteRental = async (id) => {
   if (!confirm('Delete this rental and all its year records?')) return;
-  await api(`/api/earnings/rentals/${id}`, { method: 'DELETE' });
-  loadEarnings();
+  try {
+    await api(`/api/earnings/rentals/${id}`, { method: 'DELETE' });
+  } catch (err) {
+    // Like the job delete: a failure must surface instead of failing
+    // silently — in the detail message when the detail page is open.
+    const detailVisible = !$('#earnRentalDetail').classList.contains('hidden');
+    const m = detailVisible ? $('#earnRentalDetailMsg') : $('#earnRentalMsg');
+    if (m) showMsg(m, 'err', err.message);
+    return;
+  }
+  await loadEarnings();
+  if (location.hash.startsWith('#earnings/rental/')) location.hash = '#earnings/rentals';
 };
+
+// After a rental/year/entry save or delete, the detail page (when
+// open on that rental) refreshes itself; otherwise the list reloads.
+function earnRefreshRentalView(rentalId) {
+  if (location.hash === `#earnings/rental/${rentalId}`) loadEarnRentalDetail(rentalId);
+  else loadEarnings();
+}
+
+// ----------------------------------------------------- rental detail --
+// A rental card opens its own detail page (job detail pattern). The
+// list cards carry no rental-level Edit/Delete buttons — only + Rent
+// entry and the eye — and the rental itself is edited and deleted
+// from a bottom actions row inside the detail body, reusing the card
+// handlers. The summary strip shows the latest year record's calc;
+// with no year records it shows entry-derived facts only, never an
+// invented figure, and there is no chart panel.
+let currentEarnRentalId = null;
+let earnRentalDetailChart = null;
+
+function earnRentalLatestYear(r) {
+  const years = [...(r.years || [])].sort((a, b) => a.tax_year - b.tax_year);
+  return years.length ? years[years.length - 1] : null;
+}
+
+function earnRentalDetailSummaryHtml(r) {
+  const y = earnRentalLatestYear(r);
+  if (y && y.calc) {
+    const c = y.calc;
+    return `<div class="summary-strip">
+      <div class="summary-card"><div class="k">Gross rents</div><div class="v">${money2(c.grossWhole)}</div></div>
+      <div class="summary-card"><div class="k">Deductible expenses</div><div class="v">${money2(c.deductibleExpenses)}</div></div>
+      <div class="summary-card"><div class="k">Net, whole property (9946)</div><div class="v">${money2(c.netWhole9946)}</div></div>
+      <div class="summary-card"><div class="k">Owner share</div><div class="v">${money2(c.ownerShareNet)}</div></div>
+    </div>`;
+  }
+  // No year records: entry facts only. Latest entry = latest start
+  // month; coverage spans the earliest start to the latest end.
+  const entries = [...(r.entries || [])].sort((a, b) => (a.start_ym || '').localeCompare(b.start_ym || ''));
+  const latest = entries.length ? entries[entries.length - 1] : null;
+  const end = latest && latest.end_ym ? ymLabel(latest.end_ym) : 'Ongoing';
+  return `<div class="summary-strip">
+    <div class="summary-card"><div class="k">Monthly rent</div><div class="v">${latest ? money2(latest.monthly_rent) : '—'}</div></div>
+    <div class="summary-card"><div class="k">Rent entries</div><div class="v">${entries.length}</div></div>
+    <div class="summary-card"><div class="k">Coverage</div><div class="v">${entries.length ? `${ymLabel(entries[0].start_ym)} – ${end}` : '—'}</div></div>
+    <div class="summary-card"><div class="k">Owned</div><div class="v">${r.ownership_pct}%</div></div>
+  </div>`;
+}
+
+function earnRentalDetailHtml(r) {
+  const years = [...(r.years || [])].sort((a, b) => a.tax_year - b.tax_year);
+  return `<div class="toolbar"><a id="earnRentalBackLink" href="#earnings/rentals">← Back to Rentals</a><div class="spacer"></div></div>
+    <div class="msg" id="earnRentalDetailMsg"></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span><div class="spacer"></div></div>
+      ${r.address ? `<div class="note">${esc(r.address)}</div>` : ''}
+      ${earnRentalDetailSummaryHtml(r)}
+    </div>
+    <div class="panel" id="earnRentalDetailChartPanel">
+      <div class="section-head"><h3>Annual income</h3></div>
+      <div><canvas id="earnRentalDetailChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Year records</h3></div>
+      ${years.length ? years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Rent entries</h3><div class="spacer"></div><button class="small" id="earnRentalDetailAddEntry" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
+      ${(r.entries || []).length ? r.entries.map((e) => earnEntryBlock(r, e)).join('') : '<div class="note">No rent entries yet.</div>'}
+    </div>
+    <div class="toolbar" id="earnRentalDetailActions"><div class="spacer"></div><button class="small" id="earnRentalDetailBodyEditBtn" onclick="earnEditRental(${r.id})">Edit</button><button class="small danger" id="earnRentalDetailBodyDeleteBtn" onclick="earnDeleteRental(${r.id})">Delete</button></div>`;
+}
+
+function drawEarnRentalDetailChart(r) {
+  const panel = $('#earnRentalDetailChartPanel');
+  if (!panel) return;
+  if (earnRentalDetailChart) { earnRentalDetailChart.destroy(); earnRentalDetailChart = null; window.__fmCharts.earnRentalDetail = null; }
+  const years = [...(r.years || [])].filter((y) => y.calc).sort((a, b) => a.tax_year - b.tax_year);
+  if (!years.length) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  earnRentalDetailChart = new Chart($('#earnRentalDetailChart'), {
+    type: 'bar',
+    data: {
+      labels: years.map((y) => String(y.tax_year)),
+      datasets: [
+        { label: 'Gross rents', data: years.map((y) => y.calc.grossWhole), backgroundColor: '#1668c4', borderColor: '#1668c4', borderWidth: 1 },
+        { label: 'Net (9946)', data: years.map((y) => y.calc.netWhole9946), backgroundColor: '#2e7d4f', borderColor: '#2e7d4f', borderWidth: 1 },
+      ],
+    },
+    options: {
+      responsive: true,
+      scales: { y: { beginAtZero: true, ticks: { callback: (v) => '$' + Number(v).toLocaleString() } } },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } },
+    },
+  });
+  window.__fmCharts.earnRentalDetail = earnRentalDetailChart;
+}
+
+async function loadEarnRentalDetail(id) {
+  try {
+    await loadEarnings();
+    const r = earnData.rentals.find((x) => x.id === id);
+    if (!r) { location.hash = '#earnings/rentals'; return; }
+    currentEarnRentalId = id;
+    $('#earnRentalDetail').innerHTML = earnRentalDetailHtml(r);
+    drawEarnRentalDetailChart(r);
+  } catch (e) {
+    const m = $('#earnRentalDetailMsg');
+    if (m) showMsg(m, 'err', e.message);
+  }
+}
 
 function earnExpenseRow(line = '', amount = '', direct = false) {
   const wrap = document.createElement('div');
@@ -9417,7 +9555,7 @@ $('#earnRentalYearForm').onsubmit = async (e) => {
     if (earnEditYearId) await api(`/api/earnings/rentals/${earnYearRentalId}/years/${earnEditYearId}`, { method: 'PUT', body });
     else await api(`/api/earnings/rentals/${earnYearRentalId}/years`, { method: 'POST', body });
     closeModalEl($('#earnRentalYearModal'));
-    loadEarnings();
+    earnRefreshRentalView(earnYearRentalId);
   } catch (err) { showMsg($('#earnRentalYearModalMsg'), 'err', err.message); }
 };
 window.earnEditYear = (rentalId, yearId) => {
@@ -9443,7 +9581,7 @@ window.earnEditYear = (rentalId, yearId) => {
 window.earnDeleteYear = async (rentalId, yearId) => {
   if (!confirm('Delete this year record?')) return;
   await api(`/api/earnings/rentals/${rentalId}/years/${yearId}`, { method: 'DELETE' });
-  loadEarnings();
+  earnRefreshRentalView(rentalId);
 };
 
 // ------------------------------------------------------ rent entries --
@@ -9469,7 +9607,7 @@ $('#earnRentalEntryForm').onsubmit = async (e) => {
     if (earnEditEntryId) await api(`/api/earnings/rentals/${earnEntryRentalId}/entries/${earnEditEntryId}`, { method: 'PUT', body });
     else await api(`/api/earnings/rentals/${earnEntryRentalId}/entries`, { method: 'POST', body });
     closeModalEl($('#earnRentalEntryModal'));
-    loadEarnings();
+    earnRefreshRentalView(earnEntryRentalId);
   } catch (err) { showMsg($('#earnRentalEntryModalMsg'), 'err', err.message); }
 };
 window.earnEditEntry = (rentalId, entryId) => {
@@ -9488,7 +9626,7 @@ window.earnEditEntry = (rentalId, entryId) => {
 window.earnDeleteEntry = async (rentalId, entryId) => {
   if (!confirm('Delete this rent entry? Year records it created stay.')) return;
   await api(`/api/earnings/rentals/${rentalId}/entries/${entryId}`, { method: 'DELETE' });
-  loadEarnings();
+  earnRefreshRentalView(rentalId);
 };
 
 // ------------------------------------------------------------- spending ---
