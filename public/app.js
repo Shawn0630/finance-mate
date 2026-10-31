@@ -1341,10 +1341,6 @@ const CHART_SERIES = {
     { key: 'salary', label: 'Salary net', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
     { key: 'rental', label: 'Rental net', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
   ],
-  earnSalary: [
-    { key: 'gross', label: 'Annual gross', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
-    { key: 'net', label: 'Annual net', bg: '#2e7d4f', border: '#2e7d4f', bgAlpha: null },
-  ],
   earnRentals: [
     { key: 'gross', label: 'Gross rents', bg: '#1668c4', border: '#1668c4', bgAlpha: null },
     { key: 'expenses', label: 'Deductible expenses', bg: '#d97706', border: '#d97706', bgAlpha: null },
@@ -1381,17 +1377,12 @@ function earnOverviewSeriesDefs() {
   if (earnChartData) earnChartData.earners.forEach((e, i) => defs.push(earnDef(`earner:${e}`, `${e} salary net`, i + 2)));
   return defs;
 }
-function earnSalarySeriesDefs() {
-  const defs = [...CHART_SERIES.earnSalary];
-  if (earnChartData) earnChartData.employers.forEach((e, i) => defs.push(earnDef(`employer:${e}`, `${e} net`, i + 2)));
-  return defs;
-}
 function earnRentalsSeriesDefs() {
   const defs = [];
   if (earnChartData) earnChartData.properties.forEach((p, i) => defs.push(earnDef(`rental:${p.id}`, `${p.label} net`, i)));
   return [...defs, ...CHART_SERIES.earnRentals];
 }
-const earnSeriesDefs = { earnOverview: earnOverviewSeriesDefs, earnSalary: earnSalarySeriesDefs, earnRentals: earnRentalsSeriesDefs };
+const earnSeriesDefs = { earnOverview: earnOverviewSeriesDefs, earnRentals: earnRentalsSeriesDefs };
 
 function seriesDefFor(chartId, key) {
   if (chartId === 'portfolio') return portfolioSeriesDefs().find((d) => d.key === key) || null;
@@ -1427,7 +1418,7 @@ function saveChartColorPrefs(immediate = false) {
   else chartColorSaveTimer = setTimeout(put, 400);
 }
 
-const LIVE_CHARTS = { hero: () => chartA, history: () => historyChart, portfolio: () => portfolioLineChart, earnOverview: () => earnOverviewChart, earnSalary: () => earnSalaryChart, earnRentals: () => earnRentalsChart };
+const LIVE_CHARTS = { hero: () => chartA, history: () => historyChart, portfolio: () => portfolioLineChart, earnOverview: () => earnOverviewChart, earnRentals: () => earnRentalsChart };
 
 // The draw colors for one explicit hex, under the same rules
 // seriesColors applies to a stored one.
@@ -1642,7 +1633,6 @@ wireLegendContextMenu('hero', 'combinedChart');
 wireLegendContextMenu('history', 'historyChart');
 wireLegendContextMenu('portfolio', 'portfolioChart');
 wireLegendContextMenu('earnOverview', 'earnOverviewChart');
-wireLegendContextMenu('earnSalary', 'earnSalaryChart');
 wireLegendContextMenu('earnRentals', 'earnRentalsChart');
 
 function drawPortfolioPie() {
@@ -1872,7 +1862,7 @@ let amortError = null; // last non-ok amortization response ({ error, code })
 let detailProperty = null;
 let equityData = null;
 // Test/debug hook: lets the screenshot script read the live chart configs.
-window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null, earnOverview: null, earnSalary: null, earnRentals: null });
+window.__fmCharts = Object.assign(window.__fmCharts || {}, { a: null, b: null, prime: null, history: null, earnOverview: null, earnRentals: null, earnJobMonthly: null });
 
 // ------------------------------------------------------------ photos ---
 // The detail page's gallery: a carousel over the property's photos
@@ -8577,12 +8567,10 @@ async function loadEarnings() {
 // (Chart.js default), right click opens that chart's Colors panel
 // (the only entry, wired above).
 let earnOverviewChart = null;
-let earnSalaryChart = null;
 let earnRentalsChart = null;
 let earnRentalsView = 'net';
 const earnChartRanges = {
   overview: { years: 0, from: null, to: null, fromYm: null, toYm: null },
-  salary: { years: 0, from: null, to: null, fromYm: null, toYm: null },
   rentals: { years: 0, from: null, to: null, fromYm: null, toYm: null },
 };
 
@@ -8682,32 +8670,6 @@ function drawEarnOverviewChart() {
   window.__fmCharts.earnOverview = earnOverviewChart;
 }
 
-function drawEarnSalaryChart() {
-  const years = earnEffectiveYears('salary');
-  if (earnSalaryChart) { earnSalaryChart.destroy(); earnSalaryChart = null; window.__fmCharts.earnSalary = null; }
-  const empty = !earnChartData || !years.length || !earnChartData.employers.length;
-  earnSetEmpty('earnSalaryChart', 'earnSalaryEmpty', empty);
-  if (empty) return;
-  const s = earnChartData.salary;
-  const ds = (key, values, type, hidden) => {
-    const def = seriesDefFor('earnSalary', key);
-    const c = seriesColors('earnSalary', def);
-    return { key, label: def ? def.label : key, data: values, backgroundColor: c.backgroundColor, borderColor: c.borderColor, borderWidth: type === 'line' ? 2 : 1, type, hidden: !!hidden };
-  };
-  const datasets = [
-    ds('gross', years.map((y) => (s[y] && s[y].gross) || 0), 'bar', false),
-    ds('net', years.map((y) => (s[y] && s[y].net) || 0), 'bar', false),
-  ];
-  // Per-employer net lines: hidden by default, legend toggles.
-  // The CPP/EI cap jump is in the stored net figures, so the
-  // lines show it faithfully — nothing is recomputed here.
-  earnChartData.employers.forEach((e) => {
-    datasets.push(ds(`employer:${e}`, years.map((y) => (s[y] && s[y].employers && s[y].employers[e] ? s[y].employers[e].net : 0)), 'line', true));
-  });
-  earnSalaryChart = new Chart($('#earnSalaryChart'), { type: 'bar', data: { labels: years.map(String), datasets }, ...earnChartBase() });
-  window.__fmCharts.earnSalary = earnSalaryChart;
-}
-
 function drawEarnRentalsChart() {
   const years = earnEffectiveYears('rentals');
   if (earnRentalsChart) { earnRentalsChart.destroy(); earnRentalsChart = null; window.__fmCharts.earnRentals = null; }
@@ -8741,6 +8703,9 @@ function drawEarnRentalsChart() {
 }
 
 function drawEarnVisibleChart() {
+  // The Salary view carries no chart: its annual chart moved to the
+  // job detail page as a monthly stacked chart, so the salary
+  // branch is deliberately empty — only overview and rentals draw.
   const sub = (location.hash.split('/')[1] || 'salary');
   if (sub === 'overview') {
     $('#earnOverviewRange').innerHTML = earnRangeControlsHtml('overview');
@@ -8751,10 +8716,6 @@ function drawEarnVisibleChart() {
     earnWireRange('rentals');
     drawEarnRentalsChart();
     drawRentIncomePanel();
-  } else {
-    $('#earnSalaryRange').innerHTML = earnRangeControlsHtml('salary');
-    earnWireRange('salary');
-    drawEarnSalaryChart();
   }
 }
 
@@ -9216,6 +9177,10 @@ function earnJobDetailHtml(j) {
       <div class="note">${esc(c.estimateNote)}</div>
       <div class="note">Job start ${esc(j.start_date || '—')} · Recent payment ${esc(j.recent_pay_date || '—')} · Current per-period value ${money2(earnJobPerPeriod(j))}</div>
     </div>
+    ${j.start_date && j.recent_pay_date ? `<div class="panel" id="earnJobMonthlyPanel">
+      <div class="section-head"><h3>Monthly pay</h3></div>
+      <div><canvas id="earnJobMonthlyChart"></canvas></div>
+    </div>` : ''}
     <div class="panel">
       <div class="section-head"><h3>Pay changes</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddPayChange" onclick="earnJobDetailOpenRow('pay_change', null)">+ Pay change</button></div>
       ${pcRows || '<div class="note">No pay changes yet.</div>'}
@@ -9227,6 +9192,46 @@ function earnJobDetailHtml(j) {
     <div class="toolbar" id="earnJobDetailActions"><div class="spacer"></div><button class="small" id="earnJobDetailBodyEditBtn" onclick="earnEditJob(${j.id})">Edit</button><button class="small danger" id="earnJobDetailBodyDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete</button></div>`;
 }
 
+let earnJobMonthlyChart = null;
+
+// Monthly pay composition on the job detail page: one stacked bar
+// per month, bar height = that month's total gross, segments Tax,
+// CPP/EI, RRSP (own only, when a linked plan exists) and Net. The
+// legend is display-only: a click must never toggle a segment off,
+// or the stack would stop summing to the gross. The tooltip footer
+// repeats the month's total gross — the bar top IS the total, so
+// there is no separate total line.
+async function drawEarnJobMonthlyChart(id) {
+  const panel = $('#earnJobMonthlyPanel');
+  if (!panel) return;
+  try {
+    const s = await api(`/api/earnings/jobs/${id}/monthly-chart`);
+    if (currentEarnJobId !== id) return;
+    if (earnJobMonthlyChart) { earnJobMonthlyChart.destroy(); earnJobMonthlyChart = null; window.__fmCharts.earnJobMonthly = null; }
+    if (!s || !s.months || !s.months.length) { panel.classList.add('hidden'); return; }
+    panel.classList.remove('hidden');
+    const datasets = [
+      { key: 'tax', label: 'Tax', data: s.tax, backgroundColor: '#b3543f', borderColor: '#b3543f', borderWidth: 1, stack: 'pay' },
+      { key: 'cppEi', label: 'CPP/EI', data: s.cppEi, backgroundColor: '#8d6e00', borderColor: '#8d6e00', borderWidth: 1, stack: 'pay' },
+    ];
+    if (s.rrsp) datasets.push({ key: 'rrsp', label: 'RRSP contribution', data: s.rrsp, backgroundColor: '#283593', borderColor: '#283593', borderWidth: 1, stack: 'pay' });
+    datasets.push({ key: 'net', label: 'Net', data: s.net, backgroundColor: '#2e7d4f', borderColor: '#2e7d4f', borderWidth: 1, stack: 'pay' });
+    earnJobMonthlyChart = new Chart($('#earnJobMonthlyChart'), {
+      type: 'bar',
+      data: { labels: s.months.map(formatYM), datasets },
+      options: {
+        responsive: true,
+        scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, ticks: { callback: (v) => '$' + Number(v).toLocaleString() } } },
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 12 }, onClick: () => {} },
+          tooltip: { callbacks: { footer: (items) => `Total gross ${money2(items.reduce((a, it) => a + (Number(it.parsed.y) || 0), 0))}` } },
+        },
+      },
+    });
+    window.__fmCharts.earnJobMonthly = earnJobMonthlyChart;
+  } catch { panel.classList.add('hidden'); }
+}
+
 async function loadEarnJobDetail(id) {
   try {
     await loadEarnings();
@@ -9234,6 +9239,7 @@ async function loadEarnJobDetail(id) {
     if (!j) { location.hash = '#earnings/salary'; return; }
     currentEarnJobId = id;
     $('#earnJobDetail').innerHTML = earnJobDetailHtml(j);
+    drawEarnJobMonthlyChart(id);
   } catch (e) {
     const m = $('#earnJobDetailMsg');
     if (m) showMsg(m, 'err', e.message);

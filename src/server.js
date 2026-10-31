@@ -28,7 +28,7 @@ import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, m
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
-  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome, nextPayDate,
+  calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
   deriveRentalYearFigures, entryCoveredYears,
 } from './earnings.js';
 import {
@@ -3111,6 +3111,21 @@ app.delete('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   }
   db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(id);
   res.json({ ok: true });
+});
+
+// Monthly pay composition for the job detail page: stacked gross
+// segments per month (see jobMonthlySeries). Dateless jobs get an
+// empty series — the detail page renders no chart for them.
+app.get('/api/earnings/jobs/:id/monthly-chart', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'job not found' });
+  const job = earnJobRow(row);
+  const plans = db.prepare('SELECT start_date, own_amount, employer_amount FROM invest_plans WHERE job_id = ?').all(row.id);
+  const series = jobMonthlySeries({
+    frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
+    calc: job.calc, plans, today: vancouverToday(),
+  });
+  res.json(series || { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [] });
 });
 
 app.post('/api/earnings/rentals', requireApiAuth, (req, res) => {

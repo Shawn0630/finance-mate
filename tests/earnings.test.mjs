@@ -8,7 +8,7 @@ import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
   deriveRentalYearFigures, entryCoveredYears,
-  payDatesInWindow, deriveJobYtd, solveGrossForTakeHome, nextPayDate,
+  payDatesInWindow, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
 } from '../src/earnings.js';
 
 const job = (over = {}) => ({
@@ -482,4 +482,72 @@ test('take-home: unreachable targets are errors, never silent fallbacks', () => 
   assert.ok(solveTakeHome(-5).error);
   assert.ok(solveTakeHome(100, { frequency: 'bogus' }).error);
   assert.equal(solveTakeHome(0).gross, 0);
+});
+
+// ------------------------------------------------------- job monthly chart --
+const monthlyCalc = { perPeriod: { gross: 3000, net: 2000, totalTax: 800, cpp: 100, cpp2: 50, ei: 50 } };
+const monthlyBase = {
+  frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+  calc: monthlyCalc, plans: [], today: '2026-10-31',
+};
+
+test('monthly chart: months run start month through current month, stack sums to gross to the cent', () => {
+  const s = jobMonthlySeries(monthlyBase);
+  assert.deepEqual(s.months, ['2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10']);
+  assert.equal(s.rrsp, null);
+  // Biweekly from Mon 2026-01-05: Jan has 2 paydays, Mar has 3.
+  assert.equal(s.gross[0], 6000);
+  assert.equal(s.gross[2], 9000);
+  assert.equal(s.tax[2], 2400);
+  assert.equal(s.cppEi[2], 600);
+  assert.equal(s.net[2], 6000);
+  for (let i = 0; i < s.months.length; i++) {
+    assert.equal(Math.round((s.tax[i] + s.cppEi[i] + s.net[i]) * 100) / 100, s.gross[i], `month ${s.months[i]} stack must equal gross`);
+  }
+});
+
+test('monthly chart: RRSP segment is own only — employer match never enters the stack', () => {
+  const s = jobMonthlySeries({
+    ...monthlyBase,
+    plans: [{ start_date: '2026-01-05', own_amount: 100, employer_amount: 50 }],
+  });
+  assert.ok(Array.isArray(s.rrsp));
+  // Mar 2026 has 3 plan paydays: own 100 × 3 = 300, not (100 + 50) × 3.
+  assert.equal(s.rrsp[2], 300);
+  assert.equal(s.net[2], 6000 - 300);
+  for (let i = 0; i < s.months.length; i++) {
+    assert.equal(Math.round((s.tax[i] + s.cppEi[i] + s.rrsp[i] + s.net[i]) * 100) / 100, s.gross[i]);
+  }
+});
+
+test('monthly chart: RRSP starts at the plan start month, absent with no own-positive plan', () => {
+  const s = jobMonthlySeries({
+    ...monthlyBase,
+    plans: [{ start_date: '2026-03-02', own_amount: 100, employer_amount: 0 }],
+  });
+  assert.equal(s.rrsp[0], 0);
+  assert.equal(s.rrsp[1], 0);
+  assert.ok(s.rrsp[2] > 0);
+  const employerOnly = jobMonthlySeries({
+    ...monthlyBase,
+    plans: [{ start_date: '2026-01-05', own_amount: 0, employer_amount: 50 }],
+  });
+  assert.equal(employerOnly.rrsp, null);
+});
+
+test('monthly chart: annual jobs bar only on the anniversary month, other months show no bar', () => {
+  const s = jobMonthlySeries({
+    ...monthlyBase, frequency: 'annual', startDate: '2026-01-05', recentDate: '2026-10-23',
+    calc: { perPeriod: { gross: 60000, net: 40000, totalTax: 16000, cpp: 2000, cpp2: 500, ei: 1500 } },
+  });
+  assert.equal(s.months.length, 10);
+  for (let i = 0; i < 9; i++) assert.equal(s.gross[i], 0, `month ${s.months[i]} must have no bar`);
+  assert.equal(s.gross[9], 60000);
+  assert.equal(s.tax[9] + s.cppEi[9] + s.net[9], 60000);
+});
+
+test('monthly chart: dateless jobs get null, never a guessed date', () => {
+  assert.equal(jobMonthlySeries({ ...monthlyBase, startDate: null }), null);
+  assert.equal(jobMonthlySeries({ ...monthlyBase, recentDate: null }), null);
+  assert.equal(jobMonthlySeries({ ...monthlyBase, calc: null }), null);
 });

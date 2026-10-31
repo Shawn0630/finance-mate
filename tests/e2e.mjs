@@ -7201,6 +7201,153 @@ try {
         if (!legacyGone) await wait(300);
       }
       check('the legacy fixture job is gone server-side', legacyGone);
+
+      // ---- Job detail monthly chart: stacked gross composition ----
+      // Fixture ids live outside the nested try so the finally below
+      // always cleans up — a mid-block failure must not pollute the
+      // later investments/portfolio assertions.
+      let monthlyJobId = null;
+      let monthlyPlanId = null;
+      let monthlyRrspId = null;
+      let annualJobId = null;
+      let datelessChartJobId = null;
+      try {
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Monthly Corp', province: 'BC', frequency: 'biweekly',
+        start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+      });
+      monthlyJobId = r.data.id;
+      // List cards unchanged: the card still shows its next-pay line.
+      // The page may already sit on the Salary hash (same-hash goto
+      // would not fire the router), so step away first to force a
+      // fresh list render that includes the new job.
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(500);
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('salary list card keeps its next-pay line',
+        await untilEval((id) => {
+          const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+          return card && card.textContent.includes('Monthly Corp') && card.textContent.includes('Next pay date');
+        }, monthlyJobId));
+      await page.goto(`http://ff.local/#earnings/job/${monthlyJobId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('detail monthly chart draws',
+        await until(() => {
+          const c = window.__fmCharts.earnJobMonthly;
+          return !!c && c.data.labels.length > 0;
+        }));
+      const monthlyChart = await page.evaluate(() => {
+        const c = window.__fmCharts.earnJobMonthly;
+        if (!c) return null;
+        const byKey = {};
+        c.data.datasets.forEach((d) => { byKey[d.key] = d.data; });
+        return { labels: c.data.labels, keys: c.data.datasets.map((d) => d.key), byKey };
+      });
+      // Months run Jan 2026 through the current Vancouver month.
+      const vTodayM = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+      const curYmM = vTodayM.slice(0, 7);
+      const expMonthsM = (Number(curYmM.slice(0, 4)) - 2026) * 12 + Number(curYmM.slice(5, 7));
+      check('detail monthly chart renders Jan 2026 through the current month, no RRSP without a plan',
+        monthlyChart && monthlyChart.labels.length === expMonthsM && monthlyChart.labels[0] === 'Jan 2026'
+        && !monthlyChart.keys.includes('rrsp')
+        && monthlyChart.keys.join(',') === 'tax,cppEi,net',
+        JSON.stringify(monthlyChart && { n: monthlyChart.labels.length, first: monthlyChart.labels[0], keys: monthlyChart.keys }));
+      const monthlySeries = (await req('GET', `/api/earnings/jobs/${monthlyJobId}/monthly-chart`)).data;
+      check('detail chart stacks to the monthly gross to the cent, every month',
+        monthlyChart && monthlySeries.months.every((_, i) =>
+          Math.round((monthlyChart.byKey.tax[i] + monthlyChart.byKey.cppEi[i] + monthlyChart.byKey.net[i]) * 100) / 100
+          === monthlySeries.gross[i]),
+        JSON.stringify(monthlySeries && monthlySeries.gross));
+      check('detail chart shape: a 3-payday month stacks 1.5x a 2-payday month',
+        monthlyChart
+        && Math.round((monthlyChart.byKey.tax[2] + monthlyChart.byKey.cppEi[2] + monthlyChart.byKey.net[2]) * 100)
+        === Math.round((monthlyChart.byKey.tax[1] + monthlyChart.byKey.cppEi[1] + monthlyChart.byKey.net[1]) * 100 * 1.5),
+        JSON.stringify(monthlyChart && { feb: monthlyChart.byKey.tax[1] + monthlyChart.byKey.cppEi[1] + monthlyChart.byKey.net[1], mar: monthlyChart.byKey.tax[2] + monthlyChart.byKey.cppEi[2] + monthlyChart.byKey.net[2] }));
+      // RRSP plan: own enters the stack, the employer match does not.
+      r = await req('POST', '/api/investments/accounts', { name: 'Monthly RRSP', type: 'RRSP' });
+      monthlyRrspId = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${monthlyRrspId}/holdings`, { label: 'Monthly Fund', kind: 'fund', currency: 'CAD' });
+      const monthlyFundId = r.data.id;
+      await req('POST', `/api/investments/holdings/${monthlyFundId}/nav`, { date: '2025-12-31', price: 10 });
+      r = await req('POST', `/api/investments/accounts/${monthlyRrspId}/plans`, { job_id: monthlyJobId, target_holding_id: monthlyFundId, start_date: '2026-01-05', own_amount: 100, employer_amount: 50 });
+      monthlyPlanId = r.data.id;
+      // The page is already on this job's detail hash, so a goto to
+      // the same hash would not fire the router: step away to the
+      // Salary list first, then back, to force a redraw.
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(500);
+      await page.goto(`http://ff.local/#earnings/job/${monthlyJobId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('detail monthly chart redraws with an RRSP dataset after the plan links',
+        await until(() => {
+          const c = window.__fmCharts.earnJobMonthly;
+          return !!c && c.data.datasets.some((d) => d.key === 'rrsp');
+        }));
+      const monthlyChartRrsp = await page.evaluate(() => {
+        const c = window.__fmCharts.earnJobMonthly;
+        if (!c) return null;
+        const byKey = {};
+        c.data.datasets.forEach((d) => { byKey[d.key] = d.data; });
+        return { keys: c.data.datasets.map((d) => d.key), byKey };
+      });
+      const monthlySeriesRrsp = (await req('GET', `/api/earnings/jobs/${monthlyJobId}/monthly-chart`)).data;
+      check('detail chart RRSP segment is own only: Mar 2026 is 100 x 3 paydays, not 150 x 3',
+        monthlyChartRrsp && monthlyChartRrsp.byKey.rrsp[2] === 300 && monthlyChartRrsp.byKey.rrsp[0] === 200,
+        JSON.stringify(monthlyChartRrsp && monthlyChartRrsp.byKey.rrsp));
+      check('detail chart with RRSP still stacks to the monthly gross to the cent',
+        monthlyChartRrsp && monthlySeriesRrsp.months.every((_, i) =>
+          Math.round((monthlyChartRrsp.byKey.tax[i] + monthlyChartRrsp.byKey.cppEi[i] + monthlyChartRrsp.byKey.rrsp[i] + monthlyChartRrsp.byKey.net[i]) * 100) / 100
+          === monthlySeriesRrsp.gross[i]),
+        JSON.stringify(monthlySeriesRrsp && monthlySeriesRrsp.gross));
+      // Annual job: only the anniversary month bars; other months show no bar.
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Annual Corp', province: 'BC', frequency: 'annual',
+        start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 60000,
+      });
+      annualJobId = r.data.id;
+      await page.goto(`http://ff.local/#earnings/job/${annualJobId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('annual detail chart draws',
+        await until(() => {
+          const c = window.__fmCharts.earnJobMonthly;
+          return !!c && c.data.labels.length > 0;
+        }));
+      const annualChart = await page.evaluate(() => {
+        const c = window.__fmCharts.earnJobMonthly;
+        if (!c) return null;
+        const byKey = {};
+        c.data.datasets.forEach((d) => { byKey[d.key] = d.data; });
+        return { labels: c.data.labels, byKey };
+      });
+      check('annual detail chart bars only the anniversary month',
+        annualChart && annualChart.labels.length === expMonthsM
+        && annualChart.byKey.tax.slice(0, 9).every((v, i) => v === 0 && annualChart.byKey.cppEi[i] === 0 && annualChart.byKey.net[i] === 0)
+        && annualChart.byKey.tax[9] + annualChart.byKey.cppEi[9] + annualChart.byKey.net[9] > 0,
+        JSON.stringify(annualChart && annualChart.byKey));
+      // Dateless job: no chart panel at all, never a guessed date.
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Dateless Corp', province: 'BC', frequency: 'annual',
+        gross_amount: 60000, gross_basis: 'annual', tax_year: 2026,
+      });
+      datelessChartJobId = r.data.id;
+      await page.goto(`http://ff.local/#earnings/job/${datelessChartJobId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('dateless job detail shows no monthly chart panel',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && !d.classList.contains('hidden') && d.textContent.includes('Dateless Corp')
+            && !document.querySelector('#earnJobMonthlyPanel');
+        }));
+      } finally {
+        // Cleanup: plan, then account, then jobs — always, even when
+        // a check above failed, so later sections see a clean state.
+        if (monthlyPlanId) await req('DELETE', `/api/investments/plans/${monthlyPlanId}`);
+        if (monthlyRrspId) await req('DELETE', `/api/investments/accounts/${monthlyRrspId}`);
+        if (monthlyJobId) await req('DELETE', `/api/earnings/jobs/${monthlyJobId}`);
+        if (annualJobId) await req('DELETE', `/api/earnings/jobs/${annualJobId}`);
+        if (datelessChartJobId) await req('DELETE', `/api/earnings/jobs/${datelessChartJobId}`);
+      }
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));
@@ -11590,8 +11737,10 @@ try {
       check('earnings UI: rentals section lists the rental with its T776 year summary',
         rentalText.includes('Basement suite') && rentalText.includes('Owner share'),
         rentalText.slice(0, 300));
-      // Earnings charts: overview composition, salary trend, rental
-      // net — plus the standard legend left-click toggle.
+      // Earnings charts: overview composition, rental net — plus
+      // the standard legend left-click toggle. The Salary view
+      // carries no chart any more (it moved to the job detail
+      // page), so its panel-absence is pinned below instead.
       const clickLegend = (chartKey, seriesKey) => page.evaluate((ck, sk) => {
         const c = window.__fmCharts[ck];
         if (!c || !c.legend) return 'no-chart';
@@ -11625,52 +11774,65 @@ try {
       });
       check('earnings charts: legend left click hides the salary series',
         salaryHidden === true, JSON.stringify(salaryHidden));
+      // The Salary view carries no chart any more: the annual salary
+      // chart moved to the job detail page as a monthly stacked
+      // chart. The view keeps its header, estimate note and list.
       await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
-      const salInfo = await page.evaluate(() => {
-        const c = window.__fmCharts.earnSalary;
-        return c ? { labels: c.data.labels, keys: c.data.datasets.map((d) => d.key) } : null;
-      });
-      check('earnings charts: salary trend shows gross + net series',
-        salInfo && salInfo.labels.includes('2026') && salInfo.keys.includes('gross') && salInfo.keys.includes('net'),
-        JSON.stringify(salInfo));
+      const salGone = await page.evaluate(() => ({
+        canvas: !!document.querySelector('#earnSalaryChart'),
+        range: !!document.querySelector('#earnSalaryRange'),
+        empty: !!document.querySelector('#earnSalaryEmpty'),
+        rangeBar: !!document.querySelector('[data-earn-range="salary"]'),
+        chart: !!window.__fmCharts.earnSalary,
+        list: !!document.querySelector('#earnJobList'),
+        addBtn: !!document.querySelector('#addEarnJobBtn'),
+      }));
+      check('earnings UI: salary chart panel is gone from the Salary view, list and Add stay',
+        !salGone.canvas && !salGone.range && !salGone.empty && !salGone.rangeBar && !salGone.chart
+        && salGone.list && salGone.addBtn, JSON.stringify(salGone));
       // Earnings range bars use the shared month picker now, not
       // native year selects (whose popup rendered detached from
       // the panel). The picked month's YEAR drives the year filter.
+      // The picker coverage moved to the overview bar with the
+      // salary chart's removal.
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
       const earnRangeUi = await page.evaluate(() => {
-        const bar = document.querySelector('[data-earn-range="salary"]');
+        const bar = document.querySelector('[data-earn-range="overview"]');
         return {
           hasSelect: !!bar.querySelector('select'),
           hasFromBtn: !!bar.querySelector('[data-earn-month="from"]'),
           hasToBtn: !!bar.querySelector('[data-earn-month="to"]'),
         };
       });
-      check('earnings UI: salary range bar uses month-field buttons, no native year selects',
+      check('earnings UI: overview range bar uses month-field buttons, no native year selects',
         !earnRangeUi.hasSelect && earnRangeUi.hasFromBtn && earnRangeUi.hasToBtn, JSON.stringify(earnRangeUi));
-      await page.click('[data-earn-range="salary"] [data-earn-month="from"]');
+      await page.click('[data-earn-range="overview"] [data-earn-month="from"]');
       await waitE(300);
       const earnPopRect = await page.evaluate(() => {
-        const f = document.querySelector('[data-earn-range="salary"] [data-earn-month="from"]').getBoundingClientRect();
+        const f = document.querySelector('[data-earn-range="overview"] [data-earn-month="from"]').getBoundingClientRect();
         const p = document.querySelector('#monthPop');
         const pr = p.getBoundingClientRect();
         return { hidden: p.classList.contains('hidden'), fBottom: f.bottom, fLeft: f.left, pTop: pr.top, pLeft: pr.left, pWidth: p.offsetWidth, vw: window.innerWidth };
       });
-      check('earnings UI: the month picker opens glued to its salary From button',
+      check('earnings UI: the month picker opens glued to its overview From button',
         !earnPopRect.hidden && Math.abs(earnPopRect.pTop - (earnPopRect.fBottom + 6)) <= 2
         && Math.abs(earnPopRect.pLeft - Math.max(4, Math.min(earnPopRect.fLeft, earnPopRect.vw - earnPopRect.pWidth - 4))) <= 2,
         JSON.stringify(earnPopRect));
       await page.click('#monthPop button[data-ym="2026-06"]');
       await waitE(600);
       const earnPick = await page.evaluate(() => {
-        const c = window.__fmCharts.earnSalary;
-        const btn = document.querySelector('[data-earn-range="salary"] [data-earn-month="from"]');
+        const c = window.__fmCharts.earnOverview;
+        const btn = document.querySelector('[data-earn-range="overview"] [data-earn-month="from"]');
         return { labels: c ? c.data.labels : null, btnText: btn ? btn.textContent : null, btnVal: btn ? btn.dataset.value : null };
       });
-      check('earnings UI: picking Jun 2026 filters the salary chart to 2026 and labels the button',
-        earnPick.labels && earnPick.labels.length === 1 && earnPick.labels[0] === '2026'
+      check('earnings UI: picking Jun 2026 filters the overview chart to 2026+ and labels the button',
+        earnPick.labels && earnPick.labels.length >= 1 && earnPick.labels.includes('2026')
+        && earnPick.labels.every((y) => Number(y) >= 2026)
         && earnPick.btnText === 'Jun 2026' && earnPick.btnVal === '2026-06',
         JSON.stringify(earnPick));
-      await page.click('[data-earn-range="salary"] [data-years="0"]');
+      await page.click('[data-earn-range="overview"] [data-years="0"]');
       await waitE(500);
       await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);

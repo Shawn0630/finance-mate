@@ -591,6 +591,81 @@ export function aggregateEarningsCharts(jobs, rentals) {
   };
 }
 
+// ------------------------------------------------- job monthly chart --
+// Monthly pay composition for the job detail page: one stacked bar
+// per month, bar height = that month's total gross, segments Tax,
+// CPP/EI, RRSP (own only) and Net summing EXACTLY to the gross.
+// Monthly figures are the stored per-period calc values × paydays in
+// the month, on the same cadence nextPayDate uses (weekly /
+// bi-weekly step from the start date, monthly on the start day
+// clamped to month-end, semi-monthly 15th + month-end, annual on
+// the recent date's anniversary). Segments are rounded first and
+// the gross is their sum, so the stack never shows a 1-cent gap
+// from per-period rounding. Deliberate limits: the stored calc is
+// the CURRENT rate's, so months before a raise show the current
+// rate (charts never recompute tax); bonuses are one-off, not
+// monthly pay, so they never enter; the current month counts all
+// its scheduled paydays. Dateless jobs get null — never a guessed
+// date. RRSP counts only linked plans' OWN per-period amount — the
+// employer match is not from gross, so it never enters the stack;
+// with no own-positive plan the rrsp series is null (absent, not
+// a zero slice).
+function countPaydaysInMonth(frequency, y, m, anchor, anniversary) {
+  const start = ymPad(y, m, 1);
+  const end = ymPad(y, m, lastDayOfMonth(y, m));
+  if (frequency === 'annual') {
+    // payDatesInWindow's annual fallthrough ([to]) is only valid
+    // for its YTD window; a month's annual payday is the
+    // anniversary date falling in that month, on or after the anchor.
+    const [, am, ad] = anniversary.split('-').map(Number);
+    if (m !== am) return 0;
+    const d = ymPad(y, am, Math.min(ad, lastDayOfMonth(y, am)));
+    return d >= anchor ? 1 : 0;
+  }
+  return payDatesInWindow(frequency, start, end, anchor).length;
+}
+
+export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans, today }) {
+  const pp = calc && calc.perPeriod;
+  if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today) || !pp) return null;
+  const startYm = startDate.slice(0, 7);
+  const endYm = today.slice(0, 7);
+  if (startYm > endYm) return { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [] };
+  const months = [];
+  let y = Number(startYm.slice(0, 4));
+  let m = Number(startYm.slice(5, 7));
+  const endY = Number(endYm.slice(0, 4));
+  const endM = Number(endYm.slice(5, 7));
+  while (y < endY || (y === endY && m <= endM)) {
+    months.push(ymPad(y, m, 1).slice(0, 7));
+    m += 1; if (m > 12) { m = 1; y += 1; }
+  }
+  const ownPlans = (plans || []).filter((p) => Number(p.own_amount) > 0 && normJobDate(p.start_date));
+  const rrspPresent = ownPlans.length > 0;
+  const gross = [];
+  const tax = [];
+  const cppEi = [];
+  const rrsp = rrspPresent ? [] : null;
+  const net = [];
+  for (const ym of months) {
+    const yy = Number(ym.slice(0, 4));
+    const mm = Number(ym.slice(5, 7));
+    const n = countPaydaysInMonth(frequency, yy, mm, startDate, recentDate);
+    const t = round2(pp.totalTax * n);
+    const c = round2((pp.cpp + pp.cpp2 + pp.ei) * n);
+    const r = rrspPresent
+      ? round2(ownPlans.reduce((s, p) => s + Number(p.own_amount) * countPaydaysInMonth(frequency, yy, mm, p.start_date, p.start_date), 0))
+      : 0;
+    const nt = round2(pp.net * n) - r;
+    tax.push(t);
+    cppEi.push(c);
+    if (rrsp) rrsp.push(r);
+    net.push(nt);
+    gross.push(round2(t + c + r + nt));
+  }
+  return { months, gross, tax, cppEi, rrsp, net };
+}
+
 // ------------------------------------------------------------ rental --
 export function validRentalInput(body) {
   const b = body || {};
