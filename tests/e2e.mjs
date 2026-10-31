@@ -13697,40 +13697,57 @@ try {
         balUi.info && balUi.info.includes('Credit limit $5,000.00') && balUi.info.includes('Balance owed $309.85') && balUi.info.includes('as of 2026-10-30')
         && balUi.fillPresent && balUi.fillVisible && balUi.sameHead && balUi.panelCollapsedBefore && balUi.delDanger,
         JSON.stringify(balUi));
-      const fillTxTopBefore = await page.evaluate(() => {
-        const tx = document.querySelector('#spendFillPanel + .panel');
-        return tx ? Math.round(tx.getBoundingClientRect().top + window.scrollY) : null;
+      // The Fill panel now sits ABOVE the Spending-over-time panel,
+      // so opening it pushes both that panel and the transactions
+      // panel down; closing pulls both back.
+      const fillBefore = await page.evaluate(() => {
+        const fill = document.querySelector('#spendFillPanel');
+        const detail = document.querySelector('#spendDetailPanel');
+        const tx = document.querySelector('#spendDetailTxTable').closest('.panel');
+        const top = (el) => el ? Math.round(el.getBoundingClientRect().top + window.scrollY) : null;
+        return {
+          fillAboveDetail: !!(fill && detail) && (fill.compareDocumentPosition(detail) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+          detailTop: top(detail),
+          txTop: top(tx),
+        };
       });
       await page.click('#spendFillToggleBtn');
       await waitF(650);
       const fillOpen = await page.evaluate(() => {
         const panel = document.querySelector('#spendFillPanel');
-        const tx = document.querySelector('#spendFillPanel + .panel');
+        const detail = document.querySelector('#spendDetailPanel');
+        const tx = document.querySelector('#spendDetailTxTable').closest('.panel');
+        const top = (el) => el ? Math.round(el.getBoundingClientRect().top + window.scrollY) : null;
         return {
           open: !!panel && panel.classList.contains('fill-open') && panel.getBoundingClientRect().height > 0,
-          txTop: tx ? Math.round(tx.getBoundingClientRect().top + window.scrollY) : null,
+          detailTop: top(detail),
+          txTop: top(tx),
           hasPaste: !!document.querySelector('#spendFillText'),
           hasExtract: !!document.querySelector('#spendFillBtn'),
           hasProposals: !!document.querySelector('#spendFillProposals'),
         };
       });
-      check('spending UI: clicking Fill with AI expands the Fill panel and pushes the transactions panel down',
-        fillOpen.open && fillTxTopBefore !== null && fillOpen.txTop !== null && fillOpen.txTop > fillTxTopBefore
+      check('spending UI: clicking Fill with AI expands the Fill panel and pushes the detail and transactions panels down',
+        fillBefore.fillAboveDetail && fillOpen.open && fillBefore.detailTop !== null && fillOpen.detailTop > fillBefore.detailTop
+          && fillBefore.txTop !== null && fillOpen.txTop > fillBefore.txTop
           && fillOpen.hasPaste && fillOpen.hasExtract && fillOpen.hasProposals,
-        JSON.stringify({ before: fillTxTopBefore, ...fillOpen }));
+        JSON.stringify({ before: fillBefore, ...fillOpen }));
       await page.click('#spendFillToggleBtn');
       await waitF(650);
       const fillClosed = await page.evaluate(() => {
         const panel = document.querySelector('#spendFillPanel');
-        const tx = document.querySelector('#spendFillPanel + .panel');
+        const detail = document.querySelector('#spendDetailPanel');
+        const tx = document.querySelector('#spendDetailTxTable').closest('.panel');
+        const top = (el) => el ? Math.round(el.getBoundingClientRect().top + window.scrollY) : null;
         return {
           closed: !!panel && !panel.classList.contains('fill-open') && panel.getBoundingClientRect().height === 0,
-          txTop: tx ? Math.round(tx.getBoundingClientRect().top + window.scrollY) : null,
+          detailTop: top(detail),
+          txTop: top(tx),
         };
       });
-      check('spending UI: closing Fill with AI collapses it to zero space and pulls the transactions panel back',
-        fillClosed.closed && fillClosed.txTop === fillTxTopBefore,
-        JSON.stringify({ before: fillTxTopBefore, ...fillClosed }));
+      check('spending UI: closing Fill with AI collapses it to zero space and pulls the detail and transactions panels back',
+        fillClosed.closed && fillClosed.detailTop === fillBefore.detailTop && fillClosed.txTop === fillBefore.txTop,
+        JSON.stringify({ before: fillBefore, ...fillClosed }));
       await page.click('#spendDetailImportBtn');
       await waitF(300);
       const importUi = await page.evaluate(() => {
