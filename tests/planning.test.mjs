@@ -1,0 +1,229 @@
+// Planning: penalty math, prime scenarios, op/leg validation, the
+// projection's cost/gain/net accounting (measured against the baseline
+// trajectory, never against today's value), historical return
+// suggestions with honest windows, and merge/revert write building.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  calcPenalty, presetPrimeSteps, scenarioPrimeHistory,
+  validateOp, validateLegs, computeProjection, compareProjections,
+  returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
+  resolveBuyLegs,
+} from '../src/planning.js';
+
+const PROP = () => ({
+  id: 1, mortgage_balance: 500000, mortgage_balance_date: '2026-01-01',
+  region: 'CA', payment_day: 1, payment_frequency: 'monthly',
+  terms: [{ id: 1, property_id: 1, start_date: '2026-01-01', term_months: 60, amortization_years: 25, repayment_method: 'equal_payment' }],
+  segments: [{ id: 1, property_id: 1, start_date: '2026-01-01', rate_type: 'fixed', rate_mode: 'absolute', annual_rate: 5.0, compounding: 'semi_annual', accrual: 'monthly' }],
+  lumpSums: [],
+});
+const MAINLINE = (over = {}) => ({
+  properties: [PROP()], holdings: [], fxRateLatest: null, declaredAssets: [], assessed: { 1: 1000000 },
+  ...over,
+});
+const ARGS = (over = {}) => ({
+  mainline: MAINLINE(), ops: [], legs: [], assumptions: {},
+  scenario: null, primeHistory: [], currentPrime: 4.70, currentMonth: '2026-11',
+  ...over,
+});
+
+// ---------------------------------------------------------------- penalty
+test('calcPenalty: fixed closed takes the greater of 3 months vs IRD', () => {
+  // 3 months on $400,000 at 5% = $5,000. IRD at (5 − 3)% × $400,000 × 4y = $32,000.
+  const r = calcPenalty({ balanceAtBreak: 400000, contractRatePct: 5, comparableRatePct: 3, remainingMonths: 48, kind: 'fixed_closed' });
+  assert.equal(r.penalty, 32000);
+  assert.equal(r.method, 'ird');
+  assert.equal(r.estimate, true);
+  // Comparable above contract: IRD floors at 0, 3 months wins.
+  const r2 = calcPenalty({ balanceAtBreak: 400000, contractRatePct: 5, comparableRatePct: 6, remainingMonths: 48, kind: 'fixed_closed' });
+  assert.equal(r2.penalty, 5000);
+  assert.equal(r2.method, 'three_months_interest');
+  // No comparable rate: IRD is not computed, 3 months stands.
+  const r3 = calcPenalty({ balanceAtBreak: 400000, contractRatePct: 5, comparableRatePct: null, remainingMonths: 48, kind: 'fixed_closed' });
+  assert.equal(r3.penalty, 5000);
+  assert.equal(r3.ird, null);
+});
+test('calcPenalty: variable closed is 3 months interest, open is 0', () => {
+  const v = calcPenalty({ balanceAtBreak: 400000, contractRatePct: 5, comparableRatePct: 3, remainingMonths: 48, kind: 'variable_closed' });
+  assert.equal(v.penalty, 5000);
+  const o = calcPenalty({ balanceAtBreak: 400000, contractRatePct: 5, comparableRatePct: 3, remainingMonths: 48, kind: 'open' });
+  assert.equal(o.penalty, 0);
+});
+
+// ------------------------------------------------------------- scenarios
+test('presetPrimeSteps: up-pessimistic steps within a year, flat is empty', () => {
+  const steps = presetPrimeSteps({ direction: 'up', stance: 'pessimistic', magnitude: 2.0 }, 4.70, '2026-11');
+  assert.equal(steps.length, 4);
+  assert.equal(steps[steps.length - 1].rate, 6.70);
+  assert.equal(presetPrimeSteps({ direction: 'flat' }, 4.70, '2026-11').length, 0);
+});
+test('scenarioPrimeHistory: only steps after the last actual observation survive', () => {
+  const actual = [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-04', rate: 4.70 }];
+  const out = scenarioPrimeHistory(actual, { direction: 'up', stance: 'pessimistic', magnitude: 2.0 }, 4.70, '2026-11');
+  assert.ok(out.every((o) => o.date >= '2026-10-28'));
+  assert.equal(out[out.length - 1].rate, 6.70);
+});
+
+// ------------------------------------------------------------- validation
+test('validateOp: shape errors, past dates, sell guards, position price ban', () => {
+  assert.ok(validateOp({ op_type: 'buy', params: { accountId: 1, date: '2026-12-01' } }, { currentMonth: '2026-11' }).length > 0);
+  assert.ok(validateOp({ op_type: 'prepay', params: { propertyId: 1, date: '2026-10-01', amount: 1000 } }, { currentMonth: '2026-11' }).some((e) => /before the current month/.test(e)));
+  assert.ok(validateOp({ op_type: 'sell', params: { holdingId: 1, date: '2026-12-01', units: 50 } }, { currentMonth: '2026-11', unitsAvailable: 40 }).some((e) => /only 40 held/.test(e)));
+  assert.ok(validateOp({ op_type: 'position', params: { accountId: 1, date: '2026-12-01', units: 10, price: 5 } }, { currentMonth: '2026-11' }).some((e) => /no price/.test(e)));
+  assert.deepEqual(validateOp({ op_type: 'prepay', params: { propertyId: 1, date: '2026-12-01', amount: 1000 } }, { currentMonth: '2026-11' }), []);
+});
+test('validateLegs: funding cycles are rejected', () => {
+  const ops = [
+    { seq: 1, op_type: 'sell', params: {} },
+    { seq: 2, op_type: 'buy', params: {} },
+  ];
+  const legs = [
+    { op_seq: 2, source_ref: 'op:1', amount: 'all' },
+    { op_seq: 1, source_ref: 'op:2', amount: 'all' },
+  ];
+  assert.ok(validateLegs(ops, legs).some((e) => /cycle/.test(e)));
+  assert.deepEqual(validateLegs(ops, [{ op_seq: 2, source_ref: 'op:1', amount: 'all' }]), []);
+});
+
+// ------------------------------------------------------------- projection
+test('computeProjection: open-plan prepay costs exactly the prepay and saves interest', () => {
+  const base = computeProjection(ARGS());
+  const strat = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'prepay', params: { propertyId: 1, date: '2026-12-01', amount: 100000, openClosed: 'open' } }],
+  }));
+  assert.deepEqual(strat.errors, []);
+  assert.equal(strat.cost, 100000);
+  assert.equal(strat.penaltyTotal, 0);
+  assert.ok(strat.mortgage.interestSaved > 0);
+  assert.ok(strat.payoffShiftMonths > 0);
+  const cmp = compareProjections(base, strat);
+  assert.equal(cmp.cost, 100000);
+  assert.equal(cmp.gain, cmp.interestSaved);
+  assert.equal(cmp.net, cmp.gain - cmp.cost);
+});
+test('computeProjection: a do-nothing strategy books no gain, even with growth', () => {
+  const holding = {
+    id: 1, accountId: 1, symbol: 'XQQ.TO', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 50 }],
+    pricePoints: [{ date: '2026-10-31', price: 60 }],
+  };
+  const args = ARGS({ mainline: MAINLINE({ holdings: [holding] }), assumptions: { stockReturnPct: '10' } });
+  const base = computeProjection(args);
+  const strat = computeProjection({ ...args, ops: [] });
+  const cmp = compareProjections(base, strat);
+  assert.equal(cmp.net, 0);
+  assert.equal(cmp.gain, 0);
+  assert.equal(cmp.cost, 0);
+});
+test('computeProjection: buy with a cash leg books buy cash; sell repay cuts interest', () => {
+  const holding = {
+    id: 1, accountId: 1, symbol: 'XQQ.TO', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 50 }],
+    pricePoints: [{ date: '2026-10-31', price: 60 }],
+  };
+  const ml = MAINLINE({ holdings: [holding] });
+  const buy = computeProjection(ARGS({
+    mainline: ml,
+    ops: [{ seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', date: '2026-12-01', units: 10, price: 60 } }],
+    legs: [{ op_seq: 1, source_ref: 'cash', amount: 'remainder' }],
+  }));
+  assert.deepEqual(buy.errors, []);
+  assert.equal(buy.stocks.buyCash, 600);
+  assert.equal(buy.cost, 600);
+  const sell = computeProjection(ARGS({
+    mainline: MAINLINE({ holdings: [holding] }),
+    ops: [{ seq: 1, op_type: 'sell', params: { holdingId: 1, date: '2026-12-01', units: 10, price: 60 } }],
+    legs: [{ op_seq: 1, source_ref: 'repay:1', amount: 'all' }],
+  }));
+  assert.deepEqual(sell.errors, []);
+  assert.ok(sell.mortgage.interestSaved > 0);
+});
+test('computeProjection: closed-plan prepay above privilege pays a penalty', () => {
+  const strat = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'prepay', params: { propertyId: 1, date: '2026-12-01', amount: 100000, openClosed: 'closed' } }],
+    assumptions: { privilegePct: '10', comparableRate: '4' },
+  }));
+  assert.deepEqual(strat.errors, []);
+  // Privilege 10% of the $500,000 opening = $50,000; $50,000 penalized.
+  assert.ok(strat.penaltyTotal > 0);
+  assert.equal(strat.penalties.length, 1);
+  assert.equal(strat.penalties[0].estimate, true);
+});
+
+// ------------------------------------------------------- return suggestions
+test('returnSuggestionsFromPoints: windows label their actual coverage', () => {
+  const pts = [
+    { date: '2021-10-15', price: 40 },
+    { date: '2023-10-15', price: 50 },
+    { date: '2025-10-15', price: 55 },
+    { date: '2026-10-15', price: 60 },
+  ];
+  const out = returnSuggestionsFromPoints(pts, '2026-11');
+  const byLabel = Object.fromEntries(out.map((x) => [x.label, x]));
+  assert.equal(byLabel['1y'].window, '2025-10 → 2026-10');
+  assert.equal(byLabel['3y'].window, '2023-10 → 2026-10');
+  assert.equal(byLabel['5y'].window, '2021-10 → 2026-10');
+  assert.ok(byLabel['1y'].annualizedReturn > 0);
+  // A short history never claims a 3y/5y window.
+  const short = returnSuggestionsFromPoints([{ date: '2026-03-01', price: 50 }, { date: '2026-10-15', price: 60 }], '2026-11');
+  assert.ok(!short.some((x) => x.label === '3y' || x.label === '5y' || x.label === '1y'));
+  assert.ok(short.some((x) => /since first price/.test(x.label)));
+  assert.equal(short.find((x) => /since first price/.test(x.label)).annualizedReturn, null);
+});
+
+// ------------------------------------------------------------- leg solving
+test('resolveBuyLegs: pot caps, declared maturity gates, remainder fills', () => {
+  const base = { pot: 1000, opOutputs: new Map(), declaredAssets: [{ id: 1, name: 'GIC', amount: 5000, maturity_date: '2027-06-01' }], opDate: '2026-12-01', holdingCurrency: 'CAD', fxRate: 1 };
+  const over = resolveBuyLegs([{ source_ref: 'pot', amount: 2000 }], 2000, base);
+  assert.ok(/only 1000/.test(over.error));
+  const immature = resolveBuyLegs([{ source_ref: 'declared:1', amount: 'all' }], 5000, base);
+  assert.ok(/matures/.test(immature.error));
+  const ok = resolveBuyLegs([{ source_ref: 'pot', amount: 400 }, { source_ref: 'cash', amount: 'remainder' }], 1500, base);
+  assert.equal(ok.pot, 600);
+});
+
+// ------------------------------------------------------- merge-write build
+test('buildMergeWrites: prepay inserts, switch replaces later segments, conflicts surface', () => {
+  const snapshot = {
+    properties: [{ id: 1 }], mortgage_terms: [{ id: 1, property_id: 1, start_date: '2026-01-01', payment_override: null }],
+    rate_segments: [{ id: 1, property_id: 1, start_date: '2026-01-01', rate_type: 'fixed' }],
+    lump_sums: [], invest_accounts: [], invest_holdings: [], invest_events: [],
+  };
+  const current = JSON.parse(JSON.stringify(snapshot));
+  current.rate_segments.push({ id: 2, property_id: 1, start_date: '2027-06-01', rate_type: 'fixed' });
+  const ops = [
+    { seq: 1, op_type: 'prepay', params: { propertyId: 1, date: '2026-12-01', amount: 5000 } },
+    { seq: 2, op_type: 'rate_switch', params: { propertyId: 1, date: '2027-01-01', rateType: 'fixed', annualRate: 4.0 } },
+  ];
+  const { writes, conflicts } = buildMergeWrites({ ops, legs: [], snapshot, current, projection: {} });
+  assert.ok(writes.some((w) => w.kind === 'insert' && w.table === 'lump_sums'));
+  assert.ok(writes.some((w) => w.kind === 'delete' && w.table === 'rate_segments' && w.rowId === 2));
+  assert.ok(writes.some((w) => w.kind === 'insert' && w.table === 'rate_segments'));
+  assert.deepEqual(conflicts, []);
+  // Mainline changed the term's override since the snapshot: conflict.
+  const changed = JSON.parse(JSON.stringify(current));
+  changed.mortgage_terms[0].payment_override = 3000;
+  const ops2 = [{ seq: 1, op_type: 'payment_change', params: { propertyId: 1, date: '2026-12-01', payment: 2500 } }];
+  const r2 = buildMergeWrites({ ops: ops2, legs: [], snapshot, current: changed, projection: {} });
+  assert.ok(r2.conflicts.some((c) => c.table === 'mortgage_terms' && c.field === 'payment_override' && c.base === null && c.current === 3000 && c.incoming === 2500));
+});
+test('buildRevertInverse: inserts delete, updates restore, deleted segments clash', () => {
+  const entries = [
+    { kind: 'insert', table: 'lump_sums', rowId: 9, after: { amount: 5000 }, values: { amount: 5000 } },
+    { kind: 'update', table: 'mortgage_terms', rowId: 1, before: { payment_override: null }, after: { payment_override: 2500 } },
+    { kind: 'delete', table: 'rate_segments', rowId: 2, before: { id: 2, property_id: 1, start_date: '2027-06-01' } },
+  ];
+  const cur = { lump_sums: [{ id: 9, amount: 5000 }], mortgage_terms: [{ id: 1, payment_override: 2500 }], rate_segments: [] };
+  const { inverse, conflicts } = buildRevertInverse({ entries, current: cur });
+  assert.deepEqual(conflicts, []);
+  assert.ok(inverse.some((x) => x.kind === 'delete' && x.table === 'lump_sums' && x.rowId === 9));
+  assert.ok(inverse.some((x) => x.kind === 'update' && x.table === 'mortgage_terms' && x.values.payment_override === null));
+  assert.ok(inverse.some((x) => x.kind === 'insert' && x.table === 'rate_segments'));
+  // A newer segment on the same day blocks the restore.
+  const clash = buildRevertInverse({ entries, current: { ...cur, rate_segments: [{ id: 5, property_id: 1, start_date: '2027-06-01' }] } });
+  assert.ok(clash.conflicts.some((c) => c.table === 'rate_segments' && c.field === 'start_date'));
+  // A modified insert blocks with a conflict instead of deleting.
+  const mod = buildRevertInverse({ entries, current: { ...cur, lump_sums: [{ id: 9, amount: 6000 }] } });
+  assert.ok(mod.conflicts.some((c) => c.table === 'lump_sums'));
+});

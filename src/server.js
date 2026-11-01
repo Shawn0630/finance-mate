@@ -21,7 +21,7 @@ import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   addNavPoint, updateNavPoint,
   listAccounts, getAccount, listHoldings, getHolding, listEvents, listPricePoints, rebuildEventPricePoints,
-  computeHolding, computeAccount, computePortfolio, computeFillPreview,
+  computeHolding, computeAccount, computePortfolio, computeFillPreview, unitsOn,
   effectiveAccountDefaultCurrency, pinCadReturnPct,
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
@@ -40,6 +40,11 @@ import {
   SPEND_CATEGORIES, parseQfx, validateSpendApply, normalizeMerchant, validSpendDate,
   spendMonthly, spendTotal, spendBalance,
 } from './spending.js';
+import {
+  calcPenalty, presetPrimeSteps, scenarioPrimeHistory, validateOp, validateLegs,
+  computeProjection, compareProjections, returnSuggestionsFromPoints,
+  buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
+} from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
 // through the region implementation, never directly.
@@ -3736,6 +3741,1082 @@ app.get('/api/summary', requireApiAuth, (req, res) => {
     netWorth: propertyValue + otherAssets - mortgageBalance,
     propertyCount: props.length,
   });
+});
+
+// -------------------------------------------------------------- planning ---
+// Planning is a sandbox branch off mainline: projects hold strategies,
+// strategies hold ordered ops + funding legs, and NOTHING writes
+// mainline except the atomic Merge path (with per-row before/after
+// records). Preview numbers equal post-confirm numbers because both
+// read the same projection.
+function planProjectById(id, userId) {
+  const row = db.prepare('SELECT * FROM plan_projects WHERE id = ?').get(id);
+  if (!row || (userId != null && row.user_id !== userId)) return null;
+  return row;
+}
+function planStrategyById(id) {
+  const row = db.prepare('SELECT * FROM plan_strategies WHERE id = ?').get(id);
+  return row || null;
+}
+function planOpsOf(strategyId) {
+  const ops = db.prepare('SELECT * FROM plan_ops WHERE strategy_id = ? ORDER BY seq, id').all(strategyId)
+    .map((o) => ({ ...o, params: JSON.parse(o.params || '{}') }));
+  for (const o of ops) {
+    o.legs = db.prepare('SELECT * FROM plan_legs WHERE op_id = ? ORDER BY id').all(o.id);
+  }
+  return ops;
+}
+function planAssumptionsOf(strategyId) {
+  return db.prepare('SELECT * FROM plan_assumptions WHERE strategy_id = ? ORDER BY id').all(strategyId);
+}
+// Confirmed assumptions only: an unconfirmed assumption never enters
+// a computation (it is shown as pending in the UI instead).
+function planConfirmedAssumptions(strategyId) {
+  const out = {};
+  for (const a of planAssumptionsOf(strategyId)) {
+    if (a.confirmed) out[a.key] = a.value;
+  }
+  return out;
+}
+function planSnapshotMainline() {
+  return {
+    properties: db.prepare('SELECT * FROM properties ORDER BY id').all(),
+    terms: db.prepare('SELECT * FROM mortgage_terms ORDER BY id').all(),
+    segments: db.prepare('SELECT * FROM rate_segments ORDER BY id').all(),
+    lumpSums: db.prepare('SELECT * FROM lump_sums ORDER BY id').all(),
+    accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
+    holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
+    events: db.prepare('SELECT * FROM invest_events ORDER BY id').all(),
+  };
+}
+function planSnapshotStale(snapshot) {
+  try {
+    const snap = typeof snapshot === 'string' ? JSON.parse(snapshot) : snapshot;
+    const cur = planSnapshotMainline();
+    for (const table of Object.keys(snap)) {
+      const sRows = snap[table] || [];
+      const cRows = cur[table] || [];
+      if (sRows.length !== cRows.length) return true;
+      const cById = new Map(cRows.map((r) => [r.id, r]));
+      for (const s of sRows) {
+        const c = cById.get(s.id);
+        if (!c || JSON.stringify(s) !== JSON.stringify(c)) return true;
+      }
+    }
+    return false;
+  } catch { return true; }
+}
+// Mainline data shaped for computeProjection. Assessed value is the
+// property's latest known figure (the app stores one current assessed
+// value per property); FX is the latest stored BoC rate.
+function planAssembleMainline(projectId) {
+  const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
+  const properties = props.map((p) => ({
+    ...p,
+    terms: db.prepare('SELECT * FROM mortgage_terms WHERE property_id = ? ORDER BY start_date, id').all(p.id),
+    segments: db.prepare('SELECT * FROM rate_segments WHERE property_id = ? ORDER BY start_date, id').all(p.id),
+    lumpSums: db.prepare('SELECT * FROM lump_sums WHERE property_id = ? ORDER BY date, id').all(p.id),
+  }));
+  const holdings = listHoldings(db).map((h) => ({
+    ...h,
+    accountId: h.account_id,
+    events: listEvents(db, h.id),
+    pricePoints: listPricePoints(db, h.id).map((pt) => ({ date: pt.date, price: pt.price })),
+  }));
+  const fxRow = db.prepare('SELECT rate FROM invest_fx_rates ORDER BY date DESC LIMIT 1').get();
+  const declaredAssets = db.prepare('SELECT * FROM plan_declared_assets WHERE project_id = ? ORDER BY id').all(projectId);
+  const assessed = {};
+  for (const p of props) assessed[p.id] = p.assessed_value ?? 0;
+  return { properties, holdings, fxRateLatest: fxRow ? fxRow.rate : null, declaredAssets, assessed };
+}
+async function planProjectionFor(strategy, project, scenario) {
+  await ensureFreshPrime();
+  const mainline = planAssembleMainline(project.id);
+  const ops = planOpsOf(strategy.id);
+  const legs = [];
+  for (const o of ops) for (const l of o.legs) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+  const assumptions = planConfirmedAssumptions(strategy.id);
+  const currentMonth = currentMonthKey();
+  const primeHistory = getPrimeHistory();
+  const cur = getCurrentPrime();
+  const currentPrime = cur ? cur.rate : null;
+  const args = { mainline, ops, legs, assumptions, primeHistory, currentPrime, currentMonth };
+  const baseline = computeProjection({ ...args, ops: [], legs: [], scenario: null });
+  const strategyProj = computeProjection({ ...args, scenario });
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj) };
+}
+function planScenarioRow(r) {
+  return { ...r, steps: r.steps ? JSON.parse(r.steps) : null };
+}
+const PLAN_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function planNextLetter(projectId) {
+  const used = db.prepare('SELECT letter FROM plan_strategies WHERE project_id = ?').all(projectId).map((r) => r.letter);
+  for (const ch of PLAN_LETTERS) if (!used.includes(ch)) return ch;
+  return `${used.length + 1}`;
+}
+function planUnitsHeldAt(holdingId, dateStr, strategyId, beforeSeq) {
+  const events = listEvents(db, holdingId);
+  let u = unitsOn(events, dateStr);
+  if (strategyId != null) {
+    const ops = planOpsOf(strategyId).filter((o) => beforeSeq == null || o.seq < beforeSeq);
+    for (const o of ops) {
+      const p = o.params || {};
+      if (Number(p.holdingId) !== Number(holdingId)) continue;
+      if (String(p.date || '') > dateStr) continue;
+      if (o.op_type === 'buy' || o.op_type === 'position') u += Number(p.units) || 0;
+      if (o.op_type === 'sell') u -= Number(p.units) || 0;
+    }
+  }
+  return Math.round(u * 10000) / 10000;
+}
+function planValidateStrategyOps(strategyId, ops, legs) {
+  const errs = [];
+  const currentMonth = currentMonthKey();
+  for (const o of ops) {
+    const ctx = { currentMonth };
+    if (o.op_type === 'sell' && o.params && o.params.holdingId) {
+      ctx.unitsAvailable = planUnitsHeldAt(Number(o.params.holdingId), String(o.params.date || ''), strategyId, o.seq);
+    }
+    if (o.op_type === 'buy' && o.params && o.params.price == null) {
+      errs.push(`buy operation ${o.seq} needs a price — use Position for units without a price`);
+    }
+    errs.push(...validateOp(o, ctx));
+  }
+  errs.push(...validateLegs(ops, legs));
+  return errs;
+}
+
+app.get('/api/planning/projects', requireApiAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM plan_projects WHERE user_id = ? ORDER BY id DESC').all(req.user.id);
+  const out = rows.map((p) => {
+    const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+    return { ...p, strategies, stale: planSnapshotStale(p.snapshot) };
+  });
+  res.json({ projects: out });
+});
+
+app.post('/api/planning/projects', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'project name is required' });
+  const now = nowIso();
+  const snap = JSON.stringify(planSnapshotMainline());
+  const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(req.user.id, String(b.name).trim(), b.question ? String(b.question).trim() : null, snap, now, now);
+  // Default scenario: prime holds at the current rate (the flat
+  // neutral preset); the user can add, duplicate or edit scenarios.
+  db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(info.lastInsertRowid, 'Flat at current prime', 'flat', 'neutral', null, null, 1, now, now);
+  const row = planProjectById(info.lastInsertRowid, req.user.id);
+  res.status(201).json({ project: row });
+});
+
+app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
+  const declaredAssets = db.prepare('SELECT * FROM plan_declared_assets WHERE project_id = ? ORDER BY id').all(p.id);
+  const reports = db.prepare('SELECT * FROM plan_reports WHERE project_id = ? ORDER BY id').all(p.id).map((r) => ({
+    ...r,
+    definition: JSON.parse(r.definition || '{}'),
+    stale: strategies.some((s) => s.updated_at > r.updated_at) ? 1 : 0,
+  }));
+  const history = db.prepare(
+    `SELECT m.*, s.name AS strategy_name FROM plan_merge_records m
+     JOIN plan_strategies s ON s.id = m.strategy_id
+     WHERE s.project_id = ? ORDER BY m.id DESC`).all(p.id)
+    .map((m) => ({ ...m, entries: JSON.parse(m.entries || '[]'), conflicts: m.conflicts ? JSON.parse(m.conflicts) : null }));
+  res.json({ project: p, strategies, scenarios, declaredAssets, reports, history, stale: planSnapshotStale(p.snapshot) });
+});
+
+app.put('/api/planning/projects/:id', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (b.name !== undefined && !String(b.name).trim()) return res.status(400).json({ error: 'project name is required' });
+  db.prepare('UPDATE plan_projects SET name = ?, question = ?, updated_at = ? WHERE id = ?')
+    .run(b.name !== undefined ? String(b.name).trim() : p.name, b.question !== undefined ? (b.question ? String(b.question).trim() : null) : p.question, nowIso(), p.id);
+  res.json({ project: planProjectById(p.id, req.user.id) });
+});
+
+app.delete('/api/planning/projects/:id', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  db.prepare('DELETE FROM plan_projects WHERE id = ?').run(p.id);
+  res.json({ ok: true });
+});
+
+// Rebase: refresh the project's baseline snapshot to today's mainline.
+// Projections recompute from the new baseline; strategies themselves
+// are untouched (their ops still replay in order).
+app.post('/api/planning/projects/:id/sync', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  db.prepare('UPDATE plan_projects SET snapshot = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify(planSnapshotMainline()), nowIso(), p.id);
+  res.json({ project: planProjectById(p.id, req.user.id), stale: false });
+});
+
+app.post('/api/planning/projects/:id/scenarios', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'scenario name is required' });
+  if (!['up', 'flat', 'down'].includes(b.direction)) return res.status(400).json({ error: 'direction must be up, flat or down' });
+  if (b.steps !== undefined && b.steps !== null && !Array.isArray(b.steps)) return res.status(400).json({ error: 'steps must be an array of {date, rate}' });
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), b.direction, b.stance || 'neutral', b.magnitude != null ? Number(b.magnitude) : null, b.steps ? JSON.stringify(b.steps) : null, 0, now, now);
+  res.status(201).json({ scenario: planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(info.lastInsertRowid)) });
+});
+
+app.post('/api/planning/scenarios/:id/set-base', requireApiAuth, (req, res) => {
+  const s = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'scenario not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  db.prepare('UPDATE plan_scenarios SET is_base = 0 WHERE project_id = ?').run(p.id);
+  db.prepare('UPDATE plan_scenarios SET is_base = 1 WHERE id = ?').run(s.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/planning/scenarios/:id', requireApiAuth, (req, res) => {
+  const s = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'scenario not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.is_base) return res.status(400).json({ error: 'the base scenario cannot be deleted — set another scenario as base first' });
+  db.prepare('DELETE FROM plan_scenarios WHERE id = ?').run(s.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/planning/projects/:id/declared-assets', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'asset name is required' });
+  if (!(Number(b.amount) > 0)) return res.status(400).json({ error: 'amount must be > 0' });
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_declared_assets (project_id, name, amount, maturity_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), Number(b.amount), b.maturity_date || null, now, now);
+  res.status(201).json({ asset: db.prepare('SELECT * FROM plan_declared_assets WHERE id = ?').get(info.lastInsertRowid) });
+});
+
+app.delete('/api/planning/declared-assets/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM plan_declared_assets WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'asset not found' });
+  const p = planProjectById(row.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  db.prepare('DELETE FROM plan_declared_assets WHERE id = ?').run(row.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/planning/projects/:id/strategies', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'strategy name is required' });
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), planNextLetter(p.id), b.source || 'manual', now, now);
+  res.status(201).json({ strategy: planStrategyById(info.lastInsertRowid) });
+});
+
+app.put('/api/planning/strategies/:id', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (b.name !== undefined && !String(b.name).trim()) return res.status(400).json({ error: 'strategy name is required' });
+  if (b.model_id !== undefined && b.model_id !== null && !db.prepare('SELECT id FROM plan_ai_models WHERE id = ? AND project_id = ?').get(Number(b.model_id), p.id)) {
+    return res.status(400).json({ error: 'model not found in this project' });
+  }
+  db.prepare('UPDATE plan_strategies SET name = ?, model_id = ?, updated_at = ? WHERE id = ?')
+    .run(b.name !== undefined ? String(b.name).trim() : s.name, b.model_id !== undefined ? (b.model_id == null ? null : Number(b.model_id)) : s.model_id, nowIso(), s.id);
+  res.json({ strategy: planStrategyById(s.id) });
+});
+
+app.delete('/api/planning/strategies/:id', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be deleted — revert it first' });
+  db.prepare('DELETE FROM plan_strategies WHERE id = ?').run(s.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const ops = planOpsOf(s.id);
+  const assumptions = planAssumptionsOf(s.id);
+  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
+  const baseScenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  let baseline; let strategy; let comparison;
+  try {
+    ({ baseline, strategy, comparison } = await planProjectionFor(s, p, baseScenario));
+  } catch (err) {
+    return res.status(500).json({ error: `projection failed: ${err.message}` });
+  }
+  // Scenario table: the same strategy under each project scenario.
+  // Each row also carries the summed mortgage-balance series so the
+  // detail page can draw a real fan chart (envelope + base line).
+  const scenarioTable = [];
+  for (const sc of scenarios) {
+    let r;
+    try {
+      r = await planProjectionFor(s, p, sc);
+    } catch (err) {
+      return res.status(500).json({ error: `projection failed: ${err.message}` });
+    }
+    const months = [];
+    const cur = currentMonthKey();
+    for (let i = monthIdxOf(cur); i <= monthIdxOf(cur) + 360; i++) months.push(ymOfIdx(i));
+    const balanceByMonth = months.map((m) => {
+      let bal = 0;
+      for (const per of Object.values(r.strategy.mortgage.perProperty)) {
+        const series = per.strategy && per.strategy.series ? per.strategy.series : (per.baseline && per.baseline.series ? per.baseline.series : []);
+        const row = series.find((x) => x.month === m);
+        if (row) bal += row.balance;
+        else if (series.length && m > series[series.length - 1].month) bal += 0;
+      }
+      return { month: m, balance: Math.round(bal * 100) / 100 };
+    });
+    scenarioTable.push({ scenarioId: sc.id, name: sc.name, net: r.comparison.net, payoffShiftMonths: r.comparison.payoffShiftMonths, paymentDelta: r.comparison.paymentDelta, balanceByMonth });
+  }
+  res.json({ strategy: s, project: p, ops, assumptions, scenarios, baseScenario, baseline, projection: strategy, comparison, scenarioTable });
+});
+
+app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  let scenario = null;
+  if (req.query.scenarioId) {
+    scenario = db.prepare('SELECT * FROM plan_scenarios WHERE id = ? AND project_id = ?').get(Number(req.query.scenarioId), p.id);
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+    scenario = planScenarioRow(scenario);
+  } else {
+    const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
+    scenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  }
+  let r;
+  try {
+    r = await planProjectionFor(s, p, scenario);
+  } catch (err) {
+    return res.status(500).json({ error: `projection failed: ${err.message}` });
+  }
+  res.json({ scenario, ...r });
+});
+
+app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  let scenario = null;
+  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
+  if (req.query.scenarioId) {
+    scenario = scenarios.find((x) => x.id === Number(req.query.scenarioId));
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+  } else {
+    scenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  }
+  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  const rows = [];
+  let baseline = null;
+  for (const s of strategies) {
+    let r;
+    try {
+      r = await planProjectionFor(s, p, scenario);
+    } catch (err) {
+      return res.status(500).json({ error: `projection failed: ${err.message}` });
+    }
+    if (!baseline) baseline = r.baseline;
+    rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison });
+  }
+  // Baseline-only projection for the comparison table's baseline column.
+  if (!baseline) {
+    const mainline = planAssembleMainline(p.id);
+    await ensureFreshPrime();
+    const cur = getCurrentPrime();
+    baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: {}, primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth: currentMonthKey(), scenario });
+  }
+  res.json({ project: p, scenario, scenarios, baseline, strategies: rows });
+});
+
+app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
+  const b = req.body || {};
+  if (!OP_TYPES.includes(b.op_type)) return res.status(400).json({ error: `unknown operation type ${b.op_type}` });
+  const params = b.params || {};
+  const existing = planOpsOf(s.id);
+  const seq = existing.length ? Math.max(...existing.map((o) => o.seq)) + 1 : 1;
+  const op = { seq, op_type: b.op_type, params };
+  const legs = (b.legs || []).map((l) => ({ op_seq: seq, source_ref: l.source_ref, amount: l.amount }));
+  const errs = planValidateStrategyOps(s.id, [...existing, op], legs);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(s.id, seq, b.op_type, JSON.stringify(params), b.source || 'manual', now, now);
+  for (const l of legs) {
+    db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
+      .run(info.lastInsertRowid, l.source_ref, String(l.amount), now);
+  }
+  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
+  res.status(201).json({ op: { ...op, id: info.lastInsertRowid, legs: planOpsOf(s.id).find((o) => o.id === info.lastInsertRowid).legs } });
+});
+
+app.put('/api/planning/ops/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM plan_ops WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'operation not found' });
+  const s = planStrategyById(row.strategy_id);
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
+  const b = req.body || {};
+  const params = b.params !== undefined ? b.params : JSON.parse(row.params || '{}');
+  const existing = planOpsOf(s.id).map((o) => (o.id === row.id ? { ...o, params } : o));
+  const legs = (b.legs !== undefined ? b.legs : db.prepare('SELECT * FROM plan_legs WHERE op_id = ? ORDER BY id').all(row.id))
+    .map((l) => ({ op_seq: row.seq, source_ref: l.source_ref, amount: l.amount }));
+  const op = { seq: row.seq, op_type: row.op_type, params };
+  const errs = planValidateStrategyOps(s.id, existing, legs);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const now = nowIso();
+  db.prepare('UPDATE plan_ops SET params = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(params), now, row.id);
+  if (b.legs !== undefined) {
+    db.prepare('DELETE FROM plan_legs WHERE op_id = ?').run(row.id);
+    for (const l of legs) db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)').run(row.id, l.source_ref, String(l.amount), now);
+  }
+  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
+  res.json({ op: planOpsOf(s.id).find((o) => o.id === row.id) });
+});
+
+app.delete('/api/planning/ops/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM plan_ops WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'operation not found' });
+  const s = planStrategyById(row.strategy_id);
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
+  db.prepare('DELETE FROM plan_ops WHERE id = ?').run(row.id);
+  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(nowIso(), s.id);
+  res.json({ ok: true });
+});
+
+app.put('/api/planning/strategies/:id/assumptions', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (!['comparableRate', 'privilegePct', 'stockReturnPct', 'fees'].includes(b.key)) {
+    return res.status(400).json({ error: `unknown assumption key ${b.key}` });
+  }
+  if (b.value !== null && b.value !== undefined && b.value !== '' && !isFinite(Number(b.value))) {
+    return res.status(400).json({ error: 'assumption value must be a number' });
+  }
+  const now = nowIso();
+  db.prepare(`INSERT INTO plan_assumptions (strategy_id, key, value, confirmed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(strategy_id, key) DO UPDATE SET value = excluded.value, confirmed = excluded.confirmed, updated_at = excluded.updated_at`)
+    .run(s.id, b.key, b.value == null || b.value === '' ? null : String(b.value), b.confirmed ? 1 : 0, now, now);
+  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
+  res.json({ assumptions: planAssumptionsOf(s.id) });
+});
+
+// Historical return suggestions for one holding, from the user's own
+// price records. Stored points first; when a window start is missing,
+// backfill that symbol through the existing price tiers (Stooq →
+// Yahoo → Nasdaq) and store the points under normal refresh rules.
+// Every suggestion labels its ACTUAL covered window — a short window
+// is never labeled as 1y/3y/5y. Cost-unknown holdings get no suggestion.
+app.get('/api/planning/return-suggestions', requireApiAuth, async (req, res) => {
+  const holdingId = Number(req.query.holdingId);
+  const holding = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(holdingId);
+  if (!holding) return res.status(404).json({ error: 'holding not found' });
+  const events = listEvents(db, holdingId);
+  const hasCostUnknown = events.some((e) => e.type === 'position');
+  if (hasCostUnknown) return res.json({ holding, suggestions: [], note: 'Cost unknown — no return suggestion for this holding.' });
+  let points = listPricePoints(db, holdingId).map((pt) => ({ date: pt.date, price: pt.price }));
+  const todayYm = currentMonthKey();
+  let suggestions = returnSuggestionsFromPoints(points, todayYm);
+  const labels = new Set(suggestions.map((x) => x.label));
+  let backfilled = false;
+  let backfillNote = null;
+  if ((!labels.has('1y') || !labels.has('3y') || !labels.has('5y')) && holding.kind === 'exchange' && holding.symbol) {
+    try {
+      const ok = await ensureHoldingPrices(db, holding, { backfill: true });
+      if (ok) {
+        points = listPricePoints(db, holdingId).map((pt) => ({ date: pt.date, price: pt.price }));
+        suggestions = returnSuggestionsFromPoints(points, todayYm);
+        backfilled = true;
+      }
+    } catch (e) {
+      backfillNote = `price backfill failed (${e.message}); suggestions use stored points only`;
+    }
+  }
+  res.json({
+    holding, suggestions, backfilled, backfillNote,
+    note: 'Past returns do not predict future returns.',
+  });
+});
+
+// Apply a merge write list inside the caller's transaction. Returns
+// merge-record entries with row ids and full before/after rows.
+function planApplyWrites(writes) {
+  const entries = [];
+  const now = nowIso();
+  for (const w of writes) {
+    if (w.kind === 'insert' && w.table === 'lump_sums') {
+      const term = db.prepare('SELECT id FROM mortgage_terms WHERE property_id = ? AND start_date <= ? ORDER BY start_date DESC LIMIT 1').get(w.values.property_id, w.values.date);
+      const info = db.prepare('INSERT INTO lump_sums (property_id, term_id, date, amount, note, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(w.values.property_id, term ? term.id : null, w.values.date, w.values.amount, w.values.note || 'Planning merge', now);
+      entries.push({ ...w, rowId: info.lastInsertRowid });
+    }
+    if (w.kind === 'insert' && w.table === 'rate_segments') {
+      const v = w.values;
+      const info = db.prepare('INSERT INTO rate_segments (property_id, start_date, rate_type, rate_mode, annual_rate, spread, compounding, accrual, locked_on, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(v.property_id, v.start_date, v.rate_type, v.rate_mode, v.annual_rate, v.spread, v.compounding || 'semi_annual', v.accrual || 'monthly', v.locked_on || null, now);
+      entries.push({ ...w, rowId: info.lastInsertRowid });
+    }
+    if (w.kind === 'insert' && w.table === 'mortgage_terms') {
+      const v = w.values;
+      const info = db.prepare('INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(v.property_id, v.lender || null, v.start_date, v.term_months, v.amortization_years, v.opening_balance, v.repayment_method || 'equal_payment', v.payment_override, now, now);
+      entries.push({ ...w, rowId: info.lastInsertRowid });
+    }
+    if (w.kind === 'insert' && w.table === 'invest_events') {
+      const v = w.values;
+      let holdingId = v.holdingId;
+      if (!holdingId) {
+        const existing = v.symbol ? db.prepare('SELECT * FROM invest_holdings WHERE account_id = ? AND UPPER(symbol) = UPPER(?)').get(v.accountId, v.symbol) : null;
+        if (existing) holdingId = existing.id;
+        else {
+          const hi = db.prepare('INSERT INTO invest_holdings (account_id, label, kind, symbol, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(v.accountId, v.symbol || 'New holding', v.type === 'position' ? 'fund' : 'exchange', v.symbol || null, v.currency || 'CAD', 'manual', now, now);
+          holdingId = hi.lastInsertRowid;
+          entries.push({ kind: 'insert', table: 'invest_holdings', rowId: holdingId, label: `Holding ${v.symbol || ''}`, values: { account_id: v.accountId, symbol: v.symbol } });
+        }
+      }
+      const price = v.type === 'position' ? null : (v.price ?? null);
+      const units = v.type === 'buy' && v.units == null && v.amount != null && price ? Math.round((v.amount / price) * 10000) / 10000 : v.units;
+      const info = db.prepare('INSERT INTO invest_events (holding_id, date, type, units, price, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(holdingId, v.date, v.type, units, price, 'Planning merge', 'manual', now, now);
+      entries.push({ ...w, rowId: info.lastInsertRowid, values: { ...v, holdingId, units, price } });
+    }
+    if (w.kind === 'update' && w.table === 'rate_segments') {
+      const cur = db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(w.rowId);
+      if (!cur) continue;
+      db.prepare('UPDATE rate_segments SET rate_type = ?, rate_mode = ?, annual_rate = ?, spread = ? WHERE id = ?')
+        .run(w.values.rate_type, w.values.rate_mode, w.values.annual_rate, w.values.spread, w.rowId);
+      entries.push({ ...w, before: cur, after: { ...cur, ...w.values } });
+    }
+    if (w.kind === 'update' && w.table === 'mortgage_terms') {
+      const cur = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(w.rowId);
+      if (!cur) continue;
+      db.prepare('UPDATE mortgage_terms SET payment_override = ?, updated_at = ? WHERE id = ?')
+        .run(w.values.payment_override, now, w.rowId);
+      entries.push({ ...w, before: cur, after: { ...cur, ...w.values } });
+    }
+    if (w.kind === 'delete' && w.table === 'rate_segments') {
+      const cur = db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(w.rowId);
+      if (!cur) continue;
+      db.prepare('DELETE FROM rate_segments WHERE id = ?').run(w.rowId);
+      entries.push({ ...w, before: cur });
+    }
+  }
+  return entries;
+}
+// Apply a revert inverse list inside the caller's transaction.
+function planApplyInverse(inverse) {
+  for (const inv of inverse) {
+    if (inv.kind === 'delete') {
+      db.prepare(`DELETE FROM ${inv.table} WHERE id = ?`).run(inv.rowId);
+    }
+    if (inv.kind === 'update') {
+      const vals = inv.values || {};
+      const cols = Object.keys(vals).filter((k) => k !== 'id');
+      if (!cols.length) continue;
+      db.prepare(`UPDATE ${inv.table} SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`)
+        .run(...cols.map((c) => vals[c]), inv.rowId);
+    }
+    if (inv.kind === 'insert') {
+      const row = inv.values || {};
+      const cols = Object.keys(row).filter((k) => k !== 'id');
+      db.prepare(`INSERT INTO ${inv.table} (id, ${cols.join(', ')}) VALUES (?, ${cols.map(() => '?').join(', ')})`)
+        .run(row.id, ...cols.map((c) => row[c]));
+    }
+  }
+}
+const PLAN_MONEY_NOTE = 'Revert restores mainline records only — real-world money (penalty paid, transfers made) is not returned.';
+
+function planCurrentTables() {
+  const snap = planSnapshotMainline();
+  return {
+    properties: snap.properties, mortgage_terms: snap.terms, rate_segments: snap.segments,
+    lump_sums: snap.lumpSums, invest_accounts: snap.accounts, invest_holdings: snap.holdings,
+    invest_events: snap.events,
+  };
+}
+function planMergePreviewFor(strategy, project) {
+  const ops = planOpsOf(strategy.id);
+  const legs = [];
+  for (const o of ops) for (const l of o.legs) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+  const snapshot = JSON.parse(project.snapshot || '{}');
+  // Merge/revert builders key rows by TABLE name.
+  const current = planCurrentTables();
+  const snapTables = {
+    properties: snapshot.properties || [], mortgage_terms: snapshot.terms || [], rate_segments: snapshot.segments || [],
+    lump_sums: snapshot.lumpSums || [], invest_accounts: snapshot.accounts || [], invest_holdings: snapshot.holdings || [],
+    invest_events: snapshot.events || [],
+  };
+  return { ops, legs, snapshot: snapTables, current };
+}
+
+app.post('/api/planning/strategies/:id/merge-preview', requireApiAuth, async (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'strategy is already merged' });
+  const { ops, legs, snapshot, current } = planMergePreviewFor(s, p);
+  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
+  const baseScenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  let strategy;
+  try {
+    ({ strategy } = await planProjectionFor(s, p, baseScenario));
+  } catch (err) {
+    return res.status(500).json({ error: `projection failed: ${err.message}` });
+  }
+  // Refinance opening balances come from the strategy's own projected
+  // balance series at the refinance month.
+  const refinanceBalance = {};
+  for (const op of ops) {
+    if (op.op_type !== 'refinance') continue;
+    const per = strategy.mortgage.perProperty[Number(op.params.propertyId)];
+    const row = per && per.strategy && per.strategy.series ? per.strategy.series.find((r) => r.month === String(op.params.date || '').slice(0, 7)) : null;
+    refinanceBalance[op.seq] = row ? row.balance : null;
+  }
+  const { writes, conflicts } = buildMergeWrites({ ops, legs, snapshot, current, projection: { refinanceBalance } });
+  res.json({ writes, conflicts, penalties: strategy.penalties, fees: strategy.fees, moneyNote: PLAN_MONEY_NOTE });
+});
+
+app.post('/api/planning/strategies/:id/merge', requireApiAuth, async (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'strategy is already merged' });
+  const b = req.body || {};
+  const resolutions = b.resolutions || [];
+  const { ops, legs, snapshot, current } = planMergePreviewFor(s, p);
+  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
+  const baseScenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  let strategy;
+  try {
+    ({ strategy } = await planProjectionFor(s, p, baseScenario));
+  } catch (err) {
+    return res.status(500).json({ error: `projection failed: ${err.message}` });
+  }
+  const refinanceBalance = {};
+  for (const op of ops) {
+    if (op.op_type !== 'refinance') continue;
+    const per = strategy.mortgage.perProperty[Number(op.params.propertyId)];
+    const row = per && per.strategy && per.strategy.series ? per.strategy.series.find((r) => r.month === String(op.params.date || '').slice(0, 7)) : null;
+    refinanceBalance[op.seq] = row ? row.balance : null;
+  }
+  const { writes, conflicts } = buildMergeWrites({ ops, legs, snapshot, current, projection: { refinanceBalance } });
+  // Validate references before touching mainline: a property, account
+  // or holding deleted since the snapshot must fail the merge with a
+  // plain 400, never with a database constraint error.
+  const missing = [];
+  for (const w of writes) {
+    if (['lump_sums', 'rate_segments', 'mortgage_terms'].includes(w.table) && w.values && w.values.property_id != null) {
+      if (!db.prepare('SELECT id FROM properties WHERE id = ?').get(w.values.property_id)) missing.push(`property ${w.values.property_id}`);
+    }
+    if (w.table === 'invest_events' && w.values && w.values.accountId != null) {
+      if (!db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(w.values.accountId)) missing.push(`account ${w.values.accountId}`);
+    }
+    if (w.table === 'invest_events' && w.values && w.values.holdingId != null) {
+      if (!db.prepare('SELECT id FROM invest_holdings WHERE id = ?').get(w.values.holdingId)) missing.push(`holding ${w.values.holdingId}`);
+    }
+  }
+  if (missing.length) return res.status(400).json({ error: `cannot merge — no longer on mainline: ${[...new Set(missing)].join(', ')}` });
+  // Resolve conflicts: keep-current skips that field (or the whole
+  // write for a deletion), custom overwrites the field, drop removes
+  // the op's writes and deletes the op itself.
+  const droppedSeqs = new Set();
+  const resByKey = new Map();
+  for (const r of resolutions) {
+    if (r.resolution === 'drop' && r.opSeq != null) droppedSeqs.add(Number(r.opSeq));
+    else resByKey.set(`${r.table}:${r.rowId}:${r.field}`, r);
+  }
+  const unresolved = conflicts.filter((c) => !resByKey.has(`${c.table}:${c.rowId}:${c.field}`) && !droppedSeqs.has(c.opSeq));
+  if (unresolved.length) return res.status(400).json({ error: 'all conflicts must be resolved before merging', conflicts: unresolved });
+  let finalWrites = writes.filter((w) => !droppedSeqs.has(w.opSeq));
+  for (const w of finalWrites) {
+    if (w.kind === 'update') {
+      for (const f of Object.keys(w.values)) {
+        const r = resByKey.get(`${w.table}:${w.rowId}:${f}`);
+        if (!r) continue;
+        if (r.resolution === 'current') delete w.values[f];
+        else if (r.resolution === 'custom') w.values[f] = r.customValue;
+      }
+      if (!Object.keys(w.values).length) w._skip = true;
+    }
+    if (w.kind === 'delete') {
+      const r = [...resByKey.values()].find((x) => x.table === w.table && x.rowId === w.rowId);
+      if (r && r.resolution === 'current') w._skip = true;
+    }
+  }
+  finalWrites = finalWrites.filter((w) => !w._skip);
+  const tx = db.transaction(() => {
+    const entries = planApplyWrites(finalWrites);
+    for (const seq of droppedSeqs) {
+      const opRow = db.prepare('SELECT id FROM plan_ops WHERE strategy_id = ? AND seq = ?').get(s.id, seq);
+      if (opRow) db.prepare('DELETE FROM plan_ops WHERE id = ?').run(opRow.id);
+    }
+    const info = db.prepare('INSERT INTO plan_merge_records (strategy_id, kind, entries, conflicts, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(s.id, 'merge', JSON.stringify(entries), JSON.stringify(resolutions), 'active', nowIso());
+    db.prepare('UPDATE plan_strategies SET merged = 1, merge_record_id = ?, updated_at = ? WHERE id = ?')
+      .run(info.lastInsertRowid, nowIso(), s.id);
+    return { mergeRecordId: info.lastInsertRowid, entries };
+  });
+  let result;
+  try {
+    result = tx();
+  } catch (err) {
+    // Async handlers must not let a database error reject the request
+    // promise (Express 4 would leave it unhandled and kill the server).
+    return res.status(500).json({ error: `merge failed: ${err.message}` });
+  }
+  res.json({ ...result, moneyNote: PLAN_MONEY_NOTE });
+});
+
+app.get('/api/planning/projects/:id/history', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const rows = db.prepare(
+    `SELECT m.*, s.name AS strategy_name FROM plan_merge_records m
+     JOIN plan_strategies s ON s.id = m.strategy_id
+     WHERE s.project_id = ? ORDER BY m.id DESC`).all(p.id)
+    .map((m) => ({ ...m, entries: JSON.parse(m.entries || '[]'), conflicts: m.conflicts ? JSON.parse(m.conflicts) : null }));
+  res.json({ history: rows, moneyNote: PLAN_MONEY_NOTE });
+});
+
+function planRevertDependents(strategy, record) {
+  const dependents = [];
+  const entries = JSON.parse(record.entries || '[]');
+  const touched = new Set(entries.filter((e) => e.rowId).map((e) => `${e.table}:${e.rowId}`));
+  const later = db.prepare(
+    `SELECT m.*, s.name AS strategy_name FROM plan_merge_records m
+     JOIN plan_strategies s ON s.id = m.strategy_id
+     WHERE s.project_id = ? AND m.id > ? AND m.status = 'active' ORDER BY m.id DESC`).all(strategy.project_id, record.id);
+  for (const m of later) {
+    const mEntries = JSON.parse(m.entries || '[]');
+    if (mEntries.some((e) => e.rowId && touched.has(`${e.table}:${e.rowId}`))) {
+      dependents.push({ type: 'later_merge', mergeRecordId: m.id, strategyName: m.strategy_name, kind: m.kind });
+    }
+  }
+  // Mainline rows created after this merge that reference a merged term.
+  const mergedTermIds = entries.filter((e) => e.table === 'mortgage_terms' && e.rowId).map((e) => e.rowId);
+  if (mergedTermIds.length) {
+    const placeholders = mergedTermIds.map(() => '?').join(', ');
+    const refs = db.prepare(`SELECT 'lump_sums' AS tbl, id FROM lump_sums WHERE term_id IN (${placeholders}) AND created_at > ?
+      UNION ALL SELECT 'rate_segments', id FROM rate_segments WHERE term_id IN (${placeholders}) AND created_at > ?`)
+      .all(...mergedTermIds, record.created_at, ...mergedTermIds, record.created_at);
+    for (const r of refs) dependents.push({ type: 'mainline_reference', table: r.tbl, rowId: r.id });
+  }
+  return dependents;
+}
+
+app.post('/api/planning/strategies/:id/revert-preview', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!s.merged || !s.merge_record_id) return res.status(400).json({ error: 'strategy is not merged' });
+  const record = db.prepare('SELECT * FROM plan_merge_records WHERE id = ?').get(s.merge_record_id);
+  if (!record || record.status !== 'active') return res.status(400).json({ error: 'no active merge record for this strategy' });
+  const entries = JSON.parse(record.entries || '[]');
+  const current = planCurrentTables();
+  const { inverse, conflicts } = buildRevertInverse({ entries, current });
+  const dependents = planRevertDependents(s, record);
+  res.json({ inverse, conflicts, dependents, moneyNote: PLAN_MONEY_NOTE });
+});
+
+app.post('/api/planning/strategies/:id/revert', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!s.merged || !s.merge_record_id) return res.status(400).json({ error: 'strategy is not merged' });
+  const record = db.prepare('SELECT * FROM plan_merge_records WHERE id = ?').get(s.merge_record_id);
+  if (!record || record.status !== 'active') return res.status(400).json({ error: 'no active merge record for this strategy' });
+  const entries = JSON.parse(record.entries || '[]');
+  const current = planCurrentTables();
+  const { inverse, conflicts } = buildRevertInverse({ entries, current });
+  const dependents = planRevertDependents(s, record);
+  if (dependents.length) {
+    return res.status(400).json({ error: 'later merges or mainline records depend on this merge — revert them first (newest first)', dependents });
+  }
+  const resolutions = req.body?.resolutions || [];
+  const resByKey = new Map(resolutions.map((r) => [`${r.table}:${r.rowId}:${r.field}`, r]));
+  const unresolved = conflicts.filter((c) => !resByKey.has(`${c.table}:${c.rowId}:${c.field}`));
+  if (unresolved.length) return res.status(400).json({ error: 'all conflicts must be resolved before reverting', conflicts: unresolved });
+  let finalInverse = inverse;
+  for (const inv of finalInverse) {
+    if (inv.kind !== 'update') continue;
+    for (const f of Object.keys(inv.values || {})) {
+      const r = resByKey.get(`${inv.table}:${inv.rowId}:${f}`);
+      if (!r) continue;
+      if (r.resolution === 'current') delete inv.values[f];
+      else if (r.resolution === 'custom') inv.values[f] = r.customValue;
+    }
+    if (!Object.keys(inv.values || {}).length) inv._skip = true;
+  }
+  finalInverse = finalInverse.filter((x) => !x._skip);
+  const tx = db.transaction(() => {
+    planApplyInverse(finalInverse);
+    db.prepare('UPDATE plan_merge_records SET status = ? WHERE id = ?').run('reverted', record.id);
+    const info = db.prepare('INSERT INTO plan_merge_records (strategy_id, kind, entries, conflicts, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(s.id, 'revert', JSON.stringify(finalInverse), JSON.stringify(resolutions), 'active', nowIso());
+    db.prepare('UPDATE plan_strategies SET merged = 0, merge_record_id = NULL, updated_at = ? WHERE id = ?').run(nowIso(), s.id);
+    return { revertRecordId: info.lastInsertRowid };
+  });
+  let result;
+  try {
+    result = tx();
+  } catch (err) {
+    return res.status(500).json({ error: `revert failed: ${err.message}` });
+  }
+  res.json({ ...result, moneyNote: PLAN_MONEY_NOTE });
+});
+
+// ------------------------------------------------------- planning AI --------
+// All AI features go through the app's existing LLM plumbing (aiFill.js
+// callLlm + parseModelJson). Nothing here adds a provider, a key, or
+// key storage; unconfigured servers answer 503 with the same guidance
+// as Fill with AI. AI output is always a PROPOSAL: the server validates
+// bindings and the client confirms before anything is stored.
+const PLAN_AI_NO_LLM = 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.';
+const PLAN_CHART_TEMPLATES = ['time_line', 'stacked_bar', 'share_doughnut', 'yearly_bars', 'fan_band', 'funds_flow', 'metric_cards'];
+
+function planAiValidateChartSpecs(charts, projectId) {
+  const errs = [];
+  if (!Array.isArray(charts)) return ['charts must be an array'];
+  for (const c of charts) {
+    if (!PLAN_CHART_TEMPLATES.includes(c.template)) errs.push(`unknown chart template ${c.template}`);
+    if (!c.title) errs.push('each chart spec needs a title');
+    if (c.series && !Array.isArray(c.series)) errs.push('chart series must be an array');
+  }
+  return errs;
+}
+function planResolveNameRefs(ops, projectId) {
+  // AI returns human references (property address, account name,
+  // holding symbol). Resolve them to ids; ambiguous or missing refs
+  // come back as unresolved items for the user to disambiguate — the
+  // server never guesses a binding.
+  const props = db.prepare('SELECT id, address FROM properties ORDER BY id').all();
+  const accounts = db.prepare('SELECT id, name FROM invest_accounts ORDER BY id').all();
+  const holdings = db.prepare('SELECT id, account_id, symbol, label FROM invest_holdings ORDER BY id').all();
+  const unresolved = [];
+  const resolved = [];
+  for (const op of ops || []) {
+    const p = { ...(op.params || {}) };
+    const matchProp = (ref) => {
+      if (ref == null) return null;
+      if (Number.isInteger(Number(ref))) return props.find((x) => x.id === Number(ref)) || null;
+      const hits = props.filter((x) => String(x.address || '').toLowerCase().includes(String(ref).toLowerCase()));
+      return hits.length === 1 ? hits[0] : (hits.length > 1 ? { ambiguous: hits.map((h) => h.address) } : null);
+    };
+    const matchAccount = (ref) => {
+      if (ref == null) return null;
+      if (Number.isInteger(Number(ref))) return accounts.find((x) => x.id === Number(ref)) || null;
+      const hits = accounts.filter((x) => String(x.name || '').toLowerCase().includes(String(ref).toLowerCase()));
+      return hits.length === 1 ? hits[0] : (hits.length > 1 ? { ambiguous: hits.map((h) => h.name) } : null);
+    };
+    const matchHolding = (ref, accountId) => {
+      if (ref == null) return null;
+      if (Number.isInteger(Number(ref))) return holdings.find((x) => x.id === Number(ref)) || null;
+      const pool = accountId ? holdings.filter((x) => x.account_id === accountId) : holdings;
+      const hits = pool.filter((x) => String(x.symbol || '').toUpperCase() === String(ref).toUpperCase()
+        || String(x.label || '').toLowerCase().includes(String(ref).toLowerCase()));
+      return hits.length === 1 ? hits[0] : (hits.length > 1 ? { ambiguous: hits.map((h) => h.symbol || h.label) } : null);
+    };
+    let bad = null;
+    if (['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(op.op_type)) {
+      const m = matchProp(p.propertyRef ?? p.propertyId);
+      if (!m) bad = `property "${p.propertyRef ?? p.propertyId}" not found`;
+      else if (m.ambiguous) bad = `property "${p.propertyRef}" is ambiguous: ${m.ambiguous.join(', ')}`;
+      else p.propertyId = m.id;
+    }
+    if (['buy', 'position'].includes(op.op_type)) {
+      const m = matchAccount(p.accountRef ?? p.accountId);
+      if (!m) bad = `account "${p.accountRef ?? p.accountId}" not found`;
+      else if (m.ambiguous) bad = `account "${p.accountRef}" is ambiguous: ${m.ambiguous.join(', ')}`;
+      else p.accountId = m.id;
+      if (p.holdingRef && !p.holdingId) {
+        const h = matchHolding(p.holdingRef, p.accountId);
+        if (!h) bad = `holding "${p.holdingRef}" not found`;
+        else if (h.ambiguous) bad = `holding "${p.holdingRef}" is ambiguous: ${h.ambiguous.join(', ')}`;
+        else p.holdingId = h.id;
+      }
+    }
+    if (op.op_type === 'sell') {
+      const h = matchHolding(p.holdingRef ?? p.holdingId, p.accountId);
+      if (!h) bad = `holding "${p.holdingRef ?? p.holdingId}" not found`;
+      else if (h.ambiguous) bad = `holding "${p.holdingRef}" is ambiguous: ${h.ambiguous.join(', ')}`;
+      else p.holdingId = h.id;
+    }
+    if (bad) unresolved.push({ op, reason: bad });
+    else resolved.push({ ...op, params: p });
+  }
+  return { resolved, unresolved };
+}
+
+app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  const props = db.prepare('SELECT id, address FROM properties ORDER BY id').all();
+  const accounts = db.prepare('SELECT id, name FROM invest_accounts ORDER BY id').all();
+  const holdings = db.prepare('SELECT id, account_id, symbol, label FROM invest_holdings ORDER BY id').all();
+  const prompt = [
+    'You propose planning operations as JSON only. No prose outside the JSON object.',
+    'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position.',
+    'A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price.',
+    'Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas).',
+    'Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids.',
+    'For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
+    'Output: {"ops": [{"op_type": "...", "params": {...}, "legs": [...]}]}.',
+    `Properties: ${JSON.stringify(props)}`,
+    `Accounts: ${JSON.stringify(accounts)}`,
+    `Holdings: ${JSON.stringify(holdings)}`,
+    `User request: ${text}`,
+  ].join('\n');
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed || !Array.isArray(parsed.ops)) return res.status(502).json({ error: 'the AI response did not contain an operations list' });
+  const { resolved, unresolved } = planResolveNameRefs(parsed.ops, p.id);
+  const seqBase = (planOpsOf(s.id).length ? Math.max(...planOpsOf(s.id).map((o) => o.seq)) : 0) + 1;
+  const withSeq = resolved.map((o, i) => ({ ...o, seq: seqBase + i }));
+  const legs = [];
+  for (const o of withSeq) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+  const errs = planValidateStrategyOps(s.id, [...planOpsOf(s.id), ...withSeq], legs);
+  res.json({ ops: withSeq, unresolved, warnings: errs, configured: true });
+});
+
+app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  const prompt = [
+    'You design a planning model as JSON only. No prose outside the JSON object.',
+    'The model spec has five parts, all required:',
+    '1. bindings: [{name, entity, field}] — every input bound to an existing entity/field (property, holding, account, term, segment). Never cite a number that is not in the app data.',
+    '2. formulas: [{output, expression}] — structured expressions over bound inputs and intermediate series ids, e.g. "monthly interest = prior balance * monthly rate / 12".',
+    '3. assumptions: [{key, value, source}] — every assumption explicit; nothing hidden.',
+    '4. outputs: [{id, label}] — the computed series this model produces.',
+    '5. charts: [{template, title, series}] — template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards; series entries bind to output ids.',
+    'If a request is ambiguous, return {"ask": "your question"} instead of guessing.',
+    `User request: ${text}`,
+  ].join('\n');
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed) return res.status(502).json({ error: 'the AI response did not contain a model spec' });
+  if (parsed.ask) return res.json({ ask: parsed.ask, configured: true });
+  const errs = [];
+  for (const part of ['bindings', 'formulas', 'assumptions', 'outputs', 'charts']) {
+    if (!Array.isArray(parsed[part])) errs.push(`model spec is missing ${part}`);
+  }
+  errs.push(...planAiValidateChartSpecs(parsed.charts || [], p.id));
+  if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', now, now);
+  res.status(201).json({ model: { id: info.lastInsertRowid, spec: parsed }, configured: true });
+});
+
+app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  const strategies = db.prepare('SELECT id, name, letter FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  const prompt = [
+    'You compose a report definition as JSON only. No prose outside the JSON object.',
+    'A report is an ordered list of charts over already-computed results: {"charts": [{"template": "...", "title": "...", "series": ["..."]}]}.',
+    'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
+    'Series ids are: mortgage_balance, stock_value, total_value, cost, gain, net, payoff_month, monthly_payment.',
+    'Never invent a number: the app computes every series; you only order and title charts.',
+    `Strategies: ${JSON.stringify(strategies)}`,
+    `User request: ${text}`,
+  ].join('\n');
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed || !Array.isArray(parsed.charts)) return res.status(502).json({ error: 'the AI response did not contain a report definition' });
+  const errs = planAiValidateChartSpecs(parsed.charts, p.id);
+  if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  res.json({ definition: parsed, configured: true });
+});
+
+app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'report name is required' });
+  const def = b.definition || {};
+  const errs = planAiValidateChartSpecs(def.charts || [], p.id);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const strategyIds = db.prepare('SELECT id FROM plan_strategies WHERE project_id = ?').all(p.id).map((r) => r.id);
+  for (const sid of def.strategies || []) {
+    if (!strategyIds.includes(Number(sid))) return res.status(400).json({ error: `strategy ${sid} is not in this project` });
+  }
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, now, now);
+  res.status(201).json({ report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(info.lastInsertRowid) });
+});
+
+app.delete('/api/planning/reports/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'report not found' });
+  const p = planProjectById(row.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  db.prepare('DELETE FROM plan_reports WHERE id = ?').run(row.id);
+  res.json({ ok: true });
 });
 
 // ------------------------------------------------------------------ pages ---

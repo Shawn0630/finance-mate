@@ -672,6 +672,115 @@ CREATE TABLE IF NOT EXISTS lump_sums (
 CREATE INDEX IF NOT EXISTS idx_terms_property ON mortgage_terms(property_id, start_date);
 CREATE INDEX IF NOT EXISTS idx_lump_sums_property ON lump_sums(property_id, date);
 `);
+// Planning — a sandbox branch off mainline. Projects hold strategies;
+// strategies hold ordered ops + funding legs. NOTHING here is mainline:
+// the only bridge is a merge record, applied atomically by the Merge
+// path and reversible through the same record. Cash pots are computed,
+// never stored as money.
+db.exec(`
+CREATE TABLE IF NOT EXISTS plan_projects (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  question TEXT,
+  snapshot TEXT NOT NULL,              -- JSON: mainline rows at project creation (conflict base)
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_strategies (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES plan_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  letter TEXT NOT NULL DEFAULT 'A',    -- chart legend / table header letter
+  source TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'template' | 'ai'
+  model_id INTEGER,                    -- plan_ai_models.id when the strategy came from an AI model
+  merged INTEGER NOT NULL DEFAULT 0,  -- 1 = this strategy's ops are on mainline
+  merge_record_id INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_ops (
+  id INTEGER PRIMARY KEY,
+  strategy_id INTEGER NOT NULL REFERENCES plan_strategies(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,                -- replay order within the strategy
+  op_type TEXT NOT NULL,               -- prepay | rate_switch | refinance | payment_change | buy | sell | position
+  params TEXT NOT NULL,                -- JSON: the op's fields
+  source TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'ai'
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_legs (
+  id INTEGER PRIMARY KEY,
+  op_id INTEGER NOT NULL REFERENCES plan_ops(id) ON DELETE CASCADE,
+  source_ref TEXT NOT NULL,            -- 'pot' | 'cash' | 'external' | 'external_out' | 'declared:<id>' | 'op:<seq>' | 'repay:<propertyId>'
+  amount TEXT NOT NULL,                -- number, 'all' or 'remainder'
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_declared_assets (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES plan_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  amount REAL NOT NULL,
+  maturity_date TEXT,                  -- 'YYYY-MM-DD'; NULL = available now
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_scenarios (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES plan_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  direction TEXT NOT NULL DEFAULT 'flat', -- 'up' | 'flat' | 'down'
+  stance TEXT NOT NULL DEFAULT 'neutral', -- 'pessimistic' | 'optimistic' | 'neutral'
+  magnitude REAL,                      -- total prime move, percentage points
+  steps TEXT,                          -- JSON [{date, rate}] for custom scenarios; NULL = preset steps
+  is_base INTEGER NOT NULL DEFAULT 0, -- the project's default scenario
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_assumptions (
+  id INTEGER PRIMARY KEY,
+  strategy_id INTEGER NOT NULL REFERENCES plan_strategies(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,                   -- 'comparableRate' | 'privilegePct' | 'stockReturnPct' | 'fees'
+  value TEXT,
+  confirmed INTEGER NOT NULL DEFAULT 0, -- unconfirmed assumptions never enter computation
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (strategy_id, key)
+);
+CREATE TABLE IF NOT EXISTS plan_ai_models (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES plan_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  spec TEXT NOT NULL,                  -- JSON: input bindings + formulas + assumptions + output series + chart specs
+  version INTEGER NOT NULL DEFAULT 1,
+  source TEXT NOT NULL DEFAULT 'ai',  -- 'ai' | 'template'
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_merge_records (
+  id INTEGER PRIMARY KEY,
+  strategy_id INTEGER NOT NULL REFERENCES plan_strategies(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,                  -- 'merge' | 'revert'
+  entries TEXT NOT NULL,               -- JSON: per-row before/after (+ resolutions for conflicts)
+  conflicts TEXT,                      -- JSON: resolutions applied, or null
+  status TEXT NOT NULL DEFAULT 'active', -- 'active' | 'reverted'
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_reports (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES plan_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  definition TEXT NOT NULL,            -- JSON: {strategies: [ids], charts: [{template, title, series, breakdown}]}
+  stale INTEGER NOT NULL DEFAULT 0,    -- 1 = a strategy changed since this report was generated
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_strategies_project ON plan_strategies(project_id);
+CREATE INDEX IF NOT EXISTS idx_plan_ops_strategy ON plan_ops(strategy_id, seq);
+CREATE INDEX IF NOT EXISTS idx_plan_legs_op ON plan_legs(op_id);
+CREATE INDEX IF NOT EXISTS idx_plan_scenarios_project ON plan_scenarios(project_id);
+CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strategy_id);
+`);
 {
   const segCols = db.prepare('PRAGMA table_info(rate_segments)').all().map((c) => c.name);
   if (segCols.length && !segCols.includes('term_id')) {

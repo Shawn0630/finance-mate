@@ -423,8 +423,17 @@ function route() {
       $('#spendList').classList.remove('hidden');
       loadSpending();
     }
-  } else if (['#planning', '#tax'].includes(hash)) {
-    showView(hash.slice(1));
+  } else if (hash === '#planning') {
+    showView('planning');
+    loadPlanning();
+  } else if (hash.startsWith('#planning/project/')) {
+    showView('planning');
+    loadPlanProject(Number(hash.split('/')[2]));
+  } else if (hash.startsWith('#planning/strategy/')) {
+    showView('planning');
+    loadPlanStrategy(Number(hash.split('/')[2]));
+  } else if (hash === '#tax') {
+    showView('tax');
   } else {
     // '#assets' or '#assets/<section>'
     let key = hash.split('/')[1] || 'overview';
@@ -8153,6 +8162,9 @@ $('#rangeBtns').addEventListener('click', (e) => {
 // hidden YYYY-MM input) — no pair logic, no refetch — and every
 // month in the server's valid 2000–2100 range is enabled.
 function monthPopField() {
+  // Planning op-date fields resolve to the button that opened the
+  // picker (held in planMonthBtn while it is open).
+  if (monthPopFor === 'planOp') return planMonthBtn;
   // Earnings panels resolve through their range bar (re-rendered
   // by loadEarnings, so the element is looked up live each time).
   if (monthPopFor && monthPopFor.startsWith('earn:')) {
@@ -8167,6 +8179,8 @@ function monthPopIsEntry() {
 }
 function monthPopSpan() {
   if (monthPopIsEntry()) return { start: '2000-01', end: '2100-12' };
+  // Planning op dates: any month in the server's valid range.
+  if (monthPopFor === 'planOp') return { start: '2000-01', end: '2100-12' };
   // Earnings data is yearly (tax years): the picker browses the
   // data years as months; the picked month's YEAR drives the
   // filter, the button keeps the month label.
@@ -8270,6 +8284,16 @@ $('#monthPop').addEventListener('click', (e) => {
   const cell = e.target.closest('button[data-ym]');
   if (!cell || cell.disabled || !monthPopFor) return;
   if (monthPopIsEntry()) { setEntryMonth(monthPopFor, cell.dataset.ym); closeMonthPop(); return; }
+  // Planning op date: a pick fills the button label (formatted
+  // month) and the hidden input (YYYY-MM-01, day fixed to 01).
+  if (monthPopFor === 'planOp') {
+    const ym = cell.dataset.ym;
+    if (planMonthBtn) { planMonthBtn.dataset.value = ym; planMonthBtn.textContent = formatYM(ym); }
+    const hid = document.getElementById('planOpDateVal');
+    if (hid) hid.value = ym + '-01';
+    closeMonthPop();
+    return;
+  }
   // Earnings: the picked month's YEAR drives the year filter; the
   // button keeps the month label like every other picker.
   if (monthPopFor.startsWith('earn:')) {
@@ -8327,7 +8351,7 @@ window.addEventListener('scroll', () => {
 }, { capture: true, passive: true });
 document.addEventListener('click', (e) => {
   if (!monthPopFor) return;
-  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]')) return;
+  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]') || e.target.closest('[data-plan-month]')) return;
   closeMonthPop();
 });
 document.addEventListener('keydown', (e) => {
@@ -10605,3 +10629,1028 @@ $('#spendDetailAddTxBtn').addEventListener('click', () => openSpendTxAdd(current
   ownerPickers.forEach((p) => p.refresh());
   route();
 })();
+
+// -------------------------------------------------------------- planning ---
+// Planning tab: projects → strategies → ops, with merge/revert/conflict
+// flows. Same panels, section-head padding, summary strips and modals
+// as the property/stock pages; no new visual language.
+const planCharts = {};
+function planDestroyChart(id) {
+  if (planCharts[id]) { planCharts[id].destroy(); planCharts[id] = null; }
+}
+function planLineChart(id, labels, datasets) {
+  planDestroyChart(id);
+  const el = document.getElementById(id);
+  if (!el) return null;
+  planCharts[id] = new Chart(el, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: { y: { ticks: { callback: (v) => moneyTick(v) } } },
+      plugins: { tooltip: { callbacks: { label: (it) => ` ${it.dataset.label}: ${money2(it.parsed.y)}` } } },
+    },
+  });
+  return planCharts[id];
+}
+function planBarChart(id, labels, datasets) {
+  planDestroyChart(id);
+  const el = document.getElementById(id);
+  if (!el) return null;
+  planCharts[id] = new Chart(el, {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { y: { ticks: { callback: (v) => moneyTick(v) }, stacked: true }, x: { stacked: true } },
+      plugins: { tooltip: { callbacks: { label: (it) => ` ${it.dataset.label}: ${money2(it.parsed.y)}` } } },
+    },
+  });
+  return planCharts[id];
+}
+const PLAN_COLORS = ['#20573a', '#2f7de1', '#c46a1b', '#7a3fa0', '#b03a3a', '#0f766e', '#8a6d00', '#3f3f46'];
+const planColor = (i) => PLAN_COLORS[i % PLAN_COLORS.length];
+const planMoney = (v) => (v == null ? '—' : money2(v));
+const planSigned = (v) => (v == null ? '—' : (v >= 0 ? '+' : '') + money2(v));
+let planListData = null;
+let planProjectData = null;
+let planStrategyData = null;
+let planCompareScenarioId = null;
+
+async function loadPlanning() {
+  return withLoading(async () => {
+    const data = await api('/api/planning/projects');
+    planListData = data;
+    $('#planList').classList.remove('hidden');
+    $('#planProject').classList.add('hidden');
+    $('#planStrategy').classList.add('hidden');
+    $('#planList').innerHTML = planListHtml(data.projects);
+    document.querySelectorAll('[data-plan-project]').forEach((el) => {
+      el.addEventListener('click', () => { location.hash = `#planning/project/${el.dataset.planProject}`; });
+    });
+    const addBtn = $('#planAddProjectBtn');
+    if (addBtn) addBtn.addEventListener('click', () => openPlanProjectModal(null));
+  });
+}
+function planListHtml(projects) {
+  const cards = projects.map((p) => `
+    <div class="card breakdown-card" data-plan-project="${p.id}" style="cursor:pointer">
+      <div class="k">${esc(p.name)}</div>
+      <div class="v">${p.strategies.length} strateg${p.strategies.length === 1 ? 'y' : 'ies'}</div>
+      <div class="n">${esc(p.question || '')}${p.stale ? ' · Stale baseline' : ''}</div>
+    </div>`).join('');
+  return `
+    <div class="section-head"><h2>Planning</h2><div class="toolbar"><button class="primary" id="planAddProjectBtn">+ Add project</button></div></div>
+    <div class="msg" id="planListMsg"></div>
+    ${projects.length ? `<div class="cards">${cards}</div>` : '<div class="panel"><div class="note">No projects yet.</div></div>'}`;
+}
+function openPlanProjectModal(existing) {
+  const form = $('#planProjectForm');
+  form.reset();
+  $('#planProjectModalTitle').textContent = existing ? 'Edit project' : 'Add project';
+  if (existing) { form.name.value = existing.name; form.question.value = existing.question || ''; }
+  form.dataset.projectId = existing ? existing.id : '';
+  showMsg($('#planProjectModalMsg'), '', '');
+  openModal('planProjectModal');
+}
+$('#planProjectForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = $('#planProjectModalMsg');
+  const id = form.dataset.projectId;
+  try {
+    const body = { name: form.name.value.trim(), question: form.question.value.trim() || null };
+    const data = id ? await api(`/api/planning/projects/${id}`, { method: 'PUT', body })
+      : await api('/api/planning/projects', { method: 'POST', body });
+    closeModalEl($('#planProjectModal'));
+    location.hash = `#planning/project/${(data.project || {}).id || id}`;
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+async function loadPlanProject(id) {
+  return withLoading(async () => {
+    const data = await api(`/api/planning/projects/${id}`);
+    planProjectData = data;
+    $('#planList').classList.add('hidden');
+    $('#planProject').classList.remove('hidden');
+    $('#planStrategy').classList.add('hidden');
+    $('#planProject').innerHTML = planProjectHtml(data);
+    planProjectWire(data);
+    await loadPlanComparison(id, null);
+  });
+}
+function planProjectHtml(d) {
+  const p = d.project;
+  return `
+    <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(p.name)}</h3>
+        <div class="toolbar">
+          ${d.stale ? '<span class="msg warn" style="margin:0">Stale baseline</span><button class="small" id="planSyncBtn">Sync latest mainline</button>' : ''}
+          <button class="small" id="planProjectEditBtn">Edit</button>
+          <button class="small danger" id="planProjectDeleteBtn">Delete</button>
+        </div>
+      </div>
+      <div class="note">${esc(p.question || '')}</div>
+      <div class="msg" id="planProjectMsg"></div>
+    </div>
+    <div class="panel" id="planComparePanel">
+      <div class="section-head"><h3>Comparison</h3>
+        <div class="toolbar"><label>Future world</label><select id="planCompareScenario"></select>
+        <button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
+      </div>
+      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
+      <div id="planCompareTable"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Strategies</h3></div>
+      <div id="planStrategyCards"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Prime scenarios</h3>
+        <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
+      </div>
+      <div id="planScenarioList"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Declared fixed-term assets</h3>
+        <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
+      </div>
+      <div id="planAssetList"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Reports</h3>
+        <div class="toolbar"><button class="small" id="planAddReportBtn">+ Save report</button></div>
+      </div>
+      <div id="planReportList"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>History</h3></div>
+      <div id="planHistoryList"></div>
+    </div>`;
+}
+function planProjectWire(d) {
+  const p = d.project;
+  $('#planProjectEditBtn').addEventListener('click', () => openPlanProjectModal(p));
+  $('#planProjectDeleteBtn').addEventListener('click', async () => {
+    if (!confirm(`Delete project "${p.name}" and all its strategies?`)) return;
+    try { await api(`/api/planning/projects/${p.id}`, { method: 'DELETE' }); location.hash = '#planning'; }
+    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+  });
+  const syncBtn = $('#planSyncBtn');
+  if (syncBtn) syncBtn.addEventListener('click', async () => {
+    try { await api(`/api/planning/projects/${p.id}/sync`, { method: 'POST' }); loadPlanProject(p.id); }
+    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+  });
+  $('#planAddStrategyBtn').addEventListener('click', () => openPlanStrategyModal(p.id));
+  $('#planAddScenarioBtn').addEventListener('click', () => openPlanScenarioModal(p.id));
+  $('#planAddAssetBtn').addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
+  $('#planAddReportBtn').addEventListener('click', () => planSaveReport(p.id));
+  const sel = $('#planCompareScenario');
+  sel.innerHTML = d.scenarios.map((s) => `<option value="${s.id}"${s.is_base ? ' selected' : ''}>${esc(s.name)}</option>`).join('');
+  sel.addEventListener('change', () => loadPlanComparison(p.id, Number(sel.value)));
+  $('#planScenarioList').innerHTML = d.scenarios.map((s) => `
+    <div class="plan-row"><span>${esc(s.name)} · ${esc(s.direction)} · ${esc(s.stance)}${s.magnitude != null ? ` · ${s.magnitude}%` : ''}${s.is_base ? ' · Base' : ''}</span>
+    <span class="toolbar">
+      ${s.is_base ? '' : `<button class="small" data-plan-scenario-base="${s.id}">Set as base</button>`}
+      ${s.is_base ? '' : `<button class="small danger" data-plan-scenario-del="${s.id}">Delete</button>`}
+    </span></div>`).join('') || '<div class="note">No scenarios.</div>';
+  document.querySelectorAll('[data-plan-scenario-base]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api(`/api/planning/scenarios/${b.dataset.planScenarioBase}/set-base`, { method: 'POST' }); loadPlanProject(p.id); }
+    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+  }));
+  document.querySelectorAll('[data-plan-scenario-del]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api(`/api/planning/scenarios/${b.dataset.planScenarioDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
+    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+  }));
+  $('#planAssetList').innerHTML = d.declaredAssets.map((a) => `
+    <div class="plan-row"><span>${esc(a.name)} · ${money2(a.amount)}${a.maturity_date ? ` · matures ${esc(a.maturity_date)}` : ''}</span>
+    <button class="small danger" data-plan-asset-del="${a.id}">Delete</button></div>`).join('') || '<div class="note">No declared assets.</div>';
+  document.querySelectorAll('[data-plan-asset-del]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api(`/api/planning/declared-assets/${b.dataset.planAssetDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
+    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+  }));
+  $('#planReportList').innerHTML = d.reports.map((r) => `
+    <div class="plan-row"><span>${esc(r.name)}${r.stale ? ' · Stale — regenerate' : ''}</span>
+    <button class="small danger" data-plan-report-del="${r.id}">Delete</button></div>`).join('') || '<div class="note">No reports yet.</div>';
+  document.querySelectorAll('[data-plan-report-del]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
+    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+  }));
+  $('#planHistoryList').innerHTML = d.history.map((m) => `
+    <div class="plan-row"><span>${m.kind === 'merge' ? 'Merged' : 'Reverted'} · ${esc(m.strategy_name)} · ${new Date(m.created_at).toLocaleString('en-CA')}</span></div>`).join('') || '<div class="note">No merges yet.</div>';
+}
+async function loadPlanComparison(projectId, scenarioId) {
+  const q = scenarioId ? `?scenarioId=${scenarioId}` : '';
+  const data = await api(`/api/planning/projects/${projectId}/comparison${q}`);
+  planCompareScenarioId = (data.scenario || {}).id || null;
+  const rows = data.strategies;
+  const head = `<tr><th></th><th>Baseline</th>${rows.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('')}</tr>`;
+  const numRow = (label, fn) => `<tr><td>${label}</td><td>${fn(null)}</td>${rows.map((r) => `<td>${fn(r.comparison)}</td>`).join('')}</tr>`;
+  $('#planCompareTable').innerHTML = `
+    <table class="tbl"><thead>${head}</thead><tbody>
+      ${numRow('Total cost', (c) => (c ? planMoney(c.cost) : '—'))}
+      ${numRow('Total gain', (c) => (c ? planMoney(c.gain) : '—'))}
+      ${numRow('Net benefit', (c) => (c ? planSigned(c.net) : '—'))}
+      ${numRow('Payoff shift (months)', (c) => (c && c.payoffShiftMonths != null ? c.payoffShiftMonths : '—'))}
+      ${numRow('Monthly payment Δ', (c) => (c ? planSigned(c.paymentDelta) : '—'))}
+      ${numRow('Value at horizon', (c) => (c ? planMoney(c.valueAtHorizon) : planMoney(data.baseline.valueAtHorizon)))}
+    </tbody></table>`;
+  // Balance lines: baseline + each strategy, summed across properties.
+  const sumBalance = (proj) => {
+    const byMonth = new Map();
+    for (const per of Object.values(proj.mortgage.perProperty)) {
+      const series = per.strategy && per.strategy.series ? per.strategy.series : (per.baseline && per.baseline.series ? per.baseline.series : []);
+      for (const row of series) byMonth.set(row.month, (byMonth.get(row.month) || 0) + row.balance);
+    }
+    return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  };
+  const baseSeries = sumBalance(data.baseline);
+  const labels = baseSeries.map(([m]) => m);
+  const datasets = [{ label: 'Baseline', data: baseSeries.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 }];
+  rows.forEach((r, i) => {
+    const s = sumBalance(r.projection);
+    const byMonth = new Map(s);
+    datasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true });
+  });
+  planLineChart('planCompareChart', labels, datasets);
+  $('#planStrategyCards').innerHTML = rows.map((r) => `
+    <div class="card breakdown-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
+      <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
+      <div class="v">${planSigned(r.comparison.net)}</div>
+      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)}</div>
+    </div>`).join('') || '<div class="note">No strategies yet.</div>';
+  document.querySelectorAll('[data-plan-strategy]').forEach((el) => {
+    el.addEventListener('click', () => { location.hash = `#planning/strategy/${el.dataset.planStrategy}`; });
+  });
+}
+async function planSaveReport(projectId) {
+  const name = prompt('Report name');
+  if (!name) return;
+  try {
+    await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: { strategies: [], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] } } });
+    loadPlanProject(projectId);
+  } catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+}
+
+async function loadPlanStrategy(id) {
+  return withLoading(async () => {
+    const data = await api(`/api/planning/strategies/${id}`);
+    planStrategyData = data;
+    $('#planList').classList.add('hidden');
+    $('#planProject').classList.add('hidden');
+    $('#planStrategy').classList.remove('hidden');
+    $('#planStrategy').innerHTML = planStrategyHtml(data);
+    planStrategyWire(data);
+  });
+}
+function planStrategyHtml(d) {
+  const s = d.strategy;
+  const c = d.comparison;
+  const ops = d.ops.map((o) => {
+    const p = o.params || {};
+    const desc = o.op_type === 'prepay' ? `Prepay ${money2(p.amount)} on ${esc(p.date || '')}${p.recurringYears > 1 ? ` yearly × ${p.recurringYears}` : ''}`
+      : o.op_type === 'rate_switch' ? `Switch rate on ${esc(p.date || '')} to ${p.rateType === 'fixed' ? `${p.annualRate}% fixed` : `Prime ${p.spread >= 0 ? '+' : ''}${p.spread}`}`
+      : o.op_type === 'refinance' ? `Refinance on ${esc(p.date || '')} · ${p.termMonths} months · ${p.amortizationYears}y amortization`
+      : o.op_type === 'payment_change' ? `Payment → ${money2(p.payment)} from ${esc(p.date || '')}`
+      : o.op_type === 'buy' ? `Buy ${p.symbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}`
+      : o.op_type === 'sell' ? `Sell ${p.units} units on ${esc(p.date || '')}`
+      : `Position ${p.units} units on ${esc(p.date || '')}`;
+    return `<tr><td>${o.seq}</td><td>${esc(o.op_type)}</td><td>${desc}</td><td>${esc(o.source || '')}</td>
+      <td class="toolbar"><button class="small" data-plan-op-edit="${o.id}">Edit</button><button class="small danger" data-plan-op-del="${o.id}">Delete</button></td></tr>`;
+  }).join('');
+  const penRows = (d.projection.penalties || []).map((x) => `
+    <div class="plan-row"><span>${esc(x.reason || 'Penalty')} · ${esc(x.date)} · ${esc(x.method)} · ${money2(x.penalty)}</span>
+    <span class="note">Estimate — the bank quote governs</span></div>`).join('');
+  const scenRows = d.scenarioTable.map((r) => `
+    <tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
+  // Annual interest table from the summed series.
+  const yearMap = new Map();
+  const addSeries = (series, key) => {
+    for (const row of series || []) {
+      const y = row.month.slice(0, 4);
+      if (!yearMap.has(y)) yearMap.set(y, { base: 0, strat: 0 });
+      yearMap.get(y)[key] += row.interest || 0;
+    }
+  };
+  for (const per of Object.values(d.projection.mortgage.perProperty)) {
+    addSeries(per.baseline && per.baseline.series, 'base');
+    addSeries(per.strategy && per.strategy.series, 'strat');
+  }
+  const yearRows = [...yearMap.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([y, v]) => `
+    <tr><td>${y}</td><td>${money2(v.base)}</td><td>${money2(v.strat)}</td><td>${planSigned(v.base - v.strat)}</td></tr>`).join('');
+  const asm = {};
+  for (const a of d.assumptions) asm[a.key] = a;
+  return `
+    <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(s.letter)} · ${esc(s.name)}${s.merged ? ' · Merged' : ''}</h3>
+        <div class="toolbar">
+          ${s.merged
+            ? '<button class="small" id="planRevertBtn">Revert merge</button>'
+            : '<button class="primary" id="planMergeBtn">Merge</button>'}
+          <button class="small danger" id="planStrategyDeleteBtn">Delete</button>
+        </div>
+      </div>
+      <div class="msg" id="planStrategyMsg"></div>
+      ${c.errors && c.errors.length ? `<div class="msg err">${esc(c.errors.join('; '))}</div>` : ''}
+      <div class="summary-strip">
+        <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
+        <div class="summary-card"><div class="k">Total cost</div><div class="v">${planMoney(c.cost)}</div></div>
+        <div class="summary-card"><div class="k">Total gain</div><div class="v">${planMoney(c.gain)}</div></div>
+        <div class="summary-card"><div class="k">Value at horizon</div><div class="v">${planMoney(c.valueAtHorizon)}</div></div>
+      </div>
+      <div class="cards">
+        <div class="card breakdown-card"><div class="k">Interest saved</div><div class="v">${planMoney(c.interestSaved)}</div></div>
+        <div class="card breakdown-card"><div class="k">Payoff shift</div><div class="v">${c.payoffShiftMonths != null ? `${c.payoffShiftMonths} months` : '—'}</div></div>
+        <div class="card breakdown-card"><div class="k">Monthly payment Δ</div><div class="v">${planSigned(c.paymentDelta)}</div></div>
+        <div class="card breakdown-card"><div class="k">Penalty</div><div class="v">${planMoney(c.penaltyTotal)}</div><div class="n">Estimate — the bank quote governs</div></div>
+      </div>
+    </div>
+    ${penRows ? `<div class="panel"><div class="section-head"><h3>Penalties</h3></div>${penRows}</div>` : ''}
+    <div class="panel">
+      <div class="section-head"><h3>Mortgage balance</h3></div>
+      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyMortChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Stock value</h3></div>
+      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Scenarios</h3></div>
+      <div class="chart-wrap" style="height:240px"><canvas id="planStrategyFanChart"></canvas></div>
+      <table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${scenRows}</tbody></table>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Annual interest</h3></div>
+      <table class="tbl"><thead><tr><th>Year</th><th>Baseline interest</th><th>Strategy interest</th><th>Saved</th></tr></thead><tbody>${yearRows}</tbody></table>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Operations</h3>
+        <div class="toolbar"><button class="small" id="planAddOpBtn">+ Add operation</button></div>
+      </div>
+      <table class="tbl"><thead><tr><th>#</th><th>Type</th><th>Detail</th><th>Source</th><th></th></tr></thead><tbody>${ops || '<tr><td colspan="5">No operations yet.</td></tr>'}</tbody></table>
+      <div class="msg" id="planOpsMsg"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Describe in words</h3></div>
+      <div><textarea id="planAiDescribeText" rows="3" placeholder="e.g. Prepay $100,000 on Christina in January 2027, then refinance to a 5-year fixed at 4.2%"></textarea></div>
+      <div class="toolbar"><button class="small" id="planAiDescribeBtn">Describe → operations</button></div>
+      <div id="planAiDescribeOut"></div>
+      <div class="msg" id="planAiDescribeMsg"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Assumptions</h3></div>
+      <div class="grid2">
+        <div><label>Comparable rate (%)</label><input id="planAsmComparable" type="text" inputmode="decimal" data-money value="${asm.comparableRate ? esc(asm.comparableRate.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmComparableOk"${asm.comparableRate && asm.comparableRate.confirmed ? ' checked' : ''}> Confirmed</label></div>
+        <div><label>Annual prepayment privilege (%)</label><input id="planAsmPrivilege" type="text" inputmode="decimal" data-money value="${asm.privilegePct ? esc(asm.privilegePct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmPrivilegeOk"${asm.privilegePct && asm.privilegePct.confirmed ? ' checked' : ''}> Confirmed</label></div>
+        <div><label>Stock return (% / year)</label><input id="planAsmReturn" type="text" inputmode="decimal" data-money value="${asm.stockReturnPct ? esc(asm.stockReturnPct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmReturnOk"${asm.stockReturnPct && asm.stockReturnPct.confirmed ? ' checked' : ''}> Confirmed</label></div>
+        <div><label>Return suggestions</label><div class="toolbar"><select id="planSuggestHolding"></select><button class="small" id="planSuggestBtn">Suggest</button></div><div id="planSuggestOut"></div></div>
+      </div>
+      <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
+      <div class="msg" id="planAsmMsg"></div>
+      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Blank stock return = no growth.</div>
+    </div>`;
+}
+function planStrategyWire(d) {
+  const s = d.strategy;
+  const mergeBtn = $('#planMergeBtn');
+  if (mergeBtn) mergeBtn.addEventListener('click', () => openPlanMergeModal(s.id, false));
+  const revertBtn = $('#planRevertBtn');
+  if (revertBtn) revertBtn.addEventListener('click', () => openPlanMergeModal(s.id, true));
+  $('#planStrategyDeleteBtn').addEventListener('click', async () => {
+    if (!confirm(`Delete strategy "${s.name}"?`)) return;
+    try { await api(`/api/planning/strategies/${s.id}`, { method: 'DELETE' }); location.hash = `#planning/project/${d.project.id}`; }
+    catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
+  });
+  $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
+  document.querySelectorAll('[data-plan-op-edit]').forEach((b) => b.addEventListener('click', () => {
+    const op = d.ops.find((o) => o.id === Number(b.dataset.planOpEdit));
+    openPlanOpModal(s.id, op);
+  }));
+  document.querySelectorAll('[data-plan-op-del]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api(`/api/planning/ops/${b.dataset.planOpDel}`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
+    catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
+  }));
+  // Mortgage balance lines: baseline vs strategy, summed across properties.
+  const sumBalance = (proj, side) => {
+    const byMonth = new Map();
+    for (const per of Object.values(proj.mortgage.perProperty)) {
+      const series = per[side] && per[side].series ? per[side].series : [];
+      for (const row of series) byMonth.set(row.month, (byMonth.get(row.month) || 0) + row.balance);
+    }
+    return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  };
+  const baseBal = sumBalance(d.baseline, 'baseline');
+  const stratBal = sumBalance(d.projection, 'strategy');
+  const labels = baseBal.map(([m]) => m);
+  const stratMap = new Map(stratBal);
+  planLineChart('planStrategyMortChart', labels, [
+    { label: 'Baseline', data: baseBal.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
+    { label: s.name, data: labels.map((m) => stratMap.get(m) ?? null), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
+  ]);
+  planLineChart('planStrategyStockChart', d.baseline.stocks.series.map((r) => r.month), [
+    { label: 'Baseline', data: d.baseline.stocks.series.map((r) => r.value), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
+    { label: s.name, data: d.projection.stocks.series.map((r) => r.value), borderColor: planColor(1), backgroundColor: planColor(1), fill: false, pointRadius: 0 },
+  ]);
+  // Fan chart: min/max envelope across scenarios + the base line.
+  const baseRow = d.scenarioTable.find((r) => r.scenarioId === (d.baseScenario || {}).id) || d.scenarioTable[0];
+  if (baseRow) {
+    const months = baseRow.balanceByMonth.map((r) => r.month);
+    const min = months.map((_, i) => Math.min(...d.scenarioTable.map((r) => r.balanceByMonth[i].balance)));
+    const max = months.map((_, i) => Math.max(...d.scenarioTable.map((r) => r.balanceByMonth[i].balance)));
+    planLineChart('planStrategyFanChart', months, [
+      { label: 'Best', data: min, borderColor: '#2f7de1', backgroundColor: '#2f7de1', fill: false, pointRadius: 0 },
+      { label: 'Base', data: baseRow.balanceByMonth.map((r) => r.balance), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0 },
+      { label: 'Worst', data: max, borderColor: '#b03a3a', backgroundColor: '#b03a3a', fill: false, pointRadius: 0 },
+    ]);
+  }
+  // Assumptions save.
+  $('#planAsmSaveBtn').addEventListener('click', async () => {
+    const msg = $('#planAsmMsg');
+    const parse = (id) => { const el = $(id); const v = el.value.replace(/,/g, '').trim(); return v === '' ? null : v; };
+    try {
+      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'comparableRate', value: parse('#planAsmComparable'), confirmed: $('#planAsmComparableOk').checked } });
+      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'privilegePct', value: parse('#planAsmPrivilege'), confirmed: $('#planAsmPrivilegeOk').checked } });
+      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'stockReturnPct', value: parse('#planAsmReturn'), confirmed: $('#planAsmReturnOk').checked } });
+      showMsg(msg, 'ok', 'Assumptions saved');
+      loadPlanStrategy(s.id);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+  // Return suggestions: holdings list comes from the Stocks pages' data
+  // via a fresh holdings lookup (the planning API resolves by id).
+  (async () => {
+    try {
+      const inv = await api('/api/investments');
+      const holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountName: (a.account || {}).name })));
+      const sel = $('#planSuggestHolding');
+      if (!sel) return;
+      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
+      $('#planSuggestBtn').addEventListener('click', async () => {
+        const out = $('#planSuggestOut');
+        try {
+          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
+          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available.')}</div>`; return; }
+          out.innerHTML = r.suggestions.map((x) => `
+            <button class="small" data-plan-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
+            + `<div class="note">Past returns do not predict future returns.</div>`;
+          out.querySelectorAll('[data-plan-suggest]').forEach((b) => b.addEventListener('click', () => {
+            const v = Number(b.dataset.planSuggest);
+            $('#planAsmReturn').value = formatMoneyInput(v.toFixed(2));
+            $('#planAsmReturnOk').checked = true;
+          }));
+        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+      });
+    } catch { /* Stocks data unavailable — suggestions stay empty */ }
+  })();
+  // AI describe.
+  $('#planAiDescribeBtn').addEventListener('click', async () => {
+    const msg = $('#planAiDescribeMsg');
+    const out = $('#planAiDescribeOut');
+    const text = $('#planAiDescribeText').value.trim();
+    if (!text) { showMsg(msg, 'err', 'Describe the strategy first'); return; }
+    try {
+      const r = await api(`/api/planning/strategies/${s.id}/ai-describe`, { method: 'POST', body: { text } });
+      let html = '';
+      if (r.unresolved && r.unresolved.length) {
+        html += `<div class="msg warn">Could not resolve: ${esc(r.unresolved.map((u) => u.reason).join('; '))}</div>`;
+      }
+      if (r.warnings && r.warnings.length) html += `<div class="msg warn">${esc(r.warnings.join('; '))}</div>`;
+      html += r.ops.map((o) => `<div class="plan-row"><span>${esc(o.op_type)} · ${esc(JSON.stringify(o.params))}</span></div>`).join('');
+      html += `<div class="toolbar"><button class="small primary" id="planAiApplyBtn">Apply these operations</button></div>`;
+      out.innerHTML = html || '<div class="note">No operations proposed.</div>';
+      const applyBtn = $('#planAiApplyBtn');
+      if (applyBtn) applyBtn.addEventListener('click', async () => {
+        try {
+          for (const o of r.ops) {
+            await api(`/api/planning/strategies/${s.id}/ops`, { method: 'POST', body: { op_type: o.op_type, params: o.params, legs: o.legs || [], source: 'ai' } });
+          }
+          showMsg(msg, 'ok', 'Operations applied');
+          loadPlanStrategy(s.id);
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      });
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+}
+
+// ------------------------------------------------------- planning modals ---
+function openPlanScenarioModal(projectId) {
+  const form = $('#planScenarioForm');
+  form.reset();
+  form.dataset.projectId = projectId;
+  showMsg($('#planScenarioModalMsg'), '', '');
+  openModal('planScenarioModal');
+}
+$('#planScenarioForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = $('#planScenarioModalMsg');
+  try {
+    let steps = null;
+    if (form.steps.value.trim()) {
+      steps = JSON.parse(form.steps.value.trim());
+      if (!Array.isArray(steps)) throw new Error('steps must be a JSON array');
+    }
+    const mag = form.magnitude.value.replace(/,/g, '').trim();
+    await api(`/api/planning/projects/${form.dataset.projectId}/scenarios`, { method: 'POST', body: {
+      name: form.name.value.trim(), direction: form.direction.value, stance: form.stance.value,
+      magnitude: mag === '' ? null : Number(mag), steps,
+    } });
+    closeModalEl($('#planScenarioModal'));
+    loadPlanProject(Number(form.dataset.projectId));
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+function openPlanDeclaredAssetModal(projectId) {
+  const form = $('#planDeclaredAssetForm');
+  form.reset();
+  form.dataset.projectId = projectId;
+  showMsg($('#planDeclaredAssetModalMsg'), '', '');
+  openModal('planDeclaredAssetModal');
+}
+$('#planDeclaredAssetForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = $('#planDeclaredAssetModalMsg');
+  try {
+    await api(`/api/planning/projects/${form.dataset.projectId}/declared-assets`, { method: 'POST', body: {
+      name: form.name.value.trim(), amount: parseMoneyInput(form.amount.value), maturity_date: form.maturity_date.value || null,
+    } });
+    closeModalEl($('#planDeclaredAssetModal'));
+    loadPlanProject(Number(form.dataset.projectId));
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+// ---- op form ----
+let planOpCtx = null; // {properties, accounts, holdings, declaredAssets, ops}
+async function planLoadOpCtx(projectId, strategyId) {
+  const [props, inv, proj] = await Promise.all([
+    api('/api/properties').catch(() => ({ properties: [] })),
+    api('/api/investments').catch(() => ({ accounts: [] })),
+    projectId ? api(`/api/planning/projects/${projectId}`) : Promise.resolve(planProjectData),
+  ]);
+  const properties = props.properties || props || [];
+  const accounts = (inv.accounts || []).map((a) => ({ ...(a.account || {}), holdings: (a.holdings || []).map((h) => h.holding) }));
+  const holdings = accounts.flatMap((a) => a.holdings.map((h) => ({ ...h, accountId: a.id })));
+  const declaredAssets = (proj && proj.declaredAssets) || [];
+  let ops = [];
+  if (strategyId) {
+    try { const s = await api(`/api/planning/strategies/${strategyId}`); ops = s.ops || []; } catch { /* new strategy */ }
+  }
+  return { properties, accounts, holdings, declaredAssets, ops };
+}
+function planMonthBtnHtml(valueYm, inputId) {
+  const ym = valueYm || '';
+  return `<button type="button" class="month-field" data-plan-month data-value="${esc(ym)}" aria-haspopup="dialog" aria-expanded="false">${ym ? formatYM(ym) : '—'}</button><input type="hidden" id="${inputId}" value="${ym ? `${ym}-01` : ''}">`;
+}
+function planOpFormHtml(type, params, ctx) {
+  const p = params || {};
+  const propOpts = ctx.properties.map((x) => `<option value="${x.id}"${Number(p.propertyId) === x.id ? ' selected' : ''}>${esc(x.address)}</option>`).join('');
+  const acctOpts = ctx.accounts.map((x) => `<option value="${x.id}"${Number(p.accountId) === x.id ? ' selected' : ''}>${esc(x.name)}</option>`).join('');
+  const holdOpts = ctx.holdings.map((x) => `<option value="${x.id}"${Number(p.holdingId) === x.id ? ' selected' : ''}>${esc(x.symbol || x.label)}</option>`).join('');
+  const dateRow = `<div><label>Date (month) *</label>${planMonthBtnHtml((p.date || '').slice(0, 7), 'planOpDateVal')}</div>`;
+  const rateRows = `
+    <div><label>Rate type *</label><label class="btnlike"><input type="radio" name="planOpRateType" value="fixed"${p.rateType !== 'variable' ? ' checked' : ''}> Fixed</label> <label class="btnlike"><input type="radio" name="planOpRateType" value="variable"${p.rateType === 'variable' ? ' checked' : ''}> Variable</label></div>
+    <div class="grid2">
+      <div><label>Fixed rate (%)</label><input id="planOpAnnualRate" type="text" inputmode="decimal" data-money value="${p.annualRate != null ? esc(String(p.annualRate)) : ''}"></div>
+      <div><label>Spread vs prime (points)</label><input id="planOpSpread" type="text" inputmode="decimal" data-money value="${p.spread != null ? esc(String(p.spread)) : ''}"></div>
+    </div>`;
+  let body = '';
+  if (type === 'prepay') body = `
+    <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
+    ${dateRow}
+    <div class="grid2">
+      <div><label>Amount *</label><input id="planOpAmount" type="text" inputmode="decimal" data-money value="${p.amount != null ? esc(String(p.amount)) : ''}" required></div>
+      <div><label>Recurring years</label><input id="planOpYears" type="number" min="1" max="30" value="${p.recurringYears || 1}"></div>
+      <div><label>Plan type</label><select id="planOpOpenClosed"><option value="closed"${p.openClosed !== 'open' ? ' selected' : ''}>Closed</option><option value="open"${p.openClosed === 'open' ? ' selected' : ''}>Open</option></select></div>
+    </div>`;
+  if (type === 'rate_switch') body = `
+    <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
+    <div><label>Plan type</label><select id="planOpOpenClosed"><option value="closed"${p.openClosed !== 'open' ? ' selected' : ''}>Closed</option><option value="open"${p.openClosed === 'open' ? ' selected' : ''}>Open</option></select></div>
+    ${dateRow}${rateRows}`;
+  if (type === 'refinance') body = `
+    <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
+    <div><label>Plan type</label><select id="planOpOpenClosed"><option value="closed"${p.openClosed !== 'open' ? ' selected' : ''}>Closed</option><option value="open"${p.openClosed === 'open' ? ' selected' : ''}>Open</option></select></div>
+    ${dateRow}${rateRows}
+    <div class="grid2">
+      <div><label>Term (months) *</label><input id="planOpTermMonths" type="number" min="1" max="120" value="${p.termMonths || 60}"></div>
+      <div><label>Amortization (years) *</label><input id="planOpAmortYears" type="number" min="1" max="35" value="${p.amortizationYears || 25}"></div>
+      <div><label>Fees</label><input id="planOpFees" type="text" inputmode="decimal" data-money value="${p.fees != null ? esc(String(p.fees)) : ''}"></div>
+      <div><label>Cash-out</label><input id="planOpCashOut" type="text" inputmode="decimal" data-money value="${p.cashOut != null ? esc(String(p.cashOut)) : ''}"></div>
+    </div>
+    <div><label>Lender</label><input id="planOpLender" value="${p.lender ? esc(p.lender) : ''}"></div>`;
+  if (type === 'payment_change') body = `
+    <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
+    ${dateRow}
+    <div><label>New payment *</label><input id="planOpPayment" type="text" inputmode="decimal" data-money value="${p.payment != null ? esc(String(p.payment)) : ''}" required></div>`;
+  if (type === 'buy') body = `
+    <div><label>Account *</label><select id="planOpAccount">${acctOpts}</select></div>
+    <div><label>Holding</label><select id="planOpHolding"><option value="">New holding…</option>${holdOpts}</select>
+    <input id="planOpSymbol" placeholder="Symbol for a new holding" value="${p.symbol ? esc(p.symbol) : ''}"></div>
+    ${dateRow}
+    <div class="grid2">
+      <div><label>Units</label><input id="planOpUnits" type="text" inputmode="decimal" data-money value="${p.units != null ? esc(String(p.units)) : ''}"></div>
+      <div><label>Amount</label><input id="planOpAmount" type="text" inputmode="decimal" data-money value="${p.amount != null ? esc(String(p.amount)) : ''}"></div>
+      <div><label>Price *</label><input id="planOpPrice" type="text" inputmode="decimal" data-money value="${p.price != null ? esc(String(p.price)) : ''}" required></div>
+    </div>
+    <div><label>Funded by</label><div id="planOpLegs"></div><button type="button" class="small" id="planOpAddLegBtn">+ Funding leg</button></div>`;
+  if (type === 'sell') body = `
+    <div><label>Holding *</label><select id="planOpHolding">${holdOpts}</select></div>
+    ${dateRow}
+    <div class="grid2">
+      <div><label>Units *</label><input id="planOpUnits" type="text" inputmode="decimal" data-money value="${p.units != null ? esc(String(p.units)) : ''}" required></div>
+      <div><label>Price (blank = market)</label><input id="planOpPrice" type="text" inputmode="decimal" data-money value="${p.price != null ? esc(String(p.price)) : ''}"></div>
+    </div>
+    <div><label>Proceeds go to</label><div id="planOpLegs"></div><button type="button" class="small" id="planOpAddLegBtn">+ Proceeds leg</button></div>`;
+  if (type === 'position') body = `
+    <div><label>Account *</label><select id="planOpAccount">${acctOpts}</select></div>
+    <div><label>Symbol</label><input id="planOpSymbol" value="${p.symbol ? esc(p.symbol) : ''}"></div>
+    ${dateRow}
+    <div><label>Units *</label><input id="planOpUnits" type="text" inputmode="decimal" data-money value="${p.units != null ? esc(String(p.units)) : ''}" required></div>`;
+  return body;
+}
+function planLegRowHtml(type, ctx, leg) {
+  const l = leg || { source_ref: type === 'buy' ? 'cash' : 'pot', amount: 'remainder' };
+  let srcOpts = '';
+  if (type === 'buy') {
+    srcOpts = `<option value="cash"${l.source_ref === 'cash' ? ' selected' : ''}>Declared cash</option>
+      <option value="external"${l.source_ref === 'external' ? ' selected' : ''}>External injection</option>
+      <option value="pot"${l.source_ref === 'pot' ? ' selected' : ''}>Cash pot</option>`
+      + ctx.declaredAssets.map((a) => `<option value="declared:${a.id}"${l.source_ref === `declared:${a.id}` ? ' selected' : ''}>${esc(a.name)}</option>`).join('')
+      + ctx.ops.filter((o) => o.op_type === 'sell').map((o) => `<option value="op:${o.seq}"${l.source_ref === `op:${o.seq}` ? ' selected' : ''}>Sell op #${o.seq}</option>`).join('');
+  } else {
+    srcOpts = `<option value="pot"${l.source_ref === 'pot' ? ' selected' : ''}>Cash pot</option>
+      <option value="external_out"${l.source_ref === 'external_out' ? ' selected' : ''}>External out</option>`
+      + ctx.properties.map((x) => `<option value="repay:${x.id}"${l.source_ref === `repay:${x.id}` ? ' selected' : ''}>Repay ${esc(x.address)}</option>`).join('')
+      + ctx.ops.filter((o) => o.op_type === 'buy').map((o) => `<option value="op:${o.seq}"${l.source_ref === `op:${o.seq}` ? ' selected' : ''}>Buy op #${o.seq}</option>`).join('');
+  }
+  const mode = l.amount === 'all' ? 'all' : l.amount === 'remainder' ? 'remainder' : 'fixed';
+  return `<div class="plan-row plan-leg-row">
+    <select class="plan-leg-src">${srcOpts}</select>
+    <select class="plan-leg-mode"><option value="fixed"${mode === 'fixed' ? ' selected' : ''}>Fixed</option><option value="all"${mode === 'all' ? ' selected' : ''}>All</option><option value="remainder"${mode === 'remainder' ? ' selected' : ''}>Remainder</option></select>
+    <input class="plan-leg-amount" type="text" inputmode="decimal" data-money value="${mode === 'fixed' ? esc(String(l.amount)) : ''}"${mode !== 'fixed' ? ' disabled' : ''}>
+    <button type="button" class="small danger plan-leg-del">Delete</button></div>`;
+}
+function planLegsWire(type, ctx) {
+  const box = $('#planOpLegs');
+  if (!box) return;
+  box.addEventListener('click', (e) => {
+    if (e.target.closest('.plan-leg-del')) e.target.closest('.plan-leg-row').remove();
+  });
+  box.addEventListener('change', (e) => {
+    if (e.target.closest('.plan-leg-mode')) {
+      const row = e.target.closest('.plan-leg-row');
+      const amt = row.querySelector('.plan-leg-amount');
+      amt.disabled = e.target.value !== 'fixed';
+      if (amt.disabled) amt.value = '';
+    }
+  });
+  const addBtn = $('#planOpAddLegBtn');
+  if (addBtn) addBtn.addEventListener('click', () => {
+    box.insertAdjacentHTML('beforeend', planLegRowHtml(type, ctx, null));
+    box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  });
+}
+function planReadOpForm(type) {
+  const v = (id) => { const el = document.getElementById(id); return el ? el.value : null; };
+  const m = (id) => { const x = v(id); if (x == null || String(x).trim() === '') return null; return parseMoneyInput(x); };
+  const params = { date: v('planOpDateVal') || null };
+  if (type === 'prepay') { params.propertyId = Number(v('planOpProperty')); params.amount = m('planOpAmount'); params.recurringYears = Number(v('planOpYears')) || 1; params.openClosed = v('planOpOpenClosed') || 'closed'; }
+  if (type === 'rate_switch' || type === 'refinance') {
+    params.propertyId = Number(v('planOpProperty'));
+    params.openClosed = v('planOpOpenClosed') || 'closed';
+    const rt = document.querySelector('input[name="planOpRateType"]:checked');
+    params.rateType = rt ? rt.value : 'fixed';
+    params.annualRate = params.rateType === 'fixed' ? m('planOpAnnualRate') : null;
+    params.spread = params.rateType === 'variable' ? m('planOpSpread') : null;
+  }
+  if (type === 'refinance') {
+    params.termMonths = Number(v('planOpTermMonths')); params.amortizationYears = Number(v('planOpAmortYears'));
+    params.fees = m('planOpFees'); params.cashOut = m('planOpCashOut'); params.lender = v('planOpLender') || null;
+  }
+  if (type === 'payment_change') { params.propertyId = Number(v('planOpProperty')); params.payment = m('planOpPayment'); }
+  if (type === 'buy') {
+    params.accountId = Number(v('planOpAccount'));
+    const hid = v('planOpHolding');
+    if (hid) params.holdingId = Number(hid);
+    params.symbol = v('planOpSymbol') || null;
+    params.units = m('planOpUnits'); params.amount = m('planOpAmount'); params.price = m('planOpPrice');
+  }
+  if (type === 'sell') { params.holdingId = Number(v('planOpHolding')); params.units = m('planOpUnits'); params.price = m('planOpPrice'); }
+  if (type === 'position') { params.accountId = Number(v('planOpAccount')); params.symbol = v('planOpSymbol') || null; params.units = m('planOpUnits'); }
+  const legs = [];
+  document.querySelectorAll('#planOpLegs .plan-leg-row').forEach((row) => {
+    const src = row.querySelector('.plan-leg-src').value;
+    const mode = row.querySelector('.plan-leg-mode').value;
+    const amount = mode === 'fixed' ? parseMoneyInput(row.querySelector('.plan-leg-amount').value) : mode;
+    legs.push({ source_ref: src, amount });
+  });
+  return { params, legs };
+}
+async function openPlanOpModal(strategyId, existing) {
+  const strategy = planStrategyData ? planStrategyData.strategy : null;
+  const projectId = planStrategyData ? planStrategyData.project.id : null;
+  const ctx = await planLoadOpCtx(projectId, strategyId);
+  planOpCtx = ctx;
+  const type = existing ? existing.op_type : 'prepay';
+  $('#planOpModalTitle').textContent = existing ? 'Edit operation' : 'Add operation';
+  const typeSel = existing ? '' : `<div><label>Operation type *</label><select id="planOpTypeSel">
+    <option value="prepay">Prepay mortgage</option><option value="rate_switch">Rate switch</option>
+    <option value="refinance">Refinance</option><option value="payment_change">Payment change</option>
+    <option value="buy">Buy</option><option value="sell">Sell</option><option value="position">Position (cost unknown)</option></select></div>`;
+  $('#planOpModalBody').innerHTML = `
+    ${typeSel}
+    <div id="planOpFormFields">${planOpFormHtml(type, existing ? existing.params : {}, ctx)}</div>
+    <div class="toolbar"><button class="primary" id="planOpSaveBtn">Save</button><button type="button" data-close-modal>Cancel</button></div>`;
+  $('#planOpModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  const typeEl = $('#planOpTypeSel');
+  if (typeEl) typeEl.addEventListener('change', () => {
+    $('#planOpFormFields').innerHTML = planOpFormHtml(typeEl.value, {}, ctx);
+    $('#planOpFormFields').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    planLegsWire(typeEl.value, ctx);
+    if (typeEl.value === 'buy' || typeEl.value === 'sell') {
+      const box = $('#planOpLegs');
+      if (box && !box.children.length) {
+        box.insertAdjacentHTML('beforeend', planLegRowHtml(typeEl.value, ctx, null));
+        box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+      }
+    }
+  });
+  planLegsWire(type, ctx);
+  if ((type === 'buy' || type === 'sell') && existing && existing.legs) {
+    const box = $('#planOpLegs');
+    box.innerHTML = existing.legs.map((l) => planLegRowHtml(type, ctx, l)).join('');
+    box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  } else if (type === 'buy' || type === 'sell') {
+    const box = $('#planOpLegs');
+    if (box && !box.children.length) {
+      box.insertAdjacentHTML('beforeend', planLegRowHtml(type, ctx, null));
+      box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    }
+  }
+  showMsg($('#planOpModalMsg'), '', '');
+  openModal('planOpModal');
+  $('#planOpSaveBtn').addEventListener('click', async () => {
+    const msg = $('#planOpModalMsg');
+    const curType = existing ? existing.op_type : $('#planOpTypeSel').value;
+    try {
+      const { params, legs } = planReadOpForm(curType);
+      if (!params.date) throw new Error('date is required');
+      if (existing) {
+        await api(`/api/planning/ops/${existing.id}`, { method: 'PUT', body: { params, legs } });
+      } else {
+        await api(`/api/planning/strategies/${strategyId}/ops`, { method: 'POST', body: { op_type: curType, params, legs } });
+      }
+      closeModalEl($('#planOpModal'));
+      loadPlanStrategy(strategyId);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+}
+
+// ---- strategy chooser ----
+async function openPlanStrategyModal(projectId) {
+  $('#planStrategyModalTitle').textContent = 'Add strategy';
+  showMsg($('#planStrategyModalMsg'), '', '');
+  $('#planStrategyModalBody').innerHTML = `
+    <div class="cards">
+      <div class="card breakdown-card" id="planChooseTemplate" style="cursor:pointer"><div class="k">From template</div><div class="n">A single operation: prepay, switch, refinance, buy or sell.</div></div>
+      <div class="card breakdown-card" id="planChooseDescribe" style="cursor:pointer"><div class="k">Describe in words</div><div class="n">Write the plan; AI turns it into operations for your confirmation.</div></div>
+      <div class="card breakdown-card" id="planChooseModel" style="cursor:pointer"><div class="k">Let AI design a model</div><div class="n">AI proposes a full model spec: bindings, formulas, assumptions, outputs, charts.</div></div>
+    </div>`;
+  openModal('planStrategyModal');
+  const ctx = await planLoadOpCtx(projectId, null);
+  planOpCtx = ctx;
+  $('#planChooseTemplate').addEventListener('click', () => {
+    $('#planStrategyModalBody').innerHTML = `
+      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Prepay then refinance"></div>
+      <div><label>Operation type *</label><select id="planStrategyOpType">
+        <option value="prepay">Prepay mortgage</option><option value="rate_switch">Rate switch</option>
+        <option value="refinance">Refinance</option><option value="payment_change">Payment change</option>
+        <option value="buy">Buy</option><option value="sell">Sell</option><option value="position">Position (cost unknown)</option></select></div>
+      <div id="planStrategyOpFields">${planOpFormHtml('prepay', {}, ctx)}</div>
+      <div class="toolbar"><button class="primary" id="planStrategyTemplateSave">Create strategy</button></div>`;
+    $('#planStrategyModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    const typeEl = $('#planStrategyOpType');
+    typeEl.addEventListener('change', () => {
+      $('#planStrategyOpFields').innerHTML = planOpFormHtml(typeEl.value, {}, ctx);
+      $('#planStrategyOpFields').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+      planLegsWire(typeEl.value, ctx);
+      if (typeEl.value === 'buy' || typeEl.value === 'sell') {
+        const box = $('#planOpLegs');
+        if (box && !box.children.length) box.insertAdjacentHTML('beforeend', planLegRowHtml(typeEl.value, ctx, null));
+      }
+    });
+    planLegsWire('prepay', ctx);
+    $('#planStrategyTemplateSave').addEventListener('click', async () => {
+      const msg = $('#planStrategyModalMsg');
+      try {
+        const name = $('#planStrategyName').value.trim();
+        if (!name) throw new Error('strategy name is required');
+        const curType = $('#planStrategyOpType').value;
+        const { params, legs } = planReadOpForm(curType);
+        if (!params.date) throw new Error('date is required');
+        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'template' } });
+        await api(`/api/planning/strategies/${s.strategy.id}/ops`, { method: 'POST', body: { op_type: curType, params, legs } });
+        closeModalEl($('#planStrategyModal'));
+        location.hash = `#planning/strategy/${s.strategy.id}`;
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  });
+  $('#planChooseDescribe').addEventListener('click', () => {
+    $('#planStrategyModalBody').innerHTML = `
+      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Pay down Christina, invest the rest"></div>
+      <div><label>Describe the plan *</label><textarea id="planStrategyDescribe" rows="4" placeholder="e.g. Prepay $100,000 on Christina in January 2027, then refinance to a 5-year fixed at 4.2%"></textarea></div>
+      <div class="toolbar"><button class="primary" id="planStrategyDescribeBtn">Propose operations</button></div>
+      <div id="planStrategyDescribeOut"></div>`;
+    $('#planStrategyDescribeBtn').addEventListener('click', async () => {
+      const msg = $('#planStrategyModalMsg');
+      try {
+        const name = $('#planStrategyName').value.trim();
+        const text = $('#planStrategyDescribe').value.trim();
+        if (!name) throw new Error('strategy name is required');
+        if (!text) throw new Error('describe the plan first');
+        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'ai' } });
+        const r = await api(`/api/planning/strategies/${s.strategy.id}/ai-describe`, { method: 'POST', body: { text } });
+        let html = '';
+        if (r.unresolved && r.unresolved.length) html += `<div class="msg warn">Could not resolve: ${esc(r.unresolved.map((u) => u.reason).join('; '))}</div>`;
+        if (r.warnings && r.warnings.length) html += `<div class="msg warn">${esc(r.warnings.join('; '))}</div>`;
+        html += r.ops.map((o) => `<div class="plan-row"><span>${esc(o.op_type)} · ${esc(JSON.stringify(o.params))}</span></div>`).join('');
+        html += `<div class="toolbar"><button class="small primary" id="planStrategyDescribeApply">Apply these operations</button></div>`;
+        $('#planStrategyDescribeOut').innerHTML = html || '<div class="note">No operations proposed.</div>';
+        const applyBtn = $('#planStrategyDescribeApply');
+        if (applyBtn) applyBtn.addEventListener('click', async () => {
+          try {
+            for (const o of r.ops) await api(`/api/planning/strategies/${s.strategy.id}/ops`, { method: 'POST', body: { op_type: o.op_type, params: o.params, legs: o.legs || [], source: 'ai' } });
+            closeModalEl($('#planStrategyModal'));
+            location.hash = `#planning/strategy/${s.strategy.id}`;
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        });
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  });
+  $('#planChooseModel').addEventListener('click', () => {
+    $('#planStrategyModalBody').innerHTML = `
+      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
+      <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out"></textarea></div>
+      <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
+      <div id="planStrategyModelOut"></div>`;
+    $('#planStrategyModelBtn').addEventListener('click', async () => {
+      const msg = $('#planStrategyModalMsg');
+      try {
+        const name = $('#planStrategyName').value.trim();
+        const text = $('#planStrategyModelText').value.trim();
+        if (!name) throw new Error('strategy name is required');
+        if (!text) throw new Error('describe the model first');
+        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'ai' } });
+        const r = await api(`/api/planning/strategies/${s.strategy.id}/ai-model`, { method: 'POST', body: { text, name } });
+        if (r.ask) {
+          $('#planStrategyModelOut').innerHTML = `<div class="msg warn">${esc(r.ask)}</div><div class="note">Answer the question above, then design again.</div>`;
+          return;
+        }
+        const spec = r.model.spec;
+        $('#planStrategyModelOut').innerHTML = `
+          <div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div>
+          <div class="toolbar"><button class="small primary" id="planStrategyModelAttach">Use this model</button></div>`;
+        $('#planStrategyModelAttach').addEventListener('click', async () => {
+          try {
+            await api(`/api/planning/strategies/${s.strategy.id}`, { method: 'PUT', body: { model_id: r.model.id } });
+            closeModalEl($('#planStrategyModal'));
+            location.hash = `#planning/strategy/${s.strategy.id}`;
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        });
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  });
+}
+
+// ---- merge / revert wizard ----
+async function openPlanMergeModal(strategyId, isRevert) {
+  $('#planMergeModalTitle').textContent = isRevert ? 'Revert merge' : 'Merge strategy';
+  showMsg($('#planMergeModalMsg'), '', '');
+  const body = $('#planMergeModalBody');
+  body.innerHTML = '<div class="note">Loading…</div>';
+  openModal('planMergeModal');
+  const msg = $('#planMergeModalMsg');
+  try {
+    const data = isRevert
+      ? await api(`/api/planning/strategies/${strategyId}/revert-preview`, { method: 'POST' })
+      : await api(`/api/planning/strategies/${strategyId}/merge-preview`, { method: 'POST' });
+    let step = 1;
+    const resolutions = new Map(); // key -> {resolution, customValue}
+    const droppedOps = new Set();
+    const conflicts = data.conflicts || [];
+    const conflictKey = (c) => `${c.table}:${c.rowId}:${c.field}`;
+    const resolvedCount = () => conflicts.filter((c) => resolutions.has(conflictKey(c)) || droppedOps.has(c.opSeq)).length;
+    const render = () => {
+      if (step === 1) {
+        let rows = '';
+        if (!isRevert) {
+          rows = (data.writes || []).map((w) => {
+            if (w.kind === 'insert') return `<div class="plan-row"><span>Add · ${esc(w.label)}</span></div>`;
+            if (w.kind === 'delete') return `<div class="plan-row"><span>Remove · ${esc(w.label)}</span></div>`;
+            const changes = Object.keys(w.values || {}).map((f) => `${f}: ${esc(String((w.before || {})[f] ?? ''))} → ${esc(String(w.values[f] ?? ''))}`).join(' · ');
+            return `<div class="plan-row"><span>Change · ${esc(w.label)} · ${changes}</span></div>`;
+          }).join('');
+        } else {
+          rows = (data.inverse || []).map((w) => {
+            if (w.kind === 'delete') return `<div class="plan-row"><span>Remove · ${esc(w.label || '')}</span></div>`;
+            if (w.kind === 'insert') return `<div class="plan-row"><span>Restore · ${esc(w.label || '')}</span></div>`;
+            const changes = Object.keys(w.values || {}).map((f) => `${f} → ${esc(String(w.values[f] ?? ''))}`).join(' · ');
+            return `<div class="plan-row"><span>Restore · ${esc(w.label || '')} · ${changes}</span></div>`;
+          }).join('');
+        }
+        body.innerHTML = `
+          <div class="note">${esc(data.moneyNote || '')}</div>
+          ${rows || '<div class="note">Nothing to change.</div>'}
+          ${!isRevert && data.penalties && data.penalties.length ? `<div class="note">Penalties (estimates): ${data.penalties.map((x) => money2(x.penalty)).join(', ')}</div>` : ''}
+          ${!isRevert && data.fees ? `<div class="note">Fees: ${money2(data.fees)}</div>` : ''}
+          ${isRevert && data.dependents && data.dependents.length ? `<div class="msg err">Blocked: later merges or mainline records depend on this merge — revert them first (newest first): ${esc(data.dependents.map((x) => x.strategyName || `${x.table} #${x.rowId}`).join(', '))}</div>` : ''}
+          <div class="toolbar"><button class="primary" id="planMergeNext1">Next</button></div>`;
+        $('#planMergeNext1').addEventListener('click', () => { step = 2; render(); });
+      } else if (step === 2) {
+        if (!conflicts.length) {
+          body.innerHTML = `<div class="note">No differences to resolve.</div>
+            <div class="toolbar"><button class="primary" id="planMergeNext2">Next</button></div>`;
+          $('#planMergeNext2').addEventListener('click', () => { step = 3; render(); });
+          return;
+        }
+        const cards = conflicts.map((c) => {
+          const key = conflictKey(c);
+          const cur = resolutions.get(key);
+          return `<div class="panel">
+            <div class="k">${esc(c.label || `${c.table} #${c.rowId}`)} · ${esc(c.field)}</div>
+            <div class="grid2">
+              <div><label>Baseline</label><div>${esc(String(c.base ?? ''))}</div></div>
+              <div><label>Current mainline</label><div>${esc(String(c.current ?? ''))}</div></div>
+              <div><label>${isRevert ? 'Before the merge' : 'Strategy wants'}</label><div>${esc(String(c.incoming ?? ''))}</div></div>
+            </div>
+            <div class="toolbar">
+              <label class="btnlike"><input type="radio" name="plan-res-${key}" value="current"${cur && cur.resolution === 'current' ? ' checked' : ''}> Keep current</label>
+              <label class="btnlike"><input type="radio" name="plan-res-${key}" value="incoming"${cur && cur.resolution === 'incoming' ? ' checked' : ''}> ${isRevert ? 'Use before' : "Use the strategy's"}</label>
+              <label class="btnlike"><input type="radio" name="plan-res-${key}" value="custom"${cur && cur.resolution === 'custom' ? ' checked' : ''}> Write your own <input type="text" data-plan-custom="${key}" value="${cur && cur.customValue != null ? esc(String(cur.customValue)) : ''}"></label>
+              ${!isRevert && c.opSeq != null ? `<button class="small danger" data-plan-drop="${c.opSeq}">Drop this change</button>` : ''}
+            </div></div>`;
+        }).join('');
+        body.innerHTML = `
+          <div class="note">Resolved ${resolvedCount()} / ${conflicts.length}</div>
+          <div class="toolbar"><button class="small" id="planMergeKeepAll">Keep all current</button><button class="small" id="planMergeTakeAll">Take all incoming</button></div>
+          ${cards}
+          <div class="toolbar"><button class="primary" id="planMergeNext2"${resolvedCount() < conflicts.length ? ' disabled' : ''}>Next</button></div>`;
+        body.querySelectorAll('input[type="radio"][name^="plan-res-"]').forEach((r) => r.addEventListener('change', () => {
+          const key = r.name.slice('plan-res-'.length);
+          const customEl = body.querySelector(`[data-plan-custom="${key}"]`);
+          resolutions.set(key, { resolution: r.value, customValue: customEl ? customEl.value : null });
+          render();
+        }));
+        body.querySelectorAll('[data-plan-custom]').forEach((el) => el.addEventListener('input', () => {
+          const key = el.dataset.planCustom;
+          const cur = resolutions.get(key) || {};
+          resolutions.set(key, { ...cur, resolution: 'custom', customValue: el.value });
+        }));
+        body.querySelectorAll('[data-plan-drop]').forEach((b) => b.addEventListener('click', () => {
+          droppedOps.add(Number(b.dataset.planDrop));
+          render();
+        }));
+        $('#planMergeKeepAll').addEventListener('click', () => {
+          conflicts.forEach((c) => resolutions.set(conflictKey(c), { resolution: 'current' }));
+          render();
+        });
+        $('#planMergeTakeAll').addEventListener('click', () => {
+          conflicts.forEach((c) => resolutions.set(conflictKey(c), { resolution: 'incoming' }));
+          render();
+        });
+        const nextBtn = $('#planMergeNext2');
+        if (nextBtn) nextBtn.addEventListener('click', () => { step = 3; render(); });
+      } else {
+        body.innerHTML = `
+          <div class="note">${esc(data.moneyNote || '')}</div>
+          <div class="note">${conflicts.length ? `${resolvedCount()} difference(s) resolved.` : 'No differences.'} ${droppedOps.size ? `${droppedOps.size} operation(s) dropped.` : ''}</div>
+          <div class="toolbar"><button class="primary" id="planMergeConfirmBtn">Confirm ${isRevert ? 'revert' : 'merge'}</button></div>`;
+        $('#planMergeConfirmBtn').addEventListener('click', async () => {
+          try {
+            const resList = conflicts.filter((c) => !droppedOps.has(c.opSeq)).map((c) => {
+              const r = resolutions.get(conflictKey(c)) || { resolution: 'incoming' };
+              return { table: c.table, rowId: c.rowId, field: c.field, resolution: r.resolution, customValue: r.customValue };
+            });
+            for (const seq of droppedOps) resList.push({ opSeq: seq, resolution: 'drop' });
+            if (isRevert) await api(`/api/planning/strategies/${strategyId}/revert`, { method: 'POST', body: { resolutions: resList } });
+            else await api(`/api/planning/strategies/${strategyId}/merge`, { method: 'POST', body: { resolutions: resList } });
+            closeModalEl($('#planMergeModal'));
+            loadPlanStrategy(strategyId);
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        });
+      }
+    };
+    render();
+  } catch (err) { showMsg(msg, 'err', err.message); }
+}
+
+// ---- planning month picker ----
+let planMonthBtn = null;
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-plan-month]');
+  if (!b) return;
+  if (monthPopFor === 'planOp' && planMonthBtn === b) { closeMonthPop(); return; }
+  planMonthBtn = b;
+  openMonthPop('planOp');
+});

@@ -528,7 +528,11 @@
       <option value="Groceries"><option value="Dining"><option value="Transport"><option value="Housing"><option value="Utilities"><option value="Health"><option value="Entertainment"><option value="Shopping"><option value="Travel"><option value="Education"><option value="Fees &amp; interest"><option value="Other">
     </datalist>
   </section>
-  <section id="view-planning" class="hidden"><div class="placeholder"><h2>Planning</h2><p>This module is planned for a later round.</p></div></section>
+  <section id="view-planning" class="hidden">
+    <div id="planList"></div>
+    <div id="planProject" class="hidden"></div>
+    <div id="planStrategy" class="hidden"></div>
+  </section>
   <section id="view-tax" class="hidden"><div class="placeholder"><h2>Tax</h2><p>This module is planned for a later round.</p></div></section>
 </main>
 
@@ -935,6 +939,83 @@
   <div class="modal-card wide">
     <div class="modal-head"><h3 id="spendAiDetailTitle"></h3><button class="small" data-close-modal>Close</button></div>
     <div id="spendAiDetailRows"></div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planProjectModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="planProjectModalTitle">Add project</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planProjectModalMsg"></div>
+    <form id="planProjectForm">
+      <div><label>Project name *</label><input name="name" required></div>
+      <div><label>Question</label><input name="question" placeholder="e.g. Christina mortgage payoff options"></div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planStrategyModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="planStrategyModalTitle">Add strategy</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planStrategyModalMsg"></div>
+    <div id="planStrategyModalBody"></div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planOpModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="planOpModalTitle">Add operation</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planOpModalMsg"></div>
+    <div id="planOpModalBody"></div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planScenarioModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="planScenarioModalTitle">Add scenario</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planScenarioModalMsg"></div>
+    <form id="planScenarioForm">
+      <div><label>Scenario name *</label><input name="name" required></div>
+      <div class="grid2">
+        <div><label>Direction *</label><select name="direction"><option value="up">Up</option><option value="flat">Flat</option><option value="down">Down</option></select></div>
+        <div><label>Stance</label><select name="stance"><option value="neutral">Neutral</option><option value="pessimistic">Pessimistic</option><option value="optimistic">Optimistic</option></select></div>
+      </div>
+      <div><label>Total prime move (percentage points)</label><input name="magnitude" type="text" inputmode="decimal" data-money placeholder="Blank = preset pace"></div>
+      <div><label>Custom steps (optional, JSON)</label><input name="steps" placeholder='[{"date":"2027-03-01","rate":5.2}] — blank = preset steps'></div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planDeclaredAssetModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="planDeclaredAssetModalTitle">Add fixed-term asset</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planDeclaredAssetModalMsg"></div>
+    <form id="planDeclaredAssetForm">
+      <div><label>Asset name *</label><input name="name" required></div>
+      <div class="grid2">
+        <div><label>Amount *</label><input name="amount" type="text" inputmode="decimal" data-money required></div>
+        <div><label>Maturity date</label><input name="maturity_date" type="date"></div>
+      </div>
+      <div class="toolbar">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" data-close-modal>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planMergeModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="planMergeModalTitle">Merge strategy</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planMergeModalMsg"></div>
+    <div id="planMergeModalBody"></div>
   </div>
 </div>
 

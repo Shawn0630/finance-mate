@@ -539,3 +539,10 @@ table.seg-table td:last-child { text-align: right; }
   .prop-outline-card { display: none; margin-top: 8px; }
   .prop-outline.open .prop-outline-card { display: block; }
 }
+
+/* Planning: plain rows in the app's list-row style (same spacing and
+   divider as other list rows); leg editor rows share the row flex. */
+.plan-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid #eef2f6; flex-wrap: wrap; }
+.plan-row:last-child { border-bottom: none; }
+.plan-leg-row { justify-content: flex-start; }
+.plan-leg-row select, .plan-leg-row input { flex: 1 1 auto; min-width: 0; }

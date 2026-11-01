@@ -9746,7 +9746,11 @@ try {
         const labels = window.__fmCharts.invest ? [...window.__fmCharts.invest.data.labels] : null;
         return { hasSelect: !!sel, value: sel ? sel.value : null, options: sel ? [...sel.options].map((o) => o.value) : [], rows, labels };
       });
-      const curMonth = new Date().toISOString().slice(0, 7);
+      // The app's months are Vancouver months (its current month comes
+      // from vancouverToday), so the expectation must be too: a plain
+      // toISOString month is UTC and disagrees for the first seven
+      // hours of every month.
+      const curMonth = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
       const months2026 = curMonth.startsWith('2026')
         ? (Number(curMonth.slice(5, 7))) : 0;
       check('investments UI: monthly returns default to the latest year with a year switcher',
@@ -14796,6 +14800,126 @@ try {
   }
   r = await req('DELETE', `/api/spending/cards/${comboCardId}`);
   check('category combobox cleanup: card deleted', r.status === 200);
+
+  // ------------------------------------------------------------ planning ---
+  // Project → strategy → prepay op → comparison → merge-preview →
+  // merge → mainline lump sum present → revert → lump sum gone.
+  // The op date is the first of next month (always >= current month).
+  const _planNow = new Date();
+  const _planNext = new Date(Date.UTC(_planNow.getUTCFullYear(), _planNow.getUTCMonth() + 1, 1));
+  const planOpDate = _planNext.toISOString().slice(0, 10);
+  r = await req('POST', '/api/planning/projects', { name: 'Pay down test', question: 'Prepay then hold' });
+  check('planning: create project', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const planProjectId = r.data.project.id;
+  r = await req('GET', `/api/planning/projects/${planProjectId}`);
+  check('planning: project carries a flat base scenario',
+    r.status === 200 && r.data.scenarios && r.data.scenarios.some((s) => s.is_base && s.direction === 'flat'),
+    JSON.stringify((r.data.scenarios || []).map((s) => s.direction)));
+  r = await req('POST', `/api/planning/projects/${planProjectId}/strategies`, { name: 'Prepay 10k', source: 'template' });
+  check('planning: create strategy', r.status === 201 && r.data.strategy && r.data.strategy.letter === 'A', JSON.stringify(r.data));
+  const planStrategyId = r.data.strategy.id;
+  // The section owns its property: earlier fixture properties are
+  // deleted by their own cleanup sections, so reusing one would point
+  // the op at a row that no longer exists.
+  r = await req('POST', '/api/properties', {
+    address: '77 Planning Test Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('planning: create test property', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const planPid = r.data.id;
+  r = await req('POST', `/api/properties/${planPid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('planning: add test rate segment', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: planPid, date: planOpDate, amount: 10000, openClosed: 'open' },
+  });
+  check('planning: add prepay op', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${planStrategyId}`);
+  check('planning: strategy comparison is cost-exact and saves interest',
+    r.status === 200 && r.data.comparison && r.data.comparison.cost === 10000
+    && r.data.comparison.penaltyTotal === 0 && r.data.comparison.interestSaved > 0
+    && r.data.comparison.payoffShiftMonths > 0
+    && Math.abs(r.data.comparison.net - (r.data.comparison.gain - r.data.comparison.cost)) < 0.011,
+    JSON.stringify(r.data.comparison));
+  check('planning: strategy scenario table has the base scenario',
+    r.data.scenarioTable && r.data.scenarioTable.length >= 1 && r.data.scenarioTable[0].balanceByMonth
+    && r.data.scenarioTable[0].balanceByMonth.length > 0,
+    JSON.stringify((r.data.scenarioTable || []).map((x) => x.name)));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/merge-preview`, {});
+  check('planning: merge preview lists a lump-sum insert and no conflicts',
+    r.status === 200 && (r.data.writes || []).some((w) => w.kind === 'insert' && w.table === 'lump_sums')
+    && (r.data.conflicts || []).length === 0,
+    JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/merge`, { resolutions: [] });
+  check('planning: merge succeeds', r.status === 200 && r.data.mergeRecordId > 0, JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${planPid}`);
+  check('planning: merged prepay is a mainline lump sum',
+    r.status === 200 && (r.data.lumpSums || []).some((l) => l.amount === 10000 && l.date === planOpDate),
+    JSON.stringify((r.data.lumpSums || []).map((l) => [l.amount, l.date])));
+  r = await req('GET', `/api/planning/strategies/${planStrategyId}`);
+  check('planning: strategy shows merged', r.data.strategy && r.data.strategy.merged === 1);
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/revert-preview`, {});
+  check('planning: revert preview lists the lump-sum removal',
+    r.status === 200 && (r.data.inverse || []).some((w) => w.kind === 'delete' && w.table === 'lump_sums'),
+    JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/revert`, { resolutions: [] });
+  check('planning: revert succeeds', r.status === 200 && r.data.revertRecordId > 0, JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${planPid}`);
+  check('planning: reverted prepay is gone from mainline',
+    r.status === 200 && !(r.data.lumpSums || []).some((l) => l.amount === 10000 && l.date === planOpDate),
+    JSON.stringify((r.data.lumpSums || []).map((l) => [l.amount, l.date])));
+  r = await req('GET', `/api/planning/projects/${planProjectId}/history`);
+  check('planning: history shows merge and revert',
+    r.status === 200 && (r.data.history || []).some((m) => m.kind === 'merge')
+    && (r.data.history || []).some((m) => m.kind === 'revert'),
+    JSON.stringify((r.data.history || []).map((m) => m.kind)));
+  // Validation pins: a buy without a price is rejected (use Position),
+  // and a sell above holdings is rejected.
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ops`, {
+    op_type: 'buy', params: { accountId: 1, date: planOpDate, units: 10 },
+  });
+  check('planning: buy without a price is rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ops`, {
+    op_type: 'sell', params: { holdingId: 999999, date: planOpDate, units: 10 },
+  });
+  check('planning: sell of an unknown holding is rejected', r.status === 400, JSON.stringify(r.data));
+  // Return suggestions: NAV points spanning 1y and 3y windows label
+  // their actual coverage; the AI describe endpoint rejects empty text.
+  r = await req('POST', '/api/investments/accounts', { name: 'Plan Test TFSA', type: 'TFSA' });
+  check('planning: create test account', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const planAcctId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${planAcctId}/holdings`, { label: 'Plan ETF', kind: 'exchange', symbol: 'PLAN.TO', currency: 'CAD' });
+  check('planning: create test holding', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const planHoldingId = r.data.id;
+  const _ym = (y, m) => `${y}-${String(m).padStart(2, '0')}-15`;
+  // Shift dates from the VANCOUVER month (the app's month), not UTC:
+  // in the first hours of a UTC month the two disagree and the window
+  // points would land a month off.
+  const _van = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+  const _cy = Number(_van.slice(0, 4));
+  const _cm = Number(_van.slice(5, 7));
+  const _shift = (months) => {
+    const total = _cy * 12 + (_cm - 1) - months;
+    return _ym(Math.floor(total / 12), (total % 12) + 1);
+  };
+  r = await req('POST', `/api/investments/holdings/${planHoldingId}/nav`, { date: _shift(36), price: 40 });
+  check('planning: 3y NAV point', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${planHoldingId}/nav`, { date: _shift(12), price: 50 });
+  check('planning: 1y NAV point', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${planHoldingId}/nav`, { date: _shift(1), price: 60 });
+  check('planning: recent NAV point', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/return-suggestions?holdingId=${planHoldingId}`);
+  check('planning: return suggestions label actual 1y and 3y windows',
+    r.status === 200 && (r.data.suggestions || []).some((x) => x.label === '1y')
+    && (r.data.suggestions || []).some((x) => x.label === '3y'),
+    JSON.stringify(r.data.suggestions));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ai-describe`, { text: '' });
+  check('planning: ai-describe rejects empty text', r.status === 400, JSON.stringify(r.data));
+  r = await req('DELETE', `/api/planning/projects/${planProjectId}`);
+  check('planning: project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/properties/${planPid}`);
+  check('planning: test property cleanup', r.status === 200, JSON.stringify(r.data));
 
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
