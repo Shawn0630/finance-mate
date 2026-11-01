@@ -8557,9 +8557,7 @@ function earnRentalCard(r) {
   const hidden = rentHiddenRentals.has(r.id);
   return `<div class="panel rent-card earn-rental-card" data-rental-id="${r.id}" style="cursor:pointer">
     <button type="button" class="rent-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-rental-id="${r.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}" onclick="toggleRentRental(${r.id})">${RENT_EYE_SVG}</button>
-    <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span>
-    <div class="spacer"></div>
-    <button class="small" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
+    <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span></div>
     ${(r.entries || []).length ? `<div><div class="note">Rent entries</div>${r.entries.map((e) => earnEntryBlock(r, e)).join('')}</div>` : ''}
     ${r.years.length ? r.years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
   </div>`;
@@ -9464,10 +9462,10 @@ function earnRefreshRentalView(rentalId) {
 
 // ----------------------------------------------------- rental detail --
 // A rental card opens its own detail page (job detail pattern). The
-// list cards carry no rental-level Edit/Delete buttons — only + Rent
-// entry and the eye — and the rental itself is edited and deleted
-// from a bottom actions row inside the detail body, reusing the card
-// handlers. The summary strip shows the latest year record's calc;
+// list cards carry no action buttons at all — only the eye — and the
+// rental itself is edited and deleted from Edit/Delete in the detail
+// panel header by the title, reusing the card handlers. The summary
+// strip shows the latest year record's calc;
 // with no year records it shows entry-derived facts only, never an
 // invented figure, and there is no chart panel.
 let currentEarnRentalId = null;
@@ -9507,7 +9505,7 @@ function earnRentalDetailHtml(r) {
   return `<div class="toolbar"><a id="earnRentalBackLink" href="#earnings/rentals">← Back to Rentals</a><div class="spacer"></div></div>
     <div class="msg" id="earnRentalDetailMsg"></div>
     <div class="panel">
-      <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span><div class="spacer"></div></div>
+      <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span><div class="spacer"></div><button class="small" id="earnRentalDetailEditBtn" onclick="earnEditRental(${r.id})">Edit</button><button class="small danger" id="earnRentalDetailDeleteBtn" onclick="earnDeleteRental(${r.id})">Delete</button></div>
       ${r.address ? `<div class="note">${esc(r.address)}</div>` : ''}
       ${earnRentalDetailSummaryHtml(r)}
     </div>
@@ -9522,8 +9520,7 @@ function earnRentalDetailHtml(r) {
     <div class="panel">
       <div class="section-head"><h3>Rent entries</h3><div class="spacer"></div><button class="small" id="earnRentalDetailAddEntry" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
       ${(r.entries || []).length ? r.entries.map((e) => earnEntryBlock(r, e)).join('') : '<div class="note">No rent entries yet.</div>'}
-    </div>
-    <div class="toolbar" id="earnRentalDetailActions"><div class="spacer"></div><button class="small" id="earnRentalDetailBodyEditBtn" onclick="earnEditRental(${r.id})">Edit</button><button class="small danger" id="earnRentalDetailBodyDeleteBtn" onclick="earnDeleteRental(${r.id})">Delete</button></div>`;
+    </div>`;
 }
 
 function drawEarnRentalDetailChart(r) {

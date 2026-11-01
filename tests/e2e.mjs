@@ -11898,10 +11898,13 @@ try {
       check('earnings UI: monthly-rent input groups thousands while typing',
         entryUi.grouped === '1,234', JSON.stringify(entryUi));
 
-      // Rental modals: + Rent entry opens a modal (not an inline
+      // Rental modals: the rent entry modal (not an inline
       // panel); saving from the modal creates the entry and the
       // card refreshes with derived years; + Year record is gone;
-      // year edit opens a modal too.
+      // year edit opens a modal too. The card no longer carries
+      // + Rent entry — the detail panel does — so the modal here
+      // opens through the same handler the button calls, and the
+      // detail button itself is pinned in the detail section below.
       r = await req('POST', '/api/earnings/rentals', {
         label: 'Modal rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
       });
@@ -11916,15 +11919,16 @@ try {
       const modalUi = await page.evaluate(() => {
         const hasYearBtn = [...document.querySelectorAll('#earnRentalList button')].some((b) => b.textContent.includes('Year record'));
         const inlinePanel = document.querySelector('#earnRentalEntryFormPanel') || document.querySelector('#earnRentalYearFormPanel') || document.querySelector('#earnRentalFormPanel');
-        const card = [...document.querySelectorAll('#earnRentalList .panel')].find((p) => p.textContent.includes('Modal rental'));
-        const btn = card && [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ Rent entry');
-        if (btn) btn.click();
-        const modal = document.querySelector('#earnRentalEntryModal');
-        const open = modal && !modal.classList.contains('hidden') && !!modal.querySelector('.modal-card #earnRentalEntryForm');
-        return { hasYearBtn, inlinePanel: !!inlinePanel, modalOpen: !!open };
+        return { hasYearBtn, inlinePanel: !!inlinePanel };
       });
-      check('rental modals: + Rent entry opens a modal, no inline panel remains',
-        modalUi.modalOpen && !modalUi.inlinePanel, JSON.stringify(modalUi));
+      await page.evaluate((rid) => window.earnAddEntry(rid), modalRentalId);
+      await waitE(300);
+      const modalOpen = await page.evaluate(() => {
+        const modal = document.querySelector('#earnRentalEntryModal');
+        return modal && !modal.classList.contains('hidden') && !!modal.querySelector('.modal-card #earnRentalEntryForm');
+      });
+      check('rental modals: rent entry modal opens, no inline panel remains',
+        modalOpen && !modalUi.inlinePanel, JSON.stringify({ ...modalUi, modalOpen }));
       check('rental modals: + Year record button is gone from rental cards',
         !modalUi.hasYearBtn, JSON.stringify(modalUi));
       // The entry From/To fields are the app's month-field picker
@@ -12055,10 +12059,10 @@ try {
       check('rental modals: blank-To entry saves with a null end',
         !!ongoingEntry && ongoingEntry.end_ym === null, JSON.stringify(ongoingEntry));
 
-      // Rental detail page: card click navigates; eye and + Rent
-      // entry do not; the detail carries header + summary + chart +
-      // both history panels + a bottom Edit/Delete row; the cards
-      // no longer show rental Edit/Delete; Total income stays.
+      // Rental detail page: card click navigates; eye does not; the
+      // detail carries header Edit/Delete + summary + chart +
+      // both history panels; the cards no longer show rental
+      // Edit/Delete or + Rent entry; Total income stays.
       page.on('dialog', (d) => d.accept());
       r = await req('POST', '/api/earnings/rentals', {
         label: 'Detail rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 66.67,
@@ -12100,11 +12104,11 @@ try {
           hasEye: !!card.querySelector('.rent-hide-btn'),
         };
       });
-      check('rental card header keeps only + Rent entry, no rental Edit/Delete, eye stays',
-        detailCardHead && detailCardHead.headBtns.length === 1 && detailCardHead.headBtns[0] === '+ Rent entry'
+      check('rental card header has no buttons, eye stays',
+        detailCardHead && detailCardHead.headBtns.length === 0
           && detailCardHead.hasEye,
         JSON.stringify(detailCardHead));
-      // Eye and + Rent entry clicks must not navigate.
+      // Eye click must not navigate.
       await page.evaluate(() => {
         const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
           .find((c) => c.textContent.includes('Detail rental'));
@@ -12120,20 +12124,6 @@ try {
         card.querySelector('.rent-hide-btn').click();
       });
       await waitE(300);
-      await page.evaluate(() => {
-        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
-          .find((c) => c.textContent.includes('Detail rental'));
-        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === '+ Rent entry').click();
-      });
-      await waitE(300);
-      const entryModalNav = await page.evaluate(() => ({
-        hash: location.hash,
-        open: !document.querySelector('#earnRentalEntryModal').classList.contains('hidden'),
-      }));
-      check('rental card + Rent entry click opens the modal without navigating',
-        entryModalNav.hash === '#earnings/rentals' && entryModalNav.open === true, JSON.stringify(entryModalNav));
-      await page.click('#earnRentalEntryCancelBtn');
-      await waitE(200);
       // Card click (on the heading, not a button) navigates.
       await page.evaluate(() => {
         const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
@@ -12152,6 +12142,19 @@ try {
       // The hash changes before the async detail load finishes — wait
       // for the rendered back link, not just the hash, before reading.
       await page.waitForFunction(() => !!document.querySelector('#earnRentalBackLink'), { timeout: 10000 });
+      // The detail Rent entries panel keeps its + Rent entry button:
+      // clicking it opens the modal without navigating away.
+      await page.evaluate(() => document.querySelector('#earnRentalDetailAddEntry').click());
+      await waitE(300);
+      const detailEntryModalNav = await page.evaluate(() => ({
+        hash: location.hash,
+        open: !document.querySelector('#earnRentalEntryModal').classList.contains('hidden'),
+      }));
+      check('rental detail + Rent entry click opens the modal without navigating',
+        detailEntryModalNav.hash === `#earnings/rental/${detailRentalId}` && detailEntryModalNav.open === true,
+        JSON.stringify(detailEntryModalNav));
+      await page.click('#earnRentalEntryCancelBtn');
+      await waitE(200);
       const apiDetailRental = (await req('GET', '/api/earnings')).data.rentals.find((x) => x.id === detailRentalId);
       const sortedDetailYears = [...apiDetailRental.years].sort((a, b) => a.tax_year - b.tax_year);
       const latestDetailYear = sortedDetailYears[sortedDetailYears.length - 1];
@@ -12178,9 +12181,11 @@ try {
           yearText: d.textContent.includes('2024') && d.textContent.includes('2025'),
           entryText: d.textContent.includes('$1,000.00/mo') && d.textContent.includes('$2,000.00/mo'),
           detailAddEntry: !!document.querySelector('#earnRentalDetailAddEntry'),
-          actionsLast: !!document.querySelector('#earnRentalDetailActions') && d.lastElementChild === document.querySelector('#earnRentalDetailActions'),
-          bodyEdit: !!document.querySelector('#earnRentalDetailBodyEditBtn'),
-          bodyDelete: !!document.querySelector('#earnRentalDetailBodyDeleteBtn'),
+          noBottomRow: !document.querySelector('#earnRentalDetailActions'),
+          headerEdit: !!document.querySelector('#earnRentalDetailEditBtn'),
+          headerDelete: !!document.querySelector('#earnRentalDetailDeleteBtn'),
+          headerEditInHead: !!document.querySelector('#earnRentalDetail .panel .section-head #earnRentalDetailEditBtn'),
+          headerDeleteInHead: !!document.querySelector('#earnRentalDetail .panel .section-head #earnRentalDetailDeleteBtn'),
         };
       });
       check('rental detail back is a plain link above the card with no buttons',
@@ -12211,12 +12216,12 @@ try {
       check('rental detail history shows year records and rent entries panels',
         detailInfo.hasYearPanel && detailInfo.hasEntryPanel && detailInfo.yearText && detailInfo.entryText && detailInfo.detailAddEntry,
         JSON.stringify(detailInfo));
-      check('rental detail body bottom row has Edit + Delete as the last element',
-        detailInfo.actionsLast && detailInfo.bodyEdit && detailInfo.bodyDelete, JSON.stringify(detailInfo));
-      // Edit from the detail body opens the shared modal prefilled.
-      await page.click('#earnRentalDetailBodyEditBtn');
+      check('rental detail header has Edit + Delete by the title, no bottom row',
+        detailInfo.headerEditInHead && detailInfo.headerDeleteInHead && detailInfo.noBottomRow, JSON.stringify(detailInfo));
+      // Edit from the detail header opens the shared modal prefilled.
+      await page.click('#earnRentalDetailEditBtn');
       await waitE(300);
-      check('rental detail body Edit opens the prefilled rental modal',
+      check('rental detail header Edit opens the prefilled rental modal',
         await page.evaluate(() => {
           const m = document.querySelector('#earnRentalModal');
           const f = document.querySelector('#earnRentalForm');
@@ -12233,26 +12238,26 @@ try {
       }));
       check('clicking the rental detail back link returns to the Rentals list',
         rentalBackNav.hash === '#earnings/rentals' && rentalBackNav.detailHidden === true, JSON.stringify(rentalBackNav));
-      // Delete from the detail body round-trips back to Rentals.
+      // Delete from the detail header round-trips back to Rentals.
       await page.evaluate(() => {
         const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
           .find((c) => c.textContent.includes('Detail rental'));
         card.querySelector('h3').click();
       });
       try { await page.waitForFunction((id) => location.hash === `#earnings/rental/${id}`, { timeout: 10000 }, detailRentalId); } catch {}
-      await page.waitForFunction(() => !!document.querySelector('#earnRentalDetailBodyDeleteBtn'), { timeout: 10000 });
+      await page.waitForFunction(() => !!document.querySelector('#earnRentalDetailDeleteBtn'), { timeout: 10000 });
       await waitE(300);
       // In-page click, not page.click: the button arrives with the
       // async detail load, and page.click's scroll step can catch it
       // mid-re-render and throw "detached from document".
-      await page.evaluate(() => document.querySelector('#earnRentalDetailBodyDeleteBtn').click());
+      await page.evaluate(() => document.querySelector('#earnRentalDetailDeleteBtn').click());
       try { await page.waitForFunction(() => location.hash === '#earnings/rentals', { timeout: 10000 }); } catch {}
       const rentalDelNav = await page.evaluate(() => ({
         hash: location.hash,
         detailHidden: document.querySelector('#earnRentalDetail').classList.contains('hidden'),
         cardGone: ![...document.querySelectorAll('#earnRentalList .earn-rental-card')].some((c) => c.textContent.includes('Detail rental')),
       }));
-      check('rental detail body Delete removes the rental and returns to Rentals',
+      check('rental detail header Delete removes the rental and returns to Rentals',
         rentalDelNav.hash === '#earnings/rentals' && rentalDelNav.detailHidden && rentalDelNav.cardGone,
         JSON.stringify(rentalDelNav));
       // No-year-records rental: detail renders with entry facts only,
