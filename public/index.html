@@ -801,7 +801,11 @@
     <form id="earnJobRowForm">
       <div class="grid2">
         <div><label id="earnJobRowDateLabel">Effective date *</label><input name="row_date" type="date" required></div>
-        <div><label id="earnJobRowValueLabel">New per-period value *</label><input name="row_value" type="text" inputmode="decimal" data-money required></div>
+        <div><label id="earnJobRowValueLabel">Amount *</label><input name="row_value" type="text" inputmode="decimal" data-money required></div>
+      </div>
+      <div id="earnJobRowPayOpts">
+        <div><label>Basis</label><div><label class="btnlike"><input type="radio" name="row_basis" value="gross" checked> Gross</label> <label class="btnlike"><input type="radio" name="row_basis" value="takehome"> Take-home</label></div></div>
+        <div><label>Scope</label><select name="row_scope"><option value="period">Per period</option><option value="annual">Annual</option></select></div>
       </div>
       <div class="toolbar">
         <button type="submit" class="primary">Save</button>

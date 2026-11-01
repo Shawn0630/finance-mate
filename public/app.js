@@ -9005,8 +9005,12 @@ let earnEditJobOrig = null;
 function earnJobRepeatRow(kind, values) {
   const wrap = document.createElement('div');
   if (kind === 'pay_change') {
+    const basis = values?.basis || 'gross';
+    const scope = values?.scope || 'period';
     wrap.innerHTML = `<input type="date" data-pc-date value="${esc(values?.effective_date || '')}">
-      <input type="text" inputmode="decimal" data-money data-pc-value placeholder="New per-period value" value="${values?.value == null ? '' : esc(formatMoneyInput(values.value))}">
+      <input type="text" inputmode="decimal" data-money data-pc-value placeholder="Amount" value="${values?.amount == null && values?.value == null ? '' : esc(formatMoneyInput(values.amount ?? values.value))}">
+      <select data-pc-basis><option value="gross"${basis === 'gross' ? ' selected' : ''}>Gross</option><option value="takehome"${basis === 'takehome' ? ' selected' : ''}>Take-home</option></select>
+      <select data-pc-scope><option value="period"${scope === 'period' ? ' selected' : ''}>Per period</option><option value="annual"${scope === 'annual' ? ' selected' : ''}>Annual</option></select>
       <button type="button" class="small" onclick="this.parentElement.remove()">Remove</button>`;
   } else {
     wrap.innerHTML = `<input type="date" data-bonus-date value="${esc(values?.date || '')}">
@@ -9018,7 +9022,9 @@ function earnJobRepeatRow(kind, values) {
 }
 const earnJobPayChanges = () => [...document.querySelectorAll('#earnJobPayChangeRows > div')].map((row) => ({
   effective_date: row.querySelector('[data-pc-date]').value,
-  value: parseMoneyInput(row.querySelector('[data-pc-value]').value),
+  amount: parseMoneyInput(row.querySelector('[data-pc-value]').value),
+  basis: row.querySelector('[data-pc-basis]').value,
+  scope: row.querySelector('[data-pc-scope]').value,
 }));
 const earnJobBonuses = () => [...document.querySelectorAll('#earnJobBonusRows > div')].map((row) => ({
   date: row.querySelector('[data-bonus-date]').value,
@@ -9088,7 +9094,7 @@ $('#earnJobForm').onsubmit = async (e) => {
       }
       return kept;
     };
-    const payChanges = dropEmpty(earnJobPayChanges(), 'effective_date', 'value', 'pay change');
+    const payChanges = dropEmpty(earnJobPayChanges(), 'effective_date', 'amount', 'pay change');
     const bonuses = dropEmpty(earnJobBonuses(), 'date', 'amount', 'bonus');
     let body;
     if (earnEditJobId == null || hasAny) {
@@ -9199,9 +9205,28 @@ function earnJobDateLabel(iso) {
 function earnJobDetailHtml(j) {
   const c = j.calc;
   const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
-  const pcRows = (j.pay_changes || []).map((r, i) => `<div class="note">${earnJobDateLabel(r.effective_date)} · ${money2(r.value)}/period
+  // History view: the opening position first, then every pay-change
+  // entry in date order; the latest entry's result IS the current
+  // position, so it carries the marker (the opening row carries it
+  // when no change exists yet).
+  const pcDesc = (r) => {
+    let s = `${earnJobDateLabel(r.effective_date)} · ${money2(r.amount ?? r.value)}`;
+    if (r.basis === 'takehome') s += ' take-home';
+    s += r.scope === 'annual' ? ' / year' : ' / period';
+    if (r.basis === 'takehome' || r.scope === 'annual') s += ` → ${money2(r.value)} / period`;
+    return s;
+  };
+  const pcParts = [];
+  const changes = j.pay_changes || [];
+  if (j.opening_value != null && j.start_date) {
+    pcParts.push(`<div class="note">${earnJobDateLabel(j.start_date)} · ${money2(j.opening_value)} / period · Opening position${changes.length === 0 ? ' · Current position' : ''}</div>`);
+  }
+  changes.forEach((r, i) => {
+    pcParts.push(`<div class="note">${pcDesc(r)}${i === changes.length - 1 ? ' · Current position' : ''}
     <button class="small" onclick="earnJobDetailOpenRow('pay_change', ${i})">Edit</button>
-    <button class="small danger" onclick="earnJobDetailDeleteRow('pay_change', ${i})">Delete</button></div>`).join('');
+    <button class="small danger" onclick="earnJobDetailDeleteRow('pay_change', ${i})">Delete</button></div>`);
+  });
+  const pcRows = pcParts.join('');
   const bonusRows = (j.bonuses || []).map((b, i) => `<div class="note">${earnJobDateLabel(b.date)} · ${money2(b.amount)}
     <button class="small" onclick="earnJobDetailOpenRow('bonus', ${i})">Edit</button>
     <button class="small danger" onclick="earnJobDetailDeleteRow('bonus', ${i})">Delete</button></div>`).join('');
@@ -9333,12 +9358,19 @@ window.earnJobDetailOpenRow = (kind, index) => {
     ? (index == null ? 'Add pay change' : 'Edit pay change')
     : (index == null ? 'Add bonus' : 'Edit bonus');
   $('#earnJobRowDateLabel').textContent = kind === 'pay_change' ? 'Effective date *' : 'Date *';
-  $('#earnJobRowValueLabel').textContent = kind === 'pay_change' ? 'New per-period value *' : 'Amount *';
+  $('#earnJobRowValueLabel').textContent = 'Amount *';
   const f = $('#earnJobRowForm');
   f.reset();
+  const payOpts = $('#earnJobRowPayOpts');
+  if (payOpts) payOpts.style.display = kind === 'pay_change' ? '' : 'none';
   if (row) {
     f.row_date.value = kind === 'pay_change' ? row.effective_date : row.date;
-    setMoneyValue(f.row_value, kind === 'pay_change' ? row.value : row.amount);
+    setMoneyValue(f.row_value, kind === 'pay_change' ? (row.amount ?? row.value) : row.amount);
+    if (kind === 'pay_change') {
+      const basisRadio = f.querySelector(`[name=row_basis][value=${row.basis || 'gross'}]`);
+      if (basisRadio) basisRadio.checked = true;
+      if (f.row_scope) f.row_scope.value = row.scope || 'period';
+    }
   }
   showMsg($('#earnJobRowModalMsg'), '', '');
   openModal('earnJobRowModal');
@@ -9357,18 +9389,19 @@ $('#earnJobRowForm').onsubmit = async (e) => {
       return;
     }
     const { kind, index } = earnJobRowState;
-    const payChanges = (j.pay_changes || []).map((r) => ({ effective_date: r.effective_date, value: r.value }));
+    const payChanges = (j.pay_changes || []).map((r) => ({ effective_date: r.effective_date, amount: r.amount ?? r.value, basis: r.basis || 'gross', scope: r.scope || 'period' }));
     const bonuses = (j.bonuses || []).map((b) => ({ date: b.date, amount: b.amount }));
-    // A raise that applies to the recent pay period becomes the current
-    // rate: the latest pay-change row on or before the recent date sets
-    // recent_pay_value, so adding a raise updates the annual gross.
-    let recentValue = earnJobPerPeriod(j);
+    // Position rule (server-side): the latest-dated entry sets the
+    // rate, so the client sends the current rate and lets the server
+    // pin it — a backfilled older entry never moves the position.
+    const recentValue = earnJobPerPeriod(j);
     if (kind === 'pay_change') {
-      if (index == null) payChanges.push({ effective_date: date, value });
-      else payChanges[index] = { effective_date: date, value };
+      const basis = f.querySelector('[name=row_basis]:checked')?.value || 'gross';
+      const scope = f.row_scope ? f.row_scope.value : 'period';
+      const entry = { effective_date: date, amount: value, basis, scope };
+      if (index == null) payChanges.push(entry);
+      else payChanges[index] = entry;
       payChanges.sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
-      const applicable = payChanges.filter((r) => r.effective_date <= j.recent_pay_date);
-      if (applicable.length && applicable[applicable.length - 1].effective_date === date) recentValue = value;
     } else {
       if (index == null) bonuses.push({ date, amount: value });
       else bonuses[index] = { date, amount: value };
@@ -9384,12 +9417,15 @@ window.earnJobDetailDeleteRow = async (kind, index) => {
   if (!j.start_date || !j.recent_pay_date) { earnEditJob(j.id); return; }
   if (!confirm('Delete this row?')) return;
   try {
-    const payChanges = (j.pay_changes || []).map((r) => ({ effective_date: r.effective_date, value: r.value }));
+    const payChanges = (j.pay_changes || []).map((r) => ({ effective_date: r.effective_date, amount: r.amount ?? r.value, basis: r.basis || 'gross', scope: r.scope || 'period' }));
     const bonuses = (j.bonuses || []).map((b) => ({ date: b.date, amount: b.amount }));
     if (kind === 'pay_change') payChanges.splice(index, 1);
     else bonuses.splice(index, 1);
-    // Deleting a row never moves the current rate on its own.
-    await earnJobDetailPut(j, payChanges, bonuses, earnJobPerPeriod(j));
+    // Position rule (server-side): deleting the latest falls back to
+    // the previous entry; with none left the opening position stands.
+    const recentValue = kind === 'pay_change' && payChanges.length === 0
+      ? (j.opening_value ?? earnJobPerPeriod(j)) : earnJobPerPeriod(j);
+    await earnJobDetailPut(j, payChanges, bonuses, recentValue);
   } catch (err) { showMsg($('#earnJobDetailMsg'), 'err', err.message); }
 };
 

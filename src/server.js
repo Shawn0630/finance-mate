@@ -29,7 +29,7 @@ import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
-  deriveRentalYearFigures, entryCoveredYears,
+  deriveRentalYearFigures, entryCoveredYears, resolvePayChangeValues, positionValueFor,
 } from './earnings.js';
 import {
   validPlanInput, listPlans, getPlan, planView, generatePlan, generatePlansForAccount,
@@ -2906,7 +2906,11 @@ const earnJobRow = (row) => {
   // A job's bonus_total is the bonuses dated in its tax year; the
   // calc adds it to the year's gross but never to the per-period
   // rate. Pay-change rows and bonuses ride along for the modal.
-  const payChanges = db.prepare('SELECT effective_date, value FROM earn_pay_changes WHERE job_id = ? ORDER BY effective_date').all(row.id);
+  const payChanges = db.prepare('SELECT effective_date, value, amount, basis, scope FROM earn_pay_changes WHERE job_id = ? ORDER BY effective_date, id').all(row.id)
+    .map((r) => ({
+      effective_date: r.effective_date, value: r.value,
+      amount: r.amount ?? r.value, basis: r.basis || 'gross', scope: r.scope || 'period',
+    }));
   const bonuses = db.prepare('SELECT date, amount FROM earn_bonuses WHERE job_id = ? ORDER BY date').all(row.id);
   const bonusTotal = bonuses.filter((b) => Number(String(b.date).slice(0, 4)) === row.tax_year)
     .reduce((s, b) => s + b.amount, 0);
@@ -3000,9 +3004,9 @@ app.get('/api/earnings', requireApiAuth, (req, res) => {
 const writeJobChildren = (jobId, payChanges, bonuses, ts) => {
   db.prepare('DELETE FROM earn_pay_changes WHERE job_id = ?').run(jobId);
   db.prepare('DELETE FROM earn_bonuses WHERE job_id = ?').run(jobId);
-  const insC = db.prepare('INSERT INTO earn_pay_changes (job_id, effective_date, value, created_at) VALUES (?, ?, ?, ?)');
+  const insC = db.prepare('INSERT INTO earn_pay_changes (job_id, effective_date, value, amount, basis, scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
   const insB = db.prepare('INSERT INTO earn_bonuses (job_id, date, amount, created_at) VALUES (?, ?, ?, ?)');
-  for (const c of payChanges) insC.run(jobId, c.effective_date, c.value, ts);
+  for (const c of payChanges) insC.run(jobId, c.effective_date, c.value, c.amount, c.basis, c.scope, ts);
   for (const b of bonuses) insB.run(jobId, b.date, b.amount, ts);
 };
 const derivedJobYtd = (v, cppExempt, eiExempt) => deriveJobYtd({
@@ -3035,24 +3039,53 @@ const resolveTakeHome = (body, v, existing) => {
   return null;
 };
 
+// Position rule: a job's current pay always equals its latest-dated
+// pay-change entry. derivePayChangeValues fills every entry's
+// per-period value (take-home back-solved, annual annualised) and
+// must run before any solve that prices segments; pinPositionToLatest
+// then pins the rate to the latest entry (with no entries the
+// submitted rate stands, so a legacy save and a delete-to-zero whose
+// caller sends the opening position keep working).
+const derivePayChangeValues = (v, existing) => resolvePayChangeValues({
+  entries: v.pay_changes, frequency: v.frequency, province: v.province,
+  startDate: v.start_date, recentDate: v.recent_pay_date, bonuses: v.bonuses,
+  payroll: earnRegion().payroll,
+  td1Federal: existing ? existing.td1_federal : null,
+  td1Provincial: existing ? existing.td1_provincial : null,
+  cppExempt: existing ? existing.cpp_exempt === 1 : false,
+  eiExempt: existing ? existing.ei_exempt === 1 : false,
+});
+const pinPositionToLatest = (v) => {
+  if (!v.pay_changes || !v.pay_changes.length) return;
+  const pos = positionValueFor(v.pay_changes, v.recent_pay_value);
+  v.recent_pay_value = pos;
+  v.gross_amount = pos;
+};
+
 app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
   const v = validJobInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
+  const pcErr = derivePayChangeValues(v, null);
+  if (pcErr) return res.status(400).json({ error: pcErr });
   const takeErr = resolveTakeHome(req.body || {}, v, null);
   if (takeErr) return res.status(400).json({ error: takeErr });
   const own = cleanJobOwner((req.body || {}).owner);
   if (own.error) return res.status(400).json({ error: own.error });
   const ts = nowIso();
   if (v.mode === 'derived') {
+    // The create-time current pay is the opening position, captured
+    // before the position rule pins the rate to the latest entry.
+    const opening = v.recent_pay_value;
+    pinPositionToLatest(v);
     const ytd = derivedJobYtd(v, false, false);
     const id = db.transaction(() => {
       const info = db.prepare(
         `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
-         start_date, recent_pay_date,
+         start_date, recent_pay_date, opening_value,
          td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
-        v.start_date, v.recent_pay_date,
+        v.start_date, v.recent_pay_date, opening,
         null, null, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, 0, 0, ts, ts);
       writeJobChildren(info.lastInsertRowid, v.pay_changes, v.bonuses, ts);
       return info.lastInsertRowid;
@@ -3074,6 +3107,8 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'job not found' });
+  const pcErr = derivePayChangeValues(v, existing);
+  if (pcErr) return res.status(400).json({ error: pcErr });
   const takeErr = resolveTakeHome(req.body || {}, v, existing);
   if (takeErr) return res.status(400).json({ error: takeErr });
   // Owner follows the property rule: omitted means unchanged, an
@@ -3088,6 +3123,7 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
     // The new form carries no TD1 / exemption fields: an edit
     // preserves the stored values, so a job migrated by filling in
     // dates keeps its claims exactly.
+    pinPositionToLatest(v);
     const ytd = derivedJobYtd(v, existing.cpp_exempt === 1, existing.ei_exempt === 1);
     db.transaction(() => {
       db.prepare(

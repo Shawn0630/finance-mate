@@ -7216,6 +7216,149 @@ try {
       }
       check('the legacy fixture job is gone server-side', legacyGone);
 
+      // ---- Salary position model: pay as a position, changes as history ----
+      // Create → opening position; gross/period, take-home and annual
+      // changes move the position by derivation; history shows the chain
+      // end-to-end with the latest entry marked as the current position;
+      // delete of the latest falls back; a backfilled older entry never
+      // moves the position; a plan-linked job still cannot be deleted.
+      let posJobId = null;
+      let posTakeJobId = null;
+      let posPlanJobId = null;
+      let posPlanId = null;
+      let posRrspId = null;
+      const posGetJob = async (id) => (await req('GET', '/api/earnings')).data.jobs.find((x) => x.id === id);
+      const posUntilJob = async (id, pred, tries = 40) => {
+        for (let i = 0; i < tries; i++) {
+          const j = await posGetJob(id);
+          if (j && pred(j)) return j;
+          await wait(300);
+        }
+        return null;
+      };
+      try {
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Position Corp', province: 'BC', frequency: 'biweekly',
+        start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+      });
+      posJobId = r.data.id;
+      check('position: create sets the opening position',
+        r.status === 201 && !!posJobId && r.data.opening_value === 3000 && r.data.calc.perPeriod.gross === 3000,
+        JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#earnings/job/${posJobId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      check('position: detail history shows the opening row as the current position',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes('Opening position') && d.textContent.includes('Current position');
+        }));
+      // Gross per-period change via the detail row modal.
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-06-01';
+        f.row_value.value = '3500';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      const posAfterGross = await posUntilJob(posJobId, (j) => j.calc.perPeriod.gross === 3500 && j.calc.annualGross === 91000);
+      check('position: gross per-period change moves the position',
+        !!posAfterGross && posAfterGross.pay_changes.length === 1, JSON.stringify(posAfterGross));
+      // Annual gross change: 104000 / 26 periods = 4000 per period.
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-12-01';
+        f.row_value.value = '104000';
+        f.row_scope.value = 'annual';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      const posAfterAnnual = await posUntilJob(posJobId, (j) => j.calc.perPeriod.gross === 4000 && j.calc.annualGross === 104000);
+      check('position: annual gross change annualises to the per-period position',
+        !!posAfterAnnual && posAfterAnnual.pay_changes.some((c) => c.scope === 'annual' && c.amount === 104000 && c.value === 4000),
+        JSON.stringify(posAfterAnnual));
+      check('position: history shows the annual entry with its derivation',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes('/ year') && d.textContent.includes('Current position');
+        }));
+      // Backfilled older entry must not move the position.
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-02-01';
+        f.row_value.value = '2800';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      await wait(900);
+      const posAfterBackfill = await posGetJob(posJobId);
+      check('position: backfilled older entry leaves the position alone',
+        !!posAfterBackfill && posAfterBackfill.calc.perPeriod.gross === 4000 && posAfterBackfill.pay_changes.length === 3,
+        JSON.stringify(posAfterBackfill));
+      // Delete the latest (annual) entry from the detail page: the
+      // position falls back to the previous entry. (The page-wide
+      // dialog handler registered earlier accepts the confirm.)
+      await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#earnJobDetail .note')];
+        const row = rows.find((el) => el.textContent.includes('Dec 1, 2026'));
+        const btn = row && row.querySelector('button.danger');
+        if (btn) btn.click();
+      });
+      const posAfterDelete = await posUntilJob(posJobId, (j) => j.calc.perPeriod.gross === 3500);
+      check('position: deleting the latest change falls back to the previous entry',
+        !!posAfterDelete && posAfterDelete.pay_changes.length === 2, JSON.stringify(posAfterDelete));
+      // Take-home change on a fresh job: the net at 3000 back-solves
+      // to exactly 3000 (same profile, no other segments).
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Takehome Corp', province: 'BC', frequency: 'biweekly',
+        start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+      });
+      posTakeJobId = r.data.id;
+      const takeNet = (await posGetJob(posTakeJobId)).calc.perPeriod.net;
+      await page.goto(`http://ff.local/#earnings/job/${posTakeJobId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate((net) => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-11-02';
+        f.row_value.value = String(net);
+        f.querySelector('[name=row_basis][value=takehome]').checked = true;
+      }, takeNet);
+      await page.click('#earnJobRowForm button[type=submit]');
+      const posTake = await posUntilJob(posTakeJobId, (j) => j.pay_changes.length === 1);
+      check('position: take-home change back-solves to the per-period position',
+        !!posTake && posTake.calc.perPeriod.gross === 3000
+          && posTake.pay_changes[0].basis === 'takehome' && posTake.pay_changes[0].value === 3000
+          && posTake.pay_changes[0].amount === takeNet,
+        JSON.stringify(posTake));
+      check('position: history shows the take-home entry with its derivation',
+        await until(() => {
+          const d = document.querySelector('#earnJobDetail');
+          return d && d.textContent.includes('take-home') && d.textContent.includes('Current position');
+        }));
+      // Plan-linked job still cannot be deleted.
+      r = await req('POST', '/api/earnings/jobs', { employer: 'Pos Plan Corp', province: 'BC', frequency: 'biweekly', gross_amount: 2000, gross_basis: 'period', tax_year: 2026 });
+      posPlanJobId = r.data.id;
+      r = await req('POST', '/api/investments/accounts', { name: 'Pos RRSP', type: 'RRSP' });
+      posRrspId = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${posRrspId}/holdings`, { label: 'Pos Fund', kind: 'fund', currency: 'CAD' });
+      const posFundId = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${posRrspId}/plans`, { job_id: posPlanJobId, target_holding_id: posFundId, start_date: '2026-01-05', own_amount: 100 });
+      posPlanId = r.data.id;
+      r = await req('DELETE', `/api/earnings/jobs/${posPlanJobId}`);
+      check('position: deleting a plan-linked job is still a 400',
+        r.status === 400 && /contribution plan/.test(r.data.error || ''), JSON.stringify(r.data));
+      } finally {
+        if (posPlanId) await req('DELETE', `/api/investments/plans/${posPlanId}`);
+        if (posRrspId) await req('DELETE', `/api/investments/accounts/${posRrspId}`);
+        if (posPlanJobId) await req('DELETE', `/api/earnings/jobs/${posPlanJobId}`);
+        if (posJobId) await req('DELETE', `/api/earnings/jobs/${posJobId}`);
+        if (posTakeJobId) await req('DELETE', `/api/earnings/jobs/${posTakeJobId}`);
+      }
+
       // ---- Job detail monthly chart: stacked gross composition ----
       // Fixture ids live outside the nested try so the finally below
       // always cleans up — a mid-block failure must not pollute the

@@ -353,21 +353,67 @@ export function solveGrossForTakeHome({ targetNet, frequency, province, startDat
   return { gross: g };
 }
 
+// Pay-change entries carry amount + basis + scope; the per-period
+// gross (value) is derived server-side (resolvePayChangeValues), so a
+// take-home or annual entry never stores a guessed rate. Legacy rows
+// sent as {effective_date, value} mean gross / per period.
 export function validPayChanges(rows, startDate) {
   if (rows === undefined || rows === null) return [];
   if (!Array.isArray(rows)) return { error: 'pay changes must be an array.' };
   const out = [];
   for (const r of rows) {
     const d = normJobDate(r && r.effective_date);
-    const rawV = r && r.value;
-    const v = rawV === '' || rawV == null ? NaN : Number(rawV);
     if (!d) return { error: 'each pay change needs a valid effective date.' };
-    if (!Number.isFinite(v) || v < 0) return { error: 'each pay change needs a per-period value ≥ 0.' };
     if (startDate && d < startDate) return { error: 'pay change date must be on or after the job start date.' };
-    out.push({ effective_date: d, value: v });
+    const basis = r && r.basis !== undefined && r.basis !== null ? String(r.basis) : 'gross';
+    if (basis !== 'gross' && basis !== 'takehome') return { error: 'pay change basis must be gross or takehome.' };
+    const scope = r && r.scope !== undefined && r.scope !== null ? String(r.scope) : 'period';
+    if (scope !== 'period' && scope !== 'annual') return { error: 'pay change scope must be period or annual.' };
+    const rawA = r && r.amount !== undefined && r.amount !== null ? r.amount : r.value;
+    const amount = rawA === '' || rawA == null ? NaN : Number(rawA);
+    if (!Number.isFinite(amount) || amount < 0) return { error: 'each pay change needs an amount ≥ 0.' };
+    out.push({ effective_date: d, amount, basis, scope, value: null });
   }
   out.sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
   return out;
+}
+
+// Derives every entry's per-period gross in place: gross entries are
+// direct (annual annualised by the job's frequency); take-home entries
+// back-solve through the same pipeline the job form's take-home toggle
+// uses, against the other entries as segments (a not-yet-solved later
+// take-home entry stands in at its amount — it cannot price an earlier
+// date's segment). Returns an error string, or null.
+export function resolvePayChangeValues({ entries = [], frequency, province, startDate, recentDate,
+  bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt }) {
+  const periods = PAY_FREQUENCIES[frequency] ? PAY_FREQUENCIES[frequency].periods : null;
+  if (!periods) return 'pay change needs a valid pay frequency.';
+  for (const c of entries) {
+    if (c.basis === 'gross') c.value = c.scope === 'annual' ? c.amount / periods : c.amount;
+  }
+  const sorted = [...entries].sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
+  for (const c of sorted) {
+    if (c.basis !== 'takehome') continue;
+    const target = c.scope === 'annual' ? c.amount / periods : c.amount;
+    const others = entries.filter((x) => x !== c).map((x) => ({
+      effective_date: x.effective_date, value: x.value != null ? x.value : x.amount,
+    }));
+    const solved = solveGrossForTakeHome({
+      targetNet: target, frequency, province, startDate, recentDate,
+      changes: others, bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt,
+    });
+    if (solved.error) return solved.error;
+    c.value = solved.gross;
+  }
+  return null;
+}
+
+// The position is always the latest-dated entry's derived value (entries
+// arrive date-sorted, so the last one wins; equal dates keep submission
+// order). With no entries the caller-supplied fallback stands.
+export function positionValueFor(entries, fallback) {
+  if (!entries || !entries.length) return fallback;
+  return entries[entries.length - 1].value;
 }
 
 export function validBonuses(rows) {

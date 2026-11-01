@@ -9,6 +9,7 @@ import {
   calcSalary, calcRentalYear, federalBpa, bracketTax,
   deriveRentalYearFigures, entryCoveredYears,
   payDatesInWindow, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
+  validPayChanges, resolvePayChangeValues, positionValueFor,
 } from '../src/earnings.js';
 
 const job = (over = {}) => ({
@@ -482,6 +483,63 @@ test('take-home: unreachable targets are errors, never silent fallbacks', () => 
   assert.ok(solveTakeHome(-5).error);
   assert.ok(solveTakeHome(100, { frequency: 'bogus' }).error);
   assert.equal(solveTakeHome(0).gross, 0);
+});
+
+// ------------------------------------------------------- position model --
+test('pay changes: amount + basis + scope normalise, legacy value-only means gross/period', () => {
+  const rows = validPayChanges([
+    { effective_date: '2026-06-01', value: 3000 },
+    { effective_date: '2026-01-05', amount: 104000, basis: 'gross', scope: 'annual' },
+    { effective_date: '2026-03-01', amount: 2500, basis: 'takehome', scope: 'period' },
+  ], '2026-01-01');
+  assert.equal(rows.length, 3);
+  assert.deepEqual([rows[0].amount, rows[0].basis, rows[0].scope], [104000, 'gross', 'annual']);
+  assert.deepEqual([rows[1].amount, rows[1].basis, rows[1].scope], [2500, 'takehome', 'period']);
+  assert.deepEqual([rows[2].amount, rows[2].basis, rows[2].scope], [3000, 'gross', 'period']);
+  assert.equal(rows[2].value, null);
+  assert.ok(validPayChanges([{ effective_date: '2026-06-01', amount: 100, basis: 'net' }]).error);
+  assert.ok(validPayChanges([{ effective_date: '2026-06-01', amount: 100, scope: 'monthly' }]).error);
+  assert.ok(validPayChanges([{ effective_date: '2026-06-01', amount: -5 }]).error);
+});
+
+test('pay changes: gross annual annualises, take-home back-solves, position is the latest entry', () => {
+  const entries = validPayChanges([
+    { effective_date: '2026-01-05', amount: 104000, basis: 'gross', scope: 'annual' },
+    { effective_date: '2026-06-01', amount: takeHomeNetAt(3000), basis: 'takehome', scope: 'period' },
+  ], '2026-01-01');
+  const err = resolvePayChangeValues({
+    entries, frequency: 'biweekly', province: 'BC', startDate: '2026-01-05', recentDate: '2026-10-23',
+    bonuses: [], payroll, td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(err, null);
+  assert.equal(entries[0].value, 4000);
+  // The take-home entry nets to its target under the annual entry's segment.
+  assert.equal(
+    takeHomeNetAt(entries[1].value, { changes: [{ effective_date: '2026-01-05', value: 4000 }] }),
+    takeHomeNetAt(3000));
+  assert.equal(positionValueFor(entries, 9999), entries[1].value);
+  assert.equal(positionValueFor([], 9999), 9999);
+});
+
+test('pay changes: unreachable take-home is an error; equal dates keep submission order', () => {
+  const entries = validPayChanges([
+    { effective_date: '2026-06-01', amount: 1, basis: 'takehome', scope: 'period' },
+  ], '2026-01-01');
+  const err = resolvePayChangeValues({
+    entries, frequency: 'biweekly', province: 'BC', startDate: '2026-01-05', recentDate: '2026-10-23',
+    bonuses: [{ date: '2026-06-30', amount: 50000 }], payroll,
+    td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false,
+  });
+  assert.ok(err);
+  const ties = validPayChanges([
+    { effective_date: '2026-06-01', amount: 3000 },
+    { effective_date: '2026-06-01', amount: 3200 },
+  ], '2026-01-01');
+  resolvePayChangeValues({
+    entries: ties, frequency: 'biweekly', province: 'BC', startDate: '2026-01-05', recentDate: '2026-10-23',
+    bonuses: [], payroll, td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(positionValueFor(ties, 0), 3200);
 });
 
 // ------------------------------------------------------- job monthly chart --

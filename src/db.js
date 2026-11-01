@@ -357,16 +357,29 @@ if (!earnJobCols.includes('start_date')) {
 if (!earnJobCols.includes('recent_pay_date')) {
   db.exec('ALTER TABLE earn_jobs ADD COLUMN recent_pay_date TEXT');
 }
-// Optional dated pay-change rows (effective date + new per-period
-// value) and bonus entries (date + amount) for a job. Both are
-// replaced wholesale on a derived save; deleting the job cascades.
+// The opening position: the create-time current per-period pay, kept
+// as the history chain's first entry. NULL = pre-position-model job.
+if (!earnJobCols.includes('opening_value')) {
+  db.exec('ALTER TABLE earn_jobs ADD COLUMN opening_value REAL');
+}
+// Optional dated pay-change rows (effective date + entered amount,
+// basis and scope; the derived per-period value lives in value) and
+// bonus entries (date + amount) for a job. Both are replaced wholesale
+// on a derived save; deleting the job cascades.
 db.exec(`CREATE TABLE IF NOT EXISTS earn_pay_changes (
   id INTEGER PRIMARY KEY,
   job_id INTEGER NOT NULL REFERENCES earn_jobs(id) ON DELETE CASCADE,
   effective_date TEXT NOT NULL,
   value REAL NOT NULL,
+  amount REAL,
+  basis TEXT,
+  scope TEXT,
   created_at TEXT NOT NULL
 )`);
+const pcCols = db.prepare('PRAGMA table_info(earn_pay_changes)').all().map((c) => c.name);
+if (!pcCols.includes('amount')) db.exec('ALTER TABLE earn_pay_changes ADD COLUMN amount REAL');
+if (!pcCols.includes('basis')) db.exec('ALTER TABLE earn_pay_changes ADD COLUMN basis TEXT');
+if (!pcCols.includes('scope')) db.exec('ALTER TABLE earn_pay_changes ADD COLUMN scope TEXT');
 db.exec(`CREATE TABLE IF NOT EXISTS earn_bonuses (
   id INTEGER PRIMARY KEY,
   job_id INTEGER NOT NULL REFERENCES earn_jobs(id) ON DELETE CASCADE,
