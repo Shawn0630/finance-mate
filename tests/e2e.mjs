@@ -16134,14 +16134,16 @@ try {
       const pageTpl = await page.evaluate(() => fetch('/api/planning/templates').then((x) => x.json()).catch((e) => ({ error: String(e) })));
       check('planning detail: page fetch sees the saved templates',
         Array.isArray(pageTpl.templates) && pageTpl.templates.length >= 1, JSON.stringify(pageTpl).slice(0, 200));
-      // Template refine: From saved template offers Refine with AI,
-      // and the model form opens prefilled with the template summary.
-      // The chooser handlers are wired after an async context load,
-      // so retry the card click until the saved body renders.
+      // Template refine: saved templates now live inside the AI
+      // fallback screen of the preset chooser; Refine with AI still
+      // opens the model form prefilled with the template summary.
       await page.click('#planAddStrategyBtn');
       const refinePresent = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         for (let i = 0; i < 12; i++) {
+          const ai = document.querySelector('#planChooseAi');
+          if (ai) ai.click();
+          await sleep(300);
           const card = document.querySelector('#planChooseSaved');
           if (card) card.click();
           await sleep(500);
@@ -16569,6 +16571,20 @@ try {
         JSON.stringify(poolPage));
       await page.goto(`http://ff.local/#planning/strategy/${poolStrat.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
+      // Prime is opt-in now: add the factor first, then the chart + presets render.
+      const primeAdded = await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        for (let i = 0; i < 12; i++) {
+          const sel = document.querySelector('#planFactorAddSel');
+          if (sel) {
+            sel.value = 'prime';
+            document.querySelector('#planFactorAddBtn').click();
+          }
+          await sleep(500);
+          if (document.querySelector('#planFactorPrimeChart')) return true;
+        }
+        return false;
+      });
       const stratPage = await page.evaluate(() => ({
         factorsPanel: !!document.querySelector('#planFactorsPanel'),
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
@@ -16576,8 +16592,8 @@ try {
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
         fanChart: !!document.querySelector('#planStrategyFanChart'),
       }));
-      check('planning pool: strategy detail shows the Factors panel with prime chart + view presets, no scenario panel, no fan chart',
-        stratPage.factorsPanel && stratPage.primeChart && stratPage.presetBtns === 5 && !stratPage.scenarioPanel && !stratPage.fanChart,
+      check('planning pool: strategy detail shows the Factors panel with prime chart + view presets after Add factor, no scenario panel, no fan chart',
+        primeAdded && stratPage.factorsPanel && stratPage.primeChart && stratPage.presetBtns === 5 && !stratPage.scenarioPanel && !stratPage.fanChart,
         JSON.stringify(stratPage));
       // Pool builder: account percent + holding amount compose the same
       // 1100 total live, and the preview card carries it.
@@ -16625,6 +16641,375 @@ try {
   check('planning pool: account B cleanup', r.status === 200);
   r = await req('DELETE', `/api/investments/accounts/${poolAcctC}`);
   check('planning pool: account C cleanup', r.status === 200);
+
+  // ---- Strategy editor: factor opt-in, category presets, quick actions ----
+  r = await req('POST', '/api/properties', { address: '7 Editor Lane', purchase_date: '2024-01-15', mortgage_balance: 800000, amortization_years: 25 });
+  check('strategy editor: fixture property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const edPid = r.data.id;
+  r = await req('POST', `/api/properties/${edPid}/rates`, { start_date: '2024-01-15', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 });
+  check('strategy editor: fixture variable segment created', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/projects', { name: 'Editor Opt-in', question: 'q', category: 'property', subcategory: 'refinance', entity: { type: 'property', propertyId: edPid } });
+  check('strategy editor: fixture property project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const edProjId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${edProjId}/strategies`, { name: 'Editor Strat', source: 'manual' });
+  check('strategy editor: fixture strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const edStratId = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${edStratId}/ops`, { op_type: 'prepay', params: { propertyId: edPid, date: (() => { const d = new Date(); d.setMonth(d.getMonth() + 3); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`; })(), amount: 50000 } });
+  check('strategy editor: fixture prepay op created', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${edStratId}`);
+  const edBase = r.data.comparison || {};
+  check('strategy editor: baseline comparison reads', r.status === 200 && edBase.net != null, JSON.stringify(edBase));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('strategy editor browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardR = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResR = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueR = loginResR.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserR = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    const waitR = (ms) => new Promise((res2) => setTimeout(res2, ms));
+    try {
+      const page = await browserR.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardR({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
+      await page.goto(`http://ff.local/#planning/strategy/${edStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      const fresh = await page.evaluate(() => ({
+        addSel: !!document.querySelector('#planFactorAddSel'),
+        primeChart: !!document.querySelector('#planFactorPrimeChart'),
+        stockVal: !!document.querySelector('#planFactorStockVal'),
+        growthInput: !!document.querySelector('[data-growth]'),
+        sinkBox: !!document.querySelector('#planSinkStockBox'),
+      }));
+      check('strategy editor: fresh property strategy shows no factor UI until Add factor is used',
+        fresh.addSel && !fresh.primeChart && !fresh.stockVal && !fresh.growthInput && !fresh.sinkBox, JSON.stringify(fresh));
+      const added = await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const sel = document.querySelector('#planFactorAddSel');
+        if (!sel) return false;
+        sel.value = 'stock';
+        document.querySelector('#planFactorAddBtn').click();
+        for (let i = 0; i < 12; i++) {
+          if (document.querySelector('#planFactorStockVal')) break;
+          await sleep(500);
+        }
+        const inp = document.querySelector('#planFactorStockVal');
+        if (!inp) return false;
+        inp.value = '8';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planFactorSaveBtn').click();
+        await sleep(1500);
+        return true;
+      });
+      check('strategy editor: stock factor added through the UI', added);
+      r = await req('GET', `/api/planning/strategies/${edStratId}`);
+      const edAfter = r.data.comparison || {};
+      // A stock factor is a global return override: with valued holdings
+      // in the run it moves the blended total via stockGain, so gain/net
+      // are NOT pinned here. What it provably never touches on a pure
+      // property strategy is every property number — the decision itself.
+      check('strategy editor: stock factor on a pure property strategy changes no property number',
+        edAfter.interestSaved === edBase.interestSaved && edAfter.payoffShiftMonths === edBase.payoffShiftMonths
+        && edAfter.paymentDelta === edBase.paymentDelta && edAfter.penaltyTotal === edBase.penaltyTotal
+        && edAfter.cost === edBase.cost,
+        JSON.stringify({ before: edBase, after: edAfter }));
+      r = await req('PUT', `/api/planning/strategies/${edStratId}/factors`, { factors: { prime: { points: [{ month: '2027-01', rate: 4.5 }], preset: null }, stock: { valuePct: 8 } } });
+      check('strategy editor: factors preset via API', r.status === 200, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(800);
+      await page.goto(`http://ff.local/#planning/strategy/${edStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      const legacy = await page.evaluate(() => ({
+        primeChart: !!document.querySelector('#planFactorPrimeChart'),
+        stockVal: document.querySelector('#planFactorStockVal')?.value || '',
+      }));
+      check('strategy editor: strategy with stored factors still shows them (legacy render)',
+        legacy.primeChart && legacy.stockVal === '8', JSON.stringify(legacy));
+      await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      await page.click('#planAddStrategyBtn');
+      await waitR(1200);
+      const modal = await page.evaluate(() => ({
+        presets: [...document.querySelectorAll('[data-plan-preset]')].map((c) => c.dataset.planPreset),
+        oldCards: ['#planChooseTemplate', '#planChooseDescribe', '#planChooseModel', '#planChooseSaved'].some((s) => !!document.querySelector(s)),
+        aiBtn: !!document.querySelector('#planChooseAi'),
+      }));
+      check('strategy editor: Add strategy modal shows property presets first, AI only as fallback, old cards gone',
+        JSON.stringify(modal.presets) === JSON.stringify(['prepay', 'rate_fixed', 'rate_variable', 'refinance', 'payment_change']) && !modal.oldCards && modal.aiBtn, JSON.stringify(modal));
+      const presetClicked = await page.evaluate(() => {
+        const c = document.querySelector('[data-plan-preset="refinance"]');
+        if (c) c.click();
+        return !!c;
+      });
+      await waitR(800);
+      const formState = await page.evaluate(() => ({
+        title: document.querySelector('#planStrategyModalTitle')?.textContent || '',
+        typeSel: !!document.querySelector('#planStrategyOpType'),
+        back: !!document.querySelector('#planBackToPresets'),
+      }));
+      check('strategy editor: Refinance preset opens an action form titled Refinance with no type select',
+        presetClicked && formState.title === 'Refinance' && !formState.typeSel && formState.back, JSON.stringify(formState));
+      await page.evaluate(() => { document.querySelector('#planBackToPresets').click(); });
+      await waitR(500);
+      const backToPresets = await page.evaluate(() => !!document.querySelector('[data-plan-preset="prepay"]'));
+      check('strategy editor: back button returns to the preset chooser', backToPresets);
+      await page.evaluate(() => { document.querySelector('#planStrategyModal [data-close-modal]').click(); });
+      await waitR(500);
+      await page.goto(`http://ff.local/#planning/strategy/${edStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      const quick = await page.evaluate(() => [...document.querySelectorAll('[data-plan-quick-op]')].map((b) => b.dataset.planQuickOp));
+      check('strategy editor: property strategy shows Prepay/Refinance/Rate switch/Payment change quick actions',
+        JSON.stringify(quick) === JSON.stringify(['prepay', 'refinance', 'rate_switch', 'payment_change']), JSON.stringify(quick));
+      const quickClicked = await page.evaluate(() => {
+        const b = document.querySelector('[data-plan-quick-op="payment_change"]');
+        if (b) b.click();
+        return !!b;
+      });
+      await waitR(800);
+      const quickFormState = await page.evaluate(() => ({
+        title: document.querySelector('#planOpModalTitle')?.textContent || '',
+        type: document.querySelector('#planOpTypeSel')?.value || '',
+      }));
+      check('strategy editor: Payment change quick action opens the op editor with payment_change preselected',
+        quickClicked && quickFormState.title === 'Add operation' && quickFormState.type === 'payment_change', JSON.stringify(quickFormState));
+      // ---- Optional first operation + action-form pins ----
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitR(500);
+      const futYm = (() => { const d = new Date(); d.setMonth(d.getMonth() + 3); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; })();
+      const pickTemplateMonth = (ym) => page.evaluate((target) => {
+        document.querySelector('#planStrategyModalBody [data-plan-month]').click();
+        const yearEl = document.querySelector('#monthPopYear');
+        let guard = 0;
+        while (Number(yearEl.textContent) !== Number(target.slice(0, 4)) && guard++ < 80) {
+          const btn = Number(target.slice(0, 4)) < Number(yearEl.textContent) ? document.querySelector('#monthPopPrev') : document.querySelector('#monthPopNext');
+          if (!btn || btn.disabled) break;
+          btn.click();
+        }
+        const cell = document.querySelector(`#monthPopGrid button[data-ym="${target}"]`);
+        if (!cell || cell.disabled) throw new Error(`month cell ${target} not pickable`);
+        cell.click();
+      }, ym);
+      const openActionForm = async (preset) => {
+        await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+        await waitR(1200);
+        await page.click('#planAddStrategyBtn');
+        await waitR(1200);
+        const clicked = await page.evaluate((p) => { const c = document.querySelector(`[data-plan-preset="${p}"]`); if (c) c.click(); return !!c; }, preset);
+        await waitR(800);
+        return clicked;
+      };
+      const setMoney = async (sel, val) => page.evaluate(([s, v]) => {
+        const el = document.querySelector(s);
+        if (!el) return false;
+        el.value = v;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, [sel, val]);
+      // (a) bare strategy: name only, blank date
+      const bareOpened = await openActionForm('prepay');
+      const bareFormState = await page.evaluate(() => ({
+        title: document.querySelector('#planStrategyModalTitle')?.textContent || '',
+        typeSel: !!document.querySelector('#planStrategyOpType'),
+        nameStar: (document.querySelector('#planStrategyModalBody')?.textContent || '').includes('Strategy name *'),
+        optLabel: (document.querySelector('#planStrategyModalBody')?.textContent || '').includes('First operation (optional)'),
+        dateVal: document.querySelector('#planOpDateVal')?.value || '',
+      }));
+      check('strategy editor: Prepay preset opens an action form titled Prepay, no type select, name required, op optional',
+        bareOpened && bareFormState.title === 'Prepay' && !bareFormState.typeSel && bareFormState.nameStar && bareFormState.optLabel && bareFormState.dateVal === '', JSON.stringify(bareFormState));
+      const bareHash = await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((res2) => setTimeout(res2, ms));
+        document.querySelector('#planStrategyName').value = 'Bare Strat';
+        document.querySelector('#planStrategyTemplateSave').click();
+        for (let i = 0; i < 20; i++) {
+          if (location.hash.startsWith('#planning/strategy/')) break;
+          await sleep(500);
+        }
+        return location.hash;
+      });
+      await waitR(1500);
+      const bareId = Number((bareHash.match(/(\d+)$/) || [])[1] || 0);
+      const barePage = await page.evaluate(() => ({
+        noOps: (document.body.textContent || '').includes('No operations yet.'),
+        noTemplateNote: ![...document.querySelectorAll('.note')].some((el) => (el.textContent || '').includes('Template:')),
+        quick: [...document.querySelectorAll('[data-plan-quick-op]')].map((b) => b.dataset.planQuickOp),
+      }));
+      check('strategy editor: name-only action form creates a bare strategy landing on its detail page with 0 ops and no Template note',
+        bareId > 0 && bareHash === `#planning/strategy/${bareId}` && barePage.noOps && barePage.noTemplateNote
+        && JSON.stringify(barePage.quick) === JSON.stringify(['prepay', 'refinance', 'rate_switch', 'payment_change']), JSON.stringify({ hash: bareHash, ...barePage }));
+      r = await req('GET', `/api/planning/strategies/${bareId}`);
+      const bareCmp = r.data.comparison || {};
+      check('strategy editor: zero-op strategy compares equal to baseline (all deltas zero)',
+        r.status === 200 && (r.data.ops || []).length === 0 && bareCmp.interestSaved === 0 && bareCmp.stockGain === 0
+        && bareCmp.cost === 0 && bareCmp.gain === 0 && bareCmp.net === 0 && bareCmp.payoffShiftMonths === 0 && bareCmp.paymentDelta === 0,
+        JSON.stringify({ ops: (r.data.ops || []).length, cmp: bareCmp }));
+      // (b) quick-action Prepay from the bare strategy
+      const bareQuick = await page.evaluate(() => {
+        const b = document.querySelector('[data-plan-quick-op="prepay"]');
+        if (b) b.click();
+        return !!b;
+      });
+      await waitR(800);
+      const bareQuickState = await page.evaluate(() => ({
+        title: document.querySelector('#planOpModalTitle')?.textContent || '',
+        type: document.querySelector('#planOpTypeSel')?.value || '',
+      }));
+      check('strategy editor: Prepay quick action on a bare strategy opens the op editor with prepay preselected',
+        bareQuick && bareQuickState.title === 'Add operation' && bareQuickState.type === 'prepay', JSON.stringify(bareQuickState));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitR(500);
+      // Switch to fixed: Fixed rate only, creates a fixed rate_switch op
+      const fixedOpened = await openActionForm('rate_fixed');
+      const fixedFormState = await page.evaluate(() => {
+        const fields = document.querySelector('#planStrategyOpFields');
+        const radio = fields ? fields.querySelector('input[name="planOpRateType"]') : null;
+        const annual = fields ? fields.querySelector('#planOpAnnualRate') : null;
+        const spread = fields ? fields.querySelector('#planOpSpread') : null;
+        return {
+          title: document.querySelector('#planStrategyModalTitle')?.textContent || '',
+          radioHidden: radio ? radio.closest('div').style.display : 'missing',
+          annualHidden: annual ? annual.closest('div').style.display : 'missing',
+          spreadHidden: spread ? spread.closest('div').style.display : 'missing',
+          checked: fields ? (fields.querySelector('input[name="planOpRateType"]:checked') || {}).value || '' : '',
+        };
+      });
+      check('strategy editor: Switch to fixed form shows Fixed rate only (radios + Spread hidden, Fixed checked)',
+        fixedOpened && fixedFormState.title === 'Switch to fixed' && fixedFormState.radioHidden === 'none'
+        && fixedFormState.annualHidden !== 'none' && fixedFormState.spreadHidden === 'none' && fixedFormState.checked === 'fixed', JSON.stringify(fixedFormState));
+      await page.evaluate(() => { document.querySelector('#planStrategyName').value = 'Fixed Strat'; });
+      await pickTemplateMonth(futYm);
+      await waitR(500);
+      const fixedDate = await page.evaluate(() => document.querySelector('#planOpDateVal')?.value || '');
+      await setMoney('#planOpAnnualRate', '4.25');
+      await page.evaluate(() => { document.querySelector('#planStrategyTemplateSave').click(); });
+      await waitR(1500);
+      const fixedHash = await page.evaluate(() => location.hash);
+      const fixedId = Number((fixedHash.match(/(\d+)$/) || [])[1] || 0);
+      r = await req('GET', `/api/planning/strategies/${fixedId}`);
+      const fixedOp = (r.data.ops || [])[0] || {};
+      check('strategy editor: Switch to fixed creates a rate_switch op with rateType fixed + annualRate',
+        fixedId > 0 && fixedHash === `#planning/strategy/${fixedId}` && fixedDate === `${futYm}-01` && (r.data.ops || []).length === 1
+        && fixedOp.op_type === 'rate_switch' && fixedOp.params && fixedOp.params.rateType === 'fixed' && fixedOp.params.annualRate === 4.25 && fixedOp.params.spread == null,
+        JSON.stringify({ hash: fixedHash, date: fixedDate, op: fixedOp }));
+      // Switch to variable: Spread only, creates a variable rate_switch op
+      const varOpened = await openActionForm('rate_variable');
+      const varFormState = await page.evaluate(() => {
+        const fields = document.querySelector('#planStrategyOpFields');
+        const radio = fields ? fields.querySelector('input[name="planOpRateType"]') : null;
+        const annual = fields ? fields.querySelector('#planOpAnnualRate') : null;
+        const spread = fields ? fields.querySelector('#planOpSpread') : null;
+        return {
+          title: document.querySelector('#planStrategyModalTitle')?.textContent || '',
+          radioHidden: radio ? radio.closest('div').style.display : 'missing',
+          annualHidden: annual ? annual.closest('div').style.display : 'missing',
+          spreadHidden: spread ? spread.closest('div').style.display : 'missing',
+          checked: fields ? (fields.querySelector('input[name="planOpRateType"]:checked') || {}).value || '' : '',
+        };
+      });
+      check('strategy editor: Switch to variable form shows Spread only (radios + Fixed hidden, Variable checked)',
+        varOpened && varFormState.title === 'Switch to variable' && varFormState.radioHidden === 'none'
+        && varFormState.annualHidden === 'none' && varFormState.spreadHidden !== 'none' && varFormState.checked === 'variable', JSON.stringify(varFormState));
+      await page.evaluate(() => { document.querySelector('#planStrategyName').value = 'Var Strat'; });
+      await pickTemplateMonth(futYm);
+      await waitR(500);
+      await setMoney('#planOpSpread', '0.5');
+      await page.evaluate(() => { document.querySelector('#planStrategyTemplateSave').click(); });
+      await waitR(1500);
+      const varHash = await page.evaluate(() => location.hash);
+      const varId = Number((varHash.match(/(\d+)$/) || [])[1] || 0);
+      r = await req('GET', `/api/planning/strategies/${varId}`);
+      const varOp = (r.data.ops || [])[0] || {};
+      check('strategy editor: Switch to variable creates a rate_switch op with rateType variable + spread',
+        varId > 0 && varHash === `#planning/strategy/${varId}` && (r.data.ops || []).length === 1
+        && varOp.op_type === 'rate_switch' && varOp.params && varOp.params.rateType === 'variable' && varOp.params.spread === 0.5 && varOp.params.annualRate == null,
+        JSON.stringify({ hash: varHash, op: varOp }));
+      // (c) existing path unchanged: date + amount → strategy + exactly 1 op
+      const fullOpened = await openActionForm('prepay');
+      await page.evaluate(() => { document.querySelector('#planStrategyName').value = 'Full Strat'; });
+      await pickTemplateMonth(futYm);
+      await waitR(500);
+      await setMoney('#planOpAmount', '50000');
+      await page.evaluate(() => { document.querySelector('#planStrategyTemplateSave').click(); });
+      await waitR(1500);
+      const fullHash = await page.evaluate(() => location.hash);
+      const fullId = Number((fullHash.match(/(\d+)$/) || [])[1] || 0);
+      r = await req('GET', `/api/planning/strategies/${fullId}`);
+      const fullOp = (r.data.ops || [])[0] || {};
+      const fullPageNoEmpty = await page.evaluate(() => !(document.body.textContent || '').includes('No operations yet.'));
+      check('strategy editor: date + amount action form creates a strategy with exactly 1 prepay op',
+        fullOpened && fullId > 0 && fullHash === `#planning/strategy/${fullId}` && (r.data.ops || []).length === 1
+        && fullOp.op_type === 'prepay' && fullOp.params && fullOp.params.amount === 50000 && fullPageNoEmpty,
+        JSON.stringify({ hash: fullHash, op: fullOp }));
+      // (d) date filled but amount blank → error, no strategy created
+      r = await req('GET', `/api/planning/projects/${edProjId}`);
+      const countBefore = (r.data.strategies || []).length;
+      const badOpened = await openActionForm('prepay');
+      await page.evaluate(() => { document.querySelector('#planStrategyName').value = 'Bad Strat'; });
+      await pickTemplateMonth(futYm);
+      await waitR(500);
+      await page.evaluate(() => { document.querySelector('#planStrategyTemplateSave').click(); });
+      await waitR(1200);
+      const badState = await page.evaluate(() => ({
+        msg: document.querySelector('#planStrategyModalMsg')?.textContent || '',
+        hash: location.hash,
+        modalOpen: !!document.querySelector('#planStrategyModalBody #planStrategyName'),
+      }));
+      r = await req('GET', `/api/planning/projects/${edProjId}`);
+      const countAfter = (r.data.strategies || []).length;
+      check('strategy editor: date filled but amount blank errors and creates no strategy (rejected op rolled back)',
+        badOpened && badState.msg.includes('prepay amount') && badState.hash === `#planning/project/${edProjId}` && badState.modalOpen && countAfter === countBefore,
+        JSON.stringify({ ...badState, countBefore, countAfter }));
+      await page.evaluate(() => { document.querySelector('#planStrategyModal [data-close-modal]')?.click(); });
+      await waitR(500);
+      // (e) strategy list rows show no raw template suffix
+      await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      const cardTexts = await page.evaluate(() => [...document.querySelectorAll('[data-plan-strategy]')].map((el) => el.textContent || ''));
+      check('strategy editor: strategy list rows show no raw template suffix',
+        cardTexts.length >= 4 && !cardTexts.some((t) => t.includes('· prepay') || t.includes('· rate_switch')), JSON.stringify(cardTexts.map((t) => t.slice(0, 120))));
+    } finally { await browserR.close(); }
+  }
+  r = await req('DELETE', `/api/planning/projects/${edProjId}`);
+  check('strategy editor: project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/properties/${edPid}`);
+  check('strategy editor: property cleanup', r.status === 200);
 
   // ---- Funding-source multi-select picker (browser) ----
   if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {

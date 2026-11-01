@@ -11475,7 +11475,7 @@ async function loadPlanComparison(projectId) {
     <div class="card breakdown-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
       <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
       <div class="v">${planSigned(r.comparison.net)}</div>
-      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops${r.strategy.template ? ` · ${esc(r.strategy.template)}` : ''}</div>
+      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops</div>
       ${factorLine ? `<div class="n">${esc(factorLine)}</div>` : ''}
       ${legacySinkLine}
       <div class="toolbar">
@@ -11872,7 +11872,6 @@ function planStrategyHtml(d) {
         </div>
       </div>
       <div class="msg" id="planStrategyMsg"></div>
-      ${s.template ? `<div class="note">Template: ${esc({ prepay: 'Prepay', rate_switch: 'Rate switch', refinance: 'Refinance', payment_change: 'Payment change', buy: 'Buy', sell: 'Sell', position: 'Position', 'ai-template': 'AI template' }[s.template] || s.template)}</div>` : ''}
       ${c.errors && c.errors.length ? `<div class="msg err">${esc(c.errors.join('; '))}</div>` : ''}
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
@@ -11898,7 +11897,7 @@ function planStrategyHtml(d) {
     </div>
     <div class="panel" id="planFactorsPanel">
       <div class="section-head"><h3>Factors</h3></div>
-      <div class="note">Pick what the future looks like for this strategy. Unset = current behavior. The baseline changes nothing — it never uses these.</div>
+      <div class="toolbar" id="planFactorAddRow"><select id="planFactorAddSel"></select><button class="small" id="planFactorAddBtn">Add factor</button></div>
       <div id="planFactorPrime"></div>
       <div id="planFactorStock"></div>
       <div id="planFactorGrowth"></div>
@@ -11912,7 +11911,7 @@ function planStrategyHtml(d) {
     </div>
     <div class="panel">
       <div class="section-head"><h3>Operations</h3>
-        <div class="toolbar"><button class="small" id="planAddOpBtn">+ Add operation</button></div>
+        <div class="toolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
       </div>
       <table class="tbl"><thead><tr><th>#</th><th>Type</th><th>Detail</th><th>Source</th><th></th></tr></thead><tbody>${ops || '<tr><td colspan="5">No operations yet.</td></tr>'}</tbody></table>
       <div class="msg" id="planOpsMsg"></div>
@@ -11980,6 +11979,7 @@ function planStrategyWire(d) {
     catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
   });
   $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
+  document.querySelectorAll('[data-plan-quick-op]').forEach((b) => b.addEventListener('click', () => openPlanOpModal(s.id, null, b.dataset.planQuickOp)));
   // Model follow-up iterates the strategy spec via ai-model (stored
   // thread continues). The baseline changes nothing, so it is not a
   // follow-up target.
@@ -12103,6 +12103,7 @@ function planStrategyWire(d) {
 // the whole set (an existing sink is preserved untouched by a factors
 // save — only the sink block rebuilds operations).
 let planFactorState = null;
+let planFactorActive = new Set();
 let planFactorRedrawPrime = null;
 let planFactorMonthPopWired = false;
 function planFactorWire(d) {
@@ -12118,6 +12119,16 @@ function planFactorWire(d) {
     rentGrowth: cur.rentGrowth ? { valuePct: cur.rentGrowth.valuePct } : null,
     sink: cur.sink || null,
   };
+  // Opt-in factors: a factor renders only once added. An already-set
+  // factor counts as added, so legacy strategies render exactly as
+  // before; a never-added factor is hidden and never saved.
+  planFactorActive = new Set();
+  if (planFactorState.prime.points.length || planFactorState.prime.preset) planFactorActive.add('prime');
+  if (planFactorState.stock) planFactorActive.add('stock');
+  if (planFactorState.propertyGrowth) planFactorActive.add('propertyGrowth');
+  if (planFactorState.salaryGrowth) planFactorActive.add('salaryGrowth');
+  if (planFactorState.rentGrowth) planFactorActive.add('rentGrowth');
+  if (planFactorState.sink) planFactorActive.add('sink');
   let primeInfo = null;
   let holdings = [];
   let sinkDraft = null;
@@ -12178,14 +12189,45 @@ function planFactorWire(d) {
       },
     });
   };
+  const FACTOR_LABELS = { prime: 'Prime', stock: 'Stock return', propertyGrowth: 'Property growth', salaryGrowth: 'Salary growth', rentGrowth: 'Rent growth', sink: 'Sink' };
+  const renderFactorAdd = () => {
+    const row = $('#planFactorAddRow');
+    const sel = $('#planFactorAddSel');
+    if (!row || !sel) return;
+    const avail = [];
+    if (!planFactorActive.has('prime')) avail.push('prime');
+    if (!planFactorActive.has('stock') && !(isInvestment && planFactorState.sink)) avail.push('stock');
+    if ((d.project.category === 'property' || hasMortgageOps) && !planFactorActive.has('propertyGrowth')) avail.push('propertyGrowth');
+    if (d.project.category === 'earning') {
+      if (!planFactorActive.has('salaryGrowth')) avail.push('salaryGrowth');
+      if (!planFactorActive.has('rentGrowth')) avail.push('rentGrowth');
+    }
+    if (isInvestment && !planFactorActive.has('sink')) avail.push('sink');
+    if (!avail.length) { row.classList.add('hidden'); return; }
+    row.classList.remove('hidden');
+    sel.innerHTML = avail.map((k) => `<option value="${k}">${FACTOR_LABELS[k]}</option>`).join('');
+  };
+  const renderAllFactors = () => { renderPrime(); renderStock(); renderGrowth(); renderSink(); renderFactorAdd(); };
+  const removeFactor = (key) => {
+    planFactorActive.delete(key);
+    if (key === 'prime') planFactorState.prime = { points: [], preset: null };
+    else planFactorState[key] = null;
+    if (key === 'sink') sinkDraft = null;
+    renderAllFactors();
+  };
+  const wireFactorRemove = (host) => {
+    if (!host) return;
+    host.querySelectorAll('[data-factor-remove]').forEach((b) => b.addEventListener('click', () => removeFactor(b.dataset.factorRemove)));
+  };
   const renderPrime = () => {
     if (!primeHost) return;
+    if (!planFactorActive.has('prime')) { primeHost.innerHTML = ''; return; }
     const st = planFactorState.prime;
     const curRate = primeInfo && primeInfo.current ? primeInfo.current.rate : null;
     const presetBtns = [['optimistic', 'Optimistic (prime down)'], ['pessimistic', 'Pessimistic (prime up)'], ['up', 'Up'], ['down', 'Down'], ['flat', 'Flat']]
       .map(([k, label]) => `<button class="small" data-plan-prime-preset="${k}">${label}</button>`).join(' ');
     primeHost.innerHTML = `
-      <div class="section-head"><h3>Prime</h3></div>
+      <div class="section-head"><h3>Prime</h3><div class="toolbar"><button class="small danger" data-factor-remove="prime">Remove</button></div></div>
       <div class="note">Today's prime: ${curRate != null ? `${curRate}%` : '—'} · No points = prime stays at today's rate. Between points the rate holds until the next point.</div>
       <div class="chart-wrap" style="height:220px"><canvas id="planFactorPrimeChart"></canvas></div>
       <div class="toolbar">${presetBtns}</div>
@@ -12223,6 +12265,7 @@ function planFactorWire(d) {
       planFactorState.prime.preset = null;
       renderPrime();
     });
+    wireFactorRemove(primeHost);
   };
   const renderStock = () => {
     if (!stockHost) return;
@@ -12232,7 +12275,8 @@ function planFactorWire(d) {
         <div class="note">Set by the sink below: ${st ? `${st.valuePct}%/yr${st.basis ? ` (${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''})` : ''}` : '—'}</div>`;
       return;
     }
-    stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3></div>
+    if (!planFactorActive.has('stock')) { stockHost.innerHTML = ''; return; }
+    stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3><div class="toolbar"><button class="small danger" data-factor-remove="stock">Remove</button></div></div>
       <div><label>Expected return (% / year)</label><input id="planFactorStockVal" type="text" inputmode="decimal" data-money value="${st && st.valuePct != null ? st.valuePct : ''}"></div>
       ${st && st.basis ? `<div class="note">Basis: ${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''}</div>` : ''}
       <div><label>Return suggestions (your own history)</label><div class="toolbar"><select id="planFactorSuggestHolding"></select><button class="small" id="planFactorSuggestBtn">Suggest</button></div><div id="planFactorSuggestOut"></div></div>
@@ -12254,28 +12298,30 @@ function planFactorWire(d) {
         } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
       });
     }
+    wireFactorRemove(stockHost);
   };
   const renderGrowth = () => {
     if (!growthHost) return;
     const rows = [];
-    if (d.project.category === 'property' || hasMortgageOps) rows.push(['propertyGrowth', 'Property value growth (% / year)', planFactorState.propertyGrowth]);
+    if ((d.project.category === 'property' || hasMortgageOps) && planFactorActive.has('propertyGrowth')) rows.push(['propertyGrowth', 'Property value growth (% / year)', planFactorState.propertyGrowth]);
     if (d.project.category === 'earning') {
-      rows.push(['salaryGrowth', 'Salary growth (% / year)', planFactorState.salaryGrowth]);
-      rows.push(['rentGrowth', 'Rent growth (% / year)', planFactorState.rentGrowth]);
+      if (planFactorActive.has('salaryGrowth')) rows.push(['salaryGrowth', 'Salary growth (% / year)', planFactorState.salaryGrowth]);
+      if (planFactorActive.has('rentGrowth')) rows.push(['rentGrowth', 'Rent growth (% / year)', planFactorState.rentGrowth]);
     }
     if (!rows.length) { growthHost.innerHTML = ''; return; }
     growthHost.innerHTML = `<div class="section-head"><h3>Growth</h3></div>` + rows.map(([k, label, v]) => `
-      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-growth="${k}" value="${v && v.valuePct != null ? v.valuePct : ''}"></div>`).join('')
+      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-growth="${k}" value="${v && v.valuePct != null ? v.valuePct : ''}"><button class="small danger" data-factor-remove="${k}">Remove</button></div>`).join('')
       + (d.project.category === 'earning' ? `<div class="note">Salary and rent growth are stored and labeled only — the projection has no earnings leg yet, so they do not change numbers.</div>` : '');
     growthHost.querySelectorAll('[data-growth]').forEach((inp) => inp.addEventListener('input', () => {
       const k = inp.dataset.growth;
       const v = inp.value.replace(/,/g, '').trim();
       planFactorState[k] = v === '' ? null : { valuePct: Number(v) };
     }));
+    wireFactorRemove(growthHost);
   };
   const renderSink = () => {
     if (!sinkHost) return;
-    if (!isInvestment) { sinkHost.innerHTML = ''; return; }
+    if (!isInvestment || !planFactorActive.has('sink')) { sinkHost.innerHTML = ''; return; }
     const sink = planFactorState.sink;
     const curLine = sink
       ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: existing stock · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
@@ -12283,7 +12329,7 @@ function planFactorWire(d) {
     let tp = {};
     try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
     const defaultKind = tp.sinkKind === 'custom' ? 'custom' : 'stock';
-    sinkHost.innerHTML = `<div class="section-head"><h3>Sink — where the pool goes</h3></div>
+    sinkHost.innerHTML = `<div class="section-head"><h3>Sink — where the pool goes</h3><div class="toolbar"><button class="small danger" data-factor-remove="sink">Remove</button></div></div>
       <div class="note">${esc(curLine)}</div>
       <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Existing stock</label>
       <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
@@ -12343,7 +12389,14 @@ function planFactorWire(d) {
         loadPlanStrategy(s.id);
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
+    wireFactorRemove(sinkHost);
   };
+  $('#planFactorAddBtn').addEventListener('click', () => {
+    const k = $('#planFactorAddSel').value;
+    if (!k) return;
+    planFactorActive.add(k);
+    renderAllFactors();
+  });
   $('#planFactorSaveBtn').addEventListener('click', async () => {
     const msg = $('#planFactorMsg');
     try {
@@ -12355,12 +12408,12 @@ function planFactorWire(d) {
         st.stock = v === '' ? null : { ...(st.stock || {}), valuePct: Number(v) };
       }
       const factors = {};
-      if (st.prime.points.length || st.prime.preset) factors.prime = { points: st.prime.points, preset: st.prime.preset };
-      if (st.stock) factors.stock = st.stock;
-      if (st.propertyGrowth) factors.propertyGrowth = st.propertyGrowth;
-      if (st.salaryGrowth) factors.salaryGrowth = st.salaryGrowth;
-      if (st.rentGrowth) factors.rentGrowth = st.rentGrowth;
-      if (st.sink) factors.sink = st.sink;
+      if (planFactorActive.has('prime') && (st.prime.points.length || st.prime.preset)) factors.prime = { points: st.prime.points, preset: st.prime.preset };
+      if (planFactorActive.has('stock') && st.stock) factors.stock = st.stock;
+      if (planFactorActive.has('propertyGrowth') && st.propertyGrowth) factors.propertyGrowth = st.propertyGrowth;
+      if (planFactorActive.has('salaryGrowth') && st.salaryGrowth) factors.salaryGrowth = st.salaryGrowth;
+      if (planFactorActive.has('rentGrowth') && st.rentGrowth) factors.rentGrowth = st.rentGrowth;
+      if (planFactorActive.has('sink') && st.sink) factors.sink = st.sink;
       await api(`/api/planning/strategies/${s.id}/factors`, { method: 'PUT', body: { factors } });
       showMsg(msg, 'ok', 'Factors saved');
       loadPlanStrategy(s.id);
@@ -12396,6 +12449,7 @@ function planFactorWire(d) {
     renderStock();
     renderGrowth();
     renderSink();
+    renderFactorAdd();
   })();
 }
 
@@ -12679,12 +12733,12 @@ function planReadOpForm(type, root) {
   });
   return { params, legs };
 }
-async function openPlanOpModal(strategyId, existing) {
+async function openPlanOpModal(strategyId, existing, presetType) {
   const strategy = planStrategyData ? planStrategyData.strategy : null;
   const projectId = planStrategyData ? planStrategyData.project.id : null;
   const ctx = await planLoadOpCtx(projectId, strategyId);
   planOpCtx = ctx;
-  const type = existing ? existing.op_type : 'prepay';
+  const type = existing ? existing.op_type : (presetType || 'prepay');
   $('#planOpModalTitle').textContent = existing ? 'Edit operation' : 'Add operation';
   const typeSel = existing ? '' : `<div><label>Operation type *</label><select id="planOpTypeSel">
     <option value="prepay">Prepay mortgage</option><option value="rate_switch">Rate switch</option>
@@ -12697,6 +12751,7 @@ async function openPlanOpModal(strategyId, existing) {
   $('#planOpModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   const opCard = $('#planOpModalBody').closest('.modal-card');
   const typeEl = $('#planOpTypeSel');
+  if (typeEl) typeEl.value = type;
   if (typeEl) typeEl.addEventListener('change', () => {
     $('#planOpFormFields').innerHTML = planOpFormHtml(typeEl.value, {}, ctx);
     $('#planOpFormFields').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
@@ -12774,62 +12829,118 @@ async function openPlanOpModal(strategyId, existing) {
 async function openPlanStrategyModal(projectId) {
   $('#planStrategyModalTitle').textContent = 'Add strategy';
   showMsg($('#planStrategyModalMsg'), '', '');
-  $('#planStrategyModalBody').innerHTML = `
-    <div class="cards">
-      <div class="card breakdown-card" id="planChooseTemplate" style="cursor:pointer"><div class="k">From template</div><div class="n">A single operation: prepay, switch, refinance, buy or sell.</div></div>
-      <div class="card breakdown-card" id="planChooseDescribe" style="cursor:pointer"><div class="k">Describe in words</div><div class="n">Write the plan; AI turns it into operations for your confirmation.</div></div>
-      <div class="card breakdown-card" id="planChooseModel" style="cursor:pointer"><div class="k">Let AI design a model</div><div class="n">AI proposes a full model spec: bindings, formulas, assumptions, outputs, charts.</div></div>
-      <div class="card breakdown-card" id="planChooseSaved" style="cursor:pointer"><div class="k">From saved template</div><div class="n">Apply a saved AI template to a new strategy.</div></div>
-    </div>`;
-  openModal('planStrategyModal');
-  const ctx = await planLoadOpCtx(projectId, null);
-  planOpCtx = ctx;
-  $('#planChooseTemplate').addEventListener('click', () => {
+  // Category presets first: the concrete things the user wants to do.
+  // No op type fits earning/saving/tax_saving, so those show only the
+  // AI fallback; a legacy project (no category) shows every op type.
+  const cat = planProjectData && planProjectData.project ? planProjectData.project.category : null;
+  const PRESET_LABELS = { prepay: 'Prepay', rate_fixed: 'Switch to fixed', rate_variable: 'Switch to variable', refinance: 'Refinance', payment_change: 'Payment change', buy: 'Buy', sell: 'Sell', position: 'Position' };
+  const PRESETS = cat === 'property' ? ['prepay', 'rate_fixed', 'rate_variable', 'refinance', 'payment_change']
+    : cat === 'investment' ? ['buy', 'sell', 'position']
+    : (cat === 'earning' || cat === 'saving' || cat === 'tax_saving') ? []
+    : ['prepay', 'rate_fixed', 'rate_variable', 'refinance', 'payment_change', 'buy', 'sell', 'position'];
+  let ctx = null;
+  const renderChooser = () => {
+    $('#planStrategyModalTitle').textContent = 'Add strategy';
     $('#planStrategyModalBody').innerHTML = `
+    <div class="cards">
+      ${PRESETS.map((t) => `<div class="card breakdown-card" data-plan-preset="${t}" style="cursor:pointer"><div class="k">${PRESET_LABELS[t]}</div></div>`).join('')}
+    </div>
+    <div class="toolbar"><button class="small" id="planChooseAi">AI design strategy spec</button></div>`;
+    document.querySelectorAll('[data-plan-preset]').forEach((c) => c.addEventListener('click', () => openTemplateForm(c.dataset.planPreset)));
+    $('#planChooseAi').addEventListener('click', openAiFallback);
+  };
+  const openAiFallback = () => {
+    $('#planStrategyModalBody').innerHTML = `
+      <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
+      <div class="cards">
+        <div class="card breakdown-card" id="planChooseDescribe" style="cursor:pointer"><div class="k">Describe in words</div></div>
+        <div class="card breakdown-card" id="planChooseModel" style="cursor:pointer"><div class="k">Design a model</div></div>
+        <div class="card breakdown-card" id="planChooseSaved" style="cursor:pointer"><div class="k">From saved template</div></div>
+      </div>`;
+    $('#planBackToPresets').addEventListener('click', renderChooser);
+    $('#planChooseDescribe').addEventListener('click', openDescribeForm);
+    $('#planChooseModel').addEventListener('click', () => openPlanModelForm(''));
+    $('#planChooseSaved').addEventListener('click', openSavedForm);
+  };
+  renderChooser();
+  openModal('planStrategyModal');
+  ctx = await planLoadOpCtx(projectId, null);
+  planOpCtx = ctx;
+  function openTemplateForm(presetType) {
+    if (!ctx) return;
+    // The preset IS the action: no type re-pick in this form, and the
+    // two rate presets are the two rate_switch directions.
+    const OP_TYPE = { prepay: 'prepay', rate_fixed: 'rate_switch', rate_variable: 'rate_switch', refinance: 'refinance', payment_change: 'payment_change', buy: 'buy', sell: 'sell', position: 'position' };
+    const opType = OP_TYPE[presetType] || presetType;
+    const ratePreset = presetType === 'rate_fixed' ? 'fixed' : presetType === 'rate_variable' ? 'variable' : null;
+    $('#planStrategyModalTitle').textContent = PRESET_LABELS[presetType] || 'Add strategy';
+    $('#planStrategyModalBody').innerHTML = `
+      <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Prepay then refinance"></div>
-      <div><label>Operation type *</label><select id="planStrategyOpType">
-        <option value="prepay">Prepay mortgage</option><option value="rate_switch">Rate switch</option>
-        <option value="refinance">Refinance</option><option value="payment_change">Payment change</option>
-        <option value="buy">Buy</option><option value="sell">Sell</option><option value="position">Position (cost unknown)</option></select></div>
-      <div id="planStrategyOpFields">${planOpFormHtml('prepay', {}, ctx)}</div>
+      <div><label>First operation (optional)</label></div>
+      <div id="planStrategyOpFields">${planOpFormHtml(opType, ratePreset ? { rateType: ratePreset } : {}, ctx)}</div>
       <div class="toolbar"><button class="primary" id="planStrategyTemplateSave">Create strategy</button></div>`;
+    $('#planBackToPresets').addEventListener('click', renderChooser);
     $('#planStrategyModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
-    const typeEl = $('#planStrategyOpType');
-    typeEl.addEventListener('change', () => {
-      $('#planStrategyOpFields').innerHTML = planOpFormHtml(typeEl.value, {}, ctx);
-      $('#planStrategyOpFields').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    {
       const stratCard = $('#planStrategyModalBody').closest('.modal-card');
-      planLegsWire(typeEl.value, ctx, stratCard);
-      if (typeEl.value === 'buy' || typeEl.value === 'sell') {
+      planLegsWire(opType, ctx, stratCard);
+      if (opType === 'buy' || opType === 'sell') {
         const box = stratCard.querySelector('#planOpLegs');
-        if (box && !box.children.length) box.insertAdjacentHTML('beforeend', planLegRowHtml(typeEl.value, ctx, null));
+        if (box && !box.children.length) box.insertAdjacentHTML('beforeend', planLegRowHtml(opType, ctx, null));
       }
-      if (typeEl.value === 'buy') planOpSourceWire(stratCard, ctx);
-    });
-    planLegsWire('prepay', ctx, $('#planStrategyModalBody').closest('.modal-card'));
+      if (opType === 'buy') planOpSourceWire(stratCard, ctx);
+      // A rate preset fixes its direction: hide the rate-type radios
+      // and the irrelevant rate input, leaving only the number the
+      // user actually sets.
+      if (ratePreset) {
+        const fields = $('#planStrategyOpFields');
+        const radio = fields.querySelector('input[name="planOpRateType"]');
+        if (radio && radio.closest('div')) radio.closest('div').style.display = 'none';
+        const hideInput = fields.querySelector(ratePreset === 'fixed' ? '#planOpSpread' : '#planOpAnnualRate');
+        if (hideInput && hideInput.closest('div')) hideInput.closest('div').style.display = 'none';
+      }
+    }
     $('#planStrategyTemplateSave').addEventListener('click', async () => {
       const msg = $('#planStrategyModalMsg');
       try {
         const name = $('#planStrategyName').value.trim();
         if (!name) throw new Error('strategy name is required');
-        const curType = $('#planStrategyOpType').value;
-        const { params, legs } = planReadOpForm(curType, $('#planStrategyModalBody').closest('.modal-card'));
-        if (!params.date) throw new Error('date is required');
+        const { params, legs } = planReadOpForm(opType, $('#planStrategyModalBody').closest('.modal-card'));
+        // The first operation is optional: a blank date means "name it
+        // now, decide the numbers later". The detail page's quick
+        // actions add the first op when the user is ready.
+        if (!params.date) {
+          const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'template', template: opType } });
+          closeModalEl($('#planStrategyModal'));
+          location.hash = `#planning/strategy/${s.strategy.id}`;
+          return;
+        }
         // Applying a strategy template records the template + answers
         // on the strategy; the op list underneath stays the computation.
-        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'template', template: curType, template_params: params } });
-        await api(`/api/planning/strategies/${s.strategy.id}/ops`, { method: 'POST', body: { op_type: curType, params, legs } });
+        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'template', template: opType, template_params: params } });
+        try {
+          await api(`/api/planning/strategies/${s.strategy.id}/ops`, { method: 'POST', body: { op_type: opType, params, legs } });
+        } catch (opErr) {
+          // A rejected first op must not leave an orphan strategy
+          // behind: roll the bare strategy back, then surface the op
+          // error exactly as before.
+          try { await api(`/api/planning/strategies/${s.strategy.id}`, { method: 'DELETE' }); } catch { /* best-effort cleanup */ }
+          throw opErr;
+        }
         closeModalEl($('#planStrategyModal'));
         location.hash = `#planning/strategy/${s.strategy.id}`;
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
-  });
-  $('#planChooseDescribe').addEventListener('click', () => {
+  }
+  function openDescribeForm() {
     $('#planStrategyModalBody').innerHTML = `
+      <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Pay down Christina, invest the rest"></div>
       <div><label>Describe the plan *</label><textarea id="planStrategyDescribe" rows="4" placeholder="e.g. Prepay $100,000 on Christina in January 2027, then refinance to a 5-year fixed at 4.2%"></textarea></div>
       <div class="toolbar"><button class="primary" id="planStrategyDescribeBtn">Propose operations</button></div>
       <div id="planStrategyDescribeOut"></div>`;
+    $('#planBackToPresets').addEventListener('click', renderChooser);
     $('#planStrategyDescribeBtn').addEventListener('click', async () => {
       const msg = $('#planStrategyModalMsg');
       try {
@@ -12855,19 +12966,21 @@ async function openPlanStrategyModal(projectId) {
         });
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
-  });
-  // AI model design form, reusable: the chooser card opens it blank;
+  }
+  // AI model design form, reusable: the fallback card opens it blank;
   // "Refine with AI" on a saved template opens it prefilled with that
   // template's summary, so template output is AI-refinable via
   // follow-up. Both targets (baseline + spec) are refinable: the
   // baseline step lives in the baseline panel/modal, the spec step here.
   function openPlanModelForm(prefillText) {
     $('#planStrategyModalBody').innerHTML = `
+      <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
       <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out">${esc(prefillText || '')}</textarea></div>
       <div id="planStrategyModelThread"></div>
       <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
       <div id="planStrategyModelOut"></div>`;
+    $('#planBackToPresets').addEventListener('click', renderChooser);
     // One strategy row for the whole design session: repeated Design
     // clicks (after answering questions) reuse it instead of orphaning
     // a new empty strategy per round.
@@ -12951,19 +13064,21 @@ async function openPlanStrategyModal(projectId) {
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
   }
-  $('#planChooseModel').addEventListener('click', () => openPlanModelForm(''));
-  $('#planChooseSaved').addEventListener('click', async () => {
+  async function openSavedForm() {
     const msg = $('#planStrategyModalMsg');
     try {
       const t = await api('/api/planning/templates');
       const list = t.templates || [];
       $('#planStrategyModalBody').innerHTML = `
+      <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
       ${list.length ? `<div><label>Saved template *</label><select id="planSavedTemplateSel">${list.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>
       <div id="planSavedTemplateQs"></div>
       <div class="toolbar"><button class="primary" id="planSavedTemplateApply">Apply template</button><button class="small" id="planSavedTemplateRefine">Refine with AI</button></div>`
         : '<div class="note">No saved templates yet.</div>'}`;
       const sel = $('#planSavedTemplateSel');
+      const backBtn = $('#planBackToPresets');
+      if (backBtn) backBtn.addEventListener('click', renderChooser);
       const renderQs = () => {
         const cur = list.find((x) => String(x.id) === String(sel.value));
         const schema = (cur && cur.metadata_schema) || [];
@@ -12998,7 +13113,7 @@ async function openPlanStrategyModal(projectId) {
         } catch (err) { showMsg(msg, 'err', err.message); }
       });
     } catch (err) { showMsg(msg, 'err', err.message); }
-  });
+  }
 }
 
 // ---- merge / revert wizard ----
