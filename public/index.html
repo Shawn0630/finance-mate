@@ -947,17 +947,6 @@
   </div>
 </div>
 
-<div class="modal-overlay hidden" id="planBaselineAiModal">
-  <div class="modal-card">
-    <div class="modal-head"><h3>Design baseline with AI</h3><button class="small" data-close-modal>Close</button></div>
-    <div class="msg" id="planBaselineAiMsg"></div>
-    <div><label>Describe the baseline *</label><textarea id="planBaselineAiText" rows="3" placeholder="e.g. Prime rises 1% over the next year, then holds; new money follows the current holdings allocation"></textarea></div>
-    <div id="planBaselineAiThread"></div>
-    <div class="toolbar"><button class="primary" id="planBaselineAiBtn">Design baseline</button></div>
-    <div id="planBaselineAiOut"></div>
-  </div>
-</div>
-
 <div class="modal-overlay hidden" id="planCategoryModal">
   <div class="modal-card">
     <div class="modal-head"><h3>What is this optimization about?</h3><button class="small" data-close-modal>Close</button></div>
@@ -975,8 +964,6 @@
     <form id="planBaselineEditForm">
       <div><label>Name *</label><input id="planBaselineEditName" required></div>
       <div><label>Description</label><input id="planBaselineEditDesc"></div>
-      <div><label>Prime direction</label><select id="planBaselineEditDir"><option value="flat">Flat</option><option value="up">Up</option><option value="down">Down</option></select></div>
-      <div><label>Prime stance</label><select id="planBaselineEditStance"><option value="neutral">Neutral</option><option value="optimistic">Optimistic</option><option value="pessimistic">Pessimistic</option></select></div>
       <div class="toolbar">
         <button type="submit" class="primary">Save</button>
         <button type="button" data-close-modal>Cancel</button>
@@ -1012,7 +999,6 @@
       </div>
       <div class="toolbar hidden" id="planProjectCategoryBtns">
         <button type="button" class="primary" id="planProjectApplyRecBtn">Apply recommendation</button>
-        <button type="button" id="planProjectAiDesignBtn">Design with AI</button>
       </div>
     </form>
   </div>
@@ -1044,26 +1030,6 @@
     <div class="modal-head"><h3 id="planOpModalTitle">Add operation</h3><button class="small" data-close-modal>Close</button></div>
     <div class="msg" id="planOpModalMsg"></div>
     <div id="planOpModalBody"></div>
-  </div>
-</div>
-
-<div class="modal-overlay hidden" id="planScenarioModal">
-  <div class="modal-card">
-    <div class="modal-head"><h3 id="planScenarioModalTitle">Add scenario</h3><button class="small" data-close-modal>Close</button></div>
-    <div class="msg" id="planScenarioModalMsg"></div>
-    <form id="planScenarioForm">
-      <div><label>Scenario name *</label><input name="name" required></div>
-      <div class="grid2">
-        <div><label>Direction *</label><select name="direction"><option value="up">Up</option><option value="flat">Flat</option><option value="down">Down</option></select></div>
-        <div><label>Stance</label><select name="stance"><option value="neutral">Neutral</option><option value="pessimistic">Pessimistic</option><option value="optimistic">Optimistic</option></select></div>
-      </div>
-      <div><label>Total prime move (percentage points)</label><input name="magnitude" type="text" inputmode="decimal" data-money placeholder="Blank = preset pace"></div>
-      <div><label>Custom steps (optional, JSON)</label><input name="steps" placeholder='[{"date":"2027-03-01","rate":5.2}] — blank = preset steps'></div>
-      <div class="toolbar">
-        <button type="submit" class="primary">Save</button>
-        <button type="button" data-close-modal>Cancel</button>
-      </div>
-    </form>
   </div>
 </div>
 

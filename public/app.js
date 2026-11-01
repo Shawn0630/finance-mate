@@ -10839,7 +10839,6 @@ const planSigned = (v) => (v == null ? '—' : (v >= 0 ? '+' : '') + money2(v));
 let planListData = null;
 let planProjectData = null;
 let planStrategyData = null;
-let planCompareScenarioId = null;
 
 async function loadPlanning() {
   return withLoading(async () => {
@@ -10909,20 +10908,102 @@ async function planCatPickCategory(key) {
     } else if (cat.entityType === 'investment') {
       const inv = await api('/api/investments');
       const accounts = inv.accounts || [];
-      const holdings = accounts.flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountId: (a.account || {}).id })));
-      host.innerHTML = `<div><label>Account *</label><select id="planCatAccountSel"><option value="">Select an account</option>${accounts.map((a) => `<option value="${(a.account || {}).id}">${esc((a.account || {}).name)}</option>`).join('')}</select></div>
-        <div><label>Holding (optional — whole account when blank)</label><select id="planCatHoldingSel"><option value="">Whole account</option></select></div>
+      // POOL BUILDER: the baseline's starting position is a user-defined
+      // cash pool — whole accounts and/or individual stocks, each
+      // contributing a percent OF THAT SOURCE or a CAD amount from it.
+      // Contributions add up to the pool total; they never need to
+      // sum to 100%. Picking an account covers its stocks (and picks
+      // none of them directly), so one source is never counted twice.
+      const acctRows = accounts.map((a) => ({
+        id: a.account.id, name: (a.account || {}).name || '', value: (a.summary || {}).value || 0,
+        holdings: (a.holdings || []).map((h) => ({ id: h.holding.id, symbol: h.holding.symbol || h.holding.label || '', value: (h.summary || {}).value || 0 })),
+      }));
+      host.innerHTML = `<div class="note">Build the cash pool — pick whole accounts or individual stocks. For each, give a percent of that source, or a CAD amount from it. The pool total is the sum of the contributions.</div>
+        <div id="planPoolRows">${acctRows.map((a) => `
+          <div class="plan-row"><label style="flex:1"><input type="checkbox" data-pool-account="${a.id}"> ${esc(a.name)} · ${money2(a.value)}</label>
+          <select data-pool-mode="${a.id}" disabled><option value="percent">% of account</option><option value="amount">Amount (CAD)</option></select>
+          <input type="number" min="0" max="100" step="0.01" placeholder="%" data-pool-input="${a.id}" style="width:100px" disabled></div>
+          ${a.holdings.map((h) => `
+          <div class="plan-row" style="margin-left:16px"><label style="flex:1"><input type="checkbox" data-pool-holding="${h.id}" data-pool-account-of="${a.id}"> ${esc(h.symbol)} · ${money2(h.value)}</label>
+          <select data-pool-mode-h="${h.id}" disabled><option value="percent">% of stock</option><option value="amount">Amount (CAD)</option></select>
+          <input type="number" min="0" max="100" step="0.01" placeholder="%" data-pool-input-h="${h.id}" style="width:100px" disabled></div>`).join('')}`).join('') || '<div class="note">No holdings yet.</div>'}
+        </div>
+        <div class="note" id="planPoolTotal">Pool total: $0.00</div>
         <div class="toolbar"><button class="small primary" id="planCatEntityGo">Continue</button></div>`;
-      $('#planCatAccountSel').addEventListener('change', (e) => {
-        const aid = Number(e.target.value);
-        const hs = holdings.filter((h) => h.accountId === aid);
-        $('#planCatHoldingSel').innerHTML = '<option value="">Whole account</option>' + hs.map((h) => `<option value="${h.id}">${esc(h.symbol || h.label)}</option>`).join('');
+      const acctValue = new Map(acctRows.map((a) => [String(a.id), a.value]));
+      const holdValue = new Map(acctRows.flatMap((a) => a.holdings.map((h) => [String(h.id), h.value])));
+      const rowContribution = (kind, id) => {
+        const cb = host.querySelector(kind === 'account' ? `[data-pool-account="${id}"]` : `[data-pool-holding="${id}"]`);
+        if (!cb || !cb.checked) return 0;
+        const mode = host.querySelector(kind === 'account' ? `[data-pool-mode="${id}"]` : `[data-pool-mode-h="${id}"]`).value;
+        const v = Number(host.querySelector(kind === 'account' ? `[data-pool-input="${id}"]` : `[data-pool-input-h="${id}"]`).value) || 0;
+        if (mode === 'percent') return (kind === 'account' ? acctValue.get(String(id)) : holdValue.get(String(id))) * v / 100;
+        return v;
+      };
+      const updateTotal = () => {
+        let total = 0;
+        host.querySelectorAll('[data-pool-account]').forEach((cb) => { total += rowContribution('account', cb.dataset.poolAccount); });
+        host.querySelectorAll('[data-pool-holding]').forEach((cb) => { total += rowContribution('holding', cb.dataset.poolHolding); });
+        $('#planPoolTotal').textContent = `Pool total: ${money2(total)}`;
+      };
+      const syncRow = (kind, id, checked) => {
+        const inp = host.querySelector(kind === 'account' ? `[data-pool-input="${id}"]` : `[data-pool-input-h="${id}"]`);
+        const sel = host.querySelector(kind === 'account' ? `[data-pool-mode="${id}"]` : `[data-pool-mode-h="${id}"]`);
+        inp.disabled = !checked;
+        sel.disabled = !checked;
+        if (!checked) inp.value = '';
+      };
+      host.querySelectorAll('[data-pool-account]').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          syncRow('account', cb.dataset.poolAccount, cb.checked);
+          if (cb.checked) {
+            host.querySelectorAll(`[data-pool-account-of="${cb.dataset.poolAccount}"]`).forEach((hcb) => {
+              hcb.checked = false;
+              syncRow('holding', hcb.dataset.poolHolding, false);
+            });
+          }
+          updateTotal();
+        });
       });
+      host.querySelectorAll('[data-pool-holding]').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          syncRow('holding', cb.dataset.poolHolding, cb.checked);
+          if (cb.checked) {
+            const acb = host.querySelector(`[data-pool-account="${cb.dataset.poolAccountOf}"]`);
+            if (acb && acb.checked) { acb.checked = false; syncRow('account', cb.dataset.poolAccountOf, false); }
+          }
+          updateTotal();
+        });
+      });
+      const syncMode = (kind, id) => {
+        const sel = host.querySelector(kind === 'account' ? `[data-pool-mode="${id}"]` : `[data-pool-mode-h="${id}"]`);
+        const inp = host.querySelector(kind === 'account' ? `[data-pool-input="${id}"]` : `[data-pool-input-h="${id}"]`);
+        if (sel.value === 'percent') { inp.placeholder = '%'; inp.max = '100'; }
+        else { inp.placeholder = '$'; inp.removeAttribute('max'); }
+        updateTotal();
+      };
+      host.querySelectorAll('[data-pool-mode]').forEach((sel) => sel.addEventListener('change', () => syncMode('account', sel.dataset.poolMode)));
+      host.querySelectorAll('[data-pool-mode-h]').forEach((sel) => sel.addEventListener('change', () => syncMode('holding', sel.dataset.poolModeH)));
+      host.querySelectorAll('[data-pool-input]').forEach((inp) => inp.addEventListener('input', updateTotal));
+      host.querySelectorAll('[data-pool-input-h]').forEach((inp) => inp.addEventListener('input', updateTotal));
       $('#planCatEntityGo').addEventListener('click', () => {
-        const aid = Number($('#planCatAccountSel').value);
-        if (!aid) { showMsg(msg, 'err', 'Select an account'); return; }
-        const hid = $('#planCatHoldingSel').value;
-        planCatPickEntity(hid ? { type: 'holding', accountId: aid, holdingId: Number(hid) } : { type: 'account', accountId: aid });
+        const items = [];
+        host.querySelectorAll('[data-pool-account]:checked').forEach((cb) => {
+          const id = cb.dataset.poolAccount;
+          const mode = host.querySelector(`[data-pool-mode="${id}"]`).value;
+          const v = Number(host.querySelector(`[data-pool-input="${id}"]`).value) || 0;
+          items.push(mode === 'percent' ? { accountId: Number(id), percent: v } : { accountId: Number(id), amount: v });
+        });
+        host.querySelectorAll('[data-pool-holding]:checked').forEach((cb) => {
+          const id = cb.dataset.poolHolding;
+          const mode = host.querySelector(`[data-pool-mode-h="${id}"]`).value;
+          const v = Number(host.querySelector(`[data-pool-input-h="${id}"]`).value) || 0;
+          items.push(mode === 'percent' ? { holdingId: Number(id), percent: v } : { holdingId: Number(id), amount: v });
+        });
+        if (!items.length) { showMsg(msg, 'err', 'Pick at least one account or stock for the pool'); return; }
+        if (items.some((it) => !(it.percent > 0 || it.amount > 0))) { showMsg(msg, 'err', 'Each picked source needs a percent above 0 or an amount above 0'); return; }
+        if (items.some((it) => it.percent != null && it.percent > 100)) { showMsg(msg, 'err', 'A percent cannot exceed 100% of its source'); return; }
+        planCatPickEntity({ type: 'pool', items });
       });
     } else if (cat.entityType === 'earning') {
       const er = await api('/api/earnings');
@@ -10955,10 +11036,12 @@ async function planCatPickEntity(entity) {
     $('#planCategorySubs').innerHTML = subs.map((s) => {
       const rec = planCatFlow.recommendations[s.key];
       if (!rec) return '';
+      const figs = rec.baseline.figures || {};
+      const poolLine = figs.poolValue != null ? `<div class="n">Pool value ${money2(figs.poolValue)} · ${(figs.stockCount ?? (figs.items || []).length)} stock${(figs.stockCount ?? (figs.items || []).length) === 1 ? '' : 's'}</div>` : '';
       return `<div class="card breakdown-card" data-plan-sub="${s.key}" style="cursor:pointer">
         <div class="k">${esc(s.label)}</div>
         <div class="n">Baseline: ${esc(rec.baseline.name || '')} · Strategy: ${esc(rec.strategy.name || '')}</div>
-        <div class="n">${esc(rec.strategy.summary || '')}</div></div>`;
+        <div class="n">${esc(rec.strategy.summary || '')}</div>${poolLine}</div>`;
     }).join('');
     document.querySelectorAll('#planCategorySubs [data-plan-sub]').forEach((el) => {
       el.addEventListener('click', () => planCatPickSubcategory(el.dataset.planSub));
@@ -11017,7 +11100,6 @@ function openPlanProjectModal(existing, catCtx) {
 }
 $('#planProjectForm').question.addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
 $('#planProjectApplyRecBtn').addEventListener('click', () => { const f = $('#planProjectForm'); f.dataset.planApply = '1'; f.requestSubmit(); });
-$('#planProjectAiDesignBtn').addEventListener('click', () => { const f = $('#planProjectForm'); f.dataset.planAiDesign = '1'; f.requestSubmit(); });
 $('#planProjectForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -11036,11 +11118,6 @@ $('#planProjectForm').addEventListener('submit', async (e) => {
     const newId = (data.project || {}).id || id;
     closeModalEl($('#planProjectModal'));
     location.hash = `#planning/project/${newId}`;
-    if (!id && form.dataset.planAiDesign === '1') {
-      // The detail page renders on hash change; open the AI baseline
-      // modal on top of it once it is in place.
-      setTimeout(() => openPlanBaselineAiModal(newId, ''), 400);
-    }
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
@@ -11054,99 +11131,56 @@ async function loadPlanProject(id) {
     $('#planReport').classList.add('hidden');
     $('#planProject').innerHTML = planProjectHtml(data);
     planProjectWire(data);
-    await loadPlanComparison(id, null);
+    await loadPlanComparison(id);
   });
 }
 function planBaselineCardHtml(b) {
   const def = b.definition || {};
-  const ps = def.primeScenario || null;
-  const facts = [
-    b.source ? `Source: ${b.source}` : '',
-    def.description || '',
-    ps ? `Prime: ${ps.name || ''} · ${ps.direction || ''} · ${ps.stance || ''}` : '',
-    'Stock: current plan',
-    def.figures ? Object.entries(def.figures).map(([k, v]) => `${k} ${typeof v === 'number' ? money2(v) : v}`).join(' · ') : '',
-  ].filter(Boolean).join(' · ');
+  // No factor UI ever lives on a baseline card — the baseline changes
+  // nothing. Pool baselines show the pool figure; others show source +
+  // description + stored figures.
+  const figs = def.figures || null;
+  let facts = '';
+  if (figs && Array.isArray(figs.items)) {
+    facts = `Pool value ${money2(figs.poolValue ?? 0)} · ${(figs.stockCount ?? figs.items.length)} stock${(figs.stockCount ?? figs.items.length) === 1 ? '' : 's'}`;
+  } else {
+    facts = [
+      b.source ? `Source: ${b.source}` : '',
+      def.description || '',
+      figs ? Object.entries(figs).map(([k, v]) => `${k} ${typeof v === 'number' ? money2(v) : v}`).join(' · ') : '',
+    ].filter(Boolean).join(' · ');
+  }
   return `<div class="card breakdown-card" data-plan-baseline="${b.id}">
     <div class="k">${esc(b.name)}</div>
     <div class="n">${esc(facts)}</div>
     <div class="toolbar">
       <button class="small" data-plan-baseline-edit="${b.id}">Edit</button>
-      <button class="small" data-plan-baseline-ai="${b.id}">Refine with AI</button>
       <button class="small danger" data-plan-baseline-del="${b.id}">Delete</button>
     </div></div>`;
 }
 function planProjectHtml(d) {
   const p = d.project;
-  // TEMPLATE OWNS QUESTIONS: a templated project shows its Metadata
-  // panel plus only the sections its template schema includes; a legacy
-  // project (no template schema) keeps every generic panel.
   const templated = !!d.project.templateSchema;
-  const sections = templated ? d.project.templateSchema.sections : { primeScenarios: true, declaredAssets: true };
-  const metaRows = templated ? (d.project.templateSchema.fields || []).map((f) => {
-    const v = (d.project.metadata || {})[f.key];
-    const label = d.project.metadataLabels && d.project.metadataLabels[f.key] ? d.project.metadataLabels[f.key] : (v ?? '');
-    return `<div class="plan-row"><span>${esc(f.label)}</span><span>${esc(String(label))}</span></div>`;
-  }).join('') : '';
-  // DETAIL ORDER (templated projects): baseline info → strategies →
-  // reports (with the cross-strategy comparison). Prime scenarios and
-  // declared assets are baseline inputs, so they live inside the
-  // baseline panel when the template schema includes them — never as
-  // standalone default panels. Legacy projects keep the old order.
-  if (!templated) {
-    return `
-    <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
-    <div class="toolbar" id="planProjectHeader"><h3>${esc(p.name)}</h3>
-      <div class="spacer"></div>
-      <div class="toolbar">
-        ${d.stale ? '<span class="msg warn" style="margin:0">Stale baseline</span><button class="small" id="planSyncBtn">Sync latest mainline</button>' : ''}
-        <button class="small" id="planProjectEditBtn">Edit</button>
-        <button class="small danger" id="planProjectDeleteBtn">Delete</button>
-      </div></div>
-    <div class="note">${esc(p.question || '')}</div>
-    <div class="msg" id="planProjectMsg"></div>
-    <div class="panel" id="planComparePanel">
-      <div class="section-head"><h3>Comparison</h3>
-        <div class="toolbar"><span id="planCompareScenarioWrap"><label>Future world</label><select id="planCompareScenario"></select></span>
-        <button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
-      </div>
-      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
-      <div id="planCompareTable"></div>
-    </div>
-    ${(d.project.baselines || []).length ? `<div class="panel" id="planBaselineCardsPanel">
-      <div class="section-head"><h3>Baselines</h3>
-        <div class="toolbar"><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
-      </div>
-      <div id="planBaselineCards"></div>
-    </div>` : ''}
-    <div class="panel">
-      <div class="section-head"><h3>Strategies</h3></div>
-      <div id="planStrategyCards"></div>
-    </div>
-    <div class="panel" id="planScenarioPanel">
-      <div class="section-head"><h3>Prime scenarios</h3>
-        <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
-      </div>
-      <div id="planScenarioList"></div>
-    </div>
-    <div class="panel" id="planAssetPanel">
-      <div class="section-head"><h3>Declared fixed-term assets</h3>
-        <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
-      </div>
-      <div id="planAssetList"></div>
-    </div>
-    <div class="panel">
-      <div class="section-head"><h3>Reports</h3>
-        <div class="toolbar"><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
-      </div>
-      <div id="planReportList"></div>
-    </div>
-    <div class="panel">
-      <div class="section-head"><h3>History</h3></div>
-      <div id="planHistoryList"></div>
-    </div>`;
+  const sections = templated ? d.project.templateSchema.sections : { declaredAssets: true };
+  // HEADER: title + ONE line — category · subcategory · entity for
+  // categorized projects, else the project question when present.
+  const headerLine = d.project.categoryLabels
+    ? `${d.project.categoryLabels.category} · ${d.project.categoryLabels.subcategory} · ${d.project.categoryLabels.entity}`
+    : (p.question || '');
+  // Legacy template answers (old template flow) render as ONE compact
+  // line under the header; no answers → no line at all.
+  let metaLine = '';
+  if (templated && d.project.templateSchema.key !== 'categorized') {
+    const fields = d.project.templateSchema.fields || [];
+    const parts = fields.map((f) => {
+      const v = (d.project.metadata || {})[f.key];
+      if (v === undefined || v === null || v === '') return null;
+      const label = d.project.metadataLabels && d.project.metadataLabels[f.key] ? d.project.metadataLabels[f.key] : String(v);
+      return `${f.label}: ${label}`;
+    }).filter(Boolean);
+    if (parts.length) metaLine = `<div class="note" id="planMetadataLine">${esc(parts.join(' · '))} <button class="small" id="planMetadataLineEdit">Edit</button></div>`;
   }
-  return `
+  const header = `
     <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
     <div class="toolbar" id="planProjectHeader"><h3>${esc(p.name)}</h3>
       <div class="spacer"></div>
@@ -11155,54 +11189,48 @@ function planProjectHtml(d) {
         <button class="small" id="planProjectEditBtn">Edit</button>
         <button class="small danger" id="planProjectDeleteBtn">Delete</button>
       </div></div>
-    <div class="note">${esc(p.question || '')}</div>
-    ${d.project.categoryLabels ? `<div class="note" id="planProjectCategoryLine">${esc(d.project.categoryLabels.category)} · ${esc(d.project.categoryLabels.subcategory)} · ${esc(d.project.categoryLabels.entity)}</div>` : ''}
-    <div class="msg" id="planProjectMsg"></div>
-    <div class="panel" id="planBaselinePanel">
-      <div class="section-head"><h3>Baseline info · ${esc(d.project.templateSchema.label)}</h3>
-        <div class="toolbar"><button class="small" id="planAiBaselineBtn">Design baseline with AI</button><button class="small" id="planMetadataEditBtn">Edit</button></div>
-      </div>
-      <div id="planMetadataView">${metaRows || '<div class="note">No metadata yet.</div>'}</div>
+    ${headerLine ? `<div class="note" id="planProjectCategoryLine">${esc(headerLine)}</div>` : ''}
+    ${metaLine}
+    <div class="msg" id="planProjectMsg"></div>`;
+  const baselinesPanel = `<div class="panel" id="planBaselineCardsPanel">
       <div class="section-head"><h3>Baselines</h3>
         <div class="toolbar"><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
       </div>
       <div id="planBaselineCards"></div>
-      <div class="msg" id="planMetadataMsg"></div>
-      ${sections.primeScenarios ? `<div id="planScenarioPanel">
-        <div class="section-head"><h3>Prime scenarios</h3>
-          <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
-        </div>
-        <div id="planScenarioList"></div>
-      </div>` : ''}
-      ${sections.declaredAssets ? `<div id="planAssetPanel">
-        <div class="section-head"><h3>Declared fixed-term assets</h3>
-          <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
-        </div>
-        <div id="planAssetList"></div>
-      </div>` : ''}
-    </div>
-    <div class="panel" id="planStrategiesPanel">
+    </div>`;
+  const strategiesPanel = `<div class="panel" id="planStrategiesPanel">
       <div class="section-head"><h3>Strategies</h3>
         <div class="toolbar"><button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
       </div>
       <div id="planStrategyCards"></div>
-    </div>
-    <div class="panel" id="planReportsPanel">
+    </div>`;
+  const assetsPanel = `<div class="panel" id="planAssetPanel">
+      <div class="section-head"><h3>Declared fixed-term assets</h3>
+        <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
+      </div>
+      <div id="planAssetList"></div>
+    </div>`;
+  const reportsPanel = `<div class="panel" id="planReportsPanel">
       <div class="section-head"><h3>Reports</h3>
         <div class="toolbar"><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
       </div>
       <div id="planReportList"></div>
-      <div class="section-head"><h3>Comparison across strategies</h3>
-        <div class="toolbar"><span id="planCompareScenarioWrap"><label>Future world</label><select id="planCompareScenario"></select></span></div>
-      </div>
+      <div class="section-head"><h3>Comparison across strategies</h3></div>
       <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
       <div id="planCompareEmpty"></div>
       <div id="planCompareTable"></div>
-    </div>
-    <div class="panel">
+      <div id="planBaselineRates"></div>
+    </div>`;
+  const historyPanel = `<div class="panel">
       <div class="section-head"><h3>History</h3></div>
       <div id="planHistoryList"></div>
     </div>`;
+  // DETAIL ORDER (both branches): header → baselines → strategies →
+  // (declared assets for sell templates / legacy) → reports (+
+  // comparison) → history. No prime-scenarios section, no future-world
+  // selector, no baseline-info panel anywhere.
+  if (!templated) return header + baselinesPanel + strategiesPanel + assetsPanel + reportsPanel + historyPanel;
+  return header + baselinesPanel + strategiesPanel + (sections.declaredAssets ? assetsPanel : '') + reportsPanel + historyPanel;
 }
 function planProjectWire(d) {
   const p = d.project;
@@ -11218,17 +11246,12 @@ function planProjectWire(d) {
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   });
   $('#planAddStrategyBtn').addEventListener('click', () => openPlanStrategyModal(p.id));
-  const scBtn = $('#planAddScenarioBtn');
-  if (scBtn) scBtn.addEventListener('click', () => openPlanScenarioModal(p.id));
   const asBtn = $('#planAddAssetBtn');
   if (asBtn) asBtn.addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
   $('#planAddReportBtn').addEventListener('click', () => planSaveReport(p.id));
   $('#planAiReportBtn').addEventListener('click', () => openPlanReportAiModal(p.id));
-  const baseAiBtn = $('#planAiBaselineBtn');
-  if (baseAiBtn) baseAiBtn.addEventListener('click', () => openPlanBaselineAiModal(p.id, ''));
-  // Baseline cards: one per baseline entry, each with Edit + Refine
-  // with AI + Delete. Card click opens the editor; buttons stop the
-  // click from propagating.
+  // Baseline cards: name + summary + Edit/Delete only. Card click opens
+  // the editor; buttons stop the click from propagating.
   const renderBaselineCards = () => {
     const host = $('#planBaselineCards');
     if (!host) return;
@@ -11238,7 +11261,6 @@ function planProjectWire(d) {
       card.addEventListener('click', () => openPlanBaselineEditModal(p.id, Number(card.dataset.planBaseline)));
     });
     host.querySelectorAll('[data-plan-baseline-edit]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); openPlanBaselineEditModal(p.id, Number(b.dataset.planBaselineEdit)); }));
-    host.querySelectorAll('[data-plan-baseline-ai]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); openPlanBaselineAiModal(p.id, '', Number(b.dataset.planBaselineAi)); }));
     host.querySelectorAll('[data-plan-baseline-del]').forEach((b) => b.addEventListener('click', async (e) => {
       e.stopPropagation();
       const row = rows.find((x) => x.id === Number(b.dataset.planBaselineDel));
@@ -11250,18 +11272,11 @@ function planProjectWire(d) {
   renderBaselineCards();
   const addBaseBtn = $('#planAddBaselineBtn');
   if (addBaseBtn) addBaseBtn.addEventListener('click', () => openPlanCategoryFlow({ mode: 'addBaseline', project: p }));
-  // Prime outlook control lives with the scenarios section: hide it on
-  // templated projects whose template does not ask about prime.
-  const templated = !!p.templateSchema;
-  const sections = templated ? p.templateSchema.sections : { primeScenarios: true, declaredAssets: true };
-  if (templated && !sections.primeScenarios) {
-    const wrap = $('#planCompareScenarioWrap');
-    if (wrap) wrap.classList.add('hidden');
-  }
-  // Metadata panel: Edit swaps the answer rows for the schema's fields.
-  const metaEditBtn = $('#planMetadataEditBtn');
-  if (metaEditBtn) metaEditBtn.addEventListener('click', async () => {
-    const view = $('#planMetadataView');
+  // Compact metadata line: Edit swaps the line for the schema's field
+  // editors (the same fields the old panel edited).
+  const metaLineEdit = $('#planMetadataLineEdit');
+  if (metaLineEdit) metaLineEdit.addEventListener('click', async () => {
+    const view = $('#planMetadataLine');
     const fields = p.templateSchema.fields || [];
     let props = [];
     if (fields.some((f) => f.type === 'property')) {
@@ -11275,7 +11290,7 @@ function planProjectWire(d) {
       if (f.type === 'property') return `<div><label>${esc(f.label)}${f.required ? ' *' : ''}</label><select id="planMetaField_${f.key}"><option value="">Select a property</option>${props.map((x) => `<option value="${x.id}"${Number(cur[f.key]) === Number(x.id) ? ' selected' : ''}>${esc(x.address)}</option>`).join('')}</select></div>`;
       if (f.type === 'account_type') return `<div><label>${esc(f.label)}</label><select id="planMetaField_${f.key}"><option value="">Any</option>${['TFSA', 'RRSP', 'NonRegistered'].map((t) => `<option${cur[f.key] === t ? ' selected' : ''}>${t}</option>`).join('')}</select></div>`;
       return `<div><label>${esc(f.label)}</label><input id="planMetaField_${f.key}" value="${esc(String(cur[f.key] ?? ''))}"></div>`;
-    }).join('') + `<div class="toolbar"><button class="small primary" id="planMetadataSaveBtn">Save</button><button class="small" id="planMetadataCancelBtn">Cancel</button></div>`;
+    }).join('') + `<div class="toolbar"><button class="small primary" id="planMetadataSaveBtn">Save</button><button class="small" id="planMetadataCancelBtn">Cancel</button></div><div class="msg" id="planMetadataMsg"></div>`;
     $('#planMetadataCancelBtn').addEventListener('click', () => loadPlanProject(p.id));
     $('#planMetadataSaveBtn').addEventListener('click', async () => {
       const msg = $('#planMetadataMsg');
@@ -11293,26 +11308,6 @@ function planProjectWire(d) {
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
   });
-  const sel = $('#planCompareScenario');
-  sel.innerHTML = d.scenarios.map((s) => `<option value="${s.id}"${s.is_base ? ' selected' : ''}>${esc(s.name)}</option>`).join('');
-  sel.addEventListener('change', () => loadPlanComparison(p.id, Number(sel.value)));
-  const scenList = $('#planScenarioList');
-  if (scenList) {
-    scenList.innerHTML = d.scenarios.map((s) => `
-    <div class="plan-row"><span>${esc(s.name)} · ${esc(s.direction)} · ${esc(s.stance)}${s.magnitude != null ? ` · ${s.magnitude}%` : ''}${s.is_base ? ' · Base' : ''}</span>
-    <span class="toolbar">
-      ${s.is_base ? '' : `<button class="small" data-plan-scenario-base="${s.id}">Set as base</button>`}
-      ${s.is_base ? '' : `<button class="small danger" data-plan-scenario-del="${s.id}">Delete</button>`}
-    </span></div>`).join('') || '<div class="note">No scenarios.</div>';
-  }
-  document.querySelectorAll('[data-plan-scenario-base]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`/api/planning/scenarios/${b.dataset.planScenarioBase}/set-base`, { method: 'POST' }); loadPlanProject(p.id); }
-    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
-  }));
-  document.querySelectorAll('[data-plan-scenario-del]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`/api/planning/scenarios/${b.dataset.planScenarioDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
-    catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
-  }));
   const assetList = $('#planAssetList');
   if (assetList) {
     assetList.innerHTML = d.declaredAssets.map((a) => `
@@ -11336,77 +11331,6 @@ function planProjectWire(d) {
   $('#planHistoryList').innerHTML = d.history.map((m) => `
     <div class="plan-row"><span>${m.kind === 'merge' ? 'Merged' : 'Reverted'} · ${esc(m.strategy_name)} · ${new Date(m.created_at).toLocaleString('en-CA')}</span></div>`).join('') || '<div class="note">No merges yet.</div>';
 }
-// AI baseline design (project level): describe → preview → Apply.
-// The thread persists in project metadata (aiBaselineThread) so
-// follow-up continues the conversation instead of restarting it. Apply
-// writes metadata.aiBaseline and, when the baseline names a prime
-// scenario, makes it real and sets it as base.
-function openPlanBaselineAiModal(projectId, initialText, baselineId) {
-  const msg = $('#planBaselineAiMsg');
-  const out = $('#planBaselineAiOut');
-  const threadEl = $('#planBaselineAiThread');
-  if (initialText) $('#planBaselineAiText').value = initialText;
-  showMsg(msg, '', '');
-  out.innerHTML = '';
-  threadEl.innerHTML = '';
-  let baselineThread = null;
-  const renderThread = () => {
-    if (!threadEl) return;
-    if (!baselineThread || !baselineThread.length) { threadEl.innerHTML = ''; return; }
-    threadEl.innerHTML = baselineThread.map((t) => {
-      if (t.role === 'ai' && t.questions) return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
-      if (t.role === 'ai' && t.baseline) return `<div class="plan-row"><span>AI baseline: ${esc(t.baseline.description || '')}</span></div>`;
-      return Object.entries(t.answers || {}).map(([k, v]) => `<div class="plan-row"><span>You: ${esc(k)} = ${esc(String(v))}</span></div>`).join('');
-    }).join('');
-  };
-  const design = async (text, answers) => {
-    const r = await api(`/api/planning/projects/${projectId}/ai-baseline`, { method: 'POST', body: { text, answers, ...(baselineId ? { baselineId } : {}), ...(baselineThread ? { history: baselineThread } : {}) } });
-    if (r.ask) {
-      baselineThread = r.thread || baselineThread;
-      renderThread();
-      out.innerHTML = `
-        ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planBaselineAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}
-        <div class="toolbar"><button class="small primary" id="planBaselineAiContinue">Continue design</button></div>`;
-      $('#planBaselineAiContinue').onclick = async () => {
-        try {
-          const next = {};
-          for (const q of r.ask) {
-            const el = document.querySelector(`#planBaselineAsk_${CSS.escape(q.field)}`);
-            const v = el ? el.value.trim() : '';
-            if (!v) throw new Error(`${q.label} is required`);
-            next[q.field] = q.type === 'number' ? Number(v) : v;
-          }
-          await design(text, next);
-        } catch (err) { showMsg(msg, 'err', err.message); }
-      };
-      return;
-    }
-    const b = r.baseline;
-    baselineThread = r.thread || baselineThread;
-    renderThread();
-    out.innerHTML = `
-      <div class="plan-row"><span>Baseline</span><span>${esc(b.description || '')}</span></div>
-      ${b.primeScenario ? `<div class="plan-row"><span>Prime path</span><span>${esc(b.primeScenario.name || '')} · ${esc(b.primeScenario.direction || '')} · ${esc(b.primeScenario.stance || '')}</span></div>` : ''}
-      <div class="plan-row"><span>Stock reference</span><span>Same principal in current plan</span></div>
-      ${(b.assumptions || []).map((a) => `<div class="plan-row"><span>${esc(a.key || '')}</span><span>${esc(String(a.value ?? ''))}</span></div>`).join('')}
-      <div class="toolbar"><button class="small primary" id="planBaselineAiApply">Apply baseline</button></div>`;
-    $('#planBaselineAiApply').onclick = async () => {
-      try {
-        await api(`/api/planning/projects/${projectId}/ai-baseline/apply`, { method: 'POST', body: { baseline: b, ...(baselineId ? { baselineId } : {}) } });
-        closeModalEl($('#planBaselineAiModal'));
-        loadPlanProject(projectId);
-      } catch (err) { showMsg(msg, 'err', err.message); }
-    };
-  };
-  $('#planBaselineAiBtn').onclick = async () => {
-    try {
-      const text = $('#planBaselineAiText').value.trim();
-      if (!text) throw new Error('describe the baseline first');
-      await design(text, null);
-    } catch (err) { showMsg(msg, 'err', err.message); }
-  };
-  openModal('planBaselineAiModal');
-}
 let planBaselineEditCtx = null;
 function openPlanBaselineEditModal(projectId, baselineId) {
   api(`/api/planning/projects/${projectId}`).then((d) => {
@@ -11416,9 +11340,6 @@ function openPlanBaselineEditModal(projectId, baselineId) {
     $('#planBaselineEditTitle').textContent = `Edit baseline · ${row.name}`;
     $('#planBaselineEditName').value = row.name;
     $('#planBaselineEditDesc').value = (row.definition || {}).description || '';
-    const ps = (row.definition || {}).primeScenario || null;
-    $('#planBaselineEditDir').value = ps ? ps.direction : 'flat';
-    $('#planBaselineEditStance').value = ps ? (ps.stance || 'neutral') : 'neutral';
     showMsg($('#planBaselineEditMsg'), '', '');
     openModal('planBaselineEditModal');
   }).catch((err) => showMsg($('#planProjectMsg'), 'err', err.message));
@@ -11429,22 +11350,44 @@ $('#planBaselineEditForm').addEventListener('submit', async (e) => {
   if (!ctx) return;
   const msg = $('#planBaselineEditMsg');
   try {
+    // Name + description only: the stored definition is otherwise
+    // verbatim — a baseline carries no factors and no prime path.
     const def = { ...ctx.definition };
     def.description = $('#planBaselineEditDesc').value.trim();
-    // A baseline without a prime path keeps none: inventing a named
-    // scenario from the selects would fail validation (name required).
-    if (def.primeScenario) {
-      def.primeScenario = { ...def.primeScenario, direction: $('#planBaselineEditDir').value, stance: $('#planBaselineEditStance').value };
-    }
     await api(`/api/planning/projects/${ctx.projectId}/baselines/${ctx.baselineId}`, { method: 'PUT', body: { name: $('#planBaselineEditName').value.trim(), definition: def } });
     closeModalEl($('#planBaselineEditModal'));
     loadPlanProject(ctx.projectId);
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
-async function loadPlanComparison(projectId, scenarioId) {
-  const q = scenarioId ? `?scenarioId=${scenarioId}` : '';
-  const data = await api(`/api/planning/projects/${projectId}/comparison${q}`);
-  planCompareScenarioId = (data.scenario || {}).id || null;
+// One-line factor summary for a strategy card. Empty = no line (a
+// strategy with no factors behaves exactly like the baseline plus its
+// ops). Investment strategies without a sink get a prompt instead.
+function planFactorSummaryLine(factors, isInvestment) {
+  const f = factors && typeof factors === 'object' ? factors : {};
+  const parts = [];
+  if (f.prime && Array.isArray(f.prime.points) && f.prime.points.length) {
+    const last = f.prime.points[f.prime.points.length - 1];
+    parts.push(`Prime → ${last.rate}% by ${last.month}`);
+  } else if (f.prime && f.prime.preset === 'flat') {
+    parts.push('Prime: flat at current');
+  }
+  if (f.stock && f.stock.valuePct != null) {
+    parts.push(`Stock ${f.stock.valuePct}%/yr${f.stock.basis ? ` (${f.stock.basis}${f.stock.window ? ` · ${f.stock.window}` : ''})` : ''}`);
+  }
+  if (f.propertyGrowth && f.propertyGrowth.valuePct != null) parts.push(`Property +${f.propertyGrowth.valuePct}%/yr`);
+  if (f.salaryGrowth && f.salaryGrowth.valuePct != null) parts.push(`Salary +${f.salaryGrowth.valuePct}%/yr`);
+  if (f.rentGrowth && f.rentGrowth.valuePct != null) parts.push(`Rent +${f.rentGrowth.valuePct}%/yr`);
+  if (f.sink) {
+    parts.push(f.sink.kind === 'custom' ? `Sink: ${f.sink.name}` : 'Sink: existing stock');
+  } else if (isInvestment) {
+    parts.push('Sink: not picked yet');
+  }
+  return parts.join(' · ');
+}
+async function loadPlanComparison(projectId) {
+  // No shared world: each strategy runs under its own factors, and the
+  // baseline is always the do-nothing reference.
+  const data = await api(`/api/planning/projects/${projectId}/comparison`);
   const rows = data.strategies;
   // COMPARISON IS THE FINAL OUTPUT, STRATEGY-CENTRIC: with zero
   // strategies there is nothing to compare, so the table does not
@@ -11467,24 +11410,24 @@ async function loadPlanComparison(projectId, scenarioId) {
       ${numRow('Payoff shift (months)', (r) => (r.comparison.payoffShiftMonths != null ? r.comparison.payoffShiftMonths : '—'))}
       ${numRow('Monthly payment Δ', (r) => planSigned(r.comparison.paymentDelta))}
     </tbody></table>
-    <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations). Stock gain = strategy return minus the same principal in the current plan (existing holdings allocation) — the opportunity-cost baseline, not do-nothing.</div>`;
+    <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations). Stock gain = strategy value minus the do-nothing baseline value, less new cash deployed (pot/external buys) grown at the baseline ratio; sell-funded buys are swaps and are not costed again.</div>`;
+  }
+  const ratesEl = $('#planBaselineRates');
+  if (ratesEl) {
+    const rates = data.baseline && data.baseline.currentRates;
+    ratesEl.innerHTML = rates && rates.length
+      ? `<div class="note">Baseline grows at current rates: ${rates.map((r) => `${esc(r.symbol)} ${r.ratePct}%/yr (${esc(r.basis)} · ${esc(r.window)})`).join(' · ')}</div>`
+      : '';
   }
   // CHART RULES: the chart renders ONLY after at least one strategy
   // exists, and it is strategy-driven. Funding/sell (non-mortgage)
   // projects never get a property baseline line: when any strategy
   // touches stocks, the chart shows PRINCIPAL GAIN per stock strategy
-  // (excess over the current-plan baseline, one definition shared with
+  // (excess over the do-nothing baseline, one definition shared with
   // the table's stockGain). The mortgage balance chart — baseline line
   // included — renders only for mortgage-touching projects.
   const chartWrap = document.querySelector('#planCompareChart')?.closest('.chart-wrap');
   const emptyEl = $('#planCompareEmpty');
-  const baseDefEl = $('#planBaselineDef');
-  if (baseDefEl && !baseDefEl.dataset.filled) {
-    baseDefEl.dataset.filled = '1';
-    const baseLine = `<div class="plan-row"><span>Base scenario</span><span>${esc((data.scenario && data.scenario.name) || '—')}</span></div>
-      <div class="plan-row"><span>Stock baseline</span><span>Same principal in current plan</span></div>`;
-    baseDefEl.innerHTML = baseDefEl.innerHTML + baseLine;
-  }
   if (!rows.length) {
     if (chartWrap) chartWrap.classList.add('hidden');
     if (emptyEl) emptyEl.innerHTML = '<div class="note">No strategies yet.</div>';
@@ -11525,13 +11468,16 @@ async function loadPlanComparison(projectId, scenarioId) {
   $('#planStrategyCards').innerHTML = rows.map((r) => {
     let tp = {};
     try { tp = typeof r.strategy.template_params === 'string' ? JSON.parse(r.strategy.template_params) : (r.strategy.template_params || {}); } catch { tp = {}; }
-    const sinkLine = tp.source && tp.sink ? `<div class="n">Source: ${esc(tp.source === 'pot' ? 'cash pot' : tp.source)} → Sink: ${esc(tp.sinkLabel || tp.sink)}</div>` : '';
+    const isInvestment = planProjectData && planProjectData.project && planProjectData.project.category === 'investment';
+    const factorLine = planFactorSummaryLine(r.factors, isInvestment);
+    const legacySinkLine = (!r.factors || !r.factors.sink) && tp.source && tp.sink ? `<div class="n">Source: ${esc(tp.source === 'pot' ? 'cash pot' : tp.source)} → Sink: ${esc(tp.sinkLabel || tp.sink)}</div>` : '';
     return `
     <div class="card breakdown-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
       <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
       <div class="v">${planSigned(r.comparison.net)}</div>
       <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops${r.strategy.template ? ` · ${esc(r.strategy.template)}` : ''}</div>
-      ${sinkLine}
+      ${factorLine ? `<div class="n">${esc(factorLine)}</div>` : ''}
+      ${legacySinkLine}
       <div class="toolbar">
         <button class="small" data-plan-strategy-edit="${r.strategy.id}">Edit</button>
         <button class="small danger" data-plan-strategy-del="${r.strategy.id}">Delete</button>
@@ -11562,7 +11508,7 @@ async function planSaveReport(projectId) {
     const d = await api(`/api/planning/projects/${projectId}`);
     const bases = d.project.baselines || [];
     const strs = d.strategies || [];
-    $('#planReportSaveBaseline').innerHTML = '<option value="">Project base scenario</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+    $('#planReportSaveBaseline').innerHTML = '<option value="">Do-nothing baseline</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
     $('#planReportSaveStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
   } catch (err) { showMsg(msg, 'err', err.message); return; }
   openModal('planReportSaveModal');
@@ -11590,7 +11536,7 @@ function openPlanReportAiModal(projectId) {
   api(`/api/planning/projects/${projectId}`).then((d) => {
     const bases = d.project.baselines || [];
     const strs = d.strategies || [];
-    $('#planReportAiBaseline').innerHTML = '<option value="">Project base scenario</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+    $('#planReportAiBaseline').innerHTML = '<option value="">Do-nothing baseline</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
     $('#planReportAiStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
   }).catch(() => { /* pickers stay empty; save falls back to project base */ });
   $('#planReportAiGenBtn').onclick = async () => {
@@ -11844,7 +11790,7 @@ async function loadPlanReport(projectId, reportId) {
           const sbody = table.map((r) => `<tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
           return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}<div class="note">Scenario envelope: best/worst monthly mortgage balance across the project's prime scenarios; base line = base scenario (${esc((comp.scenario || {}).name || '')}).</div></div>`);
+        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}<div class="note">Fan bands need multiple rate paths per strategy — rate paths now live on each strategy's prime factor, so no envelope is drawn here.</div></div>`);
       } else if (c.template === 'funds_flow') {
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Funds flow diagram — not rendered yet.</div></div>`);
       } else {
@@ -11855,7 +11801,7 @@ async function loadPlanReport(projectId, reportId) {
       <div><a href="#planning/project/${projectId}">← Back to ${esc(proj.project.name)}</a></div>
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
-        <div class="note">Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Project base scenario')}${comp.chosenBaseline && comp.chosenBaseline.definition && comp.chosenBaseline.definition.primeScenario ? ` · Prime: ${esc(comp.chosenBaseline.definition.primeScenario.direction || '')} · ${esc(comp.chosenBaseline.definition.primeScenario.stance || '')}` : ''} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
+        <div class="note">Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         <div class="note">${PLAN_REPORT_DEFS}</div>
         <div class="msg" id="planReportMsg"></div>
       </div>
@@ -11895,8 +11841,8 @@ function planStrategyHtml(d) {
   const penRows = (d.projection.penalties || []).map((x) => `
     <div class="plan-row"><span>${esc(x.reason || 'Penalty')} · ${esc(x.date)} · ${esc(x.method)} · ${money2(x.penalty)}</span>
     <span class="note">Estimate — the bank quote governs</span></div>`).join('');
-  const scenRows = d.scenarioTable.map((r) => `
-    <tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
+  // No scenario table anymore: rate paths live on this strategy's
+  // factors (the Factors panel below).
   // Annual interest table from the summed series.
   const yearMap = new Map();
   const addSeries = (series, key) => {
@@ -11950,10 +11896,15 @@ function planStrategyHtml(d) {
       <div class="section-head"><h3>Stock value</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
     </div>
-    <div class="panel">
-      <div class="section-head"><h3>Scenarios</h3></div>
-      <div class="chart-wrap" style="height:240px"><canvas id="planStrategyFanChart"></canvas></div>
-      <table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${scenRows}</tbody></table>
+    <div class="panel" id="planFactorsPanel">
+      <div class="section-head"><h3>Factors</h3></div>
+      <div class="note">Pick what the future looks like for this strategy. Unset = current behavior. The baseline changes nothing — it never uses these.</div>
+      <div id="planFactorPrime"></div>
+      <div id="planFactorStock"></div>
+      <div id="planFactorGrowth"></div>
+      <div id="planFactorSink"></div>
+      <div class="toolbar"><button class="small primary" id="planFactorSaveBtn">Save factors</button></div>
+      <div class="msg" id="planFactorMsg"></div>
     </div>
     <div class="panel">
       <div class="section-head"><h3>Annual interest</h3></div>
@@ -11978,12 +11929,10 @@ function planStrategyHtml(d) {
       <div class="grid2">
         <div><label>Comparable rate (%)</label><input id="planAsmComparable" type="text" inputmode="decimal" data-money value="${asm.comparableRate ? esc(asm.comparableRate.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmComparableOk"${asm.comparableRate && asm.comparableRate.confirmed ? ' checked' : ''}> Confirmed</label></div>
         <div><label>Annual prepayment privilege (%)</label><input id="planAsmPrivilege" type="text" inputmode="decimal" data-money value="${asm.privilegePct ? esc(asm.privilegePct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmPrivilegeOk"${asm.privilegePct && asm.privilegePct.confirmed ? ' checked' : ''}> Confirmed</label></div>
-        <div><label>Stock return (% / year)</label><input id="planAsmReturn" type="text" inputmode="decimal" data-money value="${asm.stockReturnPct ? esc(asm.stockReturnPct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmReturnOk"${asm.stockReturnPct && asm.stockReturnPct.confirmed ? ' checked' : ''}> Confirmed</label></div>
-        <div><label>Return suggestions</label><div class="toolbar"><select id="planSuggestHolding"></select><button class="small" id="planSuggestBtn">Suggest</button></div><div id="planSuggestOut"></div></div>
       </div>
       <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
       <div class="msg" id="planAsmMsg"></div>
-      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Blank stock return = no growth.</div>
+      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Stock return lives in Factors now.</div>
     </div>
     ${(() => {
       if (!d.model || !d.model.spec) return '';
@@ -12012,8 +11961,7 @@ function planStrategyHtml(d) {
         <table class="tbl"><thead><tr><th>Month</th><th>Mortgage balance</th><th>Month interest</th><th>Stock value</th></tr></thead><tbody><tr><td>${trialMonth}</td><td>${money2(mBal)}</td><td>${money2(mInt)}</td><td>${firstMonth ? money2(firstMonth.value) : '—'}</td></tr></tbody></table>
         <div class="note">Trial row = the engine's first projected month for this strategy. The formulas above are the model's own expressions; the app does not evaluate them — compare their substituted inputs against these engine figures.</div>
         <div class="section-head"><h3>Refine with AI</h3></div>
-        <div><label>Follow-up *</label><textarea id="planModelFollowText" rows="2" placeholder="e.g. Use a slower prime rise, and add a buy leg"></textarea></div>
-        <div><label>Target</label><select id="planModelFollowTarget"><option value="spec">Strategy spec</option><option value="baseline">Baseline</option></select></div>
+        <div><label>Follow-up *</label><textarea id="planModelFollowText" rows="2" placeholder="e.g. Add a buy leg for the new holding"></textarea></div>
         <div class="toolbar"><button class="small primary" id="planModelFollowBtn">Design</button></div>
         <div id="planModelFollowOut"></div>
         <div class="msg" id="planModelFollowMsg"></div>
@@ -12032,8 +11980,9 @@ function planStrategyWire(d) {
     catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
   });
   $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
-  // Model follow-up: both targets iterate — spec via ai-model (stored
-  // thread continues), baseline via the shared baseline modal.
+  // Model follow-up iterates the strategy spec via ai-model (stored
+  // thread continues). The baseline changes nothing, so it is not a
+  // follow-up target.
   const followBtn = $('#planModelFollowBtn');
   if (followBtn) followBtn.addEventListener('click', async () => {
     const msg = $('#planModelFollowMsg');
@@ -12041,7 +11990,6 @@ function planStrategyWire(d) {
     try {
       const text = $('#planModelFollowText').value.trim();
       if (!text) throw new Error('describe the follow-up first');
-      if ($('#planModelFollowTarget').value === 'baseline') { openPlanBaselineAiModal(d.project.id, text); return; }
       const design = async (answers) => {
         const r = await api(`/api/planning/strategies/${s.id}/ai-model`, { method: 'POST', body: { text, answers } });
         if (r.ask) {
@@ -12105,69 +12053,19 @@ function planStrategyWire(d) {
     { label: 'Baseline', data: d.baseline.stocks.series.map((r) => r.value), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
     { label: s.name, data: d.projection.stocks.series.map((r) => r.value), borderColor: planColor(1), backgroundColor: planColor(1), fill: false, pointRadius: 0 },
   ]);
-  // Fan chart: min/max envelope across scenarios + the base line.
-  const baseRow = d.scenarioTable.find((r) => r.scenarioId === (d.baseScenario || {}).id) || d.scenarioTable[0];
-  if (baseRow) {
-    const months = baseRow.balanceByMonth.map((r) => r.month);
-    const min = months.map((_, i) => Math.min(...d.scenarioTable.map((r) => r.balanceByMonth[i].balance)));
-    const max = months.map((_, i) => Math.max(...d.scenarioTable.map((r) => r.balanceByMonth[i].balance)));
-    planLineChart('planStrategyFanChart', months, [
-      { label: 'Best', data: min, borderColor: '#2f7de1', backgroundColor: '#2f7de1', fill: false, pointRadius: 0 },
-      { label: 'Base', data: baseRow.balanceByMonth.map((r) => r.balance), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0 },
-      { label: 'Worst', data: max, borderColor: '#b03a3a', backgroundColor: '#b03a3a', fill: false, pointRadius: 0 },
-    ]);
-  }
-  // Assumptions save.
+  // Assumptions save (comparable rate + privilege only — stock return
+  // lives in Factors now).
   $('#planAsmSaveBtn').addEventListener('click', async () => {
     const msg = $('#planAsmMsg');
     const parse = (id) => { const el = $(id); const v = el.value.replace(/,/g, '').trim(); return v === '' ? null : v; };
     try {
       await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'comparableRate', value: parse('#planAsmComparable'), confirmed: $('#planAsmComparableOk').checked } });
       await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'privilegePct', value: parse('#planAsmPrivilege'), confirmed: $('#planAsmPrivilegeOk').checked } });
-      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'stockReturnPct', value: parse('#planAsmReturn'), confirmed: $('#planAsmReturnOk').checked } });
       showMsg(msg, 'ok', 'Assumptions saved');
       loadPlanStrategy(s.id);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
-  // Return suggestions: holdings list comes from the Stocks pages' data
-  // via a fresh holdings lookup (the planning API resolves by id).
-  (async () => {
-    try {
-      const inv = await api('/api/investments');
-      const holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountName: (a.account || {}).name })));
-      const sel = $('#planSuggestHolding');
-      if (!sel) return;
-      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
-      $('#planSuggestBtn').addEventListener('click', async () => {
-        const out = $('#planSuggestOut');
-        try {
-          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
-          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available.')}</div>`; return; }
-          out.innerHTML = r.suggestions.map((x) => `
-            <button class="small" data-plan-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
-            + `<div class="note">Past returns do not predict future returns.</div>`;
-          out.querySelectorAll('[data-plan-suggest]').forEach((b) => b.addEventListener('click', () => {
-            const v = Number(b.dataset.planSuggest);
-            $('#planAsmReturn').value = formatMoneyInput(v.toFixed(2));
-            $('#planAsmReturnOk').checked = true;
-          }));
-        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
-      });
-      // Recommendation strategies auto-show the historical projection
-      // for their sink holding (basis + window labels, live data).
-      try {
-        const st = planStrategyData && planStrategyData.strategy;
-        if (st && st.template === 'recommendation') {
-          const tp2 = typeof st.template_params === 'string' ? JSON.parse(st.template_params) : (st.template_params || {});
-          const hid = tp2.sink && tp2.sink.holdingId;
-          if (hid && [...sel.options].some((o) => Number(o.value) === Number(hid))) {
-            sel.value = String(hid);
-            $('#planSuggestBtn').click();
-          }
-        }
-      } catch { /* auto-suggest is a convenience; manual Suggest still works */ }
-    } catch { /* Stocks data unavailable — suggestions stay empty */ }
-  })();
+  planFactorWire(d);
   // AI describe.
   $('#planAiDescribeBtn').addEventListener('click', async () => {
     const msg = $('#planAiDescribeMsg');
@@ -12198,33 +12096,310 @@ function planStrategyWire(d) {
   });
 }
 
-// ------------------------------------------------------- planning modals ---
-function openPlanScenarioModal(projectId) {
-  const form = $('#planScenarioForm');
-  form.reset();
-  form.dataset.projectId = projectId;
-  showMsg($('#planScenarioModalMsg'), '', '');
-  openModal('planScenarioModal');
-}
-$('#planScenarioForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const form = e.target;
-  const msg = $('#planScenarioModalMsg');
-  try {
-    let steps = null;
-    if (form.steps.value.trim()) {
-      steps = JSON.parse(form.steps.value.trim());
-      if (!Array.isArray(steps)) throw new Error('steps must be a JSON array');
+
+// Strategy factors editor: prime (history chart + date/rate points +
+// view presets), stock return (historical suggestions), growth rates,
+// and the investment sink. State lives in planFactorState; Save sends
+// the whole set (an existing sink is preserved untouched by a factors
+// save — only the sink block rebuilds operations).
+let planFactorState = null;
+let planFactorRedrawPrime = null;
+let planFactorMonthPopWired = false;
+function planFactorWire(d) {
+  const s = d.strategy;
+  const isInvestment = d.project.category === 'investment';
+  const hasMortgageOps = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type));
+  const cur = d.factors && typeof d.factors === 'object' ? d.factors : {};
+  planFactorState = {
+    prime: { points: (cur.prime && Array.isArray(cur.prime.points) ? cur.prime.points.map((pt) => ({ month: pt.month, rate: pt.rate })) : []), preset: (cur.prime && cur.prime.preset) || null },
+    stock: cur.stock ? { valuePct: cur.stock.valuePct, basis: cur.stock.basis || null, window: cur.stock.window || null } : null,
+    propertyGrowth: cur.propertyGrowth ? { valuePct: cur.propertyGrowth.valuePct } : null,
+    salaryGrowth: cur.salaryGrowth ? { valuePct: cur.salaryGrowth.valuePct } : null,
+    rentGrowth: cur.rentGrowth ? { valuePct: cur.rentGrowth.valuePct } : null,
+    sink: cur.sink || null,
+  };
+  let primeInfo = null;
+  let holdings = [];
+  let sinkDraft = null;
+  const primeHost = $('#planFactorPrime');
+  const stockHost = $('#planFactorStock');
+  const growthHost = $('#planFactorGrowth');
+  const sinkHost = $('#planFactorSink');
+  const nextYm = (ym) => { const [y, m] = ym.split('-').map(Number); const dt = new Date(Date.UTC(y, m - 1, 1)); dt.setUTCMonth(dt.getUTCMonth() + 1); return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}`; };
+  const nowYm = () => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}`; };
+  // The shared month picker writes the picked month onto the button
+  // itself; sync it into factor state (and redraw) whenever a factor
+  // point month is picked.
+  const syncPrimePointsFromDom = () => {
+    if (!primeHost) return;
+    const pts = [];
+    primeHost.querySelectorAll('#planPrimePoints .plan-row').forEach((row) => {
+      const btn = row.querySelector('[data-plan-month]');
+      const inp = row.querySelector('[data-prime-rate]');
+      if (btn && inp && btn.dataset.value) pts.push({ month: btn.dataset.value, rate: Number(inp.value) });
+    });
+    if (pts.length) planFactorState.prime.points = pts;
+  };
+  const drawPrimeChart = () => {
+    const canvas = document.getElementById('planFactorPrimeChart');
+    if (!canvas || !primeInfo) return;
+    const hist = (primeInfo.history || []).map((pt) => ({ month: String(pt.date).slice(0, 7), rate: Number(pt.rate) }));
+    const pts = planFactorState.prime.points;
+    const labelSet = new Set(hist.map((h) => h.month));
+    pts.forEach((pt) => labelSet.add(pt.month));
+    const labels = [...labelSet].sort();
+    const histData = labels.map((m) => {
+      let last = null;
+      for (const h of hist) { if (h.month <= m) last = h.rate; else break; }
+      return last;
+    });
+    const lastHistMonth = hist.length ? hist[hist.length - 1].month : null;
+    const lastHistRate = hist.length ? hist[hist.length - 1].rate : null;
+    const futData = labels.map((m) => {
+      if (!pts.length) return null;
+      if (lastHistMonth && m < lastHistMonth) return null;
+      let last = null;
+      for (const pt of pts) { if (pt.month <= m) last = pt.rate; else break; }
+      if (last != null) return last;
+      return lastHistRate; // holds at the last actual prime until the first point
+    });
+    planDestroyChart('planFactorPrimeChart');
+    planCharts['planFactorPrimeChart'] = new Chart(canvas, {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: 'Historical prime', data: histData, borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0, spanGaps: true },
+        { label: 'Your future path', data: futData, borderColor: '#1668c4', backgroundColor: '#1668c4', fill: false, pointRadius: 3, spanGaps: true },
+      ] },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: (v) => `${v}%` } } },
+        plugins: { tooltip: { callbacks: { label: (it) => ` ${it.dataset.label}: ${it.parsed.y}%` } } },
+      },
+    });
+  };
+  const renderPrime = () => {
+    if (!primeHost) return;
+    const st = planFactorState.prime;
+    const curRate = primeInfo && primeInfo.current ? primeInfo.current.rate : null;
+    const presetBtns = [['optimistic', 'Optimistic (prime down)'], ['pessimistic', 'Pessimistic (prime up)'], ['up', 'Up'], ['down', 'Down'], ['flat', 'Flat']]
+      .map(([k, label]) => `<button class="small" data-plan-prime-preset="${k}">${label}</button>`).join(' ');
+    primeHost.innerHTML = `
+      <div class="section-head"><h3>Prime</h3></div>
+      <div class="note">Today's prime: ${curRate != null ? `${curRate}%` : '—'} · No points = prime stays at today's rate. Between points the rate holds until the next point.</div>
+      <div class="chart-wrap" style="height:220px"><canvas id="planFactorPrimeChart"></canvas></div>
+      <div class="toolbar">${presetBtns}</div>
+      <div id="planPrimePoints">${st.points.map((pt, i) => `
+        <div class="plan-row"><button type="button" class="month-field" data-plan-month data-value="${pt.month}">${formatYM(pt.month)}</button>
+        <input type="number" step="0.01" data-prime-rate="${i}" value="${pt.rate}" style="width:90px"> %
+        <button class="small danger" data-prime-del="${i}">Remove</button></div>`).join('') || '<div class="note">No future points yet — pick a preset or add a point.</div>'}
+      </div>
+      <div class="toolbar"><button class="small" id="planPrimeAddBtn">+ Add point</button></div>`;
+    drawPrimeChart();
+    primeHost.querySelectorAll('[data-plan-prime-preset]').forEach((b) => b.addEventListener('click', async () => {
+      try {
+        const r = await api(`/api/planning/prime-presets?preset=${b.dataset.planPrimePreset}`);
+        planFactorState.prime = { points: r.points || [], preset: r.preset };
+        renderPrime();
+      } catch (err) { showMsg($('#planFactorMsg'), 'err', err.message); }
+    }));
+    primeHost.querySelectorAll('[data-prime-rate]').forEach((inp) => inp.addEventListener('input', () => {
+      const i = Number(inp.dataset.primeRate);
+      planFactorState.prime.points[i].rate = Number(inp.value);
+      planFactorState.prime.preset = null;
+      drawPrimeChart();
+    }));
+    primeHost.querySelectorAll('[data-prime-del]').forEach((b) => b.addEventListener('click', () => {
+      planFactorState.prime.points.splice(Number(b.dataset.primeDel), 1);
+      planFactorState.prime.preset = null;
+      renderPrime();
+    }));
+    const addBtn = $('#planPrimeAddBtn');
+    if (addBtn) addBtn.addEventListener('click', () => {
+      syncPrimePointsFromDom();
+      const pts = planFactorState.prime.points;
+      const last = pts.length ? pts[pts.length - 1] : null;
+      pts.push({ month: last ? nextYm(last.month) : nowYm(), rate: last ? last.rate : (curRate != null ? curRate : 0) });
+      planFactorState.prime.preset = null;
+      renderPrime();
+    });
+  };
+  const renderStock = () => {
+    if (!stockHost) return;
+    const st = planFactorState.stock;
+    if (isInvestment && planFactorState.sink) {
+      stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3></div>
+        <div class="note">Set by the sink below: ${st ? `${st.valuePct}%/yr${st.basis ? ` (${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''})` : ''}` : '—'}</div>`;
+      return;
     }
-    const mag = form.magnitude.value.replace(/,/g, '').trim();
-    await api(`/api/planning/projects/${form.dataset.projectId}/scenarios`, { method: 'POST', body: {
-      name: form.name.value.trim(), direction: form.direction.value, stance: form.stance.value,
-      magnitude: mag === '' ? null : Number(mag), steps,
-    } });
-    closeModalEl($('#planScenarioModal'));
-    loadPlanProject(Number(form.dataset.projectId));
-  } catch (err) { showMsg(msg, 'err', err.message); }
-});
+    stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3></div>
+      <div><label>Expected return (% / year)</label><input id="planFactorStockVal" type="text" inputmode="decimal" data-money value="${st && st.valuePct != null ? st.valuePct : ''}"></div>
+      ${st && st.basis ? `<div class="note">Basis: ${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''}</div>` : ''}
+      <div><label>Return suggestions (your own history)</label><div class="toolbar"><select id="planFactorSuggestHolding"></select><button class="small" id="planFactorSuggestBtn">Suggest</button></div><div id="planFactorSuggestOut"></div></div>
+      <div class="note">Past returns do not predict future returns.</div>`;
+    const sel = $('#planFactorSuggestHolding');
+    if (sel) {
+      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
+      $('#planFactorSuggestBtn').addEventListener('click', async () => {
+        const out = $('#planFactorSuggestOut');
+        try {
+          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
+          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available.')}</div>`; return; }
+          out.innerHTML = r.suggestions.map((x) => `
+            <button class="small" data-plan-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-suggest-basis="${esc(x.basis)}" data-plan-suggest-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ');
+          out.querySelectorAll('[data-plan-suggest]').forEach((b) => b.addEventListener('click', () => {
+            planFactorState.stock = { valuePct: Number(b.dataset.planSuggest), basis: b.dataset.planSuggestBasis || null, window: b.dataset.planSuggestWindow || null };
+            renderStock();
+          }));
+        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+      });
+    }
+  };
+  const renderGrowth = () => {
+    if (!growthHost) return;
+    const rows = [];
+    if (d.project.category === 'property' || hasMortgageOps) rows.push(['propertyGrowth', 'Property value growth (% / year)', planFactorState.propertyGrowth]);
+    if (d.project.category === 'earning') {
+      rows.push(['salaryGrowth', 'Salary growth (% / year)', planFactorState.salaryGrowth]);
+      rows.push(['rentGrowth', 'Rent growth (% / year)', planFactorState.rentGrowth]);
+    }
+    if (!rows.length) { growthHost.innerHTML = ''; return; }
+    growthHost.innerHTML = `<div class="section-head"><h3>Growth</h3></div>` + rows.map(([k, label, v]) => `
+      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-growth="${k}" value="${v && v.valuePct != null ? v.valuePct : ''}"></div>`).join('')
+      + (d.project.category === 'earning' ? `<div class="note">Salary and rent growth are stored and labeled only — the projection has no earnings leg yet, so they do not change numbers.</div>` : '');
+    growthHost.querySelectorAll('[data-growth]').forEach((inp) => inp.addEventListener('input', () => {
+      const k = inp.dataset.growth;
+      const v = inp.value.replace(/,/g, '').trim();
+      planFactorState[k] = v === '' ? null : { valuePct: Number(v) };
+    }));
+  };
+  const renderSink = () => {
+    if (!sinkHost) return;
+    if (!isInvestment) { sinkHost.innerHTML = ''; return; }
+    const sink = planFactorState.sink;
+    const curLine = sink
+      ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: existing stock · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
+      : 'No sink picked yet — the strategy holds the pool until you pick one.';
+    let tp = {};
+    try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
+    const defaultKind = tp.sinkKind === 'custom' ? 'custom' : 'stock';
+    sinkHost.innerHTML = `<div class="section-head"><h3>Sink — where the pool goes</h3></div>
+      <div class="note">${esc(curLine)}</div>
+      <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Existing stock</label>
+      <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
+      <div id="planSinkStockBox"${defaultKind === 'custom' ? ' class="hidden"' : ''}>
+        <div><label>Stock</label><select id="planSinkHolding"></select></div>
+        <div class="toolbar"><button class="small" id="planSinkSuggestBtn">Suggest trend</button></div><div id="planSinkSuggestOut"></div>
+      </div>
+      <div id="planSinkCustomBox"${defaultKind === 'stock' ? ' class="hidden"' : ''}>
+        <div><label>Product name *</label><input id="planSinkName"></div>
+        <div><label>Expected return (% / year) *</label><input id="planSinkReturn" type="text" inputmode="decimal" data-money></div>
+      </div>
+      <div class="toolbar"><button class="small primary" id="planSinkSaveBtn">Save sink (rebuilds operations)</button></div>
+      <div class="msg" id="planSinkMsg"></div>`;
+    const sel = $('#planSinkHolding');
+    if (sel) {
+      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
+      if (tp.sink && tp.sink.holdingId && [...sel.options].some((o) => Number(o.value) === Number(tp.sink.holdingId))) sel.value = String(tp.sink.holdingId);
+      else if (sink && sink.kind === 'stock' && [...sel.options].some((o) => Number(o.value) === Number(sink.holdingId))) sel.value = String(sink.holdingId);
+      $('#planSinkSuggestBtn').addEventListener('click', async () => {
+        const out = $('#planSinkSuggestOut');
+        try {
+          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
+          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available — pick a custom product instead.')}</div>`; return; }
+          out.innerHTML = r.suggestions.map((x) => `
+            <button class="small" data-plan-sink-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-sink-basis="${esc(x.basis)}" data-plan-sink-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
+            + `<div class="note">Past returns do not predict future returns.</div>`;
+          out.querySelectorAll('[data-plan-sink-suggest]').forEach((b) => b.addEventListener('click', () => {
+            sinkDraft = { kind: 'stock', holdingId: Number(sel.value), trendPct: Number(b.dataset.planSinkSuggest), basis: b.dataset.planSinkBasis || null, window: b.dataset.planSinkWindow || null };
+            out.innerHTML = `<div class="note">Picked: trend ${sinkDraft.trendPct}%/yr (${esc(sinkDraft.basis || '')}${sinkDraft.window ? ` · ${esc(sinkDraft.window)}` : ''})</div>`;
+          }));
+        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+      });
+    }
+    sinkHost.querySelectorAll('input[name="planSinkKind"]').forEach((r) => r.addEventListener('change', () => {
+      const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
+      $('#planSinkStockBox').classList.toggle('hidden', kind !== 'stock');
+      $('#planSinkCustomBox').classList.toggle('hidden', kind !== 'custom');
+    }));
+    $('#planSinkSaveBtn').addEventListener('click', async () => {
+      const msg = $('#planSinkMsg');
+      try {
+        const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
+        let sinkBody;
+        if (kind === 'stock') {
+          if (!sinkDraft || sinkDraft.holdingId !== Number(sel.value)) throw new Error('Pick a trend suggestion for the chosen stock first');
+          sinkBody = sinkDraft;
+        } else {
+          const name = $('#planSinkName').value.trim();
+          const ret = $('#planSinkReturn').value.replace(/,/g, '').trim();
+          if (!name) throw new Error('Product name is required');
+          if (ret === '' || !isFinite(Number(ret))) throw new Error('Expected return is required');
+          sinkBody = { kind: 'custom', name, expectedReturnPct: Number(ret) };
+        }
+        if ((d.ops || []).length && !confirm('Saving a sink replaces this strategy\'s operations with sell-pool + buy-sink operations. Continue?')) return;
+        await api(`/api/planning/strategies/${s.id}/sink`, { method: 'PUT', body: { sink: sinkBody } });
+        showMsg(msg, 'ok', 'Sink saved');
+        loadPlanStrategy(s.id);
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  };
+  $('#planFactorSaveBtn').addEventListener('click', async () => {
+    const msg = $('#planFactorMsg');
+    try {
+      syncPrimePointsFromDom();
+      const st = planFactorState;
+      const stockVal = document.querySelector('#planFactorStockVal');
+      if (stockVal) {
+        const v = stockVal.value.replace(/,/g, '').trim();
+        st.stock = v === '' ? null : { ...(st.stock || {}), valuePct: Number(v) };
+      }
+      const factors = {};
+      if (st.prime.points.length || st.prime.preset) factors.prime = { points: st.prime.points, preset: st.prime.preset };
+      if (st.stock) factors.stock = st.stock;
+      if (st.propertyGrowth) factors.propertyGrowth = st.propertyGrowth;
+      if (st.salaryGrowth) factors.salaryGrowth = st.salaryGrowth;
+      if (st.rentGrowth) factors.rentGrowth = st.rentGrowth;
+      if (st.sink) factors.sink = st.sink;
+      await api(`/api/planning/strategies/${s.id}/factors`, { method: 'PUT', body: { factors } });
+      showMsg(msg, 'ok', 'Factors saved');
+      loadPlanStrategy(s.id);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+  // Wired once: the shared picker runs before this listener (registered
+  // later), so the picked month is already on the button when we sync
+  // state and redraw the chart through the latest closure.
+  planFactorRedrawPrime = drawPrimeChart;
+  if (!planFactorMonthPopWired) {
+    planFactorMonthPopWired = true;
+    $('#monthPop').addEventListener('click', (e) => {
+      const cell = e.target.closest('button[data-ym]');
+      if (!cell || !planMonthBtn || !planMonthBtn.closest('#planPrimePoints')) return;
+      if (!planFactorState) return;
+      const pts = [];
+      document.querySelectorAll('#planPrimePoints .plan-row').forEach((row) => {
+        const btn = row.querySelector('[data-plan-month]');
+        const inp = row.querySelector('[data-prime-rate]');
+        if (btn && inp && btn.dataset.value) pts.push({ month: btn.dataset.value, rate: Number(inp.value) });
+      });
+      if (pts.length) planFactorState.prime.points = pts;
+      if (planFactorRedrawPrime) planFactorRedrawPrime();
+    });
+  }
+  (async () => {
+    try { primeInfo = await api('/api/prime'); } catch { primeInfo = null; }
+    try {
+      const inv = await api('/api/investments');
+      holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountName: (a.account || {}).name })));
+    } catch { holdings = []; }
+    renderPrime();
+    renderStock();
+    renderGrowth();
+    renderSink();
+  })();
+}
+
+// ------------------------------------------------------- planning modals ---
 function openPlanDeclaredAssetModal(projectId) {
   const form = $('#planDeclaredAssetForm');
   form.reset();

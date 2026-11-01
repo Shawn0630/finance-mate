@@ -881,6 +881,11 @@ CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strateg
   if (planStratCols.length && !planStratCols.includes('ai_thread')) {
     db.exec('ALTER TABLE plan_strategies ADD COLUMN ai_thread TEXT');
   }
+  // Strategy factors (JSON): user-picked prime points, return/growth
+  // percentages, and the investment sink. Unset = neutral behavior.
+  if (planStratCols.length && !planStratCols.includes('factors')) {
+    db.exec('ALTER TABLE plan_strategies ADD COLUMN factors TEXT');
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS plan_templates (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,

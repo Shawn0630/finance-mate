@@ -15257,9 +15257,9 @@ try {
   check('planning: create project', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const planProjectId = r.data.project.id;
   r = await req('GET', `/api/planning/projects/${planProjectId}`);
-  check('planning: project carries a flat base scenario',
-    r.status === 200 && r.data.scenarios && r.data.scenarios.some((s) => s.is_base && s.direction === 'flat'),
-    JSON.stringify((r.data.scenarios || []).map((s) => s.direction)));
+  check('planning: new project carries no scenarios (baseline is do-nothing by construction)',
+    r.status === 200 && Array.isArray(r.data.scenarios) && r.data.scenarios.length === 0,
+    JSON.stringify(r.data.scenarios));
   r = await req('POST', `/api/planning/projects/${planProjectId}/strategies`, { name: 'Prepay 10k', source: 'template' });
   check('planning: create strategy', r.status === 201 && r.data.strategy && r.data.strategy.letter === 'A', JSON.stringify(r.data));
   const planStrategyId = r.data.strategy.id;
@@ -15287,10 +15287,9 @@ try {
     && r.data.comparison.payoffShiftMonths > 0
     && Math.abs(r.data.comparison.net - (r.data.comparison.gain - r.data.comparison.cost)) < 0.011,
     JSON.stringify(r.data.comparison));
-  check('planning: strategy scenario table has the base scenario',
-    r.data.scenarioTable && r.data.scenarioTable.length >= 1 && r.data.scenarioTable[0].balanceByMonth
-    && r.data.scenarioTable[0].balanceByMonth.length > 0,
-    JSON.stringify((r.data.scenarioTable || []).map((x) => x.name)));
+  check('planning: strategy detail carries no scenario table (factors live on the strategy, not a shared world)',
+    Array.isArray(r.data.scenarioTable) && r.data.scenarioTable.length === 0 && r.data.baseScenario == null,
+    JSON.stringify({ scenarioTable: r.data.scenarioTable, baseScenario: r.data.baseScenario }));
   r = await req('POST', `/api/planning/strategies/${planStrategyId}/merge-preview`, {});
   check('planning: merge preview lists a lump-sum insert and no conflicts',
     r.status === 200 && (r.data.writes || []).some((w) => w.kind === 'insert' && w.table === 'lump_sums')
@@ -15499,8 +15498,8 @@ try {
       check('planning detail shows the category as read-only metadata',
         landed.catLine.includes('Property') && landed.catLine.includes('Refinance') && landed.catLine.includes('77 Planning Test Lane'),
         JSON.stringify({ catLine: landed.catLine }));
-      check('planning applied recommendation renders baseline + strategy cards with Edit/Delete',
-        landed.baseCards.length === 1 && landed.baseCards[0].edit && landed.baseCards[0].ai && landed.baseCards[0].del
+      check('planning applied recommendation renders baseline + strategy cards with Edit/Delete (baseline cards carry no AI refine button)',
+        landed.baseCards.length === 1 && landed.baseCards[0].edit && !landed.baseCards[0].ai && landed.baseCards[0].del
           && landed.stratCards.length === 1 && landed.stratCards[0].edit && landed.stratCards[0].del,
         JSON.stringify({ baseCards: landed.baseCards, stratCards: landed.stratCards }));
       const catProjectId = landed.hash.split('/').pop();
@@ -15728,8 +15727,8 @@ try {
     JSON.stringify(r.data));
   const metaMortgageId = r.data.project.id;
   r = await req('GET', `/api/planning/projects/${metaMortgageId}`);
-  check('planning metadata: mortgage schema shows prime scenarios, not declared assets',
-    r.status === 200 && r.data.project && r.data.project.templateSchema && r.data.project.templateSchema.sections.primeScenarios === true && r.data.project.templateSchema.sections.declaredAssets === false
+  check('planning metadata: mortgage schema shows declared-assets only, no prime scenarios section',
+    r.status === 200 && r.data.project && r.data.project.templateSchema && r.data.project.templateSchema.sections.primeScenarios === undefined && r.data.project.templateSchema.sections.declaredAssets === false
     && r.data.project.metadataLabels && r.data.project.metadataLabels.property_id && r.data.project.metadataLabels.property_id.includes('Planning Test Lane'),
     JSON.stringify({ schema: r.data.project && r.data.project.templateSchema, labels: r.data.project && r.data.project.metadataLabels }));
   r = await req('POST', '/api/planning/projects', { name: 'Meta Buy Test', question: 'Buy', template: 'buy', metadata: { account_type: 'TFSA' } });
@@ -15738,7 +15737,7 @@ try {
   const metaBuyId = r.data.project.id;
   r = await req('GET', `/api/planning/projects/${metaBuyId}`);
   check('planning metadata: buy schema shows neither prime scenarios nor declared assets',
-    r.status === 200 && r.data.project && r.data.project.templateSchema && r.data.project.templateSchema.sections.primeScenarios === false && r.data.project.templateSchema.sections.declaredAssets === false
+    r.status === 200 && r.data.project && r.data.project.templateSchema && r.data.project.templateSchema.sections.primeScenarios === undefined && r.data.project.templateSchema.sections.declaredAssets === false
     && r.data.project.metadataLabels && r.data.project.metadataLabels.account_type === 'TFSA',
     JSON.stringify(r.data.project && r.data.project.templateSchema));
   r = await req('POST', '/api/planning/projects', { name: 'Meta Bad', template: 'mortgage', metadata: {} });
@@ -15832,37 +15831,42 @@ try {
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
         baselinePanel: !!document.querySelector('#planBaselinePanel'),
-        metaEdit: !!document.querySelector('#planMetadataEditBtn'),
-        baselineAiBtn: !!document.querySelector('#planAiBaselineBtn'),
+        metadataPanel: !!document.querySelector('#planMetadataView'),
+        baselinesPanel: !!document.querySelector('#planBaselineCardsPanel'),
+        futureWorld: !!document.querySelector('#planCompareScenarioWrap'),
+        metaLine: !!document.querySelector('#planMetadataLine'),
+        metaLineEdit: !!document.querySelector('#planMetadataLineEdit'),
         tableText: (document.querySelector('#planCompareTable')?.textContent || '').trim(),
         chartVisible: (() => { const c = document.querySelector('#planCompareChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
-        futureHidden: !!document.querySelector('#planCompareScenarioWrap.hidden'),
-        panelOrder: [...document.querySelectorAll('#planBaselinePanel, #planStrategiesPanel, #planReportsPanel')].map((el) => el.id),
+        panelOrder: [...document.querySelectorAll('#planBaselineCardsPanel, #planStrategiesPanel, #planReportsPanel')].map((el) => el.id),
       }));
-      check('planning detail: buy project order is baseline → strategies → reports, no property baseline chart before strategies exist',
-        !buyPage.scenarioPanel && !buyPage.assetPanel && buyPage.baselinePanel && buyPage.metaEdit && buyPage.baselineAiBtn
-        && buyPage.tableText === '' && !buyPage.chartVisible && buyPage.futureHidden
-        && JSON.stringify(buyPage.panelOrder) === JSON.stringify(['planBaselinePanel', 'planStrategiesPanel', 'planReportsPanel']),
+      check('planning detail: buy project order is baselines → strategies → reports, compact metadata line, no scenario/future-world panels',
+        !buyPage.scenarioPanel && !buyPage.assetPanel && !buyPage.baselinePanel && !buyPage.metadataPanel && !buyPage.futureWorld
+        && buyPage.baselinesPanel && buyPage.metaLine && buyPage.metaLineEdit
+        && buyPage.tableText === '' && !buyPage.chartVisible
+        && JSON.stringify(buyPage.panelOrder) === JSON.stringify(['planBaselineCardsPanel', 'planStrategiesPanel', 'planReportsPanel']),
         JSON.stringify(buyPage));
       await page.goto(`http://ff.local/#planning/project/${metaMortgageId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1500);
       const mortPage = await page.evaluate(() => ({
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
-        scenarioInBaseline: !!document.querySelector('#planBaselinePanel #planScenarioPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
-        baselinePanel: !!document.querySelector('#planBaselinePanel'),
+        baselinesPanel: !!document.querySelector('#planBaselineCardsPanel'),
+        metaLine: !!document.querySelector('#planMetadataLine'),
+        metaLineText: document.querySelector('#planMetadataLine')?.textContent || '',
       }));
-      check('planning detail: mortgage project shows prime scenarios inside the baseline panel, no declared assets',
-        mortPage.scenarioPanel && mortPage.scenarioInBaseline && !mortPage.assetPanel && mortPage.baselinePanel, JSON.stringify(mortPage));
+      check('planning detail: mortgage project shows the compact metadata line, no scenario panel, no declared assets',
+        !mortPage.scenarioPanel && !mortPage.assetPanel && mortPage.baselinesPanel && mortPage.metaLine && mortPage.metaLineText.includes('Planning Test Lane'), JSON.stringify(mortPage));
       await page.goto(`http://ff.local/#planning/project/${planProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1500);
       const legPage = await page.evaluate(() => ({
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
-        baselinePanel: !!document.querySelector('#planBaselinePanel'),
+        baselinesPanel: !!document.querySelector('#planBaselineCardsPanel'),
+        metaLine: !!document.querySelector('#planMetadataLine'),
       }));
-      check('planning detail: legacy project keeps the full generic panels, no baseline panel',
-        legPage.scenarioPanel && legPage.assetPanel && !legPage.baselinePanel, JSON.stringify(legPage));
+      check('planning detail: legacy project keeps baselines/strategies/assets/reports, no scenario panel, no metadata line',
+        !legPage.scenarioPanel && legPage.assetPanel && legPage.baselinesPanel && !legPage.metaLine, JSON.stringify(legPage));
       // Strategy template recording on the From-template path; once a
       // strategy exists the comparison table appears.
       r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'Meta Strat', source: 'template', template: 'prepay', template_params: { propertyId: planPid, date: planOpDate, amount: 5000 } });
@@ -15946,11 +15950,11 @@ try {
     buyRow && buyRow.principalDelta === 600 && buyRow.equityDelta === null,
     JSON.stringify({ equityDelta: buyRow && buyRow.equityDelta, principalDelta: buyRow && buyRow.principalDelta }));
   // AI baseline-first flow (stub LLM): ask → spec → Apply, with the
-  // baseline landing in project metadata without wiping template
-  // answers, and its prime scenario created and set as base. Template
-  // output stays refinable: the saved-template body offers Refine
-  // with AI, and a pure buy project charts principal gain with no
-  // property baseline line.
+  // baseline landing in the baselines list (primeScenario and
+  // stockReference stripped, no scenario rows, no metadata write).
+  // Template output stays refinable: the saved-template body offers
+  // Refine with AI, and a pure buy project charts principal gain with
+  // no property baseline line.
   fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'prime_direction', label: 'Prime direction?', type: 'text' }] }));
   r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline`, { text: 'Prime rises, new money follows the current plan' });
   check('planning detail: ai-baseline ask returns structured questions, not a dead-end string',
@@ -15966,11 +15970,15 @@ try {
   r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline/apply`, { baseline: { primeScenario: { direction: 'sideways' } } });
   check('planning detail: ai-baseline apply rejects an invalid baseline', r.status === 400, JSON.stringify(r.data));
   r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline/apply`, { baseline: baselineDef });
-  check('planning detail: ai-baseline apply writes', r.status === 200 && r.data.project && r.data.project.metadata && r.data.project.metadata.aiBaseline && r.data.project.metadata.aiBaseline.description === 'Prime rises then holds' && r.data.project.metadata.account_type === 'TFSA', JSON.stringify(r.data));
+  check('planning detail: ai-baseline apply strips primeScenario/stockReference and appends a baselines-list entry, writing no metadata',
+    r.status === 200 && r.data.baseline && r.data.baseline.definition && r.data.baseline.definition.description === 'Prime rises then holds'
+      && !('primeScenario' in r.data.baseline.definition) && !('stockReference' in r.data.baseline.definition)
+      && !(r.data.project && r.data.project.metadata && r.data.project.metadata.aiBaseline),
+    JSON.stringify(r.data));
   r = await req('GET', `/api/planning/projects/${metaBuyId}/comparison`);
-  check('planning detail: applied baseline scenario is created and set as base',
-    r.status === 200 && (r.data.scenarios || []).some((s) => s.name === 'AI Baseline Path' && Number(s.is_base) === 1),
-    JSON.stringify((r.data.scenarios || []).map((s) => ({ name: s.name, is_base: s.is_base }))));
+  check('planning detail: applied baseline creates no scenario rows',
+    r.status === 200 && Array.isArray(r.data.scenarios) && r.data.scenarios.length === 0 && r.data.scenario === null,
+    JSON.stringify({ scenarios: r.data.scenarios, scenario: r.data.scenario }));
   fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
   // Pure buy project: no mortgage op anywhere, so the comparison chart
   // must show principal gain and no property baseline line.
@@ -16113,8 +16121,8 @@ try {
   r = await req('POST', '/api/planning/projects', { name: 'Category Multi', question: 'q', category: 'property', subcategory: 'refinance', entity: { type: 'property', propertyId: catPid } });
   check('planning category: bare categorized project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const catMultiId = r.data.project.id;
-  const flatDef = { description: 'Flat path', primeScenario: { name: 'Flat A', direction: 'flat', stance: 'neutral' }, stockReference: 'current-plan' };
-  const upDef = { description: 'Rising path', primeScenario: { name: 'Up B', direction: 'up', stance: 'pessimistic', magnitude: 1, steps: [{ date: '2027-01-01', rate: 6.5 }] }, stockReference: 'current-plan' };
+  const flatDef = { description: 'Flat path' };
+  const upDef = { description: 'Rising path' };
   r = await req('POST', `/api/planning/projects/${catMultiId}/baselines`, { name: 'Baseline A', source: 'manual', definition: flatDef });
   check('planning category: baseline A created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
   const baseA = r.data.baseline.id;
@@ -16156,11 +16164,40 @@ try {
     compA.status === 200 && compA.data.chosenBaseline && compA.data.chosenBaseline.id === baseA
       && (compA.data.strategies || []).length === 2,
     JSON.stringify({ chosen: compA.data.chosenBaseline && compA.data.chosenBaseline.id, n: (compA.data.strategies || []).length }));
-  check('planning category: switching the report to baseline B changes comparison values',
+  check('planning category: switching the baseline does NOT change comparison values (baseline changes nothing)',
     compB.status === 200 && compB.data.chosenBaseline && compB.data.chosenBaseline.id === baseB
-      && trajSum(compA.data) !== trajSum(compB.data)
-      && compA.data.strategies[0].comparison.net !== compB.data.strategies[0].comparison.net,
+      && trajSum(compA.data) === trajSum(compB.data)
+      && compA.data.strategies[0].comparison.net === compB.data.strategies[0].comparison.net,
     JSON.stringify({ sumA: trajSum(compA.data), sumB: trajSum(compB.data), netA: compA.data.strategies[0].comparison.net, netB: compB.data.strategies[0].comparison.net }));
+  // A strategy prime factor DOES change numbers: the strategy prices
+  // the variable segment on the factor path while the baseline stays
+  // on the flat actual-prime path.
+  const _catVan = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+  const _catY = Number(_catVan.slice(0, 4)); const _catM = Number(_catVan.slice(5, 7));
+  const _catFut = new Date(Date.UTC(_catY, _catM - 1 + 12, 1));
+  const catFutureYm = `${_catFut.getUTCFullYear()}-${String(_catFut.getUTCMonth() + 1).padStart(2, '0')}`;
+  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] } } });
+  check('planning category: strategy prime factor saves', r.status === 200 && r.data.factors && r.data.factors.prime && r.data.factors.prime.points && r.data.factors.prime.points[0].rate === 9.0, JSON.stringify(r.data));
+  const compF = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}`);
+  // A prepay GAINS value when prime rises: interestSaved compares the
+  // do-nothing plan against the with-prepay plan in the SAME world,
+  // and under the 9% path the fixed payment no longer covers interest,
+  // so the $10k prepay avoids far more interest than on the flat path.
+  // (The external do-nothing baseline itself stays on the flat path —
+  // pinned by the trajSum inversion above.)
+  check('planning category: prime factor changes the strategy net — a prepay saves more interest when prime rises',
+    compF.status === 200 && compF.data.strategies[0].comparison.net > compA.data.strategies[0].comparison.net,
+    JSON.stringify({ netA: compA.data.strategies[0].comparison.net, netF: compF.data.strategies[0].comparison.net }));
+  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] }, propertyGrowth: { valuePct: 5 } } });
+  check('planning category: property-growth factor saves alongside prime', r.status === 200 && r.data.factors && r.data.factors.propertyGrowth && r.data.factors.propertyGrowth.valuePct === 5, JSON.stringify(r.data));
+  const compG = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}`);
+  check('planning category: property-growth factor grows the strategy value at horizon past the flat baseline',
+    compG.status === 200 && compG.data.strategies[0].projection.valueAtHorizon > compG.data.baseline.valueAtHorizon * 2,
+    JSON.stringify({ strat: compG.data.strategies[0].projection.valueAtHorizon, base: compG.data.baseline.valueAtHorizon }));
+  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { unknownKey: { valuePct: 1 } } });
+  check('planning category: unknown factor key is rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: '2020-01', rate: 5 }] } } });
+  check('planning category: past prime point is rejected', r.status === 400, JSON.stringify(r.data));
   // Card edit updates only that entry.
   r = await req('PUT', `/api/planning/projects/${catMultiId}/baselines/${baseA}`, { name: 'Baseline A renamed' });
   check('planning category: baseline card rename succeeds', r.status === 200 && r.data.baseline && r.data.baseline.name === 'Baseline A renamed', JSON.stringify(r.data));
@@ -16187,8 +16224,9 @@ try {
     (r.data.strategies || []).length === 1 && r.data.strategies[0].id === stratX,
     JSON.stringify((r.data.strategies || []).map((s) => s.id)));
   // AI follow-up on an applied recommendation (stub LLM): baseline
-  // ask → spec → Apply touches only the targeted baseline row, and
-  // ai-model attaches a spec to the recommendation strategy.
+  // ask → spec → Apply touches only the targeted baseline row (and
+  // strips primeScenario/stockReference from the stored definition),
+  // and ai-model attaches a spec to the recommendation strategy.
   r = await req('POST', '/api/planning/projects', { name: 'Category AI Follow', question: 'q', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: catPid }, applyRecommendation: true });
   check('planning category: recommendation applied for AI follow-up', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const catAiId = r.data.project.id;
@@ -16208,6 +16246,8 @@ try {
     JSON.stringify((r.data.project.baselines || [])[0].definition) === aiBaseBefore,
     JSON.stringify((r.data.project.baselines || [])[0].definition));
   const followDef = { description: 'Prime rises then holds (follow-up)', primeScenario: { name: 'Follow Path', direction: 'up', stance: 'pessimistic', magnitude: 1, steps: [{ date: '2027-01-01', rate: 5.5 }] }, stockReference: 'current-plan', assumptions: [{ key: 'growth', value: 'flat' }] };
+  // The stored follow-up definition strips primeScenario/stockReference:
+  // the baseline changes nothing, the prime path lives on strategies.
   fs.writeFileSync(aiStubFile, JSON.stringify({ baseline: followDef }));
   r = await req('POST', `/api/planning/projects/${catAiId}/ai-baseline`, { text: 'Prime rises', baselineId: aiBaseRow.id });
   check('planning category: AI follow-up spec previews without writing',
@@ -16217,8 +16257,9 @@ try {
   check('planning category: spec preview leaves the baseline row unchanged',
     JSON.stringify((r.data.project.baselines || [])[0].definition) === aiBaseBefore, '');
   r = await req('POST', `/api/planning/projects/${catAiId}/ai-baseline/apply`, { baseline: followDef, baselineId: aiBaseRow.id });
-  check('planning category: AI follow-up Apply updates the targeted baseline',
-    r.status === 200 && r.data.baseline && r.data.baseline.definition && r.data.baseline.definition.description === 'Prime rises then holds (follow-up)',
+  check('planning category: AI follow-up Apply updates the targeted baseline and strips primeScenario/stockReference',
+    r.status === 200 && r.data.baseline && r.data.baseline.definition && r.data.baseline.definition.description === 'Prime rises then holds (follow-up)'
+      && !('primeScenario' in r.data.baseline.definition) && !('stockReference' in r.data.baseline.definition),
     JSON.stringify(r.data));
   const aiModelDef2 = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [{ key: 'stockReturnPct', value: 5, source: 'user' }], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
   fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef2));
@@ -16272,6 +16313,254 @@ try {
   check('planning category: legacy project cleanup', r.status === 200);
   r = await req('DELETE', `/api/properties/${catPid}`);
   check('planning category: fixture property cleanup', r.status === 200, JSON.stringify(r.data));
+
+  // ---- Investment pool + sink (factors model, corrected) ----
+  // Per-source contributions: a percent is OF ITS OWN SOURCE, an
+  // amount is CAD from that source. Contributions never sum to 100%
+  // — the pool total is their sum. The baseline holds the pool but
+  // still earns: each holding compounds at its current return rate
+  // from its own history (same basis as the stock-factor trend).
+  r = await req('POST', '/api/investments/accounts', { name: 'Pool Acct A', type: 'NonRegistered' });
+  check('planning pool: account A created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const poolAcctA = r.data.id;
+  r = await req('POST', '/api/investments/accounts', { name: 'Pool Acct B', type: 'NonRegistered' });
+  check('planning pool: account B created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const poolAcctB = r.data.id;
+  r = await req('POST', '/api/investments/accounts', { name: 'Pool Acct C', type: 'NonRegistered' });
+  check('planning pool: account C created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const poolAcctC = r.data.id;
+  const _poolVan = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+  const _poolY = Number(_poolVan.slice(0, 4)); const _poolM = Number(_poolVan.slice(5, 7));
+  const _poolShift = (months) => {
+    const total = _poolY * 12 + (_poolM - 1) - months;
+    return `${Math.floor(total / 12)}-${String((total % 12) + 1).padStart(2, '0')}-15`;
+  };
+  r = await req('POST', `/api/investments/accounts/${poolAcctA}/holdings`, { label: 'Pool Stock A', kind: 'exchange', symbol: 'POOL.A', currency: 'CAD', events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 10 }] });
+  check('planning pool: holding A created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const poolHoldA = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${poolAcctB}/holdings`, { label: 'Pool Stock B', kind: 'exchange', symbol: 'POOL.B', currency: 'CAD', events: [{ date: '2025-01-15', type: 'buy', units: 50, price: 10 }] });
+  check('planning pool: holding B created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const poolHoldB = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${poolAcctC}/holdings`, { label: 'Pool Stock C', kind: 'exchange', symbol: 'POOL.C', currency: 'CAD', events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 10 }] });
+  check('planning pool: holding C created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const poolHoldC = r.data.id;
+  r = await req('POST', `/api/investments/holdings/${poolHoldA}/nav`, { date: _poolShift(12), price: 19 });
+  check('planning pool: NAV A 1y', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${poolHoldA}/nav`, { date: _poolShift(1), price: 20 });
+  check('planning pool: NAV A recent', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${poolHoldB}/nav`, { date: _poolShift(12), price: 40 });
+  check('planning pool: NAV B 1y', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${poolHoldB}/nav`, { date: _poolShift(1), price: 40 });
+  check('planning pool: NAV B recent', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${poolHoldC}/nav`, { date: _poolShift(12), price: 16 });
+  check('planning pool: NAV C 1y', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${poolHoldC}/nav`, { date: _poolShift(1), price: 20 });
+  check('planning pool: NAV C recent', r.status === 201, JSON.stringify(r.data));
+  // Current values: A = 100x20 = 2000 (1y CAGR 20/19-1 = 5.26%),
+  // B = 50x40 = 2000 (flat), C = 100x20 = 2000 (1y CAGR 25%).
+  r = await req('POST', '/api/planning/recommendations', { category: 'investment', entity: { type: 'pool', items: [{ accountId: poolAcctA, percent: 101 }] } });
+  check('planning pool: percent over 100% of its source is rejected', r.status === 400 && /at most 100/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/recommendations', { category: 'investment', entity: { type: 'pool', items: [{ holdingId: poolHoldB, amount: 2001 }] } });
+  check('planning pool: amount above its holding value is rejected', r.status === 400 && /exceeds/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/recommendations', { category: 'investment', entity: { type: 'pool', items: [{ accountId: poolAcctA, percent: 30 }, { holdingId: poolHoldA, percent: 10 }] } });
+  check('planning pool: holding already covered by a picked account is rejected', r.status === 400 && /already covered/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/recommendations', { category: 'investment', entity: { type: 'pool', items: [{ accountId: poolAcctA, percent: 30 }, { holdingId: poolHoldB, amount: 500 }] } });
+  const poolFigs = r.data.recommendations && r.data.recommendations.stock && r.data.recommendations.stock.baseline && r.data.recommendations.stock.baseline.figures;
+  check('planning pool: 30% of account A + $500 from holding B sums to exactly 1100',
+    r.status === 200 && poolFigs && poolFigs.poolValue === 1100 && poolFigs.stockCount === 2
+      && poolFigs.items && poolFigs.items.length === 2 && poolFigs.items[0].value === 600 && poolFigs.items[1].value === 500,
+    JSON.stringify(poolFigs));
+  r = await req('POST', '/api/planning/projects', { name: 'Pool Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ accountId: poolAcctA, percent: 30 }, { holdingId: poolHoldB, amount: 500 }] }, applyRecommendation: true });
+  check('planning pool: pool project created with recommendation applied', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const poolProjId = r.data.project.id;
+  r = await req('GET', `/api/planning/projects/${poolProjId}`);
+  const poolBase = (r.data.project.baselines || [])[0];
+  const poolStrat = (r.data.strategies || [])[0];
+  check('planning pool: baseline is the 1100 pool over 2 stocks',
+    !!poolBase && poolBase.name === 'Pool · 2 stocks' && poolBase.definition && poolBase.definition.figures && poolBase.definition.figures.poolValue === 1100
+      && poolBase.definition.figures.stockCount === 2,
+    JSON.stringify({ name: poolBase && poolBase.name, figures: poolBase && poolBase.definition && poolBase.definition.figures }));
+  check('planning pool: recommendation strategy exists', !!poolStrat, JSON.stringify((r.data.strategies || []).map((x) => x.id)));
+  r = await req('GET', '/api/planning/prime-presets?preset=optimistic');
+  check('planning pool: prime presets endpoint returns a complete optimistic path',
+    r.status === 200 && r.data.preset === 'optimistic' && Array.isArray(r.data.points) && r.data.points.length > 0 && typeof r.data.label === 'string' && r.data.label.length > 0,
+    JSON.stringify(r.data));
+  // Baseline growth: a single-holding pool (100% of C) compounds at
+  // C's current 1y rate X with no strategy applied; the series ratio
+  // over the 30y horizon is exactly (1+X)^30.
+  r = await req('POST', '/api/planning/projects', { name: 'Pool Growth Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: poolHoldC, percent: 100 }] }, applyRecommendation: true });
+  check('planning pool: growth pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const poolGrowthId = r.data.project.id;
+  r = await req('GET', `/api/planning/return-suggestions?holdingId=${poolHoldC}`);
+  const sug1y = (r.data.suggestions || []).find((x) => x.label === '1y');
+  const rateX = sug1y ? sug1y.annualizedReturn : null;
+  check('planning pool: holding C current 1y rate is 25%', rateX === 0.25, JSON.stringify(r.data.suggestions));
+  r = await req('GET', `/api/planning/projects/${poolGrowthId}/comparison`);
+  const growthSeries = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
+  const growthRatio = growthSeries && growthSeries.length ? growthSeries[growthSeries.length - 1].value / growthSeries[0].value : null;
+  const growthExpected = rateX != null ? Math.pow(1 + rateX, 30) : null;
+  check('planning pool: baseline with no strategy grows at the holding current rate',
+    growthSeries && growthSeries.length > 0 && growthExpected != null && Math.abs(growthRatio - growthExpected) / growthExpected < 0.005,
+    JSON.stringify({ first: growthSeries && growthSeries[0], last: growthSeries && growthSeries[growthSeries.length - 1], ratio: growthRatio, expected: growthExpected }));
+  const baseFirstBefore = growthSeries && growthSeries.length ? growthSeries[0].value : null;
+  const baseLastBefore = growthSeries && growthSeries.length ? growthSeries[growthSeries.length - 1].value : null;
+  r = await req('GET', `/api/planning/projects/${poolGrowthId}`);
+  const growthStrat = (r.data.strategies || [])[0];
+  r = await req('PUT', `/api/planning/strategies/${growthStrat.id}/factors`, { factors: { stock: { valuePct: 10 } } });
+  check('planning pool: growth strategy stock factor saves', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${poolGrowthId}/comparison`);
+  const growthRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === growthStrat.id);
+  const growthSeriesAfter = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
+  check('planning pool: strategy factor changes the projection while the baseline stays at current rates',
+    growthRow && growthRow.projection && growthRow.projection.valueAtHorizon !== r.data.baseline.valueAtHorizon
+      && growthSeriesAfter && growthSeriesAfter[0].value === baseFirstBefore && growthSeriesAfter[growthSeriesAfter.length - 1].value === baseLastBefore,
+    JSON.stringify({ strat: growthRow && growthRow.projection.valueAtHorizon, base: r.data.baseline.valueAtHorizon, firstAfter: growthSeriesAfter && growthSeriesAfter[0].value, lastAfter: growthSeriesAfter && growthSeriesAfter[growthSeriesAfter.length - 1].value }));
+  r = await req('PUT', `/api/planning/strategies/${poolStrat.id}/sink`, { sink: { kind: 'stock', holdingId: poolHoldA, trendPct: 10, basis: 'Price CAGR', window: '1y' } });
+  check('planning sink: stock sink saves', r.status === 200 && r.data.factors && r.data.factors.sink && r.data.factors.sink.kind === 'stock', JSON.stringify(r.data.factors));
+  r = await req('GET', `/api/planning/strategies/${poolStrat.id}`);
+  check('planning sink: stock sink ops are two sells + one buy',
+    r.status === 200 && (r.data.ops || []).length === 3 && (r.data.ops || []).filter((o) => o.op_type === 'sell').length === 2 && (r.data.ops || []).filter((o) => o.op_type === 'buy').length === 1,
+    JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
+  r = await req('GET', `/api/planning/projects/${poolProjId}/comparison`);
+  const sinkRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === poolStrat.id);
+  check('planning sink: stock sink grows the pool at the 10% trend, not new cash',
+    sinkRow && sinkRow.projection && sinkRow.projection.stocks && sinkRow.projection.stocks.valueAtHorizon > sinkRow.projection.stocks.buyCash * 10 && sinkRow.comparison && sinkRow.comparison.stockGain > 0,
+    JSON.stringify({ value: sinkRow && sinkRow.projection.stocks.valueAtHorizon, buyCash: sinkRow && sinkRow.projection.stocks.buyCash, gain: sinkRow && sinkRow.comparison.stockGain }));
+  r = await req('POST', `/api/planning/projects/${poolProjId}/strategies`, { name: 'Pool Custom Sink', source: 'manual' });
+  check('planning sink: custom-sink strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const customStratId = r.data.strategy.id;
+  r = await req('PUT', `/api/planning/strategies/${customStratId}/sink`, { sink: { kind: 'custom', name: 'Test GIC', expectedReturnPct: 6 } });
+  check('planning sink: custom sink saves', r.status === 200 && r.data.factors && r.data.factors.sink && r.data.factors.sink.kind === 'custom', JSON.stringify(r.data.factors));
+  r = await req('GET', `/api/planning/projects/${poolProjId}/comparison`);
+  const customRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === customStratId);
+  check('planning sink: custom sink grows the pool at the user-filled 6% return',
+    customRow && customRow.projection && customRow.projection.stocks && customRow.projection.stocks.valueAtHorizon > customRow.projection.stocks.buyCash * 5 && customRow.comparison && customRow.comparison.stockGain > 0,
+    JSON.stringify({ value: customRow && customRow.projection.stocks.valueAtHorizon, buyCash: customRow && customRow.projection.stocks.buyCash, gain: customRow && customRow.comparison.stockGain }));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('planning pool/sink browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardQ = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResQ = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueQ = loginResQ.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserQ = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    const waitQ = (ms) => new Promise((res2) => setTimeout(res2, ms));
+    try {
+      const page = await browserQ.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardQ({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueQ, domain: 'ff.local', path: '/', httpOnly: true });
+      await page.goto(`http://ff.local/#planning/project/${poolProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1500);
+      const poolPage = await page.evaluate(() => {
+        const baseCards = [...document.querySelectorAll('#planBaselineCards [data-plan-baseline]')];
+        const stratCards = [...document.querySelectorAll('#planStrategiesPanel [data-plan-strategy]')];
+        return {
+          baseText: baseCards.map((c) => c.textContent).join(' | '),
+          stratText: stratCards.map((c) => c.textContent).join(' | '),
+          ratesText: document.querySelector('#planBaselineRates')?.textContent || '',
+        };
+      });
+      check('planning pool: baseline cards carry no factor UI, strategy card shows the sink line, baseline rates line shows current rates',
+        !poolPage.baseText.includes('Prime →') && !poolPage.baseText.includes('Sink:')
+          && poolPage.stratText.includes('Sink: existing stock')
+          && poolPage.ratesText.includes('POOL.A') && poolPage.ratesText.includes('5.26%/yr'),
+        JSON.stringify(poolPage));
+      await page.goto(`http://ff.local/#planning/strategy/${poolStrat.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1500);
+      const stratPage = await page.evaluate(() => ({
+        factorsPanel: !!document.querySelector('#planFactorsPanel'),
+        primeChart: !!document.querySelector('#planFactorPrimeChart'),
+        presetBtns: document.querySelectorAll('[data-plan-prime-preset]').length,
+        scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        fanChart: !!document.querySelector('#planStrategyFanChart'),
+      }));
+      check('planning pool: strategy detail shows the Factors panel with prime chart + view presets, no scenario panel, no fan chart',
+        stratPage.factorsPanel && stratPage.primeChart && stratPage.presetBtns === 5 && !stratPage.scenarioPanel && !stratPage.fanChart,
+        JSON.stringify(stratPage));
+      // Pool builder: account percent + holding amount compose the same
+      // 1100 total live, and the preview card carries it.
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1200);
+      await page.click('#planAddProjectBtn');
+      await waitQ(300);
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="investment"]').click(); });
+      await waitQ(1200);
+      const built = await page.evaluate((ids) => {
+        const setVal = (sel, val, ev) => {
+          const el = document.querySelector(sel);
+          if (!el) return false;
+          el.value = val;
+          el.dispatchEvent(new Event(ev, { bubbles: true }));
+          return true;
+        };
+        const acctCb = document.querySelector(`[data-pool-account="${ids.acctA}"]`);
+        if (!acctCb) return { error: 'no account row' };
+        acctCb.click();
+        setVal(`[data-pool-input="${ids.acctA}"]`, '30', 'input');
+        const holdCb = document.querySelector(`[data-pool-holding="${ids.holdB}"]`);
+        if (!holdCb) return { error: 'no holding row' };
+        holdCb.click();
+        setVal(`[data-pool-mode-h="${ids.holdB}"]`, 'amount', 'change');
+        setVal(`[data-pool-input-h="${ids.holdB}"]`, '500', 'input');
+        return { total: document.querySelector('#planPoolTotal')?.textContent || '' };
+      }, { acctA: poolAcctA, holdB: poolHoldB });
+      check('planning pool: builder composes 30% of account A + $500 of holding B into a 1,100.00 live total',
+        built.total && built.total.includes('1,100.00'), JSON.stringify(built));
+      await page.click('#planCatEntityGo');
+      await waitQ(1200);
+      const preview = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
+      check('planning pool: builder preview card carries the 1,100.00 pool value over 2 stocks',
+        preview.includes('1,100.00') && preview.includes('2 stocks'), JSON.stringify(preview.slice(0, 300)));
+    } finally { await browserQ.close(); }
+  }
+  r = await req('DELETE', `/api/planning/projects/${poolProjId}`);
+  check('planning pool: project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/planning/projects/${poolGrowthId}`);
+  check('planning pool: growth project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/investments/accounts/${poolAcctA}`);
+  check('planning pool: account A cleanup', r.status === 200);
+  r = await req('DELETE', `/api/investments/accounts/${poolAcctB}`);
+  check('planning pool: account B cleanup', r.status === 200);
+  r = await req('DELETE', `/api/investments/accounts/${poolAcctC}`);
+  check('planning pool: account C cleanup', r.status === 200);
 
   // ---- Funding-source multi-select picker (browser) ----
   if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {

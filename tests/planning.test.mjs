@@ -5,7 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  calcPenalty, presetPrimeSteps, scenarioPrimeHistory,
+  calcPenalty, scenarioPrimeHistory,
   validateOp, validateLegs, computeProjection, compareProjections,
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
   resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
@@ -14,6 +14,8 @@ import {
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline,
+  primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
+  factorsToAssumptions,
 } from '../src/planning.js';
 
 const PROP = () => ({
@@ -56,18 +58,35 @@ test('calcPenalty: variable closed is 3 months interest, open is 0', () => {
   assert.equal(o.penalty, 0);
 });
 
-// ------------------------------------------------------------- scenarios
-test('presetPrimeSteps: up-pessimistic steps within a year, flat is empty', () => {
-  const steps = presetPrimeSteps({ direction: 'up', stance: 'pessimistic', magnitude: 2.0 }, 4.70, '2026-11');
+// ------------------------------------------------------------- prime factors
+test('primeFactorPresetPoints: pessimistic rises 2.0 over 2 years, flat is empty', () => {
+  const steps = primeFactorPresetPoints('pessimistic', 4.70, '2026-11');
   assert.equal(steps.length, 4);
+  assert.equal(steps[steps.length - 1].month, '2028-11');
   assert.equal(steps[steps.length - 1].rate, 6.70);
-  assert.equal(presetPrimeSteps({ direction: 'flat' }, 4.70, '2026-11').length, 0);
+  assert.deepEqual(primeFactorPresetPoints('flat', 4.70, '2026-11'), []);
+  assert.deepEqual(primeFactorPresetPoints('optimistic', null, '2026-11'), []);
 });
 test('scenarioPrimeHistory: only steps after the last actual observation survive', () => {
   const actual = [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-04', rate: 4.70 }];
-  const out = scenarioPrimeHistory(actual, { direction: 'up', stance: 'pessimistic', magnitude: 2.0 }, 4.70, '2026-11');
+  const out = scenarioPrimeHistory(actual, { steps: [{ date: '2026-10-01', rate: 4.00 }, { date: '2027-06-01', rate: 6.00 }] });
   assert.ok(out.every((o) => o.date >= '2026-10-28'));
-  assert.equal(out[out.length - 1].rate, 6.70);
+  assert.equal(out[out.length - 1].rate, 6.00);
+  assert.equal(out.filter((o) => o.date === '2026-10-01').length, 0);
+});
+test('validateStrategyFactors: shape errors for points, percents and sinks', () => {
+  assert.deepEqual(validateStrategyFactors(null), []);
+  assert.deepEqual(validateStrategyFactors({ prime: { points: [{ month: '2027-06', rate: 5.5 }] } }, '2026-11'), []);
+  assert.ok(validateStrategyFactors({ prime: { points: [{ month: '2026-10', rate: 5.5 }] } }, '2026-11').some((e) => /past/.test(e)));
+  assert.ok(validateStrategyFactors({ prime: { points: [{ month: '2027-06', rate: 5.5 }, { month: '2027-06', rate: 6 }] } }, '2026-11').some((e) => /increasing/.test(e)));
+  assert.ok(validateStrategyFactors({ nope: 1 }).some((e) => /unknown factor/.test(e)));
+  assert.ok(validateStrategyFactors({ stock: { valuePct: 'x' } }).length > 0);
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1 } }).some((e) => /trendPct/.test(e)));
+  assert.ok(validateStrategyFactors({ sink: { kind: 'custom', name: 'GIC', expectedReturnPct: 4 } }).length === 0);
+  assert.deepEqual(primeFactorToScenario({ prime: { points: [{ month: '2027-06', rate: 5.5 }] } }), { name: 'Strategy prime', steps: [{ date: '2027-06-01', rate: 5.5 }] });
+  assert.equal(primeFactorToScenario({}), null);
+  assert.deepEqual(factorsToAssumptions({ stock: { valuePct: 6 } }, { stockReturnPct: 3, comparableRate: 4 }), { stockReturnPct: 6, comparableRate: 4 });
+  assert.deepEqual(factorsToAssumptions({}, { stockReturnPct: 3 }), { stockReturnPct: 3 });
 });
 
 // ------------------------------------------------------------- validation
@@ -261,10 +280,10 @@ test('reportCostBreakdown: cash out is the remainder after fees and penalty', ()
 
 // ------------------------------------------------------- template metadata
 test('planProjectTemplate: mortgage/refinance show prime scenarios only; buy shows neither; sell shows declared assets; blank/unknown are legacy', () => {
-  assert.deepEqual(planProjectSections('mortgage'), { primeScenarios: true, declaredAssets: false });
-  assert.deepEqual(planProjectSections('refinance'), { primeScenarios: true, declaredAssets: false });
-  assert.deepEqual(planProjectSections('buy'), { primeScenarios: false, declaredAssets: false });
-  assert.deepEqual(planProjectSections('sell'), { primeScenarios: false, declaredAssets: true });
+  assert.deepEqual(planProjectSections('mortgage'), { declaredAssets: false });
+  assert.deepEqual(planProjectSections('refinance'), { declaredAssets: false });
+  assert.deepEqual(planProjectSections('buy'), { declaredAssets: false });
+  assert.deepEqual(planProjectSections('sell'), { declaredAssets: true });
   assert.equal(planProjectTemplate('blank'), null);
   assert.equal(planProjectTemplate('nope'), null);
   assert.equal(planProjectTemplate(null), null);

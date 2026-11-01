@@ -41,7 +41,7 @@ import {
   spendMonthly, spendTotal, spendBalance,
 } from './spending.js';
 import {
-  calcPenalty, presetPrimeSteps, scenarioPrimeHistory, validateOp, validateLegs,
+  calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
   reportMonthlySeries, reportCostBreakdown,
@@ -49,7 +49,10 @@ import {
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline,
-  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory, planBaselineScenario,
+  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
+  validateStrategyFactors, primeFactorToScenario, factorsToAssumptions,
+  primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
+  currentReturnRateFromPoints, validatePoolItemShapes,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -3800,6 +3803,10 @@ function planStrategyById(id) {
   const row = db.prepare('SELECT * FROM plan_strategies WHERE id = ?').get(id);
   return row || null;
 }
+function planProjectEntityOf(project) {
+  if (!project) return null;
+  try { return project.entity ? JSON.parse(project.entity) : null; } catch { return null; }
+}
 function planOpsOf(strategyId) {
   const ops = db.prepare('SELECT * FROM plan_ops WHERE strategy_id = ? ORDER BY seq, id').all(strategyId)
     .map((o) => ({ ...o, params: JSON.parse(o.params || '{}') }));
@@ -3871,23 +3878,126 @@ function planAssembleMainline(projectId) {
   for (const p of props) assessed[p.id] = p.assessed_value ?? 0;
   return { properties, holdings, fxRateLatest: fxRow ? fxRow.rate : null, declaredAssets, assessed };
 }
-async function planProjectionFor(strategy, project, scenario, baselineScenario = undefined) {
+// A strategy row's factors, parsed (client parses the same way from
+// the raw row; this helper is for server-side computation).
+function planStrategyFactors(strategy) {
+  if (!strategy) return {};
+  try { return JSON.parse(strategy.factors || '{}') || {}; } catch { return {}; }
+}
+// Investment-pool mainline: for an investment project whose entity is
+// a user-defined cash pool, the projection mainline holds ONLY the
+// pool's contributions, each with a synthetic position event at the
+// current month. A percent contributes that percent OF ITS OWN SOURCE
+// (an account spreads pro-rata across its holdings); a CAD amount
+// contributes that amount (an account amount spreads pro-rata by
+// holding value). The pool total is the sum of the contributions.
+function planPoolMainline(project, mainline, currentMonth) {
+  const entity = planProjectEntityOf(project);
+  if (project.category !== 'investment' || !entity || entity.type !== 'pool') return mainline;
+  const fx = Number(mainline.fxRateLatest) || 1;
+  const byId = new Map((mainline.holdings || []).map((h) => [h.id, h]));
+  const cutoff = `${currentMonth}-31`;
+  const priceOn = (h) => {
+    let last = null;
+    for (const pt of h.pricePoints || []) if (String(pt.date).slice(0, 10) <= cutoff) last = pt; else break;
+    return last ? Number(last.price) : null;
+  };
+  const unitsOnAt = (h) => unitsOn(h.events || [], cutoff);
+  const toCad = (h, v) => (h.currency === 'USD' ? v * fx : v);
+  const fromCad = (h, v) => (h.currency === 'USD' ? v / fx : v);
+  const unitsByHolding = new Map();
+  const addUnits = (id, units) => { if (units > 0) unitsByHolding.set(id, (unitsByHolding.get(id) || 0) + units); };
+  for (const it of entity.items || []) {
+    if (it.accountId != null) {
+      const accHoldings = (mainline.holdings || []).filter((h) => Number(h.accountId) === Number(it.accountId));
+      if (it.percent != null) {
+        const pct = Number(it.percent) / 100;
+        for (const h of accHoldings) addUnits(h.id, pct * unitsOnAt(h));
+      } else {
+        const valued = [];
+        let total = 0;
+        for (const h of accHoldings) {
+          const pr = priceOn(h);
+          const u = unitsOnAt(h);
+          if (pr == null || !u) continue;
+          const v = toCad(h, u * pr);
+          valued.push({ h, pr, v });
+          total += v;
+        }
+        if (!total) continue;
+        for (const { h, pr, v } of valued) addUnits(h.id, fromCad(h, (v / total) * Number(it.amount)) / pr);
+      }
+    } else {
+      const h = byId.get(Number(it.holdingId));
+      if (!h) continue;
+      const pr = priceOn(h);
+      if (pr == null) continue;
+      if (it.percent != null) addUnits(h.id, (Number(it.percent) / 100) * unitsOnAt(h));
+      else addUnits(h.id, fromCad(h, Number(it.amount)) / pr);
+    }
+  }
+  const poolHoldings = [...unitsByHolding.entries()].map(([id, units]) => {
+    const holding = byId.get(id);
+    return {
+      ...holding,
+      events: [{ date: `${currentMonth}-01`, type: 'position', units: Math.round(units * 10000) / 10000 }],
+      pricePoints: holding.pricePoints,
+    };
+  });
+  return { ...mainline, holdings: poolHoldings };
+}
+// Per-holding CURRENT return rates for a mainline, from stored price
+// history only (never fetched, never invented): the map feeds the
+// engine, the labeled list feeds the comparison payload so the user
+// can check which rate each holding grows at.
+function planHoldingGrowth(mainline, currentMonth) {
+  const map = {};
+  const rates = [];
+  for (const h of mainline.holdings || []) {
+    const r = currentReturnRateFromPoints(h.pricePoints, currentMonth);
+    if (r) {
+      map[h.id] = r.ratePct;
+      rates.push({ holdingId: h.id, symbol: h.symbol || h.label || '', label: h.label || h.symbol || '', ratePct: r.ratePct, basis: r.basis, window: r.window });
+    }
+  }
+  return { map, rates };
+}
+// A strategy's projection under its OWN factors; the baseline is
+// always the do-nothing reference (no ops, no factor overrides, no
+// scenario — variable segments price at the last actual prime held
+// flat). "Changes nothing" does NOT mean flat: holdings still earn
+// their current rates, so both runs grow each holding at its current
+// rate unless the strategy overrides it with a stock factor or sink.
+async function planProjectionFor(strategy, project) {
   await ensureFreshPrime();
-  const mainline = planAssembleMainline(project.id);
+  const baseMainline = planAssembleMainline(project.id);
+  const currentMonth = currentMonthKey();
+  const mainline = planPoolMainline(project, baseMainline, currentMonth);
   const ops = planOpsOf(strategy.id);
   const legs = [];
   for (const o of ops) for (const l of o.legs) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
-  const assumptions = planConfirmedAssumptions(strategy.id);
-  const currentMonth = currentMonthKey();
+  const factors = planStrategyFactors(strategy);
+  const assumptions = factorsToAssumptions(factors, planConfirmedAssumptions(strategy.id));
   const primeHistory = getPrimeHistory();
   const cur = getCurrentPrime();
   const currentPrime = cur ? cur.rate : null;
   const args = { mainline, ops, legs, assumptions, primeHistory, currentPrime, currentMonth };
-  // A chosen baseline re-worlds the reference: the no-op projection
-  // runs under the baseline's own prime scenario instead of flat.
-  const baseline = computeProjection({ ...args, ops: [], legs: [], scenario: baselineScenario !== undefined ? baselineScenario : null });
-  const strategyProj = computeProjection({ ...args, scenario });
-  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj) };
+  const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
+  const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: {}, scenario: null, holdingGrowth });
+  baseline.currentRates = currentRates;
+  // A stock sink outside the pool is injected into the strategy run's
+  // mainline with empty events + actual price points: its pre-existing
+  // position outside the pool is NOT counted, only the sink buy is.
+  let strategyMainline = mainline;
+  if (factors.sink && factors.sink.kind === 'stock') {
+    const sinkId = Number(factors.sink.holdingId);
+    if (!mainline.holdings.some((h) => Number(h.id) === sinkId)) {
+      const real = baseMainline.holdings.find((h) => Number(h.id) === sinkId);
+      if (real) strategyMainline = { ...mainline, holdings: [...mainline.holdings, { ...real, events: [] }] };
+    }
+  }
+  const strategyProj = computeProjection({ ...args, mainline: strategyMainline, scenario: primeFactorToScenario(factors), holdingGrowth });
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj), factors, currentRates };
 }
 function planScenarioRow(r) {
   return { ...r, steps: r.steps ? JSON.parse(r.steps) : null };
@@ -3977,15 +4087,15 @@ function planProjectViewRow(p) {
   const metadata = p.metadata ? JSON.parse(p.metadata) : null;
   const entity = p.entity ? JSON.parse(p.entity) : null;
   // Categorized projects render the templated detail layout (baseline →
-  // strategies → reports) with a synthesized schema: property projects
-  // keep prime scenarios, the rest keep neither legacy panel.
+  // strategies → reports) with a synthesized schema: no category keeps
+  // a legacy panel — prime scenarios are per-strategy factors now.
   let templateSchema = planProjectTemplate(p.template);
   if (!templateSchema && p.category) {
     const sub = planOptSubcategory(p.category, p.subcategory);
     const cat = planOptCategory(p.category);
     templateSchema = {
       key: 'categorized', label: sub ? sub.label : (cat ? cat.label : p.category),
-      sections: { primeScenarios: p.category === 'property', declaredAssets: false }, fields: [],
+      sections: { declaredAssets: false }, fields: [],
     };
   }
   return {
@@ -4018,6 +4128,19 @@ function planOptEntityLabel(entity) {
     if (entity.type === 'property' && entity.propertyId) {
       const row = db.prepare('SELECT address FROM properties WHERE id = ?').get(Number(entity.propertyId));
       return row ? row.address : '';
+    }
+    if (entity.type === 'pool') {
+      const items = Array.isArray(entity.items) ? entity.items : [];
+      const ids = new Set();
+      for (const it of items) {
+        if (it.accountId != null) {
+          const hs = db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId));
+          for (const h of hs) {
+            if (unitsOn(listEvents(db, h.id), currentMonthKey()) > 0) ids.add(Number(h.id));
+          }
+        } else if (it.holdingId != null && unitsOn(listEvents(db, it.holdingId), currentMonthKey()) > 0) ids.add(Number(it.holdingId));
+      }
+      return `Pool · ${ids.size} stock${ids.size === 1 ? '' : 's'}`;
     }
     if (entity.type === 'account' || entity.type === 'holding') {
       const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(Number(entity.accountId));
@@ -4057,13 +4180,75 @@ function planValidateOptEntity(category, entity) {
     if (entity.type !== 'property' || !entity.propertyId) return 'property is required';
     if (!db.prepare('SELECT id FROM properties WHERE id = ?').get(Number(entity.propertyId))) return 'property not found';
   } else if (category === 'investment') {
-    if ((entity.type !== 'account' && entity.type !== 'holding') || !entity.accountId) return 'account is required';
-    if (!db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(Number(entity.accountId))) return 'account not found';
-    if (entity.type === 'holding' || entity.holdingId) {
-      if (!entity.holdingId) return 'holding is required';
-      const h = db.prepare('SELECT id, account_id FROM invest_holdings WHERE id = ?').get(Number(entity.holdingId));
-      if (!h) return 'holding not found';
-      if (Number(h.account_id) !== Number(entity.accountId)) return 'holding is not in this account';
+    if (entity.type === 'pool') {
+      // User-defined cash pool: each source (an account or a holding)
+      // contributes a percent OF THAT SOURCE or a CAD amount from it.
+      // Contributions NEVER need to sum to 100% — the pool total is
+      // simply their sum. Validation is hard and flagged, never
+      // silent: every percent within 0–100% of its own source, every
+      // amount not above its source's current value, every involved
+      // holding with units priced (never an invented price).
+      const shapeErr = validatePoolItemShapes(entity.items);
+      if (shapeErr) return shapeErr;
+      const items = entity.items;
+      const fxRow = db.prepare('SELECT rate FROM invest_fx_rates ORDER BY date DESC LIMIT 1').get();
+      const fx = fxRow ? fxRow.rate : 1;
+      const holdingValueCad = (hid) => {
+        const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(Number(hid));
+        if (!h) return { error: 'pool holding not found' };
+        const units = unitsOn(listEvents(db, h.id), currentMonthKey());
+        const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
+        if (units > 0 && !pts.length) return { error: `pool holding ${h.symbol || h.label || ''} has no current price` };
+        const price = pts.length ? pts[pts.length - 1].price : null;
+        const value = price != null ? units * price : 0;
+        return { holding: h, units, price, valueCad: h.currency === 'USD' ? value * fx : value };
+      };
+      // Account items first: the holdings they cover cannot also be
+      // picked directly (that would double-count one source).
+      const coveredHoldings = new Set();
+      for (const it of items) {
+        if (it.accountId == null) continue;
+        if (!db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(Number(it.accountId))) return 'pool account not found';
+        const hs = db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId));
+        if (!hs.length) return 'pool account has no holdings';
+        for (const h of hs) coveredHoldings.add(Number(h.id));
+      }
+      let total = 0;
+      for (const it of items) {
+        if (it.accountId != null) {
+          const hs = db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId));
+          let accountValue = 0;
+          for (const h of hs) {
+            const v = holdingValueCad(h.id);
+            if (v.error) return v.error;
+            accountValue += v.valueCad;
+          }
+          if (it.percent != null) total += accountValue * Number(it.percent) / 100;
+          else {
+            if (Number(it.amount) > accountValue + 0.005) return 'pool amount exceeds its account value';
+            total += Number(it.amount);
+          }
+        } else {
+          if (coveredHoldings.has(Number(it.holdingId))) return 'pool holding is already covered by a picked account';
+          const v = holdingValueCad(it.holdingId);
+          if (v.error) return v.error;
+          if (it.percent != null) total += v.valueCad * Number(it.percent) / 100;
+          else {
+            if (Number(it.amount) > v.valueCad + 0.005) return 'pool amount exceeds its holding value';
+            total += Number(it.amount);
+          }
+        }
+      }
+      if (!(total > 0)) return 'pool contributions add up to 0';
+    } else if ((entity.type !== 'account' && entity.type !== 'holding') || !entity.accountId) return 'account is required';
+    else {
+      if (!db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(Number(entity.accountId))) return 'account not found';
+      if (entity.type === 'holding' || entity.holdingId) {
+        if (!entity.holdingId) return 'holding is required';
+        const h = db.prepare('SELECT id, account_id FROM invest_holdings WHERE id = ?').get(Number(entity.holdingId));
+        if (!h) return 'holding not found';
+        if (Number(h.account_id) !== Number(entity.accountId)) return 'holding is not in this account';
+      }
     }
   } else if (category === 'earning') {
     if (entity.type === 'job') {
@@ -4080,16 +4265,16 @@ function planValidateOptEntity(category, entity) {
 }
 // Subcategory recommendations, computed from the picked entity's REAL
 // figures at request time — never generic template numbers. The baseline
-// is the status-quo reference (flat prime path, current-plan stock
-// reference); the strategy is the optimization direction. Charts and
-// comparisons still come from the projection engine replaying the
-// project's ops against live mainline data, never from these figures.
+// is the do-nothing reference (it changes nothing; its figures are just
+// the current position for display); the strategy is the optimization
+// direction. Charts and comparisons still come from the projection
+// engine replaying the project's ops against live mainline data, never
+// from these figures.
 function planRecommendationFor(category, subcategory, entity) {
   const sub = planOptSubcategory(category, subcategory);
   if (!sub) return { error: 'unknown subcategory' };
   const entErr = planValidateOptEntity(category, entity);
   if (entErr) return { error: entErr };
-  const flat = { name: 'Recommended baseline path', direction: 'flat', stance: 'neutral' };
   const label = planOptEntityLabel(entity);
   if (category === 'property') {
     const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(Number(entity.propertyId));
@@ -4100,8 +4285,57 @@ function planRecommendationFor(category, subcategory, entity) {
     const balance = prop.mortgage_balance ?? null;
     const figures = { balance, rate };
     return {
-      baseline: { name: `Current path · ${label}`, description: `Stay on the current path for ${label}`, primeScenario: flat, stockReference: 'current-plan', figures },
+      baseline: { name: `Current path · ${label}`, description: `Stay on the current path for ${label}`, figures },
       strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Bound to ${label}`, template_params: { category, subcategory, entity, opType: sub.opType, propertyId: Number(entity.propertyId) } },
+    };
+  }
+  if (category === 'investment' && entity.type === 'pool') {
+    // The baseline's starting position IS the pool: its figures are the
+    // pool's current value and per-item contributions (a percent OF
+    // ITS OWN SOURCE, or a CAD amount from it). The strategy is the
+    // sink the user picks on the strategy page (existing stock or
+    // custom product); the recommendation carries only the binding, and
+    // the sink's ops are generated when the user saves the sink.
+    const fxRow = db.prepare('SELECT rate FROM invest_fx_rates ORDER BY date DESC LIMIT 1').get();
+    const fx = fxRow ? fxRow.rate : 1;
+    let poolTotal = 0;
+    const items = [];
+    const stockIds = new Set();
+    const holdingDetail = (hid) => {
+      const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(Number(hid));
+      const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(Number(h.account_id));
+      const units = unitsOn(listEvents(db, h.id), currentMonthKey());
+      const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
+      const price = pts.length ? pts[pts.length - 1].price : null;
+      const valueNative = price != null ? Math.round(units * price * 100) / 100 : 0;
+      return { h, account: acc ? acc.name : '', units, price, valueCad: h.currency === 'USD' ? valueNative * fx : valueNative };
+    };
+    for (const it of entity.items) {
+      if (it.accountId != null) {
+        const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(Number(it.accountId));
+        const hs = db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId));
+        const details = hs.map((row) => holdingDetail(row.id)).filter((d) => d.units > 0);
+        const accountValue = details.reduce((s, d) => s + d.valueCad, 0);
+        const contribution = it.percent != null
+          ? Math.round(accountValue * Number(it.percent) / 100 * 100) / 100
+          : Number(it.amount);
+        poolTotal += contribution;
+        for (const d of details) stockIds.add(d.h.id);
+        items.push({ accountId: Number(it.accountId), account: acc ? acc.name : '', percent: it.percent != null ? Number(it.percent) : undefined, amount: it.amount != null ? Number(it.amount) : undefined, value: contribution, holdings: details.map((d) => ({ holdingId: d.h.id, symbol: d.h.symbol || d.h.label || '', units: d.units, price: d.price })) });
+      } else {
+        const d = holdingDetail(it.holdingId);
+        const contribution = it.percent != null
+          ? Math.round(d.valueCad * Number(it.percent) / 100 * 100) / 100
+          : Number(it.amount);
+        poolTotal += contribution;
+        stockIds.add(d.h.id);
+        items.push({ holdingId: Number(it.holdingId), symbol: d.h.symbol || d.h.label || '', account: d.account, percent: it.percent != null ? Number(it.percent) : undefined, amount: it.amount != null ? Number(it.amount) : undefined, units: d.units, price: d.price, value: contribution });
+      }
+    }
+    const figures = { poolValue: Math.round(poolTotal * 100) / 100, stockCount: stockIds.size, items };
+    return {
+      baseline: { name: label, description: `Hold the pool as-is`, figures },
+      strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Sink: pick on the strategy page`, template_params: { category, subcategory, entity, opType: 'buy', sinkKind: subcategory === 'gic' ? 'custom' : 'stock', sinkLabel: label, summary: `Pool → sink (pick on the strategy page)` } },
     };
   }
   if (category === 'investment') {
@@ -4128,7 +4362,7 @@ function planRecommendationFor(category, subcategory, entity) {
       figures = { value: Math.round(total * 100) / 100 };
     }
     return {
-      baseline: { name: `Current plan · ${sinkLabel}`, description: `Keep the current plan for ${sinkLabel}`, primeScenario: flat, stockReference: 'current-plan', figures },
+      baseline: { name: `Current plan · ${sinkLabel}`, description: `Keep the current plan for ${sinkLabel}`, figures },
       strategy: { name: `${sub.strategyLabel} · ${sinkLabel}`, summary: `Source: cash pot → Sink: ${sinkLabel}`, template_params: { category, subcategory, entity, opType: 'buy', source: 'pot', sink, sinkLabel, summary: `Source: cash pot → Sink: ${sinkLabel}` } },
     };
   }
@@ -4137,7 +4371,7 @@ function planRecommendationFor(category, subcategory, entity) {
     const periods = { weekly: 52, biweekly: 26, semimonthly: 24, monthly: 12, annual: 1 }[job.frequency] || 12;
     const annualGross = job.gross_basis === 'annual' ? job.gross_amount : job.gross_amount * periods;
     return {
-      baseline: { name: `Current pay · ${label}`, description: `Keep the current pay for ${label}`, primeScenario: flat, stockReference: 'current-plan', figures: { annualGross, frequency: job.frequency } },
+      baseline: { name: `Current pay · ${label}`, description: `Keep the current pay for ${label}`, figures: { annualGross, frequency: job.frequency } },
       strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Bound to ${label}`, template_params: { category, subcategory, entity, jobId: Number(entity.jobId) } },
     };
   }
@@ -4145,7 +4379,7 @@ function planRecommendationFor(category, subcategory, entity) {
     const yr = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC LIMIT 1').get(Number(entity.rentalId));
     const figures = yr ? { taxYear: yr.tax_year, gross: yr.gross_rents, net: yr.net ?? null } : {};
     return {
-      baseline: { name: `Current rents · ${label}`, description: `Keep the current rents for ${label}`, primeScenario: flat, stockReference: 'current-plan', figures },
+      baseline: { name: `Current rents · ${label}`, description: `Keep the current rents for ${label}`, figures },
       strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Bound to ${label}`, template_params: { category, subcategory, entity, rentalId: Number(entity.rentalId) } },
     };
   }
@@ -4157,7 +4391,7 @@ function planRecommendationFor(category, subcategory, entity) {
     const fromKey = `${from.getUTCFullYear()}-${String(from.getUTCMonth() + 1).padStart(2, '0')}`;
     const row = db.prepare(`SELECT COALESCE(SUM(-amount), 0) AS total FROM spend_transactions WHERE amount < 0 AND kind != 'adjustment' AND substr(date, 1, 7) >= ?`).get(fromKey);
     return {
-      baseline: { name: 'Current spending', description: 'Keep the current spending pattern', primeScenario: flat, stockReference: 'current-plan', figures: { spent12m: Math.round((row.total || 0) * 100) / 100 } },
+      baseline: { name: 'Current spending', description: 'Keep the current spending pattern', figures: { spent12m: Math.round((row.total || 0) * 100) / 100 } },
       strategy: { name: 'Spending analysis', summary: 'Scope: all spending cards', template_params: { category, subcategory, entity, scope: 'all-spending' } },
     };
   }
@@ -4165,7 +4399,7 @@ function planRecommendationFor(category, subcategory, entity) {
     const jobs = db.prepare('SELECT COUNT(*) AS n FROM earn_jobs').get().n;
     const rentals = db.prepare('SELECT COUNT(*) AS n FROM earn_rentals').get().n;
     return {
-      baseline: { name: 'Current tax position', description: 'Keep the current earnings and tax position', primeScenario: flat, stockReference: 'current-plan', figures: { jobs, rentals } },
+      baseline: { name: 'Current tax position', description: 'Keep the current earnings and tax position', figures: { jobs, rentals } },
       strategy: { name: 'Tax analysis', summary: 'Scope: all earnings', template_params: { category, subcategory, entity, scope: 'all-earnings' } },
     };
   }
@@ -4205,8 +4439,8 @@ app.post('/api/planning/projects', requireApiAuth, (req, res) => {
     const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, template, metadata, category, subcategory, entity, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(req.user.id, String(b.name).trim(), b.question ? String(b.question).trim() : null, snap, template, metadata ? JSON.stringify(metadata) : null, category, subcategory, entity ? JSON.stringify(entity) : null, now, now);
     const pid = info.lastInsertRowid;
-    db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(pid, 'Flat at current prime', 'flat', 'neutral', null, null, 1, now, now);
+    // No scenario rows are seeded: rate paths live on strategies as
+    // factors now, and the baseline is the do-nothing reference.
     if (rec) {
       db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(pid, rec.baseline.name, 'recommendation', category, subcategory, JSON.stringify(entity), JSON.stringify(rec.baseline), now, now);
@@ -4450,39 +4684,11 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
   if (!p) return res.status(404).json({ error: 'project not found' });
   const ops = planOpsOf(s.id);
   const assumptions = planAssumptionsOf(s.id);
-  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
-  const baseScenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
-  let baseline; let strategy; let comparison;
+  let baseline; let strategy; let comparison; let factors;
   try {
-    ({ baseline, strategy, comparison } = await planProjectionFor(s, p, baseScenario));
+    ({ baseline, strategy, comparison, factors } = await planProjectionFor(s, p));
   } catch (err) {
     return res.status(500).json({ error: `projection failed: ${err.message}` });
-  }
-  // Scenario table: the same strategy under each project scenario.
-  // Each row also carries the summed mortgage-balance series so the
-  // detail page can draw a real fan chart (envelope + base line).
-  const scenarioTable = [];
-  for (const sc of scenarios) {
-    let r;
-    try {
-      r = await planProjectionFor(s, p, sc);
-    } catch (err) {
-      return res.status(500).json({ error: `projection failed: ${err.message}` });
-    }
-    const months = [];
-    const cur = currentMonthKey();
-    for (let i = monthIdxOf(cur); i <= monthIdxOf(cur) + 360; i++) months.push(ymOfIdx(i));
-    const balanceByMonth = months.map((m) => {
-      let bal = 0;
-      for (const per of Object.values(r.strategy.mortgage.perProperty)) {
-        const series = per.strategy && per.strategy.series ? per.strategy.series : (per.baseline && per.baseline.series ? per.baseline.series : []);
-        const row = series.find((x) => x.month === m);
-        if (row) bal += row.balance;
-        else if (series.length && m > series[series.length - 1].month) bal += 0;
-      }
-      return { month: m, balance: Math.round(bal * 100) / 100 };
-    });
-    scenarioTable.push({ scenarioId: sc.id, name: sc.name, net: r.comparison.net, payoffShiftMonths: r.comparison.payoffShiftMonths, paymentDelta: r.comparison.paymentDelta, balanceByMonth });
   }
   // Attached AI model spec, if any: the strategy detail page renders it
   // with its formulas and a month-1 trial row from the projection.
@@ -4492,7 +4698,9 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
     if (mrow) model = { id: mrow.id, name: mrow.name, version: mrow.version, source: mrow.source, spec: JSON.parse(mrow.spec || '{}'), metadata: mrow.metadata ? JSON.parse(mrow.metadata) : null };
   }
   const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [] };
-  res.json({ strategy: strategyRow, project: p, ops, assumptions, scenarios, baseScenario, baseline, projection: strategy, comparison, scenarioTable, model });
+  // scenarioTable/baseScenario are kept as empty/null for response
+  // shape compatibility: rate paths live on the strategy's factors now.
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors, scenarios: [], baseScenario: null, baseline, projection: strategy, comparison, scenarioTable: [], model });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -4500,46 +4708,27 @@ app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, r
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  let scenario = null;
-  if (req.query.scenarioId) {
-    scenario = db.prepare('SELECT * FROM plan_scenarios WHERE id = ? AND project_id = ?').get(Number(req.query.scenarioId), p.id);
-    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
-    scenario = planScenarioRow(scenario);
-  } else {
-    const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
-    scenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
-  }
   let r;
   try {
-    r = await planProjectionFor(s, p, scenario);
+    r = await planProjectionFor(s, p);
   } catch (err) {
     return res.status(500).json({ error: `projection failed: ${err.message}` });
   }
-  res.json({ scenario, ...r });
+  res.json({ scenario: null, ...r });
 });
 
 app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  let scenario = null;
-  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
-  if (req.query.scenarioId) {
-    scenario = scenarios.find((x) => x.id === Number(req.query.scenarioId));
-    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
-  } else {
-    scenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
-  }
-  // A chosen baseline re-worlds the comparison: strategy projections
-  // run under the baseline's prime scenario and the reference is the
-  // no-op projection under that same scenario.
-  let baselineScenario = undefined;
+  // No shared world: each strategy runs under its OWN factors, and the
+  // baseline is always the do-nothing reference. A chosen baselineId
+  // is validated (404 when unknown) but is numerically inert — it only
+  // labels the reference in the report view.
   let chosenBaseline = null;
   if (req.query.baselineId !== undefined && req.query.baselineId !== null && req.query.baselineId !== '') {
     const brow = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.query.baselineId), p.id);
     if (!brow) return res.status(404).json({ error: 'baseline not found' });
     chosenBaseline = planBaselineRow(brow);
-    const bs = planBaselineScenario(chosenBaseline.definition);
-    if (bs) { baselineScenario = bs; scenario = { ...bs, name: (chosenBaseline.definition.primeScenario || {}).name || 'Baseline scenario' }; }
   }
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const rows = [];
@@ -4547,20 +4736,24 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
   for (const s of strategies) {
     let r;
     try {
-      r = await planProjectionFor(s, p, scenario, baselineScenario);
+      r = await planProjectionFor(s, p);
     } catch (err) {
       return res.status(500).json({ error: `projection failed: ${err.message}` });
     }
     if (!baseline) baseline = r.baseline;
-    rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison, opCount: planOpsOf(s.id).length });
+    rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison, factors: r.factors, opCount: planOpsOf(s.id).length });
   }
   // Baseline-only projection: the reference the strategy deltas are
   // computed against, and the chart's baseline line.
   if (!baseline) {
-    const mainline = planAssembleMainline(p.id);
+    const baseMainline = planAssembleMainline(p.id);
     await ensureFreshPrime();
     const cur = getCurrentPrime();
-    baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: {}, primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth: currentMonthKey(), scenario });
+    const currentMonth = currentMonthKey();
+    const mainline = planPoolMainline(p, baseMainline, currentMonth);
+    const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
+    baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: {}, primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: null, holdingGrowth });
+    baseline.currentRates = currentRates;
   }
   // Strategy-centric deltas: per strategy, Equity Δ (peak balance
   // advantage over baseline) and Principal Δ (buyCash vs baseline).
@@ -4579,7 +4772,7 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
     // Comparison chart inputs: which asset types each strategy touches
     // (the client picks the chart mode from these), plus the
-    // principal-gain series for stock strategies (current-plan
+    // principal-gain series for stock strategies (do-nothing
     // baseline, one definition shared with the table's stockGain).
     r.touchesMortgage = touchesMortgage;
     r.touchesStocks = touchesStocks;
@@ -4593,14 +4786,17 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
   const assessedTotal = Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
   const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal) }];
   for (const r of rows) {
-    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal) });
+    // A strategy's own property-growth factor grows its trajectory's
+    // assessed values; the baseline trajectory stays flat.
+    const growth = r.factors && r.factors.propertyGrowth ? r.factors.propertyGrowth.valuePct : null;
+    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey()) });
   }
   const report = {
     assessedTotal, assessedByProperty,
     trajectories: reportTrajectories,
     costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
   };
-  res.json({ project: p, scenario, scenarios, baseline, strategies: rows, report, chosenBaseline });
+  res.json({ project: p, scenario: null, scenarios: [], baseline, strategies: rows, report, chosenBaseline });
 });
 
 app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
@@ -4684,6 +4880,120 @@ app.put('/api/planning/strategies/:id/assumptions', requireApiAuth, (req, res) =
     .run(s.id, b.key, b.value == null || b.value === '' ? null : String(b.value), b.confirmed ? 1 : 0, now, now);
   db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
   res.json({ assumptions: planAssumptionsOf(s.id) });
+});
+
+// Strategy factors: full replace (the client sends the whole edited
+// set, including any existing sink). Prime points, return and growth
+// percentages are validated; unknown keys are rejected.
+app.put('/api/planning/strategies/:id/factors', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
+  const factors = (req.body || {}).factors;
+  if (factors == null || typeof factors !== 'object' || Array.isArray(factors)) return res.status(400).json({ error: 'factors must be an object' });
+  const errs = validateStrategyFactors(factors, currentMonthKey());
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const now = nowIso();
+  db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
+  res.json({ strategy: planStrategyById(s.id), factors });
+});
+
+// Investment sink: where the pool goes. Saves the sink into the
+// strategy's factors (merging with the other factors) and REPLACES the
+// strategy's ops with generated sell-pool + buy-sink ops: every pool
+// item is sold at its current price, proceeds earmarked to one buy of
+// the sink. A stock sink uses the user-picked historical trend as its
+// return assumption; a custom product uses the user-filled expected
+// annualized return. Investment-pool projects only.
+app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
+  if (p.category !== 'investment') return res.status(400).json({ error: 'sink is only for investment projects' });
+  const entity = planProjectEntityOf(p);
+  if (!entity || entity.type !== 'pool') return res.status(400).json({ error: 'investment sink needs a cash pool — pick pool stocks at creation' });
+  const sink = (req.body || {}).sink;
+  if (!sink || typeof sink !== 'object') return res.status(400).json({ error: 'sink is required' });
+  const errs = validateStrategyFactors({ sink }, currentMonthKey());
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const currentMonth = currentMonthKey();
+  const baseMainline = planAssembleMainline(p.id);
+  const poolMainline = planPoolMainline(p, baseMainline, currentMonth);
+  const fx = Number(baseMainline.fxRateLatest) || 1;
+  const cutoff = `${currentMonth}-31`;
+  const priceOn = (h) => {
+    let last = null;
+    for (const pt of h.pricePoints || []) if (String(pt.date).slice(0, 10) <= cutoff) last = pt; else break;
+    return last ? Number(last.price) : null;
+  };
+  // Sell every pool item at its current price; proceeds in CAD.
+  const sells = [];
+  let proceedsCad = 0;
+  for (const ph of poolMainline.holdings) {
+    const units = ph.events.reduce((sum, e) => sum + (Number(e.units) || 0), 0);
+    const price = priceOn(ph);
+    if (price == null) return res.status(400).json({ error: `pool holding ${ph.symbol || ph.label || ''} has no current price` });
+    const amount = Math.round(units * price * 100) / 100;
+    sells.push({ holding: ph, units, price, amount });
+    proceedsCad += ph.currency === 'USD' ? amount * fx : amount;
+  }
+  sells.sort((a, b) => a.holding.id - b.holding.id);
+  let buyParams; let stockFactor;
+  if (sink.kind === 'stock') {
+    const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(Number(sink.holdingId));
+    if (!h) return res.status(400).json({ error: 'sink holding not found' });
+    const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
+    const price = pts.length ? pts[pts.length - 1].price : null;
+    if (price == null) return res.status(400).json({ error: 'sink holding has no current price' });
+    const amountNative = h.currency === 'USD' ? proceedsCad / fx : proceedsCad;
+    buyParams = { accountId: h.account_id, holdingId: h.id, date: `${currentMonth}-01`, amount: amountNative, price };
+    stockFactor = { valuePct: Number(sink.trendPct), basis: sink.basis || null, window: sink.window || null };
+  } else {
+    buyParams = { accountId: null, symbol: String(sink.name).trim(), currency: 'CAD', date: `${currentMonth}-01`, amount: proceedsCad, price: 100 };
+    stockFactor = { valuePct: Number(sink.expectedReturnPct), basis: 'Your expected return', window: 'Annual' };
+  }
+  const buySeq = sells.length + 1;
+  const now = nowIso();
+  const rebuild = db.transaction(() => {
+    db.prepare('DELETE FROM plan_legs WHERE op_id IN (SELECT id FROM plan_ops WHERE strategy_id = ?)').run(s.id);
+    db.prepare('DELETE FROM plan_ops WHERE strategy_id = ?').run(s.id);
+    const sellIds = [];
+    sells.forEach((sell, i) => {
+      const info = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(s.id, i + 1, 'sell', JSON.stringify({ holdingId: sell.holding.id, date: `${currentMonth}-01`, units: sell.units, price: sell.price }), 'sink', now, now);
+      db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
+        .run(info.lastInsertRowid, `op:${buySeq}`, 'all', now);
+      sellIds.push(info.lastInsertRowid);
+    });
+    const buyInfo = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(s.id, buySeq, 'buy', JSON.stringify(buyParams), 'sink', now, now);
+    sells.forEach((sell, i) => {
+      db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
+        .run(buyInfo.lastInsertRowid, `op:${i + 1}`, 'all', now);
+    });
+    const factors = { ...planStrategyFactors(s), sink, stock: stockFactor };
+    db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
+    return factors;
+  });
+  const factors = rebuild();
+  res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), factors });
+});
+
+// Prime preset paths: complete date+rate point lists from the current
+// prime, labeled in plain words. The client still lets the user edit
+// the points after picking a preset.
+app.get('/api/planning/prime-presets', requireApiAuth, async (req, res) => {
+  const preset = String(req.query.preset || '');
+  if (!PLAN_PRIME_PRESETS.includes(preset)) return res.status(400).json({ error: 'unknown prime preset' });
+  await ensureFreshPrime();
+  const cur = getCurrentPrime();
+  const currentPrime = cur ? cur.rate : null;
+  const currentMonth = currentMonthKey();
+  res.json({ preset, label: PLAN_PRIME_PRESET_LABELS[preset], currentPrime, currentMonth, points: primeFactorPresetPoints(preset, currentPrime, currentMonth) });
 });
 
 // Historical return suggestions for one holding, from the user's own
@@ -5369,8 +5679,8 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
   });
   const prompt = [
     'You design a planning baseline definition as JSON only. No prose outside the JSON object.',
-    'The baseline has: description (one line), primeScenario (null, or {name, direction: up|flat|down, stance: pessimistic|optimistic|neutral, magnitude: number|null, steps: [{date: YYYY-MM-DD, rate: number}]|null}), stockReference (always the string "current-plan": the same principal deployed into the existing holdings allocation), assumptions: [{key, value}].',
-    'Bind ONLY to values in the snapshot below; never cite a number that is not there. The stock reference is fixed — do not propose any other reference.',
+    'The baseline changes nothing: it is a pure do-nothing reference (name + one-line description only). It carries NO prime path and NO stock reference — rate paths live on strategies as factors, never on the baseline. The baseline has: description (one line), assumptions: [{key, value}].',
+    'Bind ONLY to values in the snapshot below; never cite a number that is not there. Do not propose a prime path or a stock reference.',
     'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
     `App data snapshot: ${JSON.stringify(snapshot)}`,
     ...(confirmedBaseline ? [`Currently confirmed baseline: ${JSON.stringify(confirmedBaseline)}`, 'Refine it: keep what the user does not contradict.'] : []),
@@ -5394,7 +5704,8 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
     return res.json({ ask: questions, thread: newThread, configured: true });
   }
   const baseline = parsed.baseline || parsed;
-  baseline.stockReference = 'current-plan';
+  delete baseline.primeScenario;
+  delete baseline.stockReference;
   const errs = validateAiBaseline(baseline);
   if (errs.length) return res.status(502).json({ error: errs.join('; ') });
   const newThread = appendAiThread(thread, { role: 'ai', baseline });
@@ -5406,41 +5717,29 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
   if (!p) return res.status(404).json({ error: 'project not found' });
   const baseline = req.body?.baseline;
   if (!baseline || typeof baseline !== 'object') return res.status(400).json({ error: 'baseline is required' });
-  baseline.stockReference = 'current-plan';
+  // The baseline changes nothing: any primeScenario riding along in an
+  // AI-designed definition is stripped on apply (never stored as a
+  // scenario, never rendered), and no metadata is written — the
+  // baseline list entry is the whole record.
   const errs = validateAiBaseline(baseline);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
-  // A prime scenario in the applied baseline becomes real: find or
-  // create it by name, then set it as the project's base scenario.
-  const applyScenario = () => {
-    const ps = baseline.primeScenario;
-    if (!ps || !ps.name) return;
-    const now = nowIso();
-    let sc = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? AND name = ?').get(p.id, String(ps.name).trim());
-    if (!sc) {
-      const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(p.id, String(ps.name).trim(), ps.direction, ps.stance || 'neutral', ps.magnitude != null ? Number(ps.magnitude) : null, ps.steps ? JSON.stringify(ps.steps) : null, 0, now, now);
-      sc = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(info.lastInsertRowid);
-    }
-    db.prepare('UPDATE plan_scenarios SET is_base = 0 WHERE project_id = ?').run(p.id);
-    db.prepare('UPDATE plan_scenarios SET is_base = 1 WHERE id = ?').run(sc.id);
-  };
+  const stored = { ...baseline };
+  delete stored.primeScenario;
+  delete stored.stockReference;
   // Targeted apply: update one baseline card's definition, nothing else.
   if (req.body?.baselineId !== undefined && req.body?.baselineId !== null) {
     const row = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.body.baselineId), p.id);
     if (!row) return res.status(404).json({ error: 'baseline not found' });
-    applyScenario();
     db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
-      .run(req.body.name ? String(req.body.name).trim() : row.name, JSON.stringify(baseline), nowIso(), row.id);
+      .run(req.body.name ? String(req.body.name).trim() : row.name, JSON.stringify(stored), nowIso(), row.id);
     return res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) });
   }
-  const meta = planWriteProjectMetadata(p, { aiBaseline: baseline });
-  applyScenario();
   // Append-only list: a legacy apply also appends a list entry, so the
   // baseline list never loses an applied baseline.
   const now = nowIso();
-  db.prepare('INSERT INTO plan_baselines (project_id, name, source, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(p.id, baseline.description || 'AI baseline', 'ai', JSON.stringify(baseline), now, now);
-  res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), metadata: meta });
+  const info = db.prepare('INSERT INTO plan_baselines (project_id, name, source, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, baseline.description || 'AI baseline', 'ai', JSON.stringify(stored), now, now);
+  res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) });
 });
 
 app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res) => {

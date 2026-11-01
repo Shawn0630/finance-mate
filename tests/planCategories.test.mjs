@@ -1,13 +1,11 @@
-// Optimization categories + baseline-scenario mapping: taxonomy
-// integrity (every subcategory has a label and a strategy label, and
-// belongs to exactly one big category) and the planBaselineScenario
-// conversion (valid direction passes through with a neutral default
-// stance; an invalid direction yields null, so the caller keeps the
-// project base scenario instead of projecting under garbage).
+// Optimization categories: taxonomy integrity (every subcategory has
+// a label and a strategy label, and belongs to exactly one big
+// category). Baselines carry no prime scenario anymore — the factor
+// model replaced the baseline-scenario mapping entirely.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory, planBaselineScenario,
+  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
 } from '../src/planning.js';
 
 test('taxonomy: five big categories with the settled subcategory sets', () => {
@@ -39,26 +37,3 @@ test('taxonomy: every category and subcategory carries label + strategyLabel, no
   assert.equal(planOptSubcategory('nope', 'interest_rate'), null);
 });
 
-test('planBaselineScenario: valid direction passes through, stance defaults to neutral', () => {
-  const out = planBaselineScenario({
-    description: 'Prime rises',
-    primeScenario: { name: 'Up path', direction: 'up', stance: 'pessimistic', magnitude: 1, steps: [{ date: '2027-01-01', rate: 5.5 }] },
-    stockReference: 'current-plan',
-  });
-  assert.equal(out.direction, 'up');
-  assert.equal(out.stance, 'pessimistic');
-  assert.equal(out.magnitude, 1);
-  assert.deepEqual(out.steps, [{ date: '2027-01-01', rate: 5.5 }]);
-  const flat = planBaselineScenario({ primeScenario: { name: 'Flat', direction: 'flat' } });
-  assert.equal(flat.direction, 'flat');
-  assert.equal(flat.stance, 'neutral');
-  assert.equal(flat.magnitude, null);
-  assert.equal(flat.steps, null);
-});
-
-test('planBaselineScenario: null or invalid prime scenario yields null', () => {
-  assert.equal(planBaselineScenario({ description: 'No prime path' }), null);
-  assert.equal(planBaselineScenario({ primeScenario: null }), null);
-  assert.equal(planBaselineScenario({ primeScenario: { name: 'Bad', direction: 'sideways' } }), null);
-  assert.equal(planBaselineScenario(null), null);
-});

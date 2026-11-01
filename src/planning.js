@@ -93,44 +93,17 @@ export function calcPenalty({
 // A scenario is direction × stance × magnitude/pace. Steps are dated the
 // first of the month they take effect (the engine's month-end rule then
 // prices that month at the new rate). startMonth is 'YYYY-MM'.
-export function presetPrimeSteps(scenario, currentPrime, startMonth) {
-  const s = scenario || {};
-  if (s.direction === 'flat' || !s.direction) return [];
-  const mag = num(s.magnitude) ?? (s.stance === 'pessimistic' && s.direction === 'up' ? 2.0
-    : s.stance === 'optimistic' && s.direction === 'down' ? 2.0 : 0.5);
-  const base = num(currentPrime);
-  if (base == null) return [];
-  const at = (months, delta) => ({ date: `${addMonthsYm(startMonth, months)}-01`, rate: round2(base + delta) });
-  if (s.direction === 'up' && s.stance === 'pessimistic') {
-    return [at(3, mag * 0.25), at(6, mag * 0.5), at(9, mag * 0.75), at(12, mag)];
-  }
-  if (s.direction === 'up') { // up-optimistic: slow rise, then fall back half
-    return [at(12, mag * 0.5), at(24, mag), at(36, mag * 0.5)];
-  }
-  if (s.direction === 'down' && s.stance === 'optimistic') {
-    return [at(3, -mag * 0.25), at(6, -mag * 0.5), at(9, -mag * 0.75), at(12, -mag)];
-  }
-  if (s.direction === 'down') { // down-pessimistic: slow fall, then rebound half
-    return [at(12, -mag * 0.5), at(24, -mag), at(36, -mag * 0.5)];
-  }
-  return [];
-}
-
-// Merge actual prime history with a scenario's future steps. Steps dated
-// on or before the last actual observation are dropped (future only).
-// Custom scenarios carry their steps directly.
-export function scenarioPrimeHistory(actualHistory, scenario, currentPrime, startMonth) {
+// Merge actual prime history with a strategy's prime-factor steps. Steps
+// dated on or before the last actual observation are dropped (future
+// only). Between steps the rate holds at the last point's value until
+// the next point (the engine's month-end rule).
+export function scenarioPrimeHistory(actualHistory, scenario) {
   const actual = (actualHistory || []).map((o) => ({ date: String(o.date).slice(0, 10), rate: Number(o.rate) }))
     .filter((o) => /^\d{4}-\d{2}-\d{2}$/.test(o.date) && isFinite(o.rate))
     .sort((a, b) => (a.date < b.date ? -1 : 1));
-  if (!scenario) return actual;
-  let steps = [];
-  if (Array.isArray(scenario.steps)) {
-    steps = scenario.steps.map((o) => ({ date: String(o.date).slice(0, 10), rate: Number(o.rate) }))
-      .filter((o) => /^\d{4}-\d{2}-\d{2}$/.test(o.date) && isFinite(o.rate));
-  } else {
-    steps = presetPrimeSteps(scenario, currentPrime, startMonth);
-  }
+  if (!scenario || !Array.isArray(scenario.steps)) return actual;
+  const steps = scenario.steps.map((o) => ({ date: String(o.date).slice(0, 10), rate: Number(o.rate) }))
+    .filter((o) => /^\d{4}-\d{2}-\d{2}$/.test(o.date) && isFinite(o.rate));
   const lastActual = actual.length ? actual[actual.length - 1].date : '0000-00-00';
   const future = steps.filter((o) => o.date > lastActual);
   return [...actual, ...future].sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -258,10 +231,10 @@ export function validateLegs(ops, legs) {
 // scenario: prime-path scenario object (or null = actual history only)
 // Returns {mortgage: {perProperty, totals}, stocks: {...}, fees, penalties,
 // cost, gain, net, valueAtHorizon, errors[], warnings[]}.
-export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360 }) {
+export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null }) {
   const errors = [];
   const warnings = [];
-  const primeHist = scenarioPrimeHistory(primeHistory, scenario, currentPrime, currentMonth);
+  const primeHist = scenarioPrimeHistory(primeHistory, scenario);
   const primeForMonth = primeHistoryResolver(primeHist, currentPrime);
   const horizonMonth = addMonthsYm(currentMonth, horizonMonths);
 
@@ -452,6 +425,19 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   // ---- stocks ----------------------------------------------------------
   const returnPct = num(assumptions.stockReturnPct);
   const rAnnual = returnPct == null ? 0 : returnPct / 100;
+  // Per-holding current rates (the baseline world): when the run sets
+  // no global stock return, each holding grows at its own current
+  // rate from its own history; holdings without a usable window stay
+  // flat. A global stockReturnPct (strategy factor or sink) wins over
+  // every per-holding rate.
+  const growthFor = (holding) => {
+    if (returnPct != null) return rAnnual;
+    if (holdingGrowth && holdingGrowth[holding.id] != null) {
+      const g = num(holdingGrowth[holding.id]);
+      return g == null ? 0 : g / 100;
+    }
+    return 0;
+  };
   const holdingsById = new Map((mainline.holdings || []).map((h) => [h.id, h]));
   const stockOps = sortedOps.filter((o) => ['buy', 'sell', 'position'].includes(o.op_type));
   // Price path per holding: last stored point ≤ month, grown at the
@@ -465,7 +451,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     for (const pt of pts) if (pt.date <= cutoff) last = pt; else break;
     if (!last) return null;
     const months = monthIdxOf(monthKey) - monthIdxOf(last.date.slice(0, 7));
-    return last.price * Math.pow(1 + rAnnual, months / 12);
+    return last.price * Math.pow(1 + growthFor(holding), months / 12);
   };
   const fxRate = num(mainline.fxRateLatest) || 1;
   const toCad = (holding, v) => (holding.currency === 'USD' ? v * fxRate : v);
@@ -493,6 +479,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   let pot = 0; // CAD
   const potEvents = [];
   let buyCash = 0;
+  let buyCashFromSells = 0; // CAD — buy amount funded by sell earmarks
   let sellExternalOut = 0;
   const holdingValueSeries = {}; // holdingId -> {month: valueCad}
   const opUnitsDelta = new Map(); // holdingId -> [{month, delta}]
@@ -527,8 +514,15 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       if (resolved.error) { errors.push(`buy operation ${op.seq}: ${resolved.error}`); continue; }
       pot = resolved.pot;
       buyCash += toCad(holding, amount);
+      // Sell-earmarked funding is a swap, not new cash: it must not
+      // count as cash out nor as opportunity-costed principal.
+      buyCashFromSells += toCad(holding, resolved.fromSellsNative || 0);
       pushUnitsDelta(holding.id, monthKey, units);
       opOutput.set(op.seq, { amountCad: toCad(holding, amount), note: 'buy' });
+      // A bought holding's price path starts at its buy price, then
+      // grows at the assumed return — this is what lets a custom sink
+      // (no stored price history) project from its buy price.
+      if (isNew && pr != null) holding.pricePoints = [{ date: p.date, price: pr }];
       if (isNew) {
         if (!mainline.holdings.find((h) => h.id === holding.id)) mainline.holdings.push(holding);
         holdingsById.set(holding.id, holding);
@@ -638,21 +632,28 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   // assumption, no ops) — see compareProjections below — so a
   // do-nothing strategy never books market growth as its own gain.
   const stockGainVsStart = round2(valueAtHorizon + sellExternalOut - startingValue);
-  const cost = round2(fees + penaltyTotal + mortgagePrepayCash + buyCash);
+  // Cost counts only NEW cash out: sell-funded buys are swaps of money
+  // already counted in the baseline, not additional spending.
+  const cost = round2(fees + penaltyTotal + mortgagePrepayCash + buyCash - buyCashFromSells);
 
-  // Property equity at horizon (planning-only projected total).
+  // Property equity at horizon (planning-only projected total). A
+  // property-growth factor grows the assessed value from the current
+  // month to the horizon; with no factor the value is held flat.
   let equityAtHorizon = 0;
+  const growthPct = num(assumptions.propertyGrowthPct);
+  const growthYears = growthPct == null ? 0 : (monthIdxOf(horizonMonth) - monthIdxOf(currentMonth)) / 12;
   for (const [pid, plan] of plans) {
     const assessed = (mainline.assessed || {})[pid] ?? plan.property.assessed_value ?? 0;
+    const assessedGrown = growthPct == null ? (assessed || 0) : (assessed || 0) * Math.pow(1 + growthPct / 100, growthYears);
     const strat = mortgagePerProperty[pid] && mortgagePerProperty[pid].strategy;
     const bal = strat ? strat.balanceAtHorizon : (mortgagePerProperty[pid] && mortgagePerProperty[pid].baseline ? mortgagePerProperty[pid].baseline.balanceAtHorizon : plan.property.mortgage_balance || 0);
-    equityAtHorizon += (assessed || 0) - (bal || 0);
+    equityAtHorizon += assessedGrown - (bal || 0);
   }
   const projectedTotalAtHorizon = round2(equityAtHorizon + valueAtHorizon);
 
   return {
     mortgage: { perProperty: mortgagePerProperty, baselineInterest: round2(baselineInterest), strategyInterest: round2(strategyInterest), interestSaved },
-    stocks: { series: stockSeries, startingValue: round2(startingValue), valueAtHorizon, buyCash: round2(buyCash), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
+    stocks: { series: stockSeries, startingValue: round2(startingValue), valueAtHorizon, buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
     fees: round2(fees), penalties, penaltyTotal,
     cost, valueAtHorizon: projectedTotalAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
@@ -724,6 +725,7 @@ export function resolveBuyLegs(legs, buyAmountNative, { pot, opOutputs, declared
   const fromCadAmt = (cad) => (holdingCurrency === 'USD' ? cad / fxRate : cad);
   let remainingNative = buyAmountNative;
   let newPot = pot;
+  let fromSellsNative = 0; // buy amount funded by sell earmarks (a swap, not new cash)
   // Fixed legs first, then 'all', then 'remainder'.
   const ordered = [...(legs || [])].sort((a, b) => {
     const rank = (x) => (x.amount === 'all' ? 1 : x.amount === 'remainder' ? 2 : 0);
@@ -761,6 +763,7 @@ export function resolveBuyLegs(legs, buyAmountNative, { pot, opOutputs, declared
     }
     if (src === 'pot') newPot = round2(newPot - toCadAmt(takeNative));
     if (src.startsWith('op:')) {
+      fromSellsNative = round2(fromSellsNative + takeNative);
       const dep = Number(src.slice(3));
       const key = buySeq != null && opOutputs.has(`sell:${dep}:${buySeq}`) ? `sell:${dep}:${buySeq}`
         : opOutputs.has(dep) ? dep : null;
@@ -770,7 +773,7 @@ export function resolveBuyLegs(legs, buyAmountNative, { pot, opOutputs, declared
     remainingNative = round2(remainingNative - takeNative);
   }
   if (remainingNative > 0.005) return { error: `funding covers only part of the purchase — ${remainingNative} unfunded` };
-  return { pot: newPot };
+  return { pot: newPot, fromSellsNative };
 }
 
 function addYearsDate(dateStr, years) {
@@ -781,27 +784,28 @@ function addYearsDate(dateStr, years) {
 }
 
 // ------------------------------------------------- comparison + summaries --
-// Final comparison numbers for one strategy against its baseline
-// (same assumptions, no ops). Baseline net is 0 by construction: it
+// Final comparison numbers for one strategy against its do-nothing
+// baseline (no ops, no factors). Baseline net is 0 by construction: it
 // pays no fees, no penalty, no prepay, buys nothing, and its stock
 // trajectory is the reference the strategy's stock gain is measured
 // against — so net here IS the net benefit vs baseline.
 export function compareProjections(baseline, strategy) {
   if (!baseline || !strategy) return null;
-  // Stock gain vs the CURRENT-PLAN baseline (opportunity cost, not
-  // do-nothing): the same principal deployed into the existing
-  // holdings allocation. Baseline current-plan value at horizon =
-  // baseline holdings value + buyCash × ratio, where ratio =
-  // baseline value at horizon / baseline starting value (1 when there
-  // is no starting value, i.e. a cash baseline). A flat-price buy
-  // therefore books $0 stock gain; only the excess over the current
-  // plan counts. A do-nothing strategy still books $0 (buyCash = 0
-  // and identical trajectories).
+  // Stock gain vs the do-nothing baseline: only NEW cash deployed
+  // (pot/external buys) is opportunity-costed at the baseline ratio
+  // (baseline value at horizon / baseline starting value; 1 when
+  // there is no starting value, i.e. a cash baseline). Sell-funded
+  // buys are swaps — the sold money is already inside the baseline
+  // value, so costing it again would double-count it. A flat-price
+  // pot buy therefore books $0 stock gain; only the excess over
+  // holding the baseline counts. A do-nothing strategy still books $0
+  // (buyCash = 0 and identical trajectories).
   const bStart = (baseline.stocks && baseline.stocks.startingValue) || 0;
   const bEnd = (baseline.stocks && baseline.stocks.valueAtHorizon) || 0;
   const buyCash = (strategy.stocks && strategy.stocks.buyCash) || 0;
+  const buyCashFromSells = (strategy.stocks && strategy.stocks.buyCashFromSells) || 0;
   const ratio = bStart > 0 ? bEnd / bStart : 1;
-  const stockGain = round2((strategy.stocks.valueAtHorizon + strategy.stocks.sellExternalOut) - bEnd - buyCash * ratio);
+  const stockGain = round2((strategy.stocks.valueAtHorizon + strategy.stocks.sellExternalOut) - bEnd - (buyCash - buyCashFromSells) * ratio);
   const interestSaved = strategy.mortgage.interestSaved;
   const cost = strategy.cost;
   const gain = round2(interestSaved + stockGain);
@@ -821,23 +825,26 @@ export function compareProjections(baseline, strategy) {
 export const summarizeComparison = compareProjections;
 
 // Principal-gain series for one strategy: month by month, the excess
-// of the strategy's holdings value over the current-plan baseline
-// (baseline holdings + the same principal grown at the current-plan
-// ratio). Months align on the baseline series; missing months carry
-// the last known baseline value forward. Pure — shared by the
-// comparison chart so the chart and the table use one definition.
+// of the strategy's holdings value over the do-nothing baseline
+// (baseline holdings + new principal grown at the baseline ratio;
+// sell-funded buys are swaps and are not costed again). Months align
+// on the baseline series; missing months carry the last known
+// baseline value forward. Pure — shared by the comparison chart so
+// the chart and the table use one definition.
 export function principalGainSeries(baselineProj, strategyProj) {
   const base = (baselineProj && baselineProj.stocks && baselineProj.stocks.series) || [];
   const strat = (strategyProj && strategyProj.stocks && strategyProj.stocks.series) || [];
   if (!base.length || !strat.length) return [];
   const start = Number(base[0].value) || 0;
   const buyCash = (strategyProj.stocks && strategyProj.stocks.buyCash) || 0;
+  const buyCashFromSells = (strategyProj.stocks && strategyProj.stocks.buyCashFromSells) || 0;
+  const newCash = buyCash - buyCashFromSells;
   let lastBase = Number(base[0].value) || 0;
   let bi = 0;
   return strat.map((r) => {
     while (bi < base.length && base[bi].month <= r.month) { lastBase = Number(base[bi].value) || 0; bi++; }
     const ratio = start > 0 ? lastBase / start : 1;
-    return { month: r.month, value: round2((Number(r.value) || 0) - lastBase - buyCash * ratio) };
+    return { month: r.month, value: round2((Number(r.value) || 0) - lastBase - newCash * ratio) };
   });
 }
 
@@ -876,7 +883,7 @@ export function validateAiBaseline(b) {
 // (the assessed value is the current roll, held flat across months —
 // the same convention valueAtHorizon uses). Interest is summed too so
 // yearly bars can aggregate without re-walking the engine series.
-export function reportMonthlySeries(perProperty, side, stockSeries, assessedTotal) {
+export function reportMonthlySeries(perProperty, side, stockSeries, assessedTotal, growthPct = null, currentMonth = null) {
   const byMonth = new Map();
   for (const per of Object.values(perProperty || {})) {
     const s = per[side] && per[side].series ? per[side].series : [];
@@ -889,14 +896,20 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
   }
   const stockByMonth = new Map((stockSeries || []).map((r) => [r.month, r.value || 0]));
   for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0 });
+  const g = num(growthPct);
   return [...byMonth.keys()].sort().map((m) => {
     const b = byMonth.get(m);
     const sv = stockByMonth.get(m) || 0;
+    // A property-growth factor grows the assessed value month by month
+    // from the current month; with no factor (or no current month) the
+    // assessed value is held flat, exactly as before.
+    const assessedAt = (g == null || !currentMonth) ? (assessedTotal || 0)
+      : (assessedTotal || 0) * Math.pow(1 + g / 100, (monthIdxOf(m) - monthIdxOf(currentMonth)) / 12);
     return {
       month: m,
       mortgage_balance: round2(b.balance),
       stock_value: round2(sv),
-      total_value: round2((assessedTotal || 0) - b.balance + sv),
+      total_value: round2(assessedAt - b.balance + sv),
       interest: round2(b.interest),
     };
   });
@@ -919,27 +932,28 @@ export function reportCostBreakdown(comparison) {
 // A project with no template (created before templates, or Blank) is
 // LEGACY: planProjectTemplate returns null and the page keeps the full
 // generic panels. Section rule: a section renders only when the
-// template's schema includes it — a buy template shows neither the
-// Prime scenarios panel nor the Declared assets panel.
+// template's schema includes it — Declared assets is the only
+// template-gated section left (sell templates); prime scenarios were
+// replaced by per-strategy factors, so no template shows them.
 export const PLAN_PROJECT_TEMPLATES = {
   mortgage: {
     key: 'mortgage', label: 'Mortgage payoff',
-    sections: { primeScenarios: true, declaredAssets: false },
+    sections: { declaredAssets: false },
     fields: [{ key: 'property_id', label: 'Property', type: 'property', required: true }],
   },
   refinance: {
     key: 'refinance', label: 'Refinance / rate switch',
-    sections: { primeScenarios: true, declaredAssets: false },
+    sections: { declaredAssets: false },
     fields: [{ key: 'property_id', label: 'Property', type: 'property', required: true }],
   },
   buy: {
     key: 'buy', label: 'Buy with funding',
-    sections: { primeScenarios: false, declaredAssets: false },
+    sections: { declaredAssets: false },
     fields: [{ key: 'account_type', label: 'Account type', type: 'account_type', required: false }],
   },
   sell: {
     key: 'sell', label: 'Sell & redeploy',
-    sections: { primeScenarios: false, declaredAssets: true },
+    sections: { declaredAssets: true },
     fields: [],
   },
 };
@@ -998,19 +1012,6 @@ export function planOptSubcategory(category, subcategory) {
   const c = planOptCategory(category);
   return (c && subcategory && c.subcategories[subcategory]) || null;
 }
-// A baseline row's prime scenario as a projection scenario object.
-// Rows store the definition the user confirmed; the comparison math
-// takes the scenario object directly (no stored scenario row needed).
-export function planBaselineScenario(def) {
-  const ps = def && def.primeScenario;
-  if (!ps || !['up', 'flat', 'down'].includes(ps.direction)) return null;
-  return {
-    direction: ps.direction,
-    stance: ['pessimistic', 'optimistic', 'neutral'].includes(ps.stance) ? ps.stance : 'neutral',
-    magnitude: ps.magnitude != null ? Number(ps.magnitude) : null,
-    steps: Array.isArray(ps.steps) ? ps.steps : null,
-  };
-}
 export function planProjectSections(key) {
   const t = planProjectTemplate(key);
   return t ? t.sections : null;
@@ -1021,6 +1022,112 @@ export const PLAN_STRATEGY_TEMPLATE_LABELS = {
   payment_change: 'Payment change', buy: 'Buy', sell: 'Sell', position: 'Position',
   'ai-template': 'AI template',
 };
+// ---- Strategy factors -------------------------------------------------
+// A strategy = ops + user-picked factors. The factor library is
+// extensible; every factor is optional and unset means neutral/current
+// behavior. Shape (stored as JSON on the strategy row):
+//   { prime: { points: [{month: 'YYYY-MM', rate}], preset: key|null },
+//     stock: { valuePct, basis?, window? },
+//     propertyGrowth: { valuePct }, salaryGrowth: { valuePct },
+//     rentGrowth: { valuePct },
+//     sink: { kind: 'stock', holdingId, trendPct, basis?, window? }
+//           | { kind: 'custom', name, expectedReturnPct } }
+// Salary and rent growth are stored and labeled only — the engine has
+// no earnings leg, so they do not change numbers yet.
+export const PLAN_FACTOR_KEYS = ['prime', 'stock', 'propertyGrowth', 'salaryGrowth', 'rentGrowth', 'sink'];
+export const PLAN_PRIME_PRESETS = ['optimistic', 'pessimistic', 'up', 'down', 'flat'];
+export function validateStrategyFactors(factors, currentMonth = null) {
+  const errs = [];
+  if (factors == null) return errs;
+  if (typeof factors !== 'object' || Array.isArray(factors)) return ['factors must be an object'];
+  for (const k of Object.keys(factors)) if (!PLAN_FACTOR_KEYS.includes(k)) errs.push(`unknown factor ${k}`);
+  if (factors.prime != null) {
+    const p = factors.prime;
+    if (typeof p !== 'object' || Array.isArray(p)) errs.push('prime factor must be an object');
+    else {
+      if (p.preset != null && !PLAN_PRIME_PRESETS.includes(p.preset)) errs.push(`unknown prime preset ${p.preset}`);
+      const pts = p.points;
+      if (!Array.isArray(pts)) errs.push('prime points must be an array');
+      else {
+        let prev = '';
+        for (const pt of pts) {
+          if (!pt || !/^\d{4}-\d{2}$/.test(String(pt.month || ''))) { errs.push('prime point month must be YYYY-MM'); continue; }
+          if (pt.month <= prev) errs.push('prime points must be in increasing month order');
+          prev = pt.month;
+          if (currentMonth && pt.month < currentMonth) errs.push(`prime point ${pt.month} is in the past`);
+          const r = num(pt.rate);
+          if (r == null || r < 0 || r > 30) errs.push(`prime point ${pt.month} rate must be between 0 and 30`);
+        }
+      }
+    }
+  }
+  const pctField = (key, min, max) => {
+    const v = factors[key];
+    if (v == null) return;
+    if (typeof v !== 'object' || Array.isArray(v)) { errs.push(`${key} factor must be an object`); return; }
+    const x = num(v.valuePct);
+    if (x == null || x < min || x > max) errs.push(`${key} valuePct must be between ${min} and ${max}`);
+  };
+  pctField('stock', -90, 500);
+  pctField('propertyGrowth', -90, 500);
+  pctField('salaryGrowth', -90, 500);
+  pctField('rentGrowth', -90, 500);
+  if (factors.sink != null) {
+    const s = factors.sink;
+    if (typeof s !== 'object' || Array.isArray(s)) errs.push('sink must be an object');
+    else if (s.kind === 'stock') {
+      if (!Number.isInteger(s.holdingId)) errs.push('stock sink needs a holdingId');
+      const t = num(s.trendPct);
+      if (t == null || t < -90 || t > 500) errs.push('stock sink needs a trendPct between -90 and 500');
+    } else if (s.kind === 'custom') {
+      if (!String(s.name || '').trim()) errs.push('custom sink needs a name');
+      const r = num(s.expectedReturnPct);
+      if (r == null || r < -90 || r > 500) errs.push('custom sink needs an expectedReturnPct between -90 and 500');
+    } else errs.push(`unknown sink kind ${s.kind}`);
+  }
+  return errs;
+}
+// A prime factor's points as a projection scenario (steps the engine
+// merges onto the actual prime history). Empty points = no scenario:
+// the future holds at the last actual prime (do-nothing behavior).
+export function primeFactorToScenario(factors) {
+  const pts = factors && factors.prime && Array.isArray(factors.prime.points) ? factors.prime.points : [];
+  if (!pts.length) return null;
+  return { name: 'Strategy prime', steps: pts.map((p) => ({ date: `${p.month}-01`, rate: num(p.rate) })) };
+}
+// Factors overlay the confirmed assumptions: a set factor wins, an
+// unset one falls back to the confirmed value (or nothing).
+export function factorsToAssumptions(factors, confirmed = {}) {
+  const f = factors || {};
+  const a = { ...confirmed };
+  if (f.stock && num(f.stock.valuePct) != null) a.stockReturnPct = num(f.stock.valuePct);
+  if (f.propertyGrowth && num(f.propertyGrowth.valuePct) != null) a.propertyGrowthPct = num(f.propertyGrowth.valuePct);
+  return a;
+}
+// View-grouped prime presets: complete paths from the current prime,
+// labeled in plain words. Total moves and paces are agent-set defaults
+// the user can correct; picking a preset still allows editing points.
+//   Optimistic (prime down): falls 2.0 points over 2 years.
+//   Pessimistic (prime up): rises 2.0 points over 2 years.
+//   Up: rises 1.0 point over 1 year. Down: falls 1.0 point over 1 year.
+//   Flat: stays at today's rate (no points).
+export const PLAN_PRIME_PRESET_LABELS = {
+  optimistic: 'Prime falls 2.0 points over 2 years',
+  pessimistic: 'Prime rises 2.0 points over 2 years',
+  up: 'Prime rises 1.0 point over 1 year',
+  down: 'Prime falls 1.0 point over 1 year',
+  flat: 'Prime stays at today\u2019s rate',
+};
+export function primeFactorPresetPoints(preset, currentPrime, currentMonth) {
+  const base = num(currentPrime);
+  if (base == null || !currentMonth) return [];
+  const at = (months, delta) => ({ month: addMonthsYm(currentMonth, months), rate: round2(Math.max(0, base + delta)) });
+  if (preset === 'optimistic') return [at(3, -0.5), at(6, -1.0), at(12, -1.5), at(24, -2.0)];
+  if (preset === 'pessimistic') return [at(3, 0.5), at(6, 1.0), at(12, 1.5), at(24, 2.0)];
+  if (preset === 'up') return [at(3, 0.25), at(6, 0.5), at(9, 0.75), at(12, 1.0)];
+  if (preset === 'down') return [at(3, -0.25), at(6, -0.5), at(9, -0.75), at(12, -1.0)];
+  return []; // flat or unknown: no points = hold at today's rate
+}
 export function planStrategyTemplateLabel(key) {
   return PLAN_STRATEGY_TEMPLATE_LABELS[key] || key || '';
 }
@@ -1198,6 +1305,58 @@ export function returnSuggestionsFromPoints(points, todayYm) {
   });
   return out;
 }
+// A holding's CURRENT return rate, from its own stored price history
+// only — the same basis as the stock-factor trend suggestions. The
+// most recent annualized window wins (1y, then 3y, then 5y); a holding
+// with no usable window has no rate (flat, never invented). The
+// since-first-price window is not a current rate: it spans inception,
+// not a recent window.
+export function currentReturnRateFromPoints(points, todayYm) {
+  const sug = returnSuggestionsFromPoints(points, todayYm);
+  for (const label of ['1y', '3y', '5y']) {
+    const w = sug.find((x) => x.label === label && x.annualizedReturn != null);
+    if (w) return { ratePct: round4(w.annualizedReturn * 100), basis: 'Price CAGR', window: w.window };
+  }
+  return null;
+}
+
+// Pool item SHAPES only (no database): each item names exactly one
+// source (an account or a holding) and exactly one contribution (a
+// percent OF THAT SOURCE, or a CAD amount from it). Source-value
+// checks (amount vs value, price existence, account coverage) live in
+// the server validation, which has the database.
+export function validatePoolItemShapes(items) {
+  if (!Array.isArray(items) || !items.length) return 'pool needs at least one source';
+  const seenAccounts = new Set();
+  const seenHoldings = new Set();
+  for (const it of items) {
+    if (!it || typeof it !== 'object') return 'pool items need a source';
+    const hasAccount = it.accountId != null && it.accountId !== '';
+    const hasHolding = it.holdingId != null && it.holdingId !== '';
+    if (hasAccount === hasHolding) return 'pool items need exactly one source (an account or a holding)';
+    const hasPct = it.percent != null && it.percent !== '';
+    const hasAmt = it.amount != null && it.amount !== '';
+    if (hasPct === hasAmt) return 'pool items need exactly one contribution (a percent or an amount)';
+    if (hasPct) {
+      const pct = Number(it.percent);
+      if (!isFinite(pct) || pct <= 0 || pct > 100) return 'pool percentages must be above 0 and at most 100';
+    } else {
+      const amt = Number(it.amount);
+      if (!isFinite(amt) || amt <= 0) return 'pool amounts must be above 0';
+    }
+    if (hasAccount) {
+      if (!Number.isInteger(it.accountId)) return 'pool items need an account';
+      if (seenAccounts.has(it.accountId)) return 'pool has a duplicate account';
+      seenAccounts.add(it.accountId);
+    } else {
+      if (!Number.isInteger(it.holdingId)) return 'pool items need a holding';
+      if (seenHoldings.has(it.holdingId)) return 'pool has a duplicate holding';
+      seenHoldings.add(it.holdingId);
+    }
+  }
+  return null;
+}
+
 
 // ------------------------------------------------------- merge-write build --
 // Pure: given a strategy's ops (with legs) and the snapshot + current
