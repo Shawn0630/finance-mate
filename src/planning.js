@@ -851,6 +851,175 @@ export function reportCostBreakdown(comparison) {
   return { fees: round2(fees), penalty: round2(penalty), cashOut, total: round2(comparison.cost || 0) };
 }
 
+// ------------------------------------------- project template metadata --
+// TEMPLATE OWNS QUESTIONS: each project template declares its own
+// question/metadata schema and which project-page sections it shows.
+// A project with no template (created before templates, or Blank) is
+// LEGACY: planProjectTemplate returns null and the page keeps the full
+// generic panels. Section rule: a section renders only when the
+// template's schema includes it — a buy template shows neither the
+// Prime scenarios panel nor the Declared assets panel.
+export const PLAN_PROJECT_TEMPLATES = {
+  mortgage: {
+    key: 'mortgage', label: 'Mortgage payoff',
+    sections: { primeScenarios: true, declaredAssets: false },
+    fields: [{ key: 'property_id', label: 'Property', type: 'property', required: true }],
+  },
+  refinance: {
+    key: 'refinance', label: 'Refinance / rate switch',
+    sections: { primeScenarios: true, declaredAssets: false },
+    fields: [{ key: 'property_id', label: 'Property', type: 'property', required: true }],
+  },
+  buy: {
+    key: 'buy', label: 'Buy with funding',
+    sections: { primeScenarios: false, declaredAssets: false },
+    fields: [{ key: 'account_type', label: 'Account type', type: 'account_type', required: false }],
+  },
+  sell: {
+    key: 'sell', label: 'Sell & redeploy',
+    sections: { primeScenarios: false, declaredAssets: true },
+    fields: [],
+  },
+};
+// Null = legacy (no template schema): the project page keeps every panel.
+export function planProjectTemplate(key) {
+  return (key && PLAN_PROJECT_TEMPLATES[key]) || null;
+}
+export function planProjectSections(key) {
+  const t = planProjectTemplate(key);
+  return t ? t.sections : null;
+}
+// Human labels for applied strategy templates (op types + AI template).
+export const PLAN_STRATEGY_TEMPLATE_LABELS = {
+  prepay: 'Prepay', rate_switch: 'Rate switch', refinance: 'Refinance',
+  payment_change: 'Payment change', buy: 'Buy', sell: 'Sell', position: 'Position',
+  'ai-template': 'AI template',
+};
+export function planStrategyTemplateLabel(key) {
+  return PLAN_STRATEGY_TEMPLATE_LABELS[key] || key || '';
+}
+// AI snapshot: the app data the ai-model prompt is fed, so it stops
+// asking for numbers the app already holds (balances, terms, segments,
+// current prime + recent history, accounts, holdings). Pure: the caller
+// supplies rows; history is capped to the 12 latest points.
+export function buildPlanAiSnapshot({ properties = [], terms = [], segments = [], accounts = [], holdings = [], prime = null, primeHistory = [] } = {}) {
+  const props = (properties || []).map((p) => ({
+    id: p.id, address: p.address, mortgage_balance: p.mortgage_balance ?? null,
+    mortgage_balance_date: p.mortgage_balance_date || null, assessed_value: p.assessed_value ?? null,
+  }));
+  const termRows = (terms || []).map((t) => ({
+    id: t.id, property_id: t.property_id, start_date: t.start_date, term_months: t.term_months,
+    amortization_years: t.amortization_years ?? null, opening_balance: t.opening_balance ?? null,
+    payment_override: t.payment_override ?? null,
+  }));
+  const segRows = (segments || []).map((s) => ({
+    id: s.id, property_id: s.property_id, term_id: s.term_id ?? null, start_date: s.start_date,
+    rate_type: s.rate_type || null, annual_rate: s.annual_rate ?? null, spread: s.spread ?? null,
+    locked_on: s.locked_on || null, compounding: s.compounding || null, accrual: s.accrual || null,
+  }));
+  const hist = (primeHistory || []).slice(-12).map((h) => ({ date: h.date, rate: h.rate }));
+  return {
+    properties: props, terms: termRows, segments: segRows,
+    accounts: (accounts || []).map((a) => ({ id: a.id, name: a.name, type: a.type })),
+    holdings: (holdings || []).map((h) => ({ id: h.id, account_id: h.account_id, symbol: h.symbol, label: h.label, currency: h.currency })),
+    prime: prime != null ? prime : null, primeHistory: hist,
+  };
+}
+// Structured ask: the ai-model "ask" path returns questions naming
+// metadata fields, never a free-text dead end. A legacy string ask
+// becomes one text question; anything else is rejected (null).
+export function normalizeAiAsk(ask) {
+  if (typeof ask === 'string' && ask.trim()) return [{ field: 'answer', label: ask.trim(), type: 'text' }];
+  if (Array.isArray(ask)) {
+    const out = [];
+    for (const q of ask) {
+      if (!q || typeof q.field !== 'string' || !q.field.trim()) return null;
+      if (typeof q.label !== 'string' || !q.label.trim()) return null;
+      const type = ['text', 'number', 'date'].includes(q.type) ? q.type : 'text';
+      out.push({ field: q.field.trim(), label: q.label.trim(), type });
+    }
+    return out.length ? out : null;
+  }
+  return null;
+}
+// AI-model conversation thread: turns are {role: 'ai', questions: [...]}
+// or {role: 'user', answers: {...}}. The thread is the interaction
+// layer — the client renders it, each Design call sends the accumulated
+// turns so the model continues the same conversation, and concluded
+// answers still land in the template metadata. sanitizeAiThread keeps
+// only well-formed turns (cap 50); renderAiThreadText renders it for
+// the prompt.
+export function sanitizeAiThread(thread) {
+  if (!Array.isArray(thread)) return [];
+  const out = [];
+  for (const t of thread) {
+    if (!t || typeof t !== 'object') continue;
+    if (t.role === 'ai' && Array.isArray(t.questions)) {
+      const qs = t.questions
+        .filter((q) => q && typeof q.field === 'string' && q.field.trim() && typeof q.label === 'string' && q.label.trim())
+        .map((q) => ({ field: q.field.trim(), label: q.label.trim(), type: ['text', 'number', 'date'].includes(q.type) ? q.type : 'text' }));
+      if (qs.length) out.push({ role: 'ai', questions: qs });
+    } else if (t.role === 'user' && t.answers && typeof t.answers === 'object' && !Array.isArray(t.answers)) {
+      out.push({ role: 'user', answers: t.answers });
+    }
+  }
+  return out.slice(-50);
+}
+export function appendAiThread(thread, turn) {
+  return [...sanitizeAiThread(thread), turn].slice(-50);
+}
+export function renderAiThreadText(thread) {
+  const lines = [];
+  for (const t of sanitizeAiThread(thread)) {
+    if (t.role === 'ai') for (const q of t.questions) lines.push(`AI asked: ${q.label} (${q.field})`);
+    else for (const [k, v] of Object.entries(t.answers)) lines.push(`User answered: ${k} = ${v}`);
+  }
+  return lines.join('\n');
+}
+// Strategy-centric comparison deltas.
+// Equity Δ (peak advantage): the largest month-by-month total-balance
+// advantage the strategy ever holds over baseline, summed across
+// properties. Assessed cancels (both sides share the roll), so the
+// delta is baseline balance − strategy balance. Series run to payoff,
+// so carrying the last row forward past a series end is the payoff
+// balance (≈0) — the peak never collapses to 0 just because both loans
+// amortize away by the 30-year horizon. Missing runs fall back to the
+// other side (delta 0).
+export function equityDeltaPeak(strategyProj) {
+  if (!strategyProj || !strategyProj.mortgage) return null;
+  const per = strategyProj.mortgage.perProperty || {};
+  const props = Object.values(per).map((p) => ({
+    b: [...(p.baseline?.series || [])].sort((x, y) => (x.month < y.month ? -1 : 1)),
+    s: [...(p.strategy?.series || [])].sort((x, y) => (x.month < y.month ? -1 : 1)),
+  }));
+  const months = new Set();
+  for (const p of props) for (const r of [...p.b, ...p.s]) if (r.month != null) months.add(r.month);
+  const balAt = (rows, m) => {
+    let v = 0;
+    for (const r of rows) {
+      if (r.month <= m) v = Number(r.balance) || 0;
+      else break;
+    }
+    return v;
+  };
+  let peak = null;
+  for (const m of [...months].sort()) {
+    let d = 0;
+    for (const p of props) d += balAt(p.b, m) - balAt(p.s, m);
+    peak = peak == null ? d : Math.max(peak, d);
+  }
+  return peak == null ? 0 : round2(peak);
+}
+// Principal Δ: cash deployed into holdings by buy operations, strategy
+// minus baseline. Starting value cancels (both share the snapshot), so
+// this is buyCash strategy − buyCash baseline.
+export function principalDeltaVsBaseline(baselineProj, strategyProj) {
+  if (!baselineProj || !strategyProj) return null;
+  const b = (baselineProj.stocks && baselineProj.stocks.buyCash) || 0;
+  const s = (strategyProj.stocks && strategyProj.stocks.buyCash) || 0;
+  return round2(s - b);
+}
+
 // ------------------------------------------- historical return suggestions --
 // Pure, from stored price points only. Each suggestion labels its ACTUAL
 // covered window; a short window is never labeled as 1y/3y/5y. Windows

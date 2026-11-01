@@ -10842,6 +10842,12 @@ $('#planProjectForm').addEventListener('submit', async (e) => {
       showMsg(msg, 'err', 'Select a property'); return;
     }
     const body = { name: form.name.value.trim(), question: form.question.value.trim() || null };
+    if (!id && tpl && tpl !== 'blank') {
+      body.template = tpl;
+      if (tpl === 'mortgage' || tpl === 'refinance') body.metadata = { property_id: Number($('#planProjectProperty').value) };
+      else if (tpl === 'buy') body.metadata = $('#planProjectAccountType').value ? { account_type: $('#planProjectAccountType').value } : {};
+      else if (tpl === 'sell') body.metadata = {};
+    }
     const data = id ? await api(`/api/planning/projects/${id}`, { method: 'PUT', body })
       : await api('/api/planning/projects', { method: 'POST', body });
     closeModalEl($('#planProjectModal'));
@@ -10864,6 +10870,16 @@ async function loadPlanProject(id) {
 }
 function planProjectHtml(d) {
   const p = d.project;
+  // TEMPLATE OWNS QUESTIONS: a templated project shows its Metadata
+  // panel plus only the sections its template schema includes; a legacy
+  // project (no template schema) keeps every generic panel.
+  const templated = !!d.project.templateSchema;
+  const sections = templated ? d.project.templateSchema.sections : { primeScenarios: true, declaredAssets: true };
+  const metaRows = templated ? (d.project.templateSchema.fields || []).map((f) => {
+    const v = (d.project.metadata || {})[f.key];
+    const label = d.project.metadataLabels && d.project.metadataLabels[f.key] ? d.project.metadataLabels[f.key] : (v ?? '');
+    return `<div class="plan-row"><span>${esc(f.label)}</span><span>${esc(String(label))}</span></div>`;
+  }).join('') : '';
   return `
     <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
     <div class="panel">
@@ -10877,9 +10893,16 @@ function planProjectHtml(d) {
       <div class="note">${esc(p.question || '')}</div>
       <div class="msg" id="planProjectMsg"></div>
     </div>
+    ${templated ? `<div class="panel" id="planMetadataPanel">
+      <div class="section-head"><h3>Metadata · ${esc(d.project.templateSchema.label)}</h3>
+        <div class="toolbar"><button class="small" id="planMetadataEditBtn">Edit</button></div>
+      </div>
+      <div id="planMetadataView">${metaRows || '<div class="note">No metadata yet.</div>'}</div>
+      <div class="msg" id="planMetadataMsg"></div>
+    </div>` : ''}
     <div class="panel" id="planComparePanel">
       <div class="section-head"><h3>Comparison</h3>
-        <div class="toolbar"><label>Future world</label><select id="planCompareScenario"></select>
+        <div class="toolbar"><span id="planCompareScenarioWrap"><label>Future world</label><select id="planCompareScenario"></select></span>
         <button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
       </div>
       <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
@@ -10889,18 +10912,18 @@ function planProjectHtml(d) {
       <div class="section-head"><h3>Strategies</h3></div>
       <div id="planStrategyCards"></div>
     </div>
-    <div class="panel">
+    ${sections.primeScenarios ? `<div class="panel" id="planScenarioPanel">
       <div class="section-head"><h3>Prime scenarios</h3>
         <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
       </div>
       <div id="planScenarioList"></div>
-    </div>
-    <div class="panel">
+    </div>` : ''}
+    ${sections.declaredAssets ? `<div class="panel" id="planAssetPanel">
       <div class="section-head"><h3>Declared fixed-term assets</h3>
         <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
       </div>
       <div id="planAssetList"></div>
-    </div>
+    </div>` : ''}
     <div class="panel">
       <div class="section-head"><h3>Reports</h3>
         <div class="toolbar"><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
@@ -10926,19 +10949,67 @@ function planProjectWire(d) {
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   });
   $('#planAddStrategyBtn').addEventListener('click', () => openPlanStrategyModal(p.id));
-  $('#planAddScenarioBtn').addEventListener('click', () => openPlanScenarioModal(p.id));
-  $('#planAddAssetBtn').addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
+  const scBtn = $('#planAddScenarioBtn');
+  if (scBtn) scBtn.addEventListener('click', () => openPlanScenarioModal(p.id));
+  const asBtn = $('#planAddAssetBtn');
+  if (asBtn) asBtn.addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
   $('#planAddReportBtn').addEventListener('click', () => planSaveReport(p.id));
   $('#planAiReportBtn').addEventListener('click', () => openPlanReportAiModal(p.id));
+  // Prime outlook control lives with the scenarios section: hide it on
+  // templated projects whose template does not ask about prime.
+  const templated = !!p.templateSchema;
+  const sections = templated ? p.templateSchema.sections : { primeScenarios: true, declaredAssets: true };
+  if (templated && !sections.primeScenarios) {
+    const wrap = $('#planCompareScenarioWrap');
+    if (wrap) wrap.classList.add('hidden');
+  }
+  // Metadata panel: Edit swaps the answer rows for the schema's fields.
+  const metaEditBtn = $('#planMetadataEditBtn');
+  if (metaEditBtn) metaEditBtn.addEventListener('click', async () => {
+    const view = $('#planMetadataView');
+    const fields = p.templateSchema.fields || [];
+    let props = [];
+    if (fields.some((f) => f.type === 'property')) {
+      try {
+        const pr = await api('/api/properties');
+        props = (pr.properties || pr || []).filter((x) => (x.terms && x.terms.length > 0) || x.mortgage_balance != null);
+      } catch { props = []; }
+    }
+    const cur = p.metadata || {};
+    view.innerHTML = fields.map((f) => {
+      if (f.type === 'property') return `<div><label>${esc(f.label)}${f.required ? ' *' : ''}</label><select id="planMetaField_${f.key}"><option value="">Select a property</option>${props.map((x) => `<option value="${x.id}"${Number(cur[f.key]) === Number(x.id) ? ' selected' : ''}>${esc(x.address)}</option>`).join('')}</select></div>`;
+      if (f.type === 'account_type') return `<div><label>${esc(f.label)}</label><select id="planMetaField_${f.key}"><option value="">Any</option>${['TFSA', 'RRSP', 'NonRegistered'].map((t) => `<option${cur[f.key] === t ? ' selected' : ''}>${t}</option>`).join('')}</select></div>`;
+      return `<div><label>${esc(f.label)}</label><input id="planMetaField_${f.key}" value="${esc(String(cur[f.key] ?? ''))}"></div>`;
+    }).join('') + `<div class="toolbar"><button class="small primary" id="planMetadataSaveBtn">Save</button><button class="small" id="planMetadataCancelBtn">Cancel</button></div>`;
+    $('#planMetadataCancelBtn').addEventListener('click', () => loadPlanProject(p.id));
+    $('#planMetadataSaveBtn').addEventListener('click', async () => {
+      const msg = $('#planMetadataMsg');
+      try {
+        const meta = {};
+        for (const f of fields) {
+          const el = document.querySelector(`#planMetaField_${f.key}`);
+          const v = el ? el.value : '';
+          if (f.required && !v) throw new Error(`${f.label} is required`);
+          if (f.type === 'property') meta[f.key] = v ? Number(v) : null;
+          else meta[f.key] = v || null;
+        }
+        await api(`/api/planning/projects/${p.id}`, { method: 'PUT', body: { metadata: meta } });
+        loadPlanProject(p.id);
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  });
   const sel = $('#planCompareScenario');
   sel.innerHTML = d.scenarios.map((s) => `<option value="${s.id}"${s.is_base ? ' selected' : ''}>${esc(s.name)}</option>`).join('');
   sel.addEventListener('change', () => loadPlanComparison(p.id, Number(sel.value)));
-  $('#planScenarioList').innerHTML = d.scenarios.map((s) => `
+  const scenList = $('#planScenarioList');
+  if (scenList) {
+    scenList.innerHTML = d.scenarios.map((s) => `
     <div class="plan-row"><span>${esc(s.name)} · ${esc(s.direction)} · ${esc(s.stance)}${s.magnitude != null ? ` · ${s.magnitude}%` : ''}${s.is_base ? ' · Base' : ''}</span>
     <span class="toolbar">
       ${s.is_base ? '' : `<button class="small" data-plan-scenario-base="${s.id}">Set as base</button>`}
       ${s.is_base ? '' : `<button class="small danger" data-plan-scenario-del="${s.id}">Delete</button>`}
     </span></div>`).join('') || '<div class="note">No scenarios.</div>';
+  }
   document.querySelectorAll('[data-plan-scenario-base]').forEach((b) => b.addEventListener('click', async () => {
     try { await api(`/api/planning/scenarios/${b.dataset.planScenarioBase}/set-base`, { method: 'POST' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
@@ -10947,9 +11018,12 @@ function planProjectWire(d) {
     try { await api(`/api/planning/scenarios/${b.dataset.planScenarioDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   }));
-  $('#planAssetList').innerHTML = d.declaredAssets.map((a) => `
+  const assetList = $('#planAssetList');
+  if (assetList) {
+    assetList.innerHTML = d.declaredAssets.map((a) => `
     <div class="plan-row"><span>${esc(a.name)} · ${money2(a.amount)}${a.maturity_date ? ` · matures ${esc(a.maturity_date)}` : ''}</span>
     <button class="small danger" data-plan-asset-del="${a.id}">Delete</button></div>`).join('') || '<div class="note">No declared assets.</div>';
+  }
   document.querySelectorAll('[data-plan-asset-del]').forEach((b) => b.addEventListener('click', async () => {
     try { await api(`/api/planning/declared-assets/${b.dataset.planAssetDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
@@ -10972,17 +11046,29 @@ async function loadPlanComparison(projectId, scenarioId) {
   const data = await api(`/api/planning/projects/${projectId}/comparison${q}`);
   planCompareScenarioId = (data.scenario || {}).id || null;
   const rows = data.strategies;
-  const head = `<tr><th></th><th>Baseline</th>${rows.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('')}</tr>`;
-  const numRow = (label, fn) => `<tr><td>${label}</td><td>${fn(null)}</td>${rows.map((r) => `<td>${fn(r.comparison)}</td>`).join('')}</tr>`;
-  $('#planCompareTable').innerHTML = `
+  // COMPARISON IS THE FINAL OUTPUT, STRATEGY-CENTRIC: with zero
+  // strategies there is nothing to compare, so the table does not
+  // render at all — only the baseline trajectory chart. With strategies,
+  // columns are strategies only: no baseline column, no baseline
+  // absolute. Baseline stays the reference the deltas are computed
+  // against (and the chart's baseline line), never a displayed column.
+  if (!rows.length) {
+    $('#planCompareTable').innerHTML = '';
+  } else {
+    const head = `<tr><th></th>${rows.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('')}</tr>`;
+    const numRow = (label, fn) => `<tr><td>${label}</td>${rows.map((r) => `<td>${fn(r)}</td>`).join('')}</tr>`;
+    $('#planCompareTable').innerHTML = `
     <table class="tbl"><thead>${head}</thead><tbody>
-      ${numRow('Total cost', (c) => (c ? planMoney(c.cost) : '—'))}
-      ${numRow('Total gain', (c) => (c ? planMoney(c.gain) : '—'))}
-      ${numRow('Net benefit', (c) => (c ? planSigned(c.net) : '—'))}
-      ${numRow('Payoff shift (months)', (c) => (c && c.payoffShiftMonths != null ? c.payoffShiftMonths : '—'))}
-      ${numRow('Monthly payment Δ', (c) => (c ? planSigned(c.paymentDelta) : '—'))}
-      ${numRow('Value at horizon', (c) => (c ? planMoney(c.valueAtHorizon) : planMoney(data.baseline.valueAtHorizon)))}
-    </tbody></table>`;
+      ${numRow('Total cost', (r) => planMoney(r.comparison.cost))}
+      ${numRow('Total gain', (r) => planMoney(r.comparison.gain))}
+      ${numRow('Net benefit', (r) => planSigned(r.comparison.net))}
+      ${numRow('Equity Δ', (r) => (r.equityDelta != null ? planSigned(r.equityDelta) : '—'))}
+      ${numRow('Principal Δ', (r) => (r.principalDelta != null ? planSigned(r.principalDelta) : '—'))}
+      ${numRow('Payoff shift (months)', (r) => (r.comparison.payoffShiftMonths != null ? r.comparison.payoffShiftMonths : '—'))}
+      ${numRow('Monthly payment Δ', (r) => planSigned(r.comparison.paymentDelta))}
+    </tbody></table>
+    <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations).</div>`;
+  }
   // Balance lines: baseline + each strategy, summed across properties.
   const sumBalance = (proj) => {
     const byMonth = new Map();
@@ -11320,6 +11406,7 @@ function planStrategyHtml(d) {
         </div>
       </div>
       <div class="msg" id="planStrategyMsg"></div>
+      ${s.template ? `<div class="note">Template: ${esc({ prepay: 'Prepay', rate_switch: 'Rate switch', refinance: 'Refinance', payment_change: 'Payment change', buy: 'Buy', sell: 'Sell', position: 'Position', 'ai-template': 'AI template' }[s.template] || s.template)}</div>` : ''}
       ${c.errors && c.errors.length ? `<div class="msg err">${esc(c.errors.join('; '))}</div>` : ''}
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
@@ -11810,6 +11897,7 @@ async function openPlanStrategyModal(projectId) {
       <div class="card breakdown-card" id="planChooseTemplate" style="cursor:pointer"><div class="k">From template</div><div class="n">A single operation: prepay, switch, refinance, buy or sell.</div></div>
       <div class="card breakdown-card" id="planChooseDescribe" style="cursor:pointer"><div class="k">Describe in words</div><div class="n">Write the plan; AI turns it into operations for your confirmation.</div></div>
       <div class="card breakdown-card" id="planChooseModel" style="cursor:pointer"><div class="k">Let AI design a model</div><div class="n">AI proposes a full model spec: bindings, formulas, assumptions, outputs, charts.</div></div>
+      <div class="card breakdown-card" id="planChooseSaved" style="cursor:pointer"><div class="k">From saved template</div><div class="n">Apply a saved AI template to a new strategy.</div></div>
     </div>`;
   openModal('planStrategyModal');
   const ctx = await planLoadOpCtx(projectId, null);
@@ -11843,7 +11931,9 @@ async function openPlanStrategyModal(projectId) {
         const curType = $('#planStrategyOpType').value;
         const { params, legs } = planReadOpForm(curType);
         if (!params.date) throw new Error('date is required');
-        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'template' } });
+        // Applying a strategy template records the template + answers
+        // on the strategy; the op list underneath stays the computation.
+        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'template', template: curType, template_params: params } });
         await api(`/api/planning/strategies/${s.strategy.id}/ops`, { method: 'POST', body: { op_type: curType, params, legs } });
         closeModalEl($('#planStrategyModal'));
         location.hash = `#planning/strategy/${s.strategy.id}`;
@@ -11886,8 +11976,81 @@ async function openPlanStrategyModal(projectId) {
     $('#planStrategyModalBody').innerHTML = `
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
       <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out"></textarea></div>
+      <div id="planStrategyModelThread"></div>
       <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
       <div id="planStrategyModelOut"></div>`;
+    // One strategy row for the whole design session: repeated Design
+    // clicks (after answering questions) reuse it instead of orphaning
+    // a new empty strategy per round.
+    let modelSid = null;
+    let modelAsk = null;
+    let modelAnswers = null;
+    let modelThread = null;
+    // The conversation thread, rendered as turns: AI questions stay
+    // visible next to the user's answers; each Design call sends the
+    // accumulated turns so the model continues instead of restarting.
+    const renderModelThread = () => {
+      const el = $('#planStrategyModelThread');
+      if (!el) return;
+      if (!modelThread || !modelThread.length) { el.innerHTML = ''; return; }
+      el.innerHTML = modelThread.map((t) => {
+        if (t.role === 'ai') return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
+        return Object.entries(t.answers || {}).map(([k, v]) => `<div class="plan-row"><span>You: ${esc(k)} = ${esc(String(v))}</span></div>`).join('');
+      }).join('');
+    };
+    const design = async (msg, name, text, answers) => {
+      if (!modelSid) {
+        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'ai' } });
+        modelSid = s.strategy.id;
+      }
+      const r = await api(`/api/planning/strategies/${modelSid}/ai-model`, { method: 'POST', body: { text, name, answers, history: modelThread } });
+      if (r.ask) {
+        // Structured ask: questions naming metadata fields, answered in
+        // a form — never the old free-text dead end. Answers are kept
+        // as the model's metadata and offered as the template schema.
+        modelAsk = r.ask;
+        modelAnswers = answers || null;
+        modelThread = r.thread || modelThread;
+        renderModelThread();
+        $('#planStrategyModelOut').innerHTML = `
+          ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planModelAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}" data-money="${q.type === 'number' ? '' : null}"></div>`).join('')}
+          <div class="toolbar"><button class="small primary" id="planStrategyModelContinue">Continue design</button></div>`;
+        $('#planStrategyModelContinue').addEventListener('click', async () => {
+          try {
+            const next = {};
+            for (const q of r.ask) {
+              const el = document.querySelector(`#planModelAsk_${CSS.escape(q.field)}`);
+              const v = el ? el.value.trim() : '';
+              if (!v) throw new Error(`${q.label} is required`);
+              next[q.field] = q.type === 'number' ? Number(v) : v;
+            }
+            await design(msg, name, text, next);
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        });
+        return;
+      }
+      const spec = r.model.spec;
+      modelAnswers = r.model.metadata || modelAnswers;
+      modelThread = r.thread || modelThread;
+      renderModelThread();
+      $('#planStrategyModelOut').innerHTML = `
+          <div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div>
+          <div class="toolbar"><button class="small primary" id="planStrategyModelAttach">Use this model</button><button class="small" id="planStrategyModelSaveTpl">Save as template</button></div>
+          <div class="msg" id="planStrategyModelTplMsg"></div>`;
+      $('#planStrategyModelAttach').addEventListener('click', async () => {
+        try {
+          await api(`/api/planning/strategies/${modelSid}`, { method: 'PUT', body: { model_id: r.model.id } });
+          closeModalEl($('#planStrategyModal'));
+          location.hash = `#planning/strategy/${modelSid}`;
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      });
+      $('#planStrategyModelSaveTpl').addEventListener('click', async () => {
+        try {
+          await api('/api/planning/templates', { method: 'POST', body: { name, spec, metadata_schema: modelAsk || [], metadata_answers: modelAnswers } });
+          showMsg($('#planStrategyModelTplMsg'), 'ok', 'Saved as template');
+        } catch (err) { showMsg($('#planStrategyModelTplMsg'), 'err', err.message); }
+      });
+    };
     $('#planStrategyModelBtn').addEventListener('click', async () => {
       const msg = $('#planStrategyModalMsg');
       try {
@@ -11895,25 +12058,46 @@ async function openPlanStrategyModal(projectId) {
         const text = $('#planStrategyModelText').value.trim();
         if (!name) throw new Error('strategy name is required');
         if (!text) throw new Error('describe the model first');
-        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'ai' } });
-        const r = await api(`/api/planning/strategies/${s.strategy.id}/ai-model`, { method: 'POST', body: { text, name } });
-        if (r.ask) {
-          $('#planStrategyModelOut').innerHTML = `<div class="msg warn">${esc(r.ask)}</div><div class="note">Answer the question above, then design again.</div>`;
-          return;
-        }
-        const spec = r.model.spec;
-        $('#planStrategyModelOut').innerHTML = `
-          <div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div>
-          <div class="toolbar"><button class="small primary" id="planStrategyModelAttach">Use this model</button></div>`;
-        $('#planStrategyModelAttach').addEventListener('click', async () => {
-          try {
-            await api(`/api/planning/strategies/${s.strategy.id}`, { method: 'PUT', body: { model_id: r.model.id } });
-            closeModalEl($('#planStrategyModal'));
-            location.hash = `#planning/strategy/${s.strategy.id}`;
-          } catch (err) { showMsg(msg, 'err', err.message); }
-        });
+        await design(msg, name, text, null);
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
+  });
+  $('#planChooseSaved').addEventListener('click', async () => {
+    const msg = $('#planStrategyModalMsg');
+    try {
+      const t = await api('/api/planning/templates');
+      const list = t.templates || [];
+      $('#planStrategyModalBody').innerHTML = `
+      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
+      ${list.length ? `<div><label>Saved template *</label><select id="planSavedTemplateSel">${list.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>
+      <div id="planSavedTemplateQs"></div>
+      <div class="toolbar"><button class="primary" id="planSavedTemplateApply">Apply template</button></div>`
+        : '<div class="note">No saved templates yet.</div>'}`;
+      const sel = $('#planSavedTemplateSel');
+      const renderQs = () => {
+        const cur = list.find((x) => String(x.id) === String(sel.value));
+        const schema = (cur && cur.metadata_schema) || [];
+        const saved = (cur && cur.metadata_answers) || {};
+        $('#planSavedTemplateQs').innerHTML = schema.map((q) => `<div><label>${esc(q.label)}</label><input id="planSavedAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}" value="${esc(String(saved[q.field] ?? ''))}"></div>`).join('');
+      };
+      if (sel) { renderQs(); sel.addEventListener('change', renderQs); }
+      const applyBtn = $('#planSavedTemplateApply');
+      if (applyBtn) applyBtn.addEventListener('click', async () => {
+        try {
+          const name = $('#planStrategyName').value.trim();
+          if (!name) throw new Error('strategy name is required');
+          const cur = list.find((x) => String(x.id) === String(sel.value));
+          const answers = {};
+          for (const q of (cur.metadata_schema || [])) {
+            const el = document.querySelector(`#planSavedAsk_${CSS.escape(q.field)}`);
+            if (el && el.value.trim() !== '') answers[q.field] = q.type === 'number' ? Number(el.value) : el.value;
+          }
+          const r = await api(`/api/planning/projects/${projectId}/strategies/from-template`, { method: 'POST', body: { name, template_id: Number(sel.value), answers } });
+          closeModalEl($('#planStrategyModal'));
+          location.hash = `#planning/strategy/${r.strategy.id}`;
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      });
+    } catch (err) { showMsg(msg, 'err', err.message); }
   });
 }
 

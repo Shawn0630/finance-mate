@@ -9,6 +9,10 @@ import {
   validateOp, validateLegs, computeProjection, compareProjections,
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
   resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
+  planProjectTemplate, planProjectSections, planStrategyTemplateLabel,
+  buildPlanAiSnapshot, normalizeAiAsk,
+  sanitizeAiThread, appendAiThread, renderAiThreadText,
+  equityDeltaPeak, principalDeltaVsBaseline,
 } from '../src/planning.js';
 
 const PROP = () => ({
@@ -252,4 +256,118 @@ test('reportCostBreakdown: cash out is the remainder after fees and penalty', ()
   assert.deepEqual(bd, { fees: 500, penalty: 1500, cashOut: 10000, total: 12000 });
   assert.equal(reportCostBreakdown(null), null);
   assert.deepEqual(reportCostBreakdown({ cost: 0, fees: 0, penaltyTotal: 0 }), { fees: 0, penalty: 0, cashOut: 0, total: 0 });
+});
+
+// ------------------------------------------------------- template metadata
+test('planProjectTemplate: mortgage/refinance show prime scenarios only; buy shows neither; sell shows declared assets; blank/unknown are legacy', () => {
+  assert.deepEqual(planProjectSections('mortgage'), { primeScenarios: true, declaredAssets: false });
+  assert.deepEqual(planProjectSections('refinance'), { primeScenarios: true, declaredAssets: false });
+  assert.deepEqual(planProjectSections('buy'), { primeScenarios: false, declaredAssets: false });
+  assert.deepEqual(planProjectSections('sell'), { primeScenarios: false, declaredAssets: true });
+  assert.equal(planProjectTemplate('blank'), null);
+  assert.equal(planProjectTemplate('nope'), null);
+  assert.equal(planProjectTemplate(null), null);
+  assert.equal(planProjectTemplate('mortgage').fields[0].key, 'property_id');
+  assert.equal(planProjectTemplate('buy').fields[0].key, 'account_type');
+  assert.equal(planStrategyTemplateLabel('prepay'), 'Prepay');
+  assert.equal(planStrategyTemplateLabel('ai-template'), 'AI template');
+});
+
+test('buildPlanAiSnapshot: carries balances, terms, segments, prime and capped history', () => {
+  const snap = buildPlanAiSnapshot({
+    properties: [{ id: 1, address: '1 Test Way', mortgage_balance: 500000, mortgage_balance_date: '2026-10-01', assessed_value: 900000 }],
+    terms: [{ id: 1, property_id: 1, start_date: '2024-12-17', term_months: 60, amortization_years: 30, opening_balance: 1350000, payment_override: null }],
+    segments: [{ id: 1, property_id: 1, term_id: 1, start_date: '2024-12-17', rate_type: 'variable', annual_rate: null, spread: -1, locked_on: '2024-12-17', compounding: 'semi_annual', accrual: 'daily' }],
+    accounts: [{ id: 1, name: 'TFSA', type: 'TFSA' }],
+    holdings: [{ id: 1, account_id: 1, symbol: 'XQQ.TO', label: 'XQQ', currency: 'CAD' }],
+    prime: 4.70,
+    primeHistory: Array.from({ length: 20 }, (_, i) => ({ date: `2025-${String((i % 12) + 1).padStart(2, '0')}-01`, rate: 4.45 })),
+  });
+  assert.equal(snap.properties[0].mortgage_balance, 500000);
+  assert.equal(snap.terms[0].term_months, 60);
+  assert.equal(snap.segments[0].spread, -1);
+  assert.equal(snap.prime, 4.70);
+  assert.equal(snap.primeHistory.length, 12);
+  assert.equal(snap.accounts[0].type, 'TFSA');
+  assert.equal(snap.holdings[0].symbol, 'XQQ.TO');
+});
+
+test('normalizeAiAsk: structured questions pass through; a legacy string becomes one question; junk is rejected', () => {
+  assert.deepEqual(normalizeAiAsk([{ field: 'target', label: 'Target amount?', type: 'number' }]),
+    [{ field: 'target', label: 'Target amount?', type: 'number' }]);
+  assert.deepEqual(normalizeAiAsk('What balance?'), [{ field: 'answer', label: 'What balance?', type: 'text' }]);
+  assert.equal(normalizeAiAsk([{ field: '', label: 'x' }]), null);
+  assert.equal(normalizeAiAsk([{ label: 'no field' }]), null);
+  assert.equal(normalizeAiAsk([]), null);
+  assert.equal(normalizeAiAsk(null), null);
+  assert.equal(normalizeAiAsk('  '), null);
+});
+
+test('ai thread: sanitize drops malformed turns and caps at 50; append grows the thread; render prints both roles', () => {
+  const raw = [
+    { role: 'ai', questions: [{ field: 'target', label: 'Target amount?', type: 'number' }] },
+    { role: 'user', answers: { target: 50000 } },
+    { role: 'ai' },
+    { role: 'user', answers: 'not an object' },
+    'junk',
+    null,
+  ];
+  const clean = sanitizeAiThread(raw);
+  assert.equal(clean.length, 2);
+  assert.equal(clean[0].role, 'ai');
+  assert.equal(clean[1].answers.target, 50000);
+  const grown = appendAiThread(clean, { role: 'ai', questions: [{ field: 'rate', label: 'Rate?', type: 'number' }] });
+  assert.equal(grown.length, 3);
+  assert.equal(clean.length, 2); // append does not mutate
+  const text = renderAiThreadText(grown);
+  assert.ok(text.includes('AI asked: Target amount? (target)'));
+  assert.ok(text.includes('User answered: target = 50000'));
+  assert.ok(text.includes('AI asked: Rate? (rate)'));
+  const capped = sanitizeAiThread(Array.from({ length: 60 }, (_, i) => ({ role: 'user', answers: { n: i } })));
+  assert.equal(capped.length, 50);
+  assert.equal(capped[0].answers.n, 10); // oldest turns dropped, newest kept
+  assert.deepEqual(sanitizeAiThread('nope'), []);
+  assert.deepEqual(sanitizeAiThread(null), []);
+});
+
+test('equityDeltaPeak: peak month-by-month balance advantage, last row carried forward past a series end', () => {
+  const proj = {
+    mortgage: {
+      perProperty: {
+        1: {
+          baseline: { series: [
+            { month: '2026-11', balance: 100000 }, { month: '2026-12', balance: 99000 }, { month: '2027-01', balance: 98000 },
+          ] },
+          strategy: { series: [
+            { month: '2026-11', balance: 95000 }, { month: '2026-12', balance: 94000 },
+          ] },
+        },
+      },
+    },
+  };
+  // Nov: 5000, Dec: 5000, Jan: 98000 − 94000 (carried) = 4000 → peak 5000.
+  assert.equal(equityDeltaPeak(proj), 5000);
+  // Payoff case: the strategy series ends at 0, so later months count
+  // the full remaining baseline balance.
+  const payoff = {
+    mortgage: {
+      perProperty: {
+        1: {
+          baseline: { series: [{ month: '2026-11', balance: 10000 }, { month: '2026-12', balance: 9000 }] },
+          strategy: { series: [{ month: '2026-11', balance: 0 }] },
+        },
+      },
+    },
+  };
+  assert.equal(equityDeltaPeak(payoff), 10000);
+  assert.equal(equityDeltaPeak({ mortgage: { perProperty: {} } }), 0);
+  assert.equal(equityDeltaPeak(null), null);
+});
+
+test('principalDeltaVsBaseline: buyCash difference; starting value cancels', () => {
+  const base = { stocks: { startingValue: 40000, buyCash: 0 } };
+  const strat = { stocks: { startingValue: 40000, buyCash: 600 } };
+  assert.equal(principalDeltaVsBaseline(base, strat), 600);
+  assert.equal(principalDeltaVsBaseline(base, base), 0);
+  assert.equal(principalDeltaVsBaseline(null, strat), null);
 });

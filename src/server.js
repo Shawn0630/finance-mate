@@ -45,6 +45,9 @@ import {
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
   reportMonthlySeries, reportCostBreakdown,
+  planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
+  sanitizeAiThread, appendAiThread, renderAiThreadText,
+  equityDeltaPeak, principalDeltaVsBaseline,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -3896,19 +3899,63 @@ app.get('/api/planning/projects', requireApiAuth, (req, res) => {
   res.json({ projects: out });
 });
 
+// Template metadata validation: a template's required fields must be
+// present and reference real rows. Returns an error string or null.
+function planValidateProjectMetadata(template, metadata) {
+  const schema = planProjectTemplate(template);
+  if (!schema) return null;
+  const meta = metadata && typeof metadata === 'object' ? metadata : {};
+  for (const f of schema.fields) {
+    if (!f.required) continue;
+    const v = meta[f.key];
+    if (v === undefined || v === null || v === '') return `${f.label} is required`;
+  }
+  if (meta.property_id !== undefined && meta.property_id !== null && meta.property_id !== '') {
+    const row = db.prepare('SELECT id FROM properties WHERE id = ?').get(Number(meta.property_id));
+    if (!row) return 'property not found';
+  }
+  if (meta.account_type !== undefined && meta.account_type !== null && meta.account_type !== ''
+    && !['TFSA', 'RRSP', 'NonRegistered'].includes(meta.account_type)) {
+    return 'account type must be TFSA, RRSP or NonRegistered';
+  }
+  return null;
+}
+function planProjectMetadataLabels(metadata) {
+  const meta = metadata && typeof metadata === 'object' ? metadata : {};
+  const out = {};
+  if (meta.property_id) {
+    const row = db.prepare('SELECT address FROM properties WHERE id = ?').get(Number(meta.property_id));
+    if (row) out.property_id = row.address;
+  }
+  if (meta.account_type) out.account_type = meta.account_type;
+  return out;
+}
+function planProjectViewRow(p) {
+  if (!p) return null;
+  const metadata = p.metadata ? JSON.parse(p.metadata) : null;
+  return { ...p, metadata, templateSchema: planProjectTemplate(p.template), metadataLabels: planProjectMetadataLabels(metadata) };
+}
+
 app.post('/api/planning/projects', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'project name is required' });
+  const template = b.template ? String(b.template) : null;
+  if (template && template !== 'blank' && !planProjectTemplate(template)) {
+    return res.status(400).json({ error: 'unknown project template' });
+  }
+  const metadata = b.metadata && typeof b.metadata === 'object' ? b.metadata : null;
+  const metaErr = planValidateProjectMetadata(template, metadata);
+  if (metaErr) return res.status(400).json({ error: metaErr });
   const now = nowIso();
   const snap = JSON.stringify(planSnapshotMainline());
-  const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(req.user.id, String(b.name).trim(), b.question ? String(b.question).trim() : null, snap, now, now);
+  const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, template, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(req.user.id, String(b.name).trim(), b.question ? String(b.question).trim() : null, snap, template, metadata ? JSON.stringify(metadata) : null, now, now);
   // Default scenario: prime holds at the current rate (the flat
   // neutral preset); the user can add, duplicate or edit scenarios.
   db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(info.lastInsertRowid, 'Flat at current prime', 'flat', 'neutral', null, null, 1, now, now);
   const row = planProjectById(info.lastInsertRowid, req.user.id);
-  res.status(201).json({ project: row });
+  res.status(201).json({ project: planProjectViewRow(row) });
 });
 
 app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
@@ -3927,7 +3974,7 @@ app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
      JOIN plan_strategies s ON s.id = m.strategy_id
      WHERE s.project_id = ? ORDER BY m.id DESC`).all(p.id)
     .map((m) => ({ ...m, entries: JSON.parse(m.entries || '[]'), conflicts: m.conflicts ? JSON.parse(m.conflicts) : null }));
-  res.json({ project: p, strategies, scenarios, declaredAssets, reports, history, stale: planSnapshotStale(p.snapshot) });
+  res.json({ project: planProjectViewRow(p), strategies, scenarios, declaredAssets, reports, history, stale: planSnapshotStale(p.snapshot) });
 });
 
 app.put('/api/planning/projects/:id', requireApiAuth, (req, res) => {
@@ -3935,9 +3982,16 @@ app.put('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'project not found' });
   const b = req.body || {};
   if (b.name !== undefined && !String(b.name).trim()) return res.status(400).json({ error: 'project name is required' });
-  db.prepare('UPDATE plan_projects SET name = ?, question = ?, updated_at = ? WHERE id = ?')
-    .run(b.name !== undefined ? String(b.name).trim() : p.name, b.question !== undefined ? (b.question ? String(b.question).trim() : null) : p.question, nowIso(), p.id);
-  res.json({ project: planProjectById(p.id, req.user.id) });
+  let metadata = p.metadata ? JSON.parse(p.metadata) : null;
+  if (b.metadata !== undefined) {
+    if (b.metadata !== null && typeof b.metadata !== 'object') return res.status(400).json({ error: 'metadata must be an object' });
+    metadata = b.metadata;
+    const metaErr = planValidateProjectMetadata(p.template, metadata);
+    if (metaErr) return res.status(400).json({ error: metaErr });
+  }
+  db.prepare('UPDATE plan_projects SET name = ?, question = ?, metadata = ?, updated_at = ? WHERE id = ?')
+    .run(b.name !== undefined ? String(b.name).trim() : p.name, b.question !== undefined ? (b.question ? String(b.question).trim() : null) : p.question, metadata ? JSON.stringify(metadata) : null, nowIso(), p.id);
+  res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)) });
 });
 
 app.delete('/api/planning/projects/:id', requireApiAuth, (req, res) => {
@@ -4017,9 +4071,11 @@ app.post('/api/planning/projects/:id/strategies', requireApiAuth, (req, res) => 
   if (!p) return res.status(404).json({ error: 'project not found' });
   const b = req.body || {};
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'strategy name is required' });
+  const template = b.template ? String(b.template) : null;
+  const templateParams = b.template_params && typeof b.template_params === 'object' ? b.template_params : null;
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), planNextLetter(p.id), b.source || 'manual', now, now);
+  const info = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), planNextLetter(p.id), b.source || 'manual', template, templateParams ? JSON.stringify(templateParams) : null, now, now);
   res.status(201).json({ strategy: planStrategyById(info.lastInsertRowid) });
 });
 
@@ -4094,9 +4150,10 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
   let model = null;
   if (s.model_id) {
     const mrow = db.prepare('SELECT * FROM plan_ai_models WHERE id = ?').get(s.model_id);
-    if (mrow) model = { id: mrow.id, name: mrow.name, version: mrow.version, source: mrow.source, spec: JSON.parse(mrow.spec || '{}') };
+    if (mrow) model = { id: mrow.id, name: mrow.name, version: mrow.version, source: mrow.source, spec: JSON.parse(mrow.spec || '{}'), metadata: mrow.metadata ? JSON.parse(mrow.metadata) : null };
   }
-  res.json({ strategy: s, project: p, ops, assumptions, scenarios, baseScenario, baseline, projection: strategy, comparison, scenarioTable, model });
+  const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [] };
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, scenarios, baseScenario, baseline, projection: strategy, comparison, scenarioTable, model });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -4146,12 +4203,29 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     if (!baseline) baseline = r.baseline;
     rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison });
   }
-  // Baseline-only projection for the comparison table's baseline column.
+  // Baseline-only projection: the reference the strategy deltas are
+  // computed against, and the chart's baseline line.
   if (!baseline) {
     const mainline = planAssembleMainline(p.id);
     await ensureFreshPrime();
     const cur = getCurrentPrime();
     baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: {}, primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth: currentMonthKey(), scenario });
+  }
+  // Strategy-centric deltas: per strategy, Equity Δ (peak balance
+  // advantage over baseline) and Principal Δ (buyCash vs baseline).
+  // A delta is null when the strategy does not touch that asset type
+  // at all — the client renders '—' — so a buy strategy never shows a
+  // spurious $0 equity delta and vice versa. Baseline stays only the
+  // reference the deltas are computed against, never a table column.
+  for (const r of rows) {
+    const sops = planOpsOf(r.strategy.id);
+    const slegs = [];
+    for (const o of sops) for (const l of o.legs || []) slegs.push(l);
+    const touchesMortgage = sops.some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
+      || slegs.some((l) => String(l.source_ref || '').startsWith('repay:'));
+    const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
+    r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
+    r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
   }
   // Report-ready series: one monthly trajectory per baseline/strategy,
   // plus each strategy's cost breakdown. The report view renders from
@@ -4746,6 +4820,68 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
   res.json({ ops: withSeq, unresolved, warnings: errs, configured: true });
 });
 
+// Reusable AI templates: an ai-model spec saved with its metadata
+// schema (the questions it asked) so it can be applied to another
+// strategy later. The spec is validated like any model spec; chart
+// templates must be known, titles present.
+function planValidateModelSpec(spec) {
+  const errs = [];
+  if (!spec || typeof spec !== 'object') return ['spec must be an object'];
+  for (const part of ['bindings', 'formulas', 'assumptions', 'outputs', 'charts']) {
+    if (!Array.isArray(spec[part])) errs.push(`model spec is missing ${part}`);
+  }
+  errs.push(...planAiValidateChartSpecs(spec.charts || [], 0));
+  return errs;
+}
+app.get('/api/planning/templates', requireApiAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM plan_templates WHERE user_id = ? ORDER BY id DESC').all(req.user.id)
+    .map((t) => ({ ...t, spec: JSON.parse(t.spec || '{}'), metadata_schema: t.metadata_schema ? JSON.parse(t.metadata_schema) : [], metadata_answers: t.metadata_answers ? JSON.parse(t.metadata_answers) : null }));
+  res.json({ templates: rows });
+});
+app.post('/api/planning/templates', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'template name is required' });
+  const errs = planValidateModelSpec(b.spec);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const schema = Array.isArray(b.metadata_schema) ? b.metadata_schema : [];
+  for (const q of schema) {
+    if (!q || typeof q.field !== 'string' || !q.field.trim() || typeof q.label !== 'string' || !q.label.trim()) {
+      return res.status(400).json({ error: 'metadata_schema entries need field and label' });
+    }
+  }
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_templates (user_id, name, source, spec, metadata_schema, metadata_answers, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(req.user.id, String(b.name).trim(), 'ai', JSON.stringify(b.spec), JSON.stringify(schema),
+      b.metadata_answers && typeof b.metadata_answers === 'object' ? JSON.stringify(b.metadata_answers) : null, now, now);
+  res.status(201).json({ template: db.prepare('SELECT * FROM plan_templates WHERE id = ?').get(info.lastInsertRowid) });
+});
+app.delete('/api/planning/templates/:id', requireApiAuth, (req, res) => {
+  const t = db.prepare('SELECT * FROM plan_templates WHERE id = ? AND user_id = ?').get(Number(req.params.id), req.user.id);
+  if (!t) return res.status(404).json({ error: 'template not found' });
+  db.prepare('DELETE FROM plan_templates WHERE id = ?').run(t.id);
+  res.json({ ok: true });
+});
+// Apply a saved AI template: the spec becomes the strategy's attached
+// model (source 'template'); the op list stays the computation layer
+// and can still be edited afterwards. Answers to the template's
+// metadata questions are stored on the strategy's template_params.
+app.post('/api/planning/projects/:id/strategies/from-template', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'strategy name is required' });
+  const t = db.prepare('SELECT * FROM plan_templates WHERE id = ? AND user_id = ?').get(Number(b.template_id), req.user.id);
+  if (!t) return res.status(404).json({ error: 'template not found' });
+  const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
+  const now = nowIso();
+  const spec = JSON.parse(t.spec || '{}');
+  const minfo = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), JSON.stringify(spec), 1, 'template', answers ? JSON.stringify(answers) : null, now, now);
+  const sinfo = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, model_id, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), planNextLetter(p.id), 'ai', minfo.lastInsertRowid, 'ai-template', JSON.stringify({ template_id: t.id, answers }), now, now);
+  res.status(201).json({ strategy: planStrategyById(sinfo.lastInsertRowid), model: { id: minfo.lastInsertRowid, spec } });
+});
+
 app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, res) => {
   const s = planStrategyById(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'strategy not found' });
@@ -4754,15 +4890,41 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
+  const answers = req.body?.answers && typeof req.body.answers === 'object' ? req.body.answers : null;
+  // Conversation thread: the client sends the accumulated turns, the
+  // server persists them on the strategy draft so the design continues
+  // instead of restarting statelessly. The latest answers arrive
+  // separately and are appended as the newest user turn.
+  let thread = req.body?.history !== undefined
+    ? sanitizeAiThread(req.body.history)
+    : sanitizeAiThread(s.ai_thread ? JSON.parse(s.ai_thread) : null);
+  if (answers && Object.keys(answers).length) thread = appendAiThread(thread, { role: 'user', answers });
+  db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(thread), s.id);
+  // Feed the model the app snapshot so it stops asking for numbers the
+  // app already holds (balances, terms, segments, prime + history).
+  await ensureFreshPrime();
+  const curPrime = getCurrentPrime();
+  const snapshot = buildPlanAiSnapshot({
+    properties: db.prepare('SELECT * FROM properties ORDER BY id').all(),
+    terms: db.prepare('SELECT * FROM mortgage_terms ORDER BY id').all(),
+    segments: db.prepare('SELECT * FROM rate_segments ORDER BY id').all(),
+    accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
+    holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
+    prime: curPrime ? curPrime.rate : null,
+    primeHistory: getPrimeHistory(),
+  });
   const prompt = [
     'You design a planning model as JSON only. No prose outside the JSON object.',
     'The model spec has five parts, all required:',
-    '1. bindings: [{name, entity, field}] — every input bound to an existing entity/field (property, holding, account, term, segment). Never cite a number that is not in the app data.',
+    '1. bindings: [{name, entity, field}] — every input bound to an existing entity/field (property, holding, account, term, segment). Bind ONLY to values in the snapshot below; never cite a number that is not there.',
     '2. formulas: [{output, expression}] — structured expressions over bound inputs and intermediate series ids, e.g. "monthly interest = prior balance * monthly rate / 12".',
     '3. assumptions: [{key, value, source}] — every assumption explicit; nothing hidden.',
     '4. outputs: [{id, label}] — the computed series this model produces.',
     '5. charts: [{template, title, series}] — template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards; series entries bind to output ids.',
-    'If a request is ambiguous, return {"ask": "your question"} instead of guessing.',
+    'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
+    `App data snapshot: ${JSON.stringify(snapshot)}`,
+    ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
+    ...(answers ? [`User-provided metadata (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
     `User request: ${text}`,
   ].join('\n');
   let raw;
@@ -4773,7 +4935,13 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   }
   const parsed = parseModelJson(raw);
   if (!parsed) return res.status(502).json({ error: 'the AI response did not contain a model spec' });
-  if (parsed.ask) return res.json({ ask: parsed.ask, configured: true });
+  if (parsed.ask) {
+    const questions = normalizeAiAsk(parsed.ask);
+    if (!questions) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+    const newThread = appendAiThread(thread, { role: 'ai', questions });
+    db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(newThread), s.id);
+    return res.json({ ask: questions, thread: newThread, configured: true });
+  }
   const errs = [];
   for (const part of ['bindings', 'formulas', 'assumptions', 'outputs', 'charts']) {
     if (!Array.isArray(parsed[part])) errs.push(`model spec is missing ${part}`);
@@ -4781,9 +4949,9 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   errs.push(...planAiValidateChartSpecs(parsed.charts || [], p.id));
   if (errs.length) return res.status(502).json({ error: errs.join('; ') });
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', now, now);
-  res.status(201).json({ model: { id: info.lastInsertRowid, spec: parsed }, configured: true });
+  const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', answers ? JSON.stringify(answers) : null, now, now);
+  res.status(201).json({ model: { id: info.lastInsertRowid, spec: parsed, metadata: answers }, thread, configured: true });
 });
 
 app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res) => {

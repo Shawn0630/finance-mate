@@ -782,6 +782,45 @@ CREATE INDEX IF NOT EXISTS idx_plan_scenarios_project ON plan_scenarios(project_
 CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strategy_id);
 `);
 {
+  // Planning template metadata (2026-10-31): template + metadata JSON on
+  // the project (NULL template = legacy, keeps the full generic panels);
+  // applied-template record on the strategy; answers on the AI model;
+  // reusable AI templates with their metadata schema.
+  const planProjCols = db.prepare('PRAGMA table_info(plan_projects)').all().map((c) => c.name);
+  if (planProjCols.length && !planProjCols.includes('template')) {
+    db.exec('ALTER TABLE plan_projects ADD COLUMN template TEXT');
+  }
+  if (planProjCols.length && !planProjCols.includes('metadata')) {
+    db.exec('ALTER TABLE plan_projects ADD COLUMN metadata TEXT');
+  }
+  const planStratCols = db.prepare('PRAGMA table_info(plan_strategies)').all().map((c) => c.name);
+  if (planStratCols.length && !planStratCols.includes('template')) {
+    db.exec('ALTER TABLE plan_strategies ADD COLUMN template TEXT');
+  }
+  if (planStratCols.length && !planStratCols.includes('template_params')) {
+    db.exec('ALTER TABLE plan_strategies ADD COLUMN template_params TEXT');
+  }
+  const planModelCols = db.prepare('PRAGMA table_info(plan_ai_models)').all().map((c) => c.name);
+  if (planModelCols.length && !planModelCols.includes('metadata')) {
+    db.exec('ALTER TABLE plan_ai_models ADD COLUMN metadata TEXT');
+  }
+  // AI-model conversation thread, persisted per strategy draft so a
+  // design session survives reloads and continues instead of restarting.
+  if (planStratCols.length && !planStratCols.includes('ai_thread')) {
+    db.exec('ALTER TABLE plan_strategies ADD COLUMN ai_thread TEXT');
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS plan_templates (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'ai',
+  spec TEXT NOT NULL,
+  metadata_schema TEXT,
+  metadata_answers TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_plan_templates_user ON plan_templates(user_id)');
   const segCols = db.prepare('PRAGMA table_info(rate_segments)').all().map((c) => c.name);
   if (segCols.length && !segCols.includes('term_id')) {
     db.exec('ALTER TABLE rate_segments ADD COLUMN term_id INTEGER REFERENCES mortgage_terms(id) ON DELETE SET NULL');

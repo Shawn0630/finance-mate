@@ -15257,6 +15257,234 @@ try {
         modelPanel.trial && modelPanel.bindings && modelPanel.formula, JSON.stringify(modelPanel));
     } finally { await browserR.close(); }
   }
+  // --------------------------------------------- template metadata
+  // Project templates own their questions: intake answers are stored
+  // as project metadata, panels render only for sections the template
+  // asks about, and the comparison table stays hidden until a strategy
+  // exists. Legacy projects (no template) keep the full panels.
+  r = await req('POST', '/api/planning/projects', { name: 'Meta Mortgage Test', question: 'Pay off early', template: 'mortgage', metadata: { property_id: planPid } });
+  check('planning metadata: mortgage-template project stores template + metadata',
+    r.status === 201 && r.data.project && r.data.project.template === 'mortgage' && r.data.project.metadata && r.data.project.metadata.property_id === planPid,
+    JSON.stringify(r.data));
+  const metaMortgageId = r.data.project.id;
+  r = await req('GET', `/api/planning/projects/${metaMortgageId}`);
+  check('planning metadata: mortgage schema shows prime scenarios, not declared assets',
+    r.status === 200 && r.data.project && r.data.project.templateSchema && r.data.project.templateSchema.sections.primeScenarios === true && r.data.project.templateSchema.sections.declaredAssets === false
+    && r.data.project.metadataLabels && r.data.project.metadataLabels.property_id && r.data.project.metadataLabels.property_id.includes('Planning Test Lane'),
+    JSON.stringify({ schema: r.data.project && r.data.project.templateSchema, labels: r.data.project && r.data.project.metadataLabels }));
+  r = await req('POST', '/api/planning/projects', { name: 'Meta Buy Test', question: 'Buy', template: 'buy', metadata: { account_type: 'TFSA' } });
+  check('planning metadata: buy-template project stores template + metadata',
+    r.status === 201 && r.data.project && r.data.project.template === 'buy', JSON.stringify(r.data));
+  const metaBuyId = r.data.project.id;
+  r = await req('GET', `/api/planning/projects/${metaBuyId}`);
+  check('planning metadata: buy schema shows neither prime scenarios nor declared assets',
+    r.status === 200 && r.data.project && r.data.project.templateSchema && r.data.project.templateSchema.sections.primeScenarios === false && r.data.project.templateSchema.sections.declaredAssets === false
+    && r.data.project.metadataLabels && r.data.project.metadataLabels.account_type === 'TFSA',
+    JSON.stringify(r.data.project && r.data.project.templateSchema));
+  r = await req('POST', '/api/planning/projects', { name: 'Meta Bad', template: 'mortgage', metadata: {} });
+  check('planning metadata: mortgage template without a property is rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/projects', { name: 'Meta Bad2', template: 'mortgage', metadata: { property_id: 999999 } });
+  check('planning metadata: mortgage template with an unknown property is rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/planning/projects/${metaMortgageId}`, { metadata: { property_id: planPid } });
+  check('planning metadata: metadata edit saves', r.status === 200 && r.data.project && r.data.project.metadata && r.data.project.metadata.property_id === planPid, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${planProjectId}`);
+  check('planning metadata: legacy project has no template schema',
+    r.status === 200 && r.data.project && !r.data.project.templateSchema, JSON.stringify(r.data.project && r.data.project.templateSchema));
+  // ai-model structured ask: the stub asks for a genuinely missing
+  // field; answers round-trip into the stored model metadata.
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ai-model`, { text: 'Model contributions', name: 'Contrib model' });
+  check('planning metadata: ai-model returns structured questions, not a dead-end string',
+    r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.length === 1 && r.data.ask[0].field === 'target_contribution',
+    JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ai-model`, { text: 'Model contributions', name: 'Contrib model', answers: { target_contribution: 500 } });
+  check('planning metadata: ai-model answers round-trip into stored model metadata',
+    r.status === 201 && r.data.model && r.data.model.metadata && r.data.model.metadata.target_contribution === 500,
+    JSON.stringify(r.data));
+  // AI template storage + apply: the spec is saved with its metadata
+  // schema and applies to a new strategy with its model attached.
+  r = await req('POST', '/api/planning/templates', { name: 'Meta Saved Template', spec: aiModelDef, metadata_schema: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }], metadata_answers: { target_contribution: 500 } });
+  check('planning metadata: AI template stores its metadata schema',
+    r.status === 201 && r.data.template && r.data.template.id > 0, JSON.stringify(r.data));
+  const metaTplId = r.data.template.id;
+  r = await req('GET', '/api/planning/templates');
+  check('planning metadata: template list carries source ai and the schema',
+    r.status === 200 && (r.data.templates || []).some((t) => t.id === metaTplId && t.source === 'ai' && (t.metadata_schema || []).length === 1),
+    JSON.stringify((r.data.templates || []).map((t) => t.id)));
+  // (Strategy creation on the buy project happens after the DOM
+  // zero-state checks below, so the empty-table pin stays valid.)
+  // DOM: panel visibility, comparison gating, baseline note.
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('planning metadata browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardM = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResM = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueM = loginResM.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserM = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserM.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardM({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueM, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitM = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      const buyPage = await page.evaluate(() => ({
+        scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        assetPanel: !!document.querySelector('#planAssetPanel'),
+        metaPanel: !!document.querySelector('#planMetadataPanel'),
+        metaEdit: !!document.querySelector('#planMetadataEditBtn'),
+        tableText: (document.querySelector('#planCompareTable')?.textContent || '').trim(),
+        chartPresent: !!document.querySelector('#planCompareChart'),
+        futureHidden: !!document.querySelector('#planCompareScenarioWrap.hidden'),
+      }));
+      check('planning metadata: buy project shows metadata, no prime/asset panels, no comparison table, baseline chart only',
+        !buyPage.scenarioPanel && !buyPage.assetPanel && buyPage.metaPanel && buyPage.metaEdit
+        && buyPage.tableText === '' && buyPage.chartPresent && buyPage.futureHidden,
+        JSON.stringify(buyPage));
+      await page.goto(`http://ff.local/#planning/project/${metaMortgageId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      const mortPage = await page.evaluate(() => ({
+        scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        assetPanel: !!document.querySelector('#planAssetPanel'),
+        metaPanel: !!document.querySelector('#planMetadataPanel'),
+      }));
+      check('planning metadata: mortgage project shows prime scenarios but no declared assets',
+        mortPage.scenarioPanel && !mortPage.assetPanel && mortPage.metaPanel, JSON.stringify(mortPage));
+      await page.goto(`http://ff.local/#planning/project/${planProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      const legPage = await page.evaluate(() => ({
+        scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        assetPanel: !!document.querySelector('#planAssetPanel'),
+        metaPanel: !!document.querySelector('#planMetadataPanel'),
+      }));
+      check('planning metadata: legacy project keeps the full generic panels',
+        legPage.scenarioPanel && legPage.assetPanel && !legPage.metaPanel, JSON.stringify(legPage));
+      // Strategy template recording on the From-template path; once a
+      // strategy exists the comparison table appears.
+      r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'Meta Strat', source: 'template', template: 'prepay', template_params: { propertyId: planPid, date: planOpDate, amount: 5000 } });
+      check('planning metadata: strategy records its applied template',
+        r.status === 201 && r.data.strategy && r.data.strategy.template === 'prepay', JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      const buyTable = await page.evaluate(() => ({
+        text: document.querySelector('#planCompareTable')?.textContent || '',
+        head: document.querySelector('#planCompareTable thead')?.textContent || '',
+      }));
+      check('planning metadata: comparison table appears once a strategy exists, strategy columns only, Equity/Principal Δ rows',
+        buyTable.text.includes('Total cost') && buyTable.text.includes('Equity Δ') && buyTable.text.includes('Principal Δ')
+        && !buyTable.head.includes('Baseline') && buyTable.head.includes('Meta Strat'),
+        JSON.stringify({ head: buyTable.head, body: buyTable.text.slice(0, 200) }));
+    } finally { await browserM.close(); }
+  }
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies/from-template`, { name: 'From saved', template_id: metaTplId, answers: { target_contribution: 600 } });
+  check('planning metadata: applying a saved template creates a strategy with its model',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0 && r.data.model && (r.data.model.spec.formulas || []).length === 1,
+    JSON.stringify(r.data));
+  const metaAppliedStrategyId = r.data.strategy.id;
+  r = await req('GET', `/api/planning/strategies/${metaAppliedStrategyId}`);
+  check('planning metadata: applied strategy records ai-template + answers',
+    r.status === 200 && r.data.strategy && r.data.strategy.template === 'ai-template'
+    && r.data.strategy.template_params && r.data.strategy.template_params.template_id === metaTplId
+    && r.data.model && r.data.model.metadata && r.data.model.metadata.target_contribution === 600,
+    JSON.stringify({ tpl: r.data.strategy && r.data.strategy.template, meta: r.data.model && r.data.model.metadata }));
+  r = await req('DELETE', `/api/planning/templates/${metaTplId}`);
+  check('planning metadata: template cleanup', r.status === 200);
+  // AI-model conversation thread: the ask response carries the thread
+  // with one AI turn; answering + Continue carries two turns (AI + the
+  // user turn) and the answers into the model metadata; the strategy
+  // GET persists the thread. The server reads the stub file per call,
+  // so the suite rewrites aiStubFile between the two calls.
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'Thread Strat', source: 'ai' });
+  check('planning thread: design session strategy created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const threadStrategyId = r.data.strategy.id;
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
+  r = await req('POST', `/api/planning/strategies/${threadStrategyId}/ai-model`, { text: 'design a model', history: [] });
+  check('planning thread: ask response carries a thread with one AI turn',
+    r.status === 200 && r.data.ask && Array.isArray(r.data.thread) && r.data.thread.length === 1
+    && r.data.thread[0].role === 'ai' && r.data.thread[0].questions[0].field === 'target_contribution',
+    JSON.stringify(r.data));
+  const threadAfterAsk = r.data.thread;
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef));
+  r = await req('POST', `/api/planning/strategies/${threadStrategyId}/ai-model`, { text: 'design a model', history: threadAfterAsk, answers: { target_contribution: 600 } });
+  check('planning thread: spec response carries the user turn and the answers as metadata',
+    r.status === 201 && r.data.model && Array.isArray(r.data.thread) && r.data.thread.length === 2
+    && r.data.thread[1].role === 'user' && r.data.thread[1].answers.target_contribution === 600
+    && r.data.model.metadata && r.data.model.metadata.target_contribution === 600,
+    JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${threadStrategyId}`);
+  check('planning thread: strategy GET persists the thread',
+    r.status === 200 && r.data.strategy && Array.isArray(r.data.strategy.ai_thread) && r.data.strategy.ai_thread.length === 2,
+    JSON.stringify({ thread: r.data.strategy && r.data.strategy.ai_thread }));
+  // Strategy-centric comparison deltas: template_params alone create
+  // no ops, so the prepay and buy ops are posted for real. The prepay
+  // strategy books an equity advantage but no principal delta; the
+  // buy strategy books a principal delta (10 units × 60 CAD) but no
+  // equity delta.
+  r = await req('GET', `/api/planning/projects/${metaBuyId}/comparison`);
+  const metaStratRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.name === 'Meta Strat');
+  check('planning deltas: Meta Strat found for the prepay op',
+    !!metaStratRow, JSON.stringify({ strategies: (r.data.strategies || []).map((x) => x.strategy && x.strategy.name) }));
+  r = await req('POST', `/api/planning/strategies/${metaStratRow.strategy.id}/ops`, { op_type: 'prepay', params: { propertyId: planPid, date: planOpDate, amount: 5000 } });
+  check('planning deltas: prepay op posted', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'Delta Buy Strat', source: 'template', template: 'buy', template_params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 } });
+  check('planning deltas: buy strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const deltaBuyStratId = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${deltaBuyStratId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
+  check('planning deltas: buy op posted', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${metaBuyId}/comparison`);
+  const metaRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.name === 'Meta Strat');
+  const buyRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.name === 'Delta Buy Strat');
+  check('planning deltas: prepay strategy has an equity advantage and no principal delta',
+    r.status === 200 && metaRow && typeof metaRow.equityDelta === 'number' && metaRow.equityDelta >= 5000 && metaRow.principalDelta === null,
+    JSON.stringify({ equityDelta: metaRow && metaRow.equityDelta, principalDelta: metaRow && metaRow.principalDelta }));
+  check('planning deltas: buy strategy has a 600 principal delta and no equity delta',
+    buyRow && buyRow.principalDelta === 600 && buyRow.equityDelta === null,
+    JSON.stringify({ equityDelta: buyRow && buyRow.equityDelta, principalDelta: buyRow && buyRow.principalDelta }));
+  r = await req('DELETE', `/api/planning/projects/${metaMortgageId}`);
+  check('planning metadata: mortgage project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/planning/projects/${metaBuyId}`);
+  check('planning metadata: buy project cleanup', r.status === 200);
   r = await req('DELETE', `/api/planning/projects/${planProjectId}`);
   check('planning: project cleanup', r.status === 200);
   r = await req('DELETE', `/api/properties/${planPid}`);
