@@ -2919,14 +2919,23 @@ const earnJobRow = (row) => {
   const bonuses = db.prepare('SELECT date, amount FROM earn_bonuses WHERE job_id = ? ORDER BY date').all(row.id);
   const bonusTotal = bonuses.filter((b) => Number(String(b.date).slice(0, 4)) === row.tax_year)
     .reduce((s, b) => s + b.amount, 0);
+  // Pre-tax RRSP: linked plans' OWN per-period amount active today
+  // reduces taxable income in the calc (federal and provincial);
+  // the employer match never enters. The calc runs on read, so a
+  // plan create/edit/delete flows into every surface — list cards,
+  // detail summary, breakdown table, charts — with no stored
+  // figure to refresh and no history row touched.
+  const today = vancouverToday();
+  const rrspDeduction = db.prepare('SELECT start_date, own_amount FROM invest_plans WHERE job_id = ?').all(row.id)
+    .reduce((s, p) => s + (Number(p.own_amount) > 0 && p.start_date <= today ? Number(p.own_amount) : 0), 0);
   return {
     ...row,
     owner: row.owner || null,
     cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
     pay_changes: payChanges, bonuses, bonus_total: bonusTotal,
     next_pay_date: nextPayDate(
-      { frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date }, vancouverToday()),
-    calc: calcSalary({ ...row, bonus_total: bonusTotal }, earnRegion().payroll),
+      { frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date }, today),
+    calc: calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction }, earnRegion().payroll),
   };
 };
 const earnRentalYearRow = (rental, row) => {
@@ -3024,7 +3033,7 @@ const derivedJobYtd = (v, cppExempt, eiExempt) => deriveJobYtd({
 // Back-solve the gross through the same derived path the gross value
 // takes, so the stored job is indistinguishable from one entered as
 // gross. Returns an error string, or null after rewriting v in place.
-const resolveTakeHome = (body, v, existing) => {
+const resolveTakeHome = (body, v, existing, rrspDeduction = 0) => {
   const basis = body.pay_value_basis;
   if (basis !== undefined && basis !== 'gross' && basis !== 'takehome') return 'pay value basis must be gross or takehome.';
   if (basis !== 'takehome') return null;
@@ -3037,6 +3046,7 @@ const resolveTakeHome = (body, v, existing) => {
     td1Provincial: existing ? existing.td1_provincial : null,
     cppExempt: existing ? existing.cpp_exempt === 1 : false,
     eiExempt: existing ? existing.ei_exempt === 1 : false,
+    rrspDeduction,
   });
   if (solved.error) return solved.error;
   v.recent_pay_value = solved.gross;
@@ -3051,7 +3061,7 @@ const resolveTakeHome = (body, v, existing) => {
 // then pins the rate to the latest entry (with no entries the
 // submitted rate stands, so a legacy save and a delete-to-zero whose
 // caller sends the opening position keep working).
-const derivePayChangeValues = (v, existing) => resolvePayChangeValues({
+const derivePayChangeValues = (v, existing, rrspDeduction = 0) => resolvePayChangeValues({
   entries: v.pay_changes, frequency: v.frequency, province: v.province,
   startDate: v.start_date, recentDate: v.recent_pay_date, bonuses: v.bonuses,
   payroll: earnRegion().payroll,
@@ -3059,6 +3069,7 @@ const derivePayChangeValues = (v, existing) => resolvePayChangeValues({
   td1Provincial: existing ? existing.td1_provincial : null,
   cppExempt: existing ? existing.cpp_exempt === 1 : false,
   eiExempt: existing ? existing.ei_exempt === 1 : false,
+  rrspDeduction,
 });
 const pinPositionToLatest = (v) => {
   if (!v.pay_changes || !v.pay_changes.length) return;
@@ -3112,9 +3123,14 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'job not found' });
-  const pcErr = derivePayChangeValues(v, existing);
+  // Take-home back-solves price the displayed net definition, so a
+  // job with linked plans solves with the same pre-tax deduction
+  // the read-time calc applies (current-rate convention: plans
+  // active today; a new job has no plans, so POST keeps the 0).
+  const rrspDed = db.prepare('SELECT COALESCE(SUM(own_amount), 0) AS s FROM invest_plans WHERE job_id = ? AND own_amount > 0 AND start_date <= ?').get(id, vancouverToday()).s;
+  const pcErr = derivePayChangeValues(v, existing, rrspDed);
   if (pcErr) return res.status(400).json({ error: pcErr });
-  const takeErr = resolveTakeHome(req.body || {}, v, existing);
+  const takeErr = resolveTakeHome(req.body || {}, v, existing, rrspDed);
   if (takeErr) return res.status(400).json({ error: takeErr });
   // Owner follows the property rule: omitted means unchanged, an
   // explicit empty value clears to unassigned.
@@ -3174,6 +3190,7 @@ app.get('/api/earnings/jobs/:id/monthly-chart', requireApiAuth, (req, res) => {
   const series = jobMonthlySeries({
     frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
     calc: job.calc, plans, today: vancouverToday(),
+    job, payroll: earnRegion().payroll,
   });
   res.json(series || { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [] });
 });

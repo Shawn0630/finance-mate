@@ -7567,6 +7567,70 @@ try {
         if (annualJobId) await req('DELETE', `/api/earnings/jobs/${annualJobId}`);
         if (datelessChartJobId) await req('DELETE', `/api/earnings/jobs/${datelessChartJobId}`);
       }
+      // ---------------------------------------------------------------
+      // Pre-tax RRSP: a linked plan's OWN per-period amount reduces
+      // the job's taxable income (federal AND provincial) everywhere
+      // the job calc appears — list, detail, monthly chart — while
+      // CPP/CPP2/EI stay on the full gross. The employer match never
+      // enters: the taxable drop is own x periods, never
+      // (own + employer) x periods. A mid-year plan leaves earlier
+      // months at full-gross tax. (An employer-ONLY plan cannot be
+      // built through the API — validPlanInput requires own > 0 —
+      // so that edge is pinned at the unit level, not here.)
+      let pretaxJobId = null;
+      let pretaxRrspId = null;
+      let pretaxPlanId = null;
+      try {
+        r = await req('POST', '/api/earnings/jobs', {
+          employer: 'PreTax Corp', province: 'BC', frequency: 'biweekly',
+          start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+        });
+        pretaxJobId = r.data.id;
+        const calcOf = async () => (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === pretaxJobId).calc;
+        const before = await calcOf();
+        const seriesBefore = (await req('GET', `/api/earnings/jobs/${pretaxJobId}/monthly-chart`)).data;
+        r = await req('POST', '/api/investments/accounts', { name: 'PreTax RRSP', type: 'RRSP' });
+        pretaxRrspId = r.data.id;
+        r = await req('POST', `/api/investments/accounts/${pretaxRrspId}/holdings`, { label: 'PreTax Fund', kind: 'fund', currency: 'CAD' });
+        const pretaxFundId = r.data.id;
+        await req('POST', `/api/investments/holdings/${pretaxFundId}/nav`, { date: '2025-12-31', price: 10 });
+        r = await req('POST', `/api/investments/accounts/${pretaxRrspId}/plans`, { job_id: pretaxJobId, target_holding_id: pretaxFundId, start_date: '2026-07-06', own_amount: 220.05, employer_amount: 220.05 });
+        pretaxPlanId = r.data.id;
+        check('pre-tax RRSP: plan links with own + employer amounts',
+          !!pretaxPlanId, JSON.stringify(r.data));
+        const after = await calcOf();
+        const seriesAfter = (await req('GET', `/api/earnings/jobs/${pretaxJobId}/monthly-chart`)).data;
+        const c2 = (n) => Math.round(n * 100) / 100;
+        check('pre-tax RRSP: taxable income falls by own x 26 exactly, both taxes fall, CPP/EI and gross unchanged',
+          after && before
+          && c2(before.taxableIncome - after.taxableIncome) === 5721.30
+          && after.federalTax < before.federalTax && after.provincialTax < before.provincialTax
+          && after.cpp === before.cpp && after.cpp2 === before.cpp2 && after.ei === before.ei
+          && after.annualGross === before.annualGross,
+          JSON.stringify({ before, after }));
+        check('pre-tax RRSP: net rises by exactly the tax saved',
+          after && before && c2(after.netAnnual - before.netAnnual) === c2(before.totalTax - after.totalTax),
+          JSON.stringify({ beforeNet: before && before.netAnnual, afterNet: after && after.netAnnual }));
+        const julIdx = seriesBefore.months.indexOf('2026-07');
+        check('pre-tax RRSP: monthly chart keeps pre-plan months at full-gross tax, cuts post-plan months, RRSP only from July',
+          seriesBefore && seriesAfter && julIdx > 0
+          && seriesBefore.months.slice(0, julIdx).every((_, i) => seriesAfter.tax[i] === seriesBefore.tax[i])
+          && seriesAfter.tax.slice(julIdx).every((t, i) => t < seriesBefore.tax[julIdx + i])
+          && seriesAfter.rrsp.slice(0, julIdx).every((v) => v === 0)
+          && seriesAfter.rrsp.slice(julIdx).every((v) => v > 0),
+          JSON.stringify({ beforeTax: seriesBefore && seriesBefore.tax, afterTax: seriesAfter && seriesAfter.tax, rrsp: seriesAfter && seriesAfter.rrsp }));
+        check('pre-tax RRSP: monthly chart still stacks to the gross to the cent with the RRSP segment',
+          seriesAfter && seriesAfter.months.every((_, i) =>
+            Math.round((seriesAfter.tax[i] + seriesAfter.cppEi[i] + seriesAfter.rrsp[i] + seriesAfter.net[i]) * 100) / 100
+            === seriesAfter.gross[i]),
+          JSON.stringify(seriesAfter && seriesAfter.gross));
+      } finally {
+        // Cleanup: plan, then account, then job — always, even when
+        // a check above failed, so later sections see a clean state.
+        if (pretaxPlanId) await req('DELETE', `/api/investments/plans/${pretaxPlanId}`);
+        if (pretaxRrspId) await req('DELETE', `/api/investments/accounts/${pretaxRrspId}`);
+        if (pretaxJobId) await req('DELETE', `/api/earnings/jobs/${pretaxJobId}`);
+      }
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       check('money UI browser flow runs to completion', false, String((err && err.message) || err));

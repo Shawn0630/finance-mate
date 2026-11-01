@@ -609,3 +609,146 @@ test('monthly chart: dateless jobs get null, never a guessed date', () => {
   assert.equal(jobMonthlySeries({ ...monthlyBase, recentDate: null }), null);
   assert.equal(jobMonthlySeries({ ...monthlyBase, calc: null }), null);
 });
+
+// ------------------------------------------------- pre-tax RRSP --
+const c2 = (n) => Math.round(n * 100) / 100;
+const monthEnd = (ym) => {
+  const [y, m] = ym.split('-').map(Number);
+  return `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`;
+};
+const nIn = (ym) => payDatesInWindow('biweekly', `${ym}-01`, monthEnd(ym), '2026-01-05').length;
+const pretaxJob = (over = {}) => ({
+  frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period',
+  tax_year: 2026, province: 'BC', ytd_cpp: 0, ytd_cpp2: 0, ytd_ei: 0,
+  cpp_exempt: false, ei_exempt: false, td1_federal: null, td1_provincial: null, bonus_total: 0, ...over,
+});
+
+test('salary: pre-tax RRSP reduces taxable income and both taxes, CPP/EI unchanged, net up by exactly the tax saved', () => {
+  const oldC = calcSalary(pretaxJob(), payroll);
+  const newC = calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll);
+  assert.equal(newC.rrspAnnual, 5721.30);
+  assert.equal(newC.taxableIncome, 71431.70);
+  assert.equal(c2(oldC.taxableIncome - newC.taxableIncome), 5721.30);
+  assert.equal(newC.federalTax, 7676.13);
+  assert.equal(newC.provincialTax, 3442.54);
+  assert.equal(newC.totalTax, 11118.67);
+  assert.equal(newC.cpp, oldC.cpp);
+  assert.equal(newC.cpp2, oldC.cpp2);
+  assert.equal(newC.ei, oldC.ei);
+  assert.equal(newC.annualGross, oldC.annualGross);
+  assert.equal(c2(newC.netAnnual - oldC.netAnnual), c2(oldC.totalTax - newC.totalTax));
+  assert.equal(c2(newC.netAnnual - oldC.netAnnual), 1613.41);
+  assert.equal(newC.perPeriod.net, 2361.22);
+});
+
+test('salary: zero RRSP deduction is identical to no deduction, and the deduction floor holds at zero taxable', () => {
+  const a = calcSalary(pretaxJob(), payroll);
+  const b = calcSalary(pretaxJob({ rrspDeduction: 0 }), payroll);
+  assert.deepEqual(b, a);
+  const floored = calcSalary(pretaxJob({ rrspDeduction: 100000 }), payroll);
+  assert.equal(floored.taxableIncome, 0);
+  assert.equal(floored.totalTax, 0);
+  assert.equal(floored.cpp, a.cpp);
+  assert.equal(floored.ei, a.ei);
+});
+
+test('salary: take-home solve with a pre-tax deduction reproduces the target net under the pre-tax calc', () => {
+  const target = 2361.22;
+  const solved = solveGrossForTakeHome({
+    targetNet: target, frequency: 'biweekly', province: 'BC',
+    startDate: '2026-01-05', recentDate: '2026-10-23', changes: [], bonuses: [], payroll,
+    td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false, rrspDeduction: 220.05,
+  });
+  assert.ok(!solved.error, JSON.stringify(solved));
+  // The solve prices the net with the job's YTD offsets (start +
+  // recent dates), so the verification must derive the same YTD —
+  // ytd 0 would price a different, lower net.
+  const ytd = deriveJobYtd({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    changes: [], recentValue: solved.gross, payroll, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(calcSalary(pretaxJob({
+    gross_amount: solved.gross, ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
+    rrspDeduction: 220.05,
+  }), payroll).perPeriod.net, target);
+});
+
+test('monthly chart: pre-tax RRSP leaves pre-plan months at full-gross tax, cuts post-plan months', () => {
+  const full = calcSalary(pretaxJob(), payroll).perPeriod;
+  const reduced = calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll).perPeriod;
+  const s = jobMonthlySeries({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    calc: calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll),
+    plans: [{ start_date: '2026-07-06', own_amount: 220.05 }],
+    today: '2026-10-31', job: pretaxJob(), payroll,
+  });
+  for (let i = 0; i < 6; i++) {
+    const ym = s.months[i];
+    assert.equal(s.tax[i], c2(full.totalTax * nIn(ym)), `${ym} must keep full-gross tax`);
+    assert.equal(s.rrsp[i], 0, `${ym} must have no RRSP before the plan starts`);
+    assert.equal(s.net[i], c2(full.net * nIn(ym)), `${ym} net must be full net`);
+  }
+  for (let i = 6; i < 10; i++) {
+    const ym = s.months[i];
+    assert.equal(s.tax[i], c2(reduced.totalTax * nIn(ym)), `${ym} must use reduced tax`);
+    assert.ok(s.rrsp[i] > 0, `${ym} must have an RRSP segment`);
+    assert.equal(s.net[i], c2(reduced.net * nIn(ym)) - s.rrsp[i], `${ym} net must be reduced net minus RRSP`);
+  }
+  for (let i = 0; i < s.months.length; i++) {
+    assert.equal(Math.round((s.tax[i] + s.cppEi[i] + s.rrsp[i] + s.net[i]) * 100) / 100, s.gross[i]);
+  }
+});
+
+test('monthly chart: mid-month plan start deducts only from paydays on/after the start', () => {
+  const full = calcSalary(pretaxJob(), payroll).perPeriod;
+  const reduced = calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll).perPeriod;
+  const s = jobMonthlySeries({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    calc: calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll),
+    plans: [{ start_date: '2026-03-10', own_amount: 220.05 }],
+    today: '2026-10-31', job: pretaxJob(), payroll,
+  });
+  // March 2026 job paydays: Mar 2 (before the plan), Mar 16 + 30 (after it).
+  assert.equal(s.tax[2], c2(full.totalTax + 2 * reduced.totalTax));
+  // Plan-anchored dues in March: Mar 10 + 24.
+  assert.equal(s.rrsp[2], 440.10);
+  assert.equal(s.tax[0], c2(full.totalTax * 2));
+  assert.equal(s.rrsp[0], 0);
+});
+
+test('monthly chart: employer-only plan changes nothing', () => {
+  const full = calcSalary(pretaxJob(), payroll).perPeriod;
+  const s = jobMonthlySeries({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    calc: calcSalary(pretaxJob(), payroll),
+    plans: [{ start_date: '2026-01-05', own_amount: 0, employer_amount: 50 }],
+    today: '2026-10-31', job: pretaxJob(), payroll,
+  });
+  assert.equal(s.rrsp, null);
+  for (let i = 0; i < s.months.length; i++) {
+    assert.equal(s.tax[i], c2(full.totalTax * payDatesInWindow('biweekly', `${s.months[i]}-01`, monthEnd(s.months[i]), '2026-01-05').length));
+  }
+});
+
+test('monthly chart: monthly plan paints no RRSP and no tax cut before its start month', () => {
+  const full = calcSalary(pretaxJob({ frequency: 'monthly' }), payroll).perPeriod;
+  const s = jobMonthlySeries({
+    frequency: 'monthly', startDate: '2026-01-15', recentDate: '2026-10-15',
+    calc: calcSalary(pretaxJob({ frequency: 'monthly', rrspDeduction: 220.05 }), payroll),
+    plans: [{ start_date: '2026-11-06', own_amount: 220.05 }],
+    today: '2026-11-20', job: pretaxJob({ frequency: 'monthly' }), payroll,
+  });
+  for (let i = 0; i < 10; i++) {
+    assert.equal(s.rrsp[i], 0, `${s.months[i]} must have no RRSP before the plan starts`);
+    assert.equal(s.tax[i], c2(full.totalTax), `${s.months[i]} must keep full-gross tax`);
+  }
+  assert.equal(s.rrsp[10], 220.05);
+  // The gate applies to the legacy stored-calc path too.
+  const legacy = jobMonthlySeries({
+    frequency: 'monthly', startDate: '2026-01-15', recentDate: '2026-10-15',
+    calc: calcSalary(pretaxJob({ frequency: 'monthly', rrspDeduction: 220.05 }), payroll),
+    plans: [{ start_date: '2026-11-06', own_amount: 220.05 }],
+    today: '2026-11-20',
+  });
+  for (let i = 0; i < 10; i++) assert.equal(legacy.rrsp[i], 0);
+});

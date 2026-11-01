@@ -312,7 +312,7 @@ export function deriveJobYtd({ frequency, startDate, recentDate, changes, recent
 // A target no gross yields (e.g. below the net of a bonus-only job)
 // is an error, never a silent fallback.
 export function solveGrossForTakeHome({ targetNet, frequency, province, startDate, recentDate,
-  changes, bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt }) {
+  changes, bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt, rrspDeduction }) {
   const target = Number(targetNet);
   if (!Number.isFinite(target) || target < 0) return { error: 'take-home pay must be a number ≥ 0.' };
   if (!PAY_FREQUENCIES[frequency] || !payroll) return { error: 'take-home pay needs a valid pay frequency.' };
@@ -325,7 +325,7 @@ export function solveGrossForTakeHome({ targetNet, frequency, province, startDat
       frequency, gross_amount: gross, gross_basis: 'period', province, bonus_total: bonusTotal,
       ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
       td1_federal: td1Federal ?? null, td1_provincial: td1Provincial ?? null,
-      cpp_exempt: !!cppExempt, ei_exempt: !!eiExempt,
+      cpp_exempt: !!cppExempt, ei_exempt: !!eiExempt, rrspDeduction: rrspDeduction || 0,
     }, payroll).perPeriod.net;
   };
   const unreachable = 'no per-period gross produces that take-home pay.';
@@ -385,7 +385,7 @@ export function validPayChanges(rows, startDate) {
 // take-home entry stands in at its amount — it cannot price an earlier
 // date's segment). Returns an error string, or null.
 export function resolvePayChangeValues({ entries = [], frequency, province, startDate, recentDate,
-  bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt }) {
+  bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt, rrspDeduction }) {
   const periods = PAY_FREQUENCIES[frequency] ? PAY_FREQUENCIES[frequency].periods : null;
   if (!periods) return 'pay change needs a valid pay frequency.';
   for (const c of entries) {
@@ -400,7 +400,7 @@ export function resolvePayChangeValues({ entries = [], frequency, province, star
     }));
     const solved = solveGrossForTakeHome({
       targetNet: target, frequency, province, startDate, recentDate,
-      changes: others, bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt,
+      changes: others, bonuses, payroll, td1Federal, td1Provincial, cppExempt, eiExempt, rrspDeduction,
     });
     if (solved.error) return solved.error;
     c.value = solved.gross;
@@ -521,7 +521,14 @@ export function calcSalary(job, payroll) {
     : Math.min(Math.max(0, Math.min(annualGross, cpp.ympe) - cpp.exemption) * cpp.baseRate,
       Math.max(0, (cpp.ympe - cpp.exemption) * cpp.baseRate));
   const cppEnhancement = Math.max(0, (cppAnnual + (job.ytd_cpp || 0) + cpp2Annual + (job.ytd_cpp2 || 0)) - cppBase);
-  const taxable = Math.max(0, annualGross - cppEnhancement);
+  // Pre-tax RRSP: linked plans' OWN per-period amount (job.rrspDeduction,
+  // default 0) is payroll-deducted before tax, so it reduces taxable
+  // income for federal AND provincial tax. CPP/CPP2/EI are computed on
+  // the full gross — an RRSP deduction does not reduce the CPP/EI
+  // base — and the credits are unchanged. The employer match never
+  // enters here: only the employee portion is a payroll deduction.
+  const rrspAnnual = Math.max(0, Number(job.rrspDeduction) || 0) * periods;
+  const taxable = Math.max(0, annualGross - cppEnhancement - rrspAnnual);
   const td1Federal = job.td1_federal != null ? job.td1_federal : federalBpa(taxable, federal);
   const employmentCredit = Math.min(annualGross, federal.employmentAmountMax) * federal.lowestRate;
   const federalTax = Math.max(0, bracketTax(federal.brackets, taxable)
@@ -551,7 +558,7 @@ export function calcSalary(job, payroll) {
     annualGross: round2(annualGross), perPeriodGross: round2(perPeriodGross),
     cpp: round2(cppAnnual), cpp2: round2(cpp2Annual), ei: round2(eiAnnual),
     cppBase: round2(cppBase), cppEnhancement: round2(cppEnhancement),
-    taxableIncome: round2(taxable), td1Federal: round2(td1Federal),
+    taxableIncome: round2(taxable), rrspAnnual: round2(rrspAnnual), td1Federal: round2(td1Federal),
     federalTax: round2(federalTax), provincialTax: provincialTax == null ? null : round2(provincialTax),
     healthPremium: round2(healthPremium), totalTax: round2(totalTax), netAnnual: round2(netAnnual),
     perPeriod: {
@@ -649,29 +656,36 @@ export function aggregateEarningsCharts(jobs, rentals) {
 // the gross is their sum, so the stack never shows a 1-cent gap
 // from per-period rounding. Deliberate limits: the stored calc is
 // the CURRENT rate's, so months before a raise show the current
-// rate (charts never recompute tax); bonuses are one-off, not
-// monthly pay, so they never enter; the current month counts all
-// its scheduled paydays. Dateless jobs get null — never a guessed
-// date. RRSP counts only linked plans' OWN per-period amount — the
-// employer match is not from gross, so it never enters the stack;
-// with no own-positive plan the rrsp series is null (absent, not
-// a zero slice).
-function countPaydaysInMonth(frequency, y, m, anchor, anniversary) {
-  const start = ymPad(y, m, 1);
-  const end = ymPad(y, m, lastDayOfMonth(y, m));
+// rate; bonuses are one-off, not monthly pay, so they never enter;
+// the current month counts all its scheduled paydays. Dateless jobs
+// get null — never a guessed date. RRSP counts only linked plans'
+// OWN per-period amount — the employer match is not from gross, so
+// it never enters the stack; with no own-positive plan the rrsp
+// series is null (absent, not a zero slice). Pre-tax RRSP: when the
+// caller supplies the job inputs + payroll, each month's tax and
+// net are recomputed payday by payday with that payday's deduction
+// in force, so a plan starting mid-year leaves earlier months at
+// full-gross tax exactly; without job/payroll the stored calc's tax
+// stands (legacy callers).
+// A month's job paydays on the job's own cadence. Annual is special:
+// payDatesInWindow's annual fallthrough ([to]) is only valid for its
+// YTD window; a month's annual payday is the anniversary date falling
+// in that month, on or after the anchor.
+function jobPaydaysInMonth(frequency, y, m, anchor, anniversary) {
   if (frequency === 'annual') {
-    // payDatesInWindow's annual fallthrough ([to]) is only valid
-    // for its YTD window; a month's annual payday is the
-    // anniversary date falling in that month, on or after the anchor.
     const [, am, ad] = anniversary.split('-').map(Number);
-    if (m !== am) return 0;
+    if (m !== am) return [];
     const d = ymPad(y, am, Math.min(ad, lastDayOfMonth(y, am)));
-    return d >= anchor ? 1 : 0;
+    return d >= anchor ? [d] : [];
   }
-  return payDatesInWindow(frequency, start, end, anchor).length;
+  return payDatesInWindow(frequency, ymPad(y, m, 1), ymPad(y, m, lastDayOfMonth(y, m)), anchor);
 }
 
-export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans, today }) {
+function countPaydaysInMonth(frequency, y, m, anchor, anniversary) {
+  return jobPaydaysInMonth(frequency, y, m, anchor, anniversary).length;
+}
+
+export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans, today, job, payroll }) {
   const pp = calc && calc.perPeriod;
   if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today) || !pp) return null;
   const startYm = startDate.slice(0, 7);
@@ -688,6 +702,33 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   }
   const ownPlans = (plans || []).filter((p) => Number(p.own_amount) > 0 && normJobDate(p.start_date));
   const rrspPresent = ownPlans.length > 0;
+  // A plan counts in a month only from its start month on. The
+  // monthly/semimonthly cadences ignore the anchor's month, so
+  // without this gate a plan would paint RRSP slices (and tax
+  // deductions) in months before it existed; weekly/bi-weekly
+  // already count zero pre-start, so the gate changes nothing there.
+  const planDueInMonth = (p, ym) => ym >= p.start_date.slice(0, 7)
+    && countPaydaysInMonth(frequency, Number(ym.slice(0, 4)), Number(ym.slice(5, 7)), p.start_date, p.start_date) > 0;
+  // Pre-tax recompute, only when the caller supplies the job inputs
+  // + payroll (the server endpoint does): each month's tax and net
+  // are recomputed payday by payday, so a plan deducts from the
+  // first payday on/after its start and never before — months
+  // before the plan started keep the full-gross tax exactly. Bare
+  // calls without job/payroll keep the legacy stored-calc behavior.
+  const canRecompute = !!(job && payroll && job.gross_amount != null);
+  const calcCache = new Map();
+  const calcFor = (ded) => {
+    if (!calcCache.has(ded)) {
+      calcCache.set(ded, calcSalary({
+        frequency, gross_amount: job.gross_amount, gross_basis: job.gross_basis,
+        province: job.province, bonus_total: job.bonus_total || 0,
+        ytd_cpp: job.ytd_cpp || 0, ytd_cpp2: job.ytd_cpp2 || 0, ytd_ei: job.ytd_ei || 0,
+        td1_federal: job.td1_federal ?? null, td1_provincial: job.td1_provincial ?? null,
+        cpp_exempt: !!job.cpp_exempt, ei_exempt: !!job.ei_exempt, rrspDeduction: ded,
+      }, payroll).perPeriod);
+    }
+    return calcCache.get(ded);
+  };
   const gross = [];
   const tax = [];
   const cppEi = [];
@@ -697,12 +738,34 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
     const yy = Number(ym.slice(0, 4));
     const mm = Number(ym.slice(5, 7));
     const n = countPaydaysInMonth(frequency, yy, mm, startDate, recentDate);
-    const t = round2(pp.totalTax * n);
-    const c = round2((pp.cpp + pp.cpp2 + pp.ei) * n);
     const r = rrspPresent
-      ? round2(ownPlans.reduce((s, p) => s + Number(p.own_amount) * countPaydaysInMonth(frequency, yy, mm, p.start_date, p.start_date), 0))
+      ? round2(ownPlans.reduce((s, p) => s + (planDueInMonth(p, ym)
+        ? Number(p.own_amount) * countPaydaysInMonth(frequency, yy, mm, p.start_date, p.start_date) : 0), 0))
       : 0;
-    const nt = round2(pp.net * n) - r;
+    let t;
+    let c;
+    let nt;
+    if (canRecompute) {
+      // Group this month's job paydays by the deduction in force on
+      // each payday; CPP/EI never depend on the deduction, so they
+      // come from the zero-deduction calc exactly as stored.
+      let taxSum = 0;
+      let netSum = 0;
+      for (const d of jobPaydaysInMonth(frequency, yy, mm, startDate, recentDate)) {
+        const ded = ownPlans.reduce((s, p) => s + (p.start_date <= d ? Number(p.own_amount) : 0), 0);
+        const pc = calcFor(ded);
+        taxSum += pc.totalTax;
+        netSum += pc.net;
+      }
+      const zero = calcFor(0);
+      t = round2(taxSum);
+      c = round2((zero.cpp + zero.cpp2 + zero.ei) * n);
+      nt = round2(netSum) - r;
+    } else {
+      t = round2(pp.totalTax * n);
+      c = round2((pp.cpp + pp.cpp2 + pp.ei) * n);
+      nt = round2(pp.net * n) - r;
+    }
     tax.push(t);
     cppEi.push(c);
     if (rrsp) rrsp.push(r);
