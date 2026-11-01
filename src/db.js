@@ -387,6 +387,27 @@ db.exec(`CREATE TABLE IF NOT EXISTS earn_bonuses (
   amount REAL NOT NULL,
   created_at TEXT NOT NULL
 )`);
+// Legacy opening backfill: pre-position-model jobs have a NULL
+// opening_value (the 506f6cb migration added the column without
+// backfilling), so their Pay changes panel still shows 'No pay
+// changes yet.' Fill it from the current per-period value exactly
+// when no change record exists yet — then the position equals the
+// current pay by definition. The stored per-period value is
+// gross_amount when gross_basis='period', else gross_amount divided
+// by the frequency's periods per year (weekly 52, biweekly 26,
+// semimonthly 24, monthly 12, annual 1). Jobs WITH change records
+// keep NULL: their start pay is genuinely unknown. Idempotent
+// (NULL-guarded), and it runs on every boot, so databases that
+// already have the column still get backfilled.
+db.exec(`UPDATE earn_jobs SET opening_value = CASE
+  WHEN gross_basis = 'period' THEN gross_amount
+  WHEN frequency = 'weekly' THEN gross_amount / 52
+  WHEN frequency = 'biweekly' THEN gross_amount / 26
+  WHEN frequency = 'semimonthly' THEN gross_amount / 24
+  WHEN frequency = 'monthly' THEN gross_amount / 12
+  ELSE gross_amount END
+  WHERE opening_value IS NULL AND gross_amount IS NOT NULL
+  AND id NOT IN (SELECT job_id FROM earn_pay_changes)`);
 
 // Spending (credit cards): a card stores its last 4 digits ONLY —
 // never a full PAN. Transactions carry the file's signed amount

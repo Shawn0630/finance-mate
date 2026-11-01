@@ -8497,9 +8497,7 @@ function earnJobCard(j) {
   return `<div class="panel earn-job-card" data-job-id="${j.id}" style="cursor:pointer">
     <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
     ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
-    <div class="spacer"></div>
-    <button class="small" onclick="earnEditJob(${j.id})">Edit</button>
-    <button class="small danger" onclick="earnDeleteJob(${j.id})">Delete</button></div>
+    <div class="spacer"></div></div>
     ${earnNextPayHtml(j)}
     <div class="summary-strip">
       <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
@@ -9235,7 +9233,7 @@ function earnJobDetailHtml(j) {
     <div class="panel">
       <div class="section-head"><h3>${esc(j.employer)}</h3><span class="note">${esc(j.province)} · ${esc(freqLabel)} · ${esc(j.currency)}</span>
       ${j.owner ? `<span style="margin-left:8px">${ownerChipsHtml([j.owner])}</span>` : ''}
-      <div class="spacer"></div></div>
+      <div class="spacer"></div><button class="small" id="earnJobDetailEditBtn" onclick="earnEditJob(${j.id})">Edit</button><button class="small danger" id="earnJobDetailDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete</button></div>
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
         <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(c.netAnnual)}</div></div>
@@ -9265,8 +9263,7 @@ function earnJobDetailHtml(j) {
     <div class="panel">
       <div class="section-head"><h3>Bonuses</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddBonus" onclick="earnJobDetailOpenRow('bonus', null)">+ Bonus</button></div>
       ${bonusRows || '<div class="note">No bonuses yet.</div>'}
-    </div>
-    <div class="toolbar" id="earnJobDetailActions"><div class="spacer"></div><button class="small" id="earnJobDetailBodyEditBtn" onclick="earnEditJob(${j.id})">Edit</button><button class="small danger" id="earnJobDetailBodyDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete</button></div>`;
+    </div>`;
 }
 
 let earnJobMonthlyChart = null;

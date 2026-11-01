@@ -6850,9 +6850,18 @@ try {
       check('the saved job carries tax year 2026 from the recent date',
         !!modalJob && modalJob.tax_year === 2026 && modalJob.gross_basis === 'period', JSON.stringify(modalJob));
       // Edit: add a mid-year raise and a bonus, then save.
+      // (Cards carry no buttons now: click into the detail page and
+      // use its header Edit button, same shared modal.)
       await page.evaluate(() => {
-        [...document.querySelectorAll('#earnJobList button')].find((b) => b.textContent.trim() === 'Edit').click();
+        const card = document.querySelector('.earn-job-card');
+        if (card) card.click();
       });
+      await wait(900);
+      await until(() => {
+        const d = document.querySelector('#earnJobDetail');
+        return d && !d.classList.contains('hidden') && !!document.querySelector('#earnJobDetailEditBtn');
+      });
+      await page.click('#earnJobDetailEditBtn');
       await wait(300);
       check('editing pre-fills the simplified fields (grouped recent value)',
         await page.evaluate(() => {
@@ -6897,6 +6906,10 @@ try {
       await req('DELETE', `/api/earnings/jobs/${legacyJobId}`);
 
       // ---- Job form take-home toggle: Gross default, label follows ----
+      // (The raise+bonus edit above ran from the detail page, so step back
+      // to the salary list first: the + Add job button lives there.)
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
       await page.click('#addEarnJobBtn');
       await wait(300);
       check('job form payment toggle defaults to Gross',
@@ -6919,6 +6932,10 @@ try {
         start_date: '2026-01-05', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
       });
       const detailJobId = r.data.id;
+      // The page may already sit on the Salary hash (same-hash goto
+      // would not fire the router), so step away first to force a
+      // fresh list render that includes the new job.
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
       await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
       await page.evaluate((id) => {
@@ -7011,9 +7028,9 @@ try {
           && detailCombo.comboK === 'Next net pay date' && detailCombo.comboV === nextDateLabel
           && detailCombo.comboN === nextNet && !detailCombo.plainNetCard,
         JSON.stringify(detailCombo));
-      check('detail header has no Edit/Delete buttons',
-        await page.evaluate(() => !document.querySelector('#earnJobDetailEditBtn')
-          && !document.querySelector('#earnJobDetailDeleteBtn')));
+      check('detail header has Edit/Delete buttons',
+        await page.evaluate(() => !!document.querySelector('#earnJobDetailEditBtn')
+          && !!document.querySelector('#earnJobDetailDeleteBtn')));
       // Rendered header, not just missing ids: the header row above
       // the card is a toolbar with one plain link and zero buttons,
       // while the pay-change/bonus row buttons below stay in place.
@@ -7039,28 +7056,27 @@ try {
         JSON.stringify(jobHead));
       const detailActions = await page.evaluate(() => {
         const d = document.querySelector('#earnJobDetail');
-        const row = document.querySelector('#earnJobDetailActions');
-        const head = d ? d.firstElementChild : null;
+        const head = d ? d.querySelector('.panel .section-head') : null;
         return {
-          rowExists: !!row,
-          rowIsLast: !!row && d.lastElementChild === row,
-          rowInHead: !!head && !!head.querySelector('#earnJobDetailActions'),
-          editBtn: !!document.querySelector('#earnJobDetailBodyEditBtn'),
-          deleteBtn: !!document.querySelector('#earnJobDetailBodyDeleteBtn'),
-          editClass: document.querySelector('#earnJobDetailBodyEditBtn')?.className || null,
-          deleteClass: document.querySelector('#earnJobDetailBodyDeleteBtn')?.className || null,
+          rowExists: !!document.querySelector('#earnJobDetailActions'),
+          headerEdit: !!document.querySelector('#earnJobDetailEditBtn'),
+          headerDelete: !!document.querySelector('#earnJobDetailDeleteBtn'),
+          headerEditInHead: !!head && !!head.querySelector('#earnJobDetailEditBtn'),
+          headerDeleteInHead: !!head && !!head.querySelector('#earnJobDetailDeleteBtn'),
+          editClass: document.querySelector('#earnJobDetailEditBtn')?.className || null,
+          deleteClass: document.querySelector('#earnJobDetailDeleteBtn')?.className || null,
         };
       });
-      check('detail body bottom row has Edit + Delete, header stays button-free',
-        detailActions.rowExists && detailActions.rowIsLast && !detailActions.rowInHead
-          && detailActions.editBtn && detailActions.deleteBtn
+      check('detail header has Edit + Delete by the title, bottom row gone',
+        !detailActions.rowExists && detailActions.headerEdit && detailActions.headerDelete
+          && detailActions.headerEditInHead && detailActions.headerDeleteInHead
           && detailActions.editClass.includes('small') && !detailActions.editClass.includes('danger')
           && detailActions.deleteClass.includes('small') && detailActions.deleteClass.includes('danger'),
         JSON.stringify(detailActions));
-      // Edit from the detail body opens the shared modal prefilled.
-      await page.click('#earnJobDetailBodyEditBtn');
+      // Edit from the detail header opens the shared modal prefilled.
+      await page.click('#earnJobDetailEditBtn');
       await wait(300);
-      check('detail body Edit opens the prefilled job modal',
+      check('detail header Edit opens the prefilled job modal',
         await page.evaluate((employer) => {
           const m = document.querySelector('#earnJobModal');
           const f = document.querySelector('#earnJobForm');
@@ -7087,18 +7103,22 @@ try {
           const card = document.querySelector(`.earn-job-card[data-job-id="${args.id}"]`);
           return card && card.textContent.includes(args.label);
         }, { id: detailJobId, label: nextLabel }));
-      check('card still offers Edit and Delete',
+      check('card offers no Edit/Delete buttons (click navigates instead)',
         await page.evaluate((id) => {
           const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
-          if (!card) return false;
-          const labels = [...card.querySelectorAll('button')].map((b) => b.textContent.trim());
-          return labels.includes('Edit') && labels.includes('Delete');
+          return !!card && card.querySelectorAll('button').length === 0;
         }, detailJobId));
-      // Edit from the card: the detail page refreshes with the new name.
+      // Edit from the detail header: the detail page refreshes with the new name.
       await page.evaluate((id) => {
         const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
-        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Edit').click();
+        if (card) card.click();
       }, detailJobId);
+      await wait(900);
+      await until(() => {
+        const d = document.querySelector('#earnJobDetail');
+        return d && !d.classList.contains('hidden') && !!document.querySelector('#earnJobDetailEditBtn');
+      });
+      await page.click('#earnJobDetailEditBtn');
       await wait(300);
       await page.evaluate(() => {
         document.querySelector('#earnJobForm [name=employer]').value = 'Detail Corp II';
@@ -7109,21 +7129,27 @@ try {
         const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
         if (card) card.click();
       }, detailJobId);
-      check('editing job fields from the card persists on the detail page',
+      check('editing job fields from the detail header persists on the detail page',
         await until(() => {
           const d = document.querySelector('#earnJobDetail');
           return d && d.textContent.includes('Detail Corp II') && d.textContent.includes('$96,000.00');
         }));
-      // The card edit uses the same shared form: it shows the gross
+      // The header edit uses the same shared form: it shows the gross
       // field with the toggle back at Gross, never a take-home value.
       await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(900);
       await page.evaluate((id) => {
         const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
-        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Edit').click();
+        if (card) card.click();
       }, detailJobId);
+      await wait(900);
+      await until(() => {
+        const d = document.querySelector('#earnJobDetail');
+        return d && !d.classList.contains('hidden') && !!document.querySelector('#earnJobDetailEditBtn');
+      });
+      await page.click('#earnJobDetailEditBtn');
       await wait(300);
-      check('card edit shows the gross field (toggle back at Gross)',
+      check('header edit shows the gross field (toggle back at Gross)',
         await page.evaluate(() => {
           const f = document.querySelector('#earnJobForm');
           return f.querySelector('[name=pay_value_basis]:checked')?.value === 'gross'
@@ -7133,13 +7159,10 @@ try {
         [...document.querySelectorAll('#earnJobModal button')].find((b) => b.textContent.trim() === 'Cancel').click();
       });
       await wait(300);
-      // Delete from the card returns to a list without the job.
+      // Delete from the detail header returns to a list without the job.
       // (The page-wide dialog handler registered earlier accepts the confirm.)
-      await page.evaluate((id) => {
-        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
-        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Delete').click();
-      }, detailJobId);
-      check('deleting from the card removes the job from the salary list',
+      await page.click('#earnJobDetailDeleteBtn');
+      check('deleting from the detail header removes the job from the salary list',
         await until(() => {
           const list = document.querySelector('#earnJobList');
           return location.hash === '#earnings/salary'
@@ -7167,8 +7190,8 @@ try {
           return location.hash.startsWith('#earnings/job/')
             && d && !d.classList.contains('hidden') && d.textContent.includes('Detail Delete Corp');
         }));
-      await page.click('#earnJobDetailBodyDeleteBtn');
-      check('deleting from the detail body returns to the salary list without the job',
+      await page.click('#earnJobDetailDeleteBtn');
+      check('deleting from the detail header returns to the salary list without the job',
         await until(() => {
           const list = document.querySelector('#earnJobList');
           return location.hash === '#earnings/salary'
@@ -7213,14 +7236,26 @@ try {
       await wait(900);
       await page.evaluate((id) => {
         const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
-        [...card.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Delete').click();
+        if (card) card.click();
       }, datelessJobId);
+      await wait(900);
+      await until(() => {
+        const d = document.querySelector('#earnJobDetail');
+        return d && !d.classList.contains('hidden') && !!document.querySelector('#earnJobDetailDeleteBtn');
+      });
+      await page.click('#earnJobDetailDeleteBtn');
       // The delete is async (confirm -> API -> reload): poll the API
       // instead of racing a single read right after the click.
+      // The API row vanishes BEFORE the app's delete flow finishes:
+      // earnDeleteJob only navigates back to the salary list AFTER
+      // its post-delete reload, so also wait for that hash — a later
+      // detail goto must not race the trailing navigation, which
+      // would yank it back to the salary list.
       let legacyGone = false;
       for (let i = 0; i < 40 && !legacyGone; i++) {
         const jobs = (await req('GET', '/api/earnings')).data.jobs;
-        legacyGone = !jobs.find((j) => j.id === datelessJobId);
+        legacyGone = !jobs.find((j) => j.id === datelessJobId)
+          && await page.evaluate(() => location.hash === '#earnings/salary');
         if (!legacyGone) await wait(300);
       }
       check('the legacy fixture job is gone server-side', legacyGone);
