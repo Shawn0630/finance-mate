@@ -10916,6 +10916,64 @@ function planProjectHtml(d) {
     const label = d.project.metadataLabels && d.project.metadataLabels[f.key] ? d.project.metadataLabels[f.key] : (v ?? '');
     return `<div class="plan-row"><span>${esc(f.label)}</span><span>${esc(String(label))}</span></div>`;
   }).join('') : '';
+  // DETAIL ORDER (templated projects): baseline info → strategies →
+  // reports (with the cross-strategy comparison). Prime scenarios and
+  // declared assets are baseline inputs, so they live inside the
+  // baseline panel when the template schema includes them — never as
+  // standalone default panels. Legacy projects keep the old order.
+  if (!templated) {
+    return `
+    <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(p.name)}</h3>
+        <div class="toolbar">
+          ${d.stale ? '<span class="msg warn" style="margin:0">Stale baseline</span><button class="small" id="planSyncBtn">Sync latest mainline</button>' : ''}
+          <button class="small" id="planProjectEditBtn">Edit</button>
+          <button class="small danger" id="planProjectDeleteBtn">Delete</button>
+        </div>
+      </div>
+      <div class="note">${esc(p.question || '')}</div>
+      <div class="msg" id="planProjectMsg"></div>
+    </div>
+    <div class="panel" id="planComparePanel">
+      <div class="section-head"><h3>Comparison</h3>
+        <div class="toolbar"><span id="planCompareScenarioWrap"><label>Future world</label><select id="planCompareScenario"></select></span>
+        <button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
+      </div>
+      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
+      <div id="planCompareTable"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Strategies</h3></div>
+      <div id="planStrategyCards"></div>
+    </div>
+    <div class="panel" id="planScenarioPanel">
+      <div class="section-head"><h3>Prime scenarios</h3>
+        <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
+      </div>
+      <div id="planScenarioList"></div>
+    </div>
+    <div class="panel" id="planAssetPanel">
+      <div class="section-head"><h3>Declared fixed-term assets</h3>
+        <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
+      </div>
+      <div id="planAssetList"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Reports</h3>
+        <div class="toolbar"><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
+      </div>
+      <div id="planReportList"></div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>History</h3></div>
+      <div id="planHistoryList"></div>
+    </div>`;
+  }
+  const aiBaseline = (d.project.metadata || {}).aiBaseline || null;
+  const aiBaselineRows = aiBaseline ? `<div class="plan-row"><span>AI baseline</span><span>${esc(aiBaseline.description || '')}</span></div>
+    ${aiBaseline.primeScenario ? `<div class="plan-row"><span>Prime path</span><span>${esc(aiBaseline.primeScenario.name || '')} · ${esc(aiBaseline.primeScenario.direction || '')} · ${esc(aiBaseline.primeScenario.stance || '')}</span></div>` : ''}
+    <div class="plan-row"><span>Stock reference</span><span>Same principal in current plan</span></div>` : '';
   return `
     <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
     <div class="panel">
@@ -10929,42 +10987,43 @@ function planProjectHtml(d) {
       <div class="note">${esc(p.question || '')}</div>
       <div class="msg" id="planProjectMsg"></div>
     </div>
-    ${templated ? `<div class="panel" id="planMetadataPanel">
-      <div class="section-head"><h3>Metadata · ${esc(d.project.templateSchema.label)}</h3>
-        <div class="toolbar"><button class="small" id="planMetadataEditBtn">Edit</button></div>
+    <div class="panel" id="planBaselinePanel">
+      <div class="section-head"><h3>Baseline info · ${esc(d.project.templateSchema.label)}</h3>
+        <div class="toolbar"><button class="small" id="planAiBaselineBtn">Design baseline with AI</button><button class="small" id="planMetadataEditBtn">Edit</button></div>
       </div>
       <div id="planMetadataView">${metaRows || '<div class="note">No metadata yet.</div>'}</div>
+      <div id="planBaselineDef">${aiBaselineRows}</div>
       <div class="msg" id="planMetadataMsg"></div>
-    </div>` : ''}
-    <div class="panel" id="planComparePanel">
-      <div class="section-head"><h3>Comparison</h3>
-        <div class="toolbar"><span id="planCompareScenarioWrap"><label>Future world</label><select id="planCompareScenario"></select></span>
-        <button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
-      </div>
-      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
-      <div id="planCompareTable"></div>
+      ${sections.primeScenarios ? `<div id="planScenarioPanel">
+        <div class="section-head"><h3>Prime scenarios</h3>
+          <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
+        </div>
+        <div id="planScenarioList"></div>
+      </div>` : ''}
+      ${sections.declaredAssets ? `<div id="planAssetPanel">
+        <div class="section-head"><h3>Declared fixed-term assets</h3>
+          <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
+        </div>
+        <div id="planAssetList"></div>
+      </div>` : ''}
     </div>
-    <div class="panel">
-      <div class="section-head"><h3>Strategies</h3></div>
+    <div class="panel" id="planStrategiesPanel">
+      <div class="section-head"><h3>Strategies</h3>
+        <div class="toolbar"><button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
+      </div>
       <div id="planStrategyCards"></div>
     </div>
-    ${sections.primeScenarios ? `<div class="panel" id="planScenarioPanel">
-      <div class="section-head"><h3>Prime scenarios</h3>
-        <div class="toolbar"><button class="small" id="planAddScenarioBtn">+ Add scenario</button></div>
-      </div>
-      <div id="planScenarioList"></div>
-    </div>` : ''}
-    ${sections.declaredAssets ? `<div class="panel" id="planAssetPanel">
-      <div class="section-head"><h3>Declared fixed-term assets</h3>
-        <div class="toolbar"><button class="small" id="planAddAssetBtn">+ Add asset</button></div>
-      </div>
-      <div id="planAssetList"></div>
-    </div>` : ''}
-    <div class="panel">
+    <div class="panel" id="planReportsPanel">
       <div class="section-head"><h3>Reports</h3>
         <div class="toolbar"><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
       </div>
       <div id="planReportList"></div>
+      <div class="section-head"><h3>Comparison across strategies</h3>
+        <div class="toolbar"><span id="planCompareScenarioWrap"><label>Future world</label><select id="planCompareScenario"></select></span></div>
+      </div>
+      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
+      <div id="planCompareEmpty"></div>
+      <div id="planCompareTable"></div>
     </div>
     <div class="panel">
       <div class="section-head"><h3>History</h3></div>
@@ -10991,6 +11050,8 @@ function planProjectWire(d) {
   if (asBtn) asBtn.addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
   $('#planAddReportBtn').addEventListener('click', () => planSaveReport(p.id));
   $('#planAiReportBtn').addEventListener('click', () => openPlanReportAiModal(p.id));
+  const baseAiBtn = $('#planAiBaselineBtn');
+  if (baseAiBtn) baseAiBtn.addEventListener('click', () => openPlanBaselineAiModal(p.id, ''));
   // Prime outlook control lives with the scenarios section: hide it on
   // templated projects whose template does not ask about prime.
   const templated = !!p.templateSchema;
@@ -11077,6 +11138,77 @@ function planProjectWire(d) {
   $('#planHistoryList').innerHTML = d.history.map((m) => `
     <div class="plan-row"><span>${m.kind === 'merge' ? 'Merged' : 'Reverted'} · ${esc(m.strategy_name)} · ${new Date(m.created_at).toLocaleString('en-CA')}</span></div>`).join('') || '<div class="note">No merges yet.</div>';
 }
+// AI baseline design (project level): describe → preview → Apply.
+// The thread persists in project metadata (aiBaselineThread) so
+// follow-up continues the conversation instead of restarting it. Apply
+// writes metadata.aiBaseline and, when the baseline names a prime
+// scenario, makes it real and sets it as base.
+function openPlanBaselineAiModal(projectId, initialText) {
+  const msg = $('#planBaselineAiMsg');
+  const out = $('#planBaselineAiOut');
+  const threadEl = $('#planBaselineAiThread');
+  if (initialText) $('#planBaselineAiText').value = initialText;
+  showMsg(msg, '', '');
+  out.innerHTML = '';
+  threadEl.innerHTML = '';
+  let baselineThread = null;
+  const renderThread = () => {
+    if (!threadEl) return;
+    if (!baselineThread || !baselineThread.length) { threadEl.innerHTML = ''; return; }
+    threadEl.innerHTML = baselineThread.map((t) => {
+      if (t.role === 'ai' && t.questions) return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
+      if (t.role === 'ai' && t.baseline) return `<div class="plan-row"><span>AI baseline: ${esc(t.baseline.description || '')}</span></div>`;
+      return Object.entries(t.answers || {}).map(([k, v]) => `<div class="plan-row"><span>You: ${esc(k)} = ${esc(String(v))}</span></div>`).join('');
+    }).join('');
+  };
+  const design = async (text, answers) => {
+    const r = await api(`/api/planning/projects/${projectId}/ai-baseline`, { method: 'POST', body: { text, answers, ...(baselineThread ? { history: baselineThread } : {}) } });
+    if (r.ask) {
+      baselineThread = r.thread || baselineThread;
+      renderThread();
+      out.innerHTML = `
+        ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planBaselineAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}
+        <div class="toolbar"><button class="small primary" id="planBaselineAiContinue">Continue design</button></div>`;
+      $('#planBaselineAiContinue').onclick = async () => {
+        try {
+          const next = {};
+          for (const q of r.ask) {
+            const el = document.querySelector(`#planBaselineAsk_${CSS.escape(q.field)}`);
+            const v = el ? el.value.trim() : '';
+            if (!v) throw new Error(`${q.label} is required`);
+            next[q.field] = q.type === 'number' ? Number(v) : v;
+          }
+          await design(text, next);
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      };
+      return;
+    }
+    const b = r.baseline;
+    baselineThread = r.thread || baselineThread;
+    renderThread();
+    out.innerHTML = `
+      <div class="plan-row"><span>Baseline</span><span>${esc(b.description || '')}</span></div>
+      ${b.primeScenario ? `<div class="plan-row"><span>Prime path</span><span>${esc(b.primeScenario.name || '')} · ${esc(b.primeScenario.direction || '')} · ${esc(b.primeScenario.stance || '')}</span></div>` : ''}
+      <div class="plan-row"><span>Stock reference</span><span>Same principal in current plan</span></div>
+      ${(b.assumptions || []).map((a) => `<div class="plan-row"><span>${esc(a.key || '')}</span><span>${esc(String(a.value ?? ''))}</span></div>`).join('')}
+      <div class="toolbar"><button class="small primary" id="planBaselineAiApply">Apply baseline</button></div>`;
+    $('#planBaselineAiApply').onclick = async () => {
+      try {
+        await api(`/api/planning/projects/${projectId}/ai-baseline/apply`, { method: 'POST', body: { baseline: b } });
+        closeModalEl($('#planBaselineAiModal'));
+        loadPlanProject(projectId);
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    };
+  };
+  $('#planBaselineAiBtn').onclick = async () => {
+    try {
+      const text = $('#planBaselineAiText').value.trim();
+      if (!text) throw new Error('describe the baseline first');
+      await design(text, null);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  };
+  openModal('planBaselineAiModal');
+}
 async function loadPlanComparison(projectId, scenarioId) {
   const q = scenarioId ? `?scenarioId=${scenarioId}` : '';
   const data = await api(`/api/planning/projects/${projectId}/comparison${q}`);
@@ -11103,26 +11235,61 @@ async function loadPlanComparison(projectId, scenarioId) {
       ${numRow('Payoff shift (months)', (r) => (r.comparison.payoffShiftMonths != null ? r.comparison.payoffShiftMonths : '—'))}
       ${numRow('Monthly payment Δ', (r) => planSigned(r.comparison.paymentDelta))}
     </tbody></table>
-    <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations).</div>`;
+    <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations). Stock gain = strategy return minus the same principal in the current plan (existing holdings allocation) — the opportunity-cost baseline, not do-nothing.</div>`;
   }
-  // Balance lines: baseline + each strategy, summed across properties.
-  const sumBalance = (proj) => {
-    const byMonth = new Map();
-    for (const per of Object.values(proj.mortgage.perProperty)) {
-      const series = per.strategy && per.strategy.series ? per.strategy.series : (per.baseline && per.baseline.series ? per.baseline.series : []);
-      for (const row of series) byMonth.set(row.month, (byMonth.get(row.month) || 0) + row.balance);
+  // CHART RULES: the chart renders ONLY after at least one strategy
+  // exists, and it is strategy-driven. Funding/sell (non-mortgage)
+  // projects never get a property baseline line: when any strategy
+  // touches stocks, the chart shows PRINCIPAL GAIN per stock strategy
+  // (excess over the current-plan baseline, one definition shared with
+  // the table's stockGain). The mortgage balance chart — baseline line
+  // included — renders only for mortgage-touching projects.
+  const chartWrap = document.querySelector('#planCompareChart')?.closest('.chart-wrap');
+  const emptyEl = $('#planCompareEmpty');
+  const baseDefEl = $('#planBaselineDef');
+  if (baseDefEl && !baseDefEl.dataset.filled) {
+    baseDefEl.dataset.filled = '1';
+    const baseLine = `<div class="plan-row"><span>Base scenario</span><span>${esc((data.scenario && data.scenario.name) || '—')}</span></div>
+      <div class="plan-row"><span>Stock baseline</span><span>Same principal in current plan</span></div>`;
+    baseDefEl.innerHTML = baseDefEl.innerHTML + baseLine;
+  }
+  if (!rows.length) {
+    if (chartWrap) chartWrap.classList.add('hidden');
+    if (emptyEl) emptyEl.innerHTML = '<div class="note">No strategies yet.</div>';
+    planDestroyChart('planCompareChart');
+  } else {
+    if (chartWrap) chartWrap.classList.remove('hidden');
+    if (emptyEl) emptyEl.innerHTML = '';
+    const anyStocks = rows.some((r) => r.touchesStocks);
+    if (anyStocks) {
+      const gainRows = rows.filter((r) => r.principalGainSeries && r.principalGainSeries.length);
+      const labels = gainRows.length ? gainRows[0].principalGainSeries.map((pt) => pt.month) : [];
+      const datasets = gainRows.map((r, i) => {
+        const byMonth = new Map(r.principalGainSeries.map((pt) => [pt.month, pt.value]));
+        return { label: `${r.strategy.letter} · ${r.strategy.name} · Principal gain`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true };
+      });
+      planLineChart('planCompareChart', labels, datasets);
+    } else {
+      // Balance lines: baseline + each strategy, summed across properties.
+      const sumBalance = (proj) => {
+        const byMonth = new Map();
+        for (const per of Object.values(proj.mortgage.perProperty)) {
+          const series = per.strategy && per.strategy.series ? per.strategy.series : (per.baseline && per.baseline.series ? per.baseline.series : []);
+          for (const row of series) byMonth.set(row.month, (byMonth.get(row.month) || 0) + row.balance);
+        }
+        return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+      };
+      const baseSeries = sumBalance(data.baseline);
+      const labels = baseSeries.map(([m]) => m);
+      const datasets = [{ label: 'Baseline', data: baseSeries.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 }];
+      rows.forEach((r, i) => {
+        const s = sumBalance(r.projection);
+        const byMonth = new Map(s);
+        datasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true });
+      });
+      planLineChart('planCompareChart', labels, datasets);
     }
-    return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  };
-  const baseSeries = sumBalance(data.baseline);
-  const labels = baseSeries.map(([m]) => m);
-  const datasets = [{ label: 'Baseline', data: baseSeries.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 }];
-  rows.forEach((r, i) => {
-    const s = sumBalance(r.projection);
-    const byMonth = new Map(s);
-    datasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true });
-  });
-  planLineChart('planCompareChart', labels, datasets);
+  }
   $('#planStrategyCards').innerHTML = rows.map((r) => `
     <div class="card breakdown-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
       <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
@@ -11527,6 +11694,12 @@ function planStrategyHtml(d) {
         <div class="section-head"><h3>Month-1 trial row</h3></div>
         <table class="tbl"><thead><tr><th>Month</th><th>Mortgage balance</th><th>Month interest</th><th>Stock value</th></tr></thead><tbody><tr><td>${trialMonth}</td><td>${money2(mBal)}</td><td>${money2(mInt)}</td><td>${firstMonth ? money2(firstMonth.value) : '—'}</td></tr></tbody></table>
         <div class="note">Trial row = the engine's first projected month for this strategy. The formulas above are the model's own expressions; the app does not evaluate them — compare their substituted inputs against these engine figures.</div>
+        <div class="section-head"><h3>Refine with AI</h3></div>
+        <div><label>Follow-up *</label><textarea id="planModelFollowText" rows="2" placeholder="e.g. Use a slower prime rise, and add a buy leg"></textarea></div>
+        <div><label>Target</label><select id="planModelFollowTarget"><option value="spec">Strategy spec</option><option value="baseline">Baseline</option></select></div>
+        <div class="toolbar"><button class="small primary" id="planModelFollowBtn">Design</button></div>
+        <div id="planModelFollowOut"></div>
+        <div class="msg" id="planModelFollowMsg"></div>
       </div>`;
     })()}`;
 }
@@ -11542,6 +11715,50 @@ function planStrategyWire(d) {
     catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
   });
   $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
+  // Model follow-up: both targets iterate — spec via ai-model (stored
+  // thread continues), baseline via the shared baseline modal.
+  const followBtn = $('#planModelFollowBtn');
+  if (followBtn) followBtn.addEventListener('click', async () => {
+    const msg = $('#planModelFollowMsg');
+    const out = $('#planModelFollowOut');
+    try {
+      const text = $('#planModelFollowText').value.trim();
+      if (!text) throw new Error('describe the follow-up first');
+      if ($('#planModelFollowTarget').value === 'baseline') { openPlanBaselineAiModal(d.project.id, text); return; }
+      const design = async (answers) => {
+        const r = await api(`/api/planning/strategies/${s.id}/ai-model`, { method: 'POST', body: { text, answers } });
+        if (r.ask) {
+          out.innerHTML = `
+            ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planFollowAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}
+            <div class="toolbar"><button class="small primary" id="planModelFollowContinue">Continue design</button></div>`;
+          $('#planModelFollowContinue').onclick = async () => {
+            try {
+              const next = {};
+              for (const q of r.ask) {
+                const el = document.querySelector(`#planFollowAsk_${CSS.escape(q.field)}`);
+                const v = el ? el.value.trim() : '';
+                if (!v) throw new Error(`${q.label} is required`);
+                next[q.field] = q.type === 'number' ? Number(v) : v;
+              }
+              await design(next);
+            } catch (err) { showMsg(msg, 'err', err.message); }
+          };
+          return;
+        }
+        const spec = r.model.spec;
+        out.innerHTML = `
+          <div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div>
+          <div class="toolbar"><button class="small primary" id="planModelFollowApply">Use this model</button></div>`;
+        $('#planModelFollowApply').onclick = async () => {
+          try {
+            await api(`/api/planning/strategies/${s.id}`, { method: 'PUT', body: { model_id: r.model.id } });
+            loadPlanStrategy(s.id);
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        };
+      };
+      await design(null);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
   document.querySelectorAll('[data-plan-op-edit]').forEach((b) => b.addEventListener('click', () => {
     const op = d.ops.find((o) => o.id === Number(b.dataset.planOpEdit));
     openPlanOpModal(s.id, op);
@@ -12008,10 +12225,15 @@ async function openPlanStrategyModal(projectId) {
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
   });
-  $('#planChooseModel').addEventListener('click', () => {
+  // AI model design form, reusable: the chooser card opens it blank;
+  // "Refine with AI" on a saved template opens it prefilled with that
+  // template's summary, so template output is AI-refinable via
+  // follow-up. Both targets (baseline + spec) are refinable: the
+  // baseline step lives in the baseline panel/modal, the spec step here.
+  function openPlanModelForm(prefillText) {
     $('#planStrategyModalBody').innerHTML = `
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
-      <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out"></textarea></div>
+      <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out">${esc(prefillText || '')}</textarea></div>
       <div id="planStrategyModelThread"></div>
       <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
       <div id="planStrategyModelOut"></div>`;
@@ -12097,7 +12319,8 @@ async function openPlanStrategyModal(projectId) {
         await design(msg, name, text, null);
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
-  });
+  }
+  $('#planChooseModel').addEventListener('click', () => openPlanModelForm(''));
   $('#planChooseSaved').addEventListener('click', async () => {
     const msg = $('#planStrategyModalMsg');
     try {
@@ -12107,7 +12330,7 @@ async function openPlanStrategyModal(projectId) {
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
       ${list.length ? `<div><label>Saved template *</label><select id="planSavedTemplateSel">${list.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>
       <div id="planSavedTemplateQs"></div>
-      <div class="toolbar"><button class="primary" id="planSavedTemplateApply">Apply template</button></div>`
+      <div class="toolbar"><button class="primary" id="planSavedTemplateApply">Apply template</button><button class="small" id="planSavedTemplateRefine">Refine with AI</button></div>`
         : '<div class="note">No saved templates yet.</div>'}`;
       const sel = $('#planSavedTemplateSel');
       const renderQs = () => {
@@ -12118,6 +12341,16 @@ async function openPlanStrategyModal(projectId) {
       };
       if (sel) { renderQs(); sel.addEventListener('change', renderQs); }
       const applyBtn = $('#planSavedTemplateApply');
+      const refineBtn = $('#planSavedTemplateRefine');
+      if (refineBtn) refineBtn.addEventListener('click', () => {
+        const cur = list.find((x) => String(x.id) === String(sel.value));
+        if (!cur) return;
+        const spec = cur.spec || {};
+        const summary = `Refine the "${cur.name}" template. Outputs: ${(spec.outputs || []).map((o) => o.id || o.label || '').filter(Boolean).join(', ') || '—'}. `
+          + `Bindings: ${(spec.bindings || []).map((b) => b.name || '').filter(Boolean).join(', ') || '—'}. `
+          + `Saved metadata answers: ${JSON.stringify(cur.metadata_answers || {})}.`;
+        openPlanModelForm(summary);
+      });
       if (applyBtn) applyBtn.addEventListener('click', async () => {
         try {
           const name = $('#planStrategyName').value.trim();

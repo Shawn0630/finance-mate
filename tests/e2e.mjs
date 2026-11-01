@@ -518,21 +518,30 @@ try {
   check('get single asset (detail view source)', r.status === 200 && r.data.name === 'Test ETF' && r.data.category === 'stocks');
   r = await req('GET', '/api/assets/999999');
   check('get missing asset is 404', r.status === 404);
+  // The summary mortgage figure is the REMAINING balance at the
+  // current month (time-aware), not the recorded anchor: with a
+  // 2026-10-01 balance date it reads 100000 in October and one
+  // payment less from November on. The amortization endpoint's
+  // remainingBalance is the independent expectation, so this pin
+  // stays green across month boundaries.
+  const amortSummary = (await req('GET', `/api/properties/${pid}/amortization`)).data;
   r = await req('GET', '/api/summary');
   check('summary property value = 800000', r.data.propertyValue === 800000, JSON.stringify(r.data));
-  check('summary mortgage = 100000', r.data.mortgageBalance === 100000);
+  check('summary mortgage = remaining balance at current month', Math.abs(r.data.mortgageBalance - amortSummary.remainingBalance) <= 0.02, String(r.data.mortgageBalance));
   check('summary other assets = 5000', r.data.otherAssets === 5000);
-  check('summary net worth = 705000', r.data.netWorth === 705000, String(r.data.netWorth));
+  check('summary net worth = assessed - remaining + other', Math.abs(r.data.netWorth - (800000 - amortSummary.remainingBalance + 5000)) <= 0.02, String(r.data.netWorth));
   r = await req('DELETE', `/api/assets/${aid}`);
   check('delete other asset', r.status === 200);
   r = await req('GET', '/api/summary');
   check('summary other assets back to 0', r.data.otherAssets === 0);
 
   // Equity endpoint: no history points on pid, so the stored manual
-  // assessed value is the latest value: 800000 - 100000 = 700000.
+  // assessed value is the latest value: 800000 minus the remaining
+  // balance at the current month (100000 in October, one payment
+  // less from November on).
   r = await req('GET', `/api/properties/${pid}/equity`);
   check('equity uses stored assessed value when no history',
-    r.data.assessedValue === 800000 && r.data.balance === 100000 && r.data.equity === 700000,
+    r.data.assessedValue === 800000 && Math.abs(r.data.balance - amortSummary.remainingBalance) <= 0.02 && Math.abs(r.data.equity - (800000 - amortSummary.remainingBalance)) <= 0.02,
     JSON.stringify(r.data));
 
   // A property created from a picked suggestion stores the BC Assessment
@@ -1087,7 +1096,7 @@ try {
     JSON.stringify({ a: amortA.totalInterest, b: amortB.totalInterest }));
   const port = (await req('GET', '/api/properties/portfolio')).data;
   check('portfolio totals = baseline + both properties',
-    Math.abs(port.totals.outstanding - (portBefore.totals.outstanding + 150000)) <= 0.02
+    Math.abs(port.totals.outstanding - (portBefore.totals.outstanding + amortA.remainingBalance + amortB.remainingBalance)) <= 0.02
       && Math.abs(port.totals.monthlyPayment - (portBefore.totals.monthlyPayment + 818.22)) <= 0.02
       && Math.abs(port.totals.totalInterest - (portBefore.totals.totalInterest + amortA.totalInterest + amortB.totalInterest)) <= 0.05,
     JSON.stringify(port.totals));
@@ -4175,7 +4184,7 @@ try {
           && metaGrid.inputs === 0,
         JSON.stringify(metaGrid.labels));
       check('modal metadata values derive from the terms and the projection (payment bold, no source tag)',
-        metaGrid.opening.includes('1,350,000') && metaGrid.current.includes('1,350,000')
+        metaGrid.opening.includes('1,350,000') && Math.abs(parseFloat(metaGrid.current.replace(/[^0-9.]/g, '')) - amortApi.remainingBalance) <= 0.02
           && metaGrid.payment.includes('6,381') && metaGrid.paymentTagGone && metaGrid.paymentWeight >= 600
           && metaGrid.remaining === '30.0' && metaGrid.lender === 'Scotiabank',
         JSON.stringify(metaGrid));
@@ -4478,7 +4487,7 @@ try {
       await wait(500);
       const remMeta = await page.evaluate(() => document.querySelector('#metaCurrentPrincipal').textContent);
       check('modal Current Principal shows today\u2019s remaining balance, not the 1,350,000 anchor',
-        remMeta.includes(groupNum(remAmort.remainingBalance)) && !remMeta.includes('1,350,000'),
+        Math.abs(parseFloat(remMeta.replace(/[^0-9.]/g, '')) - remAmort.remainingBalance) <= 0.02 && !remMeta.includes('1,350,000'),
         String(remMeta));
       const remEqText = await page.evaluate(() => document.querySelector('#equitySummary').textContent);
       check('detail equity line is the bare figure (assessed minus remaining, no derivation tail)',
@@ -15514,34 +15523,38 @@ try {
       const buyPage = await page.evaluate(() => ({
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
-        metaPanel: !!document.querySelector('#planMetadataPanel'),
+        baselinePanel: !!document.querySelector('#planBaselinePanel'),
         metaEdit: !!document.querySelector('#planMetadataEditBtn'),
+        baselineAiBtn: !!document.querySelector('#planAiBaselineBtn'),
         tableText: (document.querySelector('#planCompareTable')?.textContent || '').trim(),
-        chartPresent: !!document.querySelector('#planCompareChart'),
+        chartVisible: (() => { const c = document.querySelector('#planCompareChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
         futureHidden: !!document.querySelector('#planCompareScenarioWrap.hidden'),
+        panelOrder: [...document.querySelectorAll('#planBaselinePanel, #planStrategiesPanel, #planReportsPanel')].map((el) => el.id),
       }));
-      check('planning metadata: buy project shows metadata, no prime/asset panels, no comparison table, baseline chart only',
-        !buyPage.scenarioPanel && !buyPage.assetPanel && buyPage.metaPanel && buyPage.metaEdit
-        && buyPage.tableText === '' && buyPage.chartPresent && buyPage.futureHidden,
+      check('planning detail: buy project order is baseline → strategies → reports, no property baseline chart before strategies exist',
+        !buyPage.scenarioPanel && !buyPage.assetPanel && buyPage.baselinePanel && buyPage.metaEdit && buyPage.baselineAiBtn
+        && buyPage.tableText === '' && !buyPage.chartVisible && buyPage.futureHidden
+        && JSON.stringify(buyPage.panelOrder) === JSON.stringify(['planBaselinePanel', 'planStrategiesPanel', 'planReportsPanel']),
         JSON.stringify(buyPage));
       await page.goto(`http://ff.local/#planning/project/${metaMortgageId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1500);
       const mortPage = await page.evaluate(() => ({
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        scenarioInBaseline: !!document.querySelector('#planBaselinePanel #planScenarioPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
-        metaPanel: !!document.querySelector('#planMetadataPanel'),
+        baselinePanel: !!document.querySelector('#planBaselinePanel'),
       }));
-      check('planning metadata: mortgage project shows prime scenarios but no declared assets',
-        mortPage.scenarioPanel && !mortPage.assetPanel && mortPage.metaPanel, JSON.stringify(mortPage));
+      check('planning detail: mortgage project shows prime scenarios inside the baseline panel, no declared assets',
+        mortPage.scenarioPanel && mortPage.scenarioInBaseline && !mortPage.assetPanel && mortPage.baselinePanel, JSON.stringify(mortPage));
       await page.goto(`http://ff.local/#planning/project/${planProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1500);
       const legPage = await page.evaluate(() => ({
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
-        metaPanel: !!document.querySelector('#planMetadataPanel'),
+        baselinePanel: !!document.querySelector('#planBaselinePanel'),
       }));
-      check('planning metadata: legacy project keeps the full generic panels',
-        legPage.scenarioPanel && legPage.assetPanel && !legPage.metaPanel, JSON.stringify(legPage));
+      check('planning detail: legacy project keeps the full generic panels, no baseline panel',
+        legPage.scenarioPanel && legPage.assetPanel && !legPage.baselinePanel, JSON.stringify(legPage));
       // Strategy template recording on the From-template path; once a
       // strategy exists the comparison table appears.
       r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'Meta Strat', source: 'template', template: 'prepay', template_params: { propertyId: planPid, date: planOpDate, amount: 5000 } });
@@ -15624,6 +15637,156 @@ try {
   check('planning deltas: buy strategy has a 600 principal delta and no equity delta',
     buyRow && buyRow.principalDelta === 600 && buyRow.equityDelta === null,
     JSON.stringify({ equityDelta: buyRow && buyRow.equityDelta, principalDelta: buyRow && buyRow.principalDelta }));
+  // AI baseline-first flow (stub LLM): ask → spec → Apply, with the
+  // baseline landing in project metadata without wiping template
+  // answers, and its prime scenario created and set as base. Template
+  // output stays refinable: the saved-template body offers Refine
+  // with AI, and a pure buy project charts principal gain with no
+  // property baseline line.
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'prime_direction', label: 'Prime direction?', type: 'text' }] }));
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline`, { text: 'Prime rises, new money follows the current plan' });
+  check('planning detail: ai-baseline ask returns structured questions, not a dead-end string',
+    r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.length === 1 && r.data.ask[0].field === 'prime_direction',
+    JSON.stringify(r.data));
+  const baselineThread = r.data.thread;
+  const baselineDef = { description: 'Prime rises then holds', primeScenario: { name: 'AI Baseline Path', direction: 'up', stance: 'pessimistic', magnitude: 1, steps: [{ date: '2027-01-01', rate: 5.5 }] }, stockReference: 'current-plan', assumptions: [{ key: 'growth', value: 'flat' }] };
+  fs.writeFileSync(aiStubFile, JSON.stringify({ baseline: baselineDef }));
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline`, { text: 'Prime rises, new money follows the current plan', history: baselineThread, answers: { prime_direction: 'up' } });
+  check('planning detail: ai-baseline spec returns the baseline with the continued thread',
+    r.status === 200 && r.data.baseline && r.data.baseline.description === 'Prime rises then holds' && Array.isArray(r.data.thread) && r.data.thread.length >= 2,
+    JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline/apply`, { baseline: { primeScenario: { direction: 'sideways' } } });
+  check('planning detail: ai-baseline apply rejects an invalid baseline', r.status === 400, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/ai-baseline/apply`, { baseline: baselineDef });
+  check('planning detail: ai-baseline apply writes', r.status === 200 && r.data.project && r.data.project.metadata && r.data.project.metadata.aiBaseline && r.data.project.metadata.aiBaseline.description === 'Prime rises then holds' && r.data.project.metadata.account_type === 'TFSA', JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${metaBuyId}/comparison`);
+  check('planning detail: applied baseline scenario is created and set as base',
+    r.status === 200 && (r.data.scenarios || []).some((s) => s.name === 'AI Baseline Path' && Number(s.is_base) === 1),
+    JSON.stringify((r.data.scenarios || []).map((s) => ({ name: s.name, is_base: s.is_base }))));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
+  // Pure buy project: no mortgage op anywhere, so the comparison chart
+  // must show principal gain and no property baseline line.
+  r = await req('POST', '/api/planning/projects', { name: 'Detail Buy Test', question: 'Buy', template: 'buy', metadata: { account_type: 'TFSA' } });
+  check('planning detail: pure buy project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const detailBuyId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${detailBuyId}/strategies`, { name: 'Detail Buy Strat', source: 'template', template: 'buy', template_params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 } });
+  check('planning detail: pure buy strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const detailBuyStratId = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${detailBuyStratId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
+  check('planning detail: pure buy op posted', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${detailBuyId}/comparison`);
+  const detailRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.name === 'Detail Buy Strat');
+  check('planning detail: buy strategy comparison carries touchesStocks and a principal gain series',
+    r.status === 200 && detailRow && detailRow.touchesStocks === true && Array.isArray(detailRow.principalGainSeries) && detailRow.principalGainSeries.length > 0 && detailRow.principalGainSeries.every((p) => typeof p.value === 'number'),
+    JSON.stringify({ touchesStocks: detailRow && detailRow.touchesStocks, len: detailRow && detailRow.principalGainSeries && detailRow.principalGainSeries.length }));
+  // The earlier template fixture was cleaned up by its own round, so
+  // this block creates its own saved template for the refine flow.
+  r = await req('POST', '/api/planning/templates', { name: 'Detail Refine Template', spec: aiModelDef, metadata_schema: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }], metadata_answers: { target_contribution: 500 } });
+  check('planning detail: refine fixture template created', r.status === 201 && r.data.template && r.data.template.id > 0, JSON.stringify(r.data));
+  const detailTplId = r.data.template.id;
+  r = await req('GET', '/api/planning/templates');
+  check('planning detail: templates list non-empty before browser refine check',
+    r.status === 200 && (r.data.templates || []).length >= 1, JSON.stringify((r.data.templates || []).map((t) => t.id)));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('planning detail browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardD = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResD = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueD = loginResD.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserD = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    const waitD = (ms) => new Promise((res2) => setTimeout(res2, ms));
+    try {
+      const page = await browserD.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardD({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueD, domain: 'ff.local', path: '/', httpOnly: true });
+      await page.goto(`http://ff.local/#planning/project/${detailBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(2000);
+      const gainChart = await page.evaluate(() => {
+        const canvas = document.querySelector('#planCompareChart');
+        if (!canvas || !window.Chart) return {};
+        const ch = Chart.getChart(canvas);
+        if (!ch) return {};
+        return { labels: ch.data.datasets.map((d) => d.label), visible: getComputedStyle(canvas.closest('.chart-wrap')).display !== 'none' };
+      });
+      check('planning detail: buy project chart shows principal gain, no property baseline line',
+        gainChart.visible && gainChart.labels.some((l) => String(l).includes('Principal gain')) && !gainChart.labels.some((l) => l === 'Baseline'),
+        JSON.stringify(gainChart));
+      // Diagnostic split: what does the page's own fetch see?
+      const pageTpl = await page.evaluate(() => fetch('/api/planning/templates').then((x) => x.json()).catch((e) => ({ error: String(e) })));
+      check('planning detail: page fetch sees the saved templates',
+        Array.isArray(pageTpl.templates) && pageTpl.templates.length >= 1, JSON.stringify(pageTpl).slice(0, 200));
+      // Template refine: From saved template offers Refine with AI,
+      // and the model form opens prefilled with the template summary.
+      // The chooser handlers are wired after an async context load,
+      // so retry the card click until the saved body renders.
+      await page.click('#planAddStrategyBtn');
+      const refinePresent = await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        for (let i = 0; i < 12; i++) {
+          const card = document.querySelector('#planChooseSaved');
+          if (card) card.click();
+          await sleep(500);
+          if (document.querySelector('#planSavedTemplateRefine')) return true;
+        }
+        return false;
+      });
+      const refineDiag = refinePresent ? '' : await page.evaluate(() => document.querySelector('#planStrategyModalBody')?.textContent?.slice(0, 200) || 'no modal body');
+      check('planning detail: saved-template body offers Refine with AI', refinePresent, refineDiag);
+      if (refinePresent) {
+        await page.click('#planSavedTemplateRefine');
+        await waitD(800);
+        const prefilled = await page.evaluate(() => {
+          const ta = document.querySelector('#planStrategyModelText');
+          return ta ? ta.value : '';
+        });
+        check('planning detail: Refine with AI prefills the model form with the template summary',
+          prefilled.includes('Refine the "'), JSON.stringify(prefilled.slice(0, 120)));
+      }
+    } finally { await browserD.close(); }
+  }
+  r = await req('DELETE', `/api/planning/templates/${detailTplId}`);
+  check('planning detail: refine fixture template cleanup', r.status === 200);
+  r = await req('DELETE', `/api/planning/projects/${detailBuyId}`);
+  check('planning detail: pure buy project cleanup', r.status === 200);
   r = await req('DELETE', `/api/planning/projects/${metaMortgageId}`);
   check('planning metadata: mortgage project cleanup', r.status === 200);
   r = await req('DELETE', `/api/planning/projects/${metaBuyId}`);

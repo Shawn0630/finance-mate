@@ -48,6 +48,7 @@ import {
   planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
+  principalGainSeries, validateAiBaseline,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -4262,6 +4263,13 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
     r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
     r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
+    // Comparison chart inputs: which asset types each strategy touches
+    // (the client picks the chart mode from these), plus the
+    // principal-gain series for stock strategies (current-plan
+    // baseline, one definition shared with the table's stockGain).
+    r.touchesMortgage = touchesMortgage;
+    r.touchesStocks = touchesStocks;
+    r.principalGainSeries = touchesStocks ? principalGainSeries(baseline, r.projection) : null;
   }
   // Report-ready series: one monthly trajectory per baseline/strategy,
   // plus each strategy's cost breakdown. The report view renders from
@@ -4959,6 +4967,7 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
     '5. charts: [{template, title, series}] — template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards; series entries bind to output ids.',
     'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
     `App data snapshot: ${JSON.stringify(snapshot)}`,
+    ...(planProjectMetadataOf(p).aiBaseline ? [`Confirmed baseline for this project: ${JSON.stringify(planProjectMetadataOf(p).aiBaseline)}`, 'Design the spec against this confirmed baseline.'] : []),
     ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
     ...(answers ? [`User-provided metadata (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
     `User request: ${text}`,
@@ -4988,6 +4997,107 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', answers ? JSON.stringify(answers) : null, now, now);
   res.status(201).json({ model: { id: info.lastInsertRowid, spec: parsed, metadata: answers }, thread, configured: true });
+});
+
+// AI-designed baseline (project level, designed BEFORE the strategy
+// spec; follow-up iterates both). The baseline definition is stored in
+// project metadata (aiBaseline) plus its conversation thread
+// (aiBaselineThread); it never overwrites the template answers —
+// metadata keys merge, they do not replace. Stock reference is always
+// 'current-plan' (the comparison math accepts nothing else). A
+// primeScenario in an applied baseline becomes a real project scenario
+// and is set as base, so the baseline has an effect instead of being
+// a note. All writes are Apply-only: design returns a preview.
+function planProjectMetadataOf(p) {
+  try { return p.metadata ? JSON.parse(p.metadata) : {}; } catch { return {}; }
+}
+function planWriteProjectMetadata(p, patch) {
+  const meta = { ...planProjectMetadataOf(p), ...patch };
+  db.prepare('UPDATE plan_projects SET metadata = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(meta), nowIso(), p.id);
+  return meta;
+}
+app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  const answers = req.body?.answers && typeof req.body.answers === 'object' ? req.body.answers : null;
+  const stored = planProjectMetadataOf(p);
+  let thread = req.body?.history !== undefined
+    ? sanitizeAiThread(req.body.history)
+    : sanitizeAiThread(stored.aiBaselineThread || null);
+  if (answers && Object.keys(answers).length) thread = appendAiThread(thread, { role: 'user', answers });
+  planWriteProjectMetadata(p, { aiBaselineThread: thread });
+  await ensureFreshPrime();
+  const curPrime = getCurrentPrime();
+  const snapshot = buildPlanAiSnapshot({
+    properties: db.prepare('SELECT * FROM properties ORDER BY id').all(),
+    terms: db.prepare('SELECT * FROM mortgage_terms ORDER BY id').all(),
+    segments: db.prepare('SELECT * FROM rate_segments ORDER BY id').all(),
+    accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
+    holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
+    prime: curPrime ? curPrime.rate : null,
+    primeHistory: getPrimeHistory(),
+  });
+  const prompt = [
+    'You design a planning baseline definition as JSON only. No prose outside the JSON object.',
+    'The baseline has: description (one line), primeScenario (null, or {name, direction: up|flat|down, stance: pessimistic|optimistic|neutral, magnitude: number|null, steps: [{date: YYYY-MM-DD, rate: number}]|null}), stockReference (always the string "current-plan": the same principal deployed into the existing holdings allocation), assumptions: [{key, value}].',
+    'Bind ONLY to values in the snapshot below; never cite a number that is not there. The stock reference is fixed — do not propose any other reference.',
+    'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
+    `App data snapshot: ${JSON.stringify(snapshot)}`,
+    ...(stored.aiBaseline ? [`Currently confirmed baseline: ${JSON.stringify(stored.aiBaseline)}`, 'Refine it: keep what the user does not contradict.'] : []),
+    ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
+    ...(answers ? [`User-provided metadata (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
+    `User request: ${text}`,
+  ].join('\n');
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed) return res.status(502).json({ error: 'the AI response did not contain a baseline definition' });
+  if (parsed.ask) {
+    const questions = normalizeAiAsk(parsed.ask);
+    if (!questions) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+    const newThread = appendAiThread(thread, { role: 'ai', questions });
+    planWriteProjectMetadata(p, { aiBaselineThread: newThread });
+    return res.json({ ask: questions, thread: newThread, configured: true });
+  }
+  const baseline = parsed.baseline || parsed;
+  baseline.stockReference = 'current-plan';
+  const errs = validateAiBaseline(baseline);
+  if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  const newThread = appendAiThread(thread, { role: 'ai', baseline });
+  planWriteProjectMetadata(p, { aiBaselineThread: newThread });
+  res.json({ baseline, thread: newThread, configured: true });
+});
+app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const baseline = req.body?.baseline;
+  if (!baseline || typeof baseline !== 'object') return res.status(400).json({ error: 'baseline is required' });
+  baseline.stockReference = 'current-plan';
+  const errs = validateAiBaseline(baseline);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const meta = planWriteProjectMetadata(p, { aiBaseline: baseline });
+  // A prime scenario in the applied baseline becomes real: find or
+  // create it by name, then set it as the project's base scenario.
+  const ps = baseline.primeScenario;
+  if (ps && ps.name) {
+    const now = nowIso();
+    let sc = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? AND name = ?').get(p.id, String(ps.name).trim());
+    if (!sc) {
+      const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(p.id, String(ps.name).trim(), ps.direction, ps.stance || 'neutral', ps.magnitude != null ? Number(ps.magnitude) : null, ps.steps ? JSON.stringify(ps.steps) : null, 0, now, now);
+      sc = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(info.lastInsertRowid);
+    }
+    db.prepare('UPDATE plan_scenarios SET is_base = 0 WHERE project_id = ?').run(p.id);
+    db.prepare('UPDATE plan_scenarios SET is_base = 1 WHERE id = ?').run(sc.id);
+  }
+  res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), metadata: meta });
 });
 
 app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res) => {

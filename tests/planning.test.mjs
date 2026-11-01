@@ -13,6 +13,7 @@ import {
   buildPlanAiSnapshot, normalizeAiAsk,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
+  principalGainSeries, validateAiBaseline,
 } from '../src/planning.js';
 
 const PROP = () => ({
@@ -370,4 +371,42 @@ test('principalDeltaVsBaseline: buyCash difference; starting value cancels', () 
   assert.equal(principalDeltaVsBaseline(base, strat), 600);
   assert.equal(principalDeltaVsBaseline(base, base), 0);
   assert.equal(principalDeltaVsBaseline(null, strat), null);
+});
+
+// ------------------------------------------------- current-plan baseline
+test('compareProjections: stock gain is the excess over the same principal in the current plan', () => {
+  // Existing holdings: $6,000 at start growing to $6,600 at horizon
+  // (ratio 1.1). A $600 buy at flat prices books $0 stock gain: the
+  // principal would have grown to $660 in the current plan too.
+  const base = { mortgage: { interestSaved: 0 }, stocks: { startingValue: 6000, valueAtHorizon: 6600, buyCash: 0, sellExternalOut: 0 }, cost: 0 };
+  const flatBuy = { mortgage: { interestSaved: 0 }, stocks: { startingValue: 6000, valueAtHorizon: 7260, buyCash: 600, sellExternalOut: 0 }, cost: 600 };
+  const cmpFlat = compareProjections(base, flatBuy);
+  assert.equal(cmpFlat.stockGain, 0);
+  assert.equal(cmpFlat.gain, 0);
+  // The same buy, but the bought holding grows to $720 while the
+  // current plan grows 10%: excess = 720 − 600×1.1 = 60.
+  const growthBuy = { mortgage: { interestSaved: 0 }, stocks: { startingValue: 6000, valueAtHorizon: 7320, buyCash: 600, sellExternalOut: 0 }, cost: 600 };
+  assert.equal(compareProjections(base, growthBuy).stockGain, 60);
+  // No starting value → cash baseline (ratio 1): gain = proceeds − principal.
+  const noStart = { mortgage: { interestSaved: 0 }, stocks: { startingValue: 0, valueAtHorizon: 0, buyCash: 0, sellExternalOut: 0 }, cost: 0 };
+  const cashBuy = { mortgage: { interestSaved: 0 }, stocks: { startingValue: 0, valueAtHorizon: 660, buyCash: 600, sellExternalOut: 0 }, cost: 600 };
+  assert.equal(compareProjections(noStart, cashBuy).stockGain, 60);
+  // Do-nothing still books $0.
+  assert.equal(compareProjections(base, { ...base, cost: 0 }).stockGain, 0);
+});
+test('principalGainSeries: month-by-month excess over the current-plan baseline', () => {
+  const base = { stocks: { series: [{ month: '2026-11', value: 6000 }, { month: '2026-12', value: 6600 }] } };
+  const strat = { stocks: { series: [{ month: '2026-11', value: 6600 }, { month: '2026-12', value: 7320 }], buyCash: 600 } };
+  const series = principalGainSeries(base, strat);
+  assert.equal(series[0].value, 0);
+  assert.equal(series[1].value, 60);
+  assert.deepEqual(principalGainSeries(base, base), [{ month: '2026-11', value: 0 }, { month: '2026-12', value: 0 }]);
+  assert.deepEqual(principalGainSeries(null, strat), []);
+});
+test('validateAiBaseline: prime scenario enums and step shapes, stock reference coerced by the caller', () => {
+  assert.deepEqual(validateAiBaseline({ description: 'x', primeScenario: null, stockReference: 'current-plan', assumptions: [] }), []);
+  assert.ok(validateAiBaseline({ primeScenario: { name: 'Up', direction: 'sideways' } }).length > 0);
+  assert.ok(validateAiBaseline({ primeScenario: { name: 'Up', direction: 'up', steps: [{ date: 'not-a-date', rate: 5 }] } }).length > 0);
+  assert.deepEqual(validateAiBaseline({ primeScenario: { name: 'Up', direction: 'up', stance: 'neutral', magnitude: 1, steps: [{ date: '2027-01-01', rate: 5.5 }] } }), []);
+  assert.ok(validateAiBaseline(null).length > 0);
 });

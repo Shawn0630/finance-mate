@@ -788,7 +788,20 @@ function addYearsDate(dateStr, years) {
 // against — so net here IS the net benefit vs baseline.
 export function compareProjections(baseline, strategy) {
   if (!baseline || !strategy) return null;
-  const stockGain = round2((strategy.stocks.valueAtHorizon + strategy.stocks.sellExternalOut) - baseline.stocks.valueAtHorizon);
+  // Stock gain vs the CURRENT-PLAN baseline (opportunity cost, not
+  // do-nothing): the same principal deployed into the existing
+  // holdings allocation. Baseline current-plan value at horizon =
+  // baseline holdings value + buyCash × ratio, where ratio =
+  // baseline value at horizon / baseline starting value (1 when there
+  // is no starting value, i.e. a cash baseline). A flat-price buy
+  // therefore books $0 stock gain; only the excess over the current
+  // plan counts. A do-nothing strategy still books $0 (buyCash = 0
+  // and identical trajectories).
+  const bStart = (baseline.stocks && baseline.stocks.startingValue) || 0;
+  const bEnd = (baseline.stocks && baseline.stocks.valueAtHorizon) || 0;
+  const buyCash = (strategy.stocks && strategy.stocks.buyCash) || 0;
+  const ratio = bStart > 0 ? bEnd / bStart : 1;
+  const stockGain = round2((strategy.stocks.valueAtHorizon + strategy.stocks.sellExternalOut) - bEnd - buyCash * ratio);
   const interestSaved = strategy.mortgage.interestSaved;
   const cost = strategy.cost;
   const gain = round2(interestSaved + stockGain);
@@ -796,6 +809,7 @@ export function compareProjections(baseline, strategy) {
   return {
     cost, gain, net,
     interestSaved, stockGain,
+    currentPlanRatio: round2(ratio),
     fees: strategy.fees, penaltyTotal: strategy.penaltyTotal,
     payoffShiftMonths: strategy.payoffShiftMonths,
     paymentDelta: strategy.paymentDelta,
@@ -805,6 +819,54 @@ export function compareProjections(baseline, strategy) {
   };
 }
 export const summarizeComparison = compareProjections;
+
+// Principal-gain series for one strategy: month by month, the excess
+// of the strategy's holdings value over the current-plan baseline
+// (baseline holdings + the same principal grown at the current-plan
+// ratio). Months align on the baseline series; missing months carry
+// the last known baseline value forward. Pure — shared by the
+// comparison chart so the chart and the table use one definition.
+export function principalGainSeries(baselineProj, strategyProj) {
+  const base = (baselineProj && baselineProj.stocks && baselineProj.stocks.series) || [];
+  const strat = (strategyProj && strategyProj.stocks && strategyProj.stocks.series) || [];
+  if (!base.length || !strat.length) return [];
+  const start = Number(base[0].value) || 0;
+  const buyCash = (strategyProj.stocks && strategyProj.stocks.buyCash) || 0;
+  let lastBase = Number(base[0].value) || 0;
+  let bi = 0;
+  return strat.map((r) => {
+    while (bi < base.length && base[bi].month <= r.month) { lastBase = Number(base[bi].value) || 0; bi++; }
+    const ratio = start > 0 ? lastBase / start : 1;
+    return { month: r.month, value: round2((Number(r.value) || 0) - lastBase - buyCash * ratio) };
+  });
+}
+
+// AI-designed baseline definition validation (pure, unit-testable).
+// Shape: {description, primeScenario: {name, direction, stance,
+// magnitude, steps} | null, stockReference: 'current-plan',
+// assumptions: [{key, value}]}. Stock reference is always
+// 'current-plan' — the comparison math does not accept any other
+// reference, so anything else is coerced, never rejected, and the
+// caller reports the coercion.
+export function validateAiBaseline(b) {
+  const errs = [];
+  if (!b || typeof b !== 'object') return ['baseline must be an object'];
+  if (b.primeScenario !== undefined && b.primeScenario !== null) {
+    const ps = b.primeScenario;
+    if (!ps.name || !String(ps.name).trim()) errs.push('prime scenario name is required');
+    if (!['up', 'flat', 'down'].includes(ps.direction)) errs.push('prime scenario direction must be up, flat or down');
+    if (ps.stance !== undefined && ps.stance !== null && !['pessimistic', 'optimistic', 'neutral'].includes(ps.stance)) errs.push('prime scenario stance must be pessimistic, optimistic or neutral');
+    if (ps.magnitude !== undefined && ps.magnitude !== null && !isFinite(Number(ps.magnitude))) errs.push('prime scenario magnitude must be a number');
+    if (ps.steps !== undefined && ps.steps !== null) {
+      if (!Array.isArray(ps.steps)) errs.push('prime scenario steps must be an array of {date, rate}');
+      else for (const st of ps.steps) {
+        if (!st || !/^\d{4}-\d{2}-\d{2}$/.test(String(st.date || '')) || !isFinite(Number(st.rate))) { errs.push('prime scenario steps must be {date: YYYY-MM-DD, rate: number}'); break; }
+      }
+    }
+  }
+  if (b.assumptions !== undefined && b.assumptions !== null && !Array.isArray(b.assumptions)) errs.push('assumptions must be an array');
+  return errs;
+}
 
 // ------------------------------------------- report-ready series --------
 // Pure derivations over one projection trajectory, shared by the report
