@@ -49,6 +49,7 @@ import {
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline,
+  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory, planBaselineScenario,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -3870,7 +3871,7 @@ function planAssembleMainline(projectId) {
   for (const p of props) assessed[p.id] = p.assessed_value ?? 0;
   return { properties, holdings, fxRateLatest: fxRow ? fxRow.rate : null, declaredAssets, assessed };
 }
-async function planProjectionFor(strategy, project, scenario) {
+async function planProjectionFor(strategy, project, scenario, baselineScenario = undefined) {
   await ensureFreshPrime();
   const mainline = planAssembleMainline(project.id);
   const ops = planOpsOf(strategy.id);
@@ -3882,7 +3883,9 @@ async function planProjectionFor(strategy, project, scenario) {
   const cur = getCurrentPrime();
   const currentPrime = cur ? cur.rate : null;
   const args = { mainline, ops, legs, assumptions, primeHistory, currentPrime, currentMonth };
-  const baseline = computeProjection({ ...args, ops: [], legs: [], scenario: null });
+  // A chosen baseline re-worlds the reference: the no-op projection
+  // runs under the baseline's own prime scenario instead of flat.
+  const baseline = computeProjection({ ...args, ops: [], legs: [], scenario: baselineScenario !== undefined ? baselineScenario : null });
   const strategyProj = computeProjection({ ...args, scenario });
   return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj) };
 }
@@ -3931,7 +3934,9 @@ app.get('/api/planning/projects', requireApiAuth, (req, res) => {
   const rows = db.prepare('SELECT * FROM plan_projects WHERE user_id = ? ORDER BY id DESC').all(req.user.id);
   const out = rows.map((p) => {
     const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
-    return { ...p, strategies, stale: planSnapshotStale(p.snapshot) };
+    let entity = null;
+    try { entity = p.entity ? JSON.parse(p.entity) : null; } catch { entity = null; }
+    return { ...p, strategies, stale: planSnapshotStale(p.snapshot), categoryLabels: planOptCategoryLabels(p.category, p.subcategory, entity) };
   });
   res.json({ projects: out });
 });
@@ -3970,7 +3975,201 @@ function planProjectMetadataLabels(metadata) {
 function planProjectViewRow(p) {
   if (!p) return null;
   const metadata = p.metadata ? JSON.parse(p.metadata) : null;
-  return { ...p, metadata, templateSchema: planProjectTemplate(p.template), metadataLabels: planProjectMetadataLabels(metadata) };
+  const entity = p.entity ? JSON.parse(p.entity) : null;
+  // Categorized projects render the templated detail layout (baseline →
+  // strategies → reports) with a synthesized schema: property projects
+  // keep prime scenarios, the rest keep neither legacy panel.
+  let templateSchema = planProjectTemplate(p.template);
+  if (!templateSchema && p.category) {
+    const sub = planOptSubcategory(p.category, p.subcategory);
+    const cat = planOptCategory(p.category);
+    templateSchema = {
+      key: 'categorized', label: sub ? sub.label : (cat ? cat.label : p.category),
+      sections: { primeScenarios: p.category === 'property', declaredAssets: false }, fields: [],
+    };
+  }
+  return {
+    ...p, metadata, entity, templateSchema,
+    metadataLabels: planProjectMetadataLabels(metadata),
+    categoryLabels: planOptCategoryLabels(p.category, p.subcategory, entity),
+    baselines: planBaselinesOf(p.id),
+  };
+}
+function planBaselineRow(b) {
+  if (!b) return null;
+  return { ...b, definition: b.definition ? JSON.parse(b.definition) : null, entity: b.entity ? JSON.parse(b.entity) : null };
+}
+function planBaselinesOf(projectId) {
+  return db.prepare('SELECT * FROM plan_baselines WHERE project_id = ? ORDER BY id').all(projectId).map(planBaselineRow);
+}
+// One-time seed: a pre-multi-baseline project's single metadata
+// baseline becomes its first list entry, so the list never loses it.
+function planSeedLegacyBaseline(p) {
+  const meta = p.metadata ? JSON.parse(p.metadata) : null;
+  if (!meta || !meta.aiBaseline) return;
+  if (db.prepare('SELECT id FROM plan_baselines WHERE project_id = ? LIMIT 1').get(p.id)) return;
+  const now = nowIso();
+  db.prepare('INSERT INTO plan_baselines (project_id, name, source, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, 'AI baseline', 'ai', JSON.stringify(meta.aiBaseline), now, now);
+}
+function planOptEntityLabel(entity) {
+  if (!entity || typeof entity !== 'object') return '';
+  try {
+    if (entity.type === 'property' && entity.propertyId) {
+      const row = db.prepare('SELECT address FROM properties WHERE id = ?').get(Number(entity.propertyId));
+      return row ? row.address : '';
+    }
+    if (entity.type === 'account' || entity.type === 'holding') {
+      const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(Number(entity.accountId));
+      if (!acc) return '';
+      if (entity.holdingId) {
+        const h = db.prepare('SELECT symbol, label FROM invest_holdings WHERE id = ?').get(Number(entity.holdingId));
+        return h ? `${acc.name} · ${h.symbol || h.label || ''}`.trim() : acc.name;
+      }
+      return acc.name;
+    }
+    if (entity.type === 'job' && entity.jobId) {
+      const row = db.prepare('SELECT employer FROM earn_jobs WHERE id = ?').get(Number(entity.jobId));
+      return row ? row.employer : '';
+    }
+    if (entity.type === 'rental' && entity.rentalId) {
+      const row = db.prepare('SELECT name, address FROM earn_rentals WHERE id = ?').get(Number(entity.rentalId));
+      return row ? (row.name || row.address || '') : '';
+    }
+    if (entity.type === 'all-spending') return 'All spending';
+    if (entity.type === 'all-earnings') return 'All earnings';
+  } catch { /* label falls back to empty */ }
+  return '';
+}
+function planOptCategoryLabels(category, subcategory, entity) {
+  if (!category) return null;
+  const cat = planOptCategory(category);
+  const sub = planOptSubcategory(category, subcategory);
+  return {
+    category: cat ? cat.label : category,
+    subcategory: sub ? sub.label : (subcategory || ''),
+    entity: planOptEntityLabel(entity),
+  };
+}
+function planValidateOptEntity(category, entity) {
+  if (!entity || typeof entity !== 'object') return 'entity is required';
+  if (category === 'property') {
+    if (entity.type !== 'property' || !entity.propertyId) return 'property is required';
+    if (!db.prepare('SELECT id FROM properties WHERE id = ?').get(Number(entity.propertyId))) return 'property not found';
+  } else if (category === 'investment') {
+    if ((entity.type !== 'account' && entity.type !== 'holding') || !entity.accountId) return 'account is required';
+    if (!db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(Number(entity.accountId))) return 'account not found';
+    if (entity.type === 'holding' || entity.holdingId) {
+      if (!entity.holdingId) return 'holding is required';
+      const h = db.prepare('SELECT id, account_id FROM invest_holdings WHERE id = ?').get(Number(entity.holdingId));
+      if (!h) return 'holding not found';
+      if (Number(h.account_id) !== Number(entity.accountId)) return 'holding is not in this account';
+    }
+  } else if (category === 'earning') {
+    if (entity.type === 'job') {
+      if (!entity.jobId || !db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(Number(entity.jobId))) return 'job not found';
+    } else if (entity.type === 'rental') {
+      if (!entity.rentalId || !db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(Number(entity.rentalId))) return 'rental not found';
+    } else return 'job or rental is required';
+  } else if (category === 'saving') {
+    if (entity.type !== 'all-spending') return 'saving scope is all spending';
+  } else if (category === 'tax_saving') {
+    if (entity.type !== 'all-earnings') return 'tax saving scope is all earnings';
+  } else return 'unknown category';
+  return null;
+}
+// Subcategory recommendations, computed from the picked entity's REAL
+// figures at request time — never generic template numbers. The baseline
+// is the status-quo reference (flat prime path, current-plan stock
+// reference); the strategy is the optimization direction. Charts and
+// comparisons still come from the projection engine replaying the
+// project's ops against live mainline data, never from these figures.
+function planRecommendationFor(category, subcategory, entity) {
+  const sub = planOptSubcategory(category, subcategory);
+  if (!sub) return { error: 'unknown subcategory' };
+  const entErr = planValidateOptEntity(category, entity);
+  if (entErr) return { error: entErr };
+  const flat = { name: 'Recommended baseline path', direction: 'flat', stance: 'neutral' };
+  const label = planOptEntityLabel(entity);
+  if (category === 'property') {
+    const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(Number(entity.propertyId));
+    const seg = db.prepare('SELECT * FROM rate_segments WHERE property_id = ? ORDER BY start_date DESC, id DESC LIMIT 1').get(Number(entity.propertyId));
+    const cur = getCurrentPrime();
+    let rate = seg ? seg.annual_rate : null;
+    if (rate == null && seg && seg.rate_type === 'prime_spread' && cur) rate = cur.rate + (Number(seg.spread) || 0);
+    const balance = prop.mortgage_balance ?? null;
+    const figures = { balance, rate };
+    return {
+      baseline: { name: `Current path · ${label}`, description: `Stay on the current path for ${label}`, primeScenario: flat, stockReference: 'current-plan', figures },
+      strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Bound to ${label}`, template_params: { category, subcategory, entity, opType: sub.opType, propertyId: Number(entity.propertyId) } },
+    };
+  }
+  if (category === 'investment') {
+    const acc = db.prepare('SELECT * FROM invest_accounts WHERE id = ?').get(Number(entity.accountId));
+    let figures = {};
+    let sinkLabel = acc.name;
+    let sink = { type: subcategory === 'gic' ? 'gic' : 'account', accountId: Number(entity.accountId) };
+    if (entity.holdingId) {
+      const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(Number(entity.holdingId));
+      const units = unitsOn(listEvents(db, h.id), currentMonthKey());
+      const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
+      const price = pts.length ? pts[pts.length - 1].price : null;
+      figures = { units, price, value: price != null ? Math.round(units * price * 100) / 100 : null };
+      sinkLabel = h.symbol || h.label || acc.name;
+      sink = { type: 'holding', holdingId: Number(entity.holdingId), accountId: Number(entity.accountId) };
+    } else {
+      const holdings = listHoldings(db, acc.id);
+      let total = 0;
+      for (const h of holdings) {
+        const units = unitsOn(listEvents(db, h.id), currentMonthKey());
+        const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
+        if (pts.length) total += units * pts[pts.length - 1].price;
+      }
+      figures = { value: Math.round(total * 100) / 100 };
+    }
+    return {
+      baseline: { name: `Current plan · ${sinkLabel}`, description: `Keep the current plan for ${sinkLabel}`, primeScenario: flat, stockReference: 'current-plan', figures },
+      strategy: { name: `${sub.strategyLabel} · ${sinkLabel}`, summary: `Source: cash pot → Sink: ${sinkLabel}`, template_params: { category, subcategory, entity, opType: 'buy', source: 'pot', sink, sinkLabel, summary: `Source: cash pot → Sink: ${sinkLabel}` } },
+    };
+  }
+  if (category === 'earning' && entity.type === 'job') {
+    const job = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(Number(entity.jobId));
+    const periods = { weekly: 52, biweekly: 26, semimonthly: 24, monthly: 12, annual: 1 }[job.frequency] || 12;
+    const annualGross = job.gross_basis === 'annual' ? job.gross_amount : job.gross_amount * periods;
+    return {
+      baseline: { name: `Current pay · ${label}`, description: `Keep the current pay for ${label}`, primeScenario: flat, stockReference: 'current-plan', figures: { annualGross, frequency: job.frequency } },
+      strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Bound to ${label}`, template_params: { category, subcategory, entity, jobId: Number(entity.jobId) } },
+    };
+  }
+  if (category === 'earning' && entity.type === 'rental') {
+    const yr = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC LIMIT 1').get(Number(entity.rentalId));
+    const figures = yr ? { taxYear: yr.tax_year, gross: yr.gross_rents, net: yr.net ?? null } : {};
+    return {
+      baseline: { name: `Current rents · ${label}`, description: `Keep the current rents for ${label}`, primeScenario: flat, stockReference: 'current-plan', figures },
+      strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Bound to ${label}`, template_params: { category, subcategory, entity, rentalId: Number(entity.rentalId) } },
+    };
+  }
+  if (category === 'saving') {
+    const cur = currentMonthKey();
+    const [y, m] = cur.split('-').map(Number);
+    const from = new Date(Date.UTC(y, m - 1, 1));
+    from.setUTCMonth(from.getUTCMonth() - 11);
+    const fromKey = `${from.getUTCFullYear()}-${String(from.getUTCMonth() + 1).padStart(2, '0')}`;
+    const row = db.prepare(`SELECT COALESCE(SUM(-amount), 0) AS total FROM spend_transactions WHERE amount < 0 AND kind != 'adjustment' AND substr(date, 1, 7) >= ?`).get(fromKey);
+    return {
+      baseline: { name: 'Current spending', description: 'Keep the current spending pattern', primeScenario: flat, stockReference: 'current-plan', figures: { spent12m: Math.round((row.total || 0) * 100) / 100 } },
+      strategy: { name: 'Spending analysis', summary: 'Scope: all spending cards', template_params: { category, subcategory, entity, scope: 'all-spending' } },
+    };
+  }
+  if (category === 'tax_saving') {
+    const jobs = db.prepare('SELECT COUNT(*) AS n FROM earn_jobs').get().n;
+    const rentals = db.prepare('SELECT COUNT(*) AS n FROM earn_rentals').get().n;
+    return {
+      baseline: { name: 'Current tax position', description: 'Keep the current earnings and tax position', primeScenario: flat, stockReference: 'current-plan', figures: { jobs, rentals } },
+      strategy: { name: 'Tax analysis', summary: 'Scope: all earnings', template_params: { category, subcategory, entity, scope: 'all-earnings' } },
+    };
+  }
+  return { error: 'unknown category' };
 }
 
 app.post('/api/planning/projects', requireApiAuth, (req, res) => {
@@ -3983,21 +4182,48 @@ app.post('/api/planning/projects', requireApiAuth, (req, res) => {
   const metadata = b.metadata && typeof b.metadata === 'object' ? b.metadata : null;
   const metaErr = planValidateProjectMetadata(template, metadata);
   if (metaErr) return res.status(400).json({ error: metaErr });
+  // Optimization category: validated taxonomy + entity binding. The
+  // category is immutable after creation (PUT rejects any change).
+  const category = b.category ? String(b.category) : null;
+  const subcategory = b.subcategory ? String(b.subcategory) : null;
+  const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
+  if (category || subcategory || entity) {
+    if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
+    if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
+    const entErr = planValidateOptEntity(category, entity);
+    if (entErr) return res.status(400).json({ error: entErr });
+  }
+  let rec = null;
+  if (b.applyRecommendation) {
+    if (!category) return res.status(400).json({ error: 'category is required to apply a recommendation' });
+    rec = planRecommendationFor(category, subcategory, entity);
+    if (rec.error) return res.status(400).json({ error: rec.error });
+  }
   const now = nowIso();
   const snap = JSON.stringify(planSnapshotMainline());
-  const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, template, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(req.user.id, String(b.name).trim(), b.question ? String(b.question).trim() : null, snap, template, metadata ? JSON.stringify(metadata) : null, now, now);
-  // Default scenario: prime holds at the current rate (the flat
-  // neutral preset); the user can add, duplicate or edit scenarios.
-  db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(info.lastInsertRowid, 'Flat at current prime', 'flat', 'neutral', null, null, 1, now, now);
-  const row = planProjectById(info.lastInsertRowid, req.user.id);
+  const insertProject = db.transaction(() => {
+    const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, template, metadata, category, subcategory, entity, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(req.user.id, String(b.name).trim(), b.question ? String(b.question).trim() : null, snap, template, metadata ? JSON.stringify(metadata) : null, category, subcategory, entity ? JSON.stringify(entity) : null, now, now);
+    const pid = info.lastInsertRowid;
+    db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(pid, 'Flat at current prime', 'flat', 'neutral', null, null, 1, now, now);
+    if (rec) {
+      db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(pid, rec.baseline.name, 'recommendation', category, subcategory, JSON.stringify(entity), JSON.stringify(rec.baseline), now, now);
+      db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(pid, rec.strategy.name, 'A', 'template', 'recommendation', JSON.stringify(rec.strategy.template_params), now, now);
+    }
+    return pid;
+  });
+  const pid = insertProject();
+  const row = planProjectById(pid, req.user.id);
   res.status(201).json({ project: planProjectViewRow(row) });
 });
 
 app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
+  planSeedLegacyBaseline(p);
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
   const declaredAssets = db.prepare('SELECT * FROM plan_declared_assets WHERE project_id = ? ORDER BY id').all(p.id);
@@ -4018,6 +4244,10 @@ app.put('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
   const b = req.body || {};
+  // Optimization category is immutable once chosen at creation.
+  if (b.category !== undefined || b.subcategory !== undefined || b.entity !== undefined) {
+    return res.status(400).json({ error: 'optimization category cannot be changed after creation' });
+  }
   if (b.name !== undefined && !String(b.name).trim()) return res.status(400).json({ error: 'project name is required' });
   let metadata = p.metadata ? JSON.parse(p.metadata) : null;
   if (b.metadata !== undefined) {
@@ -4029,6 +4259,78 @@ app.put('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   db.prepare('UPDATE plan_projects SET name = ?, question = ?, metadata = ?, updated_at = ? WHERE id = ?')
     .run(b.name !== undefined ? String(b.name).trim() : p.name, b.question !== undefined ? (b.question ? String(b.question).trim() : null) : p.question, metadata ? JSON.stringify(metadata) : null, nowIso(), p.id);
   res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)) });
+});
+
+// Optimization taxonomy (labels only; figures come from the
+// recommendation endpoint, computed per entity).
+app.get('/api/planning/categories', requireApiAuth, (req, res) => {
+  const categories = Object.values(PLAN_OPT_CATEGORIES).map((c) => ({
+    key: c.key, label: c.label, entityType: c.entityType,
+    subcategories: Object.values(c.subcategories).map((s) => ({ key: s.key, label: s.label, strategyLabel: s.strategyLabel })),
+  }));
+  res.json({ categories });
+});
+// All subcategory recommendations for one picked entity, in one call
+// (the creation flow shows every subcategory card with its figures).
+app.post('/api/planning/recommendations', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  const category = b.category ? String(b.category) : null;
+  const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
+  if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
+  const entErr = planValidateOptEntity(category, entity);
+  if (entErr) return res.status(400).json({ error: entErr });
+  const out = {};
+  for (const sub of Object.values(PLAN_OPT_CATEGORIES[category].subcategories)) {
+    const rec = planRecommendationFor(category, sub.key, entity);
+    if (!rec.error) out[sub.key] = rec;
+  }
+  res.json({ category, entity, recommendations: out });
+});
+// Baseline list: append-only. Every creation appends a row; nothing
+// here ever overwrites another entry.
+app.post('/api/planning/projects/:id/baselines', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  const def = b.definition && typeof b.definition === 'object' ? b.definition : null;
+  if (!def) return res.status(400).json({ error: 'definition is required' });
+  def.stockReference = 'current-plan';
+  const errs = validateAiBaseline(def);
+  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const now = nowIso();
+  const info = db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, b.name ? String(b.name).trim() : 'Baseline', b.source ? String(b.source) : 'manual', b.category ? String(b.category) : p.category, b.subcategory ? String(b.subcategory) : p.subcategory, b.entity ? JSON.stringify(b.entity) : (p.entity || null), JSON.stringify(def), now, now);
+  res.status(201).json({ baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) });
+});
+app.put('/api/planning/projects/:id/baselines/:bid', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const row = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.params.bid), p.id);
+  if (!row) return res.status(404).json({ error: 'baseline not found' });
+  const b = req.body || {};
+  const cur = planBaselineRow(row);
+  let def = cur.definition;
+  if (b.definition !== undefined) {
+    if (!b.definition || typeof b.definition !== 'object') return res.status(400).json({ error: 'definition must be an object' });
+    def = { ...def, ...b.definition };
+    def.stockReference = 'current-plan';
+    const errs = validateAiBaseline(def);
+    if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  }
+  db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
+    .run(b.name !== undefined ? String(b.name).trim() : row.name, JSON.stringify(def), nowIso(), row.id);
+  res.json({ baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) });
+});
+app.delete('/api/planning/projects/:id/baselines/:bid', requireApiAuth, (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const row = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.params.bid), p.id);
+  if (!row) return res.status(404).json({ error: 'baseline not found' });
+  // A report drafted against this baseline loses its selection (never
+  // silently falls back); the user re-picks in the report view.
+  const cleared = db.prepare('UPDATE plan_reports SET baseline_id = NULL, baseline_cleared = 1 WHERE project_id = ? AND baseline_id = ?').run(p.id, row.id);
+  db.prepare('DELETE FROM plan_baselines WHERE id = ?').run(row.id);
+  res.json({ ok: true, clearedReports: cleared.changes });
 });
 
 app.delete('/api/planning/projects/:id', requireApiAuth, (req, res) => {
@@ -4227,18 +4529,30 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
   } else {
     scenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
   }
+  // A chosen baseline re-worlds the comparison: strategy projections
+  // run under the baseline's prime scenario and the reference is the
+  // no-op projection under that same scenario.
+  let baselineScenario = undefined;
+  let chosenBaseline = null;
+  if (req.query.baselineId !== undefined && req.query.baselineId !== null && req.query.baselineId !== '') {
+    const brow = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.query.baselineId), p.id);
+    if (!brow) return res.status(404).json({ error: 'baseline not found' });
+    chosenBaseline = planBaselineRow(brow);
+    const bs = planBaselineScenario(chosenBaseline.definition);
+    if (bs) { baselineScenario = bs; scenario = { ...bs, name: (chosenBaseline.definition.primeScenario || {}).name || 'Baseline scenario' }; }
+  }
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const rows = [];
   let baseline = null;
   for (const s of strategies) {
     let r;
     try {
-      r = await planProjectionFor(s, p, scenario);
+      r = await planProjectionFor(s, p, scenario, baselineScenario);
     } catch (err) {
       return res.status(500).json({ error: `projection failed: ${err.message}` });
     }
     if (!baseline) baseline = r.baseline;
-    rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison });
+    rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison, opCount: planOpsOf(s.id).length });
   }
   // Baseline-only projection: the reference the strategy deltas are
   // computed against, and the chart's baseline line.
@@ -4286,7 +4600,7 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     trajectories: reportTrajectories,
     costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
   };
-  res.json({ project: p, scenario, scenarios, baseline, strategies: rows, report });
+  res.json({ project: p, scenario, scenarios, baseline, strategies: rows, report, chosenBaseline });
 });
 
 app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
@@ -5023,12 +5337,25 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
   const answers = req.body?.answers && typeof req.body.answers === 'object' ? req.body.answers : null;
+  // Targeted follow-up: a baselineId pins the thread to one baseline
+  // card; without it the legacy project-level thread is used.
+  let targetRow = null;
+  if (req.body?.baselineId !== undefined && req.body?.baselineId !== null) {
+    targetRow = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.body.baselineId), p.id);
+    if (!targetRow) return res.status(404).json({ error: 'baseline not found' });
+  }
   const stored = planProjectMetadataOf(p);
+  const storedThread = targetRow && targetRow.ai_thread ? JSON.parse(targetRow.ai_thread) : stored.aiBaselineThread;
+  const confirmedBaseline = targetRow ? planBaselineRow(targetRow).definition : stored.aiBaseline;
+  const writeThread = (thread) => {
+    if (targetRow) db.prepare('UPDATE plan_baselines SET ai_thread = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(thread), nowIso(), targetRow.id);
+    else planWriteProjectMetadata(p, { aiBaselineThread: thread });
+  };
   let thread = req.body?.history !== undefined
     ? sanitizeAiThread(req.body.history)
-    : sanitizeAiThread(stored.aiBaselineThread || null);
+    : sanitizeAiThread(storedThread || null);
   if (answers && Object.keys(answers).length) thread = appendAiThread(thread, { role: 'user', answers });
-  planWriteProjectMetadata(p, { aiBaselineThread: thread });
+  writeThread(thread);
   await ensureFreshPrime();
   const curPrime = getCurrentPrime();
   const snapshot = buildPlanAiSnapshot({
@@ -5046,7 +5373,7 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. The stock reference is fixed — do not propose any other reference.',
     'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
     `App data snapshot: ${JSON.stringify(snapshot)}`,
-    ...(stored.aiBaseline ? [`Currently confirmed baseline: ${JSON.stringify(stored.aiBaseline)}`, 'Refine it: keep what the user does not contradict.'] : []),
+    ...(confirmedBaseline ? [`Currently confirmed baseline: ${JSON.stringify(confirmedBaseline)}`, 'Refine it: keep what the user does not contradict.'] : []),
     ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
     ...(answers ? [`User-provided metadata (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
     `User request: ${text}`,
@@ -5063,7 +5390,7 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
     const questions = normalizeAiAsk(parsed.ask);
     if (!questions) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
     const newThread = appendAiThread(thread, { role: 'ai', questions });
-    planWriteProjectMetadata(p, { aiBaselineThread: newThread });
+    writeThread(newThread);
     return res.json({ ask: questions, thread: newThread, configured: true });
   }
   const baseline = parsed.baseline || parsed;
@@ -5071,7 +5398,7 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
   const errs = validateAiBaseline(baseline);
   if (errs.length) return res.status(502).json({ error: errs.join('; ') });
   const newThread = appendAiThread(thread, { role: 'ai', baseline });
-  planWriteProjectMetadata(p, { aiBaselineThread: newThread });
+  writeThread(newThread);
   res.json({ baseline, thread: newThread, configured: true });
 });
 app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, res) => {
@@ -5082,11 +5409,11 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
   baseline.stockReference = 'current-plan';
   const errs = validateAiBaseline(baseline);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
-  const meta = planWriteProjectMetadata(p, { aiBaseline: baseline });
   // A prime scenario in the applied baseline becomes real: find or
   // create it by name, then set it as the project's base scenario.
-  const ps = baseline.primeScenario;
-  if (ps && ps.name) {
+  const applyScenario = () => {
+    const ps = baseline.primeScenario;
+    if (!ps || !ps.name) return;
     const now = nowIso();
     let sc = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? AND name = ?').get(p.id, String(ps.name).trim());
     if (!sc) {
@@ -5096,7 +5423,23 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
     }
     db.prepare('UPDATE plan_scenarios SET is_base = 0 WHERE project_id = ?').run(p.id);
     db.prepare('UPDATE plan_scenarios SET is_base = 1 WHERE id = ?').run(sc.id);
+  };
+  // Targeted apply: update one baseline card's definition, nothing else.
+  if (req.body?.baselineId !== undefined && req.body?.baselineId !== null) {
+    const row = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.body.baselineId), p.id);
+    if (!row) return res.status(404).json({ error: 'baseline not found' });
+    applyScenario();
+    db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
+      .run(req.body.name ? String(req.body.name).trim() : row.name, JSON.stringify(baseline), nowIso(), row.id);
+    return res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) });
   }
+  const meta = planWriteProjectMetadata(p, { aiBaseline: baseline });
+  applyScenario();
+  // Append-only list: a legacy apply also appends a list entry, so the
+  // baseline list never loses an applied baseline.
+  const now = nowIso();
+  db.prepare('INSERT INTO plan_baselines (project_id, name, source, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(p.id, baseline.description || 'AI baseline', 'ai', JSON.stringify(baseline), now, now);
   res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), metadata: meta });
 });
 
@@ -5141,10 +5484,56 @@ app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {
   for (const sid of def.strategies || []) {
     if (!strategyIds.includes(Number(sid))) return res.status(400).json({ error: `strategy ${sid} is not in this project` });
   }
+  // Baseline picker (one) + strategy picker (many): the report is
+  // built against exactly this baseline and these strategies.
+  let baselineId = null;
+  if (b.baseline_id !== undefined && b.baseline_id !== null && b.baseline_id !== '') {
+    const brow = db.prepare('SELECT id FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(b.baseline_id), p.id);
+    if (!brow) return res.status(400).json({ error: 'baseline is not in this project' });
+    baselineId = brow.id;
+  }
+  let pickedStrategies = def.strategies || [];
+  if (b.strategy_ids !== undefined && b.strategy_ids !== null) {
+    if (!Array.isArray(b.strategy_ids)) return res.status(400).json({ error: 'strategy_ids must be an array' });
+    for (const sid of b.strategy_ids) {
+      if (!strategyIds.includes(Number(sid))) return res.status(400).json({ error: `strategy ${sid} is not in this project` });
+    }
+    pickedStrategies = b.strategy_ids.map(Number);
+    def.strategies = pickedStrategies;
+  }
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, now, now);
+  const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, baseline_id, baseline_cleared, strategy_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, baselineId, 0, JSON.stringify(pickedStrategies), now, now);
   res.status(201).json({ report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(info.lastInsertRowid) });
+});
+app.put('/api/planning/reports/:id', requireApiAuth, (req, res) => {
+  const r = db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: 'report not found' });
+  const p = planProjectById(r.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  let baselineId = r.baseline_id;
+  let cleared = r.baseline_cleared;
+  if (b.baseline_id !== undefined) {
+    if (b.baseline_id === null || b.baseline_id === '') { baselineId = null; }
+    else {
+      const brow = db.prepare('SELECT id FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(b.baseline_id), p.id);
+      if (!brow) return res.status(400).json({ error: 'baseline is not in this project' });
+      baselineId = brow.id; cleared = 0;
+    }
+  }
+  let strategyIds = r.strategy_ids ? JSON.parse(r.strategy_ids) : null;
+  if (b.strategy_ids !== undefined && b.strategy_ids !== null) {
+    if (!Array.isArray(b.strategy_ids)) return res.status(400).json({ error: 'strategy_ids must be an array' });
+    const all = db.prepare('SELECT id FROM plan_strategies WHERE project_id = ?').all(p.id).map((x) => x.id);
+    for (const sid of b.strategy_ids) {
+      if (!all.includes(Number(sid))) return res.status(400).json({ error: `strategy ${sid} is not in this project` });
+    }
+    strategyIds = b.strategy_ids.map(Number);
+  }
+  db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, updated_at = ? WHERE id = ?')
+    .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, nowIso(), r.id);
+  res.json({ report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(r.id) });
 });
 
 app.delete('/api/planning/reports/:id', requireApiAuth, (req, res) => {

@@ -827,6 +827,44 @@ CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strateg
   if (planProjCols.length && !planProjCols.includes('metadata')) {
     db.exec('ALTER TABLE plan_projects ADD COLUMN metadata TEXT');
   }
+  // Optimization category (immutable after creation): big category +
+  // subcategory + picked data entity (JSON). NULL = legacy/uncategorized.
+  for (const col of ['category', 'subcategory', 'entity']) {
+    if (planProjCols.length && !planProjCols.includes(col)) {
+      db.exec(`ALTER TABLE plan_projects ADD COLUMN ${col} TEXT`);
+    }
+  }
+  // Multiple named baselines per project (append-only list; the single
+  // metadata.aiBaseline from the 54203bc round is seeded into this
+  // table on first read, never overwritten by later entries).
+  db.exec(`CREATE TABLE IF NOT EXISTS plan_baselines (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES plan_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual',
+  category TEXT,
+  subcategory TEXT,
+  entity TEXT,
+  definition TEXT NOT NULL,
+  ai_thread TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_plan_baselines_project ON plan_baselines(project_id)');
+  // Report baseline selection: baseline_id NULL + baseline_cleared 0 =
+  // legacy default (project base scenario); baseline_cleared 1 = the
+  // selected baseline was deleted and the user must re-pick — the view
+  // never silently falls back to another baseline.
+  const planReportCols = db.prepare('PRAGMA table_info(plan_reports)').all().map((c) => c.name);
+  if (planReportCols.length && !planReportCols.includes('baseline_id')) {
+    db.exec('ALTER TABLE plan_reports ADD COLUMN baseline_id INTEGER');
+  }
+  if (planReportCols.length && !planReportCols.includes('baseline_cleared')) {
+    db.exec('ALTER TABLE plan_reports ADD COLUMN baseline_cleared INTEGER NOT NULL DEFAULT 0');
+  }
+  if (planReportCols.length && !planReportCols.includes('strategy_ids')) {
+    db.exec('ALTER TABLE plan_reports ADD COLUMN strategy_ids TEXT');
+  }
   const planStratCols = db.prepare('PRAGMA table_info(plan_strategies)').all().map((c) => c.name);
   if (planStratCols.length && !planStratCols.includes('template')) {
     db.exec('ALTER TABLE plan_strategies ADD COLUMN template TEXT');

@@ -15393,119 +15393,153 @@ try {
       await waitT(1200);
       await page.click('#planAddProjectBtn');
       await waitT(300);
-      const chooser = await page.evaluate(() => {
-        const m = document.querySelector('#planTemplateModal');
+      const cats = await page.evaluate(() => {
+        const m = document.querySelector('#planCategoryModal');
         return {
           open: m && !m.classList.contains('hidden'),
-          templates: [...document.querySelectorAll('#planTemplateModal [data-plan-template]')].map((el) => el.dataset.planTemplate),
+          categories: [...document.querySelectorAll('#planCategoryCards [data-plan-cat]')].map((el) => el.dataset.planCat),
         };
       });
-      check('planning template chooser renders all five templates',
-        chooser.open && JSON.stringify(chooser.templates) === JSON.stringify(['mortgage', 'refinance', 'buy', 'sell', 'blank']),
-        JSON.stringify(chooser));
-      const intakeFor = async (tpl) => {
-        await page.evaluate((t) => {
-          document.querySelector(`#planTemplateModal [data-plan-template="${t}"]`).click();
-        }, tpl);
-        await waitT(800);
-        return page.evaluate(() => ({
-          modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
-          question: document.querySelector('#planProjectForm [name=question]').value,
-          propVisible: !document.querySelector('#planProjectPropertyRow').classList.contains('hidden'),
-          acctVisible: !document.querySelector('#planProjectAccountRow').classList.contains('hidden'),
-          propOptions: [...document.querySelectorAll('#planProjectProperty option')].map((o) => o.textContent),
-        }));
-      };
-      const closeProject = async () => {
-        await page.evaluate(() => {
-          const b = document.querySelector('#planProjectModal [data-close-modal]');
-          if (b) b.click();
-        });
-        await waitT(300);
-        await page.click('#planAddProjectBtn');
-        await waitT(300);
-      };
-      const mortgageIntake = await intakeFor('mortgage');
-      check('planning mortgage template intake shows property picker and payoff prefill',
-        mortgageIntake.modalOpen && mortgageIntake.propVisible && !mortgageIntake.acctVisible
-          && mortgageIntake.question === 'Pay off the mortgage early'
-          && mortgageIntake.propOptions.some((o) => o.includes('77 Planning Test Lane')),
-        JSON.stringify(mortgageIntake));
-      await closeProject();
-      const refiIntake = await intakeFor('refinance');
-      check('planning refinance template intake shows property picker and refinance prefill',
-        refiIntake.modalOpen && refiIntake.propVisible && !refiIntake.acctVisible
-          && refiIntake.question === 'Refinance or switch the mortgage rate',
-        JSON.stringify(refiIntake));
-      await closeProject();
-      const buyIntake = await intakeFor('buy');
-      check('planning buy template intake shows account-type picker and buy prefill',
-        buyIntake.modalOpen && !buyIntake.propVisible && buyIntake.acctVisible
-          && buyIntake.question === 'Buy with funding',
-        JSON.stringify(buyIntake));
-      await closeProject();
-      const sellIntake = await intakeFor('sell');
-      check('planning sell template intake shows no picker and sell prefill',
-        sellIntake.modalOpen && !sellIntake.propVisible && !sellIntake.acctVisible
-          && sellIntake.question === 'Sell and redeploy the proceeds',
-        JSON.stringify(sellIntake));
-      await closeProject();
-      const blankIntake = await intakeFor('blank');
-      check('planning blank template intake shows no picker and empty question',
-        blankIntake.modalOpen && !blankIntake.propVisible && !blankIntake.acctVisible
-          && blankIntake.question === '',
-        JSON.stringify(blankIntake));
-      // Mortgage-template create: pick the test property, the question
-      // re-prefills with the address, submit lands on the project page.
-      await page.evaluate(() => { document.querySelector('#planProjectModal [data-close-modal]').click(); });
-      await waitT(300);
-      await page.click('#planAddProjectBtn');
-      await waitT(300);
-      await page.evaluate(() => { document.querySelector('#planTemplateModal [data-plan-template="mortgage"]').click(); });
+      check('planning category picker renders all five big categories',
+        cats.open && JSON.stringify(cats.categories) === JSON.stringify(['property', 'investment', 'earning', 'saving', 'tax_saving']),
+        JSON.stringify(cats));
+      // Big category → data entity → subcategory's optimal.
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="property"]').click(); });
       await waitT(800);
+      const entityStep = await page.evaluate(() => ({
+        hasSelect: !!document.querySelector('#planCatEntitySel'),
+        options: [...document.querySelectorAll('#planCatEntitySel option')].map((o) => o.textContent),
+      }));
+      check('planning property category shows a property picker',
+        entityStep.hasSelect && entityStep.options.some((o) => o.includes('77 Planning Test Lane')),
+        JSON.stringify(entityStep));
       await page.evaluate(() => {
-        const sel = document.querySelector('#planProjectProperty');
+        const sel = document.querySelector('#planCatEntitySel');
         const opt = [...sel.options].find((o) => o.textContent.includes('77 Planning Test Lane'));
         if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
       });
-      await waitT(200);
-      await page.type('#planProjectForm [name=name]', 'Template Flow Test');
-      const prefilledQ = await page.evaluate(() => document.querySelector('#planProjectForm [name=question]').value);
-      check('planning mortgage intake re-prefills the question with the picked property',
-        prefilledQ === 'Pay off the mortgage on 77 Planning Test Lane, Victoria, BC early',
-        JSON.stringify({ prefilledQ }));
-      await page.click('#planProjectForm button[type=submit]');
-      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
       await waitT(800);
-      const landed = await page.evaluate(() => ({
-        hash: location.hash,
-        text: document.querySelector('#planProject') ? document.querySelector('#planProject').textContent : '',
+      const subs = await page.evaluate(() => [...document.querySelectorAll('#planCategorySubs [data-plan-sub]')].map((el) => ({
+        key: el.dataset.planSub, text: el.textContent,
+      })));
+      check('planning subcategory cards show recommended baseline + strategy for the picked property',
+        subs.some((x) => x.key === 'interest_rate' && x.text.includes('Baseline:') && x.text.includes('Strategy:'))
+          && subs.some((x) => x.key === 'refinance' && x.text.includes('Baseline:') && x.text.includes('Strategy:')),
+        JSON.stringify(subs));
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="refinance"]').click(); });
+      await waitT(800);
+      const intake = await page.evaluate(() => ({
+        modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+        catNote: document.querySelector('#planProjectCategoryNote') ? document.querySelector('#planProjectCategoryNote').textContent : '',
+        catBtnsVisible: !document.querySelector('#planProjectCategoryBtns').classList.contains('hidden'),
+        saveLabel: document.querySelector('#planProjectSaveBtn').textContent,
+        question: document.querySelector('#planProjectForm [name=question]').value,
       }));
-      check('planning mortgage-template create lands on the project page with the prefilled question',
-        landed.hash.startsWith('#planning/project/') && landed.text.includes('Template Flow Test')
-          && landed.text.includes('Pay off the mortgage on 77 Planning Test Lane, Victoria, BC early'),
-        JSON.stringify({ hash: landed.hash, hasQ: landed.text.includes('Pay off the mortgage') }));
-      const templateProjectId = landed.hash.split('/').pop();
-      // Blank-path create behaves as before (name + optional question).
+      check('planning category intake shows the recommendation, Apply + AI + Create-without',
+        intake.modalOpen && intake.catBtnsVisible && intake.saveLabel === 'Create without'
+          && intake.catNote.includes('property') && intake.catNote.includes('refinance')
+          && intake.catNote.includes('Baseline:') && intake.catNote.includes('Strategy:')
+          && intake.question.length > 0,
+        JSON.stringify(intake));
+      await page.type('#planProjectForm [name=name]', 'Category Flow Test');
+      await page.click('#planProjectApplyRecBtn');
+      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await waitT(1500);
+      const landed = await page.evaluate(() => {
+        const panelTitles = [...document.querySelectorAll('.panel .section-head h3')].map((el) => el.textContent);
+        const baseCards = [...document.querySelectorAll('#planBaselineCards [data-plan-baseline]')].map((el) => ({
+          name: el.textContent,
+          edit: !!el.querySelector('[data-plan-baseline-edit]'),
+          ai: !!el.querySelector('[data-plan-baseline-ai]'),
+          del: !!el.querySelector('[data-plan-baseline-del]'),
+        }));
+        const stratCards = [...document.querySelectorAll('#planStrategyCards [data-plan-strategy]')].map((el) => ({
+          text: el.textContent,
+          edit: !!el.querySelector('[data-plan-strategy-edit]'),
+          del: !!el.querySelector('[data-plan-strategy-del]'),
+        }));
+        return {
+          hash: location.hash,
+          headerTitle: document.querySelector('#planProjectHeader h3') ? document.querySelector('#planProjectHeader h3').textContent : '',
+          panelTitles,
+          catLine: document.querySelector('#planProjectCategoryLine') ? document.querySelector('#planProjectCategoryLine').textContent : '',
+          baseCards, stratCards,
+        };
+      });
+      check('planning detail title is an inline header row, not a standalone card',
+        landed.hash.startsWith('#planning/project/') && landed.headerTitle === 'Category Flow Test'
+          && !landed.panelTitles.includes('Category Flow Test'),
+        JSON.stringify({ headerTitle: landed.headerTitle, panelTitles: landed.panelTitles }));
+      check('planning detail shows the category as read-only metadata',
+        landed.catLine.includes('Property') && landed.catLine.includes('Refinance') && landed.catLine.includes('77 Planning Test Lane'),
+        JSON.stringify({ catLine: landed.catLine }));
+      check('planning applied recommendation renders baseline + strategy cards with Edit/Delete',
+        landed.baseCards.length === 1 && landed.baseCards[0].edit && landed.baseCards[0].ai && landed.baseCards[0].del
+          && landed.stratCards.length === 1 && landed.stratCards[0].edit && landed.stratCards[0].del,
+        JSON.stringify({ baseCards: landed.baseCards, stratCards: landed.stratCards }));
+      const catProjectId = landed.hash.split('/').pop();
+      // Edit modal carries no category control, and PUT rejects a change.
+      await page.evaluate(() => { document.querySelector('#planProjectEditBtn').click(); });
+      await waitT(500);
+      const editModal = await page.evaluate(() => ({
+        open: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+        catRowHidden: document.querySelector('#planProjectCategoryRow').classList.contains('hidden'),
+        catBtnsHidden: document.querySelector('#planProjectCategoryBtns').classList.contains('hidden'),
+        saveLabel: document.querySelector('#planProjectSaveBtn').textContent,
+      }));
+      check('planning edit modal has no category control',
+        editModal.open && editModal.catRowHidden && editModal.catBtnsHidden && editModal.saveLabel === 'Save',
+        JSON.stringify(editModal));
+      await page.evaluate(() => { document.querySelector('#planProjectModal [data-close-modal]').click(); });
+      await waitT(300);
+      r = await req('PUT', `/api/planning/projects/${catProjectId}`, { name: 'Category Flow Test', category: 'investment' });
+      check('planning PUT changing the category returns 400',
+        r.status === 400 && String(r.data.error || '').includes('cannot be changed'), JSON.stringify(r.data));
+      // Create-without: same flow, no recommendation applied.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitT(1000);
       await page.click('#planAddProjectBtn');
       await waitT(300);
-      await page.evaluate(() => { document.querySelector('#planTemplateModal [data-plan-template="blank"]').click(); });
-      await waitT(300);
-      await page.type('#planProjectForm [name=name]', 'Blank Flow Test');
-      await page.click('#planProjectForm button[type=submit]');
-      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="property"]').click(); });
       await waitT(800);
-      const blankLanded = await page.evaluate(() => ({ hash: location.hash }));
-      check('planning blank-template create lands on a project page',
-        blankLanded.hash.startsWith('#planning/project/') && blankLanded.hash !== landed.hash,
-        JSON.stringify(blankLanded));
-      const blankProjectId = blankLanded.hash.split('/').pop();
-      r = await req('DELETE', `/api/planning/projects/${templateProjectId}`);
-      check('planning template-flow project cleanup', r.status === 200);
-      r = await req('DELETE', `/api/planning/projects/${blankProjectId}`);
-      check('planning blank-flow project cleanup', r.status === 200);
+      await page.evaluate(() => {
+        const sel = document.querySelector('#planCatEntitySel');
+        const opt = [...sel.options].find((o) => o.textContent.includes('77 Planning Test Lane'));
+        if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+      });
+      await waitT(800);
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="interest_rate"]').click(); });
+      await waitT(800);
+      await page.type('#planProjectForm [name=name]', 'Category Bare Test');
+      await page.click('#planProjectSaveBtn');
+      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await waitT(1500);
+      const bareLanded = await page.evaluate(() => ({ hash: location.hash }));
+      check('planning create-without lands on a project page',
+        bareLanded.hash.startsWith('#planning/project/') && bareLanded.hash !== landed.hash,
+        JSON.stringify(bareLanded));
+      const bareProjectId = bareLanded.hash.split('/').pop();
+      r = await req('GET', `/api/planning/projects/${bareProjectId}`);
+      check('planning create-without starts with no baseline and no strategy',
+        (r.data.project.baselines || []).length === 0 && (r.data.strategies || []).length === 0,
+        JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length }));
+      // Different entity → different recommendation figures (API-level).
+      r = await req('POST', '/api/properties', { address: '1 Cat Entity Way', purchase_date: '2024-01-15', mortgage_balance: 500000 });
+      const entA = r.data.id || (r.data.property && r.data.property.id);
+      r = await req('POST', '/api/properties', { address: '2 Cat Entity Way', purchase_date: '2024-01-15', mortgage_balance: 900000 });
+      const entB = r.data.id || (r.data.property && r.data.property.id);
+      const recA = await req('POST', '/api/planning/recommendations', { category: 'property', entity: { type: 'property', propertyId: entA } });
+      const recB = await req('POST', '/api/planning/recommendations', { category: 'property', entity: { type: 'property', propertyId: entB } });
+      check('planning recommendation references the picked entity (different entity, different figures)',
+        entA && entB && recA.data.recommendations.refinance.baseline.figures.balance === 500000
+          && recB.data.recommendations.refinance.baseline.figures.balance === 900000,
+        JSON.stringify({ a: recA.data.recommendations?.refinance?.baseline?.figures, b: recB.data.recommendations?.refinance?.baseline?.figures }));
+      r = await req('DELETE', `/api/planning/projects/${catProjectId}`);
+      check('planning category-flow project cleanup', r.status === 200);
+      r = await req('DELETE', `/api/planning/projects/${bareProjectId}`);
+      check('planning category-bare project cleanup', r.status === 200);
+      if (entA) await req('DELETE', `/api/properties/${entA}`);
+      if (entB) await req('DELETE', `/api/properties/${entB}`);
     } finally { await browserT.close(); }
   }
   // AI report: generate → preview → save (nothing writes before Save),
@@ -16043,6 +16077,303 @@ try {
   check('planning: project cleanup', r.status === 200);
   r = await req('DELETE', `/api/properties/${planPid}`);
   check('planning: test property cleanup', r.status === 200, JSON.stringify(r.data));
+
+  // ---- Optimization categories: multi-baseline, cards, AI follow-up, grounding ----
+  r = await req('POST', '/api/properties', { address: '9 Category Lane', purchase_date: '2024-01-15', mortgage_balance: 800000, amortization_years: 25 });
+  check('planning category: fixture property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const catPid = r.data.id;
+  r = await req('POST', `/api/properties/${catPid}/rates`, { start_date: '2024-01-15', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 });
+  check('planning category: variable segment created', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/projects', { name: 'Category Multi', question: 'q', category: 'property', subcategory: 'refinance', entity: { type: 'property', propertyId: catPid } });
+  check('planning category: bare categorized project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const catMultiId = r.data.project.id;
+  const flatDef = { description: 'Flat path', primeScenario: { name: 'Flat A', direction: 'flat', stance: 'neutral' }, stockReference: 'current-plan' };
+  const upDef = { description: 'Rising path', primeScenario: { name: 'Up B', direction: 'up', stance: 'pessimistic', magnitude: 1, steps: [{ date: '2027-01-01', rate: 6.5 }] }, stockReference: 'current-plan' };
+  r = await req('POST', `/api/planning/projects/${catMultiId}/baselines`, { name: 'Baseline A', source: 'manual', definition: flatDef });
+  check('planning category: baseline A created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
+  const baseA = r.data.baseline.id;
+  r = await req('POST', `/api/planning/projects/${catMultiId}/baselines`, { name: 'Baseline B', source: 'manual', definition: upDef });
+  check('planning category: baseline B created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
+  const baseB = r.data.baseline.id;
+  r = await req('GET', `/api/planning/projects/${catMultiId}`);
+  check('planning category: two baselines coexist in one project',
+    (r.data.project.baselines || []).length === 2, JSON.stringify((r.data.project.baselines || []).map((b) => b.name)));
+  const mkStrat = async (name, amount) => {
+    const s2 = await req('POST', `/api/planning/projects/${catMultiId}/strategies`, { name, source: 'template' });
+    const sid = s2.data.strategy.id;
+    await req('POST', `/api/planning/strategies/${sid}/ops`, { op_type: 'prepay', params: { propertyId: catPid, date: '2026-12-01', amount, openClosed: 'open' } });
+    return sid;
+  };
+  const stratX = await mkStrat('Cat Strat X', 10000);
+  const stratY = await mkStrat('Cat Strat Y', 20000);
+  check('planning category: two strategies created', stratX > 0 && stratY > 0 && stratX !== stratY, JSON.stringify({ stratX, stratY }));
+  // Applying a subcategory recommendation APPENDS a baseline.
+  const recCat = await req('POST', '/api/planning/recommendations', { category: 'property', entity: { type: 'property', propertyId: catPid } });
+  r = await req('POST', `/api/planning/projects/${catMultiId}/baselines`, { name: recCat.data.recommendations.refinance.baseline.name, source: 'recommendation', category: 'property', subcategory: 'refinance', entity: { type: 'property', propertyId: catPid }, definition: recCat.data.recommendations.refinance.baseline });
+  check('planning category: recommendation appends a third baseline', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catMultiId}`);
+  check('planning category: append keeps the old baselines',
+    (r.data.project.baselines || []).length === 3
+      && (r.data.project.baselines || []).some((b) => b.id === baseA)
+      && (r.data.project.baselines || []).some((b) => b.id === baseB),
+    JSON.stringify((r.data.project.baselines || []).map((b) => b.name)));
+  // Report from baseline A + strategies X,Y; switching to B changes values.
+  r = await req('POST', `/api/planning/projects/${catMultiId}/reports`, { name: 'Cat Report', definition: { strategies: [stratX, stratY], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }] }, baseline_id: baseA, strategy_ids: [stratX, stratY] });
+  check('planning category: report stores baseline A + strategies X,Y',
+    r.status === 201 && r.data.report && r.data.report.baseline_id === baseA && r.data.report.strategy_ids === `[${stratX},${stratY}]`,
+    JSON.stringify(r.data.report));
+  const catRepId = r.data.report.id;
+  const trajSum = (comp) => (comp.report.trajectories[0].monthly || []).reduce((s, m) => s + (m.mortgage_balance || 0), 0);
+  const compA = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}`);
+  const compB = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseB}`);
+  check('planning category: report from baseline A compares both strategies against A',
+    compA.status === 200 && compA.data.chosenBaseline && compA.data.chosenBaseline.id === baseA
+      && (compA.data.strategies || []).length === 2,
+    JSON.stringify({ chosen: compA.data.chosenBaseline && compA.data.chosenBaseline.id, n: (compA.data.strategies || []).length }));
+  check('planning category: switching the report to baseline B changes comparison values',
+    compB.status === 200 && compB.data.chosenBaseline && compB.data.chosenBaseline.id === baseB
+      && trajSum(compA.data) !== trajSum(compB.data)
+      && compA.data.strategies[0].comparison.net !== compB.data.strategies[0].comparison.net,
+    JSON.stringify({ sumA: trajSum(compA.data), sumB: trajSum(compB.data), netA: compA.data.strategies[0].comparison.net, netB: compB.data.strategies[0].comparison.net }));
+  // Card edit updates only that entry.
+  r = await req('PUT', `/api/planning/projects/${catMultiId}/baselines/${baseA}`, { name: 'Baseline A renamed' });
+  check('planning category: baseline card rename succeeds', r.status === 200 && r.data.baseline && r.data.baseline.name === 'Baseline A renamed', JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catMultiId}`);
+  check('planning category: card edit updates only that baseline',
+    (r.data.project.baselines || []).some((b) => b.id === baseA && b.name === 'Baseline A renamed')
+      && (r.data.project.baselines || []).some((b) => b.id === baseB && b.name === 'Baseline B'),
+    JSON.stringify((r.data.project.baselines || []).map((b) => b.name)));
+  // Card delete removes only that entry; deleting baseline A (in the
+  // report draft) clears the report selection instead of falling back.
+  r = await req('DELETE', `/api/planning/projects/${catMultiId}/baselines/${baseA}`);
+  check('planning category: delete baseline A clears the report draft', r.status === 200 && r.data.clearedReports === 1, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catMultiId}`);
+  const catRep = (r.data.reports || []).find((x) => x.id === catRepId);
+  check('planning category: report selection cleared, other baseline + strategies intact',
+    catRep && catRep.baseline_id === null && catRep.baseline_cleared === 1
+      && (r.data.project.baselines || []).some((b) => b.id === baseB)
+      && (r.data.strategies || []).length === 2,
+    JSON.stringify({ rep: catRep, baselines: (r.data.project.baselines || []).map((b) => b.id), strategies: (r.data.strategies || []).length }));
+  r = await req('DELETE', `/api/planning/strategies/${stratY}`);
+  check('planning category: delete strategy Y removes only Y', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catMultiId}`);
+  check('planning category: strategy X survives the Y delete',
+    (r.data.strategies || []).length === 1 && r.data.strategies[0].id === stratX,
+    JSON.stringify((r.data.strategies || []).map((s) => s.id)));
+  // AI follow-up on an applied recommendation (stub LLM): baseline
+  // ask → spec → Apply touches only the targeted baseline row, and
+  // ai-model attaches a spec to the recommendation strategy.
+  r = await req('POST', '/api/planning/projects', { name: 'Category AI Follow', question: 'q', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: catPid }, applyRecommendation: true });
+  check('planning category: recommendation applied for AI follow-up', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const catAiId = r.data.project.id;
+  r = await req('GET', `/api/planning/projects/${catAiId}`);
+  const aiBaseRow = (r.data.project.baselines || [])[0];
+  const aiStratRow = (r.data.strategies || [])[0];
+  check('planning category: applied project has one baseline + one strategy',
+    !!aiBaseRow && !!aiStratRow, JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length }));
+  const aiBaseBefore = JSON.stringify(aiBaseRow.definition);
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'prime_direction', label: 'Prime direction?', type: 'text' }] }));
+  r = await req('POST', `/api/planning/projects/${catAiId}/ai-baseline`, { text: 'Prime rises', baselineId: aiBaseRow.id });
+  check('planning category: AI follow-up ask targets the baseline card without writing',
+    r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.length === 1,
+    JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catAiId}`);
+  check('planning category: ask preview leaves the baseline row unchanged',
+    JSON.stringify((r.data.project.baselines || [])[0].definition) === aiBaseBefore,
+    JSON.stringify((r.data.project.baselines || [])[0].definition));
+  const followDef = { description: 'Prime rises then holds (follow-up)', primeScenario: { name: 'Follow Path', direction: 'up', stance: 'pessimistic', magnitude: 1, steps: [{ date: '2027-01-01', rate: 5.5 }] }, stockReference: 'current-plan', assumptions: [{ key: 'growth', value: 'flat' }] };
+  fs.writeFileSync(aiStubFile, JSON.stringify({ baseline: followDef }));
+  r = await req('POST', `/api/planning/projects/${catAiId}/ai-baseline`, { text: 'Prime rises', baselineId: aiBaseRow.id });
+  check('planning category: AI follow-up spec previews without writing',
+    r.status === 200 && r.data.baseline && r.data.baseline.description === 'Prime rises then holds (follow-up)',
+    JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catAiId}`);
+  check('planning category: spec preview leaves the baseline row unchanged',
+    JSON.stringify((r.data.project.baselines || [])[0].definition) === aiBaseBefore, '');
+  r = await req('POST', `/api/planning/projects/${catAiId}/ai-baseline/apply`, { baseline: followDef, baselineId: aiBaseRow.id });
+  check('planning category: AI follow-up Apply updates the targeted baseline',
+    r.status === 200 && r.data.baseline && r.data.baseline.definition && r.data.baseline.definition.description === 'Prime rises then holds (follow-up)',
+    JSON.stringify(r.data));
+  const aiModelDef2 = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [{ key: 'stockReturnPct', value: 5, source: 'user' }], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef2));
+  r = await req('POST', `/api/planning/strategies/${aiStratRow.id}/ai-model`, { text: 'Model interest', name: 'Follow model' });
+  check('planning category: AI follow-up designs a model on the recommendation strategy',
+    r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
+  const followModelId = r.data.model.id;
+  r = await req('PUT', `/api/planning/strategies/${aiStratRow.id}`, { model_id: followModelId });
+  check('planning category: follow-up model attaches to the strategy', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${aiStratRow.id}`);
+  check('planning category: strategy returns the attached follow-up model',
+    r.status === 200 && r.data.model && r.data.model.id === followModelId, JSON.stringify(r.data.model && r.data.model.id));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ fields: {} }));
+  // Grounding: report numbers come from the live snapshot, not the template.
+  r = await req('POST', '/api/investments/accounts', { name: 'Cat Ground Acct', type: 'NonRegistered' });
+  check('planning category: grounding account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const gAcct = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${gAcct}/holdings`, { label: 'Ground Holding', kind: 'exchange', symbol: 'GROUND', currency: 'CAD', events: [{ date: '2026-01-15', type: 'buy', units: 100, price: 10 }] });
+  check('planning category: grounding holding with buy event created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const gHold = r.data.id;
+  r = await req('POST', '/api/planning/projects', { name: 'Category Ground', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'holding', accountId: gAcct, holdingId: gHold } });
+  check('planning category: grounding project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const gProj = r.data.project.id;
+  const stockLast = async () => {
+    const c = await req('GET', `/api/planning/projects/${gProj}/comparison`);
+    const s = c.data.baseline && c.data.baseline.stocks && c.data.baseline.stocks.series;
+    return s && s.length ? s[s.length - 1].value : null;
+  };
+  const stockBefore = await stockLast();
+  r = await req('POST', `/api/investments/holdings/${gHold}/events`, { date: '2026-06-15', type: 'buy', units: 100, price: 10 });
+  check('planning category: second buy event posted', r.status === 201, JSON.stringify(r.data));
+  const stockAfter = await stockLast();
+  check('planning category: comparison stock value moves with the live snapshot (not baked into the template)',
+    stockBefore !== null && stockAfter !== null && stockAfter !== stockBefore,
+    JSON.stringify({ stockBefore, stockAfter }));
+  // Legacy project: no category, no baselines panel content.
+  r = await req('POST', '/api/planning/projects', { name: 'Category Legacy', question: 'legacy q' });
+  check('planning category: legacy project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const legacyId = r.data.project.id;
+  r = await req('GET', `/api/planning/projects/${legacyId}`);
+  check('planning category: legacy project shows no category and no baselines',
+    r.data.project && !r.data.project.category && !r.data.project.categoryLabels && (r.data.project.baselines || []).length === 0,
+    JSON.stringify({ category: r.data.project.category, baselines: (r.data.project.baselines || []).length }));
+  r = await req('DELETE', `/api/planning/projects/${catMultiId}`);
+  check('planning category: multi project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/planning/projects/${catAiId}`);
+  check('planning category: AI follow-up project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/planning/projects/${gProj}`);
+  check('planning category: grounding project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/planning/projects/${legacyId}`);
+  check('planning category: legacy project cleanup', r.status === 200);
+  r = await req('DELETE', `/api/properties/${catPid}`);
+  check('planning category: fixture property cleanup', r.status === 200, JSON.stringify(r.data));
+
+  // ---- Funding-source multi-select picker (browser) ----
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('planning source-picker browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardP = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResP = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueP = loginResP.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserP = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserP.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardP({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueP, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      // Fixtures: one account, two holdings, one strategy, two sell ops
+      // (one per holding) — the buy's two sources.
+      r = await req('POST', '/api/investments/accounts', { name: 'Picker Acct', type: 'NonRegistered' });
+      const pkAcct = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${pkAcct}/holdings`, { label: 'Picker H1', kind: 'exchange', symbol: 'PKA', currency: 'CAD', events: [{ date: '2026-01-15', type: 'buy', units: 50, price: 20 }] });
+      const pkH1 = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${pkAcct}/holdings`, { label: 'Picker H2', kind: 'exchange', symbol: 'PKB', currency: 'CAD', events: [{ date: '2026-01-15', type: 'buy', units: 50, price: 20 }] });
+      const pkH2 = r.data.id;
+      r = await req('POST', '/api/planning/projects', { name: 'Picker Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'account', accountId: pkAcct } });
+      const pkProj = r.data.project.id;
+      r = await req('POST', `/api/planning/projects/${pkProj}/strategies`, { name: 'Picker Strat', source: 'template' });
+      const pkStrat = r.data.strategy.id;
+      r = await req('POST', `/api/planning/strategies/${pkStrat}/ops`, { op_type: 'sell', params: { holdingId: pkH1, date: '2026-12-01', units: 10, price: 20 } });
+      check('planning picker: sell op A posted', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', `/api/planning/strategies/${pkStrat}/ops`, { op_type: 'sell', params: { holdingId: pkH2, date: '2026-12-01', units: 10, price: 20 } });
+      check('planning picker: sell op B posted', r.status === 201, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${pkStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1500);
+      await page.click('#planAddOpBtn');
+      await waitP(500);
+      await page.select('#planOpTypeSel', 'buy');
+      await waitP(500);
+      const pickerBefore = await page.evaluate(() => ({
+        hasBtn: !!document.querySelector('#planOpSourceBtn'),
+        panelHidden: document.querySelector('#planOpSourcePanel') ? document.querySelector('#planOpSourcePanel').classList.contains('hidden') : null,
+        options: [...document.querySelectorAll('#planOpSourcePanel [data-plan-op-source]')].map((el) => el.dataset.planOpSource),
+        legs: [...document.querySelectorAll('#planOpLegs .plan-leg-row .plan-leg-src')].map((el) => el.value),
+      }));
+      check('planning picker: buy form shows a multi-select source picker with both sell ops',
+        pickerBefore.hasBtn && pickerBefore.panelHidden === true
+          && pickerBefore.options.includes('op:1') && pickerBefore.options.includes('op:2'),
+        JSON.stringify(pickerBefore));
+      await page.click('#planOpSourceBtn');
+      await waitP(300);
+      await page.evaluate(() => {
+        // The new buy starts with the default cash leg checked; uncheck
+        // it first (unchecking removes the leg), then check both sells.
+        const cash = document.querySelector('#planOpSourcePanel [data-plan-op-source="cash"]');
+        if (cash && cash.checked) cash.click();
+        for (const v of ['op:1', 'op:2']) {
+          const box = document.querySelector(`#planOpSourcePanel [data-plan-op-source="${v}"]`);
+          if (box && !box.checked) box.click();
+        }
+      });
+      await waitP(300);
+      const pickerAfter = await page.evaluate(() => ({
+        btnLabel: document.querySelector('#planOpSourceBtn') ? document.querySelector('#planOpSourceBtn').textContent : '',
+        legs: [...document.querySelectorAll('#planOpLegs .plan-leg-row .plan-leg-src')].map((el) => el.value),
+      }));
+      check('planning picker: checking two sources renders two funding legs',
+        pickerAfter.legs.length === 2 && pickerAfter.legs.includes('op:1') && pickerAfter.legs.includes('op:2')
+          && pickerAfter.btnLabel.includes('2 sources'),
+        JSON.stringify(pickerAfter));
+      // Fill the buy and save: both legs validate together.
+      await page.evaluate((acct) => {
+        const sel = document.querySelector('#planOpAccount');
+        sel.value = String(acct);
+        document.querySelector('#planOpSymbol').value = 'PKC';
+        document.querySelector('#planOpUnits').value = '10';
+        document.querySelector('#planOpPrice').value = '20';
+        document.querySelector('#planOpDateVal').value = '2026-12-01';
+      }, pkAcct);
+      await page.click('#planOpSaveBtn');
+      await waitP(1200);
+      r = await req('GET', `/api/planning/strategies/${pkStrat}`);
+      const buyOp = (r.data.ops || []).find((o) => o.op_type === 'buy');
+      check('planning picker: saved buy carries both funding legs',
+        !!buyOp && (buyOp.legs || []).length === 2
+          && (buyOp.legs || []).map((l) => l.source_ref).includes('op:1')
+          && (buyOp.legs || []).map((l) => l.source_ref).includes('op:2'),
+        JSON.stringify(buyOp));
+      r = await req('DELETE', `/api/planning/projects/${pkProj}`);
+      check('planning picker: project cleanup', r.status === 200);
+    } finally { await browserP.close(); }
+  }
 
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);

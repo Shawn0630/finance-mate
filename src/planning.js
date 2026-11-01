@@ -947,6 +947,70 @@ export const PLAN_PROJECT_TEMPLATES = {
 export function planProjectTemplate(key) {
   return (key && PLAN_PROJECT_TEMPLATES[key]) || null;
 }
+// ---- Optimization categories (creation taxonomy) -----------------------
+// Big category → subcategories. Each subcategory names the strategy
+// shape it recommends; the recommendation itself (baseline definition +
+// strategy params, bound to a picked entity's real figures) is computed
+// server-side by planRecommendationFor. The taxonomy is data, not a
+// closed switch: adding a subcategory is adding one entry here.
+// Earning subcategories (salary, rental) mirror the Earnings module's
+// two blocks; saving/tax-saving scope to the whole module's data.
+export const PLAN_OPT_CATEGORIES = {
+  property: {
+    key: 'property', label: 'Property', entityType: 'property',
+    subcategories: {
+      interest_rate: { key: 'interest_rate', label: 'Interest rate', opType: 'rate_switch', strategyLabel: 'Rate switch' },
+      refinance: { key: 'refinance', label: 'Refinance', opType: 'refinance', strategyLabel: 'Refinance' },
+    },
+  },
+  investment: {
+    key: 'investment', label: 'Investment', entityType: 'investment',
+    subcategories: {
+      gic: { key: 'gic', label: 'GIC', opType: 'buy', strategyLabel: 'Buy GIC' },
+      stock: { key: 'stock', label: 'Stock', opType: 'buy', strategyLabel: 'Buy stock' },
+      etf: { key: 'etf', label: 'ETF', opType: 'buy', strategyLabel: 'Buy ETF' },
+    },
+  },
+  earning: {
+    key: 'earning', label: 'Earning', entityType: 'earning',
+    subcategories: {
+      salary: { key: 'salary', label: 'Salary', opType: null, strategyLabel: 'Salary plan' },
+      rental: { key: 'rental', label: 'Rental', opType: null, strategyLabel: 'Rental plan' },
+    },
+  },
+  saving: {
+    key: 'saving', label: 'Saving', entityType: 'scope',
+    subcategories: {
+      spending_analysis: { key: 'spending_analysis', label: 'Spending analysis', opType: null, strategyLabel: 'Spending analysis' },
+    },
+  },
+  tax_saving: {
+    key: 'tax_saving', label: 'Tax saving', entityType: 'scope',
+    subcategories: {
+      tax_analysis: { key: 'tax_analysis', label: 'Tax analysis', opType: null, strategyLabel: 'Tax analysis' },
+    },
+  },
+};
+export function planOptCategory(key) {
+  return (key && PLAN_OPT_CATEGORIES[key]) || null;
+}
+export function planOptSubcategory(category, subcategory) {
+  const c = planOptCategory(category);
+  return (c && subcategory && c.subcategories[subcategory]) || null;
+}
+// A baseline row's prime scenario as a projection scenario object.
+// Rows store the definition the user confirmed; the comparison math
+// takes the scenario object directly (no stored scenario row needed).
+export function planBaselineScenario(def) {
+  const ps = def && def.primeScenario;
+  if (!ps || !['up', 'flat', 'down'].includes(ps.direction)) return null;
+  return {
+    direction: ps.direction,
+    stance: ['pessimistic', 'optimistic', 'neutral'].includes(ps.stance) ? ps.stance : 'neutral',
+    magnitude: ps.magnitude != null ? Number(ps.magnitude) : null,
+    steps: Array.isArray(ps.steps) ? ps.steps : null,
+  };
+}
 export function planProjectSections(key) {
   const t = planProjectTemplate(key);
   return t ? t.sections : null;
