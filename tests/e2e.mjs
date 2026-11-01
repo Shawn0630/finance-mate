@@ -3173,9 +3173,9 @@ try {
         JSON.stringify({ card: sweepCard && sweepCard.slice(0, 200), remaining: sweepFmt(sweepState.p.remainingBalance), payment: sweepFmt(sweepState.p.paymentUsed) }));
 
       // Assessed-history window: the range is a start/end month
-      // pair (the default 5-year preset fills Nov 2021-Oct 2026).
-      // A property with 8 years on record (2019-2026) draws the 5
-      // whose January falls in the pair (2022-2026); All widens it
+      // pair (the default 1-year preset fills Dec 2025-Nov 2026).
+      // A property with 8 years on record (2019-2026) draws the 1
+      // whose January falls in the pair (2026); All widens it
       // to every year, and the trend summary is calculated over
       // the same range the chart shows.
       r = await req('POST', '/api/properties', { address: '977 Window Test Way, Victoria, BC', purchase_date: '2020-01-15', mortgage_balance: 500000 });
@@ -3190,11 +3190,11 @@ try {
         return ds ? ds.data.map((p) => p.x) : null;
       });
       const winDefault = await assessedYears();
-      check('detail chart A defaults to the most recent 5 assessment years (2022-2026)',
-        JSON.stringify(winDefault) === JSON.stringify([2022, 2023, 2024, 2025, 2026]), JSON.stringify(winDefault));
+      check('detail chart A defaults to the most recent 1 assessment year (2026)',
+        JSON.stringify(winDefault) === JSON.stringify([2026]), JSON.stringify(winDefault));
       const sumDefault = await page.evaluate(() => document.querySelector('#trendSummary').textContent);
-      check('trend summary is calculated over the displayed 5-year window (figure only, no range-guidance tail)',
-        sumDefault.includes('Change 2022 → 2026') && !sumDefault.includes('fall in the selected chart range'), sumDefault);
+      check('trend summary with a single-year default window shows the single-point guidance, not a Change figure',
+        sumDefault.includes('Only the 2026 point falls in the selected chart range') && !sumDefault.includes('Change 2022'), sumDefault);
       await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="0"]').click());
       await wait(600);
       const winAll = await assessedYears();
@@ -3259,6 +3259,10 @@ try {
       await req('POST', `/api/properties/${winPid}/rates`, { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 });
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
+      // Reload resets the active preset to the 1-year default; the
+      // 5-year axis pins below need the 60-month preset re-picked.
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="60"]').click());
+      await wait(600);
       ax = await axisA();
       rp = await rangePair();
       check('chart A 5-year axis is the filled month pair, with month ticks',
@@ -3941,14 +3945,14 @@ try {
       const pfDefPts = await pfPts();
       const tdP = await todayDec();
       const pfIntYears = (pfDefPts || []).map((p) => p.x).filter((x) => Number.isInteger(x));
-      check('portfolio assessed line defaults to the recent 5 years, carried in at the left edge',
-        JSON.stringify(pfIntYears) === JSON.stringify([2022, 2023, 2024, 2025, 2026])
-          && !!pfDefPts && Math.abs(pfDefPts[0].x - (tdP - 5)) < 0.05 && pfDefPts[0].y === rowOf(2021).total
+      check('portfolio assessed line defaults to the recent 1 year, carried in at the left edge',
+        JSON.stringify(pfIntYears) === JSON.stringify([2026])
+          && !!pfDefPts && Math.abs(pfDefPts[0].x - (tdP - 1)) < 0.05 && pfDefPts[0].y === rowOf(2025).total
           && Math.abs(pfDefPts[pfDefPts.length - 1].x - tdP) < 0.02,
         JSON.stringify(pfDefPts));
       let pax = await axisPf();
-      check('portfolio axis is the 5-year look-back ending today',
-        !!pax && Math.abs(pax.max - tdP) < 0.02 && Math.abs(pax.min - (tdP - 5)) < 0.05,
+      check('portfolio axis is the 1-year look-back ending today',
+        !!pax && Math.abs(pax.max - tdP) < 0.02 && Math.abs(pax.min - (tdP - 1)) < 0.05,
         JSON.stringify(pax && { min: pax.min, max: pax.max }));
       const pfY = await page.evaluate(() => {
         const c = window.__fmCharts.portfolio;
@@ -4021,6 +4025,20 @@ try {
       });
       await page.goto(`http://ff.local/#property/${stepPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await wait(1600);
+      // The 5-year point/pixel pins below need the 60-month preset;
+      // the page loads on the 1-year default now. The pixel scans
+      // read the drawn line, so wait out the preset-change
+      // re-fetch + chart animation (a 600ms wait caught the chart
+      // mid-animation and misread the columns).
+      await page.evaluate(() => document.querySelector('#rangeBtns button[data-months="60"]').click());
+      await wait(2000);
+      const pfDetailSet = await page.evaluate(() => {
+        const bar = document.querySelector('#rangeBtns');
+        const q = (s) => !!bar.querySelector(s);
+        return { one: q('button[data-months="12"]'), two: q('button[data-months="24"]'), five: q('button[data-months="60"]'), ten: q('button[data-months="120"]'), all: q('button[data-months="0"]') };
+      });
+      check('date range: property detail presets keep 1/2/5/10y/All',
+        pfDetailSet.one && pfDetailSet.two && pfDetailSet.five && pfDetailSet.ten && pfDetailSet.all, JSON.stringify(pfDetailSet));
       const stepCfg = await page.evaluate(() => {
         const ds = window.__fmCharts.a.data.datasets.find((d) => d.label === 'Assessed value');
         return ds ? { showLine: ds.showLine, tension: ds.tension, stepped: ds.stepped, pts: ds.data } : null;
@@ -9941,6 +9959,10 @@ try {
       await waitI(500);
       await page.goto(`http://ff.local/#invest-account/${pageAcctId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitI(800);
+      // The year-switch pins below need the All range; the account
+      // page loads on the 1-year default now.
+      await page.click('#invRangeBtns-investAccount button[data-months="0"]');
+      await waitI(400);
       const pageState = await page.evaluate(() => {
         const sel = document.querySelector('#investAccountMonthly select');
         const rows = [...document.querySelectorAll('#investAccountMonthly tbody tr')].map((tr) => tr.cells[0].textContent.trim());
@@ -10113,8 +10135,10 @@ try {
       const latestYearOf = (months) => months.filter((m) => m.startsWith(months[months.length - 1].slice(0, 4)));
       let rs = await holdRangeState();
       const hLatest = latestYearOf(hMonths);
-      check('investments UI: the holding range defaults to All — chart spans the full history, table pages to the latest year',
-        rs.labels.length === hFull && rs.rows.length === hLatest.length && rs.rows[0] === hLatest[0] && rs.rows[rs.rows.length - 1] === hLast
+      const hWin0 = Math.min(12, hFull);
+      const hWin0Latest = latestYearOf(hMonths.slice(-hWin0));
+      check('investments UI: the holding range defaults to 1 year — chart spans the last 12 months, table pages to the latest year',
+        rs.labels.length === hWin0 && rs.rows.length === hWin0Latest.length && rs.rows[0] === hWin0Latest[0] && rs.rows[rs.rows.length - 1] === hLast
           && rs.hasSelect && rs.selValue === hLast.slice(0, 4),
         JSON.stringify({ points: rs.labels.length, rows: rs.rows.length, full: hFull }));
       await page.click('#invRangeBtns-investHolding button[data-months="12"]');
@@ -10127,6 +10151,13 @@ try {
           && rs.labels[0] === addMonthsStr2(hLast, -(hWin - 1)) && rs.labels[rs.labels.length - 1] === hLast
           && rs.rows[0] === hWinLatest[0] && rs.rows[rs.rows.length - 1] === hLast,
         JSON.stringify({ points: rs.labels.length, rows: rs.rows.length, first: rs.rows[0], last: rs.rows[rs.rows.length - 1] }));
+      const holdSet = await page.evaluate(() => {
+        const bar = document.querySelector('#invRangeBtns-investHolding');
+        const q = (s) => !!bar.querySelector(s);
+        return { three: q('button[data-months="3"]'), one: q('button[data-months="12"]'), two: q('button[data-months="24"]'), five: q('button[data-months="60"]'), ten: q('button[data-months="120"]'), all: q('button[data-months="0"]') };
+      });
+      check('date range: stock holding presets keep 1/2/5/10y/All (no 3-month button)',
+        !holdSet.three && holdSet.one && holdSet.two && holdSet.five && holdSet.ten && holdSet.all, JSON.stringify(holdSet));
       // Manual From/To through the month popover: a 12-month
       // window starting 30 months after the first data month.
       const mFrom = addMonthsStr2(hFirst, 30);
@@ -10181,8 +10212,10 @@ try {
         rows: [...document.querySelectorAll('#investPortfolioMonthly tbody tr')].map((tr) => tr.children[0].textContent),
       }));
       let ps = await pfRangeState();
-      check('investments UI: the portfolio range defaults to All — chart spans everything, table pages to the latest year',
-        ps.labels.length === pFull && ps.rows.length === pLatest.length && ps.rows[0] === pLatest[0],
+      const pWin0 = Math.min(12, pFull);
+      const pWin0Latest = pMonths.slice(-pWin0).filter((m) => m.startsWith(pMonths[pMonths.length - 1].slice(0, 4)));
+      check('investments UI: the portfolio range defaults to 1 year — chart spans the last 12 months, table pages to the latest year',
+        ps.labels.length === pWin0 && ps.rows.length === pWin0Latest.length && ps.rows[0] === pWin0Latest[0],
         JSON.stringify({ points: ps.labels.length, rows: ps.rows.length, full: pFull }));
       await page.click('#invRangeBtns-investments button[data-months="12"]');
       await waitI(400);
@@ -10688,6 +10721,10 @@ try {
       check('overview UI: both deleted note lines are absent from the Overview',
         !ovNoteText.includes('Pick a section above') && !ovNoteText.includes('This composition view does not change net worth'),
         JSON.stringify(ovNoteText.slice(0, 300)));
+      // The stack/total pins below need the full span; the overview
+      // loads on the 1-year default now.
+      await page.click('#invRangeBtns-overview button[data-months="0"]');
+      await waitI(400);
       const ovHd0 = await ovChartData();
       const ovBarsOk = ovHd0 && ovHd0.sets.length === 3
         && ovHd0.sets[0].label === 'Property' && ovHd0.sets[1].label === 'Stock'
@@ -10722,6 +10759,10 @@ try {
           await page.click(`#invMonthPop-overview button[data-ym="${ym}"]`);
           await waitI(300);
         };
+        // The End pick below pairs with the span start; restore All
+        // first, since the overview loads on the 1-year default now.
+        await page.click('#invRangeBtns-overview button[data-months="0"]');
+        await waitI(400);
         await pickOvMonth('#invRangeEnd-overview', ovPastEnd);
         const shPast = await ovShareNow();
         const wantPast = [];
@@ -10733,6 +10774,14 @@ try {
         await page.click('#invRangeBtns-overview button[data-months="0"]');
         await waitI(400);
       }
+      const ovSet = await page.evaluate(() => {
+        const bar = document.querySelector('#invRangeBtns-overview');
+        const q = (s) => !!bar.querySelector(s);
+        return { three: q('button[data-months="3"]'), ytd: q('button[data-ytd]'), two: q('button[data-months="24"]'), all: q('button[data-months="0"]'), twelve: q('button[data-months="12"]'), sixty: q('button[data-months="60"]') };
+      });
+      check('date range: overview presets are This year / 2 years / All (no 3-month, 1/5-year buttons)',
+        !ovSet.three && ovSet.ytd && ovSet.two && ovSet.all && !ovSet.twelve && !ovSet.sixty,
+        JSON.stringify(ovSet));
       // Invest picker anchoring (2026-10-29 screenshots): the
       // invest popovers are position:fixed, so they must anchor
       // from the field's viewport rect — the old offsetTop /
@@ -12013,6 +12062,44 @@ try {
       });
       check('earnings UI: overview range bar uses month-field buttons, no native year selects',
         !earnRangeUi.hasSelect && earnRangeUi.hasFromBtn && earnRangeUi.hasToBtn, JSON.stringify(earnRangeUi));
+      const earnPresetSet = await page.evaluate(() => {
+        const bar = document.querySelector('[data-earn-range="overview"]');
+        const q = (s) => !!bar.querySelector(s);
+        return { three: q('[data-preset="3mo"]'), ytd: q('[data-preset="ytd"]'), two: q('[data-years="2"]'), all: q('[data-years="0"]'), five: q('[data-years="5"]'), ten: q('[data-years="10"]'), one: q('[data-years="1"]') };
+      });
+      check('date range: salary overview presets are 3 months / This year / 2 years / All (no 1/5/10-year buttons)',
+        earnPresetSet.three && earnPresetSet.ytd && earnPresetSet.two && earnPresetSet.all && !earnPresetSet.five && !earnPresetSet.ten && !earnPresetSet.one,
+        JSON.stringify(earnPresetSet));
+      await page.click('[data-earn-range="overview"] [data-preset="ytd"]');
+      await waitE(500);
+      const earnYtd = await page.evaluate(() => {
+        const c = window.__fmCharts.earnOverview;
+        const bar = document.querySelector('[data-earn-range="overview"]');
+        return { labels: c ? c.data.labels : null,
+          from: bar.querySelector('[data-earn-month="from"]').dataset.value,
+          to: bar.querySelector('[data-earn-month="to"]').dataset.value };
+      });
+      check('date range: salary This year preset filters the overview chart to the current tax year',
+        earnYtd.labels && earnYtd.labels.length >= 1 && earnYtd.labels.every((y) => y === '2026') && earnYtd.from === '2026-01',
+        JSON.stringify(earnYtd));
+      await page.click('[data-earn-range="overview"] [data-years="2"]');
+      await waitE(500);
+      const earn2y = await page.evaluate(() => {
+        const c = window.__fmCharts.earnOverview;
+        return c ? c.data.labels : null;
+      });
+      check('date range: salary 2 years preset shows the last two tax years',
+        earn2y && earn2y.includes('2025') && earn2y.includes('2026') && earn2y.every((y) => Number(y) >= 2025),
+        JSON.stringify(earn2y));
+      await page.click('[data-earn-range="overview"] [data-years="0"]');
+      await waitE(500);
+      const earnAll2 = await page.evaluate(() => {
+        const c = window.__fmCharts.earnOverview;
+        return c ? c.data.labels : null;
+      });
+      check('date range: salary All preset restores all tax years',
+        earnAll2 && earnAll2.includes('2025') && earnAll2.includes('2026'),
+        JSON.stringify(earnAll2));
       await page.click('[data-earn-range="overview"] [data-earn-month="from"]');
       await waitE(300);
       const earnPopRect = await page.evaluate(() => {
@@ -12433,6 +12520,7 @@ try {
       // Back link returns to the Rentals list.
       await page.click('#earnRentalBackLink');
       try { await page.waitForFunction(() => location.hash === '#earnings/rentals', { timeout: 5000 }); } catch {}
+      try { await page.waitForFunction(() => document.querySelector('#earnRentalDetail').classList.contains('hidden'), { timeout: 5000 }); } catch {}
       const rentalBackNav = await page.evaluate(() => ({
         hash: location.hash,
         detailHidden: document.querySelector('#earnRentalDetail').classList.contains('hidden'),
@@ -12683,6 +12771,27 @@ try {
         JSON.stringify(panelPlace));
       const chartsApi = await req('GET', '/api/earnings/charts');
       const apiYears = chartsApi.data.years.map(String);
+      // Round 3: the rentals picker loads on the 1-year trailing
+      // default now; pin the default window, then restore All for
+      // the full-span share pins below.
+      const rentDef = await page.evaluate(() => ({
+        from: document.querySelector('#invRangeStart-rentIncome') ? document.querySelector('#invRangeStart-rentIncome').dataset.value : null,
+        to: document.querySelector('#invRangeEnd-rentIncome') ? document.querySelector('#invRangeEnd-rentIncome').dataset.value : null,
+      }));
+      const rentDefFrom = ymIdx(span.end) - 11 >= ymIdx(span.start) ? addM(span.end, -11) : span.start;
+      check('date range: rentals picker defaults to the past 12 months',
+        rentDef.from === rentDefFrom && rentDef.to === span.end,
+        JSON.stringify({ ...rentDef, wantFrom: rentDefFrom, wantTo: span.end }));
+      const rentSet = await page.evaluate(() => {
+        const bar = document.querySelector('#invRangeBtns-rentIncome');
+        const q = (s) => !!bar.querySelector(s);
+        return { three: q('button[data-months="3"]'), ytd: q('button[data-ytd]'), two: q('button[data-months="24"]'), all: q('button[data-months="0"]'), twelve: q('button[data-months="12"]'), sixty: q('button[data-months="60"]') };
+      });
+      check('date range: rentals presets are 3 months / This year / 2 years / All (no 1/5-year buttons)',
+        rentSet.three && rentSet.ytd && rentSet.two && rentSet.all && !rentSet.twelve && !rentSet.sixty,
+        JSON.stringify(rentSet));
+      await page.click('#invRangeBtns-rentIncome button[data-months="0"]');
+      await waitE(600);
       const shareAll = await page.evaluate(() => {
         const c = window.__fmCharts.rentIncomeShare;
         const a = window.__fmCharts.earnRentals;
@@ -12723,9 +12832,25 @@ try {
         JSON.stringify({ labels: shareAll && shareAll.annualLabels, apiYears, bars: shareAll && shareAll.annualBars, line: shareAll && shareAll.annualLine }));
       // Range change: 1 year = last 12 months of the span. Chart A
       // and Chart B (both 2025-only) must drop out of the share.
-      await page.click('#invRangeBtns-rentIncome button[data-months="12"]');
-      await waitE(600);
+      // The spend preset set has no 12-month button (the default
+      // IS 1 year), so set the window through the month popovers.
       const winStart = ymIdx(span.end) - 11 >= ymIdx(span.start) ? addM(span.end, -11) : span.start;
+      const pickRentMonth = async (fieldSel, ym) => {
+        await page.click(fieldSel);
+        await page.waitForFunction(() => !document.querySelector('#invMonthPop-rentIncome').classList.contains('hidden'), { timeout: 5000 });
+        const targetYear = Number(ym.slice(0, 4));
+        for (let i = 0; i < 40; i++) {
+          const y = await page.evaluate(() => Number(document.querySelector('#invMonthPop-rentIncome .month-pop-year').textContent));
+          if (y === targetYear) break;
+          await page.click(`#invMonthPop-rentIncome ${y < targetYear ? '[data-pop-next]' : '[data-pop-prev]'}`);
+          await waitE(120);
+        }
+        await page.click(`#invMonthPop-rentIncome button[data-ym="${ym}"]`);
+        await waitE(300);
+      };
+      await pickRentMonth('#invRangeStart-rentIncome', winStart);
+      await pickRentMonth('#invRangeEnd-rentIncome', span.end);
+      await waitE(600);
       const expectedWin = {};
       let expectedWinCenter = 0;
       for (const rt of earnAll.rentals) { expectedWin[rt.label] = rentalTotal(rt, winStart, span.end); expectedWinCenter += expectedWin[rt.label]; }
@@ -12760,6 +12885,30 @@ try {
       });
       check('rental income panel: All range restores the 2025 rentals + all annual years',
         backAll.share === true && JSON.stringify(backAll.annual) === JSON.stringify(apiYears), JSON.stringify(backAll));
+      // Round 3: preset actions drive the rentals range and chart.
+      const rentFields = () => page.evaluate(() => ({
+        from: document.querySelector('#invRangeStart-rentIncome').dataset.value,
+        to: document.querySelector('#invRangeEnd-rentIncome').dataset.value,
+        annual: window.__fmCharts.earnRentals ? window.__fmCharts.earnRentals.data.labels : null,
+      }));
+      await page.click('#invRangeBtns-rentIncome button[data-ytd]');
+      await waitE(600);
+      const rentYtd = await rentFields();
+      check('date range: rentals This year preset narrows to Jan-current month',
+        rentYtd.from === '2026-01' && rentYtd.to === span.end && JSON.stringify(rentYtd.annual) === JSON.stringify(['2026']),
+        JSON.stringify(rentYtd));
+      await page.click('#invRangeBtns-rentIncome button[data-months="24"]');
+      await waitE(600);
+      const rent2y = await rentFields();
+      const rent2yFrom = ymIdx(span.end) - 23 >= ymIdx(span.start) ? addM(span.end, -23) : span.start;
+      check('date range: rentals 2 years preset widens to the trailing 24 months',
+        rent2y.from === rent2yFrom && rent2y.to === span.end, JSON.stringify(rent2y));
+      await page.click('#invRangeBtns-rentIncome button[data-months="0"]');
+      await waitE(600);
+      const rentAll2 = await rentFields();
+      check('date range: rentals All preset restores the full span',
+        rentAll2.from === span.start && rentAll2.to === span.end && JSON.stringify(rentAll2.annual) === JSON.stringify(apiYears),
+        JSON.stringify(rentAll2));
       // Toggle: Income vs expenses swaps in gross + expenses bars
       // with a Net line (gross minus expenses) from the same range.
       await page.click('#earnRentalsViewBtns [data-view="income"]');
@@ -12896,6 +13045,11 @@ try {
       // Per-visit: a reload restores everything.
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
+      // The page reloads on the 1-year default now; restore All
+      // for the full-span assertions below (the range is not what
+      // this pin is about).
+      await page.click('#invRangeBtns-rentIncome button[data-months="0"]');
+      await waitE(600);
       const afterReload = await page.evaluate(() => {
         const card = [...document.querySelectorAll('#earnRentalList .rent-card')].find((p) => p.textContent.includes('Chart A'));
         const btn = card && card.querySelector('.rent-hide-btn');
@@ -13681,10 +13835,45 @@ try {
         && spendAlign.groupX != null && Math.abs(spendAlign.groupX - spendAlign.cellX) <= 1
         && spendAlign.groupW != null && spendAlign.tableW != null && Math.abs(spendAlign.groupW - spendAlign.tableW) <= 1,
         JSON.stringify(spendAlign));
+      // Round 3: the spending picker loads on the 1-year trailing
+      // default (Nov 2025-Oct 2026 on this fixture's span).
+      const spendDef = await page.evaluate(() => ({
+        from: document.querySelector('#invRangeStart-spending').textContent.trim(),
+        to: document.querySelector('#invRangeEnd-spending').textContent.trim(),
+      }));
+      check('date range: spending picker defaults to the past 12 months',
+        spendDef.from === 'Nov 2025' && spendDef.to === 'Oct 2026', JSON.stringify(spendDef));
+      const spendSet = await page.evaluate(() => {
+        const bar = document.querySelector('#invRangeBtns-spending');
+        const q = (s) => !!bar.querySelector(s);
+        return { three: q('button[data-months="3"]'), ytd: q('button[data-ytd]'), two: q('button[data-months="24"]'), all: q('button[data-months="0"]'), twelve: q('button[data-months="12"]'), sixty: q('button[data-months="60"]') };
+      });
+      check('date range: spending presets are 3 months / This year / 2 years / All (no 1/5-year buttons)',
+        spendSet.three && spendSet.ytd && spendSet.two && spendSet.all && !spendSet.twelve && !spendSet.sixty,
+        JSON.stringify(spendSet));
       // Range constrains pageable months: 1 year from Oct 2026
       // ends at Nov 2025, so stepping back must stop there and
-      // can never reach the 2024-05 row.
-      await page.click('#invRangeBtns-spending button[data-months="12"]');
+      // can never reach the 2024-05 row. The spend preset set has
+      // no 12-month button, so set the window explicitly: All
+      // first (a real change, re-defaulting the table), then the
+      // 1-year window through the month popovers.
+      await page.click('#invRangeBtns-spending button[data-months="0"]');
+      await waitM(800);
+      const pickSpendMonth = async (fieldSel, ym) => {
+        await page.click(fieldSel);
+        await page.waitForFunction(() => !document.querySelector('#invMonthPop-spending').classList.contains('hidden'), { timeout: 5000 });
+        const targetYear = Number(ym.slice(0, 4));
+        for (let i = 0; i < 40; i++) {
+          const y = await page.evaluate(() => Number(document.querySelector('#invMonthPop-spending .month-pop-year').textContent));
+          if (y === targetYear) break;
+          await page.click(`#invMonthPop-spending ${y < targetYear ? '[data-pop-next]' : '[data-pop-prev]'}`);
+          await waitM(120);
+        }
+        await page.click(`#invMonthPop-spending button[data-ym="${ym}"]`);
+        await waitM(300);
+      };
+      await pickSpendMonth('#invRangeStart-spending', '2025-11');
+      await pickSpendMonth('#invRangeEnd-spending', '2026-10');
       await waitM(800);
       const afterPreset = await page.evaluate(readSpendTxPage);
       check('spending UI: a range change re-defaults the table to the latest month in range',
@@ -13706,6 +13895,30 @@ try {
         JSON.stringify(rangeEdge));
       await page.click('#invRangeBtns-spending button[data-months="0"]');
       await waitM(800);
+      // Round 3: preset actions drive the spending range (and the
+      // table re-defaults to the latest month in range each time).
+      const spendRangeFields = () => page.evaluate(() => ({
+        from: document.querySelector('#invRangeStart-spending').textContent.trim(),
+        to: document.querySelector('#invRangeEnd-spending').textContent.trim(),
+        pager: document.querySelector('[data-spend-tx-pager="spending"]') ? document.querySelector('[data-spend-tx-pager="spending"]').querySelector('span').textContent.trim() : null,
+      }));
+      await page.click('#invRangeBtns-spending button[data-ytd]');
+      await waitM(800);
+      const spendYtd = await spendRangeFields();
+      check('date range: spending This year preset narrows to Jan-current month and re-defaults the table',
+        spendYtd.from === 'Jan 2026' && spendYtd.to === 'Oct 2026' && spendYtd.pager === 'Oct 2026', JSON.stringify(spendYtd));
+      await page.click('#invRangeBtns-spending button[data-months="24"]');
+      await waitM(800);
+      const spend2y = await spendRangeFields();
+      check('date range: spending 2 years preset widens to the trailing 24 months',
+        spend2y.from === 'Nov 2024' && spend2y.to === 'Oct 2026' && spend2y.pager === 'Oct 2026', JSON.stringify(spend2y));
+      await page.click('#invRangeBtns-spending button[data-months="0"]');
+      await waitM(800);
+      const spendAll2 = await spendRangeFields();
+      const monIdx = (s) => { const [mo, y] = s.split(' '); return Number(y) * 12 + ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].indexOf(mo); };
+      check('date range: spending All preset restores the full span',
+        spendAll2.to === 'Oct 2026' && spendAll2.pager === 'Oct 2026' && monIdx(spendAll2.from) < monIdx('Nov 2024'),
+        JSON.stringify(spendAll2));
       // Detail table: the identical month pager on card A.
       await page.goto(`http://ff.local/#spending/card/${monthCardAId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1200);

@@ -1248,7 +1248,7 @@ wireOwnersFlagClear($('#propForm'), $('#propOwnerPicker'));
 let portfolioData = null;
 let portfolioPieChart = null;
 let portfolioLineChart = null;
-let pfRangeMonths = 60;
+let pfRangeMonths = 12;
 let pfPieMetric = 'outstanding';
 const PF_COLORS = ['#1668c4', '#e67e22', '#8e44ad', '#2e7d4f', '#c0392b', '#16a085', '#b7950b', '#7d3c98', '#2e86c1', '#ba4a00'];
 window.__fmCharts = window.__fmCharts || {};
@@ -4922,24 +4922,53 @@ window.investYearStep = (level, dir) => {
 // clamped into the data span by the shared clampRange (a start
 // past the end pulls the end up). Default is All.
 const investRanges = {
-  investments: { months: 0, custom: null },
-  investAccount: { months: 0, custom: null },
-  investHolding: { months: 0, custom: null },
-  overview: { months: 0, custom: null },
-  rentIncome: { months: 0, custom: null },
-  spending: { months: 0, custom: null },
-  spendCard: { months: 0, custom: null },
+  investments: { months: 12, custom: null, ytd: false },
+  investAccount: { months: 12, custom: null, ytd: false },
+  investHolding: { months: 12, custom: null, ytd: false },
+  overview: { months: 12, custom: null, ytd: false },
+  rentIncome: { months: 12, custom: null, ytd: false },
+  spending: { months: 12, custom: null, ytd: false },
+  spendCard: { months: 12, custom: null, ytd: false },
+};
+// Range presets by page family: stock pages keep the old
+// 1/2/5/10y/All set; spending/salary/rental pickers get 3 months +
+// this year + 2 years + All; every other invest picker gets this
+// year + 2 years + All (no 3 months). Every picker DEFAULTS to a
+// one-year trailing range (months: 12 above) — the default is a
+// range, not a preset, so on spend/plain sets no button starts
+// active; the From/To fields show the range in force.
+const INVEST_RANGE_PRESETS = {
+  stock: [
+    { months: 12, label: '1 year' }, { months: 24, label: '2 years' },
+    { months: 60, label: '5 years' }, { months: 120, label: '10 years' },
+    { months: 0, label: 'All' },
+  ],
+  spend: [
+    { months: 3, label: '3 months' }, { ytd: true, label: 'This year' },
+    { months: 24, label: '2 years' }, { months: 0, label: 'All' },
+  ],
+  plain: [
+    { ytd: true, label: 'This year' },
+    { months: 24, label: '2 years' }, { months: 0, label: 'All' },
+  ],
+};
+const INVEST_RANGE_PRESET_SET = {
+  investments: 'stock', investAccount: 'stock', investHolding: 'stock',
+  spending: 'spend', spendCard: 'spend', rentIncome: 'spend',
+  overview: 'plain',
 };
 const investViewData = {}; // level -> { series, monthly, cur, nativePct }
 let invPop = null; // { level, which: 'start'|'end', year }
 
 function investRangeControlsHtml(level) {
+  const st = investRanges[level];
+  const presets = INVEST_RANGE_PRESETS[INVEST_RANGE_PRESET_SET[level] || 'plain'];
+  const btns = presets.map((p) => {
+    if (p.ytd) return `<button type="button" data-ytd="1" class="${!st.custom && st.ytd ? 'active' : ''}">This year</button>`;
+    return `<button type="button" data-months="${p.months}" class="${!st.custom && !st.ytd && st.months === p.months ? 'active' : ''}">${p.label}</button>`;
+  }).join('\n    ');
   return `<div class="toolbar range-btns" id="invRangeBtns-${level}">
-    <button type="button" data-months="12">1 year</button>
-    <button type="button" data-months="24">2 years</button>
-    <button type="button" data-months="60">5 years</button>
-    <button type="button" data-months="120">10 years</button>
-    <button type="button" data-months="0" class="active">All</button>
+    ${btns}
     <span class="range-pick">From <button type="button" id="invRangeStart-${level}" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range start month">—</button></span>
     <span class="range-pick">To <button type="button" id="invRangeEnd-${level}" class="month-field" data-value="" aria-haspopup="dialog" aria-expanded="false" aria-label="Range end month">—</button></span>
     <div class="month-pop hidden" id="invMonthPop-${level}" role="dialog" aria-label="Choose a month">
@@ -4969,6 +4998,13 @@ function investEffectiveRange(level) {
   if (!span) return null;
   const st = investRanges[level];
   if (st.custom) return clampRange(st.custom, span);
+  if (st.ytd) {
+    // This year: calendar January through the latest data month
+    // (data never runs past the current month, so the span end
+    // is the current month in practice).
+    const jan = `${monthStrOf(new Date()).slice(0, 4)}-01`;
+    return { start: jan < span.start ? span.start : jan, end: span.end };
+  }
   if (!st.months) return span;
   const start = addMonthsYM(span.end, -(st.months - 1));
   return { start: start < span.start ? span.start : start, end: span.end };
@@ -5442,7 +5478,10 @@ function syncInvestRangeInputs(level) {
   if (!bar) return;
   const st = investRanges[level];
   bar.querySelectorAll('button[data-months]').forEach((b) => {
-    b.classList.toggle('active', !st.custom && Number(b.dataset.months) === st.months);
+    b.classList.toggle('active', !st.custom && !st.ytd && Number(b.dataset.months) === st.months);
+  });
+  bar.querySelectorAll('button[data-ytd]').forEach((b) => {
+    b.classList.toggle('active', !st.custom && !!st.ytd);
   });
   const span = investSpan(level);
   const r = investEffectiveRange(level);
@@ -5529,6 +5568,15 @@ function wireInvestRangeControls(level) {
     if (preset) {
       investRanges[level].months = Number(preset.dataset.months);
       investRanges[level].custom = null;
+      investRanges[level].ytd = false;
+      closeInvMonthPop();
+      applyInvestRange(level);
+      return;
+    }
+    const ytdBtn = e.target.closest('button[data-ytd]');
+    if (ytdBtn) {
+      investRanges[level].custom = null;
+      investRanges[level].ytd = true;
       closeInvMonthPop();
       applyInvestRange(level);
       return;
@@ -8310,7 +8358,9 @@ $('#monthPop').addEventListener('click', (e) => {
     const yr = Number(ym.slice(0, 4));
     if (which === 'from') { st.from = yr; st.fromYm = ym; } else { st.to = yr; st.toYm = ym; }
     if (btn) { btn.dataset.value = ym; btn.textContent = formatYM(ym); }
+    st.preset = null;
     document.querySelectorAll(`[data-earn-range="${key}"] [data-years]`).forEach((b) => b.classList.remove('active'));
+    document.querySelectorAll(`[data-earn-range="${key}"] [data-preset]`).forEach((b) => b.classList.remove('active'));
     drawEarnVisibleChart();
     return;
   }
@@ -8616,19 +8666,30 @@ let earnRentalsView = 'net';
 const earnChartRanges = {
   // Overview only now: the rentals summary is driven by the shared
   // invest-range picker (level 'rentIncome'), not by this state.
-  overview: { years: 0, from: null, to: null, fromYm: null, toYm: null },
+  // Default is a one-year window (the annual chart's '1 year':
+  // the latest tax year); presets are 3 months (salary pages
+  // only — on annual data it resolves to the current tax year),
+  // this year, 2 years, All.
+  overview: { years: 1, from: null, to: null, fromYm: null, toYm: null, preset: null },
 };
 
 function earnRangeControlsHtml(key) {
   const st = earnChartRanges[key];
-  const presets = [[1, '1 year'], [2, '2 years'], [5, '5 years'], [10, '10 years'], [0, 'All']];
+  const presets = [['3mo', '3 months'], ['ytd', 'This year'], [2, '2 years'], [0, 'All']];
   // The same month-field buttons + shared #monthPop the
   // property-detail panel uses (never native year selects: their
   // popup renders detached from the panel). The button keeps the
   // picked month's label; the picked month's YEAR drives the
-  // existing year filter below.
+  // existing year filter below. Annual data cannot express
+  // months, so 3 months and this year both resolve to the
+  // current tax year (from/to = that year).
   return `<div class="toolbar range-btns" data-earn-range="${key}">`
-    + presets.map(([n, label]) => `<button type="button" data-years="${n}" class="${st.years === n && st.from == null && st.to == null ? 'active' : ''}">${label}</button>`).join('')
+    + presets.map(([n, label]) => {
+      const isPreset = n === '3mo' || n === 'ytd';
+      const active = isPreset ? st.preset === n : (st.preset == null && st.years === n && st.from == null && st.to == null);
+      const attr = isPreset ? `data-preset="${n}"` : `data-years="${n}"`;
+      return `<button type="button" ${attr} class="${active ? 'active' : ''}">${label}</button>`;
+    }).join('')
     + `<span class="range-pick">From <button type="button" data-earn-month="from" class="month-field" data-value="${st.fromYm || ''}" aria-haspopup="dialog" aria-expanded="false" aria-label="Range start month">${formatYM(st.fromYm)}</button></span>`
     + `<span class="range-pick">To <button type="button" data-earn-month="to" class="month-field" data-value="${st.toYm || ''}" aria-haspopup="dialog" aria-expanded="false" aria-label="Range end month">${formatYM(st.toYm)}</button></span></div>`;
 }
@@ -8639,8 +8700,25 @@ function earnWireRange(key) {
   const st = earnChartRanges[key];
   wrap.querySelectorAll('[data-years]').forEach((b) => {
     b.onclick = () => {
+      st.preset = null;
       st.years = Number(b.dataset.years); st.from = null; st.to = null; st.fromYm = null; st.toYm = null;
       wrap.querySelectorAll('[data-earn-month]').forEach((f) => { f.dataset.value = ''; f.textContent = '—'; f.setAttribute('aria-expanded', 'false'); });
+      wrap.querySelectorAll('[data-preset]').forEach((x) => x.classList.remove('active'));
+      drawEarnVisibleChart();
+    };
+  });
+  wrap.querySelectorAll('[data-preset]').forEach((b) => {
+    b.onclick = () => {
+      const curYm = monthStrOf(new Date());
+      const curYear = Number(curYm.slice(0, 4));
+      st.preset = b.dataset.preset; st.from = curYear; st.to = curYear;
+      st.fromYm = `${curYear}-01`; st.toYm = curYm;
+      wrap.querySelectorAll('[data-years]').forEach((x) => x.classList.remove('active'));
+      wrap.querySelectorAll('[data-preset]').forEach((x) => x.classList.toggle('active', x === b));
+      const from = wrap.querySelector('[data-earn-month="from"]');
+      const to = wrap.querySelector('[data-earn-month="to"]');
+      if (from) { from.dataset.value = st.fromYm; from.textContent = formatYM(st.fromYm); }
+      if (to) { to.dataset.value = st.toYm; to.textContent = formatYM(st.toYm); }
       drawEarnVisibleChart();
     };
   });
@@ -8736,7 +8814,7 @@ function drawEarnOverviewChart() {
 function drawEarnRentalsChart() {
   const st = investRanges.rentIncome;
   const years = rentAnnualYears((earnChartData && earnChartData.years) || [],
-    investEffectiveRange('rentIncome'), !st.custom && !st.months);
+    investEffectiveRange('rentIncome'), !st.custom && !st.months && !st.ytd);
   if (earnRentalsChart) { earnRentalsChart.destroy(); earnRentalsChart = null; window.__fmCharts.earnRentals = null; }
   const r = earnChartData && earnChartData.rentals;
   const empty = rentAnnualEmpty(r, years);
@@ -9757,7 +9835,7 @@ function spendTxRange(level) {
   // would vanish from the table entirely. Under an explicit
   // preset/custom pair the range stays exactly as picked.
   const st = investRanges[level];
-  if (!st.months && !st.custom && txMonths.length) {
+  if (!st.months && !st.custom && !st.ytd && txMonths.length) {
     return {
       start: r.start < txMonths[0] ? r.start : txMonths[0],
       end: r.end > txMonths[txMonths.length - 1] ? r.end : txMonths[txMonths.length - 1],
