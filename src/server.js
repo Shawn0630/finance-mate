@@ -44,6 +44,7 @@ import {
   calcPenalty, presetPrimeSteps, scenarioPrimeHistory, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
+  reportMonthlySeries, reportCostBreakdown,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -4088,7 +4089,14 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
     });
     scenarioTable.push({ scenarioId: sc.id, name: sc.name, net: r.comparison.net, payoffShiftMonths: r.comparison.payoffShiftMonths, paymentDelta: r.comparison.paymentDelta, balanceByMonth });
   }
-  res.json({ strategy: s, project: p, ops, assumptions, scenarios, baseScenario, baseline, projection: strategy, comparison, scenarioTable });
+  // Attached AI model spec, if any: the strategy detail page renders it
+  // with its formulas and a month-1 trial row from the projection.
+  let model = null;
+  if (s.model_id) {
+    const mrow = db.prepare('SELECT * FROM plan_ai_models WHERE id = ?').get(s.model_id);
+    if (mrow) model = { id: mrow.id, name: mrow.name, version: mrow.version, source: mrow.source, spec: JSON.parse(mrow.spec || '{}') };
+  }
+  res.json({ strategy: s, project: p, ops, assumptions, scenarios, baseScenario, baseline, projection: strategy, comparison, scenarioTable, model });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -4145,7 +4153,22 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     const cur = getCurrentPrime();
     baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: {}, primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth: currentMonthKey(), scenario });
   }
-  res.json({ project: p, scenario, scenarios, baseline, strategies: rows });
+  // Report-ready series: one monthly trajectory per baseline/strategy,
+  // plus each strategy's cost breakdown. The report view renders from
+  // this block only — it never recomputes engine figures client-side.
+  const mainlineForReport = planAssembleMainline(p.id);
+  const assessedByProperty = mainlineForReport.assessed || {};
+  const assessedTotal = Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
+  const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal) }];
+  for (const r of rows) {
+    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal) });
+  }
+  const report = {
+    assessedTotal, assessedByProperty,
+    trajectories: reportTrajectories,
+    costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
+  };
+  res.json({ project: p, scenario, scenarios, baseline, strategies: rows, report });
 });
 
 app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {

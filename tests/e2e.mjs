@@ -2058,6 +2058,20 @@ try {
       check('without LLM configuration the endpoint is a 503 naming the missing setup',
         resp.status === 503 && String(body2.error || '').includes('LLM_API_KEY'),
         JSON.stringify({ status: resp.status, body: body2 }));
+      // Planning AI reports follow the same 503 guidance path.
+      const proj2 = await fetch(`http://127.0.0.1:${port2}/api/planning/projects`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie2 },
+        body: JSON.stringify({ name: 'No LLM project' }),
+      });
+      const proj2Data = await proj2.json();
+      const rep2 = await fetch(`http://127.0.0.1:${port2}/api/planning/projects/${proj2Data.project.id}/ai-report`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie2 },
+        body: JSON.stringify({ text: 'Show me something' }),
+      });
+      const rep2Body = await rep2.json();
+      check('without LLM configuration ai-report is a 503 naming the missing setup',
+        rep2.status === 503 && String(rep2Body.error || '').includes('LLM_API_KEY'),
+        JSON.stringify({ status: rep2.status, body: rep2Body }));
     } finally {
       server2.kill();
       fs.rmSync(dir2, { recursive: true, force: true });
@@ -15093,6 +15107,155 @@ try {
       r = await req('DELETE', `/api/planning/projects/${blankProjectId}`);
       check('planning blank-flow project cleanup', r.status === 200);
     } finally { await browserT.close(); }
+  }
+  // AI report: generate → preview → save (nothing writes before Save),
+  // report block arithmetic, fixed-default save path, attached model spec.
+  const aiReportDef = { charts: [
+    { template: 'time_line', title: 'Balance path', series: ['mortgage_balance'] },
+    { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
+    { template: 'yearly_bars', title: 'Year-end balance', series: ['mortgage_balance'] },
+    { template: 'share_doughnut', title: 'Equity share', series: ['total_value'] },
+  ] };
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiReportDef));
+  r = await req('POST', `/api/planning/projects/${planProjectId}/ai-report`, { text: 'Compare balance paths and headlines' });
+  check('planning: ai-report returns the stub definition',
+    r.status === 200 && JSON.stringify(r.data.definition) === JSON.stringify(aiReportDef), JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${planProjectId}`);
+  check('planning: ai-report writes nothing before Save',
+    r.status === 200 && !(r.data.reports || []).some((x) => x.name === 'AI report test'), JSON.stringify((r.data.reports || []).map((x) => x.name)));
+  r = await req('POST', `/api/planning/projects/${planProjectId}/reports`, { name: 'AI report test', definition: aiReportDef });
+  check('planning: save AI report', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const aiReportId = r.data.report.id;
+  r = await req('POST', `/api/planning/projects/${planProjectId}/reports`, { name: 'Fixed report test', definition: { strategies: [], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] } });
+  check('planning: fixed-default save path still works', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${planProjectId}/comparison`);
+  const repBlock = r.data.report;
+  const t0 = repBlock && repBlock.trajectories[0] && repBlock.trajectories[0].monthly[0];
+  check('planning: report total = assessed - balance + stock',
+    !!t0 && Math.abs(t0.total_value - (repBlock.assessedTotal - t0.mortgage_balance + t0.stock_value)) < 0.011,
+    JSON.stringify({ t0, assessedTotal: repBlock && repBlock.assessedTotal }));
+  const stratRow0 = (r.data.strategies || [])[0];
+  const bd0 = stratRow0 && repBlock.costBreakdown[stratRow0.strategy.id];
+  check('planning: report cost breakdown sums to cost',
+    !!bd0 && Math.abs(bd0.fees + bd0.penalty + bd0.cashOut - bd0.total) < 0.011 && bd0.total === stratRow0.comparison.cost,
+    JSON.stringify(bd0));
+  // Attached AI model spec surfaces on the strategy, with formulas.
+  const aiModelDef = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [{ key: 'stockReturnPct', value: 5, source: 'user' }], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef));
+  r = await req('POST', `/api/planning/strategies/${planStrategyId}/ai-model`, { text: 'Model interest', name: 'Interest model' });
+  check('planning: ai-model saves a spec', r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
+  const aiModelId = r.data.model.id;
+  r = await req('PUT', `/api/planning/strategies/${planStrategyId}`, { model_id: aiModelId });
+  check('planning: attach model to strategy', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${planStrategyId}`);
+  check('planning: strategy returns attached model spec',
+    r.status === 200 && r.data.model && r.data.model.spec && (r.data.model.spec.formulas || []).length === 1,
+    JSON.stringify(r.data.model && r.data.model.spec));
+  // Positive equity for the share doughnut: the test property gains an
+  // assessed value (earlier comparison pins already ran, so this cannot
+  // disturb them).
+  r = await req('PUT', `/api/properties/${planPid}`, { assessed_value: 500000 });
+  check('planning: test property gains an assessed value', r.status === 200, JSON.stringify(r.data));
+  // AI report UI flow in a real browser: Generate → preview → Save, then
+  // the saved report renders charts, tables and how-calculated lines.
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('planning ai-report browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    fs.writeFileSync(aiStubFile, JSON.stringify(aiReportDef));
+    const forwardR = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResR = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueR = loginResR.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserR = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserR.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardR({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitR = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${planProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      await page.click('#planAiReportBtn');
+      await waitR(400);
+      const modalOpen = await page.evaluate(() => !document.querySelector('#planReportAiModal').classList.contains('hidden'));
+      check('planning: Generate with AI opens the modal', modalOpen);
+      await page.type('#planReportAiName', 'AI report browser');
+      await page.type('#planReportAiText', 'Compare balance paths and headlines');
+      await page.click('#planReportAiGenBtn');
+      await waitR(1500);
+      const preview = await page.evaluate(() => {
+        const out = document.querySelector('#planReportAiOut');
+        return { text: out ? out.textContent : '', save: !!document.querySelector('#planReportAiSaveBtn') };
+      });
+      check('planning: AI preview lists the proposed charts before Save',
+        preview.save && preview.text.includes('Balance path') && preview.text.includes('Equity share'), JSON.stringify(preview));
+      r = await req('GET', `/api/planning/projects/${planProjectId}`);
+      check('planning: browser preview writes nothing before Save',
+        !(r.data.reports || []).some((x) => x.name === 'AI report browser'), JSON.stringify((r.data.reports || []).map((x) => x.name)));
+      await page.click('#planReportAiSaveBtn');
+      await waitR(1500);
+      const listed = await page.evaluate(() => document.querySelector('#planReportList').textContent.includes('AI report browser'));
+      check('planning: saved AI report appears in the Reports list', listed);
+      await page.evaluate(() => { document.querySelector('[data-plan-report-view]').click(); });
+      await waitR(1500);
+      const view = await page.evaluate(() => ({
+        hash: location.hash,
+        line: !!document.querySelector('#planReportChart0'),
+        yearly: !!document.querySelector('#planReportChart2'),
+        doughnut: !!document.querySelector('#planReportChart3'),
+        defs: document.querySelector('#planReport').textContent.includes('Cost = fees + penalty + cash out'),
+        lane: document.querySelector('#planReport').textContent.includes('Planning Test Lane'),
+        metric: document.querySelector('#planReport').textContent.includes('Total cost'),
+      }));
+      check('planning: report view renders charts, tables and how-calculated lines',
+        view.hash.startsWith('#planning/report/') && view.line && view.yearly && view.doughnut && view.defs && view.lane && view.metric,
+        JSON.stringify(view));
+      await page.goto(`http://ff.local/#planning/strategy/${planStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      const modelPanel = await page.evaluate(() => {
+        const el = document.querySelector('#planStrategy');
+        return el ? { trial: el.textContent.includes('Month-1 trial row'), bindings: el.textContent.includes('Bindings'), formula: el.textContent.includes('prior balance * monthly rate / 12') } : {};
+      });
+      check('planning: strategy model panel shows bindings, formulas and the month-1 trial row',
+        modelPanel.trial && modelPanel.bindings && modelPanel.formula, JSON.stringify(modelPanel));
+    } finally { await browserR.close(); }
   }
   r = await req('DELETE', `/api/planning/projects/${planProjectId}`);
   check('planning: project cleanup', r.status === 200);

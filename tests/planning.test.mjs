@@ -8,7 +8,7 @@ import {
   calcPenalty, presetPrimeSteps, scenarioPrimeHistory,
   validateOp, validateLegs, computeProjection, compareProjections,
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
-  resolveBuyLegs,
+  resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
 } from '../src/planning.js';
 
 const PROP = () => ({
@@ -226,4 +226,30 @@ test('buildRevertInverse: inserts delete, updates restore, deleted segments clas
   // A modified insert blocks with a conflict instead of deleting.
   const mod = buildRevertInverse({ entries, current: { ...cur, lump_sums: [{ id: 9, amount: 6000 }] } });
   assert.ok(mod.conflicts.some((c) => c.table === 'lump_sums'));
+});
+
+test('reportMonthlySeries: balances sum across properties, total = assessed - balance + stock', () => {
+  const perProperty = {
+    1: { baseline: { series: [{ month: '2026-11', balance: 100000, interest: 400 }, { month: '2026-12', balance: 99000, interest: 395 }] } },
+    2: { baseline: { series: [{ month: '2026-11', balance: 50000, interest: 200 }, { month: '2026-12', balance: 49500, interest: 198 }] } },
+  };
+  const stock = [{ month: '2026-11', value: 10000 }, { month: '2026-12', value: 11000 }];
+  const rows = reportMonthlySeries(perProperty, 'baseline', stock, 500000);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].mortgage_balance, 150000);
+  assert.equal(rows[0].stock_value, 10000);
+  assert.equal(rows[0].total_value, 360000);
+  assert.equal(rows[0].interest, 600);
+  assert.equal(rows[1].total_value, 362500);
+  // Missing side yields zero balances, stock months still present.
+  const empty = reportMonthlySeries(perProperty, 'strategy', stock, 500000);
+  assert.equal(empty[0].mortgage_balance, 0);
+  assert.equal(empty[0].total_value, 510000);
+});
+
+test('reportCostBreakdown: cash out is the remainder after fees and penalty', () => {
+  const bd = reportCostBreakdown({ cost: 12000, fees: 500, penaltyTotal: 1500 });
+  assert.deepEqual(bd, { fees: 500, penalty: 1500, cashOut: 10000, total: 12000 });
+  assert.equal(reportCostBreakdown(null), null);
+  assert.deepEqual(reportCostBreakdown({ cost: 0, fees: 0, penaltyTotal: 0 }), { fees: 0, penalty: 0, cashOut: 0, total: 0 });
 });
