@@ -14921,6 +14921,179 @@ try {
     JSON.stringify(r.data.suggestions));
   r = await req('POST', `/api/planning/strategies/${planStrategyId}/ai-describe`, { text: '' });
   check('planning: ai-describe rejects empty text', r.status === 400, JSON.stringify(r.data));
+  // Template-first project creation (DOM): chooser with five templates,
+  // per-template intake fields, prefilled question, blank path as before.
+  // Runs before cleanup so the test property (mortgaged) is still there.
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('planning template-flow browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardT = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResT = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueT = loginResT.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserT = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserT.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardT({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueT, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitT = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitT(1200);
+      await page.click('#planAddProjectBtn');
+      await waitT(300);
+      const chooser = await page.evaluate(() => {
+        const m = document.querySelector('#planTemplateModal');
+        return {
+          open: m && !m.classList.contains('hidden'),
+          templates: [...document.querySelectorAll('#planTemplateModal [data-plan-template]')].map((el) => el.dataset.planTemplate),
+        };
+      });
+      check('planning template chooser renders all five templates',
+        chooser.open && JSON.stringify(chooser.templates) === JSON.stringify(['mortgage', 'refinance', 'buy', 'sell', 'blank']),
+        JSON.stringify(chooser));
+      const intakeFor = async (tpl) => {
+        await page.evaluate((t) => {
+          document.querySelector(`#planTemplateModal [data-plan-template="${t}"]`).click();
+        }, tpl);
+        await waitT(800);
+        return page.evaluate(() => ({
+          modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+          question: document.querySelector('#planProjectForm [name=question]').value,
+          propVisible: !document.querySelector('#planProjectPropertyRow').classList.contains('hidden'),
+          acctVisible: !document.querySelector('#planProjectAccountRow').classList.contains('hidden'),
+          propOptions: [...document.querySelectorAll('#planProjectProperty option')].map((o) => o.textContent),
+        }));
+      };
+      const closeProject = async () => {
+        await page.evaluate(() => {
+          const b = document.querySelector('#planProjectModal [data-close-modal]');
+          if (b) b.click();
+        });
+        await waitT(300);
+        await page.click('#planAddProjectBtn');
+        await waitT(300);
+      };
+      const mortgageIntake = await intakeFor('mortgage');
+      check('planning mortgage template intake shows property picker and payoff prefill',
+        mortgageIntake.modalOpen && mortgageIntake.propVisible && !mortgageIntake.acctVisible
+          && mortgageIntake.question === 'Pay off the mortgage early'
+          && mortgageIntake.propOptions.some((o) => o.includes('77 Planning Test Lane')),
+        JSON.stringify(mortgageIntake));
+      await closeProject();
+      const refiIntake = await intakeFor('refinance');
+      check('planning refinance template intake shows property picker and refinance prefill',
+        refiIntake.modalOpen && refiIntake.propVisible && !refiIntake.acctVisible
+          && refiIntake.question === 'Refinance or switch the mortgage rate',
+        JSON.stringify(refiIntake));
+      await closeProject();
+      const buyIntake = await intakeFor('buy');
+      check('planning buy template intake shows account-type picker and buy prefill',
+        buyIntake.modalOpen && !buyIntake.propVisible && buyIntake.acctVisible
+          && buyIntake.question === 'Buy with funding',
+        JSON.stringify(buyIntake));
+      await closeProject();
+      const sellIntake = await intakeFor('sell');
+      check('planning sell template intake shows no picker and sell prefill',
+        sellIntake.modalOpen && !sellIntake.propVisible && !sellIntake.acctVisible
+          && sellIntake.question === 'Sell and redeploy the proceeds',
+        JSON.stringify(sellIntake));
+      await closeProject();
+      const blankIntake = await intakeFor('blank');
+      check('planning blank template intake shows no picker and empty question',
+        blankIntake.modalOpen && !blankIntake.propVisible && !blankIntake.acctVisible
+          && blankIntake.question === '',
+        JSON.stringify(blankIntake));
+      // Mortgage-template create: pick the test property, the question
+      // re-prefills with the address, submit lands on the project page.
+      await page.evaluate(() => { document.querySelector('#planProjectModal [data-close-modal]').click(); });
+      await waitT(300);
+      await page.click('#planAddProjectBtn');
+      await waitT(300);
+      await page.evaluate(() => { document.querySelector('#planTemplateModal [data-plan-template="mortgage"]').click(); });
+      await waitT(800);
+      await page.evaluate(() => {
+        const sel = document.querySelector('#planProjectProperty');
+        const opt = [...sel.options].find((o) => o.textContent.includes('77 Planning Test Lane'));
+        if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+      });
+      await waitT(200);
+      await page.type('#planProjectForm [name=name]', 'Template Flow Test');
+      const prefilledQ = await page.evaluate(() => document.querySelector('#planProjectForm [name=question]').value);
+      check('planning mortgage intake re-prefills the question with the picked property',
+        prefilledQ === 'Pay off the mortgage on 77 Planning Test Lane, Victoria, BC early',
+        JSON.stringify({ prefilledQ }));
+      await page.click('#planProjectForm button[type=submit]');
+      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await waitT(800);
+      const landed = await page.evaluate(() => ({
+        hash: location.hash,
+        text: document.querySelector('#planProject') ? document.querySelector('#planProject').textContent : '',
+      }));
+      check('planning mortgage-template create lands on the project page with the prefilled question',
+        landed.hash.startsWith('#planning/project/') && landed.text.includes('Template Flow Test')
+          && landed.text.includes('Pay off the mortgage on 77 Planning Test Lane, Victoria, BC early'),
+        JSON.stringify({ hash: landed.hash, hasQ: landed.text.includes('Pay off the mortgage') }));
+      const templateProjectId = landed.hash.split('/').pop();
+      // Blank-path create behaves as before (name + optional question).
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitT(1000);
+      await page.click('#planAddProjectBtn');
+      await waitT(300);
+      await page.evaluate(() => { document.querySelector('#planTemplateModal [data-plan-template="blank"]').click(); });
+      await waitT(300);
+      await page.type('#planProjectForm [name=name]', 'Blank Flow Test');
+      await page.click('#planProjectForm button[type=submit]');
+      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await waitT(800);
+      const blankLanded = await page.evaluate(() => ({ hash: location.hash }));
+      check('planning blank-template create lands on a project page',
+        blankLanded.hash.startsWith('#planning/project/') && blankLanded.hash !== landed.hash,
+        JSON.stringify(blankLanded));
+      const blankProjectId = blankLanded.hash.split('/').pop();
+      r = await req('DELETE', `/api/planning/projects/${templateProjectId}`);
+      check('planning template-flow project cleanup', r.status === 200);
+      r = await req('DELETE', `/api/planning/projects/${blankProjectId}`);
+      check('planning blank-flow project cleanup', r.status === 200);
+    } finally { await browserT.close(); }
+  }
   r = await req('DELETE', `/api/planning/projects/${planProjectId}`);
   check('planning: project cleanup', r.status === 200);
   r = await req('DELETE', `/api/properties/${planPid}`);

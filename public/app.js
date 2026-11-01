@@ -10687,7 +10687,7 @@ async function loadPlanning() {
       el.addEventListener('click', () => { location.hash = `#planning/project/${el.dataset.planProject}`; });
     });
     const addBtn = $('#planAddProjectBtn');
-    if (addBtn) addBtn.addEventListener('click', () => openPlanProjectModal(null));
+    if (addBtn) addBtn.addEventListener('click', () => openPlanTemplateChooser());
   });
 }
 function planListHtml(projects) {
@@ -10702,21 +10702,89 @@ function planListHtml(projects) {
     <div class="msg" id="planListMsg"></div>
     ${projects.length ? `<div class="cards">${cards}</div>` : '<div class="panel"><div class="note">No projects yet.</div></div>'}`;
 }
-function openPlanProjectModal(existing) {
+// Template-first project creation: the chooser only frames the intake
+// (entity picker + prefilled question). It never creates a strategy and
+// the template choice itself is not stored — the project still starts
+// baseline-only.
+const PLAN_TEMPLATE_QUESTIONS = {
+  mortgage: (label) => label ? `Pay off the mortgage on ${label} early` : 'Pay off the mortgage early',
+  refinance: (label) => label ? `Refinance or switch the rate on the mortgage for ${label}` : 'Refinance or switch the mortgage rate',
+  buy: (label) => label ? `Buy in ${label} with funding` : 'Buy with funding',
+  sell: () => 'Sell and redeploy the proceeds',
+  blank: () => '',
+};
+let planTemplateChooserWired = false;
+function openPlanTemplateChooser() {
+  if (!planTemplateChooserWired) {
+    planTemplateChooserWired = true;
+    document.querySelectorAll('#planTemplateModal [data-plan-template]').forEach((el) => {
+      el.addEventListener('click', () => {
+        closeModalEl($('#planTemplateModal'));
+        openPlanProjectModal(null, el.dataset.planTemplate);
+      });
+    });
+  }
+  showMsg($('#planProjectModalMsg'), '', '');
+  openModal('planTemplateModal');
+}
+function planTemplateRefreshQuestion() {
+  const form = $('#planProjectForm');
+  const q = form.question;
+  if (q.dataset.touched) return;
+  const tpl = form.dataset.planTemplate;
+  const fn = PLAN_TEMPLATE_QUESTIONS[tpl];
+  if (!fn) return;
+  let label = '';
+  if (tpl === 'mortgage' || tpl === 'refinance') {
+    const sel = $('#planProjectProperty');
+    label = sel.value && sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : '';
+  } else if (tpl === 'buy') {
+    label = $('#planProjectAccountType').value || '';
+  }
+  q.value = fn(label);
+}
+function openPlanProjectModal(existing, template) {
   const form = $('#planProjectForm');
   form.reset();
   $('#planProjectModalTitle').textContent = existing ? 'Edit project' : 'Add project';
+  const propRow = $('#planProjectPropertyRow');
+  const acctRow = $('#planProjectAccountRow');
+  propRow.classList.add('hidden');
+  acctRow.classList.add('hidden');
+  form.dataset.planTemplate = existing ? '' : (template || 'blank');
+  form.question.dataset.touched = '';
   if (existing) { form.name.value = existing.name; form.question.value = existing.question || ''; }
+  else if (template && template !== 'blank') { form.question.value = PLAN_TEMPLATE_QUESTIONS[template](''); }
   form.dataset.projectId = existing ? existing.id : '';
   showMsg($('#planProjectModalMsg'), '', '');
   openModal('planProjectModal');
+  if (!existing && (template === 'mortgage' || template === 'refinance')) {
+    propRow.classList.remove('hidden');
+    api('/api/properties').then((props) => {
+      const list = (props.properties || props || []).filter((p) =>
+        (p.terms && p.terms.length > 0) || p.mortgage_balance != null);
+      const sel = $('#planProjectProperty');
+      sel.innerHTML = '<option value="">Select a property</option>' + list.map((p) =>
+        `<option value="${p.id}">${esc(p.address)}</option>`).join('');
+    }).catch(() => {
+      $('#planProjectProperty').innerHTML = '<option value="">Select a property</option>';
+    });
+  }
+  if (!existing && template === 'buy') acctRow.classList.remove('hidden');
 }
+$('#planProjectForm').question.addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
+$('#planProjectProperty').addEventListener('change', planTemplateRefreshQuestion);
+$('#planProjectAccountType').addEventListener('change', planTemplateRefreshQuestion);
 $('#planProjectForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
   const msg = $('#planProjectModalMsg');
   const id = form.dataset.projectId;
   try {
+    const tpl = form.dataset.planTemplate;
+    if (!id && (tpl === 'mortgage' || tpl === 'refinance') && !$('#planProjectProperty').value) {
+      showMsg(msg, 'err', 'Select a property'); return;
+    }
     const body = { name: form.name.value.trim(), question: form.question.value.trim() || null };
     const data = id ? await api(`/api/planning/projects/${id}`, { method: 'PUT', body })
       : await api('/api/planning/projects', { method: 'POST', body });

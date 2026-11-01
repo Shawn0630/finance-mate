@@ -949,11 +949,26 @@
     <form id="planProjectForm">
       <div><label>Project name *</label><input name="name" required></div>
       <div><label>Question</label><input name="question" placeholder="e.g. Christina mortgage payoff options"></div>
+      <div id="planProjectPropertyRow" class="hidden"><label>Property *</label><select id="planProjectProperty"></select></div>
+      <div id="planProjectAccountRow" class="hidden"><label>Account type</label><select id="planProjectAccountType"><option value="">Any</option><option value="TFSA">TFSA</option><option value="RRSP">RRSP</option><option value="NonRegistered">NonRegistered</option></select></div>
       <div class="toolbar">
         <button type="submit" class="primary">Save</button>
         <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="planTemplateModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Choose a template</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="cards">
+      <div class="card breakdown-card" data-plan-template="mortgage" style="cursor:pointer"><div class="k">Mortgage payoff</div><div class="n">Pay a mortgage off early.</div></div>
+      <div class="card breakdown-card" data-plan-template="refinance" style="cursor:pointer"><div class="k">Refinance / rate switch</div><div class="n">Refinance or switch a mortgage rate.</div></div>
+      <div class="card breakdown-card" data-plan-template="buy" style="cursor:pointer"><div class="k">Buy with funding</div><div class="n">Buy with funding legs.</div></div>
+      <div class="card breakdown-card" data-plan-template="sell" style="cursor:pointer"><div class="k">Sell &amp; redeploy</div><div class="n">Sell and redeploy the proceeds.</div></div>
+      <div class="card breakdown-card" data-plan-template="blank" style="cursor:pointer"><div class="k">Blank</div><div class="n">Start empty.</div></div>
+    </div>
   </div>
 </div>
 
