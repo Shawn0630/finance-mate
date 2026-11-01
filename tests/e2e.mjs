@@ -14150,6 +14150,32 @@ try {
           && overallSum.controlsToTable === 10 && overallSum.lastToPanel === 16
           && overallSum.centerDiff <= 2 && overallSum.heightDiff <= 2 && overallSum.cardsGap === '12px',
         JSON.stringify(overallSum));
+      // Cards-gap round: the Transactions panel below the card
+      // grid sits exactly one standard block gap (14px) under the
+      // cards — previously the two borders touched (0px), because
+      // .cards carries no margin and .panel carries no margin-top.
+      // Card-to-card gap stays 12px.
+      const cardsGapBlock = await page.evaluate(() => {
+        const list = document.querySelector('#spendCardList');
+        const panel = document.querySelector('#spendTxTable').closest('.panel');
+        const lr = list.getBoundingClientRect();
+        const pr = panel.getBoundingClientRect();
+        const cards = [...document.querySelectorAll('#spendCardList .breakdown-card')];
+        let rowGap = null;
+        for (let i = 1; i < cards.length; i++) {
+          const a = cards[i - 1].getBoundingClientRect();
+          const b = cards[i].getBoundingClientRect();
+          if (Math.abs(a.top - b.top) <= 1) { rowGap = Math.round(b.left - a.right); break; }
+        }
+        return {
+          blockGap: Math.round(pr.top - lr.bottom),
+          cardsGap: getComputedStyle(list).gap,
+          rowGap,
+        };
+      });
+      check('spending UI: card grid to Transactions panel gap is 14px, card-to-card gap stays 12px',
+        cardsGapBlock.blockGap === 14 && cardsGapBlock.cardsGap === '12px' && (cardsGapBlock.rowGap === null || cardsGapBlock.rowGap === 12),
+        JSON.stringify(cardsGapBlock));
       // Overall multi-select: Select none empties the table
       // (note, no sum row); Select all restores page + sum.
       await page.click('#spendCatBtn');
