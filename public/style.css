@@ -151,6 +151,7 @@ td.num, th.num { text-align: right; }
 .month-pop-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
 .month-pop-grid button { padding: 6px 0; font-size: 13px; text-align: center; }
 .month-pop-grid button.sel { background: #1668c4; border-color: #1668c4; color: #fff; }
+.month-pop-grid button.pre { outline: 2px solid #1668c4; outline-offset: -2px; }
 .month-pop-grid button:disabled { opacity: .35; cursor: default; }
 .month-pop-grid button:disabled:hover { background: #fff; }
 .msg { padding: 9px 12px; border-radius: 8px; margin: 10px 0; display: none; }

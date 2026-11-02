@@ -17076,6 +17076,49 @@ try {
       }));
       check('strategy editor: Prepay preset opens an action form titled Prepay, no type select, name required, op optional',
         bareOpened && bareFormState.title === 'Prepay' && !bareFormState.typeSel && bareFormState.nameStar && bareFormState.optLabel && bareFormState.dateVal === '', JSON.stringify(bareFormState));
+      // ---- Month-picker pins: empty plan date opens at the current
+      // year with the nearest future month highlighted; clicking it
+      // fills the field, closing without picking leaves it blank ----
+      const curYear = new Date().getFullYear();
+      const nextYm = (() => { const d = new Date(); d.setMonth(d.getMonth() + 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; })();
+      const planOpenState = await page.evaluate(() => {
+        document.querySelector('#planStrategyModalBody [data-plan-month]').click();
+        return {
+          year: document.querySelector('#monthPopYear')?.textContent || '',
+          preYm: (document.querySelector('#monthPopGrid button.pre') || {}).dataset?.ym || '',
+          dateVal: document.querySelector('#planOpDateVal')?.value || '',
+        };
+      });
+      check('month picker: empty plan date opens at the current year (not 2100) with the nearest future month highlighted and the field still blank',
+        planOpenState.year === String(curYear) && planOpenState.preYm === nextYm && planOpenState.dateVal === '', JSON.stringify(planOpenState));
+      const planPickedState = await page.evaluate((ym) => {
+        document.querySelector(`#monthPopGrid button[data-ym="${ym}"]`).click();
+        return {
+          popHidden: document.querySelector('#monthPop').classList.contains('hidden'),
+          dateVal: document.querySelector('#planOpDateVal')?.value || '',
+          btnVal: (document.querySelector('#planStrategyModalBody [data-plan-month]') || {}).dataset?.value || '',
+        };
+      }, nextYm);
+      check('month picker: clicking the highlighted nearest future month fills the plan date field',
+        planPickedState.popHidden && planPickedState.dateVal === `${nextYm}-01` && planPickedState.btnVal === nextYm, JSON.stringify(planPickedState));
+      // Fresh blank form: close the modal left open by the pick,
+      // reopen the action form, open the picker, close with Escape
+      // — the field must stay blank.
+      await page.evaluate(() => { document.querySelector('#planStrategyModal [data-close-modal]')?.click(); });
+      await waitR(500);
+      const blankAgain = await openActionForm('prepay');
+      const planEscState = await page.evaluate(() => {
+        document.querySelector('#planStrategyModalBody [data-plan-month]').click();
+        return { openedYear: document.querySelector('#monthPopYear')?.textContent || '' };
+      });
+      await page.keyboard.press('Escape');
+      await waitR(300);
+      const planEscAfter = await page.evaluate(() => ({
+        popHidden: document.querySelector('#monthPop').classList.contains('hidden'),
+        dateVal: document.querySelector('#planOpDateVal')?.value || '',
+      }));
+      check('month picker: closing without picking leaves the plan date blank (bare-strategy rule survives)',
+        blankAgain && planEscState.openedYear === String(curYear) && planEscAfter.popHidden && planEscAfter.dateVal === '', JSON.stringify({ ...planEscState, ...planEscAfter }));
       const bareHash = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((res2) => setTimeout(res2, ms));
         document.querySelector('#planStrategyName').value = 'Bare Strat';

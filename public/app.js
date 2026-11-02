@@ -8383,17 +8383,28 @@ function renderMonthPop() {
   const selYear = selected ? Number(selected.slice(0, 4)) : null;
   const minYear = Math.min(Number(span.start.slice(0, 4)), selYear ?? Infinity);
   const maxYear = Math.max(Number(span.end.slice(0, 4)), selYear ?? -Infinity);
-  // An empty entry field opens on the current year, not on the
-  // span's last year (2100 would be a long step back).
-  if (monthPopYear == null) monthPopYear = selected ? Number(selected.slice(0, 4)) : (monthPopIsEntry() ? new Date().getFullYear() : maxYear);
+  // An empty entry or plan-op field opens on the current year, not
+  // on the span's last year (2100 would be a long step back).
+  // Range fields keep the span-end default (unchanged).
+  if (monthPopYear == null) monthPopYear = selected ? Number(selected.slice(0, 4)) : ((monthPopIsEntry() || monthPopFor === 'planOp') ? new Date().getFullYear() : maxYear);
   monthPopYear = Math.min(Math.max(monthPopYear, minYear), maxYear);
   $('#monthPopYear').textContent = String(monthPopYear);
   $('#monthPopPrev').disabled = monthPopYear <= minYear;
   $('#monthPopNext').disabled = monthPopYear >= maxYear;
+  // Plan-op preselect: with no value yet, the nearest future month
+  // is highlighted as a visual hint ONLY — the field stays blank
+  // until the user clicks a cell (so a blank date still builds a
+  // bare strategy). Only that one month ever carries the class.
+  let preYm = null;
+  if (monthPopFor === 'planOp' && !selected) {
+    const nx = new Date(); nx.setMonth(nx.getMonth() + 1);
+    preYm = `${nx.getFullYear()}-${String(nx.getMonth() + 1).padStart(2, '0')}`;
+  }
   $('#monthPopGrid').innerHTML = MONTH_NAMES.map((name, i) => {
     const ym = `${monthPopYear}-${String(i + 1).padStart(2, '0')}`;
     const off = ym < span.start || ym > span.end;
-    return `<button type="button" data-ym="${ym}"${off ? ' disabled' : ''}${ym === selected ? ' class="sel"' : ''}>${name}</button>`;
+    const cls = ym === selected ? ' class="sel"' : (ym === preYm ? ' class="pre"' : '');
+    return `<button type="button" data-ym="${ym}"${off ? ' disabled' : ''}${cls}>${name}</button>`;
   }).join('');
 }
 
