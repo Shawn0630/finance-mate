@@ -548,6 +548,8 @@ table.seg-table td:last-child { text-align: right; }
 /* Planning comparison: nonzero delta cells in the diff/master/Apple
    tables render bold so the eye lands on what changed. */
 .plan-diff { font-weight: 700; }
+.plan-year-head td { font-weight: 700; background: #f2f2f2; }
+.plan-year-total td { font-weight: 700; border-top: 2px solid #ccc; }
 
 /* Planning: plain rows in the app's list-row style (same spacing and
    divider as other list rows); leg editor rows share the row flex. */

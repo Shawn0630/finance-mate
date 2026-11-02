@@ -8355,6 +8355,13 @@ function monthPopField() {
     const which = monthPopFor.split(':')[1];
     return document.querySelector(`#planDiffRange [data-plan-diff-month="${which}"]`);
   }
+  // Comparison-trajectory range fields live in the active panel's
+  // range bar (project page or report view, per planTrajActive).
+  if (monthPopFor && monthPopFor.startsWith('planTraj:')) {
+    const which = monthPopFor.split(':')[1];
+    const host = planTrajActive && planTrajActive.ids ? '#planReportComparePanel' : '#planCompareNewPanel';
+    return document.querySelector(`${host} [data-plan-traj-month="${which}"]`);
+  }
   return { start: $('#rangeStart'), end: $('#rangeEnd'), entryStart: $('#earnEntryStartBtn'), entryEnd: $('#earnEntryEndBtn') }[monthPopFor] || null;
 }
 function monthPopIsEntry() {
@@ -8374,6 +8381,9 @@ function monthPopSpan() {
   }
   // Strategy-diff range: the projection months (set by planDiffRender).
   if (monthPopFor && monthPopFor.startsWith('planDiff:')) return planDiffSpan;
+  // Comparison-trajectory range: the trajectory months (set by
+  // planCompareNewRender).
+  if (monthPopFor && monthPopFor.startsWith('planTraj:')) return planTrajSpan;
   return dataSpanMonths();
 }
 // Rent entry modal fields: a pick fills that field only — the
@@ -8456,6 +8466,9 @@ function openMonthPop(which) {
   document.querySelectorAll('[data-plan-diff-month]').forEach((b) => {
     b.setAttribute('aria-expanded', String(monthPopFor === `planDiff:${b.dataset.planDiffMonth}`));
   });
+  document.querySelectorAll('[data-plan-traj-month]').forEach((b) => {
+    b.setAttribute('aria-expanded', String(monthPopFor === `planTraj:${b.dataset.planTrajMonth}`));
+  });
 }
 
 function closeMonthPop() {
@@ -8467,6 +8480,7 @@ function closeMonthPop() {
   }
   document.querySelectorAll('[data-earn-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
   document.querySelectorAll('[data-plan-diff-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+  document.querySelectorAll('[data-plan-traj-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
 }
 
 function onMonthFieldClick(which) {
@@ -8537,6 +8551,33 @@ $('#monthPop').addEventListener('click', (e) => {
     planDiffRender();
     return;
   }
+  // Comparison-trajectory range: same fill-one-side + clamp + custom
+  // rule as the diff range, then re-render the active panel — the
+  // picker drives both the trajectory chart and the breakdown bars.
+  if (monthPopFor.startsWith('planTraj:')) {
+    const which = monthPopFor.split(':')[1];
+    const ym = cell.dataset.ym;
+    closeMonthPop();
+    const active = planTrajActive;
+    if (!active || !ym) return;
+    const st = active.ids ? (active.ids.trajState || (active.ids.trajState = { preset: 'all', from: '', to: '' })) : planTrajState;
+    const trajs = (active.block.report && active.block.report.trajectories) || [];
+    const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
+    const eff = planTrajEffectiveRange(months, st);
+    if (which === 'from') {
+      st.from = ym;
+      if (st.preset !== 'custom') st.to = eff.length ? eff[eff.length - 1] : '';
+    } else {
+      st.to = ym;
+      if (st.preset !== 'custom') st.from = eff.length ? eff[0] : '';
+    }
+    if (st.from && st.to && st.from > st.to) {
+      if (which === 'from') st.to = st.from; else st.from = st.to;
+    }
+    st.preset = 'custom';
+    planCompareNewRender(active.block, active.ids);
+    return;
+  }
   const start = monthPopFor === 'start' ? cell.dataset.ym : $('#rangeStart').dataset.value;
   const end = monthPopFor === 'end' ? cell.dataset.ym : $('#rangeEnd').dataset.value;
   closeMonthPop();
@@ -8578,7 +8619,7 @@ window.addEventListener('scroll', () => {
 }, { capture: true, passive: true });
 document.addEventListener('click', (e) => {
   if (!monthPopFor) return;
-  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]') || e.target.closest('[data-plan-month]') || e.target.closest('[data-plan-diff-month]')) return;
+  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]') || e.target.closest('[data-plan-month]') || e.target.closest('[data-plan-diff-month]') || e.target.closest('[data-plan-traj-month]')) return;
   closeMonthPop();
 });
 document.addEventListener('keydown', (e) => {
@@ -10945,6 +10986,14 @@ function planDoughnutChart(id, labels, data, centerLabel, centerTotal) {
 }
 const PLAN_COLORS = ['#20573a', '#2f7de1', '#c46a1b', '#7a3fa0', '#b03a3a', '#0f766e', '#8a6d00', '#3f3f46'];
 const planColor = (i) => PLAN_COLORS[i % PLAN_COLORS.length];
+// Light tint of a palette color for the principal leg of a stacked
+// payment breakdown (interest stays solid).
+const planColorAlpha = (hex, a) => {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+};
 const planMoney = (v) => (v == null ? '—' : money2(v));
 const planSigned = (v) => (v == null ? '—' : (v >= 0 ? '+' : '') + money2(v));
 let planListData = null;
@@ -11350,8 +11399,15 @@ function planProjectHtml(d) {
   const compareNewPanel = `<div class="panel" id="planCompareNewPanel">
       <div class="section-head"><h3>Strategy comparison</h3></div>
       <div class="note" id="planTrajectoryNote"></div>
-      <div class="chart-wrap" style="height:280px"><canvas id="planTrajectoryChart"></canvas></div>
+      <div class="section-head"><h3>Total value over time</h3></div>
+      <div class="note">X: month · Y: total value (CAD) = assessed value − outstanding principal + stock value. A pure rate switch changes no holdings, so identical lines mean holdings are unchanged.</div>
+      <div id="planTrajRange"></div>
+      <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planTrajectoryChart"></canvas></div>
       <div id="planTrajectoryEmpty"></div>
+      <div class="section-head"><h3>Monthly payment breakdown</h3></div>
+      <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
+      <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planTrajectoryBreakdownChart"></canvas></div>
+      <div id="planTrajectoryBreakdownEmpty"></div>
       <div class="section-head"><h3>Master table</h3></div>
       <div id="planMasterTable"></div>
       <div class="section-head"><h3>Compare strategies</h3></div>
@@ -11795,8 +11851,15 @@ async function loadPlanComparison(projectId) {
     // under an unpicked world — chart hidden, tables cleared.
     planCompareNewBlock = null;
     planDestroyChart('planTrajectoryChart');
-    const trajWrap = document.querySelector('#planCompareNewPanel .chart-wrap');
+    planDestroyChart('planTrajectoryBreakdownChart');
+    const trajWrap = document.querySelector('#planCompareNewPanel .plan-traj-wrap');
     if (trajWrap) trajWrap.style.display = 'none';
+    const trajBreakWrap = document.querySelector('#planCompareNewPanel .plan-traj-breakdown-wrap');
+    if (trajBreakWrap) trajBreakWrap.style.display = 'none';
+    const trajRange = $('#planTrajRange');
+    if (trajRange) trajRange.innerHTML = '';
+    const trajBreakEmpty = $('#planTrajectoryBreakdownEmpty');
+    if (trajBreakEmpty) trajBreakEmpty.innerHTML = '';
     const trajNote = $('#planTrajectoryNote');
     if (trajNote) trajNote.textContent = 'Pick a scenario to compare under.';
     const trajEmpty = $('#planTrajectoryEmpty');
@@ -12098,7 +12161,7 @@ async function loadPlanReport(projectId, reportId) {
             return `<td>${v == null ? '—' : money2(v)}</td>`;
           }).join('')}</tr>`;
         }).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
+        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
         draws.push(() => planLineChart(cid, months, datasets));
       } else if (c.template === 'metric_cards') {
         const sids = series || ['cost', 'gain', 'net'];
@@ -12120,7 +12183,7 @@ async function loadPlanReport(projectId, reportId) {
         const datasets = trajs.map((t, ti) => ({ label: t.label, data: yearEnd(t), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1) }));
         const head = `<tr><th>Year</th>${trajs.map((t) => `<th>${esc(t.label)}</th>`).join('')}</tr>`;
         const body = years.map((y, yi) => `<tr><td>${y}</td>${datasets.map((d) => `<td>${d.data[yi] == null ? '—' : money2(d.data[yi])}</td>`).join('')}</tr>`).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">Year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} per year, baseline vs each strategy. ${esc(how)}</div></div>`);
+        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: year · Y: year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} (CAD), baseline vs each strategy. ${esc(how)}</div></div>`);
         draws.push(() => planGroupedBarChart(cid, years, datasets));
       } else if (c.template === 'stacked_bar') {
         const sids = series || ['mortgage_balance'];
@@ -12144,7 +12207,7 @@ async function loadPlanReport(projectId, reportId) {
         const snapIdx = planReportYearRows(baseTraj.monthly).map((r) => monthIndex.get(r.month));
         const head = `<tr><th>Month</th>${datasets.map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
         const body = snapIdx.map((mi) => `<tr><td>${months[mi]}</td>${datasets.map((d) => `<td>${d.data[mi] == null ? '—' : money2(d.data[mi])}</td>`).join('')}</tr>`).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline uses actual prime history. ${esc(how)}</div></div>`);
+        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline uses actual prime history. ${esc(how)}</div></div>`);
         draws.push(() => planBarChart(cid, months, datasets));
       } else if (c.template === 'share_doughnut') {
         if (sidsHas(series, 'cost') && !sidsHas(series, 'mortgage_balance') && !sidsHas(series, 'total_value')) {
@@ -12197,7 +12260,7 @@ async function loadPlanReport(projectId, reportId) {
             { label: 'Worst', data: max, borderColor: '#b03a3a', backgroundColor: '#b03a3a', fill: false, pointRadius: 0 },
           ]));
           const sbody = table.map((r) => `<tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
-          return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
+          return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><div class="note">X: month · Y: mortgage balance (CAD) across scenarios.</div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}<div class="note">Fan bands need multiple rate paths per strategy — rate paths now live on each strategy's prime factor, so no envelope is drawn here.</div></div>`);
       } else if (c.template === 'funds_flow') {
@@ -12223,8 +12286,15 @@ async function loadPlanReport(projectId, reportId) {
       <div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
-        <div class="chart-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
+        <div class="section-head"><h3>Total value over time</h3></div>
+        <div class="note">X: month · Y: total value (CAD) = assessed value − outstanding principal + stock value. A pure rate switch changes no holdings, so identical lines mean holdings are unchanged.</div>
+        <div id="planReportTrajRange"></div>
+        <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
+        <div class="section-head"><h3>Monthly payment breakdown</h3></div>
+        <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
+        <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planReportTrajectoryBreakdownChart"></canvas></div>
+        <div id="planReportTrajectoryBreakdownEmpty"></div>
         <div class="section-head"><h3>Master table</h3></div>
         <div id="planReportMasterTable"></div>
         <div class="section-head"><h3>Compare strategies</h3></div>
@@ -12239,7 +12309,10 @@ async function loadPlanReport(projectId, reportId) {
     try {
       planCompareNewRender({ scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report }, {
         note: '#planReportTrajectoryNote', chart: 'planReportTrajectoryChart', empty: '#planReportTrajectoryEmpty',
-        wrapSel: '#planReportComparePanel .chart-wrap', master: '#planReportMasterTable',
+        wrapSel: '#planReportComparePanel .plan-traj-wrap',
+        range: '#planReportTrajRange', breakdown: 'planReportTrajectoryBreakdownChart', breakdownEmpty: '#planReportTrajectoryBreakdownEmpty',
+        breakdownWrapSel: '#planReportComparePanel .plan-traj-breakdown-wrap',
+        master: '#planReportMasterTable',
         picker: '#planReportApplePicker', apple: '#planReportAppleTable', ctx: { block: null, appleIds: null },
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
@@ -12342,6 +12415,16 @@ function planStrategyHtml(d) {
         <div class="card breakdown-card"><div class="k">Penalty</div><div class="v">${planMoney(c.penaltyTotal)}</div><div class="n">Estimate — the bank quote governs</div></div>
       </div>
     </div>
+    <div class="panel" id="planStrategyAsmPanel">
+      <div class="section-head"><h3>Assumptions</h3></div>
+      <div class="grid2">
+        <div><label>Comparable rate (%)</label><input id="planAsmComparable" type="text" inputmode="decimal" data-money value="${asm.comparableRate ? esc(asm.comparableRate.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmComparableOk"${asm.comparableRate && asm.comparableRate.confirmed ? ' checked' : ''}> Confirmed</label><div class="toolbar"><button class="small danger" data-plan-asm-del="comparableRate">Delete</button></div></div>
+        <div><label>Annual prepayment privilege (%)</label><input id="planAsmPrivilege" type="text" inputmode="decimal" data-money value="${asm.privilegePct ? esc(asm.privilegePct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmPrivilegeOk"${asm.privilegePct && asm.privilegePct.confirmed ? ' checked' : ''}> Confirmed</label><div class="toolbar"><button class="small danger" data-plan-asm-del="privilegePct">Delete</button></div></div>
+      </div>
+      <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
+      <div class="msg" id="planAsmMsg"></div>
+      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Stock return lives in the scenario now.</div>
+    </div>
     <div class="panel">
       <div class="section-head"><h3>Operations</h3>
         <div class="toolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
@@ -12349,13 +12432,22 @@ function planStrategyHtml(d) {
       <table class="tbl"><thead><tr><th>#</th><th>Type</th><th>Detail</th><th>Source</th><th></th></tr></thead><tbody>${ops || '<tr><td colspan="5">No operations yet.</td></tr>'}</tbody></table>
       <div class="msg" id="planOpsMsg"></div>
     </div>
+    <div class="panel" id="planStrategyDescribePanel">
+      <div class="section-head"><h3>Describe in words</h3></div>
+      <div><textarea id="planAiDescribeText" rows="3" placeholder="e.g. Prepay $100,000 on Christina in January 2027, then refinance to a 5-year fixed at 4.2%"></textarea></div>
+      <div class="toolbar"><button class="small" id="planAiDescribeBtn">Describe → operations</button></div>
+      <div id="planAiDescribeOut"></div>
+      <div class="msg" id="planAiDescribeMsg"></div>
+    </div>
     <div class="panel">
       <div class="section-head"><h3>Mortgage balance</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyMortChart"></canvas></div>
+      <div class="note">X: month · Y: outstanding principal (CAD), baseline vs strategy, summed across properties.</div>
     </div>
     <div class="panel">
       <div class="section-head"><h3>Stock value</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
+      <div class="note">X: month · Y: stock value (CAD), baseline vs strategy.</div>
     </div>
     ${d.project.category === 'investment' ? `<div class="panel" id="planSinkPanel">
       <div class="section-head"><h3>Sink</h3></div>
@@ -12376,7 +12468,12 @@ function planStrategyHtml(d) {
         <span class="range-pick">To <button type="button" class="month-field" data-plan-diff-month="to" data-value="">—</button></span>
       </div>
       <div class="chart-wrap" style="height:260px"><canvas id="planDiffChart"></canvas></div>
+      <div class="note" id="planDiffCaption"></div>
       <div id="planDiffEmpty"></div>
+      <div class="section-head"><h3 id="planDiffBreakdownTitle">Monthly payment breakdown</h3></div>
+      <div class="note" id="planDiffBreakdownCaption"></div>
+      <div class="chart-wrap" style="height:260px"><canvas id="planDiffBreakdownChart"></canvas></div>
+      <div id="planDiffBreakdownEmpty"></div>
       <div id="planDiffTable"></div>
     </div>
     <div class="panel" id="planStrategyReportPanel">
@@ -12387,23 +12484,6 @@ function planStrategyHtml(d) {
       <div class="msg" id="planStrategyReportMsg"></div>
     </div>
     ${penRows ? `<div class="panel"><div class="section-head"><h3>Penalties</h3></div>${penRows}</div>` : ''}
-    <div class="panel">
-      <div class="section-head"><h3>Describe in words</h3></div>
-      <div><textarea id="planAiDescribeText" rows="3" placeholder="e.g. Prepay $100,000 on Christina in January 2027, then refinance to a 5-year fixed at 4.2%"></textarea></div>
-      <div class="toolbar"><button class="small" id="planAiDescribeBtn">Describe → operations</button></div>
-      <div id="planAiDescribeOut"></div>
-      <div class="msg" id="planAiDescribeMsg"></div>
-    </div>
-    <div class="panel">
-      <div class="section-head"><h3>Assumptions</h3></div>
-      <div class="grid2">
-        <div><label>Comparable rate (%)</label><input id="planAsmComparable" type="text" inputmode="decimal" data-money value="${asm.comparableRate ? esc(asm.comparableRate.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmComparableOk"${asm.comparableRate && asm.comparableRate.confirmed ? ' checked' : ''}> Confirmed</label></div>
-        <div><label>Annual prepayment privilege (%)</label><input id="planAsmPrivilege" type="text" inputmode="decimal" data-money value="${asm.privilegePct ? esc(asm.privilegePct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmPrivilegeOk"${asm.privilegePct && asm.privilegePct.confirmed ? ' checked' : ''}> Confirmed</label></div>
-      </div>
-      <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
-      <div class="msg" id="planAsmMsg"></div>
-      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Stock return lives in the scenario now.</div>
-    </div>
     ${(() => {
       if (!d.model || !d.model.spec) return '';
       const spec = d.model.spec;
@@ -12616,6 +12696,16 @@ function planStrategyWire(d) {
       loadPlanStrategy(s.id);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
+  // Assumption Delete resets that assumption to UNSET (value null,
+  // unconfirmed) — the existing unset semantics apply unchanged
+  // (blank privilege = penalty on the full amount, upper bound).
+  document.querySelectorAll('[data-plan-asm-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Reset this assumption to unset?')) return;
+    try {
+      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: b.dataset.planAsmDel, value: null, confirmed: false } });
+      loadPlanStrategy(s.id);
+    } catch (err) { showMsg($('#planAsmMsg'), 'err', err.message); }
+  }));
   const scenSel = $('#planStrategyScenarioSel');
   if (scenSel) scenSel.addEventListener('change', () => loadPlanStrategy(s.id, Number(scenSel.value)));
   planSinkWire(d);
@@ -12782,14 +12872,14 @@ let planDiffSpan = null;
 function planDiffMonthly(d) {
   const rows = new Map();
   const row = (m) => {
-    if (!rows.has(m)) rows.set(m, { month: m, balBase: null, balStrat: null, intBase: null, intStrat: null, valBase: null, valStrat: null });
+    if (!rows.has(m)) rows.set(m, { month: m, balBase: null, balStrat: null, intBase: null, intStrat: null, prinBase: null, prinStrat: null, valBase: null, valStrat: null });
     return rows.get(m);
   };
   for (const per of Object.values((d.baseline.mortgage && d.baseline.mortgage.perProperty) || {})) {
-    for (const pt of ((per.baseline && per.baseline.series) || [])) { const r = row(pt.month); r.balBase = (r.balBase || 0) + pt.balance; r.intBase = (r.intBase || 0) + pt.interest; }
+    for (const pt of ((per.baseline && per.baseline.series) || [])) { const r = row(pt.month); r.balBase = (r.balBase || 0) + pt.balance; r.intBase = (r.intBase || 0) + pt.interest; r.prinBase = (r.prinBase || 0) + (pt.principal || 0); }
   }
   for (const per of Object.values((d.projection.mortgage && d.projection.mortgage.perProperty) || {})) {
-    for (const pt of ((per.strategy && per.strategy.series) || [])) { const r = row(pt.month); r.balStrat = (r.balStrat || 0) + pt.balance; r.intStrat = (r.intStrat || 0) + pt.interest; }
+    for (const pt of ((per.strategy && per.strategy.series) || [])) { const r = row(pt.month); r.balStrat = (r.balStrat || 0) + pt.balance; r.intStrat = (r.intStrat || 0) + pt.interest; r.prinStrat = (r.prinStrat || 0) + (pt.principal || 0); }
   }
   for (const pt of (((d.baseline.stocks) || {}).series || [])) { const r = row(pt.month); r.valBase = (r.valBase || 0) + pt.value; }
   for (const pt of (((d.projection.stocks) || {}).series || [])) { const r = row(pt.month); r.valStrat = (r.valStrat || 0) + pt.value; }
@@ -12881,13 +12971,32 @@ function planDiffRender(d) {
   const wrap = host.querySelector('.chart-wrap');
   if (!filtered.length) {
     planDestroyChart('planDiffChart');
+    planDestroyChart('planDiffBreakdownChart');
     if (wrap) wrap.style.display = 'none';
+    const bWrap0 = document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap');
+    if (bWrap0) bWrap0.style.display = 'none';
     if (empty) empty.innerHTML = '<div class="note">No months in this range.</div>';
+    const cap0 = $('#planDiffCaption'); if (cap0) cap0.textContent = '';
+    const bCap0 = $('#planDiffBreakdownCaption'); if (bCap0) bCap0.textContent = '';
     $('#planDiffTable').innerHTML = '';
     return;
   }
   if (wrap) wrap.style.display = '';
   if (empty) empty.innerHTML = '';
+  const cap = $('#planDiffCaption');
+  const bCap = $('#planDiffBreakdownCaption');
+  const bTitle = $('#planDiffBreakdownTitle');
+  const bWrap = document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap');
+  if (bWrap) bWrap.style.display = '';
+  if (planDiffState.gran === 'annual') {
+    if (cap) cap.textContent = 'X: year · Y: CAD — Equity Δ = the year\'s peak monthly balance advantage; Value Δ = year-end.';
+    if (bTitle) bTitle.textContent = 'Annual payment breakdown';
+    if (bCap) bCap.textContent = 'X: year · Y: CAD per year — scheduled payment split into interest (solid) + principal (light), baseline vs strategy, summed over the year\'s months.';
+  } else {
+    if (cap) cap.textContent = 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
+    if (bTitle) bTitle.textContent = 'Monthly payment breakdown';
+    if (bCap) bCap.textContent = 'X: month · Y: CAD per month — scheduled payment split into interest (solid) + principal (light), baseline vs strategy.';
+  }
   const diffCls = (v) => (v != null && v !== 0) ? ' class="plan-diff"' : '';
   if (planDiffState.gran === 'annual') {
     const years = planDiffAnnual(filtered);
@@ -12895,6 +13004,22 @@ function planDiffRender(d) {
     if (hasMort) datasets.push({ label: 'Equity Δ (peak)', data: years.map((a) => a.equityPeak), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
     if (hasStock) datasets.push({ label: 'Value Δ (year-end)', data: years.map((a) => a.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
     if (datasets.length) planLineChart('planDiffChart', years.map((a) => a.year), datasets); else planDestroyChart('planDiffChart');
+    // Annual breakdown: per-year sums of scheduled interest/principal.
+    const prinByYear = new Map();
+    for (const r of filtered) {
+      const y = r.month.slice(0, 4);
+      const cur = prinByYear.get(y) || { prinBase: 0, prinStrat: 0 };
+      cur.prinBase += r.prinBase || 0; cur.prinStrat += r.prinStrat || 0;
+      prinByYear.set(y, cur);
+    }
+    const bDatasetsA = [];
+    if (hasMort) {
+      bDatasetsA.push({ label: 'Baseline interest', data: years.map((a) => a.intBase), backgroundColor: '#888888', stack: 'base' });
+      bDatasetsA.push({ label: 'Baseline principal', data: years.map((a) => (prinByYear.get(a.year) || {}).prinBase || 0), backgroundColor: planColorAlpha('#888888', 0.45), stack: 'base' });
+      bDatasetsA.push({ label: 'Strategy interest', data: years.map((a) => a.intStrat), backgroundColor: planColor(0), stack: 'strat' });
+      bDatasetsA.push({ label: 'Strategy principal', data: years.map((a) => (prinByYear.get(a.year) || {}).prinStrat || 0), backgroundColor: planColorAlpha(planColor(0), 0.45), stack: 'strat' });
+    }
+    if (bDatasetsA.length) planBarChart('planDiffBreakdownChart', years.map((a) => a.year), bDatasetsA); else planDestroyChart('planDiffBreakdownChart');
     let head = '<tr><th>Year</th>';
     if (hasMort) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Equity Δ (peak)</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
     if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
@@ -12911,16 +13036,45 @@ function planDiffRender(d) {
     if (hasMort) datasets.push({ label: 'Balance Δ', data: filtered.map((r) => r.balDiff), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
     if (hasStock) datasets.push({ label: 'Value Δ', data: filtered.map((r) => r.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
     if (datasets.length) planLineChart('planDiffChart', filtered.map((r) => formatYM(r.month)), datasets); else planDestroyChart('planDiffChart');
+    // Monthly breakdown: per-month scheduled interest (solid) +
+    // principal (light), baseline vs strategy.
+    const bDatasets = [];
+    if (hasMort) {
+      bDatasets.push({ label: 'Baseline interest', data: filtered.map((r) => r.intBase), backgroundColor: '#888888', stack: 'base' });
+      bDatasets.push({ label: 'Baseline principal', data: filtered.map((r) => r.prinBase), backgroundColor: planColorAlpha('#888888', 0.45), stack: 'base' });
+      bDatasets.push({ label: 'Strategy interest', data: filtered.map((r) => r.intStrat), backgroundColor: planColor(0), stack: 'strat' });
+      bDatasets.push({ label: 'Strategy principal', data: filtered.map((r) => r.prinStrat), backgroundColor: planColorAlpha(planColor(0), 0.45), stack: 'strat' });
+    }
+    if (bDatasets.length) planBarChart('planDiffBreakdownChart', filtered.map((r) => formatYM(r.month)), bDatasets); else planDestroyChart('planDiffBreakdownChart');
     let head = '<tr><th>Month</th>';
     if (hasMort) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Balance Δ</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
     if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
     head += '</tr>';
-    const rows = filtered.map((r) => {
+    // Monthly rows group BY YEAR: a year header, the year's months,
+    // then an annual-sum row — flows summed over the year's months,
+    // balances/value at year-end.
+    const cols = 1 + (hasMort ? 6 : 0) + (hasStock ? 3 : 0);
+    let rows = '';
+    let curYear = null; let yearRows = [];
+    const flushYear = () => {
+      if (!yearRows.length) return;
+      const last = yearRows[yearRows.length - 1];
+      const sum = (f) => yearRows.reduce((a, r) => a + (r[f] || 0), 0);
+      rows += `<tr class="plan-year-total"><td>${curYear} total</td>`;
+      if (hasMort) rows += `<td>${planMoney(last.balBase)}</td><td>${planMoney(last.balStrat)}</td><td${diffCls(last.balDiff)}>${planSigned(last.balDiff)}</td><td>${planMoney(sum('intBase'))}</td><td>${planMoney(sum('intStrat'))}</td><td${diffCls(sum('intSaved'))}>${planSigned(sum('intSaved'))}</td>`;
+      if (hasStock) rows += `<td>${planMoney(last.valBase)}</td><td>${planMoney(last.valStrat)}</td><td${diffCls(last.valDiff)}>${planSigned(last.valDiff)}</td>`;
+      rows += '</tr>';
+    };
+    for (const r of filtered) {
+      const y = r.month.slice(0, 4);
+      if (y !== curYear) { flushYear(); curYear = y; yearRows = []; rows += `<tr class="plan-year-head"><td colspan="${cols}">${y}</td></tr>`; }
+      yearRows.push(r);
       let x = `<tr><td>${formatYM(r.month)}</td>`;
       if (hasMort) x += `<td>${planMoney(r.balBase)}</td><td>${planMoney(r.balStrat)}</td><td${diffCls(r.balDiff)}>${planSigned(r.balDiff)}</td><td>${planMoney(r.intBase)}</td><td>${planMoney(r.intStrat)}</td><td${diffCls(r.intSaved)}>${planSigned(r.intSaved)}</td>`;
       if (hasStock) x += `<td>${planMoney(r.valBase)}</td><td>${planMoney(r.valStrat)}</td><td${diffCls(r.valDiff)}>${planSigned(r.valDiff)}</td>`;
-      return x + '</tr>';
-    }).join('');
+      rows += x + '</tr>';
+    }
+    flushYear();
     $('#planDiffTable').innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
   }
 }
@@ -12960,9 +13114,36 @@ function planBaselineValue(block) {
 // without duplication.
 const planCompareDefaultIds = () => ({
   note: '#planTrajectoryNote', chart: 'planTrajectoryChart', empty: '#planTrajectoryEmpty',
-  wrapSel: '#planCompareNewPanel .chart-wrap', master: '#planMasterTable',
+  wrapSel: '#planCompareNewPanel .plan-traj-wrap',
+  range: '#planTrajRange', breakdown: 'planTrajectoryBreakdownChart', breakdownEmpty: '#planTrajectoryBreakdownEmpty',
+  breakdownWrapSel: '#planCompareNewPanel .plan-traj-breakdown-wrap',
+  master: '#planMasterTable',
   picker: '#planApplePicker', apple: '#planAppleTable',
 });
+// Trajectory range state: module-global for the project page, per-ctx
+// for the report view (mirrors the Apple picker split). The active
+// target lets the shared month picker re-render the panel it came
+// from; only one comparison panel is visible at a time, so a single
+// active target is safe.
+let planTrajState = { preset: 'all', from: '', to: '' };
+let planTrajSpan = null;
+let planTrajActive = null;
+function planTrajEffectiveRange(months, st) {
+  if (!months.length) return [];
+  if (st.preset === 'custom' && st.from && st.to) {
+    const lo = st.from <= st.to ? st.from : st.to;
+    const hi = st.from <= st.to ? st.to : st.from;
+    return months.filter((m) => m >= lo && m <= hi);
+  }
+  const n = { '1y': 12, '2y': 24, '5y': 60, '10y': 120 }[st.preset];
+  if (n) return months.slice(0, n);
+  return months;
+}
+function planTrajRangeHtml(st, months) {
+  const presets = ['all', '1y', '2y', '5y', '10y'];
+  const eff = planTrajEffectiveRange(months, st);
+  return `<div class="toolbar">${presets.map((p) => `<button class="small${st.preset === p ? ' active' : ''}" data-plan-traj-preset="${p}">${p === 'all' ? 'All' : p}</button>`).join(' ')} <span class="range-label">${eff.length ? `${formatYM(eff[0])} – ${formatYM(eff[eff.length - 1])}` : '—'}</span> <button class="small month-field" data-plan-traj-month="from" data-value="${st.from || ''}">${st.from ? formatYM(st.from) : 'From'}</button> <button class="small month-field" data-plan-traj-month="to" data-value="${st.to || ''}">${st.to ? formatYM(st.to) : 'To'}</button></div>`;
+}
 function planCompareNewRender(block, ids) {
   const t = ids || planCompareDefaultIds();
   if (ids) { t.block = block; if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id); }
@@ -12976,16 +13157,51 @@ function planCompareNewRender(block, ids) {
   if (note) note.textContent = block.scenario ? `Under ${block.scenario.name}` : 'Current rates (no scenario)';
   const trajs = (block.report && block.report.trajectories) || [];
   const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
+  // Range state + active target (month picker re-renders this panel).
+  if (ids) { if (t.trajState == null) t.trajState = { preset: 'all', from: '', to: '' }; }
+  const trajState = ids ? t.trajState : planTrajState;
+  planTrajActive = { block, ids: ids || null };
+  planTrajSpan = months.length ? { start: months[0], end: months[months.length - 1] } : null;
+  const rangeEl = $(t.range);
+  if (rangeEl) {
+    rangeEl.innerHTML = planTrajRangeHtml(trajState, months);
+    rangeEl.querySelectorAll('[data-plan-traj-preset]').forEach((b) => b.addEventListener('click', () => {
+      trajState.preset = b.dataset.planTrajPreset; trajState.from = ''; trajState.to = '';
+      planCompareNewRender(block, ids);
+    }));
+    rangeEl.querySelectorAll('[data-plan-traj-month]').forEach((b) => b.addEventListener('click', () => onMonthFieldClick(`planTraj:${b.dataset.planTrajMonth}`)));
+  }
+  const effMonths = planTrajEffectiveRange(months, trajState);
+  const byMonth = (tr) => { const m = new Map((tr.monthly || []).map((r) => [r.month, r])); return (mo) => m.get(mo); };
   const wrap = document.querySelector(t.wrapSel);
   const empty = $(t.empty);
-  if (trajs.length && months.length) {
+  const bWrap = document.querySelector(t.breakdownWrapSel);
+  const bEmpty = $(t.breakdownEmpty);
+  if (trajs.length && effMonths.length) {
     if (wrap) wrap.style.display = '';
     if (empty) empty.innerHTML = '';
-    planLineChart(t.chart, months.map(formatYM), trajs.map((tr, i) => ({ label: tr.label, data: (tr.monthly || []).map((m) => m.total_value), borderColor: planColor(i), backgroundColor: planColor(i), spanGaps: true })));
+    planLineChart(t.chart, effMonths.map(formatYM), trajs.map((tr, i) => {
+      const get = byMonth(tr);
+      return { label: tr.label, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : r.total_value; }), borderColor: planColor(i), backgroundColor: planColor(i), spanGaps: true };
+    }));
+    // Payment breakdown: per-month scheduled interest (solid) +
+    // principal (light), stacked per trajectory, over the same range.
+    if (bWrap) bWrap.style.display = '';
+    if (bEmpty) bEmpty.innerHTML = '';
+    const bDatasets = [];
+    trajs.forEach((tr, i) => {
+      const get = byMonth(tr);
+      bDatasets.push({ label: `${tr.label} interest`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.interest || 0); }), backgroundColor: planColor(i), stack: tr.label });
+      bDatasets.push({ label: `${tr.label} principal`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.principal || 0); }), backgroundColor: planColorAlpha(planColor(i), 0.45), stack: tr.label });
+    });
+    planBarChart(t.breakdown, effMonths.map(formatYM), bDatasets);
   } else {
     planDestroyChart(t.chart);
+    planDestroyChart(t.breakdown);
     if (wrap) wrap.style.display = 'none';
-    if (empty) empty.innerHTML = '<div class="note">No trajectory data.</div>';
+    if (bWrap) bWrap.style.display = 'none';
+    if (empty) empty.innerHTML = `<div class="note">${trajs.length && months.length ? 'No months in this range.' : 'No trajectory data.'}</div>`;
+    if (bEmpty) bEmpty.innerHTML = '';
   }
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const baseValue = planBaselineValue(block);

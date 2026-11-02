@@ -271,6 +271,19 @@ test('reportMonthlySeries: balances sum across properties, total = assessed - ba
   assert.equal(empty[0].total_value, 510000);
 });
 
+test('reportMonthlySeries: scheduled principal sums across properties, 0 on stock-only months', () => {
+  const perProperty = {
+    1: { baseline: { series: [{ month: '2026-11', balance: 100000, interest: 400, principal: 600 }, { month: '2026-12', balance: 99000, interest: 395, principal: 605 }] } },
+    2: { baseline: { series: [{ month: '2026-11', balance: 50000, interest: 200, principal: 300 }] } },
+  };
+  const stock = [{ month: '2026-11', value: 10000 }, { month: '2026-12', value: 11000 }, { month: '2027-01', value: 12000 }];
+  const rows = reportMonthlySeries(perProperty, 'baseline', stock, 500000);
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].principal, 900);
+  assert.equal(rows[1].principal, 605);
+  assert.equal(rows[2].principal, 0);
+});
+
 test('reportCostBreakdown: cash out is the remainder after fees and penalty', () => {
   const bd = reportCostBreakdown({ cost: 12000, fees: 500, penaltyTotal: 1500 });
   assert.deepEqual(bd, { fees: 500, penalty: 1500, cashOut: 10000, total: 12000 });

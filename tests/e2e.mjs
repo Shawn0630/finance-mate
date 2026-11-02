@@ -17809,7 +17809,7 @@ try {
       const diff = await page.evaluate(() => ({
         panel: !!document.querySelector('#planDiffPanel'),
         head: document.querySelector('#planDiffTable thead')?.textContent || '',
-        rows: document.querySelectorAll('#planDiffTable tbody tr').length,
+        rows: document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length,
         chart: !!document.querySelector('#planDiffChart'),
         allActive: !!document.querySelector('[data-plan-diff-preset="all"].active'),
         presets: [...document.querySelectorAll('[data-plan-diff-preset]')].map((b) => b.dataset.planDiffPreset),
@@ -17829,12 +17829,12 @@ try {
         diff.rows === apiMonths.size, JSON.stringify({ rows: diff.rows, apiMonths: apiMonths.size }));
       await page.click('[data-plan-diff-preset="1y"]');
       await waitC(800);
-      const shortRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr').length);
+      const shortRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
       check('comparison: diff 1y preset narrows the monthly table',
         shortRows > 0 && shortRows <= 12 && shortRows < diff.rows, JSON.stringify({ shortRows, fullRows: diff.rows }));
       await page.click('[data-plan-diff-preset="all"]');
       await waitC(800);
-      const backRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr').length);
+      const backRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
       check('comparison: diff All preset restores the full table', backRows === diff.rows, JSON.stringify({ backRows, fullRows: diff.rows }));
       await page.click('[data-plan-diff-gran="annual"]');
       await waitC(800);
@@ -18562,6 +18562,245 @@ try {
       const threadShown = await page.evaluate(() => !document.querySelector('#planStrategyModelThread.hidden'));
       check('redesign: thread toggle reveals the thread', threadShown);
     } finally { await browserR.close(); }
+  }
+  // ------------------------------------------- strategy-detail clarity
+  // Titles + axis captions on report charts (template + AI paths),
+  // interest/principal stacked bars + range picker on time charts,
+  // year-grouped diff table with annual-sum rows, Assumptions as top
+  // metadata with Delete, Describe next to Operations, Report +
+  // Penalties above Model.
+  r = await req('POST', '/api/planning/projects', { name: 'DC Clarity', question: 'q' });
+  check('detail-clarity: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const dcProjectId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${dcProjectId}/strategies`, { name: 'DC strat', source: 'template' });
+  check('detail-clarity: pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const dcStrategyId = r.data.strategy.id;
+  r = await req('POST', '/api/properties', {
+    address: '99 Clarity Test Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('detail-clarity: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const dcPropId = r.data.id;
+  r = await req('POST', `/api/properties/${dcPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('detail-clarity: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+  const _dcNow = new Date();
+  const _dcNext = new Date(Date.UTC(_dcNow.getUTCFullYear(), _dcNow.getUTCMonth() + 1, 1));
+  const dcOpDate = _dcNext.toISOString().slice(0, 10);
+  r = await req('POST', `/api/planning/strategies/${dcStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: dcPropId, date: dcOpDate, amount: 10000, openClosed: 'open' },
+  });
+  check('detail-clarity: pin prepay op added', r.status === 201, JSON.stringify(r.data));
+  // Rate switch with no openClosed defaults to closed → a penalty
+  // row, so the Penalties panel renders for the order pin.
+  r = await req('POST', `/api/planning/strategies/${dcStrategyId}/ops`, {
+    op_type: 'rate_switch',
+    params: { propertyId: dcPropId, date: '2027-06-01', rateType: 'fixed', annualRate: 4.2 },
+  });
+  check('detail-clarity: pin rate-switch op added (closed → penalty)', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${dcProjectId}/scenarios`, { name: 'DC world' });
+  check('detail-clarity: pin scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const dcScenId = r.data.scenario.id;
+  r = await req('GET', `/api/planning/projects/${dcProjectId}/comparison?scenarioIds=${dcScenId}`);
+  const dcTrajs = (r.data.report && r.data.report.trajectories) || [];
+  const dcFirst = dcTrajs.length ? dcTrajs[0].monthly || [] : [];
+  check('detail-clarity: trajectory rows carry scheduled interest + principal',
+    r.status === 200 && dcTrajs.length >= 2 && dcFirst.length > 12 && dcFirst.every((m) => typeof m.interest === 'number' && typeof m.principal === 'number'),
+    JSON.stringify({ trajs: dcTrajs.length, months: dcFirst.length, sample: dcFirst[0] }));
+  r = await req('PUT', `/api/planning/strategies/${dcStrategyId}/assumptions`, { key: 'privilegePct', value: 10, confirmed: true });
+  check('detail-clarity: pin privilege assumption set', r.status === 200, JSON.stringify(r.data));
+  // Model attach (same stub path as the ai-model pins) so the Model
+  // panel renders for the order pin.
+  const dcModelDef = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
+  fs.writeFileSync(aiStubFile, JSON.stringify(dcModelDef));
+  r = await req('POST', `/api/planning/strategies/${dcStrategyId}/ai-model`, { text: 'Model interest', name: 'DC model' });
+  check('detail-clarity: pin model saved', r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
+  const dcModelId = r.data.model.id;
+  r = await req('PUT', `/api/planning/strategies/${dcStrategyId}`, { model_id: dcModelId });
+  check('detail-clarity: pin model attached', r.status === 200, JSON.stringify(r.data));
+  // Reports: template path (no method → engine how-line) and AI path
+  // (method carried through) share the renderer.
+  const dcDef = { strategies: [dcStrategyId], charts: [{ template: 'time_line', title: 'DC balance path', series: ['mortgage_balance'] }] };
+  r = await req('POST', `/api/planning/projects/${dcProjectId}/reports`, { name: 'DC template report', definition: dcDef, strategy_ids: [dcStrategyId], scenario_ids: [dcScenId] });
+  check('detail-clarity: template report saved', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const dcRepId = r.data.report.id;
+  const dcMethodDef = { strategies: [dcStrategyId], charts: [{ template: 'time_line', title: 'DC AI balance path', series: ['mortgage_balance'], method: 'AI method line: monthly outstanding principal, baseline vs strategy.' }] };
+  r = await req('POST', `/api/planning/projects/${dcProjectId}/reports`, { name: 'DC AI report', definition: dcMethodDef, strategy_ids: [dcStrategyId], scenario_ids: [dcScenId] });
+  check('detail-clarity: AI-method report saved', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const dcAiRepId = r.data.report.id;
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('detail-clarity browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardD = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResD = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueD = loginResD.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserD = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserD.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardD({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueD, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitD = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const order = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('#planStrategy .panel h3')].map((h) => h.textContent.trim());
+        const idx = (h) => heads.indexOf(h);
+        const chartLabels = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
+        return {
+          heads,
+          asmTop: idx('Assumptions') === 1,
+          describeAfterOps: idx('Describe in words') === idx('Operations') + 1,
+          reportAfterDiff: idx('Report') === idx('Difference vs baseline') + 2,
+          penAfterReport: idx('Penalties') === idx('Report') + 1,
+          modelLast: idx('Model') === heads.length - 1 || idx('Model') > idx('Penalties'),
+          mortCap: !!document.querySelector('#planStrategyMortChart')?.closest('.panel')?.textContent.includes('X: month'),
+          stockCap: !!document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent.includes('X: month'),
+          diffCap: (document.querySelector('#planDiffCaption')?.textContent || '').includes('X: month'),
+          diffBreak: !!document.querySelector('#planDiffBreakdownChart'),
+          diffBreakLabels: chartLabels('planDiffBreakdownChart'),
+          diffBreakCap: (document.querySelector('#planDiffBreakdownCaption')?.textContent || '').includes('X: month'),
+          asmDel: [...document.querySelectorAll('[data-plan-asm-del]')].map((b) => b.dataset.planAsmDel),
+          privVal: document.querySelector('#planAsmPrivilege')?.value || '',
+          privChecked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
+        };
+      });
+      check('detail-clarity: panel order — Assumptions top, Describe after Operations, Report + Penalties above Model',
+        order.asmTop && order.describeAfterOps && order.reportAfterDiff && order.penAfterReport && order.modelLast, JSON.stringify(order.heads));
+      check('detail-clarity: detail charts + diff carry axis captions and a breakdown chart',
+        order.mortCap && order.stockCap && order.diffCap && order.diffBreak && order.diffBreakLabels > 12 && order.diffBreakCap, JSON.stringify(order));
+      check('detail-clarity: assumptions panel has per-assumption Delete, privilege preset from API',
+        order.asmDel.includes('comparableRate') && order.asmDel.includes('privilegePct') && order.privVal.replace(/,/g, '') === '10' && order.privChecked, JSON.stringify(order));
+      await page.click('[data-plan-asm-del="privilegePct"]');
+      await waitD(1500);
+      const afterDel = await page.evaluate(() => ({
+        val: document.querySelector('#planAsmPrivilege')?.value || '',
+        checked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
+        note: document.querySelector('#planStrategyAsmPanel')?.textContent.includes('Blank privilege % = penalty on the full amount (upper bound)') || false,
+      }));
+      check('detail-clarity: assumption Delete resets to unset, upper-bound note still true',
+        afterDel.val === '' && !afterDel.checked && afterDel.note, JSON.stringify(afterDel));
+      r = await req('GET', `/api/planning/strategies/${dcStrategyId}`);
+      const privAsm = (r.data.assumptions || []).find((a) => a.key === 'privilegePct');
+      check('detail-clarity: deleted assumption is NULL + unconfirmed in the API',
+        r.status === 200 && privAsm && privAsm.value == null && !privAsm.confirmed, JSON.stringify(privAsm));
+      // Diff year grouping: annual-sum rows equal the year's monthly
+      // sums (flows, ±10¢ rounding) and year-end balances. Column
+      // indices come from the header, so a stock column never shifts
+      // the comparison.
+      const grouping = await page.evaluate(() => {
+        const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+        const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+        const col = (name) => headCells.indexOf(name);
+        const rows = [...document.querySelectorAll('#planDiffTable tbody tr')];
+        const groups = [];
+        let cur = null;
+        for (const tr of rows) {
+          if (tr.classList.contains('plan-year-head')) { cur = { year: tr.textContent.trim(), months: [], total: null }; groups.push(cur); }
+          else if (tr.classList.contains('plan-year-total')) { if (cur) cur.total = [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()); }
+          else if (cur) cur.months.push([...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        }
+        const full = groups.filter((g) => g.months.length >= 12 && g.total);
+        const checked = full.map((g) => {
+          const sum = (i) => g.months.reduce((a, m) => a + (parse(m[i]) || 0), 0);
+          const last = g.months[g.months.length - 1];
+          return {
+            year: g.year,
+            intSavedOk: Math.abs(sum(col('Interest saved')) - (parse(g.total[col('Interest saved')]) || 0)) <= 0.10,
+            intBaseOk: Math.abs(sum(col('Baseline interest')) - (parse(g.total[col('Baseline interest')]) || 0)) <= 0.10,
+            balOk: g.total[col('Baseline balance')] === last[col('Baseline balance')]
+              && g.total[col('Strategy balance')] === last[col('Strategy balance')]
+              && g.total[col('Balance Δ')] === last[col('Balance Δ')],
+          };
+        });
+        return { groups: groups.length, full: full.length, checked };
+      });
+      check('detail-clarity: diff monthly table groups by year with annual-sum rows (flows summed, balances year-end)',
+        grouping.groups >= 2 && grouping.checked.length > 0 && grouping.checked.every((c) => c.intSavedOk && c.intBaseOk && c.balOk), JSON.stringify(grouping));
+      // Project comparison: trajectory title + caption + picker +
+      // breakdown chart; 1y narrows both charts (via Chart.getChart).
+      await page.goto(`http://ff.local/#planning/project/${dcProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const traj = await page.evaluate(() => {
+        const panel = document.querySelector('#planCompareNewPanel');
+        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
+        return {
+          title: [...(panel ? panel.querySelectorAll('h3') : [])].map((h) => h.textContent.trim()).includes('Total value over time'),
+          caption: (panel?.textContent || '').includes('X: month') && (panel?.textContent || '').includes('total value (CAD)'),
+          picker: !!panel?.querySelector('[data-plan-traj-preset="1y"]'),
+          breakdown: !!document.querySelector('#planTrajectoryBreakdownChart'),
+          labelsAll: chartOf('planTrajectoryChart'),
+          labelsBreak: chartOf('planTrajectoryBreakdownChart'),
+        };
+      });
+      check('detail-clarity: comparison trajectory has title, axis caption, picker and breakdown bars',
+        traj.title && traj.caption && traj.picker && traj.breakdown && traj.labelsAll > 12 && traj.labelsBreak > 12, JSON.stringify(traj));
+      await page.click('[data-plan-traj-preset="1y"]');
+      await waitD(800);
+      const narrowed = await page.evaluate(() => {
+        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
+        return { labels: chartOf('planTrajectoryChart'), labelsBreak: chartOf('planTrajectoryBreakdownChart'), active: !!document.querySelector('[data-plan-traj-preset="1y"].active') };
+      });
+      check('detail-clarity: trajectory 1y preset narrows both the trajectory chart and the breakdown bars',
+        narrowed.labels === 12 && narrowed.labelsBreak === 12 && narrowed.active, JSON.stringify(narrowed));
+      // Report views: template path + AI path both carry titles +
+      // axis captions (AI path keeps its method line).
+      await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const repView = await page.evaluate(() => ({
+        title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC balance path'),
+        axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
+        trajTitle: [...document.querySelectorAll('#planReportComparePanel h3')].map((h) => h.textContent.trim()).includes('Total value over time'),
+        trajBreak: !!document.querySelector('#planReportTrajectoryBreakdownChart'),
+      }));
+      check('detail-clarity: template report chart has title + axis caption, embedded comparison too',
+        repView.title && repView.axis && repView.trajTitle && repView.trajBreak, JSON.stringify(repView));
+      await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcAiRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const aiView = await page.evaluate(() => ({
+        title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC AI balance path'),
+        axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
+        method: (document.querySelector('#planReport')?.textContent || '').includes('AI method line:'),
+      }));
+      check('detail-clarity: AI report chart has title + axis caption + its method line',
+        aiView.title && aiView.axis && aiView.method, JSON.stringify(aiView));
+    } finally { await browserD.close(); }
   }
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);

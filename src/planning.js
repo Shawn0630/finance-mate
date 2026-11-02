@@ -884,21 +884,23 @@ export function validateAiBaseline(b) {
 // stock value, and monthly total value. Total value = property equity +
 // stock value, where equity = assessed value − outstanding principal
 // (the assessed value is the current roll, held flat across months —
-// the same convention valueAtHorizon uses). Interest is summed too so
-// yearly bars can aggregate without re-walking the engine series.
+// the same convention valueAtHorizon uses). Interest and scheduled
+// principal are summed too so yearly bars and the payment breakdown
+// can aggregate without re-walking the engine series.
 export function reportMonthlySeries(perProperty, side, stockSeries, assessedTotal, growthPct = null, currentMonth = null) {
   const byMonth = new Map();
   for (const per of Object.values(perProperty || {})) {
     const s = per[side] && per[side].series ? per[side].series : [];
     for (const row of s) {
-      const cur = byMonth.get(row.month) || { balance: 0, interest: 0 };
+      const cur = byMonth.get(row.month) || { balance: 0, interest: 0, principal: 0 };
       cur.balance += row.balance || 0;
       cur.interest += row.interest || 0;
+      cur.principal += row.principal || 0;
       byMonth.set(row.month, cur);
     }
   }
   const stockByMonth = new Map((stockSeries || []).map((r) => [r.month, r.value || 0]));
-  for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0 });
+  for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
   const g = num(growthPct);
   return [...byMonth.keys()].sort().map((m) => {
     const b = byMonth.get(m);
@@ -914,6 +916,10 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
       stock_value: round2(sv),
       total_value: round2(assessedAt - b.balance + sv),
       interest: round2(b.interest),
+      // Scheduled principal (the payment split) — lump sums deduct
+      // balance directly and never flow into this field, so the
+      // breakdown caption says "scheduled".
+      principal: round2(b.principal),
     };
   });
 }
