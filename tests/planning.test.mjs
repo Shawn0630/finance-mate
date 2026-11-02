@@ -13,7 +13,7 @@ import {
   buildPlanAiSnapshot, normalizeAiAsk,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
-  principalGainSeries, validateAiBaseline,
+  principalGainSeries, validateAiBaseline, paymentScopeFor,
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
   factorsToAssumptions,
 } from '../src/planning.js';
@@ -465,4 +465,41 @@ test('validateAiBaseline: prime scenario enums and step shapes, stock reference 
   assert.ok(validateAiBaseline({ primeScenario: { name: 'Up', direction: 'up', steps: [{ date: 'not-a-date', rate: 5 }] } }).length > 0);
   assert.deepEqual(validateAiBaseline({ primeScenario: { name: 'Up', direction: 'up', stance: 'neutral', magnitude: 1, steps: [{ date: '2027-01-01', rate: 5.5 }] } }), []);
   assert.ok(validateAiBaseline(null).length > 0);
+});
+test('paymentScopeFor: legacy table stock-only row renders —, never a summed +$0.00', () => {
+  // The legacy comparison table shows only a delta. Summing
+  // per-property payment diffs for a stock-only strategy yields 0
+  // (every mortgage payment is unchanged), which the old table
+  // rendered as a spurious '+$0.00'. The scoped delta is null, so
+  // the legacy row renders '—' like Master/Apple.
+  const base = { mortgage: { perProperty: {
+    1: { baseline: { paymentAtEffect: 1000 }, strategy: { paymentAtEffect: 1000 } },
+    2: { baseline: { paymentAtEffect: 500 }, strategy: { paymentAtEffect: 500 } },
+  } } };
+  const summed = Object.values(base.mortgage.perProperty)
+    .reduce((s, per) => s + (per.strategy.paymentAtEffect - per.baseline.paymentAtEffect), 0);
+  assert.equal(summed, 0);
+  assert.deepEqual(paymentScopeFor(base, base, [{ op_type: 'position', params: { accountId: 9, holdingId: 1, units: 50 } }]),
+    { propertyIds: [], baseline: null, strategy: null, delta: null });
+});
+test('paymentScopeFor: payment covers only mortgage-op properties, never the project total', () => {
+  const base = { mortgage: { perProperty: {
+    1: { baseline: { paymentAtEffect: 1000 }, strategy: { paymentAtEffect: 1200 } },
+    2: { baseline: { paymentAtEffect: 500 }, strategy: { paymentAtEffect: 500 } },
+    3: { baseline: { paymentAtEffect: 700 }, strategy: { paymentAtEffect: 700 } },
+  } } };
+  const strat = base;
+  assert.deepEqual(paymentScopeFor(base, strat, [{ op_type: 'rate_switch', params: { propertyId: 1 } }]),
+    { propertyIds: [1], baseline: 1000, strategy: 1200, delta: 200 });
+  assert.deepEqual(paymentScopeFor(base, strat, [
+    { op_type: 'rate_switch', params: { propertyId: 1 } },
+    { op_type: 'prepay', params: { propertyId: 2 } },
+  ]), { propertyIds: [1, 2], baseline: 1500, strategy: 1700, delta: 200 });
+  // Stock ops, funding legs (not ops), and non-integer property refs never count.
+  assert.deepEqual(paymentScopeFor(base, strat, [{ op_type: 'buy', params: { accountId: 9, units: 10 } }]),
+    { propertyIds: [], baseline: null, strategy: null, delta: null });
+  assert.deepEqual(paymentScopeFor(base, strat, [{ op_type: 'rate_switch', params: {} }]),
+    { propertyIds: [], baseline: null, strategy: null, delta: null });
+  assert.deepEqual(paymentScopeFor(base, strat, []),
+    { propertyIds: [], baseline: null, strategy: null, delta: null });
 });

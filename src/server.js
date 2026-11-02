@@ -53,7 +53,7 @@ import {
   planAiEntityCandidates, rewriteAiIdQuestions, dropAnsweredAiQuestions, bindAiNameAnswers,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
-  principalGainSeries, validateAiBaseline,
+  principalGainSeries, validateAiBaseline, paymentScopeFor,
   PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
   validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
   primeFactorToScenario, factorsToAssumptions,
@@ -5651,6 +5651,18 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
       const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
       r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
       r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
+      // Monthly-payment scope (user rule 2026-11-02): the payment
+      // figures cover ONLY the properties this strategy's mortgage
+      // ops touch — never the project total. Stock-only / no-op
+      // strategies carry nulls and render '—'. The single-property
+      // label names the property so the figure is self-evident.
+      const scope = paymentScopeFor(baseline, r.projection, sops);
+      let scopeLabel = 'Monthly payment';
+      if (scope.propertyIds.length === 1) {
+        const addr = db.prepare('SELECT address FROM properties WHERE id = ?').get(scope.propertyIds[0]);
+        if (addr && addr.address) scopeLabel = `Monthly payment · ${addr.address}`;
+      }
+      r.paymentScope = { ...scope, label: scopeLabel };
       // Comparison chart inputs: which asset types each strategy touches
       // (the client picks the chart mode from these), plus the
       // principal-gain series for stock strategies (do-nothing

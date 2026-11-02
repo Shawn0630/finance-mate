@@ -685,6 +685,37 @@ function paymentDeltaOf(perProperty) {
   return out;
 }
 
+// Monthly-payment scope (user rule 2026-11-02): the payment figure
+// covers ONLY the properties a strategy's mortgage ops touch —
+// rate_switch, refinance, prepay, payment_change, by params.propertyId.
+// Stock ops and funding legs never count. No mortgage ops → all null
+// (the client renders '—', never the project total).
+export function paymentScopeFor(baselineProj, strategyProj, ops) {
+  const MORTGAGE_PAYMENT_OPS = ['prepay', 'rate_switch', 'refinance', 'payment_change'];
+  const propertyIds = [...new Set((ops || [])
+    .filter((o) => MORTGAGE_PAYMENT_OPS.includes(o.op_type))
+    .map((o) => Number(o.params && o.params.propertyId))
+    .filter(Number.isInteger))];
+  const sumSide = (proj, side) => {
+    if (!propertyIds.length) return null;
+    let sum = null;
+    for (const pid of propertyIds) {
+      const per = proj && proj.mortgage && proj.mortgage.perProperty && proj.mortgage.perProperty[pid];
+      const s = per && per[side];
+      if (s && s.paymentAtEffect != null) sum = (sum == null ? 0 : sum) + s.paymentAtEffect;
+    }
+    return sum;
+  };
+  const baseline = sumSide(baselineProj, 'baseline');
+  const strategy = sumSide(strategyProj, 'strategy');
+  return {
+    propertyIds,
+    baseline,
+    strategy,
+    delta: (baseline != null && strategy != null) ? round2(strategy - baseline) : null,
+  };
+}
+
 // Baseline plan for one property, from mainline data as stored.
 function baselinePlanFor(mainline, pid) {
   const p = (mainline.properties || []).find((x) => x.id === pid);

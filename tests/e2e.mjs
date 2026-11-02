@@ -17898,6 +17898,212 @@ try {
         JSON.stringify(repick));
     } finally { await browserC.close(); }
   }
+  // ------------------------------------------- monthly payment scope
+  // User rule 2026-11-02: the Monthly payment figure covers ONLY the
+  // properties a strategy's mortgage ops touch — never the project
+  // total. Self-contained fixtures: each pin project carries its own
+  // mortgaged properties plus an untouched mortgaged property, so a
+  // leaking total is caught even though mainline is global.
+  const psFmt = (v) => (v == null ? '—' : Number(v).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+  const psSigned = (v) => (v == null ? '—' : (v >= 0 ? '+' : '') + psFmt(v));
+  const psClose = (a, b) => Math.abs((a || 0) - (b || 0)) < 0.005;
+  const _psNow = new Date();
+  const _psNext = new Date(Date.UTC(_psNow.getUTCFullYear(), _psNow.getUTCMonth() + 1, 1));
+  const psOpDate = _psNext.toISOString().slice(0, 10);
+  const psMkProp = async (address, balance) => {
+    let rr = await req('POST', '/api/properties', { address, mortgage_balance: balance, mortgage_balance_date: '2026-10-01', amortization_years: 25, purchase_date: '2020-03-15' });
+    check(`payscope: property ${address} created`, rr.status === 201 && rr.data.id > 0, JSON.stringify(rr.data));
+    const pid = rr.data.id;
+    rr = await req('POST', `/api/properties/${pid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+    check(`payscope: rate segment for ${address}`, rr.status === 201, JSON.stringify(rr.data));
+    return pid;
+  };
+  const psPay = (per, pid, side) => { const s = per[pid] && per[pid][side]; return s ? s.paymentAtEffect : null; };
+  // --- single-property project: label names the property, baseline +
+  // strategy cells are that property alone (untouched C excluded).
+  r = await req('POST', '/api/planning/projects', { name: 'PayScope single', question: 'Fix one' });
+  check('payscope: single project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const ps1Proj = r.data.project.id;
+  const ps1A = await psMkProp('11 PayScope A Lane, Victoria, BC', 120000);
+  await psMkProp('33 PayScope C Lane, Victoria, BC', 80000);
+  r = await req('POST', `/api/planning/projects/${ps1Proj}/strategies`, { name: 'Fix A', source: 'template' });
+  check('payscope: single strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const ps1Strat = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${ps1Strat}/ops`, { op_type: 'rate_switch', params: { propertyId: ps1A, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  check('payscope: single rate-switch op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${ps1Proj}/scenarios`, { name: 'PS world' });
+  check('payscope: single scenario created', r.status === 201, JSON.stringify(r.data));
+  const ps1Scen = r.data.scenario && r.data.scenario.id;
+  r = await req('GET', `/api/planning/projects/${ps1Proj}/comparison`);
+  check('payscope: single comparison loads', r.status === 200 && r.data.strategies && r.data.strategies.length === 1, JSON.stringify(r.status));
+  const ps1Row = (r.data.strategies || [])[0] || {};
+  const ps1Scope = ps1Row.paymentScope || {};
+  const ps1BasePer = (r.data.baseline && r.data.baseline.mortgage && r.data.baseline.mortgage.perProperty) || {};
+  const ps1StratPer = (ps1Row.projection && ps1Row.projection.mortgage && ps1Row.projection.mortgage.perProperty) || {};
+  const ps1TotalBase = Object.values(ps1BasePer).reduce((s, per) => s + ((per.baseline && per.baseline.paymentAtEffect) || 0), 0);
+  check('payscope: single scope names only property A with A-only payments',
+    JSON.stringify(ps1Scope.propertyIds) === JSON.stringify([ps1A])
+    && ps1Scope.baseline === psPay(ps1BasePer, ps1A, 'baseline')
+    && ps1Scope.strategy === psPay(ps1StratPer, ps1A, 'strategy')
+    && psClose(ps1Scope.delta, ps1Scope.strategy - ps1Scope.baseline)
+    && ps1Scope.baseline < ps1TotalBase
+    && (ps1Scope.label || '').includes('11 PayScope A Lane'),
+    JSON.stringify({ scope: ps1Scope, totalBase: ps1TotalBase }));
+  // --- multi project: a two-property strategy sums exactly those two;
+  // a stock-only (position) strategy shows '—' everywhere.
+  r = await req('POST', '/api/planning/projects', { name: 'PayScope multi', question: 'Fix two, stocks third' });
+  check('payscope: multi project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const ps2Proj = r.data.project.id;
+  const ps2A = await psMkProp('44 PayScope A2 Lane, Victoria, BC', 150000);
+  const ps2B = await psMkProp('55 PayScope B2 Lane, Victoria, BC', 90000);
+  await psMkProp('66 PayScope C2 Lane, Victoria, BC', 70000);
+  r = await req('POST', '/api/investments/accounts', { name: 'PS Acct', type: 'NonRegistered' });
+  check('payscope: stock account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const psAcct = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${psAcct}/holdings`, { label: 'PS Fund', kind: 'fund', currency: 'CAD' });
+  check('payscope: stock holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const psHold = r.data.id;
+  r = await req('POST', `/api/planning/projects/${ps2Proj}/strategies`, { name: 'Fix AB', source: 'template' });
+  check('payscope: Fix AB strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const ps2Fix = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${ps2Fix}/ops`, { op_type: 'rate_switch', params: { propertyId: ps2A, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  check('payscope: Fix AB op A2 added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${ps2Fix}/ops`, { op_type: 'rate_switch', params: { propertyId: ps2B, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  check('payscope: Fix AB op B2 added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${ps2Proj}/strategies`, { name: 'Stocks only', source: 'template' });
+  check('payscope: Stocks only strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const ps2Stk = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${ps2Stk}/ops`, { op_type: 'position', params: { accountId: psAcct, holdingId: psHold, units: 50, date: psOpDate } });
+  check('payscope: Stocks only position op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${ps2Proj}/scenarios`, { name: 'PS2 world' });
+  check('payscope: multi scenario created', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${ps2Proj}/comparison`);
+  check('payscope: multi comparison loads', r.status === 200 && r.data.strategies && r.data.strategies.length === 2, JSON.stringify(r.status));
+  const ps2FixRow = (r.data.strategies || []).find((x) => x.strategy.name === 'Fix AB') || {};
+  const ps2StkRow = (r.data.strategies || []).find((x) => x.strategy.name === 'Stocks only') || {};
+  const ps2Scope = ps2FixRow.paymentScope || {};
+  const ps2BasePer = (r.data.baseline && r.data.baseline.mortgage && r.data.baseline.mortgage.perProperty) || {};
+  const ps2FixPer = (ps2FixRow.projection && ps2FixRow.projection.mortgage && ps2FixRow.projection.mortgage.perProperty) || {};
+  const ps2TotalBase = Object.values(ps2BasePer).reduce((s, per) => s + ((per.baseline && per.baseline.paymentAtEffect) || 0), 0);
+  const ps2ExpBase = (psPay(ps2BasePer, ps2A, 'baseline') || 0) + (psPay(ps2BasePer, ps2B, 'baseline') || 0);
+  const ps2ExpStrat = (psPay(ps2FixPer, ps2A, 'strategy') || 0) + (psPay(ps2FixPer, ps2B, 'strategy') || 0);
+  check('payscope: two-property scope sums exactly A2 + B2 (C2 excluded)',
+    JSON.stringify(ps2Scope.propertyIds) === JSON.stringify([ps2A, ps2B])
+    && psClose(ps2Scope.baseline, ps2ExpBase) && psClose(ps2Scope.strategy, ps2ExpStrat)
+    && psClose(ps2Scope.delta, ps2Scope.strategy - ps2Scope.baseline)
+    && ps2Scope.baseline < ps2TotalBase,
+    JSON.stringify({ scope: ps2Scope, expBase: ps2ExpBase, totalBase: ps2TotalBase }));
+  const ps2StkScope = ps2StkRow.paymentScope || {};
+  check('payscope: stock-only scope is empty with null payments',
+    JSON.stringify(ps2StkScope.propertyIds) === JSON.stringify([])
+    && ps2StkScope.baseline == null && ps2StkScope.strategy == null && ps2StkScope.delta == null,
+    JSON.stringify(ps2StkScope));
+  // Legacy-table proof: the old summed delta for the stock-only row
+  // is 0 (every payment unchanged), which the legacy table used to
+  // render as '+$0.00'; the scoped delta is null, so it renders '—'.
+  check('payscope: legacy stock-only delta is summed 0 but scoped null',
+    ps2StkRow.comparison && ps2StkRow.comparison.paymentDelta === 0 && ps2StkScope.delta == null,
+    JSON.stringify({ summed: ps2StkRow.comparison && ps2StkRow.comparison.paymentDelta, scoped: ps2StkScope.delta }));
+  // Report view for the single project: same scoped payment.
+  r = await req('POST', `/api/planning/projects/${ps1Proj}/reports`, { name: 'PS report', definition: { strategies: [ps1Strat], charts: [{ template: 'time_line', title: 'T', series: ['mortgage_balance'] }] }, strategy_ids: [ps1Strat], scenario_ids: [ps1Scen] });
+  check('payscope: single report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const ps1Rep = r.data.report.id;
+  const ps1Exp = { baseline: psFmt(ps1Scope.baseline), strategy: psFmt(ps1Scope.strategy), delta: psSigned(ps1Scope.delta) };
+  const ps2Exp = { baseline: psFmt(ps2Scope.baseline), strategy: psFmt(ps2Scope.strategy), delta: psSigned(ps2Scope.delta) };
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('payscope browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardPS = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResPS = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValuePS = loginResPS.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserPS = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserPS.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardPS({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValuePS, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitPS = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      const readPayRow = async (sel) => page.evaluate((sel2) => {
+        const tr = [...document.querySelectorAll(`${sel2} tbody tr`)].find((x) => (x.cells[0]?.textContent || '').startsWith('Monthly payment'));
+        if (!tr) return null;
+        return { label: tr.cells[0].textContent, cells: [...tr.cells].map((c) => c.textContent.trim()) };
+      }, sel);
+      await page.goto(`http://ff.local/#planning/project/${ps1Proj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitPS(1500);
+      const ps1Master = await readPayRow('#planMasterTable');
+      const ps1Apple = await readPayRow('#planAppleTable');
+      check('payscope: single project page master row names A with A-only payments',
+        ps1Master && ps1Master.label.includes('11 PayScope A Lane')
+        && ps1Master.cells[1] === ps1Exp.baseline && ps1Master.cells[2] === ps1Exp.strategy,
+        JSON.stringify({ master: ps1Master, exp: ps1Exp }));
+      check('payscope: single project page Apple row shows the A-only delta',
+        ps1Apple && ps1Apple.cells[1] === ps1Exp.baseline && ps1Apple.cells[2] === ps1Exp.delta,
+        JSON.stringify({ apple: ps1Apple, exp: ps1Exp }));
+      const ps1Legacy = await readPayRow('#planCompareTable');
+      check('payscope: single project page legacy row shows the A-only delta',
+        ps1Legacy && ps1Legacy.cells[1] === ps1Exp.delta,
+        JSON.stringify({ legacy: ps1Legacy, exp: ps1Exp }));
+      await page.goto(`http://ff.local/#planning/project/${ps2Proj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitPS(1500);
+      const ps2Master = await readPayRow('#planMasterTable');
+      const ps2Apple = await readPayRow('#planAppleTable');
+      check('payscope: multi project page master row sums A2 + B2, stocks-only is —',
+        ps2Master && ps2Master.cells[1] === ps2Exp.baseline && ps2Master.cells[2] === ps2Exp.strategy && ps2Master.cells[3] === '—',
+        JSON.stringify({ master: ps2Master, exp: ps2Exp }));
+      check('payscope: multi project page Apple row shows the A2 + B2 delta, stocks-only is —',
+        ps2Apple && ps2Apple.cells[1] === ps2Exp.baseline && ps2Apple.cells[2] === ps2Exp.delta && ps2Apple.cells[3] === '—',
+        JSON.stringify({ apple: ps2Apple, exp: ps2Exp }));
+      const ps2Legacy = await readPayRow('#planCompareTable');
+      check('payscope: multi project page legacy row shows the A2 + B2 delta, stocks-only is —',
+        ps2Legacy && ps2Legacy.cells[1] === ps2Exp.delta && ps2Legacy.cells[2] === '—',
+        JSON.stringify({ legacy: ps2Legacy, exp: ps2Exp }));
+      await page.goto(`http://ff.local/#planning/report/${ps1Proj}/${ps1Rep}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitPS(1500);
+      const psRepMaster = await readPayRow('#planReportMasterTable');
+      check('payscope: report view master row names A with A-only payments',
+        psRepMaster && psRepMaster.label.includes('11 PayScope A Lane')
+        && psRepMaster.cells[1] === ps1Exp.baseline && psRepMaster.cells[2] === ps1Exp.strategy,
+        JSON.stringify({ master: psRepMaster, exp: ps1Exp }));
+    } finally { await browserPS.close(); }
+  }
   // ------------------------------------------- property net excludes stockGain
   // Property-category strategies exclude stockGain from gain AND net
   // (net = gain − cost still holds); stockGain stays computed and is

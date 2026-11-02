@@ -11728,7 +11728,7 @@ function planCompareTableHtml(rows) {
       ${numRow('Equity Δ', (r) => (r.equityDelta != null ? planSigned(r.equityDelta) : '—'))}
       ${numRow('Principal Δ', (r) => (r.principalDelta != null ? planSigned(r.principalDelta) : '—'))}
       ${numRow('Payoff shift (months)', (r) => (r.comparison.payoffShiftMonths != null ? r.comparison.payoffShiftMonths : '—'))}
-      ${numRow('Monthly payment Δ', (r) => planSigned(r.comparison.paymentDelta))}
+      ${numRow('Monthly payment Δ', (r) => planSigned(r.paymentScope ? r.paymentScope.delta : r.comparison.paymentDelta))}
     </tbody></table>
     <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations). Stock gain = strategy value minus the do-nothing baseline value, less new cash deployed (pot/external buys) grown at the baseline ratio; sell-funded buys are swaps and are not costed again.</div>`;
 }
@@ -13100,6 +13100,28 @@ function planMortAbs(proj, side) {
   const interest = proj.mortgage ? (side === 'baseline' ? proj.mortgage.baselineInterest : proj.mortgage.strategyInterest) : null;
   return { payment, payoff, interest };
 }
+// Monthly-payment scope for a comparison block: when every strategy
+// touches the same properties, the shared baseline cell is exactly
+// that set's baseline payment (and the label names a lone property).
+// When strategies touch different sets, the shared cell covers the
+// union of touched properties — strategy cells and Apple deltas
+// always stay per-strategy scoped. Null (no scopes on the payload)
+// falls back to the old project-total behavior.
+function planPaymentScopeMeta(block) {
+  const scopes = (block.strategies || []).map((r) => r.paymentScope).filter(Boolean);
+  if (!scopes.length) return null;
+  const keyOf = (s) => (s.propertyIds || []).slice().sort((a, b) => a - b).join(',');
+  const first = scopes[0];
+  if (scopes.every((s) => keyOf(s) === keyOf(first))) return { label: first.label || 'Monthly payment', baseline: first.baseline };
+  const union = [...new Set(scopes.flatMap((s) => s.propertyIds || []))];
+  let baseline = null;
+  for (const pid of union) {
+    const per = block.baseline && block.baseline.mortgage && block.baseline.mortgage.perProperty && block.baseline.mortgage.perProperty[pid];
+    const s = per && per.baseline;
+    if (s && s.paymentAtEffect != null) baseline = (baseline == null ? 0 : baseline) + s.paymentAtEffect;
+  }
+  return { label: 'Monthly payment', baseline };
+}
 function planBaselineValue(block) {
   const first = block.strategies[0];
   if (first && first.comparison && first.comparison.baselineValueAtHorizon != null) return first.comparison.baselineValueAtHorizon;
@@ -13204,9 +13226,10 @@ function planCompareNewRender(block, ids) {
     if (bEmpty) bEmpty.innerHTML = '';
   }
   const baseAbs = planMortAbs(block.baseline, 'baseline');
+  const payMeta = planPaymentScopeMeta(block);
   const baseValue = planBaselineValue(block);
   const masterRows = [
-    { label: 'Monthly payment', base: planMoney(baseAbs.payment), strat: (r) => planMoney(planMortAbs(r.projection, 'strategy').payment) },
+    { label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => (r.paymentScope ? planMoney(r.paymentScope.strategy) : planMoney(planMortAbs(r.projection, 'strategy').payment)) },
     { label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => planMoney(planMortAbs(r.projection, 'strategy').interest) },
     { label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => planMortAbs(r.projection, 'strategy').payoff || '—' },
     { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => planMoney(r.comparison.valueAtHorizon) },
@@ -13238,6 +13261,7 @@ function planAppleRender(t) {
   const appleIds = t.getAppleIds ? t.getAppleIds() : planAppleIds;
   const picked = block.strategies.filter((r) => appleIds && appleIds.includes(r.strategy.id));
   const baseAbs = planMortAbs(block.baseline, 'baseline');
+  const payMeta = planPaymentScopeMeta(block);
   const baseValue = planBaselineValue(block);
   const diffCls = (v) => (v != null && v !== 0) ? ' class="plan-diff"' : '';
   const months = (v) => (v == null ? '—' : ((v >= 0 ? '+' : '') + v + ' months'));
@@ -13245,7 +13269,7 @@ function planAppleRender(t) {
   // vs-baseline figures by construction and stay unhighlighted, so
   // the bold marks only the six true delta rows.
   const appleRows = [
-    { label: 'Monthly payment', base: planMoney(baseAbs.payment), strat: (r) => `<td${diffCls(r.comparison.paymentDelta)}>${planSigned(r.comparison.paymentDelta)}</td>` },
+    { label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => { const dv = r.paymentScope ? r.paymentScope.delta : r.comparison.paymentDelta; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
     { label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => { const dv = r.comparison.interestSaved == null ? null : -r.comparison.interestSaved; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
     { label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => `<td${diffCls(r.comparison.payoffShiftMonths)}>${months(r.comparison.payoffShiftMonths)}</td>` },
     { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => { const dv = (r.comparison.valueAtHorizon != null && r.comparison.baselineValueAtHorizon != null) ? r.comparison.valueAtHorizon - r.comparison.baselineValueAtHorizon : null; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
