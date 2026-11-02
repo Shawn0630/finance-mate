@@ -50,6 +50,7 @@ import {
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
   reportMonthlySeries, reportCostBreakdown,
   planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
+  planAiEntityCandidates, rewriteAiIdQuestions, dropAnsweredAiQuestions, bindAiNameAnswers,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline,
@@ -6664,6 +6665,33 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
     prime: curPrime ? curPrime.rate : null,
     primeHistory: getPrimeHistory(),
   });
+  // Name binding: the user picks entities by NAME, never by database
+  // id. Resolve the latest answers against the snapshot now: a value
+  // matching nothing (or several candidates) comes back as a mismatch
+  // question naming the candidates, never a silent re-ask.
+  const candidates = planAiEntityCandidates(snapshot);
+  const binding = bindAiNameAnswers(answers, candidates);
+  if (binding.mismatches.length) {
+    const mismatchQs = binding.mismatches.map((m) => ({
+      field: m.entity,
+      type: 'text',
+      label: m.ambiguous
+        ? `"${m.value}" matches several ${m.entity}s. Please choose one: ${m.candidates.join('; ')}`
+        : `No ${m.entity} matches "${m.value}". Please choose one: ${m.candidates.join('; ')}`,
+    }));
+    const mismatchThread = appendAiThread(thread, { role: 'ai', questions: mismatchQs });
+    db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(mismatchThread), s.id);
+    return res.json({ ask: mismatchQs, thread: mismatchThread, mismatch: true, configured: true, ...(binding.resolved.length ? { resolved: binding.resolved } : {}) });
+  }
+  const candidateGroups = [
+    ['Properties', candidates.properties], ['Mortgage terms', candidates.terms],
+    ['Accounts', candidates.accounts], ['Holdings', candidates.holdings],
+  ].filter(([, list]) => list.length).map(([label, list]) => `${label}: ${list.map((c) => c.label).join('; ')}`);
+  const candidateLines = candidateGroups.length ? candidateGroups.join(' | ') : 'none yet';
+  const projLabels = planOptCategoryLabels(p.category, p.subcategory, planProjectEntityOf(p));
+  const projectContext = projLabels && (projLabels.category || projLabels.entity)
+    ? `This project is a ${projLabels.category || 'planning'} project${projLabels.subcategory ? ` (${projLabels.subcategory})` : ''}${projLabels.entity ? ` about ${projLabels.entity}` : ''}. Do not ask which property, account, holding, job, or rental this model is for — the project already determines it.`
+    : null;
   const prompt = [
     'You design a planning model as JSON only. No prose outside the JSON object.',
     'The model spec has five parts, all required:',
@@ -6673,6 +6701,10 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
     '4. outputs: [{id, label}] — the computed series this model produces.',
     '5. charts: [{template, title, series}] — template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards; series entries bind to output ids.',
     'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
+    'NEVER ask the user for a database ID (property_id, term_id, account_id, holding_id, segment_id, or any *_id field): the user does not know database IDs and cannot answer them. When you need the user to choose an entity, ask by NAME: name the candidates from the snapshot (property addresses, mortgage terms by property + start date, account names, holding symbols) and ask the user to pick one by name. The app binds the chosen name to the ID itself — never put an *_id field in an ask list.',
+    `Named candidates the user can pick from: ${candidateLines}`,
+    ...(projectContext ? [projectContext] : []),
+    ...(binding.resolved.length ? [`Already resolved by name: ${binding.resolved.map((r) => `${r.field} "${r.label}" = ${r.entity} id ${r.id}`).join('; ')}. Bind to these ids in the spec.`] : []),
     `App data snapshot: ${JSON.stringify(snapshot)}`,
     ...(planProjectMetadataOf(p).aiBaseline ? [`Confirmed baseline for this project: ${JSON.stringify(planProjectMetadataOf(p).aiBaseline)}`, 'Design the spec against this confirmed baseline.'] : []),
     ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
@@ -6685,14 +6717,47 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   } catch (e) {
     return res.status(502).json({ error: `AI call failed: ${e.message}` });
   }
-  const parsed = parseModelJson(raw);
+  let parsed = parseModelJson(raw);
   if (!parsed) return res.status(502).json({ error: 'the AI response did not contain a model spec' });
+  // Server-side ask hygiene: rewrite id questions to name picks, drop
+  // questions already answered in the thread (answered once = answered).
+  // A malformed ask is still a 502; an ask left empty by the drop means
+  // the model re-asked only answered questions — one retry forces it to
+  // produce the spec instead of looping the user back to the same form.
+  const filterAsk = (askRaw) => {
+    const qs = normalizeAiAsk(askRaw);
+    if (!qs) return { malformed: true, questions: null };
+    return { malformed: false, questions: dropAnsweredAiQuestions(rewriteAiIdQuestions(qs, candidates), thread, answers) };
+  };
+  let askQuestions = null;
   if (parsed.ask) {
-    const questions = normalizeAiAsk(parsed.ask);
-    if (!questions) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
-    const newThread = appendAiThread(thread, { role: 'ai', questions });
+    let f = filterAsk(parsed.ask);
+    if (f.malformed) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+    if (!f.questions.length) {
+      let raw2;
+      try {
+        raw2 = await callLlm([{ role: 'user', content: `${prompt}\nAll pending questions are already answered in the conversation above. Do not return an ask list — produce the complete model spec JSON now.` }], process.env, getAiFillModel());
+      } catch (e) {
+        return res.status(502).json({ error: `AI call failed: ${e.message}` });
+      }
+      const parsed2 = parseModelJson(raw2);
+      if (!parsed2) return res.status(502).json({ error: 'the AI response did not contain a model spec' });
+      if (parsed2.ask) {
+        f = filterAsk(parsed2.ask);
+        if (f.malformed) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+        if (!f.questions.length) return res.status(502).json({ error: 'the AI kept asking questions that are already answered — please rephrase the request' });
+        askQuestions = f.questions;
+      } else {
+        parsed = parsed2;
+      }
+    } else {
+      askQuestions = f.questions;
+    }
+  }
+  if (askQuestions) {
+    const newThread = appendAiThread(thread, { role: 'ai', questions: askQuestions });
     db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(newThread), s.id);
-    return res.json({ ask: questions, thread: newThread, configured: true });
+    return res.json({ ask: askQuestions, thread: newThread, configured: true, ...(binding.resolved.length ? { resolved: binding.resolved } : {}) });
   }
   const errs = [];
   for (const part of ['bindings', 'formulas', 'assumptions', 'outputs', 'charts']) {
@@ -6707,7 +6772,7 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   }, () => {
     const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', answers ? JSON.stringify(answers) : null, now, now);
-    return { value: { model: { id: info.lastInsertRowid, spec: parsed, metadata: answers }, thread, configured: true }, entityId: p.id };
+    return { value: { model: { id: info.lastInsertRowid, spec: parsed, metadata: answers }, thread, configured: true, ...(binding.resolved.length ? { resolved: binding.resolved } : {}) }, entityId: p.id };
   });
   res.status(201).json(out);
 });

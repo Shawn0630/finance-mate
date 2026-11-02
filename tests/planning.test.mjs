@@ -340,9 +340,10 @@ test('ai thread: sanitize drops malformed turns and caps at 50; append grows the
   assert.equal(grown.length, 3);
   assert.equal(clean.length, 2); // append does not mutate
   const text = renderAiThreadText(grown);
-  assert.ok(text.includes('AI asked: Target amount? (target)'));
-  assert.ok(text.includes('User answered: target = 50000'));
-  assert.ok(text.includes('AI asked: Rate? (rate)'));
+  assert.ok(text.includes('AI asked: Target amount?'));
+  assert.ok(text.includes('User answered "Target amount?": 50000'));
+  assert.ok(!text.includes('target = 50000'));
+  assert.ok(text.includes('AI asked: Rate?'));
   const capped = sanitizeAiThread(Array.from({ length: 60 }, (_, i) => ({ role: 'user', answers: { n: i } })));
   assert.equal(capped.length, 50);
   assert.equal(capped[0].answers.n, 10); // oldest turns dropped, newest kept

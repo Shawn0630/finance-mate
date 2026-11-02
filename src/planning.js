@@ -1240,15 +1240,21 @@ export function buildPlanAiSnapshot({ properties = [], terms = [], segments = []
 // Structured ask: the ai-model "ask" path returns questions naming
 // metadata fields, never a free-text dead end. A legacy string ask
 // becomes one text question; anything else is rejected (null).
+// Duplicate fields are collapsed (first wins): the model repeating a
+// question in one round must never surface twice in the form.
 export function normalizeAiAsk(ask) {
   if (typeof ask === 'string' && ask.trim()) return [{ field: 'answer', label: ask.trim(), type: 'text' }];
   if (Array.isArray(ask)) {
     const out = [];
+    const seen = new Set();
     for (const q of ask) {
       if (!q || typeof q.field !== 'string' || !q.field.trim()) return null;
       if (typeof q.label !== 'string' || !q.label.trim()) return null;
+      const field = q.field.trim();
+      if (seen.has(field)) continue;
+      seen.add(field);
       const type = ['text', 'number', 'date'].includes(q.type) ? q.type : 'text';
-      out.push({ field: q.field.trim(), label: q.label.trim(), type });
+      out.push({ field, label: q.label.trim(), type });
     }
     return out.length ? out : null;
   }
@@ -1280,13 +1286,117 @@ export function sanitizeAiThread(thread) {
 export function appendAiThread(thread, turn) {
   return [...sanitizeAiThread(thread), turn].slice(-50);
 }
+// Latest question label for a field, from the ai turns seen so far in
+// the thread (a user answer pairs with the question it answered).
+export function aiThreadQuestionLabel(thread, field) {
+  let label = null;
+  for (const t of sanitizeAiThread(thread)) {
+    if (t.role !== 'ai') continue;
+    for (const q of t.questions) if (q.field === field) label = q.label;
+  }
+  return label;
+}
 export function renderAiThreadText(thread) {
   const lines = [];
+  const seen = [];
   for (const t of sanitizeAiThread(thread)) {
-    if (t.role === 'ai') for (const q of t.questions) lines.push(`AI asked: ${q.label} (${q.field})`);
-    else for (const [k, v] of Object.entries(t.answers)) lines.push(`User answered: ${k} = ${v}`);
+    if (t.role === 'ai') {
+      for (const q of t.questions) lines.push(`AI asked: ${q.label}`);
+      seen.push(t);
+    } else {
+      for (const [k, v] of Object.entries(t.answers)) {
+        const label = aiThreadQuestionLabel(seen, k);
+        lines.push(label ? `User answered "${label}": ${v}` : `User answered: ${v}`);
+      }
+    }
   }
   return lines.join('\n');
+}
+// AI-model name binding: the user picks entities by NAME, never by
+// database id (they cannot know ids). Candidates come from the app
+// snapshot; term labels carry their property address + start date so
+// two terms on one property stay distinguishable.
+export function planAiEntityCandidates(snapshot) {
+  const snap = snapshot || {};
+  const props = (snap.properties || []).map((p) => ({ id: p.id, label: p.address || `Property ${p.id}` }));
+  const addressOf = (pid) => {
+    const p = (snap.properties || []).find((x) => Number(x.id) === Number(pid));
+    return p ? (p.address || `Property ${p.id}`) : `Property ${pid}`;
+  };
+  return {
+    properties: props,
+    terms: (snap.terms || []).map((t) => ({ id: t.id, label: `${addressOf(t.property_id)} · ${t.start_date || ''}`.replace(/ · $/, '') })),
+    accounts: (snap.accounts || []).map((a) => ({ id: a.id, label: a.name || `Account ${a.id}` })),
+    holdings: (snap.holdings || []).map((h) => ({ id: h.id, label: h.label && h.label !== h.symbol ? `${h.symbol} (${h.label})` : (h.symbol || h.label || `Holding ${h.id}`) })),
+  };
+}
+// Which entity a question/answer field picks, if any. Only bare names
+// and name/id suffixes count — value fields that merely mention an
+// entity (e.g. property_tax_rate) are not picks.
+export function aiAskEntityType(field) {
+  if (typeof field !== 'string') return null;
+  const m = field.trim().toLowerCase().match(/^(property|term|account|holding)(_(id|name|address|choice|selection))?$/);
+  return m ? m[1] : null;
+}
+const AI_ENTITY_WORD = { property: 'property', term: 'term', account: 'account', holding: 'holding' };
+const AI_ENTITY_PLURAL = { property: 'properties', term: 'terms', account: 'accounts', holding: 'holdings' };
+// Hard enforcement of the never-ask-for-ids rule: a question naming a
+// database id is rewritten to a name pick with the snapshot's named
+// candidates in the label, so the user never sees an id question even
+// when the model disobeys the prompt rule.
+export function rewriteAiIdQuestions(questions, candidates) {
+  const cands = candidates || {};
+  return (questions || []).map((q) => {
+    const entity = aiAskEntityType(q.field);
+    if (!entity || !/_id$/.test(q.field.trim().toLowerCase())) return q;
+    const list = (cands[AI_ENTITY_PLURAL[entity]] || []).map((c) => c.label);
+    return {
+      ...q,
+      field: AI_ENTITY_WORD[entity],
+      label: list.length ? `Which ${entity}? Choose by name: ${list.join('; ')}` : `Which ${entity}?`,
+    };
+  });
+}
+// Answered once = answered: drop questions whose field already has an
+// answer in the thread or in the current answers payload.
+export function dropAnsweredAiQuestions(questions, thread, answers) {
+  const answered = new Set();
+  for (const t of sanitizeAiThread(thread)) {
+    if (t.role === 'user') for (const k of Object.keys(t.answers || {})) answered.add(k);
+  }
+  if (answers && typeof answers === 'object') for (const k of Object.keys(answers)) answered.add(k);
+  return (questions || []).filter((q) => !answered.has(q.field));
+}
+// Bind name answers to snapshot entities server-side. Returns resolved
+// picks (field → entity id) and mismatches: an answer matching nothing
+// (or several candidates ambiguously) is a mismatch the caller must
+// surface with the named candidates, never a silent re-ask. Numeric
+// answers equal to a candidate id still resolve (legacy id answers).
+export function bindAiNameAnswers(answers, candidates) {
+  const cands = candidates || {};
+  const resolved = [];
+  const mismatches = [];
+  if (!answers || typeof answers !== 'object') return { resolved, mismatches };
+  for (const [field, raw] of Object.entries(answers)) {
+    const entity = aiAskEntityType(field);
+    if (!entity) continue;
+    const list = cands[AI_ENTITY_PLURAL[entity]] || [];
+    if (!list.length) continue;
+    const value = raw == null ? '' : String(raw).trim();
+    if (!value) continue;
+    const num = Number(value);
+    if (value !== '' && !Number.isNaN(num)) {
+      const byId = list.find((c) => Number(c.id) === num);
+      if (byId) { resolved.push({ field, entity, id: byId.id, label: byId.label }); continue; }
+    }
+    const norm = value.toLowerCase();
+    const exact = list.find((c) => c.label.toLowerCase() === norm);
+    if (exact) { resolved.push({ field, entity, id: exact.id, label: exact.label }); continue; }
+    const sub = list.filter((c) => c.label.toLowerCase().includes(norm));
+    if (sub.length === 1) { resolved.push({ field, entity, id: sub[0].id, label: sub[0].label }); continue; }
+    mismatches.push({ field, value, entity, ambiguous: sub.length > 1, candidates: (sub.length > 1 ? sub : list).map((c) => c.label) });
+  }
+  return { resolved, mismatches };
 }
 // Strategy-centric comparison deltas.
 // Equity Δ (peak advantage): the largest month-by-month total-balance

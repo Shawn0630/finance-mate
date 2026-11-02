@@ -11571,7 +11571,7 @@ async function planBaselineAiPropose(text, answers, history) {
         for (const q of r.ask) {
           const el = document.querySelector(`#planBaselineAsk_${CSS.escape(q.field)}`);
           const v = el ? el.value.trim() : '';
-          if (!v) throw new Error(`${q.label} is required`);
+          if (!v) throw new Error('Please answer all questions before continuing.');
           next[q.field] = q.type === 'number' ? Number(v) : v;
         }
         await planBaselineAiPropose(text, next, r.thread);
@@ -12553,7 +12553,7 @@ function planStrategyWire(d) {
               for (const q of r.ask) {
                 const el = document.querySelector(`#planFollowAsk_${CSS.escape(q.field)}`);
                 const v = el ? el.value.trim() : '';
-                if (!v) throw new Error(`${q.label} is required`);
+                if (!v) throw new Error('Please answer all questions before continuing.');
                 next[q.field] = q.type === 'number' ? Number(v) : v;
               }
               await design(next);
@@ -13935,13 +13935,19 @@ async function openPlanStrategyModal(projectId) {
     // The conversation thread, rendered as turns: AI questions stay
     // visible next to the user's answers; each Design call sends the
     // accumulated turns so the model continues instead of restarting.
+    // Answers pair with the question they answered (values only — the
+    // internal field key never renders as "key = value").
     const renderModelThread = () => {
       const el = $('#planStrategyModelThread');
       if (!el) return;
       if (!modelThread || !modelThread.length) { el.innerHTML = ''; return; }
+      const labels = {};
       el.innerHTML = modelThread.map((t) => {
-        if (t.role === 'ai') return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
-        return Object.entries(t.answers || {}).map(([k, v]) => `<div class="plan-row"><span>You: ${esc(k)} = ${esc(String(v))}</span></div>`).join('');
+        if (t.role === 'ai') {
+          for (const q of (t.questions || [])) if (q.field) labels[q.field] = q.label;
+          return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
+        }
+        return Object.entries(t.answers || {}).map(([k, v]) => `<div class="plan-row"><span>You: ${labels[k] ? `${esc(labels[k])}: ` : ''}${esc(String(v))}</span></div>`).join('');
       }).join('');
     };
     const design = async (msg, name, text, answers) => {
@@ -13967,7 +13973,7 @@ async function openPlanStrategyModal(projectId) {
             for (const q of r.ask) {
               const el = document.querySelector(`#planModelAsk_${CSS.escape(q.field)}`);
               const v = el ? el.value.trim() : '';
-              if (!v) throw new Error(`${q.label} is required`);
+              if (!v) throw new Error('Please answer all questions before continuing.');
               next[q.field] = q.type === 'number' ? Number(v) : v;
             }
             await design(msg, name, text, next);

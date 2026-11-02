@@ -16216,6 +16216,148 @@ try {
   check('planning thread: strategy GET persists the thread',
     r.status === 200 && r.data.strategy && Array.isArray(r.data.strategy.ai_thread) && r.data.strategy.ai_thread.length === 2,
     JSON.stringify({ thread: r.data.strategy && r.data.strategy.ai_thread }));
+  // AI-model no-id fixes: the model asking for property_id/term_id is
+  // rewritten server-side to name picks (never shown to the user), a
+  // repeated question dedupes, a name answer binds, an unbindable
+  // answer surfaces a mismatch with named candidates, and a question
+  // already answered in the thread never re-appears.
+  r = await req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'AiModel Strat', source: 'ai' });
+  check('ai-model no-id: design session strategy created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const aiModelStratId = r.data.strategy.id;
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [
+    { field: 'property_id', label: 'Which property ID corresponds to 77 Planning Test Lane?', type: 'text' },
+    { field: 'term_id', label: 'Which term ID?', type: 'text' },
+    { field: 'property_id', label: 'Which property ID?', type: 'text' },
+  ] }));
+  r = await req('POST', `/api/planning/strategies/${aiModelStratId}/ai-model`, { text: 'switch to 4.2% fixed rate', history: [] });
+  check('ai-model no-id: id questions rewritten to name picks, duplicates collapsed',
+    r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.length === 2
+    && !r.data.ask.some((q) => /_id$/.test(q.field))
+    && r.data.ask.some((q) => q.field === 'property' && q.label.includes('77 Planning Test Lane'))
+    && r.data.ask.some((q) => q.field === 'term' && q.label.includes('Choose by name')),
+    JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'property', label: 'Which property?', type: 'text' }] }));
+  r = await req('POST', `/api/planning/strategies/${aiModelStratId}/ai-model`, { text: 'switch to 4.2% fixed rate', history: [], answers: { property: 'No Such Place 123' } });
+  check('ai-model no-id: unbindable name answer surfaces a mismatch with named candidates, not a silent re-ask',
+    r.status === 200 && r.data.mismatch === true && Array.isArray(r.data.ask) && r.data.ask.length === 1
+    && r.data.ask[0].field === 'property' && r.data.ask[0].label.includes('No property matches "No Such Place 123"')
+    && r.data.ask[0].label.includes('77 Planning Test Lane'),
+    JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef));
+  r = await req('POST', `/api/planning/strategies/${aiModelStratId}/ai-model`, { text: 'switch to 4.2% fixed rate', history: [], answers: { property: '77 Planning Test Lane, Victoria, BC' } });
+  check('ai-model no-id: an answer by name binds to the entity and produces a spec, not a re-ask',
+    r.status === 201 && r.data.model && Array.isArray(r.data.resolved) && r.data.resolved.some((x) => x.entity === 'property' && x.label.includes('77 Planning Test Lane')),
+    JSON.stringify(r.data));
+  const answeredHistory = [
+    { role: 'ai', questions: [{ field: 'effective_date', label: 'Effective date?', type: 'date' }] },
+    { role: 'user', answers: { effective_date: '2027-01-31' } },
+  ];
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [
+    { field: 'effective_date', label: 'Effective date?', type: 'date' },
+    { field: 'fixed_rate', label: 'Fixed rate?', type: 'number' },
+  ] }));
+  r = await req('POST', `/api/planning/strategies/${aiModelStratId}/ai-model`, { text: 'switch to 4.2% fixed rate', history: answeredHistory });
+  check('ai-model no-id: a question answered in the thread is dropped, only the new question is asked',
+    r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.length === 1 && r.data.ask[0].field === 'fixed_rate',
+    JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'effective_date', label: 'Effective date?', type: 'date' }] }));
+  r = await req('POST', `/api/planning/strategies/${aiModelStratId}/ai-model`, { text: 'switch to 4.2% fixed rate', history: answeredHistory });
+  check('ai-model no-id: a model that only re-asks answered questions fails honestly instead of looping the user',
+    r.status === 502 && typeof r.data.error === 'string' && r.data.error.includes('already answered'),
+    JSON.stringify(r.data));
+  // Browser: the model-form thread pairs answers with their question
+  // (no raw "key = value" lines) and an empty answer shows a generic
+  // error, never the question text pasted in as a field name.
+  let aiPptr = null;
+  try {
+    const { createRequire } = await import('node:module');
+    const aiReqmod = createRequire(import.meta.url);
+    try { aiPptr = aiReqmod('puppeteer-core'); } catch { aiPptr = aiReqmod('/tmp/pptr/node_modules/puppeteer-core'); }
+  } catch { aiPptr = null; }
+  if (!aiPptr || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('ai-model browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const aiForward = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const aiLogin = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const aiCookie = aiLogin.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const aiBrowser = await aiPptr.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await aiBrowser.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await aiForward({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: aiCookie, domain: 'ff.local', path: '/', httpOnly: true });
+      const aiWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await aiWait(1500);
+      await page.evaluate(() => document.querySelector('#planAddStrategyBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planStrategyModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planChooseAi').click());
+      await page.waitForFunction(() => !!document.querySelector('#planChooseModel'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planChooseModel').click());
+      await page.waitForFunction(() => !!document.querySelector('#planStrategyModelText'), { timeout: 10000 });
+      await page.evaluate(() => {
+        document.querySelector('#planStrategyName').value = 'AiModel Browser';
+        document.querySelector('#planStrategyModelText').value = 'design a model';
+      });
+      fs.writeFileSync(aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
+      await page.evaluate(() => document.querySelector('#planStrategyModelBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planModelAsk_target_contribution'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planStrategyModelContinue').click());
+      await page.waitForFunction(() => (document.querySelector('#planStrategyModalMsg')?.textContent || '').length > 0, { timeout: 10000 });
+      const errText = await page.evaluate(() => document.querySelector('#planStrategyModalMsg')?.textContent || '');
+      check('ai-model browser: empty answer shows a generic error, never the question text as a field name',
+        errText.includes('Please answer all questions before continuing.') && !errText.includes('Target monthly contribution? is required'),
+        JSON.stringify({ errText }));
+      fs.writeFileSync(aiStubFile, JSON.stringify(aiModelDef));
+      await page.evaluate(() => { document.querySelector('#planModelAsk_target_contribution').value = '600'; });
+      await page.evaluate(() => document.querySelector('#planStrategyModelContinue').click());
+      await page.waitForFunction(() => (document.querySelector('#planStrategyModelOut')?.textContent || '').includes('Bindings:'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planStrategyModelThreadToggle').click());
+      const threadText = await page.evaluate(() => document.querySelector('#planStrategyModelThread')?.textContent || '');
+      check('ai-model browser: thread pairs the answer with its question, no raw key = value line',
+        threadText.includes('You: Target monthly contribution?: 600') && !threadText.includes('target_contribution = 600'),
+        JSON.stringify({ threadText }));
+    } finally { await aiBrowser.close(); }
+  }
   // Strategy-centric comparison deltas: template_params alone create
   // no ops, so the prepay and buy ops are posted for real. The prepay
   // strategy books an equity advantage but no principal delta; the
