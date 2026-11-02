@@ -19124,6 +19124,225 @@ try {
         aiView.title && aiView.axis && aiView.method, JSON.stringify(aiView));
     } finally { await browserD.close(); }
   }
+  // ------------------------------------------- project flow wiring
+  // One connected flow (Scenarios | Baselines | Strategies |
+  // Reports) with connector lines + shared selection: wiring picks
+  // drive the comparison panel and the report pins.
+  r = await req('POST', '/api/planning/projects', { name: 'Wiring test', question: 'Wiring pins' });
+  check('wiring: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const wProjectId = r.data.project.id;
+  r = await req('POST', '/api/properties', {
+    address: '77 Wiring Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('wiring: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const wPropId = r.data.id;
+  r = await req('POST', `/api/properties/${wPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('wiring: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${wProjectId}/strategies`, { name: 'Wiring prepay', source: 'template' });
+  check('wiring: pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const wStrategyId = r.data.strategy.id;
+  const _wNow = new Date();
+  const _wNext = new Date(Date.UTC(_wNow.getUTCFullYear(), _wNow.getUTCMonth() + 1, 1));
+  r = await req('POST', `/api/planning/strategies/${wStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: wPropId, date: _wNext.toISOString().slice(0, 10), amount: 10000, openClosed: 'open' },
+  });
+  check('wiring: pin prepay op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${wProjectId}/scenarios`, { name: 'Wiring world' });
+  check('wiring: pin scenario 1 created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const wScen1 = r.data.scenario.id;
+  r = await req('POST', `/api/planning/projects/${wProjectId}/scenarios`, { name: 'Wiring world 2' });
+  check('wiring: pin scenario 2 created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const wScen2 = r.data.scenario.id;
+  r = await req('POST', `/api/planning/projects/${wProjectId}/baselines`, { name: 'Wiring baseline', source: 'manual', definition: { description: 'Wiring base path' } });
+  check('wiring: pin baseline created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
+  const wBaseId = r.data.baseline.id;
+  const wDef = { strategies: [wStrategyId], charts: [{ template: 'time_line', title: 'Wiring balance', series: ['mortgage_balance'] }] };
+  r = await req('POST', `/api/planning/projects/${wProjectId}/reports`, { name: 'Wiring report', definition: wDef, strategy_ids: [wStrategyId], baseline_id: wBaseId, scenario_ids: [wScen1] });
+  check('wiring: pin report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const wRepId = r.data.report.id;
+  r = await req('POST', `/api/planning/projects/${wProjectId}/reports`, { name: 'Wiring report 2', definition: wDef, strategy_ids: [wStrategyId], baseline_id: wBaseId, scenario_ids: [wScen2] });
+  check('wiring: pin report 2 created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const wRep2Id = r.data.report.id;
+  r = await req('GET', `/api/planning/projects/${wProjectId}`);
+  const wRep = (r.data.reports || []).find((x) => x.id === wRepId);
+  check('wiring: project GET carries report pins',
+    !!wRep && JSON.stringify(wRep.scenarioIds) === JSON.stringify([wScen1]) && wRep.baseline_id === wBaseId
+      && JSON.stringify(JSON.parse(wRep.strategy_ids || 'null')) === JSON.stringify([wStrategyId]), JSON.stringify(wRep));
+  r = await req('POST', '/api/planning/projects', { name: 'Wiring flat', question: 'Flat pins' });
+  check('wiring: flat project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const wFlatId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${wFlatId}/reports`, { name: 'Wiring flat report', definition: { strategies: [], charts: [{ template: 'time_line', title: 'Flat balance', series: ['mortgage_balance'] }] } });
+  check('wiring: flat report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const wFlatRepId = r.data.report.id;
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('wiring browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardW = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResW = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueW = loginResW.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserW = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserW.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardW({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueW, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitW = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      await page.goto(`http://ff.local/#planning/project/${wProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitW(1500);
+      const flow = await page.evaluate(() => {
+        const grid = document.querySelector('#planFlowGrid');
+        const card = document.querySelector('#planFlowGrid .plan-flow-card');
+        const selBtn = document.querySelector('[data-plan-scenario-select][aria-pressed="true"]');
+        const selCard = selBtn ? selBtn.closest('.card') : null;
+        const paths = [...document.querySelectorAll('#planFlowSvg path')].map((p) => ({ line: p.dataset.flowLine, from: p.dataset.flowFrom, to: p.dataset.flowTo }));
+        return {
+          panel: !!document.querySelector('#planFlowPanel'),
+          cols: [...document.querySelectorAll('#planFlowGrid .plan-flow-col')].map((c) => c.id),
+          tracks: grid ? getComputedStyle(grid).gridTemplateColumns.split(' ').length : 0,
+          cardPadTop: card ? getComputedStyle(card).paddingTop : '',
+          selScen: selBtn ? Number(selBtn.dataset.planScenarioSelect) : null,
+          selCard: !!selCard && selCard.classList.contains('plan-selected'),
+          selBorder: selCard ? getComputedStyle(selCard).borderColor : '',
+          selPaths: paths.filter((p) => p.line === 'sel'),
+          repPaths: paths.filter((p) => p.line === 'report'),
+        };
+      });
+      check('wiring: flow panel lays out four columns with tightened cards and a selected base scenario',
+        flow.panel && JSON.stringify(flow.cols) === JSON.stringify(['planScenarioCardsPanel', 'planBaselineCardsPanel', 'planStrategiesPanel', 'planReportsPanel'])
+          && flow.tracks === 4 && flow.cardPadTop === '12px' && flow.selScen === wScen1 && flow.selCard && flow.selBorder === 'rgb(22, 104, 196)',
+        JSON.stringify(flow));
+      check('wiring: connector lines draw selection + stored report pins',
+        flow.selPaths.some((p) => p.from === `scenario:${wScen1}` && p.to === `strategy:${wStrategyId}`)
+          && flow.repPaths.some((p) => p.from === `report:${wRepId}` && p.to === `scenario:${wScen1}`)
+          && flow.repPaths.some((p) => p.from === `report:${wRepId}` && p.to === `baseline:${wBaseId}`)
+          && flow.repPaths.some((p) => p.from === `report:${wRepId}` && p.to === `strategy:${wStrategyId}`),
+        JSON.stringify(flow));
+      await page.click(`[data-plan-scenario-select="${wScen2}"]`);
+      await waitW(1200);
+      const world2 = await page.evaluate((s1, s2) => ({
+        note: document.querySelector('#planTrajectoryNote')?.textContent || '',
+        legacyChecked: [...document.querySelectorAll('#planCompareScenarios input:checked')].map((el) => Number(el.dataset.planCompareScenario)),
+        selCard: !!document.querySelector(`[data-plan-scenario="${s2}"]`)?.classList.contains('plan-selected'),
+        oldSel: !!document.querySelector(`[data-plan-scenario="${s1}"]`)?.classList.contains('plan-selected'),
+      }), wScen1, wScen2);
+      check('wiring: wiring scenario pick switches the comparison world and the legacy picker',
+        world2.note.includes('Wiring world 2') && JSON.stringify(world2.legacyChecked) === JSON.stringify([wScen2]) && world2.selCard && !world2.oldSel,
+        JSON.stringify(world2));
+      await page.click(`[data-plan-baseline-select="${wBaseId}"]`);
+      await waitW(500);
+      await page.click('#planAddReportBtn');
+      await waitW(1000);
+      const modal = await page.evaluate((b, s) => ({
+        baseVal: document.querySelector('#planReportSaveBaseline')?.value || '',
+        scenChecked: [...document.querySelectorAll('#planReportSaveScenarios input:checked')].map((el) => Number(el.value)),
+        open: !document.querySelector('#planReportSaveModal').classList.contains('hidden'),
+      }), wBaseId, wScen2);
+      check('wiring: report modal defaults to the wiring baseline + wiring scenario',
+        modal.open && modal.baseVal === String(wBaseId) && JSON.stringify(modal.scenChecked) === JSON.stringify([wScen2]),
+        JSON.stringify(modal));
+      await page.evaluate(() => { document.querySelector('#planReportSaveName').value = 'Wiring modal report'; });
+      await page.click('#planReportSaveBtn');
+      await waitW(1200);
+      r = await req('GET', `/api/planning/projects/${wProjectId}`);
+      const modalRep = (r.data.reports || []).find((x) => x.name === 'Wiring modal report');
+      check('wiring: modal save pins the wiring selection into the report',
+        !!modalRep && modalRep.baseline_id === wBaseId && JSON.stringify(modalRep.scenarioIds) === JSON.stringify([wScen2]),
+        JSON.stringify(modalRep));
+      const chipBefore = await page.evaluate(() => [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')));
+      await page.click(`[data-plan-strategy-select="${wStrategyId}"]`);
+      await waitW(800);
+      const chipAfter = await page.evaluate(() => [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')));
+      check('wiring: wiring strategy toggle drives the comparison picker chips',
+        chipBefore.length >= 1 && chipBefore.every((v) => v === 'true')
+          && chipAfter.length === chipBefore.length && chipAfter.every((v) => v === 'false'),
+        JSON.stringify({ chipBefore, chipAfter }));
+      await page.click(`[data-plan-strategy-select="${wStrategyId}"]`);
+      await waitW(800);
+      const chipBack = await page.evaluate(() => [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')));
+      check('wiring: wiring strategy toggle back restores the chip',
+        chipBack.length >= 1 && chipBack.every((v) => v === 'true'), JSON.stringify(chipBack));
+      await page.evaluate((sid) => { document.querySelector(`[data-plan-strategy="${sid}"] .k`).click(); }, wStrategyId);
+      await waitW(800);
+      const navHash = await page.evaluate(() => location.hash);
+      check('wiring: strategy card click still navigates to the detail page',
+        navHash === `#planning/strategy/${wStrategyId}`, navHash);
+      r = await req('DELETE', `/api/planning/scenarios/${wScen2}`);
+      check('wiring: non-base scenario deleted', r.status === 200, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/project/${wProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitW(1500);
+      const gone = await page.evaluate((s2, r2) => ({
+        repCard: !!document.querySelector(`[data-plan-report="${r2}"]`),
+        scenCard: !!document.querySelector(`[data-plan-scenario="${s2}"]`),
+        dangling: [...document.querySelectorAll('#planFlowSvg path')].some((p) => p.dataset.flowTo === `scenario:${s2}`),
+      }), wScen2, wRep2Id);
+      check('wiring: report pinned to a deleted scenario draws no line to it',
+        gone.repCard && !gone.scenCard && !gone.dangling, JSON.stringify(gone));
+      await page.goto(`http://ff.local/#planning/project/${wFlatId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitW(1500);
+      const flat = await page.evaluate((fr) => ({
+        node: !!document.querySelector('#planFlowFlatNode'),
+        nodeText: document.querySelector('#planFlowFlatNode')?.textContent || '',
+        repTag: document.querySelector(`[data-plan-report="${fr}"]`)?.textContent || '',
+        flatLine: [...document.querySelectorAll('#planFlowSvg path')].some((p) => p.dataset.flowTo === 'flat'),
+      }), wFlatRepId);
+      check('wiring: scenario-less project shows a flat-world node with a flat report line',
+        flat.node && flat.nodeText.includes('Current rates (no scenario)') && flat.repTag.includes('Flat world') && flat.flatLine,
+        JSON.stringify(flat));
+      await page.goto(`http://ff.local/#planning/project/${wProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitW(1500);
+      await page.setViewport({ width: 700, height: 900 });
+      await waitW(800);
+      const narrow = await page.evaluate(() => {
+        const grid = document.querySelector('#planFlowGrid');
+        return {
+          tracks: grid ? getComputedStyle(grid).gridTemplateColumns.split(' ').length : 0,
+          paths: document.querySelectorAll('#planFlowSvg path').length,
+        };
+      });
+      check('wiring: narrow viewport stacks columns without breaking lines',
+        narrow.tracks === 1 && narrow.paths > 0, JSON.stringify(narrow));
+      await page.setViewport({ width: 1500, height: 900 });
+    } finally { await browserW.close(); }
+  }
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above
