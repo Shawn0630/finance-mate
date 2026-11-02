@@ -789,7 +789,10 @@ function addYearsDate(dateStr, years) {
 // pays no fees, no penalty, no prepay, buys nothing, and its stock
 // trajectory is the reference the strategy's stock gain is measured
 // against — so net here IS the net benefit vs baseline.
-export function compareProjections(baseline, strategy) {
+// opts.excludeStockGain (property-category projects): gain counts
+// interest saved ONLY — stockGain is still computed and returned, but
+// never summed into gain or net, so net = gain − cost keeps holding.
+export function compareProjections(baseline, strategy, opts = {}) {
   if (!baseline || !strategy) return null;
   // Stock gain vs the do-nothing baseline: only NEW cash deployed
   // (pot/external buys) is opportunity-costed at the baseline ratio
@@ -808,7 +811,7 @@ export function compareProjections(baseline, strategy) {
   const stockGain = round2((strategy.stocks.valueAtHorizon + strategy.stocks.sellExternalOut) - bEnd - (buyCash - buyCashFromSells) * ratio);
   const interestSaved = strategy.mortgage.interestSaved;
   const cost = strategy.cost;
-  const gain = round2(interestSaved + stockGain);
+  const gain = opts.excludeStockGain ? round2(interestSaved) : round2(interestSaved + stockGain);
   const net = round2(gain - cost);
   return {
     cost, gain, net,

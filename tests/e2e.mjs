@@ -17756,6 +17756,148 @@ try {
         JSON.stringify(repick));
     } finally { await browserC.close(); }
   }
+  // ------------------------------------------- property net excludes stockGain
+  // Property-category strategies exclude stockGain from gain AND net
+  // (net = gain − cost still holds); stockGain stays computed and is
+  // shown separately. Investment-category strategies keep stockGain
+  // inside gain/net. Scoping is by project category, so a mixed
+  // mortgage + stock strategy in a property project follows the
+  // property rule. Fixtures: a fund holding with a buy event + one
+  // NAV price (flat $31 path — a single point has no growth window),
+  // a mortgaged property, and a position op (strategy-only stock
+  // exposure, no funding legs) that books stockGain without moving
+  // the baseline trajectory. (A scenario stock factor alone cannot
+  // produce nonzero stockGain: it reprices baseline and strategy
+  // together by design — the exclusion operates on the computed
+  // stockGain figure regardless of its source.)
+  r = await req('POST', '/api/investments/accounts', { name: 'SG Test', type: 'NonRegistered' });
+  check('stockgain: pin account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const sgAcctId = r.data.id;
+  r = await req('POST', `/api/investments/accounts/${sgAcctId}/holdings`, { label: 'SG Fund', kind: 'fund', currency: 'CAD' });
+  check('stockgain: pin fund holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const sgHoldingId = r.data.id;
+  r = await req('POST', `/api/investments/holdings/${sgHoldingId}/events`, { date: '2026-01-12', type: 'buy', units: 100, price: 30 });
+  check('stockgain: pin fund buy recorded', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/investments/holdings/${sgHoldingId}/nav`, { date: '2026-01-31', price: 31 });
+  check('stockgain: pin fund NAV recorded', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', '/api/properties', {
+    address: '55 StockGain Test Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('stockgain: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const sgPropId = r.data.id;
+  r = await req('POST', `/api/properties/${sgPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('stockgain: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+  const _sgNow = new Date();
+  const _sgNext = new Date(Date.UTC(_sgNow.getUTCFullYear(), _sgNow.getUTCMonth() + 1, 1));
+  const sgOpDate = _sgNext.toISOString().slice(0, 10);
+  r = await req('POST', '/api/planning/projects', { name: 'SG property', question: 'Mixed then hold', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: sgPropId } });
+  check('stockgain: property project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const sgPropProjectId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${sgPropProjectId}/strategies`, { name: 'Prepay + position', source: 'template' });
+  check('stockgain: property strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const sgPropStrategyId = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${sgPropStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: sgPropId, date: sgOpDate, amount: 10000, openClosed: 'open' },
+  });
+  check('stockgain: property prepay op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${sgPropStrategyId}/ops`, {
+    op_type: 'position',
+    params: { accountId: sgAcctId, holdingId: sgHoldingId, units: 50, date: sgOpDate },
+  });
+  check('stockgain: property position op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${sgPropProjectId}/scenarios`, { name: 'SG world' });
+  check('stockgain: scenario created for the property project', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${sgPropStrategyId}`);
+  const sgC = (r.data && r.data.comparison) || {};
+  const sgClose = (a, b) => Math.abs((a || 0) - (b || 0)) < 0.005;
+  check('stockgain: mixed property strategy books nonzero stockGain', sgC.stockGain > 0, JSON.stringify(sgC));
+  check('stockgain: property gain excludes stockGain (gain == interest saved)', sgClose(sgC.gain, sgC.interestSaved) && sgC.interestSaved > 0, JSON.stringify(sgC));
+  check('stockgain: property net = gain − cost to the cent', sgClose(sgC.net, sgC.gain - sgC.cost) && sgC.cost === 10000, JSON.stringify(sgC));
+  r = await req('POST', '/api/planning/projects', { name: 'SG investment', question: 'Position then hold', category: 'investment', subcategory: 'stock', entity: { type: 'account', accountId: sgAcctId } });
+  check('stockgain: investment project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const sgInvProjectId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${sgInvProjectId}/strategies`, { name: 'Position only', source: 'template' });
+  check('stockgain: investment strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const sgInvStrategyId = r.data.strategy.id;
+  r = await req('POST', `/api/planning/strategies/${sgInvStrategyId}/ops`, {
+    op_type: 'position',
+    params: { accountId: sgAcctId, holdingId: sgHoldingId, units: 50, date: sgOpDate },
+  });
+  check('stockgain: investment position op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/strategies/${sgInvStrategyId}`);
+  const sgI = (r.data && r.data.comparison) || {};
+  check('stockgain: investment gain keeps stockGain inside (gain == interest saved + stockGain)', sgI.stockGain > 0 && sgClose(sgI.gain, (sgI.interestSaved || 0) + sgI.stockGain), JSON.stringify(sgI));
+  check('stockgain: investment net = gain − cost to the cent', sgClose(sgI.net, sgI.gain - sgI.cost), JSON.stringify(sgI));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('stockgain browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardSG = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResSG = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueSG = loginResSG.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserSG = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const pageSG = await browserSG.newPage();
+      const clientSG = await pageSG.target().createCDPSession();
+      await clientSG.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      clientSG.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await clientSG.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardSG({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await clientSG.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await clientSG.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await clientSG.send('Network.setCookie', { name: 'ff_session', value: cookieValueSG, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitSG = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await pageSG.goto(`http://ff.local/#planning/strategy/${sgPropStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitSG(1500);
+      const sgCards = await pageSG.evaluate(() => [...document.querySelectorAll('.breakdown-card')].map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' })));
+      const sgCard = sgCards.find((c) => c.k === 'Stock gain');
+      check('stockgain: strategy detail shows Stock gain as its own card', !!sgCard && sgCard.v !== '—' && sgCard.v !== '', JSON.stringify(sgCards));
+      await pageSG.goto(`http://ff.local/#planning/project/${sgPropProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitSG(1500);
+      const sgTables = await pageSG.evaluate(() => ({
+        legacy: document.querySelector('#planCompareTable')?.textContent || '',
+        master: document.querySelector('#planMasterTable')?.textContent || '',
+        apple: document.querySelector('#planAppleTable')?.textContent || '',
+      }));
+      check('stockgain: legacy, master and Apple tables show a Stock gain row', sgTables.legacy.includes('Stock gain') && sgTables.master.includes('Stock gain') && sgTables.apple.includes('Stock gain'),
+        JSON.stringify({ legacy: sgTables.legacy.slice(0, 200), master: sgTables.master.slice(0, 200), apple: sgTables.apple.slice(0, 200) }));
+    } finally { await browserSG.close(); }
+  }
   // ------------------------------------------- report + templates
   // Pinned scenario/baseline/strategy for report generation (never a
   // silent fallback), template recommendation slots (populated from

@@ -11667,6 +11667,7 @@ function planCompareTableHtml(rows) {
     <table class="tbl"><thead>${head}</thead><tbody>
       ${numRow('Total cost', (r) => planMoney(r.comparison.cost))}
       ${numRow('Total gain', (r) => planMoney(r.comparison.gain))}
+      ${numRow('Stock gain', (r) => planMoney(r.comparison.stockGain))}
       ${numRow('Net benefit', (r) => planSigned(r.comparison.net))}
       ${numRow('Equity Δ', (r) => (r.equityDelta != null ? planSigned(r.equityDelta) : '—'))}
       ${numRow('Principal Δ', (r) => (r.principalDelta != null ? planSigned(r.principalDelta) : '—'))}
@@ -11746,7 +11747,7 @@ function planStrategyCardsRender(rows, projectId) {
     <div class="card breakdown-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
       <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
       ${r.comparison ? `<div class="v">${planSigned(r.comparison.net)}</div>
-      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops</div>` : ''}
+      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · Stock gain ${planMoney(r.comparison.stockGain)} · ${r.opCount ?? 0} ops</div>` : ''}
       ${sinkLine ? `<div class="n">${esc(sinkLine)}</div>` : ''}
       ${legacySinkLine}
     </div>`;
@@ -11918,7 +11919,7 @@ function openPlanReportAiModal(projectId) {
 // ---- report view: charts + tables + how each figure is calculated ----
 const PLAN_REPORT_SERIES_LABEL = {
   mortgage_balance: 'Mortgage balance', stock_value: 'Stock value', total_value: 'Total value',
-  cost: 'Total cost', gain: 'Total gain', net: 'Net benefit',
+  cost: 'Total cost', gain: 'Total gain', net: 'Net benefit', stock_gain: 'Stock gain',
   payoff_month: 'Payoff shift (months)', monthly_payment: 'Monthly payment Δ',
 };
 const PLAN_REPORT_DEFS = 'Cost = fees + penalty + cash out. Gain = interest saved vs baseline + asset growth under assumptions. Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
@@ -11927,7 +11928,7 @@ const PLAN_REPORT_HOW = {
   stock_value: 'Stock value = units × last price at or before the month (last price carried forward, never invented). The cash pot is included only at the horizon month.',
   total_value: 'Total value = property equity + stock value. Equity = assessed value − outstanding principal; assessed value is the current roll, held flat across months.',
   cost: 'Cost = fees + penalty + cash out (prepay cash + buy cash). Penalty is an estimate; the bank quote governs.',
-  gain: 'Gain = interest saved vs baseline + stock growth vs the baseline trajectory (same return assumption, no ops). A do-nothing strategy books no gain.',
+  gain: 'Gain = interest saved vs baseline + stock growth vs the baseline trajectory (same return assumption, no ops). A do-nothing strategy books no gain. Property-category strategies exclude stock gain from gain (shown separately as Stock gain).',
   net: 'Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count.',
   payoff_month: 'Payoff shift = baseline payoff month − strategy payoff month, in months (positive = earlier).',
   monthly_payment: 'Monthly payment Δ = strategy payment at effect − baseline payment at effect, summed across properties.',
@@ -12101,7 +12102,7 @@ async function loadPlanReport(projectId, reportId) {
         draws.push(() => planLineChart(cid, months, datasets));
       } else if (c.template === 'metric_cards') {
         const sids = series || ['cost', 'gain', 'net'];
-        const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
+        const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'stock_gain' ? row.comparison.stockGain : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
         const fmt = (sid, v) => v == null ? '—' : sid === 'payoff_month' ? `${v} months` : sid === 'monthly_payment' ? planSigned(v) : money2(v);
         const cards = comp.strategies.map((row) => `<div class="cards">${sids.map((sid) => `<div class="card breakdown-card"><div class="k">${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</div><div class="v">${fmt(sid, valOf(row, sid))}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`).join('')}</div>`).join('') || '<div class="note">No strategies yet.</div>';
         const head = `<tr><th>Strategy</th>${sids.map((sid) => `<th>${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</th>`).join('')}</tr>`;
@@ -12335,6 +12336,7 @@ function planStrategyHtml(d) {
       </div>
       <div class="cards">
         <div class="card breakdown-card"><div class="k">Interest saved</div><div class="v">${planMoney(c.interestSaved)}</div></div>
+        <div class="card breakdown-card"><div class="k">Stock gain</div><div class="v">${planMoney(c.stockGain)}</div></div>
         <div class="card breakdown-card"><div class="k">Payoff shift</div><div class="v">${c.payoffShiftMonths != null ? `${c.payoffShiftMonths} months` : '—'}</div></div>
         <div class="card breakdown-card"><div class="k">Monthly payment Δ</div><div class="v">${planSigned(c.paymentDelta)}</div></div>
         <div class="card breakdown-card"><div class="k">Penalty</div><div class="v">${planMoney(c.penaltyTotal)}</div><div class="n">Estimate — the bank quote governs</div></div>
@@ -12994,6 +12996,7 @@ function planCompareNewRender(block, ids) {
     { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => planMoney(r.comparison.valueAtHorizon) },
     { label: 'Total cost', base: '—', strat: (r) => planMoney(r.comparison.cost) },
     { label: 'Total gain', base: '—', strat: (r) => planMoney(r.comparison.gain) },
+    { label: 'Stock gain', base: '—', strat: (r) => planMoney(r.comparison.stockGain) },
     { label: 'Net benefit', base: '—', strat: (r) => planSigned(r.comparison.net) },
     { label: 'Equity Δ', base: '—', strat: (r) => (r.equityDelta != null ? planSigned(r.equityDelta) : '—') },
     { label: 'Principal Δ', base: '—', strat: (r) => (r.principalDelta != null ? planSigned(r.principalDelta) : '—') },
@@ -13032,6 +13035,7 @@ function planAppleRender(t) {
     { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => { const dv = (r.comparison.valueAtHorizon != null && r.comparison.baselineValueAtHorizon != null) ? r.comparison.valueAtHorizon - r.comparison.baselineValueAtHorizon : null; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
     { label: 'Total cost', base: '—', strat: (r) => `<td>${planMoney(r.comparison.cost)}</td>` },
     { label: 'Total gain', base: '—', strat: (r) => `<td>${planMoney(r.comparison.gain)}</td>` },
+    { label: 'Stock gain', base: '—', strat: (r) => `<td>${planMoney(r.comparison.stockGain)}</td>` },
     { label: 'Net benefit', base: '—', strat: (r) => `<td>${planSigned(r.comparison.net)}</td>` },
     { label: 'Equity Δ', base: '—', strat: (r) => `<td${diffCls(r.equityDelta)}>${r.equityDelta != null ? planSigned(r.equityDelta) : '—'}</td>` },
     { label: 'Principal Δ', base: '—', strat: (r) => `<td${diffCls(r.principalDelta)}>${r.principalDelta != null ? planSigned(r.principalDelta) : '—'}</td>` },

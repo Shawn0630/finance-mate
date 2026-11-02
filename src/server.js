@@ -4583,7 +4583,7 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
     }
   }
   const strategyProj = computeProjection({ ...args, mainline: strategyMainline, assumptions: strategyAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
-  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj), factors, sink, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property' }), factors, sink, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
 }
 function planScenarioRow(r) {
   if (!r) return null;

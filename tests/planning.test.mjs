@@ -413,6 +413,29 @@ test('compareProjections: stock gain is the excess over the same principal in th
   // Do-nothing still books $0.
   assert.equal(compareProjections(base, { ...base, cost: 0 }).stockGain, 0);
 });
+test('compareProjections: excludeStockGain drops stock gain from gain and net but keeps it reported', () => {
+  // Mixed mortgage + stock strategy: $1,000 interest saved, $1,550
+  // stock gain, $10,000 prepay cost. Property rule: gain counts the
+  // interest only; net = gain − cost still holds to the cent.
+  const base = { mortgage: { interestSaved: 0 }, stocks: { startingValue: 3100, valueAtHorizon: 3100, buyCash: 0, sellExternalOut: 0 }, cost: 0 };
+  const strat = { mortgage: { interestSaved: 1000 }, stocks: { startingValue: 3100, valueAtHorizon: 4650, buyCash: 0, sellExternalOut: 0 }, cost: 10000 };
+  const cmp = compareProjections(base, strat, { excludeStockGain: true });
+  assert.equal(cmp.stockGain, 1550);
+  assert.equal(cmp.gain, 1000);
+  assert.equal(cmp.net, -9000);
+  assert.equal(cmp.net, cmp.gain - cmp.cost);
+  // Same figures without the flag: stock gain stays inside gain/net.
+  const incl = compareProjections(base, strat);
+  assert.equal(incl.stockGain, 1550);
+  assert.equal(incl.gain, 2550);
+  assert.equal(incl.net, -7450);
+  // Negative stock gain is excluded the same way (never added back).
+  const neg = { mortgage: { interestSaved: 1000 }, stocks: { startingValue: 3100, valueAtHorizon: 2500, buyCash: 0, sellExternalOut: 0 }, cost: 10000 };
+  const cmpNeg = compareProjections(base, neg, { excludeStockGain: true });
+  assert.equal(cmpNeg.stockGain, -600);
+  assert.equal(cmpNeg.gain, 1000);
+  assert.equal(cmpNeg.net, -9000);
+});
 test('principalGainSeries: month-by-month excess over the current-plan baseline', () => {
   const base = { stocks: { series: [{ month: '2026-11', value: 6000 }, { month: '2026-12', value: 6600 }] } };
   const strat = { stocks: { series: [{ month: '2026-11', value: 6600 }, { month: '2026-12', value: 7320 }], buyCash: 600 } };
