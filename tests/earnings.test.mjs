@@ -360,6 +360,13 @@ test('next pay date: recent-date anchor, holiday moves a day earlier, today coun
   assert.equal(npd('biweekly', '2022-06-06', '2026-12-24', '2026-12-26'), '2027-01-08');
   assert.equal(npd('biweekly', '2022-06-06', '2026-12-24', '2026-12-24'), '2026-12-24');
   assert.equal(npd('weekly', '2022-06-06', '2026-12-24', '2027-01-02'), '2027-01-08');
+  // Same no-drift rule for monthly and annual: the day (monthly) or
+  // month-day (annual) comes from the NOMINAL recent date, not the
+  // entered moved-early one.
+  assert.equal(npd('monthly', '2026-01-25', '2026-12-24', '2027-01-05'), '2027-01-25');
+  assert.equal(npd('monthly', '2025-01-01', '2025-12-31', '2026-01-05'), '2026-02-01');
+  assert.equal(npd('monthly', '2026-01-25', '2026-12-24', '2026-12-24'), '2026-12-24');
+  assert.equal(npd('annual', '2020-04-03', '2026-04-02', '2026-06-01'), '2027-04-03');
   // A future start date is its own first pay date.
   assert.equal(npd('biweekly', '2026-06-01', '2026-06-01', '2026-01-06'), '2026-06-01');
   // Dateless legacy jobs and bad inputs: no guessed date.

@@ -258,8 +258,15 @@ export function payDatesInWindow(frequency, from, to, anchor) {
 // alone moved.
 export function nextPayDate({ frequency, startDate, recentDate }, today) {
   if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today)) return null;
+  // A pay grid is FIXED: a holiday move is one-off and never drifts
+  // it. If the entered recent payment is itself the moved one (its
+  // next day is a holiday), the nominal anchor is that next day, not
+  // the entered date. Applies to weekly, bi-weekly, monthly, and
+  // annual alike; semi-monthly ignores the anchor either way.
+  const recentN = jobDayNum(recentDate);
+  const nominalRecent = isHoliday(jobDayStr(recentN + 1)) ? jobDayStr(recentN + 1) : recentDate;
   if (frequency === 'annual') {
-    const [, m, d] = recentDate.split('-').map(Number);
+    const [, m, d] = nominalRecent.split('-').map(Number);
     const y = Number(today.slice(0, 4));
     for (const yy of [y, y + 1]) {
       const cand = ymPad(yy, m, Math.min(d, lastDayOfMonth(yy, m)));
@@ -278,13 +285,7 @@ export function nextPayDate({ frequency, startDate, recentDate }, today) {
     // forward, which strands a recent anchor after the window).
     const step = frequency === 'weekly' ? 7 : 14;
     const todayN = jobDayNum(today);
-    // A weekly/bi-weekly grid is a FIXED weekday: a holiday move is
-    // one-off and never drifts the grid. If the entered recent
-    // payment is itself the moved one (its next day is a holiday),
-    // the nominal anchor is that next day, not the entered date.
-    const recentN = jobDayNum(recentDate);
-    const nominal = isHoliday(jobDayStr(recentN + 1)) ? jobDayStr(recentN + 1) : recentDate;
-    let n = jobDayNum(nominal);
+    let n = jobDayNum(nominalRecent);
     if (n < todayN) n += Math.ceil((todayN - n) / step) * step;
     else while (n - step >= todayN) n -= step;
     for (;;) {
@@ -294,7 +295,7 @@ export function nextPayDate({ frequency, startDate, recentDate }, today) {
     }
   }
   const far = jobDayStr(jobDayNum(today) + 62);
-  const dates = payDatesInWindow(frequency, today, far, recentDate);
+  const dates = payDatesInWindow(frequency, today, far, nominalRecent);
   for (const d of dates) {
     const adj = adjustPayday(d);
     if (adj >= today) return adj;
