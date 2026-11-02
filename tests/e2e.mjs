@@ -15784,9 +15784,9 @@ try {
       check('planning detail shows the category as read-only metadata',
         landed.catLine.includes('Property') && landed.catLine.includes('Refinance') && landed.catLine.includes('77 Planning Test Lane'),
         JSON.stringify({ catLine: landed.catLine }));
-      check('planning applied recommendation renders baseline + strategy cards with Edit/Delete (baseline cards carry no AI refine button)',
+      check('planning applied recommendation renders baseline cards with Edit/Delete and strategy cards as click-to-navigate only (no card toolbar)',
         landed.baseCards.length === 1 && landed.baseCards[0].edit && !landed.baseCards[0].ai && landed.baseCards[0].del
-          && landed.stratCards.length === 1 && landed.stratCards[0].edit && landed.stratCards[0].del,
+          && landed.stratCards.length === 1 && !landed.stratCards[0].edit && !landed.stratCards[0].del,
         JSON.stringify({ baseCards: landed.baseCards, stratCards: landed.stratCards }));
       const catProjectId = landed.hash.split('/').pop();
       // Edit modal carries no category control, and PUT rejects a change.
@@ -17980,6 +17980,304 @@ try {
       const baseListed = await page.evaluate(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('AI baseline test'));
       check('report: applied AI baseline joins the Baselines list', baseListed);
     } finally { await browserP2.close(); }
+  }
+  // ------------------------------------------- strategy page redesign
+  // The detail page holds only fillable things, each with Edit +
+  // Delete: header rename + delete, op rows, funding-leg sub-rows,
+  // sink view/edit/delete, AI spec detach, collapsed model thread.
+  // Strategy cards are click-to-navigate only (the old card Edit
+  // button just re-navigated — that bug is fixed by removing the
+  // toolbar, not by making it do something else). Self-contained.
+  const _rdNow = new Date();
+  const _rdNext = new Date(Date.UTC(_rdNow.getUTCFullYear(), _rdNow.getUTCMonth() + 1, 1));
+  const rdOpDate = _rdNext.toISOString().slice(0, 10);
+  r = await req('POST', '/api/planning/projects', { name: 'Redesign test', question: 'Straightforward page' });
+  check('redesign: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const rdProjectId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${rdProjectId}/strategies`, { name: 'Redesign strat', source: 'template' });
+  check('redesign: pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const rdStrategyId = r.data.strategy.id;
+  r = await req('POST', '/api/properties', {
+    address: '99 Redesign Test Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('redesign: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const rdPropId = r.data.id;
+  r = await req('POST', `/api/properties/${rdPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('redesign: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/strategies/${rdStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: rdPropId, date: rdOpDate, amount: 10000, openClosed: 'open' },
+  });
+  check('redesign: pin prepay op added', r.status === 201 && r.data.op && r.data.op.id > 0, JSON.stringify(r.data));
+  const rdPrepayOpId = r.data.op.id;
+  r = await req('POST', '/api/investments/accounts', { name: 'Redesign Acct', type: 'NonRegistered' });
+  check('redesign: pin account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const rdAcctId = r.data.id;
+  r = await req('POST', `/api/planning/strategies/${rdStrategyId}/ops`, {
+    op_type: 'buy',
+    params: { accountId: rdAcctId, symbol: 'RDTEST', date: rdOpDate, amount: 5000, price: 50 },
+    legs: [{ source_ref: 'cash', amount: 'remainder' }, { source_ref: 'pot', amount: 100 }],
+  });
+  check('redesign: pin buy op with two legs added', r.status === 201 && r.data.op && r.data.op.id > 0, JSON.stringify(r.data));
+  const rdBuyOpId = r.data.op.id;
+  r = await req('GET', `/api/planning/strategies/${rdStrategyId}`);
+  check('redesign: buy op carries both legs from the API',
+    r.status === 200 && (r.data.ops || []).find((o) => o.id === rdBuyOpId) && ((r.data.ops || []).find((o) => o.id === rdBuyOpId).legs || []).length === 2,
+    JSON.stringify((r.data.ops || []).map((o) => [o.id, (o.legs || []).length])));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('redesign browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardR = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResR = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueR = loginResR.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserR = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserR.newPage();
+      page.on('dialog', (d) => d.accept());
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardR({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitR = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      // Card: no toolbar, click navigates to the detail page.
+      await page.goto(`http://ff.local/#planning/project/${rdProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      const card = await page.evaluate((sid) => {
+        const el = document.querySelector(`[data-plan-strategy="${sid}"]`);
+        return { found: !!el, edit: !!el?.querySelector('[data-plan-strategy-edit]'), del: !!el?.querySelector('[data-plan-strategy-del]') };
+      }, rdStrategyId);
+      check('redesign: strategy card has no toolbar buttons', card.found && !card.edit && !card.del, JSON.stringify(card));
+      await page.evaluate((sid) => { document.querySelector(`[data-plan-strategy="${sid}"]`).click(); }, rdStrategyId);
+      await waitR(1500);
+      const landedDetail = await page.evaluate(() => ({ hash: location.hash, title: document.querySelector('#planStrategyTitle')?.textContent || '' }));
+      check('redesign: clicking the card navigates to the strategy detail page',
+        landedDetail.hash === `#planning/strategy/${rdStrategyId}` && landedDetail.title.includes('Redesign strat'), JSON.stringify(landedDetail));
+      // Header rename: Edit swaps the title for an input + Save.
+      await page.click('#planStrategyRenameBtn');
+      await waitR(400);
+      const renameInput = await page.evaluate(() => !!document.querySelector('#planStrategyNameInput'));
+      check('redesign: header Edit opens a rename input', renameInput);
+      await page.click('#planStrategyNameInput');
+      await page.keyboard.down('Control');
+      await page.keyboard.press('a');
+      await page.keyboard.up('Control');
+      await page.type('#planStrategyNameInput', 'Redesign renamed');
+      await page.click('#planStrategyRenameSave');
+      await waitR(1200);
+      const renamed = await page.evaluate(() => document.querySelector('#planStrategyTitle')?.textContent || '');
+      check('redesign: header rename saves and shows the new name', renamed.includes('Redesign renamed'), JSON.stringify(renamed));
+      // Op row Edit: modal opens, amount change persists.
+      await page.evaluate((oid) => { document.querySelector(`[data-plan-op-edit="${oid}"]`).click(); }, rdPrepayOpId);
+      await waitR(800);
+      const opModal = await page.evaluate(() => ({ title: document.querySelector('#planOpModalTitle')?.textContent || '', amount: document.querySelector('#planOpAmount')?.value || '' }));
+      check('redesign: op row Edit opens the edit modal with the current amount',
+        opModal.title === 'Edit operation' && opModal.amount.replace(/,/g, '') === '10000', JSON.stringify(opModal));
+      await page.click('#planOpAmount');
+      await page.keyboard.down('Control');
+      await page.keyboard.press('a');
+      await page.keyboard.up('Control');
+      await page.type('#planOpAmount', '15000');
+      await page.click('#planOpSaveBtn');
+      await waitR(1200);
+      r = await req('GET', `/api/planning/strategies/${rdStrategyId}`);
+      const editedOp = (r.data.ops || []).find((o) => o.id === rdPrepayOpId);
+      check('redesign: op Edit saves the new amount', editedOp && Number(editedOp.params.amount) === 15000, JSON.stringify(editedOp && editedOp.params));
+      // Op row Delete removes the op.
+      await page.evaluate((oid) => { document.querySelector(`[data-plan-op-del="${oid}"]`).click(); }, rdPrepayOpId);
+      await waitR(1200);
+      r = await req('GET', `/api/planning/strategies/${rdStrategyId}`);
+      check('redesign: op Delete removes the operation', !(r.data.ops || []).some((o) => o.id === rdPrepayOpId), JSON.stringify((r.data.ops || []).map((o) => o.id)));
+      // Leg sub-rows: Edit swaps the row for the leg editor.
+      const legRows = await page.evaluate(() => [...document.querySelectorAll('.plan-leg-subrow')].map((tr) => tr.textContent));
+      check('redesign: buy op renders funding-leg sub-rows', legRows.length === 2 && legRows.some((t) => t.includes('Declared cash')) && legRows.some((t) => t.includes('Cash pot')), JSON.stringify(legRows));
+      r = await req('GET', `/api/planning/strategies/${rdStrategyId}`);
+      const buyOp = (r.data.ops || []).find((o) => o.id === rdBuyOpId);
+      const legCash = (buyOp.legs || []).find((l) => l.source_ref === 'cash');
+      const legPot = (buyOp.legs || []).find((l) => l.source_ref === 'pot');
+      await page.evaluate((lid) => { document.querySelector(`[data-plan-leg-edit$=":${lid}"]`).click(); }, legCash.id);
+      await waitR(1200);
+      const legEditor = await page.evaluate((lid) => {
+        const tr = document.querySelector(`tr[data-plan-leg-id="${lid}"]`);
+        return { editor: !!tr?.querySelector('.plan-leg-src'), save: !!tr?.querySelector('#planLegSaveBtn') };
+      }, legCash.id);
+      check('redesign: leg Edit opens the inline leg editor', legEditor.editor && legEditor.save, JSON.stringify(legEditor));
+      await page.select(`tr[data-plan-leg-id="${legCash.id}"] .plan-leg-mode`, 'fixed');
+      await waitR(200);
+      await page.type(`tr[data-plan-leg-id="${legCash.id}"] .plan-leg-amount`, '500');
+      await page.click('#planLegSaveBtn');
+      await waitR(1200);
+      r = await req('GET', `/api/planning/strategies/${rdStrategyId}`);
+      const buyOp2 = (r.data.ops || []).find((o) => o.id === rdBuyOpId);
+      const legCash2 = (buyOp2.legs || []).find((l) => l.source_ref === 'cash');
+      check('redesign: leg Edit saves the fixed amount', legCash2 && Number(legCash2.amount) === 500, JSON.stringify(buyOp2.legs));
+      // Leg Delete drops one leg, survivors re-validate.
+      await page.evaluate((lid) => { document.querySelector(`[data-plan-leg-del$=":${lid}"]`).click(); }, legPot.id);
+      await waitR(1200);
+      r = await req('GET', `/api/planning/strategies/${rdStrategyId}`);
+      const buyOp3 = (r.data.ops || []).find((o) => o.id === rdBuyOpId);
+      check('redesign: leg Delete leaves the surviving leg only',
+        (buyOp3.legs || []).length === 1 && buyOp3.legs[0].source_ref === 'cash', JSON.stringify(buyOp3.legs));
+      // The newer panels survive the redesign, in place.
+      const panels = await page.evaluate(() => ({
+        diff: !!document.querySelector('#planDiffPanel'),
+        report: !!document.querySelector('#planStrategyReportPanel'),
+        opsFirst: (() => { const heads = [...document.querySelectorAll('#planStrategy .panel .section-head h3')].map((h) => h.textContent.trim()); return heads.indexOf('Operations') < heads.indexOf('Difference vs baseline'); })(),
+      }));
+      check('redesign: diff + report panels still render, Operations sits before the diff section',
+        panels.diff && panels.report && panels.opsFirst, JSON.stringify(panels));
+      // Header Delete removes an unmerged strategy.
+      r = await req('POST', `/api/planning/projects/${rdProjectId}/strategies`, { name: 'Delete me', source: 'template' });
+      const rdDelId = r.data.strategy.id;
+      await page.goto(`http://ff.local/#planning/strategy/${rdDelId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      await page.click('#planStrategyDeleteBtn');
+      await waitR(1200);
+      const delLanded = await page.evaluate(() => location.hash);
+      r = await req('GET', `/api/planning/strategies/${rdDelId}`);
+      check('redesign: header Delete removes an unmerged strategy and returns to the project',
+        delLanded === `#planning/project/${rdProjectId}` && r.status === 404, JSON.stringify({ hash: delLanded, status: r.status }));
+      // Header Delete on a merged strategy is refused (400), strategy stays.
+      r = await req('POST', `/api/planning/projects/${rdProjectId}/strategies`, { name: 'Merge victim', source: 'template' });
+      const rdMergeId = r.data.strategy.id;
+      r = await req('POST', `/api/planning/strategies/${rdMergeId}/ops`, {
+        op_type: 'prepay',
+        params: { propertyId: rdPropId, date: rdOpDate, amount: 5000, openClosed: 'open' },
+      });
+      check('redesign: merge victim prepay op added', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', `/api/planning/strategies/${rdMergeId}/merge-preview`, {});
+      check('redesign: merge victim preview has no conflicts', r.status === 200 && (r.data.conflicts || []).length === 0, JSON.stringify(r.data));
+      r = await req('POST', `/api/planning/strategies/${rdMergeId}/merge`, { resolutions: [] });
+      check('redesign: merge victim merged', r.status === 200 && r.data.mergeRecordId > 0, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${rdMergeId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      await page.click('#planStrategyDeleteBtn');
+      await waitR(1200);
+      const mergedDel = await page.evaluate(() => ({
+        msg: document.querySelector('#planStrategyMsg')?.textContent || '',
+        stillThere: !!document.querySelector('#planStrategyTitle'),
+      }));
+      r = await req('GET', `/api/planning/strategies/${rdMergeId}`);
+      check('redesign: header Delete on a merged strategy is refused and the strategy stays',
+        /merged/i.test(mergedDel.msg) && mergedDel.stillThere && r.status === 200, JSON.stringify({ msg: mergedDel.msg, status: r.status }));
+      // AI spec detach: stub a spec, attach it, Delete drops the panel.
+      const rdAiDef = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [{ key: 'stockReturnPct', value: 5, source: 'user' }], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
+      fs.writeFileSync(aiStubFile, JSON.stringify(rdAiDef));
+      r = await req('POST', `/api/planning/projects/${rdProjectId}/strategies`, { name: 'AI strat', source: 'template' });
+      const rdAiId = r.data.strategy.id;
+      r = await req('POST', `/api/planning/strategies/${rdAiId}/ai-model`, { text: 'Model interest', name: 'Interest model' });
+      check('redesign: ai-model spec saved for detach pin', r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
+      r = await req('PUT', `/api/planning/strategies/${rdAiId}`, { model_id: r.data.model.id });
+      check('redesign: model attached to strategy', r.status === 200, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${rdAiId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      const modelBefore = await page.evaluate(() => ({
+        panel: [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'),
+        detach: !!document.querySelector('#planModelDetachBtn'),
+        follow: !!document.querySelector('#planModelFollowBtn'),
+      }));
+      check('redesign: attached AI spec renders with follow-up Edit + Delete (detach)',
+        modelBefore.panel && modelBefore.detach && modelBefore.follow, JSON.stringify(modelBefore));
+      await page.click('#planModelDetachBtn');
+      await waitR(1200);
+      const modelAfter = await page.evaluate(() => [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'));
+      r = await req('GET', `/api/planning/strategies/${rdAiId}`);
+      check('redesign: spec Delete detaches the model and the panel leaves',
+        !modelAfter && r.data.model === null, JSON.stringify({ panelLeft: modelAfter, model: r.data.model }));
+      // Sink Edit + Delete on a minimal pool project.
+      r = await req('POST', '/api/investments/accounts', { name: 'Redesign Pool Acct', type: 'NonRegistered' });
+      const rdPoolAcct = r.data.id;
+      r = await req('POST', `/api/investments/accounts/${rdPoolAcct}/holdings`, { label: 'Redesign Pool Stock', kind: 'exchange', symbol: 'RD.POOL', currency: 'CAD', events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 10 }] });
+      const rdPoolHold = r.data.id;
+      const _rdVan = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+      r = await req('POST', `/api/investments/holdings/${rdPoolHold}/nav`, { date: `${_rdVan.slice(0, 7)}-15`, price: 20 });
+      check('redesign: pool holding NAV posted', r.status === 201, JSON.stringify(r.data));
+      r = await req('POST', '/api/planning/projects', { name: 'Redesign pool', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: rdPoolHold, percent: 100 }] }, applyRecommendation: true });
+      check('redesign: pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+      const rdPoolProj = r.data.project.id;
+      r = await req('GET', `/api/planning/projects/${rdPoolProj}`);
+      const rdPoolStrat = (r.data.strategies || [])[0];
+      check('redesign: pool recommendation strategy exists', !!rdPoolStrat, JSON.stringify((r.data.strategies || []).map((x) => x.id)));
+      r = await req('PUT', `/api/planning/strategies/${rdPoolStrat.id}/sink`, { sink: { kind: 'stock', holdingId: rdPoolHold, trendPct: 10, basis: 'Price CAGR', window: '1y' } });
+      check('redesign: pool sink saved', r.status === 200 && r.data.sink && r.data.sink.kind === 'stock', JSON.stringify(r.data.sink));
+      await page.goto(`http://ff.local/#planning/strategy/${rdPoolStrat.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      const sinkView = await page.evaluate(() => ({
+        panel: !!document.querySelector('#planSinkPanel'),
+        line: (document.querySelector('#planFactorSink')?.textContent || '').includes('Current sink'),
+        edit: !!document.querySelector('#planSinkEditBtn'),
+        del: !!document.querySelector('#planSinkDelBtn'),
+      }));
+      check('redesign: picked sink shows as a line with Edit + Delete', sinkView.panel && sinkView.line && sinkView.edit && sinkView.del, JSON.stringify(sinkView));
+      await page.click('#planSinkEditBtn');
+      await waitR(800);
+      const sinkEditor = await page.evaluate(() => !!document.querySelector('#planSinkSaveBtn'));
+      check('redesign: sink Edit opens the pick form', sinkEditor);
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      await page.click('#planSinkDelBtn');
+      await waitR(1500);
+      const sinkCleared = await page.evaluate(() => (document.querySelector('#planFactorSink')?.textContent || '').includes('No sink picked yet'));
+      r = await req('GET', `/api/planning/strategies/${rdPoolStrat.id}`);
+      check('redesign: sink Delete clears to the pick state and drops the sink ops',
+        sinkCleared && r.data.sink === null && !(r.data.ops || []).some((o) => o.source === 'sink'), JSON.stringify({ cleared: sinkCleared, sink: r.data.sink, ops: (r.data.ops || []).map((o) => o.source) }));
+      // Model thread display starts collapsed behind its toggle.
+      await page.goto(`http://ff.local/#planning/project/${rdProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      await page.click('#planAddStrategyBtn');
+      await waitR(800);
+      await page.click('#planChooseAi');
+      await waitR(400);
+      await page.click('#planChooseModel');
+      await waitR(800);
+      const thread = await page.evaluate(() => ({
+        toggle: !!document.querySelector('#planStrategyModelThreadToggle'),
+        hidden: !!document.querySelector('#planStrategyModelThread.hidden'),
+      }));
+      check('redesign: model thread starts collapsed behind a toggle', thread.toggle && thread.hidden, JSON.stringify(thread));
+      await page.click('#planStrategyModelThreadToggle');
+      await waitR(400);
+      const threadShown = await page.evaluate(() => !document.querySelector('#planStrategyModelThread.hidden'));
+      check('redesign: thread toggle reveals the thread', threadShown);
+    } finally { await browserR.close(); }
   }
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);

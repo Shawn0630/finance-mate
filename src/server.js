@@ -5912,6 +5912,33 @@ app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
   res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), sink: sinkSaved });
 });
 
+// Clearing a sink returns the strategy to the pick-a-new-sink state:
+// the sink column is nulled and the sink-generated sell/buy operations
+// (source 'sink') go with it; user-added operations are left alone.
+app.delete('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
+  if (p.category !== 'investment') return res.status(400).json({ error: 'sink is only for investment projects' });
+  const before = snapshotByAggregate(db, 'project', p.id);
+  const now = nowIso();
+  db.transaction(() => {
+    const sinkOps = db.prepare("SELECT id FROM plan_ops WHERE strategy_id = ? AND source = 'sink'").all(s.id);
+    for (const o of sinkOps) db.prepare('DELETE FROM plan_legs WHERE op_id = ?').run(o.id);
+    db.prepare("DELETE FROM plan_ops WHERE strategy_id = ? AND source = 'sink'").run(s.id);
+    db.prepare('UPDATE plan_strategies SET sink = NULL, updated_at = ? WHERE id = ?').run(now, s.id);
+    recordCommit(db, {
+      userId: req.user.id, username: req.user.username, module: 'planning',
+      entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+      entityLabel: p.name, summary: `Cleared sink · ${s.name} · ${p.name}`,
+      before, snapshot: snapshotByAggregate(db, 'project', p.id),
+    });
+  })();
+  res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), sink: null });
+});
+
 // Prime preset paths: complete date+rate point lists from the current
 // prime, labeled in plain words. The client still lets the user edit
 // the points after picking a preset.

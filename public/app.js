@@ -11749,28 +11749,10 @@ function planStrategyCardsRender(rows, projectId) {
       <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops</div>` : ''}
       ${sinkLine ? `<div class="n">${esc(sinkLine)}</div>` : ''}
       ${legacySinkLine}
-      <div class="toolbar">
-        <button class="small" data-plan-strategy-edit="${r.strategy.id}">Edit</button>
-        <button class="small danger" data-plan-strategy-del="${r.strategy.id}">Delete</button>
-      </div>
     </div>`;
   }).join('') || '<div class="note">No strategies yet.</div>';
   document.querySelectorAll('[data-plan-strategy]').forEach((el) => {
     el.addEventListener('click', () => { location.hash = `#planning/strategy/${el.dataset.planStrategy}`; });
-  });
-  document.querySelectorAll('[data-plan-strategy-edit]').forEach((b) => {
-    b.addEventListener('click', (e) => { e.stopPropagation(); location.hash = `#planning/strategy/${b.dataset.planStrategyEdit}`; });
-  });
-  document.querySelectorAll('[data-plan-strategy-del]').forEach((b) => {
-    b.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const row = rows.find((r) => r.strategy.id === Number(b.dataset.planStrategyDel));
-      const name = row ? row.strategy.name : ((planProjectData.strategies || []).find((st) => st.id === Number(b.dataset.planStrategyDel)) || {}).name || '';
-      if (!row && !name) return;
-      if (!confirm(`Delete strategy "${name}"?`)) return;
-      try { await api(`/api/planning/strategies/${b.dataset.planStrategyDel}`, { method: 'DELETE' }); loadPlanProject(projectId); }
-      catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
-    });
   });
 }
 async function loadPlanComparison(projectId) {
@@ -12279,6 +12261,13 @@ async function loadPlanStrategy(id, scenarioId) {
     planStrategyWire(data);
   });
 }
+function planLegLabel(l) {
+  const src = String(l.source_ref || '');
+  const srcLabel = src === 'cash' ? 'Declared cash' : src === 'pot' ? 'Cash pot' : src === 'external' ? 'External injection' : src === 'external_out' ? 'External out'
+    : src.startsWith('op:') ? `Op #${src.slice(3)}` : src.startsWith('repay:') ? `Repay property #${src.slice(6)}` : src.startsWith('declared:') ? `Declared #${src.slice(9)}` : src;
+  const amt = l.amount === 'all' ? 'All' : l.amount === 'remainder' ? 'Remainder' : money2(Number(l.amount));
+  return `${srcLabel} · ${amt}`;
+}
 function planStrategyHtml(d) {
   const s = d.strategy;
   const c = d.comparison;
@@ -12291,8 +12280,13 @@ function planStrategyHtml(d) {
       : o.op_type === 'buy' ? `Buy ${p.symbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}`
       : o.op_type === 'sell' ? `Sell ${p.units} units on ${esc(p.date || '')}`
       : `Position ${p.units} units on ${esc(p.date || '')}`;
+    const legRows = (o.op_type === 'buy' || o.op_type === 'sell') ? (o.legs || []).map((l) => `
+      <tr class="plan-leg-subrow" data-plan-leg-op="${o.id}" data-plan-leg-id="${l.id}">
+        <td></td><td>↳ Leg</td><td>${esc(planLegLabel(l))}</td><td></td>
+        <td class="toolbar"><button class="small" data-plan-leg-edit="${o.id}:${l.id}">Edit</button><button class="small danger" data-plan-leg-del="${o.id}:${l.id}">Delete</button></td>
+      </tr>`).join('') : '';
     return `<tr><td>${o.seq}</td><td>${esc(o.op_type)}</td><td>${desc}</td><td>${esc(o.source || '')}</td>
-      <td class="toolbar"><button class="small" data-plan-op-edit="${o.id}">Edit</button><button class="small danger" data-plan-op-del="${o.id}">Delete</button></td></tr>`;
+      <td class="toolbar"><button class="small" data-plan-op-edit="${o.id}">Edit</button><button class="small danger" data-plan-op-del="${o.id}">Delete</button></td></tr>${legRows}`;
   }).join('');
   const penRows = (d.projection.penalties || []).map((x) => `
     <div class="plan-row"><span>${esc(x.reason || 'Penalty')} · ${esc(x.date)} · ${esc(x.method)} · ${money2(x.penalty)}</span>
@@ -12319,11 +12313,12 @@ function planStrategyHtml(d) {
   return `
     <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
     <div class="panel">
-      <div class="section-head"><h3>${esc(s.letter)} · ${esc(s.name)}${s.merged ? ' · Merged' : ''}</h3>
-        <div class="toolbar">
+      <div class="section-head"><h3 id="planStrategyTitle">${esc(s.letter)} · ${esc(s.name)}${s.merged ? ' · Merged' : ''}</h3>
+        <div class="toolbar" id="planStrategyHeaderTools">
           ${s.merged
             ? '<button class="small" id="planRevertBtn">Revert merge</button>'
             : '<button class="primary" id="planMergeBtn">Merge</button>'}
+          <button class="small" id="planStrategyRenameBtn">Edit</button>
           <button class="small danger" id="planStrategyDeleteBtn">Delete</button>
         </div>
       </div>
@@ -12345,7 +12340,13 @@ function planStrategyHtml(d) {
         <div class="card breakdown-card"><div class="k">Penalty</div><div class="v">${planMoney(c.penaltyTotal)}</div><div class="n">Estimate — the bank quote governs</div></div>
       </div>
     </div>
-    ${penRows ? `<div class="panel"><div class="section-head"><h3>Penalties</h3></div>${penRows}</div>` : ''}
+    <div class="panel">
+      <div class="section-head"><h3>Operations</h3>
+        <div class="toolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
+      </div>
+      <table class="tbl"><thead><tr><th>#</th><th>Type</th><th>Detail</th><th>Source</th><th></th></tr></thead><tbody>${ops || '<tr><td colspan="5">No operations yet.</td></tr>'}</tbody></table>
+      <div class="msg" id="planOpsMsg"></div>
+    </div>
     <div class="panel">
       <div class="section-head"><h3>Mortgage balance</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyMortChart"></canvas></div>
@@ -12383,13 +12384,7 @@ function planStrategyHtml(d) {
       <div class="toolbar"><button class="small primary" id="planStrategyReportBtn">Generate report</button></div>
       <div class="msg" id="planStrategyReportMsg"></div>
     </div>
-    <div class="panel">
-      <div class="section-head"><h3>Operations</h3>
-        <div class="toolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
-      </div>
-      <table class="tbl"><thead><tr><th>#</th><th>Type</th><th>Detail</th><th>Source</th><th></th></tr></thead><tbody>${ops || '<tr><td colspan="5">No operations yet.</td></tr>'}</tbody></table>
-      <div class="msg" id="planOpsMsg"></div>
-    </div>
+    ${penRows ? `<div class="panel"><div class="section-head"><h3>Penalties</h3></div>${penRows}</div>` : ''}
     <div class="panel">
       <div class="section-head"><h3>Describe in words</h3></div>
       <div><textarea id="planAiDescribeText" rows="3" placeholder="e.g. Prepay $100,000 on Christina in January 2027, then refinance to a 5-year fixed at 4.2%"></textarea></div>
@@ -12422,7 +12417,7 @@ function planStrategyHtml(d) {
       }
       const firstMonth = (d.projection.stocks.series || [])[0];
       const trialMonth = firstMonth ? firstMonth.month : ((d.projection.mortgage.perProperty[Object.keys(d.projection.mortgage.perProperty)[0]] || {}).strategy || {}).series?.[0]?.month || '—';
-      return `<div class="panel"><div class="section-head"><h3>Model</h3></div>
+      return `<div class="panel"><div class="section-head"><h3>Model</h3><div class="toolbar"><button class="small danger" id="planModelDetachBtn">Delete</button></div></div>
         <div class="note">${esc(d.model.name)} · v${d.model.version} · ${esc(d.model.source)}</div>
         <div class="section-head"><h3>Bindings</h3></div>
         <table class="tbl"><thead><tr><th>Name</th><th>Entity</th><th>Field</th></tr></thead><tbody>${bindRows || '<tr><td colspan="3">No bindings.</td></tr>'}</tbody></table>
@@ -12450,6 +12445,85 @@ function planStrategyWire(d) {
   $('#planStrategyDeleteBtn').addEventListener('click', async () => {
     if (!confirm(`Delete strategy "${s.name}"?`)) return;
     try { await api(`/api/planning/strategies/${s.id}`, { method: 'DELETE' }); location.hash = `#planning/project/${d.project.id}`; }
+    catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
+  });
+  // Header rename: Edit swaps the title for an input + Save/Cancel.
+  const renameBtn = $('#planStrategyRenameBtn');
+  if (renameBtn) renameBtn.addEventListener('click', () => {
+    const title = $('#planStrategyTitle');
+    const tools = $('#planStrategyHeaderTools');
+    if (!title || !tools || title.querySelector('input')) return;
+    title.innerHTML = `<input id="planStrategyNameInput" value="${esc(s.name)}">`;
+    const save = document.createElement('button');
+    save.className = 'small primary';
+    save.id = 'planStrategyRenameSave';
+    save.textContent = 'Save';
+    const cancel = document.createElement('button');
+    cancel.className = 'small';
+    cancel.id = 'planStrategyRenameCancel';
+    cancel.textContent = 'Cancel';
+    renameBtn.replaceWith(save);
+    tools.appendChild(cancel);
+    const input = $('#planStrategyNameInput');
+    input.focus();
+    input.select();
+    cancel.addEventListener('click', () => loadPlanStrategy(s.id));
+    save.addEventListener('click', async () => {
+      const name = input.value.trim();
+      if (!name) { showMsg($('#planStrategyMsg'), 'err', 'strategy name is required'); return; }
+      try { await api(`/api/planning/strategies/${s.id}`, { method: 'PUT', body: { name } }); loadPlanStrategy(s.id); }
+      catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
+    });
+  });
+  // Funding-leg rows: Edit swaps the row for the leg editor (same
+  // row shape as the op modal, minus its Delete button); Delete
+  // drops the leg via the op PUT, which re-validates the survivors.
+  document.querySelectorAll('[data-plan-leg-edit]').forEach((b) => b.addEventListener('click', async () => {
+    const [opId, legId] = b.dataset.planLegEdit.split(':').map(Number);
+    const op = d.ops.find((o) => o.id === opId);
+    const leg = op ? (op.legs || []).find((l) => l.id === legId) : null;
+    if (!op || !leg) return;
+    const row = b.closest('tr');
+    try {
+      const ctx = await planLoadOpCtx(d.project.id, s.id);
+      row.innerHTML = `<td></td><td>↳ Leg</td><td colspan="2">${planLegRowHtml(op.op_type, ctx, leg, false)}</td>
+        <td class="toolbar"><button class="small primary" id="planLegSaveBtn">Save</button><button class="small" id="planLegCancelBtn">Cancel</button></td>`;
+      row.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+      const modeSel = row.querySelector('.plan-leg-mode');
+      const amtInput = row.querySelector('.plan-leg-amount');
+      if (modeSel) modeSel.addEventListener('change', () => {
+        amtInput.disabled = modeSel.value !== 'fixed';
+        if (amtInput.disabled) amtInput.value = '';
+      });
+      row.querySelector('#planLegCancelBtn').addEventListener('click', () => loadPlanStrategy(s.id));
+      row.querySelector('#planLegSaveBtn').addEventListener('click', async () => {
+        try {
+          const src = row.querySelector('.plan-leg-src').value;
+          const mode = row.querySelector('.plan-leg-mode').value;
+          const amount = mode === 'fixed' ? parseMoneyInput(row.querySelector('.plan-leg-amount').value) : mode;
+          const legs = (op.legs || []).map((l) => (l.id === legId ? { source_ref: src, amount } : { source_ref: l.source_ref, amount: l.amount }));
+          await api(`/api/planning/ops/${opId}`, { method: 'PUT', body: { legs } });
+          loadPlanStrategy(s.id);
+        } catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
+      });
+    } catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
+  }));
+  document.querySelectorAll('[data-plan-leg-del]').forEach((b) => b.addEventListener('click', async () => {
+    const [opId, legId] = b.dataset.planLegDel.split(':').map(Number);
+    const op = d.ops.find((o) => o.id === opId);
+    if (!op) return;
+    try {
+      const legs = (op.legs || []).filter((l) => l.id !== legId).map((l) => ({ source_ref: l.source_ref, amount: l.amount }));
+      await api(`/api/planning/ops/${opId}`, { method: 'PUT', body: { legs } });
+      loadPlanStrategy(s.id);
+    } catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
+  }));
+  // AI spec detach: Delete drops the model link; the panel itself
+  // disappears on reload because the strategy carries no model.
+  const detachBtn = $('#planModelDetachBtn');
+  if (detachBtn) detachBtn.addEventListener('click', async () => {
+    if (!confirm('Detach the AI model spec from this strategy?')) return;
+    try { await api(`/api/planning/strategies/${s.id}`, { method: 'PUT', body: { model_id: null } }); loadPlanStrategy(s.id); }
     catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
   });
   $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
@@ -12599,11 +12673,26 @@ function planSinkWire(d) {
   const sink = d.sink || null;
   let tp = {};
   try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
+  let sinkEditing = false;
   const render = () => {
     const defaultKind = tp.sinkKind === 'custom' ? 'custom' : 'stock';
     const curLine = sink
       ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: existing stock · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
       : 'No sink picked yet — the strategy holds the pool until you pick one.';
+    // A picked sink shows as a line with Edit + Delete; Delete clears
+    // it back to the pick form below. No sink = the pick form itself.
+    if (sink && !sinkEditing) {
+      sinkHost.innerHTML = `<div class="note">${esc(curLine)}</div>
+        <div class="toolbar"><button class="small" id="planSinkEditBtn">Edit</button><button class="small danger" id="planSinkDelBtn">Delete</button></div>
+        <div class="msg" id="planSinkMsg"></div>`;
+      $('#planSinkEditBtn').addEventListener('click', () => { sinkEditing = true; render(); });
+      $('#planSinkDelBtn').addEventListener('click', async () => {
+        if (!confirm('Delete the sink? This clears the sink and removes its sell/buy operations.')) return;
+        try { await api(`/api/planning/strategies/${s.id}/sink`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
+        catch (err) { showMsg($('#planSinkMsg'), 'err', err.message); }
+      });
+      return;
+    }
     sinkHost.innerHTML = `<div class="note">${esc(curLine)}</div>
       <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Existing stock</label>
       <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
@@ -13426,7 +13515,7 @@ function planBuySourceOpts(ctx) {
   for (const o of (ctx.ops || []).filter((x) => x.op_type === 'sell')) opts.push({ value: `op:${o.seq}`, label: `Sell op #${o.seq}` });
   return opts;
 }
-function planLegRowHtml(type, ctx, leg) {
+function planLegRowHtml(type, ctx, leg, withDel = true) {
   const l = leg || { source_ref: type === 'buy' ? 'cash' : 'pot', amount: 'remainder' };
   let srcOpts = '';
   if (type === 'buy') {
@@ -13442,7 +13531,7 @@ function planLegRowHtml(type, ctx, leg) {
     <select class="plan-leg-src">${srcOpts}</select>
     <select class="plan-leg-mode"><option value="fixed"${mode === 'fixed' ? ' selected' : ''}>Fixed</option><option value="all"${mode === 'all' ? ' selected' : ''}>All</option><option value="remainder"${mode === 'remainder' ? ' selected' : ''}>Remainder</option></select>
     <input class="plan-leg-amount" type="text" inputmode="decimal" data-money value="${mode === 'fixed' ? esc(String(l.amount)) : ''}"${mode !== 'fixed' ? ' disabled' : ''}>
-    <button type="button" class="small danger plan-leg-del">Delete</button></div>`;
+    ${withDel ? '<button type="button" class="small danger plan-leg-del">Delete</button>' : ''}</div>`;
 }
 // Funding-source picker (buy ops only): the app's checkbox
 // multi-select pattern — one box per source, each checked source is
@@ -13817,10 +13906,21 @@ async function openPlanStrategyModal(projectId) {
       <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
       <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out">${esc(prefillText || '')}</textarea></div>
-      <div id="planStrategyModelThread"></div>
+      <div class="toolbar"><button class="small" id="planStrategyModelThreadToggle">Show conversation thread</button></div>
+      <div id="planStrategyModelThread" class="hidden"></div>
       <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
       <div id="planStrategyModelOut"></div>`;
     $('#planBackToPresets').addEventListener('click', renderChooser);
+    // The thread stays collapsed until the user asks to see it —
+    // design rounds accumulate turns behind this toggle, never in
+    // the open by default.
+    $('#planStrategyModelThreadToggle').addEventListener('click', () => {
+      const el = $('#planStrategyModelThread');
+      const btn = $('#planStrategyModelThreadToggle');
+      if (!el || !btn) return;
+      el.classList.toggle('hidden');
+      btn.textContent = el.classList.contains('hidden') ? 'Show conversation thread' : 'Hide conversation thread';
+    });
     // One strategy row for the whole design session: repeated Design
     // clicks (after answering questions) reuse it instead of orphaning
     // a new empty strategy per round.
