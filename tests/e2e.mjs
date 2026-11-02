@@ -17847,33 +17847,60 @@ try {
       await page.goto(`http://ff.local/#planning/project/${cmpProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitC(1500);
       const proj = await page.evaluate(() => ({
-        trajChart: (() => { const c = document.querySelector('#planTrajectoryChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
+        deltaChart: (() => { const c = document.querySelector('#planTrajectoryChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
         trajNote: document.querySelector('#planTrajectoryNote')?.textContent || '',
-        masterHead: document.querySelector('#planMasterTable thead')?.textContent || '',
-        masterText: document.querySelector('#planMasterTable')?.textContent || '',
-        appleHead: document.querySelector('#planAppleTable thead')?.textContent || '',
-        appleDiff: !!document.querySelector('#planAppleTable .plan-diff'),
-        appleChecked: [...document.querySelectorAll('#planApplePicker input[type="checkbox"]')].map((c) => c.checked),
+        mergedHead: document.querySelector('#planMergedTable thead')?.textContent || '',
+        mergedText: document.querySelector('#planMergedTable')?.textContent || '',
+        mergedDiff: !!document.querySelector('#planMergedTable .plan-diff'),
+        mergedCellLines: (() => { const tr = [...document.querySelectorAll('#planMergedTable tbody tr')].find((x) => (x.cells[0]?.textContent || '').startsWith('Monthly payment')); if (!tr || !tr.cells[2]) return null; return [...tr.cells[2].querySelectorAll('div')].map((d) => d.textContent.trim()); })(),
+        pickerTop: (() => { const panel = document.querySelector('#planCompareNewPanel'); if (!panel) return false; const picker = panel.querySelector('#planComparePicker'); const chart = panel.querySelector('#planTrajectoryChart'); return !!picker && !!chart && (picker.compareDocumentPosition(chart) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0; })(),
+        payoffCell: (() => { const tr = [...document.querySelectorAll('#planMergedTable tbody tr')].find((x) => (x.cells[0]?.textContent || '') === 'Payoff'); if (!tr || !tr.cells[2]) return null; return { divs: [...tr.cells[2].querySelectorAll('div')].map((d) => d.textContent.trim()), text: tr.cells[2].textContent.trim() }; })(),
+        chips: [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')),
+        deltaSets: (() => { try { const ch = window.Chart && Chart.getChart ? Chart.getChart(document.getElementById('planTrajectoryChart')) : null; return ch ? ch.data.datasets.map((d) => ({ label: d.label, maxAbs: Math.max(...d.data.map((v) => Math.abs(v || 0))) })) : []; } catch { return []; } })(),
+        oldHosts: !!document.querySelector('#planMasterTable') || !!document.querySelector('#planAppleTable'),
       }));
-      check('comparison: project overlay chart + master table render under the picked scenario',
-        proj.trajChart && proj.trajNote.includes('Compare world') && proj.masterHead.includes('Baseline') && proj.masterText.includes('Prepay 10k'),
+      check('comparison: project difference chart + merged table render under the picked scenario',
+        proj.deltaChart && proj.trajNote.includes('Compare world') && proj.mergedHead.includes('Baseline') && proj.mergedText.includes('Prepay 10k'),
         JSON.stringify(proj));
-      check('comparison: Apple compare shows baseline absolutes with highlighted strategy deltas',
-        proj.appleHead.includes('Baseline') && proj.appleHead.includes('Prepay 10k') && proj.appleDiff && proj.appleChecked.length >= 1 && proj.appleChecked.every(Boolean),
+      check('comparison: merged table shows baseline absolutes with strategy absolute + delta cells and highlighted deltas',
+        proj.mergedHead.includes('Baseline') && proj.mergedHead.includes('Prepay 10k') && proj.mergedDiff && proj.mergedCellLines && proj.mergedCellLines.length === 2 && proj.chips.length >= 1 && proj.chips.every((v) => v === 'true') && !proj.oldHosts,
         JSON.stringify(proj));
-      await page.evaluate(() => { document.querySelectorAll('#planApplePicker input[type="checkbox"]').forEach((cb) => { if (cb.checked) cb.click(); }); });
-      await waitC(800);
+      check('comparison: picker is chips at the panel top, not a checkbox stack',
+        proj.pickerTop && proj.chips.length >= 1, JSON.stringify(proj));
+      check('comparison: difference chart plots a nonzero Balance Δ line for the prepay strategy',
+        proj.deltaSets.some((d) => d.label.includes('Balance Δ') && d.maxAbs > 0), JSON.stringify(proj.deltaSets));
+      check('comparison: merged Payoff cell shows shift alone when it differs from the displayed months',
+        proj.payoffCell && proj.payoffCell.divs.length === 0 && proj.payoffCell.text.includes('+53 months'), JSON.stringify(proj.payoffCell));
+      for (;;) {
+        const more = await page.evaluate(() => {
+          const b = document.querySelector('#planComparePicker button[data-plan-apple][aria-pressed="true"]');
+          if (!b) return false;
+          b.click();
+          return true;
+        });
+        if (!more) break;
+        await waitC(500);
+      }
       const unpicked = await page.evaluate(() => ({
-        head: document.querySelector('#planAppleTable thead')?.textContent || '',
-        note: document.querySelector('#planAppleTable')?.textContent || '',
+        head: document.querySelector('#planMergedTable thead')?.textContent || '',
+        note: document.querySelector('#planMergedTable')?.textContent || '',
+        chartSets: (() => { try { const ch = window.Chart && Chart.getChart ? Chart.getChart(document.getElementById('planTrajectoryChart')) : null; return ch ? ch.data.datasets.map((d) => d.label) : null; } catch { return null; } })(),
       }));
-      check('comparison: Apple picker uncheck-all leaves the baseline column + pick note',
-        unpicked.head.includes('Baseline') && !unpicked.head.includes('Prepay 10k') && unpicked.note.includes('Pick a strategy to compare.'),
+      check('comparison: picker uncheck-all leaves the baseline column + pick note, chart emptied',
+        unpicked.head.includes('Baseline') && !unpicked.head.includes('Prepay 10k') && unpicked.note.includes('Pick a strategy to compare.') && (unpicked.chartSets === null || unpicked.chartSets.length === 0),
         JSON.stringify(unpicked));
-      await page.evaluate(() => { document.querySelectorAll('#planApplePicker input[type="checkbox"]').forEach((cb) => { if (!cb.checked) cb.click(); }); });
-      await waitC(800);
-      const repicked = await page.evaluate(() => document.querySelector('#planAppleTable thead')?.textContent || '');
-      check('comparison: Apple picker re-check restores the strategy column',
+      for (;;) {
+        const more = await page.evaluate(() => {
+          const b = document.querySelector('#planComparePicker button[data-plan-apple][aria-pressed="false"]');
+          if (!b) return false;
+          b.click();
+          return true;
+        });
+        if (!more) break;
+        await waitC(500);
+      }
+      const repicked = await page.evaluate(() => document.querySelector('#planMergedTable thead')?.textContent || '');
+      check('comparison: picker re-check restores the strategy column',
         repicked.includes('Prepay 10k'), JSON.stringify(repicked));
       // Scenario re-pick: uncheck all (one at a time with waits, so
       // no stale load overwrites the re-pick state) → the new panels
@@ -17890,11 +17917,10 @@ try {
         legacyNote: document.querySelector('#planCompareEmpty')?.textContent || '',
         trajNote: document.querySelector('#planTrajectoryNote')?.textContent || '',
         trajHidden: (() => { const c = document.querySelector('#planTrajectoryChart'); const w = c ? c.closest('.chart-wrap') : null; return !w || getComputedStyle(w).display === 'none'; })(),
-        master: (document.querySelector('#planMasterTable')?.textContent || '').trim(),
-        apple: (document.querySelector('#planAppleTable')?.textContent || '').trim(),
+        merged: (document.querySelector('#planMergedTable')?.textContent || '').trim(),
       }));
       check('comparison: uncheck-all scenarios shows the re-pick panel only (new panels cleared)',
-        repick.legacyNote.includes('Pick a scenario') && repick.trajNote.includes('Pick a scenario') && repick.trajHidden && repick.master === '' && repick.apple === '',
+        repick.legacyNote.includes('Pick a scenario') && repick.trajNote.includes('Pick a scenario') && repick.trajHidden && repick.merged === '',
         JSON.stringify(repick));
     } finally { await browserC.close(); }
   }
@@ -18066,42 +18092,45 @@ try {
         if (!tr) return null;
         return { label: tr.cells[0].textContent, cells: [...tr.cells].map((c) => c.textContent.trim()) };
       }, sel);
+      // Merged table: baseline cell is plain text; each strategy cell
+      // carries absolute + delta as two divs (stock-only: single '—').
+      const readMergedPayRow = async (sel) => page.evaluate((sel2) => {
+        const tr = [...document.querySelectorAll(`${sel2} tbody tr`)].find((x) => (x.cells[0]?.textContent || '').startsWith('Monthly payment'));
+        if (!tr) return null;
+        const cols = [...tr.cells].slice(2).map((c) => {
+          const ds = [...c.querySelectorAll('div')].map((d) => d.textContent.trim());
+          return ds.length >= 2 ? { abs: ds[0], delta: ds[1] } : { abs: c.textContent.trim(), delta: null };
+        });
+        return { label: tr.cells[0].textContent, baseline: tr.cells[1] ? tr.cells[1].textContent.trim() : null, cols };
+      }, sel);
       await page.goto(`http://ff.local/#planning/project/${ps1Proj}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitPS(1500);
-      const ps1Master = await readPayRow('#planMasterTable');
-      const ps1Apple = await readPayRow('#planAppleTable');
-      check('payscope: single project page master row names A with A-only payments',
-        ps1Master && ps1Master.label.includes('11 PayScope A Lane')
-        && ps1Master.cells[1] === ps1Exp.baseline && ps1Master.cells[2] === ps1Exp.strategy,
-        JSON.stringify({ master: ps1Master, exp: ps1Exp }));
-      check('payscope: single project page Apple row shows the A-only delta',
-        ps1Apple && ps1Apple.cells[1] === ps1Exp.baseline && ps1Apple.cells[2] === ps1Exp.delta,
-        JSON.stringify({ apple: ps1Apple, exp: ps1Exp }));
+      const ps1Merged = await readMergedPayRow('#planMergedTable');
+      check('payscope: single project page merged row names A with A-only absolute + delta',
+        ps1Merged && ps1Merged.label.includes('11 PayScope A Lane')
+        && ps1Merged.baseline === ps1Exp.baseline && ps1Merged.cols[0].abs === ps1Exp.strategy && ps1Merged.cols[0].delta === ps1Exp.delta,
+        JSON.stringify({ merged: ps1Merged, exp: ps1Exp }));
       const ps1Legacy = await readPayRow('#planCompareTable');
       check('payscope: single project page legacy row shows the A-only delta',
         ps1Legacy && ps1Legacy.cells[1] === ps1Exp.delta,
         JSON.stringify({ legacy: ps1Legacy, exp: ps1Exp }));
       await page.goto(`http://ff.local/#planning/project/${ps2Proj}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitPS(1500);
-      const ps2Master = await readPayRow('#planMasterTable');
-      const ps2Apple = await readPayRow('#planAppleTable');
-      check('payscope: multi project page master row sums A2 + B2, stocks-only is —',
-        ps2Master && ps2Master.cells[1] === ps2Exp.baseline && ps2Master.cells[2] === ps2Exp.strategy && ps2Master.cells[3] === '—',
-        JSON.stringify({ master: ps2Master, exp: ps2Exp }));
-      check('payscope: multi project page Apple row shows the A2 + B2 delta, stocks-only is —',
-        ps2Apple && ps2Apple.cells[1] === ps2Exp.baseline && ps2Apple.cells[2] === ps2Exp.delta && ps2Apple.cells[3] === '—',
-        JSON.stringify({ apple: ps2Apple, exp: ps2Exp }));
+      const ps2Merged = await readMergedPayRow('#planMergedTable');
+      check('payscope: multi project page merged row sums A2 + B2 with absolute + delta, stocks-only is —',
+        ps2Merged && ps2Merged.baseline === ps2Exp.baseline && ps2Merged.cols[0].abs === ps2Exp.strategy && ps2Merged.cols[0].delta === ps2Exp.delta && ps2Merged.cols[1].abs === '—',
+        JSON.stringify({ merged: ps2Merged, exp: ps2Exp }));
       const ps2Legacy = await readPayRow('#planCompareTable');
       check('payscope: multi project page legacy row shows the A2 + B2 delta, stocks-only is —',
         ps2Legacy && ps2Legacy.cells[1] === ps2Exp.delta && ps2Legacy.cells[2] === '—',
         JSON.stringify({ legacy: ps2Legacy, exp: ps2Exp }));
       await page.goto(`http://ff.local/#planning/report/${ps1Proj}/${ps1Rep}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitPS(1500);
-      const psRepMaster = await readPayRow('#planReportMasterTable');
-      check('payscope: report view master row names A with A-only payments',
-        psRepMaster && psRepMaster.label.includes('11 PayScope A Lane')
-        && psRepMaster.cells[1] === ps1Exp.baseline && psRepMaster.cells[2] === ps1Exp.strategy,
-        JSON.stringify({ master: psRepMaster, exp: ps1Exp }));
+      const psRepMerged = await readMergedPayRow('#planReportMergedTable');
+      check('payscope: report view merged row names A with A-only absolute + delta',
+        psRepMerged && psRepMerged.label.includes('11 PayScope A Lane')
+        && psRepMerged.baseline === ps1Exp.baseline && psRepMerged.cols[0].abs === ps1Exp.strategy && psRepMerged.cols[0].delta === ps1Exp.delta,
+        JSON.stringify({ merged: psRepMerged, exp: ps1Exp }));
     } finally { await browserPS.close(); }
   }
   // ------------------------------------------- property net excludes stockGain
@@ -18239,11 +18268,10 @@ try {
       await waitSG(1500);
       const sgTables = await pageSG.evaluate(() => ({
         legacy: document.querySelector('#planCompareTable')?.textContent || '',
-        master: document.querySelector('#planMasterTable')?.textContent || '',
-        apple: document.querySelector('#planAppleTable')?.textContent || '',
+        merged: document.querySelector('#planMergedTable')?.textContent || '',
       }));
-      check('stockgain: legacy, master and Apple tables show a Stock gain row', sgTables.legacy.includes('Stock gain') && sgTables.master.includes('Stock gain') && sgTables.apple.includes('Stock gain'),
-        JSON.stringify({ legacy: sgTables.legacy.slice(0, 200), master: sgTables.master.slice(0, 200), apple: sgTables.apple.slice(0, 200) }));
+      check('stockgain: legacy and merged tables show a Stock gain row', sgTables.legacy.includes('Stock gain') && sgTables.merged.includes('Stock gain'),
+        JSON.stringify({ legacy: sgTables.legacy.slice(0, 200), merged: sgTables.merged.slice(0, 200) }));
     } finally { await browserSG.close(); }
   }
   // ------------------------------------------- report + templates
@@ -18401,12 +18429,12 @@ try {
         const t = el ? el.textContent : '';
         return {
           hash: location.hash, world: t.includes('Under Report world'), method: t.includes('Monthly outstanding principal from the engine projection'),
-          traj: !!document.querySelector('#planReportTrajectoryChart'), master: (document.querySelector('#planReportMasterTable')?.textContent || '').includes('Baseline'),
-          apple: (document.querySelector('#planReportAppleTable')?.textContent || '').includes('Monthly payment'),
+          traj: !!document.querySelector('#planReportTrajectoryChart'), merged: (document.querySelector('#planReportMergedTable')?.textContent || '').includes('Baseline'),
+          mergedPay: (document.querySelector('#planReportMergedTable')?.textContent || '').includes('Monthly payment'),
         };
       });
       check('report: pinned view renders under its scenario with method line + comparison component',
-        view.hash.startsWith('#planning/report/') && view.world && view.method && view.traj && view.master && view.apple, JSON.stringify(view));
+        view.hash.startsWith('#planning/report/') && view.world && view.method && view.traj && view.merged && view.mergedPay, JSON.stringify(view));
       // Deleted pinned scenario re-opens the pin panel; re-pinning restores the view.
       // (The base scenario cannot be deleted, so the second scenario becomes base first.)
       r = await req('POST', `/api/planning/scenarios/${repScen2Id}/set-base`, {});
@@ -18959,7 +18987,7 @@ try {
       });
       check('detail-clarity: diff monthly table groups by year with annual-sum rows (flows summed, balances year-end)',
         grouping.groups >= 2 && grouping.checked.length > 0 && grouping.checked.every((c) => c.intSavedOk && c.intBaseOk && c.balOk), JSON.stringify(grouping));
-      // Project comparison: trajectory title + caption + picker +
+      // Project comparison: difference-chart title + caption + picker +
       // breakdown chart; 1y narrows both charts (via Chart.getChart).
       await page.goto(`http://ff.local/#planning/project/${dcProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
@@ -18967,15 +18995,15 @@ try {
         const panel = document.querySelector('#planCompareNewPanel');
         const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
         return {
-          title: [...(panel ? panel.querySelectorAll('h3') : [])].map((h) => h.textContent.trim()).includes('Total value over time'),
-          caption: (panel?.textContent || '').includes('X: month') && (panel?.textContent || '').includes('total value (CAD)'),
+          title: [...(panel ? panel.querySelectorAll('h3') : [])].map((h) => h.textContent.trim()).includes('Difference vs baseline'),
+          caption: (panel?.textContent || '').includes('X: month') && (panel?.textContent || '').includes('Balance Δ'),
           picker: !!panel?.querySelector('[data-plan-traj-preset="1y"]'),
           breakdown: !!document.querySelector('#planTrajectoryBreakdownChart'),
           labelsAll: chartOf('planTrajectoryChart'),
           labelsBreak: chartOf('planTrajectoryBreakdownChart'),
         };
       });
-      check('detail-clarity: comparison trajectory has title, axis caption, picker and breakdown bars',
+      check('detail-clarity: comparison difference chart has title, axis caption, picker and breakdown bars',
         traj.title && traj.caption && traj.picker && traj.breakdown && traj.labelsAll > 12 && traj.labelsBreak > 12, JSON.stringify(traj));
       await page.click('[data-plan-traj-preset="1y"]');
       await waitD(800);
@@ -18983,7 +19011,7 @@ try {
         const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
         return { labels: chartOf('planTrajectoryChart'), labelsBreak: chartOf('planTrajectoryBreakdownChart'), active: !!document.querySelector('[data-plan-traj-preset="1y"].active') };
       });
-      check('detail-clarity: trajectory 1y preset narrows both the trajectory chart and the breakdown bars',
+      check('detail-clarity: difference 1y preset narrows both the difference chart and the breakdown bars',
         narrowed.labels === 12 && narrowed.labelsBreak === 12 && narrowed.active, JSON.stringify(narrowed));
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
@@ -18992,7 +19020,7 @@ try {
       const repView = await page.evaluate(() => ({
         title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC balance path'),
         axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
-        trajTitle: [...document.querySelectorAll('#planReportComparePanel h3')].map((h) => h.textContent.trim()).includes('Total value over time'),
+        trajTitle: [...document.querySelectorAll('#planReportComparePanel h3')].map((h) => h.textContent.trim()).includes('Difference vs baseline'),
         trajBreak: !!document.querySelector('#planReportTrajectoryBreakdownChart'),
       }));
       check('detail-clarity: template report chart has title + axis caption, embedded comparison too',

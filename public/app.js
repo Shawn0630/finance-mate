@@ -8553,7 +8553,7 @@ $('#monthPop').addEventListener('click', (e) => {
   }
   // Comparison-trajectory range: same fill-one-side + clamp + custom
   // rule as the diff range, then re-render the active panel — the
-  // picker drives both the trajectory chart and the breakdown bars.
+  // picker drives both the difference chart and the breakdown bars.
   if (monthPopFor.startsWith('planTraj:')) {
     const which = monthPopFor.split(':')[1];
     const ym = cell.dataset.ym;
@@ -11399,8 +11399,9 @@ function planProjectHtml(d) {
   const compareNewPanel = `<div class="panel" id="planCompareNewPanel">
       <div class="section-head"><h3>Strategy comparison</h3></div>
       <div class="note" id="planTrajectoryNote"></div>
-      <div class="section-head"><h3>Total value over time</h3></div>
-      <div class="note">X: month · Y: total value (CAD) = assessed value − outstanding principal + stock value. A pure rate switch changes no holdings, so identical lines mean holdings are unchanged.</div>
+      <div id="planComparePicker" class="toolbar"></div>
+      <div class="section-head"><h3>Difference vs baseline</h3></div>
+      <div class="note">X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.</div>
       <div id="planTrajRange"></div>
       <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planTrajectoryChart"></canvas></div>
       <div id="planTrajectoryEmpty"></div>
@@ -11408,12 +11409,8 @@ function planProjectHtml(d) {
       <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
       <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planTrajectoryBreakdownChart"></canvas></div>
       <div id="planTrajectoryBreakdownEmpty"></div>
-      <div class="section-head"><h3>Master table</h3></div>
-      <div id="planMasterTable"></div>
-      <div class="section-head"><h3>Compare strategies</h3></div>
-      <div id="planApplePicker"></div>
-      <div id="planAppleTable"></div>
-      <div class="note" id="planAppleNote">Baseline: absolute figures. Strategy columns: deltas vs baseline.</div>
+      <div id="planMergedTable"></div>
+      <div class="note">Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below.</div>
     </div>`;
   // DETAIL ORDER (both branches): header → scenarios → baselines →
   // strategies → (declared assets for sell templates / legacy) →
@@ -11864,12 +11861,10 @@ async function loadPlanComparison(projectId) {
     if (trajNote) trajNote.textContent = 'Pick a scenario to compare under.';
     const trajEmpty = $('#planTrajectoryEmpty');
     if (trajEmpty) trajEmpty.innerHTML = '';
-    const master = $('#planMasterTable');
-    if (master) master.innerHTML = '';
-    const pickerNew = $('#planApplePicker');
+    const merged = $('#planMergedTable');
+    if (merged) merged.innerHTML = '';
+    const pickerNew = $('#planComparePicker');
     if (pickerNew) pickerNew.innerHTML = '';
-    const apple = $('#planAppleTable');
-    if (apple) apple.innerHTML = '';
     return;
   }
   const q = scenarios.length ? `?scenarioIds=${planCompareScenarioIds.join(',')}` : '';
@@ -12286,8 +12281,9 @@ async function loadPlanReport(projectId, reportId) {
       <div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
-        <div class="section-head"><h3>Total value over time</h3></div>
-        <div class="note">X: month · Y: total value (CAD) = assessed value − outstanding principal + stock value. A pure rate switch changes no holdings, so identical lines mean holdings are unchanged.</div>
+        <div id="planReportComparePicker" class="toolbar"></div>
+        <div class="section-head"><h3>Difference vs baseline</h3></div>
+        <div class="note">X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.</div>
         <div id="planReportTrajRange"></div>
         <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
@@ -12295,12 +12291,8 @@ async function loadPlanReport(projectId, reportId) {
         <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
         <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planReportTrajectoryBreakdownChart"></canvas></div>
         <div id="planReportTrajectoryBreakdownEmpty"></div>
-        <div class="section-head"><h3>Master table</h3></div>
-        <div id="planReportMasterTable"></div>
-        <div class="section-head"><h3>Compare strategies</h3></div>
-        <div id="planReportApplePicker"></div>
-        <div id="planReportAppleTable"></div>
-        <div class="note">Baseline: absolute figures. Strategy columns: deltas vs baseline. Total value = property equity + stock value; equity = assessed value − outstanding principal.</div>
+        <div id="planReportMergedTable"></div>
+        <div class="note">Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Total value = property equity + stock value; equity = assessed value − outstanding principal.</div>
       </div>`;
     draws.forEach((d) => { try { d(); } catch { /* a failed chart never blocks the tables */ } });
     // Project report includes the comparison component, reused from
@@ -12312,8 +12304,8 @@ async function loadPlanReport(projectId, reportId) {
         wrapSel: '#planReportComparePanel .plan-traj-wrap',
         range: '#planReportTrajRange', breakdown: 'planReportTrajectoryBreakdownChart', breakdownEmpty: '#planReportTrajectoryBreakdownEmpty',
         breakdownWrapSel: '#planReportComparePanel .plan-traj-breakdown-wrap',
-        master: '#planReportMasterTable',
-        picker: '#planReportApplePicker', apple: '#planReportAppleTable', ctx: { block: null, appleIds: null },
+        master: '#planReportMergedTable',
+        picker: '#planReportComparePicker', merged: '#planReportMergedTable', ctx: { block: null, appleIds: null },
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
   });
@@ -13139,11 +13131,10 @@ const planCompareDefaultIds = () => ({
   wrapSel: '#planCompareNewPanel .plan-traj-wrap',
   range: '#planTrajRange', breakdown: 'planTrajectoryBreakdownChart', breakdownEmpty: '#planTrajectoryBreakdownEmpty',
   breakdownWrapSel: '#planCompareNewPanel .plan-traj-breakdown-wrap',
-  master: '#planMasterTable',
-  picker: '#planApplePicker', apple: '#planAppleTable',
+  picker: '#planComparePicker', merged: '#planMergedTable',
 });
-// Trajectory range state: module-global for the project page, per-ctx
-// for the report view (mirrors the Apple picker split). The active
+// Difference-chart range state: module-global for the project page,
+// per-ctx for the report view (mirrors the picker split). The active
 // target lets the shared month picker re-render the panel it came
 // from; only one comparison panel is visible at a time, so a single
 // active target is safe.
@@ -13170,9 +13161,9 @@ function planCompareNewRender(block, ids) {
   const t = ids || planCompareDefaultIds();
   if (ids) { t.block = block; if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id); }
   else { planCompareNewBlock = block; t.block = block; if (planAppleIds == null) planAppleIds = block.strategies.map((r) => r.strategy.id); }
-  // Apple picker state lives on the target (module globals for the
+  // Picker state lives on the target (module globals for the
   // project page, the passed ctx for the report view) so each view's
-  // picker re-renders only its own table.
+  // picker re-renders only its own panel.
   t.getAppleIds = () => (ids ? t.appleIds : planAppleIds);
   t.setAppleIds = (v) => { if (ids) t.appleIds = v; else planAppleIds = v; };
   const note = $(t.note);
@@ -13195,6 +13186,8 @@ function planCompareNewRender(block, ids) {
   }
   const effMonths = planTrajEffectiveRange(months, trajState);
   const byMonth = (tr) => { const m = new Map((tr.monthly || []).map((r) => [r.month, r])); return (mo) => m.get(mo); };
+  const picked = block.strategies.filter((r) => t.getAppleIds().includes(r.strategy.id));
+  const pickedIds = picked.map((r) => r.strategy.id);
   const wrap = document.querySelector(t.wrapSel);
   const empty = $(t.empty);
   const bWrap = document.querySelector(t.breakdownWrapSel);
@@ -13202,16 +13195,34 @@ function planCompareNewRender(block, ids) {
   if (trajs.length && effMonths.length) {
     if (wrap) wrap.style.display = '';
     if (empty) empty.innerHTML = '';
-    planLineChart(t.chart, effMonths.map(formatYM), trajs.map((tr, i) => {
-      const get = byMonth(tr);
-      return { label: tr.label, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : r.total_value; }), borderColor: planColor(i), backgroundColor: planColor(i), spanGaps: true };
-    }));
-    // Payment breakdown: per-month scheduled interest (solid) +
-    // principal (light), stacked per trajectory, over the same range.
+    // Difference chart: Balance Δ / Value Δ advantage lines per
+    // picked strategy, the same series the strategy-detail diff
+    // panel plots (baseline balance − strategy balance; strategy
+    // value − baseline value). A pure rate switch moves no holdings,
+    // so the old total-value lines overlapped perfectly; the Δ lines
+    // show the actual difference, and a flat $0 line honestly means
+    // there is none.
+    if (picked.length) {
+      const dDatasets = [];
+      picked.forEach((r, i) => {
+        const monthly = planDiffMonthly({ baseline: block.baseline, projection: r.projection });
+        const byMo = new Map(monthly.map((m) => [m.month, m]));
+        if (monthly.some((m) => m.balDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Balance Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.balDiff; }), borderColor: planColor(2 * i), backgroundColor: planColor(2 * i), spanGaps: true });
+        if (monthly.some((m) => m.valDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Value Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valDiff; }), borderColor: planColor(2 * i + 1), backgroundColor: planColor(2 * i + 1), spanGaps: true });
+      });
+      if (dDatasets.length) planLineChart(t.chart, effMonths.map(formatYM), dDatasets);
+      else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
+    } else {
+      planDestroyChart(t.chart);
+      if (empty) empty.innerHTML = '<div class="note">Pick a strategy to compare.</div>';
+    }
+    // Payment breakdown: same range, baseline + picked trajectories
+    // only (the picker drives both charts now).
     if (bWrap) bWrap.style.display = '';
     if (bEmpty) bEmpty.innerHTML = '';
+    const shownTrajs = trajs.filter((tr) => tr.key === 'baseline' || pickedIds.includes(Number(tr.key)));
     const bDatasets = [];
-    trajs.forEach((tr, i) => {
+    shownTrajs.forEach((tr, i) => {
       const get = byMonth(tr);
       bDatasets.push({ label: `${tr.label} interest`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.interest || 0); }), backgroundColor: planColor(i), stack: tr.label });
       bDatasets.push({ label: `${tr.label} principal`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.principal || 0); }), backgroundColor: planColorAlpha(planColor(i), 0.45), stack: tr.label });
@@ -13225,36 +13236,36 @@ function planCompareNewRender(block, ids) {
     if (empty) empty.innerHTML = `<div class="note">${trajs.length && months.length ? 'No months in this range.' : 'No trajectory data.'}</div>`;
     if (bEmpty) bEmpty.innerHTML = '';
   }
-  const baseAbs = planMortAbs(block.baseline, 'baseline');
-  const payMeta = planPaymentScopeMeta(block);
-  const baseValue = planBaselineValue(block);
-  const masterRows = [
-    { label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => (r.paymentScope ? planMoney(r.paymentScope.strategy) : planMoney(planMortAbs(r.projection, 'strategy').payment)) },
-    { label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => planMoney(planMortAbs(r.projection, 'strategy').interest) },
-    { label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => planMortAbs(r.projection, 'strategy').payoff || '—' },
-    { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => planMoney(r.comparison.valueAtHorizon) },
-    { label: 'Total cost', base: '—', strat: (r) => planMoney(r.comparison.cost) },
-    { label: 'Total gain', base: '—', strat: (r) => planMoney(r.comparison.gain) },
-    { label: 'Stock gain', base: '—', strat: (r) => planMoney(r.comparison.stockGain) },
-    { label: 'Net benefit', base: '—', strat: (r) => planSigned(r.comparison.net) },
-    { label: 'Equity Δ', base: '—', strat: (r) => (r.equityDelta != null ? planSigned(r.equityDelta) : '—') },
-    { label: 'Principal Δ', base: '—', strat: (r) => (r.principalDelta != null ? planSigned(r.principalDelta) : '—') },
-  ];
-  const masterHead = '<tr><th></th><th>Baseline</th>' + block.strategies.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('') + '</tr>';
-  const masterBody = masterRows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + block.strategies.map((r) => `<td>${row.strat(r)}</td>`).join('') + '</tr>').join('');
-  const master = $(t.master);
-  if (master) master.innerHTML = `<table class="tbl"><thead>${masterHead}</thead><tbody>${masterBody}</tbody></table>`;
+  // Strategy picker: horizontal toggle chips at the panel top. One
+  // picker drives the difference chart, the breakdown bars and the
+  // merged table.
   const picker = $(t.picker);
   if (picker) {
-    picker.innerHTML = block.strategies.map((r) => `<label class="chk"><input type="checkbox" data-plan-apple="${r.strategy.id}"${t.getAppleIds().includes(r.strategy.id) ? ' checked' : ''}> ${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</label>`).join(' ');
-    picker.querySelectorAll('[data-plan-apple]').forEach((cb) => cb.addEventListener('change', () => {
-      t.setAppleIds([...picker.querySelectorAll('[data-plan-apple]:checked')].map((x) => Number(x.dataset.planApple)));
-      planAppleRender(t);
+    picker.innerHTML = block.strategies.map((r) => `<button class="small plan-pick-chip${t.getAppleIds().includes(r.strategy.id) ? ' active' : ''}" data-plan-apple="${r.strategy.id}" aria-pressed="${t.getAppleIds().includes(r.strategy.id) ? 'true' : 'false'}">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</button>`).join(' ');
+    picker.querySelectorAll('[data-plan-apple]').forEach((b) => b.addEventListener('click', () => {
+      const id = Number(b.dataset.planApple);
+      const cur = t.getAppleIds();
+      t.setAppleIds(cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
+      planCompareNewRender(block, ids);
     }));
   }
-  planAppleRender(t);
+  planMergedRender(t);
 }
-function planAppleRender(t) {
+// Merged comparison table: one table replaces the old Master +
+// Apple pair. Baseline column: absolute figures. Each picked
+// strategy cell: its absolute figure with the delta vs baseline
+// below it (dimmed); vs-baseline-only rows keep their single figure.
+// The Monthly payment row keeps the payment-scope rule (only the
+// properties the strategy's mortgage ops touch; single touched
+// property names its address in the row label; stock-only is '—').
+// Payoff honesty: the shift sums per-property month shifts, so it
+// need not equal the difference of the displayed months — the
+// displayed month is the LATEST payoff across properties, while the
+// shift may come from a property that is not the latest. Month +
+// shift show together only when they are arithmetically consistent
+// (strategy month = baseline month − shift); otherwise the shift
+// alone (old Apple form), never a pair that contradicts itself.
+function planMergedRender(t) {
   t = t || planCompareDefaultIds();
   const block = t.block || planCompareNewBlock;
   if (!block) return;
@@ -13263,26 +13274,45 @@ function planAppleRender(t) {
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const payMeta = planPaymentScopeMeta(block);
   const baseValue = planBaselineValue(block);
-  const diffCls = (v) => (v != null && v !== 0) ? ' class="plan-diff"' : '';
   const months = (v) => (v == null ? '—' : ((v >= 0 ? '+' : '') + v + ' months'));
-  // Strategy cells are deltas vs baseline; cost/gain/net are the
-  // vs-baseline figures by construction and stay unhighlighted, so
-  // the bold marks only the six true delta rows.
-  const appleRows = [
-    { label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => { const dv = r.paymentScope ? r.paymentScope.delta : r.comparison.paymentDelta; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
-    { label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => { const dv = r.comparison.interestSaved == null ? null : -r.comparison.interestSaved; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
-    { label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => `<td${diffCls(r.comparison.payoffShiftMonths)}>${months(r.comparison.payoffShiftMonths)}</td>` },
-    { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => { const dv = (r.comparison.valueAtHorizon != null && r.comparison.baselineValueAtHorizon != null) ? r.comparison.valueAtHorizon - r.comparison.baselineValueAtHorizon : null; return `<td${diffCls(dv)}>${planSigned(dv)}</td>`; } },
-    { label: 'Total cost', base: '—', strat: (r) => `<td>${planMoney(r.comparison.cost)}</td>` },
-    { label: 'Total gain', base: '—', strat: (r) => `<td>${planMoney(r.comparison.gain)}</td>` },
-    { label: 'Stock gain', base: '—', strat: (r) => `<td>${planMoney(r.comparison.stockGain)}</td>` },
-    { label: 'Net benefit', base: '—', strat: (r) => `<td>${planSigned(r.comparison.net)}</td>` },
-    { label: 'Equity Δ', base: '—', strat: (r) => `<td${diffCls(r.equityDelta)}>${r.equityDelta != null ? planSigned(r.equityDelta) : '—'}</td>` },
-    { label: 'Principal Δ', base: '—', strat: (r) => `<td${diffCls(r.principalDelta)}>${r.principalDelta != null ? planSigned(r.principalDelta) : '—'}</td>` },
+  const rows = [
+    { label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => {
+      const abs = r.paymentScope ? planMoney(r.paymentScope.strategy) : planMoney(planMortAbs(r.projection, 'strategy').payment);
+      const dv = r.paymentScope ? r.paymentScope.delta : r.comparison.paymentDelta;
+      const delta = planSigned(dv);
+      if (abs === '—' && delta === '—') return { single: '—' };
+      return { abs, delta, bold: dv != null && dv !== 0 };
+    } },
+    { label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => {
+      const dv = r.comparison.interestSaved == null ? null : -r.comparison.interestSaved;
+      return { abs: planMoney(planMortAbs(r.projection, 'strategy').interest), delta: planSigned(dv), bold: dv != null && dv !== 0 };
+    } },
+    { label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => {
+      const shift = r.comparison.payoffShiftMonths;
+      const stratPayoff = planMortAbs(r.projection, 'strategy').payoff || '—';
+      const ymIdx = (s) => (s && /^\d{4}-\d{2}$/.test(s) ? Number(s.slice(0, 4)) * 12 + Number(s.slice(5, 7)) : null);
+      const consistent = shift != null && ymIdx(baseAbs.payoff) != null && ymIdx(stratPayoff) != null
+        && (ymIdx(stratPayoff) - ymIdx(baseAbs.payoff)) === -shift;
+      if (consistent) return { abs: stratPayoff, delta: months(shift), bold: shift !== 0 };
+      return { single: months(shift), bold: shift != null && shift !== 0 };
+    } },
+    { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => {
+      const dv = (r.comparison.valueAtHorizon != null && r.comparison.baselineValueAtHorizon != null) ? r.comparison.valueAtHorizon - r.comparison.baselineValueAtHorizon : null;
+      return { abs: planMoney(r.comparison.valueAtHorizon), delta: planSigned(dv), bold: dv != null && dv !== 0 };
+    } },
+    { label: 'Total cost', base: '—', strat: (r) => ({ single: planMoney(r.comparison.cost) }) },
+    { label: 'Total gain', base: '—', strat: (r) => ({ single: planMoney(r.comparison.gain) }) },
+    { label: 'Stock gain', base: '—', strat: (r) => ({ single: planMoney(r.comparison.stockGain) }) },
+    { label: 'Net benefit', base: '—', strat: (r) => ({ single: planSigned(r.comparison.net) }) },
+    { label: 'Equity Δ', base: '—', strat: (r) => ({ single: r.equityDelta != null ? planSigned(r.equityDelta) : '—', bold: r.equityDelta != null && r.equityDelta !== 0 }) },
+    { label: 'Principal Δ', base: '—', strat: (r) => ({ single: r.principalDelta != null ? planSigned(r.principalDelta) : '—', bold: r.principalDelta != null && r.principalDelta !== 0 }) },
   ];
+  const cell = (c) => (c.single != null
+    ? `<td${c.bold ? ' class="plan-diff"' : ''}>${c.single}</td>`
+    : `<td><div>${c.abs}</div><div class="plan-cell-delta${c.bold ? ' plan-diff' : ''}">${c.delta}</div></td>`);
   const head = '<tr><th></th><th>Baseline</th>' + picked.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('') + '</tr>';
-  const body = appleRows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + picked.map((r) => row.strat(r)).join('') + '</tr>').join('');
-  const host = $(t.apple || '#planAppleTable');
+  const body = rows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + picked.map((r) => cell(row.strat(r))).join('') + '</tr>').join('');
+  const host = $(t.merged || '#planMergedTable');
   if (!host) return;
   host.innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table>`
     + (picked.length === 0 && block.strategies.length > 0 ? '<div class="note">Pick a strategy to compare.</div>' : '');
