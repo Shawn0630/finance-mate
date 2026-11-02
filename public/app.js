@@ -109,7 +109,11 @@ async function api(path, opts = {}) {
   });
   if (res.status === 401) { location.href = '/login.html'; throw new Error('not signed in'); }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(data.error || `request failed (${res.status})`);
+    err.details = data;
+    throw err;
+  }
   return data;
 }
 
@@ -338,7 +342,7 @@ let currentAssetId = null;
 let currentSection = 'overview';
 
 function showView(name) {
-  for (const v of ['assets', 'property', 'asset', 'invest-account', 'invest-holding', 'earnings', 'spending', 'planning', 'tax', 'admin']) {
+  for (const v of ['assets', 'property', 'asset', 'invest-account', 'invest-holding', 'earnings', 'spending', 'planning', 'history', 'tax', 'admin']) {
     $('#view-' + v).classList.toggle('hidden', v !== name);
   }
   document.querySelectorAll('#mainNav a').forEach((a) =>
@@ -436,6 +440,9 @@ function route() {
     showView('planning');
     const parts = hash.split('/');
     loadPlanReport(Number(parts[2]), Number(parts[3]));
+  } else if (hash === '#history') {
+    showView('history');
+    loadHistory();
   } else if (hash === '#tax') {
     showView('tax');
   } else {
@@ -458,6 +465,151 @@ function route() {
   }
 }
 window.addEventListener('hashchange', route);
+
+// ---------------------------------------------------------------- History --
+// App-level commit log: every user Apply/Save is one commit. The tab
+// lists commits newest first and offers undo / restore-to per commit.
+let histCommits = [];
+let histSelectedId = null;
+let histSearchTimer = null;
+
+async function loadHistory() {
+  const params = new URLSearchParams({ limit: 100 });
+  const mod = $('#histModuleFilter').value;
+  const q = $('#histSearch').value.trim();
+  if (mod) params.set('module', mod);
+  if (q) params.set('q', q);
+  try {
+    const r = await api(`/api/history/commits?${params}`);
+    histCommits = r.commits || [];
+    renderHistList();
+    if (histSelectedId && !histCommits.some((c) => c.id === histSelectedId)) {
+      histSelectedId = null;
+      $('#histDetail').classList.add('hidden');
+    }
+  } catch (err) {
+    $('#histList').innerHTML = `<div class="msg err">${esc(err.message)}</div>`;
+  }
+}
+
+function histKindLabel(kind) {
+  return { commit: 'Save', revert: 'Revert', merge: 'Merge', 'merge-revert': 'Merge revert' }[kind] || kind;
+}
+
+function renderHistList() {
+  const el = $('#histList');
+  if (!histCommits.length) { el.innerHTML = '<div class="note">No commits yet.</div>'; return; }
+  el.innerHTML = `<table><thead><tr><th>#</th><th>Date</th><th>Module</th><th>Entity</th><th>Summary</th><th>Changes</th></tr></thead><tbody>` +
+    histCommits.map((c) => `<tr data-hist-id="${c.id}" style="cursor:pointer">
+      <td>${c.id}</td><td>${new Date(c.created_at).toLocaleString('en-CA')}</td>
+      <td>${esc(c.module)}</td><td>${esc(c.entity_label || `${c.entity_type} ${c.entity_id ?? ''}`)}</td>
+      <td>${esc(c.summary)}</td><td>${c.eventCount}</td></tr>`).join('') + `</tbody></table>`;
+  el.querySelectorAll('[data-hist-id]').forEach((row) =>
+    row.addEventListener('click', () => loadHistDetail(Number(row.dataset.histId))));
+}
+
+$('#histModuleFilter').addEventListener('change', loadHistory);
+$('#histRefreshBtn').addEventListener('click', loadHistory);
+$('#histSearch').addEventListener('input', () => {
+  clearTimeout(histSearchTimer);
+  histSearchTimer = setTimeout(loadHistory, 300);
+});
+
+async function loadHistDetail(id) {
+  histSelectedId = id;
+  const panel = $('#histDetail');
+  panel.classList.remove('hidden');
+  panel.innerHTML = '<div class="note">Loading…</div>';
+  try {
+    const r = await api(`/api/history/commits/${id}`);
+    panel.innerHTML = histDetailHtml(r.commit);
+    wireHistDetail(r.commit);
+  } catch (err) {
+    panel.innerHTML = `<div class="msg err">${esc(err.message)}</div>`;
+  }
+}
+
+const HIST_VOLATILE = new Set(['created_at', 'updated_at', 'ai_thread']);
+function histVal(v) {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'object') return esc(JSON.stringify(v));
+  return esc(String(v));
+}
+function histEntryHtml(e) {
+  const pk = Object.entries(e.pk || {}).map(([k, v]) => `${k}=${v}`).join(', ');
+  const kind = !e.before ? 'Added' : !e.after ? 'Deleted' : 'Updated';
+  let rows = '';
+  if (!e.before) {
+    rows = Object.entries(e.after).filter(([k]) => !HIST_VOLATILE.has(k))
+      .map(([k, v]) => `<tr><td>${esc(k)}</td><td>—</td><td>${histVal(v)}</td></tr>`).join('');
+  } else if (!e.after) {
+    rows = Object.entries(e.before).filter(([k]) => !HIST_VOLATILE.has(k))
+      .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${histVal(v)}</td><td>—</td></tr>`).join('');
+  } else {
+    rows = Object.keys({ ...e.before, ...e.after })
+      .filter((k) => !HIST_VOLATILE.has(k) && JSON.stringify(e.before[k]) !== JSON.stringify(e.after[k]))
+      .map((k) => `<tr><td>${esc(k)}</td><td>${histVal(e.before[k])}</td><td>${histVal(e.after[k])}</td></tr>`).join('');
+  }
+  return `<div class="section-head"><h3>${esc(e.table)} · ${esc(pk)} · ${kind}</h3></div>
+    <table><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>${rows || '<tr><td colspan="3">No field changes</td></tr>'}</tbody></table>`;
+}
+
+function histDetailHtml(c) {
+  const canUndo = c.kind !== 'merge-revert';
+  const canRestore = c.kind === 'commit' || c.kind === 'revert';
+  const projectLink = c.project_id ? `<div><a href="#planning/project/${c.project_id}">View project</a></div>` : '';
+  const undoLabel = c.kind === 'merge' ? 'Revert merge' : 'Undo this commit';
+  return `<div class="section-head"><h3>Commit #${c.id} · ${histKindLabel(c.kind)}</h3></div>
+    <div>${esc(new Date(c.created_at).toLocaleString('en-CA'))} · ${esc(c.username || '')} · ${esc(c.module)} · ${esc(c.entity_label || '')}</div>
+    <div><strong>${esc(c.summary)}</strong></div>
+    ${projectLink}
+    <div class="toolbar">
+      ${canUndo ? `<button class="small" id="histUndoBtn">${undoLabel}</button>` : ''}
+      ${canRestore ? `<button class="small" id="histRestoreBtn">Restore to this commit</button>` : ''}
+    </div>
+    <div class="msg" id="histDetailMsg"></div>
+    <div id="histDiff">${(c.event || []).map(histEntryHtml).join('') || '<div class="note">No recorded changes</div>'}</div>`;
+}
+
+function showHistRevertError(msgEl, err, c) {
+  const d = err.details || {};
+  if (d.dependents && d.dependents.length) {
+    const list = d.dependents.map((x) => `#${x.id} · ${esc(x.summary || '')}`).join('<br>');
+    msgEl.className = 'msg err';
+    msgEl.innerHTML = `Blocked — later commits touched the same rows:<br>${list}`;
+    return;
+  }
+  if (d.conflicts && d.conflicts.length) {
+    const link = c.strategy_id ? ` <a href="#planning/strategy/${c.strategy_id}">Resolve in the strategy merge wizard</a>` : '';
+    msgEl.className = 'msg err';
+    msgEl.innerHTML = `Blocked — merge conflicts need resolving.${link}`;
+    return;
+  }
+  showMsg(msgEl, 'err', err.message);
+}
+
+function wireHistDetail(c) {
+  const msgEl = $('#histDetailMsg');
+  const undoBtn = $('#histUndoBtn');
+  if (undoBtn) undoBtn.addEventListener('click', async () => {
+    const verb = c.kind === 'merge' ? 'revert this merge' : 'undo this commit';
+    if (!confirm(`Are you sure you want to ${verb}?`)) return;
+    try {
+      const r = await api(`/api/history/commits/${c.id}/undo`, { method: 'POST' });
+      showMsg(msgEl, 'ok', `Done — new commit #${r.commitId}`);
+      loadHistory();
+    } catch (err) { showHistRevertError(msgEl, err, c); }
+  });
+  const restoreBtn = $('#histRestoreBtn');
+  if (restoreBtn) restoreBtn.addEventListener('click', async () => {
+    if (!confirm(`Restore to commit #${c.id}? Current state will be replaced by this commit's snapshot.`)) return;
+    try {
+      const r = await api(`/api/history/commits/${c.id}/restore`, { method: 'POST' });
+      showMsg(msgEl, 'ok', `Done — new commit #${r.commitId}`);
+      loadHistory();
+    } catch (err) { showHistRevertError(msgEl, err, c); }
+  });
+}
 
 // ---------------------------------------------------------------- owners ---
 // Owners are a SET of people: joint ownership is picking several names —
@@ -7019,32 +7171,12 @@ document.querySelector('[data-invest-proposed]').addEventListener('click', async
   const applyBtn = e.target.closest('[data-invest-apply]');
   applyBtn.disabled = true;
   try {
-    const refToId = new Map();
-    for (const h of chosenHoldings) {
-      const { checked, conflict, ref, ...fields } = h;
-      const created = await api(`/api/investments/accounts/${investChatAccountId}/holdings`, {
-        method: 'POST', body: { ...fields, source: 'ai' },
-      });
-      refToId.set(ref, created.id);
-    }
-    for (const ev of chosenEvents) {
-      const { checked, conflict, holdingRef, ...fields } = ev;
-      const holdingId = ev.holdingId != null ? ev.holdingId : refToId.get(holdingRef);
-      await api(`/api/investments/holdings/${holdingId}/events`, {
-        method: 'POST', body: { ...fields, holdingId: undefined, source: 'ai' },
-      });
-    }
-    // NAV snapshots write through the same manual endpoint the
-    // holding page uses — Apply only ever writes checked rows, and
-    // a checked conflict row is the user's explicit overwrite
-    // approval, so the flag travels with it.
-    for (const n of chosenNav) {
-      const { checked, conflict, oldPrice, holdingRef, ...fields } = n;
-      const holdingId = n.holdingId != null ? n.holdingId : refToId.get(holdingRef);
-      await api(`/api/investments/holdings/${holdingId}/nav`, {
-        method: 'POST', body: { date: fields.date, price: fields.price, overwrite: true },
-      });
-    }
+    // One Apply = one History commit: the whole checked draft goes
+    // in a single batch call (the server validates and writes it
+    // atomically), instead of one POST per row.
+    await api(`/api/investments/accounts/${investChatAccountId}/fill/apply`, {
+      method: 'POST', body: { holdings: chosenHoldings, events: chosenEvents, nav: chosenNav },
+    });
     const n = chosenHoldings.length + chosenEvents.length + chosenNav.length;
     investChatState.proposed = {
       holdings: draft.holdings.filter((h) => !h.checked).map(({ checked, ...rest }) => rest),
@@ -11221,16 +11353,13 @@ function planProjectHtml(d) {
       <div id="planCompareTable"></div>
       <div id="planBaselineRates"></div>
     </div>`;
-  const historyPanel = `<div class="panel">
-      <div class="section-head"><h3>History</h3></div>
-      <div id="planHistoryList"></div>
-    </div>`;
   // DETAIL ORDER (both branches): header → baselines → strategies →
   // (declared assets for sell templates / legacy) → reports (+
-  // comparison) → history. No prime-scenarios section, no future-world
-  // selector, no baseline-info panel anywhere.
-  if (!templated) return header + baselinesPanel + strategiesPanel + assetsPanel + reportsPanel + historyPanel;
-  return header + baselinesPanel + strategiesPanel + (sections.declaredAssets ? assetsPanel : '') + reportsPanel + historyPanel;
+  // comparison). No prime-scenarios section, no future-world
+  // selector, no baseline-info panel anywhere, and no per-project
+  // history panel — history lives in the app-level History tab.
+  if (!templated) return header + baselinesPanel + strategiesPanel + assetsPanel + reportsPanel;
+  return header + baselinesPanel + strategiesPanel + (sections.declaredAssets ? assetsPanel : '') + reportsPanel;
 }
 function planProjectWire(d) {
   const p = d.project;
@@ -11328,8 +11457,6 @@ function planProjectWire(d) {
     try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   }));
-  $('#planHistoryList').innerHTML = d.history.map((m) => `
-    <div class="plan-row"><span>${m.kind === 'merge' ? 'Merged' : 'Reverted'} · ${esc(m.strategy_name)} · ${new Date(m.created_at).toLocaleString('en-CA')}</span></div>`).join('') || '<div class="note">No merges yet.</div>';
 }
 let planBaselineEditCtx = null;
 function openPlanBaselineEditModal(projectId, baselineId) {

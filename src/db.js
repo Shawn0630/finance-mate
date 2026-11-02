@@ -809,6 +809,31 @@ CREATE TABLE IF NOT EXISTS plan_reports (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- App-global History (2026-11-01): one row per user Apply/Save, across
+-- all modules. event = touched rows before→after (diff + undo);
+-- snapshot = the touched aggregate's full post-commit state
+-- (restore-to). kind: 'commit' | 'revert' | 'merge' | 'merge-revert'.
+-- plan_merge_records stays the merge subsystem's own store.
+CREATE TABLE IF NOT EXISTS app_commits (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER,
+  username TEXT,
+  module TEXT NOT NULL,                -- planning | property | stocks | earnings | spending
+  entity_type TEXT NOT NULL,
+  entity_id INTEGER,
+  entity_label TEXT,
+  project_id INTEGER,
+  strategy_id INTEGER,
+  merge_record_id INTEGER,
+  kind TEXT NOT NULL DEFAULT 'commit',
+  summary TEXT NOT NULL,
+  event TEXT NOT NULL,                 -- JSON array of {table, pk, before, after}
+  snapshot TEXT NOT NULL,              -- JSON envelope {aggregate, tables, ...}
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_app_commits_module ON app_commits(module);
+CREATE INDEX IF NOT EXISTS idx_app_commits_project ON app_commits(project_id);
+CREATE INDEX IF NOT EXISTS idx_app_commits_entity ON app_commits(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_plan_strategies_project ON plan_strategies(project_id);
 CREATE INDEX IF NOT EXISTS idx_plan_ops_strategy ON plan_ops(strategy_id, seq);
 CREATE INDEX IF NOT EXISTS idx_plan_legs_op ON plan_legs(op_id);

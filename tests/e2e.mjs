@@ -15424,6 +15424,150 @@ try {
     JSON.stringify(r.data.suggestions));
   r = await req('POST', `/api/planning/strategies/${planStrategyId}/ai-describe`, { text: '' });
   check('planning: ai-describe rejects empty text', r.status === 400, JSON.stringify(r.data));
+  // ---- App-global History tab -------------------------------------------
+  // A save creates exactly one commit; undo restores the prior state;
+  // restore-to writes back a snapshot; a later touch blocks undo with
+  // a dependency list; merge commits refuse restore-to and
+  // merge-revert commits refuse undo; one bulk Fill Apply is exactly
+  // one commit.
+  const histCount = async () => (await req('GET', '/api/history/commits?limit=1')).data.total;
+  let histBefore = await histCount();
+  r = await req('POST', '/api/properties', {
+    address: '77 History Lane, Coquitlam, BC',
+    mortgage_balance: 50000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('history: create property', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const histPid = r.data.id;
+  r = await req('GET', '/api/history/commits?limit=1');
+  check('history: one save = one commit',
+    r.status === 200 && r.data.total === histBefore + 1
+    && r.data.commits[0].module === 'property'
+    && r.data.commits[0].entity_label === '77 History Lane, Coquitlam, BC',
+    JSON.stringify(r.data.commits[0]));
+  r = await req('PUT', `/api/properties/${histPid}`, { assessed_value: 800000 });
+  check('history: first assessed update', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', '/api/history/commits?limit=1');
+  const histUpd1Id = r.data.commits[0].id;
+  r = await req('PUT', `/api/properties/${histPid}`, { assessed_value: 900000 });
+  check('history: second assessed update', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', '/api/history/commits?limit=1');
+  const histUpd2Id = r.data.commits[0].id;
+  r = await req('POST', `/api/history/commits/${histUpd1Id}/undo`, {});
+  check('history: undo blocked by later touch, dependency named',
+    r.status === 400 && Array.isArray(r.data.dependents)
+    && r.data.dependents.some((d) => d.id === histUpd2Id),
+    JSON.stringify(r.data));
+  r = await req('POST', `/api/history/commits/${histUpd2Id}/undo`, {});
+  check('history: undo newest update', r.status === 200 && r.data.commitId > 0, JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${histPid}`);
+  check('history: undo restored prior assessed value',
+    r.status === 200 && r.data.assessed_value === 800000, JSON.stringify(r.data.assessed_value));
+  r = await req('PUT', `/api/properties/${histPid}`, { assessed_value: 950000 });
+  check('history: third assessed update', r.status === 200, JSON.stringify(r.data));
+  r = await req('POST', `/api/history/commits/${histUpd1Id}/restore`, {});
+  check('history: restore-to first update', r.status === 200 && r.data.commitId > 0, JSON.stringify(r.data));
+  r = await req('GET', `/api/properties/${histPid}`);
+  check('history: restore-to rewrote the assessed value to the snapshot',
+    r.status === 200 && r.data.assessed_value === 800000, JSON.stringify(r.data.assessed_value));
+  r = await req('GET', '/api/history/commits?module=planning&q=Merged%20strategy&limit=5');
+  const histMerge = (r.data.commits || []).find((c) => c.kind === 'merge');
+  check('history: merge commit visible in the global tab', !!histMerge, JSON.stringify((r.data.commits || []).map((c) => c.kind)));
+  if (histMerge) {
+    r = await req('POST', `/api/history/commits/${histMerge.id}/restore`, {});
+    check('history: merge commit refuses restore-to', r.status === 400, JSON.stringify(r.data));
+  }
+  r = await req('GET', '/api/history/commits?module=planning&q=Reverted%20merge&limit=5');
+  const histMergeRevert = (r.data.commits || []).find((c) => c.kind === 'merge-revert');
+  check('history: merge-revert commit visible in the global tab', !!histMergeRevert, JSON.stringify((r.data.commits || []).map((c) => c.kind)));
+  if (histMergeRevert) {
+    r = await req('POST', `/api/history/commits/${histMergeRevert.id}/undo`, {});
+    check('history: merge-revert commit refuses undo', r.status === 400, JSON.stringify(r.data));
+  }
+  r = await req('POST', '/api/investments/accounts', { name: 'Hist TFSA', type: 'TFSA' });
+  check('history: create fill account', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const histAcctId = r.data.id;
+  histBefore = await histCount();
+  r = await req('POST', `/api/investments/accounts/${histAcctId}/fill/apply`, {
+    holdings: [{ ref: 'h1', label: 'Hist ETF', kind: 'exchange', symbol: 'HIST.TO', currency: 'CAD',
+      events: [{ date: '2026-01-15', type: 'buy', units: 10, price: 50 }] }],
+    events: [],
+    nav: [{ holdingRef: 'h1', date: '2026-01-15', price: 52 }],
+  });
+  check('history: bulk Fill Apply succeeds', r.status === 201 && r.data.appliedHoldings === 1 && r.data.appliedNav === 1, JSON.stringify(r.data));
+  r = await req('GET', '/api/history/commits?limit=1');
+  check('history: one bulk Apply = exactly one commit',
+    r.status === 200 && r.data.total === histBefore + 1 && r.data.commits[0].module === 'stocks',
+    JSON.stringify(r.data.commits[0]));
+  r = await req('DELETE', `/api/properties/${histPid}`);
+  check('history: cleanup delete property', r.status === 200, JSON.stringify(r.data));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('history browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardH = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResH = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueH = loginResH.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserH = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserH.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardH({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueH, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitH = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${planProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitH(1500);
+      const noPanel = await page.evaluate(() => !document.querySelector('#planHistoryList'));
+      check('history: per-project History panel is gone', noPanel === true);
+      await page.goto('http://ff.local/#history', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitH(1500);
+      const tabOk = await page.evaluate(() => {
+        const v = document.querySelector('#view-history');
+        const list = document.querySelector('#histList');
+        return v && !v.classList.contains('hidden') && list && list.textContent.includes('Hist TFSA');
+      });
+      check('history: History tab renders the commit list', tabOk === true);
+    } finally {
+      await browserH.close();
+    }
+  }
   // Template-first project creation (DOM): chooser with five templates,
   // per-template intake fields, prefilled question, blank path as before.
   // Runs before cleanup so the test property (mortgaged) is still there.

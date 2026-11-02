@@ -41,6 +41,10 @@ import {
   spendMonthly, spendTotal, spendBalance,
 } from './spending.js';
 import {
+  snapshotByAggregate, emptySnapshot, recordCommit, listCommits, getCommit, getCommitFull,
+  undoCommit, restoreCommit, findDependents, mergeEventFromEntries, eventFromRowStates, readRow,
+} from './history.js';
+import {
   calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
@@ -96,6 +100,27 @@ function requireApiAuth(req, res, next) {
   if (!user) return res.status(401).json({ error: 'not signed in' });
   req.user = user;
   next();
+}
+
+// History: run a user write + its commit in one transaction (the
+// commit row and the write land together or not at all). fn runs
+// inside the transaction and returns { value, entityId?, entityLabel?,
+// extra? }; entityId defaults to meta.entityId (known for updates and
+// deletes; creates return the new id). The before snapshot is taken
+// before the transaction, so it always sees the pre-write state.
+function commitTx(req, aggregate, meta, fn) {
+  const before = snapshotByAggregate(db, aggregate, meta.entityId ?? null, meta.extra);
+  return db.transaction(() => {
+    const r = fn();
+    const entityId = r.entityId != null ? r.entityId : meta.entityId;
+    const snapshot = snapshotByAggregate(db, aggregate, entityId, r.extra || meta.extra);
+    recordCommit(db, {
+      userId: req.user.id, username: req.user.username,
+      before, snapshot, ...meta,
+      entityId, entityLabel: r.entityLabel != null ? r.entityLabel : meta.entityLabel,
+    });
+    return r.value;
+  })();
 }
 
 app.post('/api/login', (req, res) => {
@@ -473,6 +498,7 @@ app.post('/api/investments/accounts/:id/import-csv/apply', requireApiAuth, (req,
   if (v.error) return res.status(400).json({ error: v.error });
   const ts = nowIso();
   const refToId = new Map();
+  const before = snapshotByAggregate(db, 'account', account.id);
   try {
     db.transaction(() => {
       for (const h of v.holdings) {
@@ -487,12 +513,19 @@ app.post('/api/investments/accounts/:id/import-csv/apply', requireApiAuth, (req,
         const holdingId = e.holdingId != null ? e.holdingId : refToId.get(e.holdingRef);
         ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, source, ts, ts);
       }
+      const touched = new Set([...refToId.values(), ...v.events.filter((e) => e.holdingId != null).map((e) => e.holdingId)]);
+      for (const hid of touched) rebuildEventPricePoints(db, hid, ts);
+      // One bulk Apply = one commit, however many rows it wrote.
+      recordCommit(db, {
+        userId: req.user.id, username: req.user.username, module: 'stocks',
+        entityType: 'account', entityId: account.id, entityLabel: account.name,
+        summary: `Imported CSV · ${account.name} (${v.events.length} events)`,
+        before, snapshot: snapshotByAggregate(db, 'account', account.id),
+      });
     })();
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
-  const touched = new Set([...refToId.values(), ...v.events.filter((e) => e.holdingId != null).map((e) => e.holdingId)]);
-  for (const hid of touched) rebuildEventPricePoints(db, hid, ts);
   res.status(201).json({ createdHoldings: v.holdings.length, createdEvents: v.events.length, skippedDuplicates: v.skippedDuplicates });
 });
 
@@ -1014,57 +1047,64 @@ app.post('/api/properties', requireApiAuth, (req, res) => {
   const bcaId = b.bca_id ? String(b.bca_id) : null;
   const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
   if (own.error) return res.status(400).json({ error: own.error });
-  const info = db
-    .prepare(
-      `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
-         mortgage_balance, mortgage_balance_date, amortization_years, lender,
-         notes, bca_id, bca_matched_address, owners, purchase_date, region, ai_fields, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      String(b.address).trim(),
-      num(b.assessed_value),
-      num(b.assessed_year),
-      b.assessed_value != null ? 'manual' : null,
-      balance,
-      balanceDate,
+  const created = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: null,
+    entityLabel: String(b.address).trim(),
+    summary: `Added property ${String(b.address).trim()}`,
+  }, () => {
+    const info = db
+      .prepare(
+        `INSERT INTO properties (address, assessed_value, assessed_year, assessed_source,
+           mortgage_balance, mortgage_balance_date, amortization_years, lender,
+           notes, bca_id, bca_matched_address, owners, purchase_date, region, ai_fields, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        String(b.address).trim(),
+        num(b.assessed_value),
+        num(b.assessed_year),
+        b.assessed_value != null ? 'manual' : null,
+        balance,
+        balanceDate,
+        amortYears,
+        b.lender ? String(b.lender).trim() || null : null,
+        b.notes || null,
+        bcaId,
+        // The picked suggestion's label is the submitted address text
+        // itself; the fetch later replaces this with the GIS-canonical form.
+        bcaId ? String(b.address).trim() : null,
+        JSON.stringify(own.value ?? []),
+        b.purchase_date,
+        'CA',
+        aiFieldsJson(cleanAiFields(b, PROPERTY_AI_FIELDS)),
+        nowIso(),
+        nowIso()
+      );
+    const createdRow = getProperty(info.lastInsertRowid);
+    // Every mortgage starts as Term 1: it opens on the balance date
+    // with the current balance, runs a standard 5 years, and carries
+    // the amortization / lender given at add time (either may be
+    // filled in later — until the term has an amortization, the
+    // projection reports NO_PAYMENT; the payment itself is always
+    // calculated, never entered). With no principal given, the term
+    // opens empty (NULL balance, starting today) and the anchor
+    // arrives when the term's opening balance is first saved (see
+    // the term PUT handler).
+    db.prepare(
+      `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
+    ).run(
+      createdRow.id,
+      createdRow.lender ?? null,
+      createdRow.mortgage_balance_date || new Date().toISOString().slice(0, 10),
+      60,
       amortYears,
-      b.lender ? String(b.lender).trim() || null : null,
-      b.notes || null,
-      bcaId,
-      // The picked suggestion's label is the submitted address text
-      // itself; the fetch later replaces this with the GIS-canonical form.
-      bcaId ? String(b.address).trim() : null,
-      JSON.stringify(own.value ?? []),
-      b.purchase_date,
-      'CA',
-      aiFieldsJson(cleanAiFields(b, PROPERTY_AI_FIELDS)),
+      balance,
       nowIso(),
       nowIso()
     );
-  const created = getProperty(info.lastInsertRowid);
-  // Every mortgage starts as Term 1: it opens on the balance date
-  // with the current balance, runs a standard 5 years, and carries
-  // the amortization / lender given at add time (either may be
-  // filled in later — until the term has an amortization, the
-  // projection reports NO_PAYMENT; the payment itself is always
-  // calculated, never entered). With no principal given, the term
-  // opens empty (NULL balance, starting today) and the anchor
-  // arrives when the term's opening balance is first saved (see
-  // the term PUT handler).
-  db.prepare(
-    `INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, amortization_defaulted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
-  ).run(
-    created.id,
-    created.lender ?? null,
-    created.mortgage_balance_date || new Date().toISOString().slice(0, 10),
-    60,
-    amortYears,
-    balance,
-    nowIso(),
-    nowIso()
-  );
+    return { value: createdRow, entityId: createdRow.id };
+  });
   // Best-effort HouseSigma history pull in the background: earlier
   // assessment years appear on the property by themselves; a failure
   // is recorded on the property (detail page shows it) and never
@@ -1398,61 +1438,67 @@ app.put('/api/properties/:id', requireApiAuth, (req, res) => {
   if (!next.address) return res.status(400).json({ error: 'address is required' });
   // Editing the assessed value by hand marks it as a manual value.
   if (b.assessed_value !== undefined && num(b.assessed_value) !== p.assessed_value) next.assessed_source = 'manual';
-  db.prepare(
-    `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
-       assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
-       mortgage_balance_date=?, amortization_years=?, lender=?, notes=?,
-       owners=?, purchase_date=?, payment_day=?, payment_frequency=?, region=?, ai_fields=?, updated_at=? WHERE id=?`
-  ).run(
-    next.address, next.bca_id, next.bca_matched_address, next.photo_url,
-    next.assessed_value, next.assessed_year, next.assessed_source,
-    next.mortgage_balance, next.mortgage_balance_date,
-    next.amortization_years, next.lender, next.notes, JSON.stringify(next.owners), next.purchase_date,
-    next.payment_day, next.payment_frequency, next.region, next.ai_fields, nowIso(), p.id
-  );
-  // Lender and remaining amortization live on the current term
-  // now: the Mortgage form still edits them at property level, so
-  // write them through to the term the balance anchor sits in.
-  if (b.amortization_years !== undefined || b.lender !== undefined) {
-    const cur = currentTermOf(getProperty(p.id));
-    if (cur) {
-      db.prepare('UPDATE mortgage_terms SET lender = ?, amortization_years = ?, updated_at = ? WHERE id = ?')
-        .run(
-          b.lender !== undefined ? next.lender : cur.lender,
-          b.amortization_years !== undefined ? next.amortization_years : cur.amortization_years,
-          nowIso(),
-          cur.id
-        );
+  const updated = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: next.address, summary: `Updated property ${next.address}`,
+  }, () => {
+    db.prepare(
+      `UPDATE properties SET address=?, bca_id=?, bca_matched_address=?, photo_url=?,
+         assessed_value=?, assessed_year=?, assessed_source=?, mortgage_balance=?,
+         mortgage_balance_date=?, amortization_years=?, lender=?, notes=?,
+         owners=?, purchase_date=?, payment_day=?, payment_frequency=?, region=?, ai_fields=?, updated_at=? WHERE id=?`
+    ).run(
+      next.address, next.bca_id, next.bca_matched_address, next.photo_url,
+      next.assessed_value, next.assessed_year, next.assessed_source,
+      next.mortgage_balance, next.mortgage_balance_date,
+      next.amortization_years, next.lender, next.notes, JSON.stringify(next.owners), next.purchase_date,
+      next.payment_day, next.payment_frequency, next.region, next.ai_fields, nowIso(), p.id
+    );
+    // Lender and remaining amortization live on the current term
+    // now: the Mortgage form still edits them at property level, so
+    // write them through to the term the balance anchor sits in.
+    if (b.amortization_years !== undefined || b.lender !== undefined) {
+      const cur = currentTermOf(getProperty(p.id));
+      if (cur) {
+        db.prepare('UPDATE mortgage_terms SET lender = ?, amortization_years = ?, updated_at = ? WHERE id = ?')
+          .run(
+            b.lender !== undefined ? next.lender : cur.lender,
+            b.amortization_years !== undefined ? next.amortization_years : cur.amortization_years,
+            nowIso(),
+            cur.id
+          );
+      }
     }
-  }
-  // The payment schedule lives on the terms now, with the same
-  // property-level editing contract as before: the frequency /
-  // payment day — which ruled the whole mortgage before they were
-  // per-term — write through to EVERY term, so a property-level
-  // edit keeps its old whole-mortgage meaning. (There is no
-  // property-level payment to write through: the payment is
-  // always calculated.)
-  if (b.payment_day !== undefined || b.payment_frequency !== undefined) {
-    if (b.payment_day !== undefined) {
-      db.prepare('UPDATE mortgage_terms SET payment_day = ?, updated_at = ? WHERE property_id = ?')
-        .run(next.payment_day, nowIso(), p.id);
+    // The payment schedule lives on the terms now, with the same
+    // property-level editing contract as before: the frequency /
+    // payment day — which ruled the whole mortgage before they were
+    // per-term — write through to EVERY term, so a property-level
+    // edit keeps its old whole-mortgage meaning. (There is no
+    // property-level payment to write through: the payment is
+    // always calculated.)
+    if (b.payment_day !== undefined || b.payment_frequency !== undefined) {
+      if (b.payment_day !== undefined) {
+        db.prepare('UPDATE mortgage_terms SET payment_day = ?, updated_at = ? WHERE property_id = ?')
+          .run(next.payment_day, nowIso(), p.id);
+      }
+      if (b.payment_frequency !== undefined) {
+        db.prepare('UPDATE mortgage_terms SET payment_frequency = ?, updated_at = ? WHERE property_id = ?')
+          .run(next.payment_frequency, nowIso(), p.id);
+      }
     }
-    if (b.payment_frequency !== undefined) {
-      db.prepare('UPDATE mortgage_terms SET payment_frequency = ?, updated_at = ? WHERE property_id = ?')
-        .run(next.payment_frequency, nowIso(), p.id);
+    // A moved balance anchor re-seats itself on the term that now
+    // contains it (the anchor is carried — and edited — by that term).
+    if (b.mortgage_balance !== undefined || b.mortgage_balance_date !== undefined) {
+      syncTermAnchor(getProperty(p.id));
     }
-  }
-  // A moved balance anchor re-seats itself on the term that now
-  // contains it (the anchor is carried — and edited — by that term).
-  if (b.mortgage_balance !== undefined || b.mortgage_balance_date !== undefined) {
-    syncTermAnchor(getProperty(p.id));
-  }
-  // A changed address invalidates the stored HouseSigma location:
-  // clear its ids so the next history pull locates the new address.
-  if (next.address !== p.address) {
-    db.prepare('UPDATE properties SET hs_id_address = NULL, hs_id_listing = NULL WHERE id = ?').run(p.id);
-  }
-  res.json(propertyView(getProperty(p.id)));
+    // A changed address invalidates the stored HouseSigma location:
+    // clear its ids so the next history pull locates the new address.
+    if (next.address !== p.address) {
+      db.prepare('UPDATE properties SET hs_id_address = NULL, hs_id_listing = NULL WHERE id = ?').run(p.id);
+    }
+    return { value: propertyView(getProperty(p.id)), entityId: p.id };
+  });
+  res.json(updated);
 });
 
 app.delete('/api/properties/:id', requireApiAuth, (req, res) => {
@@ -1460,7 +1506,13 @@ app.delete('/api/properties/:id', requireApiAuth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'property not found' });
   // The gallery rows cascade away with the property; their files go too.
   const files = db.prepare('SELECT file_name FROM property_photos WHERE property_id = ?').all(p.id);
-  db.prepare('DELETE FROM properties WHERE id = ?').run(p.id);
+  commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Deleted property ${p.address}`,
+  }, () => {
+    db.prepare('DELETE FROM properties WHERE id = ?').run(p.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   for (const f of files) fs.promises.unlink(path.join(PHOTOS_DIR, f.file_name)).catch(() => {});
   res.json({ ok: true });
 });
@@ -1651,16 +1703,22 @@ app.post('/api/properties/:id/value-history', requireApiAuth, (req, res) => {
     : (req.body || {}));
   if (v.error) return res.status(400).json({ error: v.error });
   const value = v.value;
-  db.prepare(
-    `INSERT INTO value_history (property_id, year, value, source, notes, land_value, building_value, created_at, updated_at)
-     VALUES (?, ?, ?, 'manual', ?, ?, ?, ?, ?)
-     ON CONFLICT(property_id, year) DO UPDATE SET
-       value = excluded.value, source = 'manual', notes = excluded.notes,
-       land_value = excluded.land_value, building_value = excluded.building_value,
-       updated_at = excluded.updated_at`
-  ).run(p.id, v.year, value, (req.body || {}).notes || null,
-    sp.present ? sp.land : null, sp.present ? sp.building : null, nowIso(), nowIso());
-  res.status(201).json(historyView(p.id));
+  const view = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated assessment history · ${p.address}`,
+  }, () => {
+    db.prepare(
+      `INSERT INTO value_history (property_id, year, value, source, notes, land_value, building_value, created_at, updated_at)
+       VALUES (?, ?, ?, 'manual', ?, ?, ?, ?, ?)
+       ON CONFLICT(property_id, year) DO UPDATE SET
+         value = excluded.value, source = 'manual', notes = excluded.notes,
+         land_value = excluded.land_value, building_value = excluded.building_value,
+         updated_at = excluded.updated_at`
+    ).run(p.id, v.year, value, (req.body || {}).notes || null,
+      sp.present ? sp.land : null, sp.present ? sp.building : null, nowIso(), nowIso());
+    return { value: historyView(p.id), entityId: p.id };
+  });
+  res.status(201).json(view);
 });
 
 app.put('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, res) => {
@@ -1685,20 +1743,36 @@ app.put('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, res)
   }
   // Hand-editing a value turns the point into a manual one.
   const source = value !== pt.value ? 'manual' : pt.source;
+  let view;
   try {
-    db.prepare('UPDATE value_history SET year=?, value=?, source=?, notes=?, land_value=?, building_value=?, updated_at=? WHERE id=?')
-      .run(v.year, value, source, b.notes !== undefined ? b.notes || null : pt.notes, land, building, nowIso(), pt.id);
+    view = commitTx(req, 'property', {
+      module: 'property', entityType: 'property', entityId: p.id,
+      entityLabel: p.address, summary: `Updated assessment history · ${p.address}`,
+    }, () => {
+      db.prepare('UPDATE value_history SET year=?, value=?, source=?, notes=?, land_value=?, building_value=?, updated_at=? WHERE id=?')
+        .run(v.year, value, source, b.notes !== undefined ? b.notes || null : pt.notes, land, building, nowIso(), pt.id);
+      return { value: historyView(p.id), entityId: p.id };
+    });
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return res.status(400).json({ error: `a point for ${v.year} already exists` });
     throw e;
   }
-  res.json(historyView(p.id));
+  res.json(view);
 });
 
 app.delete('/api/properties/:id/value-history/:pointId', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM value_history WHERE id = ? AND property_id = ?').run(req.params.pointId, req.params.id);
-  if (!info.changes) return res.status(404).json({ error: 'history point not found' });
-  res.json(historyView(req.params.id));
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const pt = db.prepare('SELECT id FROM value_history WHERE id = ? AND property_id = ?').get(req.params.pointId, req.params.id);
+  if (!pt) return res.status(404).json({ error: 'history point not found' });
+  const view = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated assessment history · ${p.address}`,
+  }, () => {
+    db.prepare('DELETE FROM value_history WHERE id = ? AND property_id = ?').run(req.params.pointId, req.params.id);
+    return { value: historyView(req.params.id), entityId: p.id };
+  });
+  res.json(view);
 });
 
 // -------------------------------------------------------- property costs ---
@@ -1718,8 +1792,14 @@ app.post('/api/properties/:id/costs', requireApiAuth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'property not found' });
   const v = validCostInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  upsertCost(db, p.id, v, (req.body || {}).source === 'ai' ? 'ai' : 'manual', nowIso());
-  res.status(201).json(costsView(db, p.id));
+  const view = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated costs · ${p.address}`,
+  }, () => {
+    upsertCost(db, p.id, v, (req.body || {}).source === 'ai' ? 'ai' : 'manual', nowIso());
+    return { value: costsView(db, p.id), entityId: p.id };
+  });
+  res.status(201).json(view);
 });
 
 app.put('/api/properties/:id/costs/:costId', requireApiAuth, (req, res) => {
@@ -1753,24 +1833,40 @@ app.put('/api/properties/:id/costs/:costId', requireApiAuth, (req, res) => {
   const changed = v.year !== row.year || v.category !== row.category
     || v.amount !== row.amount || v.basis !== row.basis || v.notes !== row.notes
     || JSON.stringify(v.monthlyAmounts) !== JSON.stringify(parseStoredMonthlyAmounts(row.monthly_amounts));
+  let view;
   try {
-    db.prepare('UPDATE property_costs SET year=?, category=?, amount=?, basis=?, monthly_amounts=?, notes=?, source=?, updated_at=? WHERE id=?')
-      .run(v.year, v.category, v.amount, v.basis,
-        v.monthlyAmounts ? JSON.stringify(v.monthlyAmounts) : null,
-        v.notes, changed ? 'manual' : row.source, nowIso(), row.id);
+    view = commitTx(req, 'property', {
+      module: 'property', entityType: 'property', entityId: p.id,
+      entityLabel: p.address, summary: `Updated costs · ${p.address}`,
+    }, () => {
+      db.prepare('UPDATE property_costs SET year=?, category=?, amount=?, basis=?, monthly_amounts=?, notes=?, source=?, updated_at=? WHERE id=?')
+        .run(v.year, v.category, v.amount, v.basis,
+          v.monthlyAmounts ? JSON.stringify(v.monthlyAmounts) : null,
+          v.notes, changed ? 'manual' : row.source, nowIso(), row.id);
+      return { value: costsView(db, p.id), entityId: p.id };
+    });
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {
       return res.status(400).json({ error: `a ${v.category} entry for ${v.year} already exists` });
     }
     throw e;
   }
-  res.json(costsView(db, p.id));
+  res.json(view);
 });
 
 app.delete('/api/properties/:id/costs/:costId', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM property_costs WHERE id = ? AND property_id = ?').run(req.params.costId, req.params.id);
-  if (!info.changes) return res.status(404).json({ error: 'cost entry not found' });
-  res.json(costsView(db, req.params.id));
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const row = db.prepare('SELECT id FROM property_costs WHERE id = ? AND property_id = ?').get(req.params.costId, req.params.id);
+  if (!row) return res.status(404).json({ error: 'cost entry not found' });
+  const view = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated costs · ${p.address}`,
+  }, () => {
+    db.prepare('DELETE FROM property_costs WHERE id = ? AND property_id = ?').run(req.params.costId, req.params.id);
+    return { value: costsView(db, req.params.id), entityId: p.id };
+  });
+  res.json(view);
 });
 
 // ---------------------------------------------------------- rate segments ---
@@ -1868,10 +1964,16 @@ app.post('/api/properties/:id/rates', requireApiAuth, (req, res) => {
   if (segmentStartTaken(p.id, owner.value, s.start_date, null)) {
     return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
   }
-  const info = db
-    .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, accrual, locked_on, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.accrual, s.locked_on, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
-  res.status(201).json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)));
+  const seg = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated rate plan · ${p.address}`,
+  }, () => {
+    const info = db
+      .prepare('INSERT INTO rate_segments (property_id, term_id, start_date, rate_type, annual_rate, rate_mode, spread, compounding, accrual, locked_on, ai_fields, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.accrual, s.locked_on, aiFieldsJson(cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS)), nowIso());
+    return { value: segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(info.lastInsertRowid)), entityId: p.id };
+  });
+  res.status(201).json(seg);
 });
 
 app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
@@ -1887,14 +1989,29 @@ app.put('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: `a segment already starts on ${s.start_date} in this term` });
   }
   const segAi = cleanAiFields(req.body || {}, SEGMENT_AI_FIELDS);
-  db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, accrual=?, locked_on=?, ai_fields=? WHERE id=?')
-    .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.accrual, s.locked_on, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
-  res.json(segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)));
+  const updated = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated rate plan · ${p.address}`,
+  }, () => {
+    db.prepare('UPDATE rate_segments SET term_id=?, start_date=?, rate_type=?, annual_rate=?, rate_mode=?, spread=?, compounding=?, accrual=?, locked_on=?, ai_fields=? WHERE id=?')
+      .run(owner.value, s.start_date, s.rate_type, s.annual_rate, s.rate_mode, s.spread, s.compounding, s.accrual, s.locked_on, segAi === null ? (seg.ai_fields ?? null) : aiFieldsJson(segAi), seg.id);
+    return { value: segmentView(db.prepare('SELECT * FROM rate_segments WHERE id = ?').get(seg.id)), entityId: p.id };
+  });
+  res.json(updated);
 });
 
 app.delete('/api/properties/:id/rates/:segId', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM rate_segments WHERE id = ? AND property_id = ?').run(req.params.segId, req.params.id);
-  if (!info.changes) return res.status(404).json({ error: 'segment not found' });
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const seg = db.prepare('SELECT id FROM rate_segments WHERE id = ? AND property_id = ?').get(req.params.segId, req.params.id);
+  if (!seg) return res.status(404).json({ error: 'segment not found' });
+  commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated rate plan · ${p.address}`,
+  }, () => {
+    db.prepare('DELETE FROM rate_segments WHERE id = ? AND property_id = ?').run(req.params.segId, req.params.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
@@ -2070,31 +2187,37 @@ app.post('/api/properties/:id/terms', requireApiAuth, async (req, res) => {
   const clean = cleanTerm(candidate);
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
-  const info = db
-    .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
-    .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
-  // A first term created already carrying an opening balance on a
-  // property with no balance anchor seeds the anchor from the
-  // pair, exactly as a term save does — otherwise the projection
-  // has no balance to run from until some later edit. (A renewal
-  // is never the earliest term, and an existing anchor is never
-  // overwritten.)
-  {
-    const fresh = getProperty(p.id);
-    if (fresh.mortgage_balance == null && t.opening_balance != null) {
-      const earliest = termsOf(p.id)[0];
-      if (earliest && earliest.id === Number(info.lastInsertRowid)) {
-        db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
-          .run(t.opening_balance, t.start_date, nowIso(), p.id);
+  const out = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Added mortgage term · ${p.address}`,
+  }, () => {
+    const info = db
+      .prepare(`INSERT INTO mortgage_terms (property_id, lender, start_date, term_months, amortization_years, opening_balance, repayment_method, payment_frequency, payment_day, payment_override, anchor_balance, anchor_date, amortization_defaulted, ai_fields, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`)
+      .run(p.id, t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, aiFieldsJson(cleanAiFields(b, TERM_AI_FIELDS)), nowIso(), nowIso());
+    // A first term created already carrying an opening balance on a
+    // property with no balance anchor seeds the anchor from the
+    // pair, exactly as a term save does — otherwise the projection
+    // has no balance to run from until some later edit. (A renewal
+    // is never the earliest term, and an existing anchor is never
+    // overwritten.)
+    {
+      const fresh = getProperty(p.id);
+      if (fresh.mortgage_balance == null && t.opening_balance != null) {
+        const earliest = termsOf(p.id)[0];
+        if (earliest && earliest.id === Number(info.lastInsertRowid)) {
+          db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
+            .run(t.opening_balance, t.start_date, nowIso(), p.id);
+        }
       }
     }
-  }
-  syncTermMirror(getProperty(p.id));
-  syncTermAnchor(getProperty(p.id));
-  syncScheduleMirror(getProperty(p.id));
-  const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(info.lastInsertRowid);
-  res.status(201).json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id), termPayMapFor(getProperty(p.id))));
+    syncTermMirror(getProperty(p.id));
+    syncTermAnchor(getProperty(p.id));
+    syncScheduleMirror(getProperty(p.id));
+    const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(info.lastInsertRowid);
+    return { value: termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id), termPayMapFor(getProperty(p.id))), entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 
 app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
@@ -2119,58 +2242,64 @@ app.put('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
   if (clean.error) return res.status(400).json({ error: clean.error });
   const t = clean.value;
   const termAi = cleanAiFields(b, TERM_AI_FIELDS);
-  db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
-    .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
-  // Editing the anchor pair on the term that carries it edits the
-  // property's balance anchor itself — the two are one fact, stored
-  // in both places: write the submitted pair through, then let the
-  // placement sync re-seat the columns (a date moved onto or before
-  // the term's start has already folded into the opening balance
-  // above, and the anchor then lives there).
-  if (b.anchor_balance !== undefined || b.anchor_date !== undefined) {
-    const submittedBalance = b.anchor_balance !== undefined ? num(b.anchor_balance) : term.anchor_balance;
-    const submittedDate = b.anchor_date !== undefined ? (b.anchor_date || null) : term.anchor_date;
-    if (submittedBalance != null && submittedDate) {
-      db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
-        .run(submittedBalance, submittedDate, nowIso(), p.id);
-    }
-  }
-  // The earliest term's opening FIGURE and the property's
-  // balance anchor are one fact whenever the anchor is folded
-  // into that term (its date on or before the term's start — the
-  // placement rule syncTermAnchor applies): the card edits the
-  // figure as "Outstanding principal", while the projection runs
-  // entirely off the property anchor, so an opening-figure save
-  // must write the anchor figure through too, or the plan keeps
-  // running on the old balance. The anchor DATE is its own fact:
-  // it is seeded with the pair at the first save, but afterwards
-  // it moves only through the anchor pair (the write-through
-  // above) — a term-start edit never drags it; instead the
-  // placement sync re-seats the standing anchor on the term that
-  // now contains it, and the projection is unchanged by the move.
-  // A save through the anchor pair itself is handled above and
-  // excluded here, as is a save that never submitted the figure
-  // (a lender-only edit must not move an anchor).
-  {
-    const fresh = getProperty(p.id);
-    const earliest = termsOf(p.id)[0];
-    if (earliest && earliest.id === term.id && t.opening_balance != null
-      && b.anchor_balance === undefined && b.anchor_date === undefined) {
-      if (fresh.mortgage_balance == null) {
+  const out = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated mortgage term · ${p.address}`,
+  }, () => {
+    db.prepare('UPDATE mortgage_terms SET lender=?, start_date=?, term_months=?, amortization_years=?, opening_balance=?, repayment_method=?, payment_frequency=?, payment_day=?, payment_override=?, anchor_balance=?, anchor_date=?, amortization_defaulted=0, ai_fields=?, updated_at=? WHERE id=?')
+      .run(t.lender, t.start_date, t.term_months, t.amortization_years, t.opening_balance, t.repayment_method, t.payment_frequency, t.payment_day, t.payment_override, t.anchor_balance, t.anchor_date, termAi === null ? (term.ai_fields ?? null) : aiFieldsJson(termAi), nowIso(), term.id);
+    // Editing the anchor pair on the term that carries it edits the
+    // property's balance anchor itself — the two are one fact, stored
+    // in both places: write the submitted pair through, then let the
+    // placement sync re-seat the columns (a date moved onto or before
+    // the term's start has already folded into the opening balance
+    // above, and the anchor then lives there).
+    if (b.anchor_balance !== undefined || b.anchor_date !== undefined) {
+      const submittedBalance = b.anchor_balance !== undefined ? num(b.anchor_balance) : term.anchor_balance;
+      const submittedDate = b.anchor_date !== undefined ? (b.anchor_date || null) : term.anchor_date;
+      if (submittedBalance != null && submittedDate) {
         db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
-          .run(t.opening_balance, t.start_date, nowIso(), p.id);
-      } else if (b.opening_balance !== undefined
-        && p.mortgage_balance_date && p.mortgage_balance_date <= term.start_date) {
-        db.prepare('UPDATE properties SET mortgage_balance = ?, updated_at = ? WHERE id = ?')
-          .run(t.opening_balance, nowIso(), p.id);
+          .run(submittedBalance, submittedDate, nowIso(), p.id);
       }
     }
-  }
-  syncTermAnchor(getProperty(p.id));
-  syncScheduleMirror(getProperty(p.id));
-  syncTermMirror(getProperty(p.id));
-  const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(term.id);
-  res.json(termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id), termPayMapFor(getProperty(p.id))));
+    // The earliest term's opening FIGURE and the property's
+    // balance anchor are one fact whenever the anchor is folded
+    // into that term (its date on or before the term's start — the
+    // placement rule syncTermAnchor applies): the card edits the
+    // figure as "Outstanding principal", while the projection runs
+    // entirely off the property anchor, so an opening-figure save
+    // must write the anchor figure through too, or the plan keeps
+    // running on the old balance. The anchor DATE is its own fact:
+    // it is seeded with the pair at the first save, but afterwards
+    // it moves only through the anchor pair (the write-through
+    // above) — a term-start edit never drags it; instead the
+    // placement sync re-seats the standing anchor on the term that
+    // now contains it, and the projection is unchanged by the move.
+    // A save through the anchor pair itself is handled above and
+    // excluded here, as is a save that never submitted the figure
+    // (a lender-only edit must not move an anchor).
+    {
+      const fresh = getProperty(p.id);
+      const earliest = termsOf(p.id)[0];
+      if (earliest && earliest.id === term.id && t.opening_balance != null
+        && b.anchor_balance === undefined && b.anchor_date === undefined) {
+        if (fresh.mortgage_balance == null) {
+          db.prepare('UPDATE properties SET mortgage_balance = ?, mortgage_balance_date = ?, updated_at = ? WHERE id = ?')
+            .run(t.opening_balance, t.start_date, nowIso(), p.id);
+        } else if (b.opening_balance !== undefined
+          && p.mortgage_balance_date && p.mortgage_balance_date <= term.start_date) {
+          db.prepare('UPDATE properties SET mortgage_balance = ?, updated_at = ? WHERE id = ?')
+            .run(t.opening_balance, nowIso(), p.id);
+        }
+      }
+    }
+    syncTermAnchor(getProperty(p.id));
+    syncScheduleMirror(getProperty(p.id));
+    syncTermMirror(getProperty(p.id));
+    const row = db.prepare('SELECT * FROM mortgage_terms WHERE id = ?').get(term.id);
+    return { value: termView(row, segmentsOf(p.id).map(segmentView), lumpSumsOf(p.id), termPayMapFor(getProperty(p.id))), entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.delete('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
@@ -2183,7 +2312,10 @@ app.delete('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     return res.status(400).json({ error: 'a mortgage keeps at least one term — edit this term instead of deleting it' });
   }
   const remaining = terms.filter((t) => t.id !== term.id);
-  db.transaction(() => {
+  const view = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Updated mortgage term · ${p.address}`,
+  }, () => {
     // The deleted term's segments move to the term in effect at
     // their start among the remaining ones (their dates — what the
     // projection prices from — do not change).
@@ -2196,11 +2328,12 @@ app.delete('/api/properties/:id/terms/:termId', requireApiAuth, (req, res) => {
     }
     db.prepare('DELETE FROM lump_sums WHERE term_id = ?').run(term.id);
     db.prepare('DELETE FROM mortgage_terms WHERE id = ?').run(term.id);
-  })();
-  syncTermMirror(getProperty(p.id));
-  syncTermAnchor(getProperty(p.id));
-  syncScheduleMirror(getProperty(p.id));
-  res.json(propertyView(getProperty(p.id)));
+    syncTermMirror(getProperty(p.id));
+    syncTermAnchor(getProperty(p.id));
+    syncScheduleMirror(getProperty(p.id));
+    return { value: propertyView(getProperty(p.id)), entityId: p.id };
+  });
+  res.json(view);
 });
 
 app.post('/api/properties/:id/lump-sums', requireApiAuth, (req, res) => {
@@ -2221,15 +2354,30 @@ app.post('/api/properties/:id/lump-sums', requireApiAuth, (req, res) => {
     for (const t of terms) if (t.start_date <= String(b.date)) owner = t;
     termId = (owner || terms[0]).id;
   }
-  const info = db
-    .prepare('INSERT INTO lump_sums (property_id, term_id, date, amount, note, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(p.id, termId, String(b.date), amount, b.note ? String(b.note) : null, nowIso());
-  res.status(201).json(db.prepare('SELECT * FROM lump_sums WHERE id = ?').get(info.lastInsertRowid));
+  const lump = commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Added lump sum · ${p.address}`,
+  }, () => {
+    const info = db
+      .prepare('INSERT INTO lump_sums (property_id, term_id, date, amount, note, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(p.id, termId, String(b.date), amount, b.note ? String(b.note) : null, nowIso());
+    return { value: db.prepare('SELECT * FROM lump_sums WHERE id = ?').get(info.lastInsertRowid), entityId: p.id };
+  });
+  res.status(201).json(lump);
 });
 
 app.delete('/api/properties/:id/lump-sums/:lsId', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM lump_sums WHERE id = ? AND property_id = ?').run(req.params.lsId, req.params.id);
-  if (!info.changes) return res.status(404).json({ error: 'lump sum not found' });
+  const p = getProperty(req.params.id);
+  if (!p) return res.status(404).json({ error: 'property not found' });
+  const row = db.prepare('SELECT id FROM lump_sums WHERE id = ? AND property_id = ?').get(req.params.lsId, req.params.id);
+  if (!row) return res.status(404).json({ error: 'lump sum not found' });
+  commitTx(req, 'property', {
+    module: 'property', entityType: 'property', entityId: p.id,
+    entityLabel: p.address, summary: `Deleted lump sum · ${p.address}`,
+  }, () => {
+    db.prepare('DELETE FROM lump_sums WHERE id = ? AND property_id = ?').run(req.params.lsId, req.params.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
@@ -2495,10 +2643,16 @@ app.post('/api/assets', requireApiAuth, (req, res) => {
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'name is required' });
   const own = cleanOwners(b.owners !== undefined ? b.owners : b.owner);
   if (own.error) return res.status(400).json({ error: own.error });
-  const info = db
-    .prepare('INSERT INTO other_assets (category, name, value, currency, notes, owners, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, JSON.stringify(own.value ?? []), nowIso(), nowIso());
-  res.status(201).json(assetView(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(info.lastInsertRowid)));
+  const asset = commitTx(req, 'other-asset', {
+    module: 'property', entityType: 'other-asset', entityId: null,
+    entityLabel: String(b.name).trim(), summary: `Added asset ${String(b.name).trim()}`,
+  }, () => {
+    const info = db
+      .prepare('INSERT INTO other_assets (category, name, value, currency, notes, owners, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(b.category, String(b.name).trim(), num(b.value) ?? 0, b.currency || 'CAD', b.notes || null, JSON.stringify(own.value ?? []), nowIso(), nowIso());
+    return { value: assetView(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(info.lastInsertRowid)), entityId: info.lastInsertRowid };
+  });
+  res.status(201).json(asset);
 });
 
 app.put('/api/assets/:id', requireApiAuth, (req, res) => {
@@ -2520,14 +2674,27 @@ app.put('/api/assets/:id', requireApiAuth, (req, res) => {
   }
   if (!ASSET_CATEGORIES.includes(next.category)) return res.status(400).json({ error: 'unknown category' });
   if (!next.name) return res.status(400).json({ error: 'name is required' });
-  db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, owners=?, updated_at=? WHERE id=?')
-    .run(next.category, next.name, next.value, next.currency, next.notes, JSON.stringify(next.owners), nowIso(), a.id);
-  res.json(assetView(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(a.id)));
+  const updated = commitTx(req, 'other-asset', {
+    module: 'property', entityType: 'other-asset', entityId: a.id,
+    entityLabel: next.name, summary: `Updated asset ${next.name}`,
+  }, () => {
+    db.prepare('UPDATE other_assets SET category=?, name=?, value=?, currency=?, notes=?, owners=?, updated_at=? WHERE id=?')
+      .run(next.category, next.name, next.value, next.currency, next.notes, JSON.stringify(next.owners), nowIso(), a.id);
+    return { value: assetView(db.prepare('SELECT * FROM other_assets WHERE id = ?').get(a.id)), entityId: a.id };
+  });
+  res.json(updated);
 });
 
 app.delete('/api/assets/:id', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM other_assets WHERE id = ?').run(req.params.id);
-  if (!info.changes) return res.status(404).json({ error: 'asset not found' });
+  const a = db.prepare('SELECT * FROM other_assets WHERE id = ?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'asset not found' });
+  commitTx(req, 'other-asset', {
+    module: 'property', entityType: 'other-asset', entityId: a.id,
+    entityLabel: a.name, summary: `Deleted asset ${a.name}`,
+  }, () => {
+    db.prepare('DELETE FROM other_assets WHERE id = ?').run(req.params.id);
+    return { value: { ok: true }, entityId: a.id };
+  });
   res.json({ ok: true });
 });
 
@@ -2615,16 +2782,97 @@ app.post('/api/investments/accounts/:id/fill-preview', requireApiAuth, (req, res
   res.json({ previews });
 });
 
+// Fill-with-AI Apply, batched: the client used to apply a checked
+// draft row by row (one POST per holding/event/NAV), which would
+// record one History commit per row. One Apply is one commit, so
+// the whole checked draft lands in a single transaction — and a
+// bad row rejects the batch untouched, where the row-by-row flow
+// left earlier rows applied. Holdings validate up front; events
+// validate in order against their holding's events-so-far (the
+// same rule the single-event endpoint applies); NAV snapshots
+// write with overwrite, exactly as the single-NAV endpoint did
+// for checked rows.
+app.post('/api/investments/accounts/:id/fill/apply', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
+  const b = req.body || {};
+  const holdings = Array.isArray(b.holdings) ? b.holdings : [];
+  const events = Array.isArray(b.events) ? b.events : [];
+  const nav = Array.isArray(b.nav) ? b.nav : [];
+  const validated = [];
+  for (const h of holdings) {
+    const v = validHoldingInput(h);
+    if (v.error) return res.status(400).json({ error: v.error });
+    const ev = validInitialEvents(h.events);
+    if (ev.error) return res.status(400).json({ error: ev.error });
+    validated.push({ h, v, ev });
+  }
+  const before = snapshotByAggregate(db, 'account', account.id);
+  try {
+    db.transaction(() => {
+      const ts = nowIso();
+      const refToId = new Map();
+      const touched = new Set();
+      const insHolding = db.prepare(
+        'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      const insEvent = db.prepare(
+        'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      for (const { h, v, ev } of validated) {
+        const info = insHolding.run(account.id, v.label, v.kind, v.symbol, v.fundCode, v.currency, 'ai', ts, ts);
+        if (h.ref != null) refToId.set(h.ref, info.lastInsertRowid);
+        for (const e of ev.events) {
+          insEvent.run(info.lastInsertRowid, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, 'ai', ts, ts);
+        }
+        if (ev.events.length) touched.add(info.lastInsertRowid);
+      }
+      for (const e of events) {
+        const holdingId = e.holdingId != null ? e.holdingId : refToId.get(e.holdingRef);
+        const holding = holdingId != null ? getHolding(db, holdingId) : null;
+        if (!holding || holding.account_id !== account.id) throw new Error('an event names a holding that is not in this account');
+        const v = validEventInput(e, { events: listEvents(db, holdingId) });
+        if (v.error) throw new Error(v.error);
+        insEvent.run(holdingId, v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note, 'ai', ts, ts);
+        touched.add(holdingId);
+      }
+      for (const n of nav) {
+        const holdingId = n.holdingId != null ? n.holdingId : refToId.get(n.holdingRef);
+        const holding = holdingId != null ? getHolding(db, holdingId) : null;
+        if (!holding || holding.account_id !== account.id) throw new Error('a NAV snapshot names a holding that is not in this account');
+        const v = validNavInput(n);
+        if (v.error) throw new Error(v.error);
+        const r = addNavPoint(db, holdingId, v, { overwrite: true });
+        if (r.error) throw new Error(r.error);
+      }
+      for (const hid of touched) rebuildEventPricePoints(db, hid, ts);
+      recordCommit(db, {
+        userId: req.user.id, username: req.user.username, module: 'stocks',
+        entityType: 'account', entityId: account.id, entityLabel: account.name,
+        summary: `Applied Fill with AI · ${account.name} (${holdings.length + events.length + nav.length} items)`,
+        before, snapshot: snapshotByAggregate(db, 'account', account.id),
+      });
+    })();
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  res.status(201).json({ appliedHoldings: holdings.length, appliedEvents: events.length, appliedNav: nav.length });
+});
+
 app.post('/api/investments/accounts', requireApiAuth, (req, res) => {
   const v = validAccountInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
   const own = cleanOwners((req.body || {}).owners);
   if (own.error) return res.status(400).json({ error: own.error });
-  const ts = nowIso();
-  const info = db.prepare(
-    'INSERT INTO invest_accounts (name, type, institution, note, owners, default_currency, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(v.name, v.type, v.institution, v.note, JSON.stringify(own.value || []), v.defaultCurrency, ts, ts);
-  res.status(201).json(getAccount(db, info.lastInsertRowid));
+  const account = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: null,
+    entityLabel: v.name, summary: `Added account ${v.name}`,
+  }, () => {
+    const ts = nowIso();
+    const info = db.prepare(
+      'INSERT INTO invest_accounts (name, type, institution, note, owners, default_currency, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(v.name, v.type, v.institution, v.note, JSON.stringify(own.value || []), v.defaultCurrency, ts, ts);
+    return { value: getAccount(db, info.lastInsertRowid), entityId: info.lastInsertRowid };
+  });
+  res.status(201).json(account);
 });
 
 app.get('/api/investments/accounts/:id', requireApiAuth, async (req, res) => {
@@ -2673,13 +2921,19 @@ app.post('/api/investments/accounts/:id/plans', requireApiAuth, (req, res) => {
   if (!job) return res.status(400).json({ error: 'salary job not found' });
   const holding = getHolding(db, v.holdingId);
   if (!holding || holding.account_id !== account.id) return res.status(400).json({ error: 'target holding must belong to this account' });
-  const ts = nowIso();
-  const info = db.prepare(
-    'INSERT INTO invest_plans (account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(account.id, v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, ts, ts);
-  const plan = getPlan(db, info.lastInsertRowid);
-  const gen = generatePlan(db, plan, { today: vancouverToday(), ts });
-  res.status(201).json({ ...planView(db, plan, vancouverToday()), generation: gen });
+  const out = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: account.id,
+    entityLabel: account.name, summary: `Added contribution plan · ${account.name}`,
+  }, () => {
+    const ts = nowIso();
+    const info = db.prepare(
+      'INSERT INTO invest_plans (account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(account.id, v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, ts, ts);
+    const plan = getPlan(db, info.lastInsertRowid);
+    const gen = generatePlan(db, plan, { today: vancouverToday(), ts });
+    return { value: { ...planView(db, plan, vancouverToday()), generation: gen }, entityId: account.id };
+  });
+  res.status(201).json(out);
 });
 
 app.put('/api/investments/plans/:id', requireApiAuth, (req, res) => {
@@ -2692,22 +2946,33 @@ app.put('/api/investments/plans/:id', requireApiAuth, (req, res) => {
   if (!job) return res.status(400).json({ error: 'salary job not found' });
   const holding = getHolding(db, v.holdingId);
   if (!holding || holding.account_id !== account.id) return res.status(400).json({ error: 'target holding must belong to this account' });
-  db.prepare('UPDATE invest_plans SET job_id = ?, target_holding_id = ?, start_date = ?, own_amount = ?, employer_amount = ?, updated_at = ? WHERE id = ?')
-    .run(v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, nowIso(), plan.id);
-  const updated = getPlan(db, plan.id);
-  const gen = generatePlan(db, updated, { today: vancouverToday(), ts: nowIso() });
-  res.json({ ...planView(db, updated, vancouverToday()), generation: gen });
+  const out = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: account.id,
+    entityLabel: account.name, summary: `Updated contribution plan · ${account.name}`,
+  }, () => {
+    db.prepare('UPDATE invest_plans SET job_id = ?, target_holding_id = ?, start_date = ?, own_amount = ?, employer_amount = ?, updated_at = ? WHERE id = ?')
+      .run(v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, nowIso(), plan.id);
+    const updated = getPlan(db, plan.id);
+    const gen = generatePlan(db, updated, { today: vancouverToday(), ts: nowIso() });
+    return { value: { ...planView(db, updated, vancouverToday()), generation: gen }, entityId: account.id };
+  });
+  res.json(out);
 });
 
 app.delete('/api/investments/plans/:id', requireApiAuth, (req, res) => {
   const plan = getPlan(db, Number(req.params.id));
   if (!plan) return res.status(404).json({ error: 'plan not found' });
-  // Generated buys stay as ordinary history (their plan link
-  // clears); only the plan and its tombstones go.
-  db.transaction(() => {
+  const account = getAccount(db, plan.account_id);
+  commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: account.id,
+    entityLabel: account ? account.name : null, summary: `Deleted contribution plan · ${account ? account.name : ''}`,
+  }, () => {
+    // Generated buys stay as ordinary history (their plan link
+    // clears); only the plan and its tombstones go.
     db.prepare('UPDATE invest_events SET plan_id = NULL WHERE plan_id = ?').run(plan.id);
     db.prepare('DELETE FROM invest_plans WHERE id = ?').run(plan.id);
-  })();
+    return { value: { ok: true }, entityId: account.id };
+  });
   res.json({ ok: true });
 });
 
@@ -2731,19 +2996,32 @@ app.put('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
     if (own.error) return res.status(400).json({ error: own.error });
     owners = own.value;
   }
-  db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, owners = ?, default_currency = ?, updated_at = ? WHERE id = ?')
-    .run(v.name, v.type, v.institution, v.note, JSON.stringify(owners), v.defaultCurrency, nowIso(), account.id);
-  res.json(getAccount(db, account.id));
+  const updated = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: account.id,
+    entityLabel: v.name, summary: `Updated account ${v.name}`,
+  }, () => {
+    db.prepare('UPDATE invest_accounts SET name = ?, type = ?, institution = ?, note = ?, owners = ?, default_currency = ?, updated_at = ? WHERE id = ?')
+      .run(v.name, v.type, v.institution, v.note, JSON.stringify(owners), v.defaultCurrency, nowIso(), account.id);
+    return { value: getAccount(db, account.id), entityId: account.id };
+  });
+  res.json(updated);
 });
 
 app.delete('/api/investments/accounts/:id', requireApiAuth, (req, res) => {
+  const account = getAccount(db, Number(req.params.id));
+  if (!account) return res.status(404).json({ error: 'account not found' });
   const doomed = listHoldings(db, Number(req.params.id)).map((h) => h.id);
-  const info = db.prepare('DELETE FROM invest_accounts WHERE id = ?').run(Number(req.params.id));
-  if (!info.changes) return res.status(404).json({ error: 'account not found' });
-  // Holdings cascade away, but their price-fetch stamps are
-  // plain app_meta rows — clear them so a later holding that
-  // reuses an id does not inherit a backoff or stale failure.
-  for (const id of doomed) clearHoldingPriceMeta(db, id);
+  commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: account.id,
+    entityLabel: account.name, summary: `Deleted account ${account.name}`,
+  }, () => {
+    db.prepare('DELETE FROM invest_accounts WHERE id = ?').run(Number(req.params.id));
+    // Holdings cascade away, but their price-fetch stamps are
+    // plain app_meta rows — clear them so a later holding that
+    // reuses an id does not inherit a backoff or stale failure.
+    for (const id of doomed) clearHoldingPriceMeta(db, id);
+    return { value: { ok: true }, entityId: account.id };
+  });
   res.json({ ok: true });
 });
 
@@ -2760,8 +3038,11 @@ app.post('/api/investments/accounts/:id/holdings', requireApiAuth, (req, res) =>
   if (ev.error) return res.status(400).json({ error: ev.error });
   const ts = nowIso();
   const source = req.body && req.body.source === 'ai' ? 'ai' : 'manual';
-  let holdingId = null;
-  db.transaction(() => {
+  const holding = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: account.id,
+    entityLabel: account.name, summary: `Added holding ${v.label || v.symbol || ''} · ${account.name}`,
+  }, () => {
+    let holdingId = null;
     const info = db.prepare(
       'INSERT INTO invest_holdings (account_id, label, kind, symbol, fund_code, currency, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(account.id, v.label, v.kind, v.symbol, v.fundCode, v.currency, source, ts, ts);
@@ -2771,9 +3052,10 @@ app.post('/api/investments/accounts/:id/holdings', requireApiAuth, (req, res) =>
     for (const e of ev.events) {
       ins.run(holdingId, e.date, e.type, e.units, e.price, e.amount, e.splitNew, e.splitOld, e.note, source, ts, ts);
     }
-  })();
-  if (ev.events.length) rebuildEventPricePoints(db, holdingId, ts);
-  res.status(201).json(getHolding(db, holdingId));
+    if (ev.events.length) rebuildEventPricePoints(db, holdingId, ts);
+    return { value: getHolding(db, holdingId), entityId: account.id };
+  });
+  res.status(201).json(holding);
 });
 
 app.get('/api/investments/holdings/:id', requireApiAuth, async (req, res) => {
@@ -2801,7 +3083,11 @@ app.put('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
   if (!holding) return res.status(404).json({ error: 'holding not found' });
   const v = validHoldingInput(req.body || {}, holding);
   if (v.error) return res.status(400).json({ error: v.error });
-  db.transaction(() => {
+  const account = getAccount(db, holding.account_id);
+  const updated = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: holding.account_id,
+    entityLabel: account ? account.name : null, summary: `Updated holding ${v.label || v.symbol || ''} · ${account ? account.name : ''}`,
+  }, () => {
     db.prepare('UPDATE invest_holdings SET label = ?, kind = ?, symbol = ?, fund_code = ?, currency = ?, updated_at = ? WHERE id = ?')
       .run(v.label, v.kind, v.symbol, v.fundCode, v.currency, nowIso(), holding.id);
     // A new symbol invalidates the closes fetched for the old
@@ -2810,14 +3096,23 @@ app.put('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
       db.prepare("DELETE FROM invest_prices WHERE holding_id = ? AND source IN ('stooq', 'yahoo', 'nasdaq')").run(holding.id);
       db.prepare("DELETE FROM app_meta WHERE key = ?").run(`invest_px_${holding.id}_ok`);
     }
-  })();
-  res.json(getHolding(db, holding.id));
+    return { value: getHolding(db, holding.id), entityId: holding.account_id };
+  });
+  res.json(updated);
 });
 
 app.delete('/api/investments/holdings/:id', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM invest_holdings WHERE id = ?').run(Number(req.params.id));
-  if (!info.changes) return res.status(404).json({ error: 'holding not found' });
-  clearHoldingPriceMeta(db, Number(req.params.id));
+  const holding = getHolding(db, Number(req.params.id));
+  if (!holding) return res.status(404).json({ error: 'holding not found' });
+  const account = getAccount(db, holding.account_id);
+  commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: holding.account_id,
+    entityLabel: account ? account.name : null, summary: `Deleted holding ${holding.label || holding.symbol || ''} · ${account ? account.name : ''}`,
+  }, () => {
+    db.prepare('DELETE FROM invest_holdings WHERE id = ?').run(Number(req.params.id));
+    clearHoldingPriceMeta(db, Number(req.params.id));
+    return { value: { ok: true }, entityId: holding.account_id };
+  });
   res.json({ ok: true });
 });
 
@@ -2826,13 +3121,20 @@ app.post('/api/investments/holdings/:id/events', requireApiAuth, (req, res) => {
   if (!holding) return res.status(404).json({ error: 'holding not found' });
   const v = validEventInput(req.body || {}, { events: listEvents(db, holding.id) });
   if (v.error) return res.status(400).json({ error: v.error });
-  const ts = nowIso();
-  const info = db.prepare(
-    'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(holding.id, v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note,
-      req.body && req.body.source === 'ai' ? 'ai' : 'manual', ts, ts);
-  rebuildEventPricePoints(db, holding.id, ts);
-  res.status(201).json(db.prepare('SELECT * FROM invest_events WHERE id = ?').get(info.lastInsertRowid));
+  const account = getAccount(db, holding.account_id);
+  const ev = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: holding.account_id,
+    entityLabel: account ? account.name : null, summary: `Added event · ${holding.symbol || holding.label || ''} · ${account ? account.name : ''}`,
+  }, () => {
+    const ts = nowIso();
+    const info = db.prepare(
+      'INSERT INTO invest_events (holding_id, date, type, units, price, amount, split_new, split_old, note, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(holding.id, v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note,
+        req.body && req.body.source === 'ai' ? 'ai' : 'manual', ts, ts);
+    rebuildEventPricePoints(db, holding.id, ts);
+    return { value: db.prepare('SELECT * FROM invest_events WHERE id = ?').get(info.lastInsertRowid), entityId: holding.account_id };
+  });
+  res.status(201).json(ev);
 });
 
 app.put('/api/investments/events/:id', requireApiAuth, (req, res) => {
@@ -2842,23 +3144,37 @@ app.put('/api/investments/events/:id', requireApiAuth, (req, res) => {
     base: ev, events: listEvents(db, ev.holding_id), exceptId: ev.id,
   });
   if (v.error) return res.status(400).json({ error: v.error });
-  const ts = nowIso();
-  db.prepare('UPDATE invest_events SET date = ?, type = ?, units = ?, price = ?, amount = ?, split_new = ?, split_old = ?, note = ?, updated_at = ? WHERE id = ?')
-    .run(v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note, ts, ev.id);
-  rebuildEventPricePoints(db, ev.holding_id, ts);
-  res.json(db.prepare('SELECT * FROM invest_events WHERE id = ?').get(ev.id));
+  const holding = getHolding(db, ev.holding_id);
+  const account = holding ? getAccount(db, holding.account_id) : null;
+  const updated = commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: holding ? holding.account_id : null,
+    entityLabel: account ? account.name : null, summary: `Updated event · ${holding ? (holding.symbol || holding.label || '') : ''} · ${account ? account.name : ''}`,
+  }, () => {
+    const ts = nowIso();
+    db.prepare('UPDATE invest_events SET date = ?, type = ?, units = ?, price = ?, amount = ?, split_new = ?, split_old = ?, note = ?, updated_at = ? WHERE id = ?')
+      .run(v.date, v.type, v.units, v.price, v.amount, v.splitNew, v.splitOld, v.note, ts, ev.id);
+    rebuildEventPricePoints(db, ev.holding_id, ts);
+    return { value: db.prepare('SELECT * FROM invest_events WHERE id = ?').get(ev.id), entityId: holding ? holding.account_id : null };
+  });
+  res.json(updated);
 });
 
 app.delete('/api/investments/events/:id', requireApiAuth, (req, res) => {
   const ev = db.prepare('SELECT * FROM invest_events WHERE id = ?').get(Number(req.params.id));
   if (!ev) return res.status(404).json({ error: 'event not found' });
-  // A deleted plan-generated event tombstones its due period
-  // so later generation runs never recreate it (see src/plans.js).
-  db.transaction(() => {
+  const holding = getHolding(db, ev.holding_id);
+  const account = holding ? getAccount(db, holding.account_id) : null;
+  commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: holding ? holding.account_id : null,
+    entityLabel: account ? account.name : null, summary: `Deleted event · ${holding ? (holding.symbol || holding.label || '') : ''} · ${account ? account.name : ''}`,
+  }, () => {
+    // A deleted plan-generated event tombstones its due period
+    // so later generation runs never recreate it (see src/plans.js).
     recordPlanEventDeletion(db, ev);
     db.prepare('DELETE FROM invest_events WHERE id = ?').run(ev.id);
-  })();
-  rebuildEventPricePoints(db, ev.holding_id, nowIso());
+    rebuildEventPricePoints(db, ev.holding_id, nowIso());
+    return { value: { ok: true }, entityId: holding ? holding.account_id : null };
+  });
   res.json({ ok: true });
 });
 
@@ -2871,9 +3187,22 @@ app.post('/api/investments/holdings/:id/nav', requireApiAuth, (req, res) => {
   if (!holding) return res.status(404).json({ error: 'holding not found' });
   const v = validNavInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  const r = addNavPoint(db, holding.id, v, { overwrite: req.body && req.body.overwrite === true });
-  if (r.error) return res.status(400).json({ error: r.error });
-  res.status(201).json(r);
+  const account = getAccount(db, holding.account_id);
+  let out;
+  try {
+    out = commitTx(req, 'account', {
+      module: 'stocks', entityType: 'account', entityId: holding.account_id,
+      entityLabel: account ? account.name : null, summary: `Added NAV snapshot · ${holding.symbol || holding.label || ''} · ${account ? account.name : ''}`,
+    }, () => {
+      const r = addNavPoint(db, holding.id, v, { overwrite: req.body && req.body.overwrite === true });
+      if (r.error) throw Object.assign(new Error(r.error), { status: 400 });
+      return { value: r, entityId: holding.account_id };
+    });
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    throw e;
+  }
+  res.status(201).json(out);
 });
 
 // Inline row edit for a manual snapshot: date and price both
@@ -2882,9 +3211,25 @@ app.post('/api/investments/holdings/:id/nav', requireApiAuth, (req, res) => {
 app.put('/api/investments/prices/:id', requireApiAuth, (req, res) => {
   const v = validNavInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  const r = updateNavPoint(db, Number(req.params.id), v);
-  if (r.error) return res.status(r.notFound ? 404 : 400).json({ error: r.error });
-  res.json(r);
+  const row0 = db.prepare('SELECT * FROM invest_prices WHERE id = ?').get(Number(req.params.id));
+  if (!row0) return res.status(404).json({ error: 'price point not found' });
+  const holding = getHolding(db, row0.holding_id);
+  const account = holding ? getAccount(db, holding.account_id) : null;
+  let out;
+  try {
+    out = commitTx(req, 'account', {
+      module: 'stocks', entityType: 'account', entityId: holding ? holding.account_id : null,
+      entityLabel: account ? account.name : null, summary: `Updated NAV snapshot · ${holding ? (holding.symbol || holding.label || '') : ''} · ${account ? account.name : ''}`,
+    }, () => {
+      const r = updateNavPoint(db, Number(req.params.id), v);
+      if (r.error) throw Object.assign(new Error(r.error), { status: r.notFound ? 404 : 400 });
+      return { value: r, entityId: holding ? holding.account_id : null };
+    });
+  } catch (e) {
+    if (e.status === 400 || e.status === 404) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
+  res.json(out);
 });
 
 app.delete('/api/investments/prices/:id', requireApiAuth, (req, res) => {
@@ -2893,7 +3238,15 @@ app.delete('/api/investments/prices/:id', requireApiAuth, (req, res) => {
   if (row.source !== 'manual') {
     return res.status(400).json({ error: 'only manual price snapshots can be deleted' });
   }
-  db.prepare('DELETE FROM invest_prices WHERE id = ?').run(row.id);
+  const holding = getHolding(db, row.holding_id);
+  const account = holding ? getAccount(db, holding.account_id) : null;
+  commitTx(req, 'account', {
+    module: 'stocks', entityType: 'account', entityId: holding ? holding.account_id : null,
+    entityLabel: account ? account.name : null, summary: `Deleted NAV snapshot · ${holding ? (holding.symbol || holding.label || '') : ''} · ${account ? account.name : ''}`,
+  }, () => {
+    db.prepare('DELETE FROM invest_prices WHERE id = ?').run(row.id);
+    return { value: { ok: true }, entityId: holding ? holding.account_id : null };
+  });
   res.json({ ok: true });
 });
 
@@ -3094,28 +3447,40 @@ app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
     const opening = v.recent_pay_value;
     pinPositionToLatest(v);
     const ytd = derivedJobYtd(v, false, false);
-    const id = db.transaction(() => {
-      const info = db.prepare(
-        `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
-         start_date, recent_pay_date, opening_value,
-         td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
-        v.start_date, v.recent_pay_date, opening,
-        null, null, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, 0, 0, ts, ts);
-      writeJobChildren(info.lastInsertRowid, v.pay_changes, v.bonuses, ts);
-      return info.lastInsertRowid;
-    })();
-    return res.status(201).json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
+    const out = commitTx(req, 'job', {
+      module: 'earnings', entityType: 'job', entityId: null,
+      entityLabel: v.employer, summary: `Added job ${v.employer}`,
+    }, () => {
+      const id = db.transaction(() => {
+        const info = db.prepare(
+          `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
+           start_date, recent_pay_date, opening_value,
+           td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+          v.start_date, v.recent_pay_date, opening,
+          null, null, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, 0, 0, ts, ts);
+        writeJobChildren(info.lastInsertRowid, v.pay_changes, v.bonuses, ts);
+        return info.lastInsertRowid;
+      })();
+      return { value: earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)), entityId: id };
+    });
+    return res.status(201).json(out);
   }
-  const info = db.prepare(
-    `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
-     td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
-    v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
-    v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, ts, ts);
-  res.status(201).json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(info.lastInsertRowid)));
+  const out = commitTx(req, 'job', {
+    module: 'earnings', entityType: 'job', entityId: null,
+    entityLabel: v.employer, summary: `Added job ${v.employer}`,
+  }, () => {
+    const info = db.prepare(
+      `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
+       td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      v.employer, own.value, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+      v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
+      v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, ts, ts);
+    return { value: earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(info.lastInsertRowid)), entityId: info.lastInsertRowid };
+  });
+  res.status(201).json(out);
 });
 app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   const v = validJobInput(req.body || {});
@@ -3146,28 +3511,41 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
     // dates keeps its claims exactly.
     pinPositionToLatest(v);
     const ytd = derivedJobYtd(v, existing.cpp_exempt === 1, existing.ei_exempt === 1);
-    db.transaction(() => {
-      db.prepare(
-        `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
-         tax_year = ?, start_date = ?, recent_pay_date = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?, updated_at = ? WHERE id = ?`).run(
-        v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis,
-        v.tax_year, v.start_date, v.recent_pay_date, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, nowIso(), id);
-      writeJobChildren(id, v.pay_changes, v.bonuses, nowIso());
-    })();
-    return res.json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
+    const out = commitTx(req, 'job', {
+      module: 'earnings', entityType: 'job', entityId: id,
+      entityLabel: v.employer, summary: `Updated job ${v.employer}`,
+    }, () => {
+      db.transaction(() => {
+        db.prepare(
+          `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
+           tax_year = ?, start_date = ?, recent_pay_date = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?, updated_at = ? WHERE id = ?`).run(
+          v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis,
+          v.tax_year, v.start_date, v.recent_pay_date, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, nowIso(), id);
+        writeJobChildren(id, v.pay_changes, v.bonuses, nowIso());
+      })();
+      return { value: earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)), entityId: id };
+    });
+    return res.json(out);
   }
-  db.prepare(
-    `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
-     tax_year = ?, td1_federal = ?, td1_provincial = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?,
-     cpp_exempt = ?, ei_exempt = ?, updated_at = ? WHERE id = ?`).run(
-    v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
-    v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
-    v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, nowIso(), id);
-  res.json(earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)));
+  const out = commitTx(req, 'job', {
+    module: 'earnings', entityType: 'job', entityId: id,
+    entityLabel: v.employer, summary: `Updated job ${v.employer}`,
+  }, () => {
+    db.prepare(
+      `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
+       tax_year = ?, td1_federal = ?, td1_provincial = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?,
+       cpp_exempt = ?, ei_exempt = ?, updated_at = ? WHERE id = ?`).run(
+      v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis, v.tax_year,
+      v.td1_federal, v.td1_provincial, v.ytd_cpp, v.ytd_cpp2, v.ytd_ei,
+      v.cpp_exempt ? 1 : 0, v.ei_exempt ? 1 : 0, nowIso(), id);
+    return { value: earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)), entityId: id };
+  });
+  res.json(out);
 });
 app.delete('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   const id = Number(req.params.id);
-  if (!db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)) return res.status(404).json({ error: 'job not found' });
+  const job = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id);
+  if (!job) return res.status(404).json({ error: 'job not found' });
   // A job with linked contribution plans cannot go: plans
   // derive their frequency from it, so deleting it would
   // strand them. Delete the plans first, then the job.
@@ -3175,7 +3553,13 @@ app.delete('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   if (linked > 0) {
     return res.status(400).json({ error: `cannot delete this job — ${linked} contribution plan${linked === 1 ? '' : 's'} link to it; delete the plan${linked === 1 ? '' : 's'} first` });
   }
-  db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(id);
+  commitTx(req, 'job', {
+    module: 'earnings', entityType: 'job', entityId: id,
+    entityLabel: job.employer, summary: `Deleted job ${job.employer}`,
+  }, () => {
+    db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(id);
+    return { value: { ok: true }, entityId: id };
+  });
   res.json({ ok: true });
 });
 
@@ -3201,14 +3585,20 @@ app.post('/api/earnings/rentals', requireApiAuth, (req, res) => {
   if (v.property_id != null && !db.prepare('SELECT id FROM properties WHERE id = ?').get(v.property_id)) {
     return res.status(400).json({ error: 'property not found.' });
   }
-  const ts = nowIso();
-  const info = db.prepare(
-    `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level, ownership_pct,
-     is_principal_residence, was_principal_residence, structural_change, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
-    v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, ts, ts);
-  res.status(201).json(earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(info.lastInsertRowid)));
+  const out = commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: null,
+    entityLabel: v.label, summary: `Added rental ${v.label}`,
+  }, () => {
+    const ts = nowIso();
+    const info = db.prepare(
+      `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level, ownership_pct,
+       is_principal_residence, was_principal_residence, structural_change, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
+      v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, ts, ts);
+    return { value: earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(info.lastInsertRowid)), entityId: info.lastInsertRowid };
+  });
+  res.status(201).json(out);
 });
 app.put('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
   const v = validRentalInput(req.body || {});
@@ -3218,17 +3608,30 @@ app.put('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
   if (v.property_id != null && !db.prepare('SELECT id FROM properties WHERE id = ?').get(v.property_id)) {
     return res.status(400).json({ error: 'property not found.' });
   }
-  db.prepare(
-    `UPDATE earn_rentals SET property_id = ?, label = ?, address = ?, rental_type = ?, services_level = ?,
-     ownership_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
-     updated_at = ? WHERE id = ?`).run(
-    v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
-    v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, nowIso(), id);
-  res.json(earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(id)));
+  const out = commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: id,
+    entityLabel: v.label, summary: `Updated rental ${v.label}`,
+  }, () => {
+    db.prepare(
+      `UPDATE earn_rentals SET property_id = ?, label = ?, address = ?, rental_type = ?, services_level = ?,
+       ownership_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
+       updated_at = ? WHERE id = ?`).run(
+      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
+      v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, nowIso(), id);
+    return { value: earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(id)), entityId: id };
+  });
+  res.json(out);
 });
 app.delete('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM earn_rentals WHERE id = ?').run(Number(req.params.id));
-  if (!info.changes) return res.status(404).json({ error: 'rental not found' });
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.id));
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: rental.id,
+    entityLabel: rental.label, summary: `Deleted rental ${rental.label}`,
+  }, () => {
+    db.prepare('DELETE FROM earn_rentals WHERE id = ?').run(Number(req.params.id));
+    return { value: { ok: true }, entityId: rental.id };
+  });
   res.json({ ok: true });
 });
 
@@ -3238,21 +3641,28 @@ app.post('/api/earnings/rentals/:id/years', requireApiAuth, (req, res) => {
   if (!rental) return res.status(404).json({ error: 'rental not found' });
   const v = validRentalYearInput(req.body || {}, earnRegion().rental.t776Lines);
   if (v.error) return res.status(400).json({ error: v.error });
-  const ts = nowIso();
+  let out;
   try {
-    const info = db.prepare(
-      `INSERT INTO earn_rental_years (rental_id, tax_year, gross_rents, other_income, area_share_pct, rental_days,
-       mortgage_interest, mortgage_principal, expenses, claim_cca, cca_acknowledged, ucc_class1, ucc_class8,
-       str_compliant_days, str_non_compliant_days, created_at, updated_at)
-       VALUES (?, ?, 0, ?, ?, 365, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      rentalId, v.tax_year, v.other_income, v.area_share_pct,
-      v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
-      v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
-      v.str_compliant_days, v.str_non_compliant_days, ts, ts);
-    res.status(201).json(earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(info.lastInsertRowid)));
+    out = commitTx(req, 'rental', {
+      module: 'earnings', entityType: 'rental', entityId: rentalId,
+      entityLabel: rental.label, summary: `Updated year record · ${rental.label}`,
+    }, () => {
+      const ts = nowIso();
+      const info = db.prepare(
+        `INSERT INTO earn_rental_years (rental_id, tax_year, gross_rents, other_income, area_share_pct, rental_days,
+         mortgage_interest, mortgage_principal, expenses, claim_cca, cca_acknowledged, ucc_class1, ucc_class8,
+         str_compliant_days, str_non_compliant_days, created_at, updated_at)
+         VALUES (?, ?, 0, ?, ?, 365, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        rentalId, v.tax_year, v.other_income, v.area_share_pct,
+        v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
+        v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
+        v.str_compliant_days, v.str_non_compliant_days, ts, ts);
+      return { value: earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(info.lastInsertRowid)), entityId: rentalId };
+    });
   } catch {
     return res.status(400).json({ error: 'a year record already exists for this rental.' });
   }
+  res.status(201).json(out);
 });
 app.put('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, res) => {
   const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.rentalId));
@@ -3263,21 +3673,37 @@ app.put('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, r
   }
   const v = validRentalYearInput(req.body || {}, earnRegion().rental.t776Lines);
   if (v.error) return res.status(400).json({ error: v.error });
-  db.prepare(
-    `UPDATE earn_rental_years SET tax_year = ?, other_income = ?, area_share_pct = ?,
-     mortgage_interest = ?, mortgage_principal = ?, expenses = ?, claim_cca = ?, cca_acknowledged = ?,
-     ucc_class1 = ?, ucc_class8 = ?, str_compliant_days = ?, str_non_compliant_days = ?, updated_at = ?
-     WHERE id = ?`).run(
-    v.tax_year, v.other_income, v.area_share_pct,
-    v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
-    v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
-    v.str_compliant_days, v.str_non_compliant_days, nowIso(), yearId);
-  res.json(earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(yearId)));
+  const out = commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: rental.id,
+    entityLabel: rental.label, summary: `Updated year record · ${rental.label}`,
+  }, () => {
+    db.prepare(
+      `UPDATE earn_rental_years SET tax_year = ?, other_income = ?, area_share_pct = ?,
+       mortgage_interest = ?, mortgage_principal = ?, expenses = ?, claim_cca = ?, cca_acknowledged = ?,
+       ucc_class1 = ?, ucc_class8 = ?, str_compliant_days = ?, str_non_compliant_days = ?, updated_at = ?
+       WHERE id = ?`).run(
+      v.tax_year, v.other_income, v.area_share_pct,
+      v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
+      v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
+      v.str_compliant_days, v.str_non_compliant_days, nowIso(), yearId);
+    return { value: earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(yearId)), entityId: rental.id };
+  });
+  res.json(out);
 });
 app.delete('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM earn_rental_years WHERE id = ? AND rental_id = ?')
-    .run(Number(req.params.yearId), Number(req.params.rentalId));
-  if (!info.changes) return res.status(404).json({ error: 'year record not found' });
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.rentalId));
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  if (!db.prepare('SELECT id FROM earn_rental_years WHERE id = ? AND rental_id = ?').get(Number(req.params.yearId), rental.id)) {
+    return res.status(404).json({ error: 'year record not found' });
+  }
+  commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: rental.id,
+    entityLabel: rental.label, summary: `Updated year record · ${rental.label}`,
+  }, () => {
+    db.prepare('DELETE FROM earn_rental_years WHERE id = ? AND rental_id = ?')
+      .run(Number(req.params.yearId), Number(req.params.rentalId));
+    return { value: { ok: true }, entityId: rental.id };
+  });
   res.json({ ok: true });
 });
 
@@ -3290,14 +3716,20 @@ app.post('/api/earnings/rentals/:id/entries', requireApiAuth, (req, res) => {
   if (!rental) return res.status(404).json({ error: 'rental not found' });
   const v = validRentalEntryInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  const ts = nowIso();
-  const info = db.prepare(
-    `INSERT INTO earn_rental_entries (rental_id, start_ym, end_ym, monthly_rent, pay_day, cash_amount, tenant_name, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    rental.id, v.start_ym, v.end_ym, v.monthly_rent, v.pay_day, v.cash_amount, v.tenant_name, ts, ts);
-  const entry = db.prepare('SELECT * FROM earn_rental_entries WHERE id = ?').get(info.lastInsertRowid);
-  ensureRentalYearsForEntry(rental.id, entry);
-  res.status(201).json(earnRentalRow(rental));
+  const out = commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: rental.id,
+    entityLabel: rental.label, summary: `Updated rent entry · ${rental.label}`,
+  }, () => {
+    const ts = nowIso();
+    const info = db.prepare(
+      `INSERT INTO earn_rental_entries (rental_id, start_ym, end_ym, monthly_rent, pay_day, cash_amount, tenant_name, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      rental.id, v.start_ym, v.end_ym, v.monthly_rent, v.pay_day, v.cash_amount, v.tenant_name, ts, ts);
+    const entry = db.prepare('SELECT * FROM earn_rental_entries WHERE id = ?').get(info.lastInsertRowid);
+    ensureRentalYearsForEntry(rental.id, entry);
+    return { value: earnRentalRow(rental), entityId: rental.id };
+  });
+  res.status(201).json(out);
 });
 app.put('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (req, res) => {
   const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.rentalId));
@@ -3308,18 +3740,34 @@ app.put('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (req
   }
   const v = validRentalEntryInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  db.prepare(
-    `UPDATE earn_rental_entries SET start_ym = ?, end_ym = ?, monthly_rent = ?, pay_day = ?,
-     cash_amount = ?, tenant_name = ?, updated_at = ? WHERE id = ?`).run(
-    v.start_ym, v.end_ym, v.monthly_rent, v.pay_day, v.cash_amount, v.tenant_name, nowIso(), entryId);
-  const entry = db.prepare('SELECT * FROM earn_rental_entries WHERE id = ?').get(entryId);
-  ensureRentalYearsForEntry(rental.id, entry);
-  res.json(earnRentalRow(rental));
+  const out = commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: rental.id,
+    entityLabel: rental.label, summary: `Updated rent entry · ${rental.label}`,
+  }, () => {
+    db.prepare(
+      `UPDATE earn_rental_entries SET start_ym = ?, end_ym = ?, monthly_rent = ?, pay_day = ?,
+       cash_amount = ?, tenant_name = ?, updated_at = ? WHERE id = ?`).run(
+      v.start_ym, v.end_ym, v.monthly_rent, v.pay_day, v.cash_amount, v.tenant_name, nowIso(), entryId);
+    const entry = db.prepare('SELECT * FROM earn_rental_entries WHERE id = ?').get(entryId);
+    ensureRentalYearsForEntry(rental.id, entry);
+    return { value: earnRentalRow(rental), entityId: rental.id };
+  });
+  res.json(out);
 });
 app.delete('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM earn_rental_entries WHERE id = ? AND rental_id = ?')
-    .run(Number(req.params.entryId), Number(req.params.rentalId));
-  if (!info.changes) return res.status(404).json({ error: 'entry not found' });
+  const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(req.params.rentalId));
+  if (!rental) return res.status(404).json({ error: 'rental not found' });
+  if (!db.prepare('SELECT id FROM earn_rental_entries WHERE id = ? AND rental_id = ?').get(Number(req.params.entryId), rental.id)) {
+    return res.status(404).json({ error: 'entry not found' });
+  }
+  commitTx(req, 'rental', {
+    module: 'earnings', entityType: 'rental', entityId: rental.id,
+    entityLabel: rental.label, summary: `Updated rent entry · ${rental.label}`,
+  }, () => {
+    db.prepare('DELETE FROM earn_rental_entries WHERE id = ? AND rental_id = ?')
+      .run(Number(req.params.entryId), Number(req.params.rentalId));
+    return { value: { ok: true }, entityId: rental.id };
+  });
   res.json({ ok: true });
 });
 
@@ -3397,23 +3845,42 @@ app.get('/api/spending', requireApiAuth, (req, res) => {
 app.post('/api/spending/cards', requireApiAuth, (req, res) => {
   const v = validSpendCardInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  const ts = nowIso();
-  const info = db.prepare('INSERT INTO spend_cards (name, issuer, last4, credit_limit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(v.name, v.issuer, v.last4, v.credit_limit, ts, ts);
-  res.status(201).json(spendCardView(getSpendCard(info.lastInsertRowid)));
+  const card = commitTx(req, 'card', {
+    module: 'spending', entityType: 'card', entityId: null,
+    entityLabel: v.name, summary: `Added card ${v.name}`,
+  }, () => {
+    const ts = nowIso();
+    const info = db.prepare('INSERT INTO spend_cards (name, issuer, last4, credit_limit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(v.name, v.issuer, v.last4, v.credit_limit, ts, ts);
+    return { value: spendCardView(getSpendCard(info.lastInsertRowid)), entityId: info.lastInsertRowid };
+  });
+  res.status(201).json(card);
 });
 app.put('/api/spending/cards/:id', requireApiAuth, (req, res) => {
   const card = getSpendCard(Number(req.params.id));
   if (!card) return res.status(404).json({ error: 'card not found' });
   const v = validSpendCardInput(req.body || {});
   if (v.error) return res.status(400).json({ error: v.error });
-  db.prepare('UPDATE spend_cards SET name = ?, issuer = ?, last4 = ?, credit_limit = ?, updated_at = ? WHERE id = ?')
-    .run(v.name, v.issuer, v.last4, v.credit_limit, nowIso(), card.id);
-  res.json(spendCardView(getSpendCard(card.id)));
+  const updated = commitTx(req, 'card', {
+    module: 'spending', entityType: 'card', entityId: card.id,
+    entityLabel: v.name, summary: `Updated card ${v.name}`,
+  }, () => {
+    db.prepare('UPDATE spend_cards SET name = ?, issuer = ?, last4 = ?, credit_limit = ?, updated_at = ? WHERE id = ?')
+      .run(v.name, v.issuer, v.last4, v.credit_limit, nowIso(), card.id);
+    return { value: spendCardView(getSpendCard(card.id)), entityId: card.id };
+  });
+  res.json(updated);
 });
 app.delete('/api/spending/cards/:id', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM spend_cards WHERE id = ?').run(Number(req.params.id));
-  if (!info.changes) return res.status(404).json({ error: 'card not found' });
+  const card = getSpendCard(Number(req.params.id));
+  if (!card) return res.status(404).json({ error: 'card not found' });
+  commitTx(req, 'card', {
+    module: 'spending', entityType: 'card', entityId: card.id,
+    entityLabel: card.name, summary: `Deleted card ${card.name}`,
+  }, () => {
+    db.prepare('DELETE FROM spend_cards WHERE id = ?').run(Number(req.params.id));
+    return { value: { ok: true }, entityId: card.id };
+  });
   res.json({ ok: true });
 });
 app.get('/api/spending/cards/:id', requireApiAuth, (req, res) => {
@@ -3434,11 +3901,17 @@ app.post('/api/spending/cards/:id/transactions', requireApiAuth, (req, res) => {
   const amount = b.type === 'payment' ? Math.abs(raw) : -Math.abs(raw);
   const kind = b.type === 'payment' ? 'payment' : 'charge';
   const category = b.category != null ? String(b.category).trim() : '';
-  const info = db.prepare(
-    `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, 'manual', ?, ?)`).run(
-    card.id, b.date, merchant, b.memo != null ? String(b.memo) : null, category || null, amount, kind, nowIso());
-  res.status(201).json(db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(info.lastInsertRowid));
+  const row = commitTx(req, 'card', {
+    module: 'spending', entityType: 'card', entityId: card.id,
+    entityLabel: card.name, summary: `Added transaction · ${card.name}`,
+  }, () => {
+    const info = db.prepare(
+      `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'manual', ?, ?)`).run(
+      card.id, b.date, merchant, b.memo != null ? String(b.memo) : null, category || null, amount, kind, nowIso());
+    return { value: db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(info.lastInsertRowid), entityId: card.id };
+  });
+  res.status(201).json(row);
 });
 app.put('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
   const row = db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(Number(req.params.id));
@@ -3447,13 +3920,28 @@ app.put('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
   const merchant = b.merchant != null ? String(b.merchant).trim() : row.merchant;
   if (!merchant) return res.status(400).json({ error: 'merchant is required.' });
   const category = b.category != null ? String(b.category).trim() : row.category;
-  db.prepare('UPDATE spend_transactions SET merchant = ?, memo = ?, category = ? WHERE id = ?')
-    .run(merchant, b.memo != null ? String(b.memo) : row.memo, category || null, row.id);
-  res.json(db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(row.id));
+  const card = getSpendCard(row.card_id);
+  const updated = commitTx(req, 'card', {
+    module: 'spending', entityType: 'card', entityId: row.card_id,
+    entityLabel: card ? card.name : null, summary: `Updated transaction · ${card ? card.name : ''}`,
+  }, () => {
+    db.prepare('UPDATE spend_transactions SET merchant = ?, memo = ?, category = ? WHERE id = ?')
+      .run(merchant, b.memo != null ? String(b.memo) : row.memo, category || null, row.id);
+    return { value: db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(row.id), entityId: row.card_id };
+  });
+  res.json(updated);
 });
 app.delete('/api/spending/transactions/:id', requireApiAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM spend_transactions WHERE id = ?').run(Number(req.params.id));
-  if (!info.changes) return res.status(404).json({ error: 'transaction not found' });
+  const row = db.prepare('SELECT * FROM spend_transactions WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'transaction not found' });
+  const card = getSpendCard(row.card_id);
+  commitTx(req, 'card', {
+    module: 'spending', entityType: 'card', entityId: row.card_id,
+    entityLabel: card ? card.name : null, summary: `Deleted transaction · ${card ? card.name : ''}`,
+  }, () => {
+    db.prepare('DELETE FROM spend_transactions WHERE id = ?').run(Number(req.params.id));
+    return { value: { ok: true }, entityId: row.card_id };
+  });
   res.json({ ok: true });
 });
 // QFX import, step 1: parse writes nothing. Rows already on the card
@@ -3518,6 +4006,7 @@ app.post('/api/spending/cards/:id/import-qfx/apply', requireApiAuth, (req, res) 
   const balanceAsof = validSpendDate(b.balanceAsof) ? b.balanceAsof : null;
   const ts = nowIso();
   let adjustment = null;
+  const before = snapshotByAggregate(db, 'card', card.id);
   try {
     db.transaction(() => {
       const ins = db.prepare(
@@ -3539,6 +4028,13 @@ app.post('/api/spending/cards/:id/import-qfx/apply', requireApiAuth, (req, res) 
           }
         }
       }
+      // One import Apply = one commit, however many rows it wrote.
+      recordCommit(db, {
+        userId: req.user.id, username: req.user.username, module: 'spending',
+        entityType: 'card', entityId: card.id, entityLabel: card.name,
+        summary: `Imported QFX · ${card.name} (${v.valid.length} transactions)`,
+        before, snapshot: snapshotByAggregate(db, 'card', card.id),
+      });
     })();
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -3614,6 +4110,23 @@ app.post('/api/spending/ai-categories/apply', requireApiAuth, (req, res) => {
   }
   let updated = 0;
   db.transaction(() => {
+    // The touched set is fixed before any write: the uncategorized
+    // rows each proposal's merchant would claim, plus every
+    // override row. The before snapshot reads these rows (and the
+    // mappings preference) pre-update; the after snapshot reads
+    // the same set post-update.
+    const uncategorized = db.prepare("SELECT id, merchant FROM spend_transactions WHERE category IS NULL OR category = ''").all();
+    const touchedIds = new Set();
+    for (const p of proposals) {
+      if (!p || typeof p.merchant !== 'string' || !SPEND_CATEGORIES.includes(p.category)) continue;
+      const key = normalizeMerchant(p.merchant);
+      for (const r of uncategorized) {
+        if (normalizeMerchant(r.merchant) === key && !overrideById.has(r.id)) touchedIds.add(r.id);
+      }
+    }
+    for (const txId of overrideById.keys()) touchedIds.add(txId);
+    const extra = { txIds: [...touchedIds], userId: req.user.id };
+    const before = snapshotByAggregate(db, 'spending-global', null, extra);
     for (const p of proposals) {
       if (!p || typeof p.merchant !== 'string' || !SPEND_CATEGORIES.includes(p.category)) continue;
       mappings[normalizeMerchant(p.merchant)] = p.category;
@@ -3634,6 +4147,13 @@ app.post('/api/spending/ai-categories/apply', requireApiAuth, (req, res) => {
     for (const [txId, category] of overrideById) {
       updated += db.prepare('UPDATE spend_transactions SET category = ? WHERE id = ?').run(category, txId).changes;
     }
+    // One analysis Apply = one commit, across all cards.
+    recordCommit(db, {
+      userId: req.user.id, username: req.user.username, module: 'spending',
+      entityType: 'spending-global', entityId: null, entityLabel: 'All cards',
+      summary: `Applied category analysis (${updated} transactions)`,
+      before, snapshot: snapshotByAggregate(db, 'spending-global', null, extra),
+    });
   })();
   res.json({ mapped: proposals.length, updated });
 });
@@ -3699,11 +4219,18 @@ app.post('/api/spending/cards/:id/fill/apply', requireApiAuth, (req, res) => {
     });
   }
   const ts = nowIso();
+  const before = snapshotByAggregate(db, 'card', card.id);
   db.transaction(() => {
     const ins = db.prepare(
       `INSERT INTO spend_transactions (card_id, date, merchant, memo, category, amount, fitid, source, kind, created_at)
        VALUES (?, ?, ?, ?, ?, ?, NULL, 'ai', 'charge', ?)`);
     for (const r of valid) ins.run(card.id, r.date, r.merchant, r.memo, r.category, r.amount, ts);
+    recordCommit(db, {
+      userId: req.user.id, username: req.user.username, module: 'spending',
+      entityType: 'card', entityId: card.id, entityLabel: card.name,
+      summary: `Applied Fill with AI · ${card.name} (${valid.length} transactions)`,
+      before, snapshot: snapshotByAggregate(db, 'card', card.id),
+    });
   })();
   res.status(201).json({ inserted: valid.length, dropped });
 });
@@ -4466,9 +4993,14 @@ app.post('/api/planning/projects', requireApiAuth, (req, res) => {
     }
     return pid;
   });
-  const pid = insertProject();
-  const row = planProjectById(pid, req.user.id);
-  res.status(201).json({ project: planProjectViewRow(row) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: null,
+    entityLabel: String(b.name).trim(), summary: `Created project ${String(b.name).trim()}`,
+  }, () => {
+    const pid = insertProject();
+    return { value: { project: planProjectViewRow(planProjectById(pid, req.user.id)) }, entityId: pid };
+  });
+  res.status(201).json(out);
 });
 
 app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
@@ -4507,9 +5039,16 @@ app.put('/api/planning/projects/:id', requireApiAuth, (req, res) => {
     const metaErr = planValidateProjectMetadata(p.template, metadata);
     if (metaErr) return res.status(400).json({ error: metaErr });
   }
-  db.prepare('UPDATE plan_projects SET name = ?, question = ?, metadata = ?, updated_at = ? WHERE id = ?')
-    .run(b.name !== undefined ? String(b.name).trim() : p.name, b.question !== undefined ? (b.question ? String(b.question).trim() : null) : p.question, metadata ? JSON.stringify(metadata) : null, nowIso(), p.id);
-  res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: b.name !== undefined ? String(b.name).trim() : p.name,
+    summary: `Updated project ${b.name !== undefined ? String(b.name).trim() : p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_projects SET name = ?, question = ?, metadata = ?, updated_at = ? WHERE id = ?')
+      .run(b.name !== undefined ? String(b.name).trim() : p.name, b.question !== undefined ? (b.question ? String(b.question).trim() : null) : p.question, metadata ? JSON.stringify(metadata) : null, nowIso(), p.id);
+    return { value: { project: planProjectViewRow(planProjectById(p.id, req.user.id)) }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 // Optimization taxonomy (labels only; figures come from the
@@ -4549,9 +5088,15 @@ app.post('/api/planning/projects/:id/baselines', requireApiAuth, (req, res) => {
   const errs = validateAiBaseline(def);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, b.name ? String(b.name).trim() : 'Baseline', b.source ? String(b.source) : 'manual', b.category ? String(b.category) : p.category, b.subcategory ? String(b.subcategory) : p.subcategory, b.entity ? JSON.stringify(b.entity) : (p.entity || null), JSON.stringify(def), now, now);
-  res.status(201).json({ baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Added baseline · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, b.name ? String(b.name).trim() : 'Baseline', b.source ? String(b.source) : 'manual', b.category ? String(b.category) : p.category, b.subcategory ? String(b.subcategory) : p.subcategory, b.entity ? JSON.stringify(b.entity) : (p.entity || null), JSON.stringify(def), now, now);
+    return { value: { baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 app.put('/api/planning/projects/:id/baselines/:bid', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
@@ -4568,9 +5113,15 @@ app.put('/api/planning/projects/:id/baselines/:bid', requireApiAuth, (req, res) 
     const errs = validateAiBaseline(def);
     if (errs.length) return res.status(400).json({ error: errs.join('; ') });
   }
-  db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
-    .run(b.name !== undefined ? String(b.name).trim() : row.name, JSON.stringify(def), nowIso(), row.id);
-  res.json({ baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Updated baseline · ${p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
+      .run(b.name !== undefined ? String(b.name).trim() : row.name, JSON.stringify(def), nowIso(), row.id);
+    return { value: { baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) }, entityId: p.id };
+  });
+  res.json(out);
 });
 app.delete('/api/planning/projects/:id/baselines/:bid', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
@@ -4579,15 +5130,27 @@ app.delete('/api/planning/projects/:id/baselines/:bid', requireApiAuth, (req, re
   if (!row) return res.status(404).json({ error: 'baseline not found' });
   // A report drafted against this baseline loses its selection (never
   // silently falls back); the user re-picks in the report view.
-  const cleared = db.prepare('UPDATE plan_reports SET baseline_id = NULL, baseline_cleared = 1 WHERE project_id = ? AND baseline_id = ?').run(p.id, row.id);
-  db.prepare('DELETE FROM plan_baselines WHERE id = ?').run(row.id);
-  res.json({ ok: true, clearedReports: cleared.changes });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Deleted baseline · ${p.name}`,
+  }, () => {
+    const cleared = db.prepare('UPDATE plan_reports SET baseline_id = NULL, baseline_cleared = 1 WHERE project_id = ? AND baseline_id = ?').run(p.id, row.id);
+    db.prepare('DELETE FROM plan_baselines WHERE id = ?').run(row.id);
+    return { value: { ok: true, clearedReports: cleared.changes }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.delete('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  db.prepare('DELETE FROM plan_projects WHERE id = ?').run(p.id);
+  commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Deleted project ${p.name}`,
+  }, () => {
+    db.prepare('DELETE FROM plan_projects WHERE id = ?').run(p.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
@@ -4597,9 +5160,15 @@ app.delete('/api/planning/projects/:id', requireApiAuth, (req, res) => {
 app.post('/api/planning/projects/:id/sync', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  db.prepare('UPDATE plan_projects SET snapshot = ?, updated_at = ? WHERE id = ?')
-    .run(JSON.stringify(planSnapshotMainline()), nowIso(), p.id);
-  res.json({ project: planProjectById(p.id, req.user.id), stale: false });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Synced latest mainline · ${p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_projects SET snapshot = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(planSnapshotMainline()), nowIso(), p.id);
+    return { value: { project: planProjectById(p.id, req.user.id), stale: false }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.post('/api/planning/projects/:id/scenarios', requireApiAuth, (req, res) => {
@@ -4642,9 +5211,15 @@ app.post('/api/planning/projects/:id/declared-assets', requireApiAuth, (req, res
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'asset name is required' });
   if (!(Number(b.amount) > 0)) return res.status(400).json({ error: 'amount must be > 0' });
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_declared_assets (project_id, name, amount, maturity_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), Number(b.amount), b.maturity_date || null, now, now);
-  res.status(201).json({ asset: db.prepare('SELECT * FROM plan_declared_assets WHERE id = ?').get(info.lastInsertRowid) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Added declared asset · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_declared_assets (project_id, name, amount, maturity_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(b.name).trim(), Number(b.amount), b.maturity_date || null, now, now);
+    return { value: { asset: db.prepare('SELECT * FROM plan_declared_assets WHERE id = ?').get(info.lastInsertRowid) }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 
 app.delete('/api/planning/declared-assets/:id', requireApiAuth, (req, res) => {
@@ -4652,7 +5227,13 @@ app.delete('/api/planning/declared-assets/:id', requireApiAuth, (req, res) => {
   if (!row) return res.status(404).json({ error: 'asset not found' });
   const p = planProjectById(row.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  db.prepare('DELETE FROM plan_declared_assets WHERE id = ?').run(row.id);
+  commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Deleted declared asset · ${p.name}`,
+  }, () => {
+    db.prepare('DELETE FROM plan_declared_assets WHERE id = ?').run(row.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
@@ -4664,9 +5245,15 @@ app.post('/api/planning/projects/:id/strategies', requireApiAuth, (req, res) => 
   const template = b.template ? String(b.template) : null;
   const templateParams = b.template_params && typeof b.template_params === 'object' ? b.template_params : null;
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), planNextLetter(p.id), b.source || 'manual', template, templateParams ? JSON.stringify(templateParams) : null, now, now);
-  res.status(201).json({ strategy: planStrategyById(info.lastInsertRowid) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Added strategy ${String(b.name).trim()} · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(b.name).trim(), planNextLetter(p.id), b.source || 'manual', template, templateParams ? JSON.stringify(templateParams) : null, now, now);
+    return { value: { strategy: planStrategyById(info.lastInsertRowid) }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 
 app.put('/api/planning/strategies/:id', requireApiAuth, (req, res) => {
@@ -4679,9 +5266,15 @@ app.put('/api/planning/strategies/:id', requireApiAuth, (req, res) => {
   if (b.model_id !== undefined && b.model_id !== null && !db.prepare('SELECT id FROM plan_ai_models WHERE id = ? AND project_id = ?').get(Number(b.model_id), p.id)) {
     return res.status(400).json({ error: 'model not found in this project' });
   }
-  db.prepare('UPDATE plan_strategies SET name = ?, model_id = ?, updated_at = ? WHERE id = ?')
-    .run(b.name !== undefined ? String(b.name).trim() : s.name, b.model_id !== undefined ? (b.model_id == null ? null : Number(b.model_id)) : s.model_id, nowIso(), s.id);
-  res.json({ strategy: planStrategyById(s.id) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Updated strategy ${b.name !== undefined ? String(b.name).trim() : s.name} · ${p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_strategies SET name = ?, model_id = ?, updated_at = ? WHERE id = ?')
+      .run(b.name !== undefined ? String(b.name).trim() : s.name, b.model_id !== undefined ? (b.model_id == null ? null : Number(b.model_id)) : s.model_id, nowIso(), s.id);
+    return { value: { strategy: planStrategyById(s.id) }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.delete('/api/planning/strategies/:id', requireApiAuth, (req, res) => {
@@ -4690,7 +5283,13 @@ app.delete('/api/planning/strategies/:id', requireApiAuth, (req, res) => {
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
   if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be deleted — revert it first' });
-  db.prepare('DELETE FROM plan_strategies WHERE id = ?').run(s.id);
+  commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Deleted strategy ${s.name} · ${p.name}`,
+  }, () => {
+    db.prepare('DELETE FROM plan_strategies WHERE id = ?').run(s.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
@@ -4832,14 +5431,20 @@ app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
   const errs = planValidateStrategyOps(s.id, [...existing, op], legs);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(s.id, seq, b.op_type, JSON.stringify(params), b.source || 'manual', now, now);
-  for (const l of legs) {
-    db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
-      .run(info.lastInsertRowid, l.source_ref, String(l.amount), now);
-  }
-  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
-  res.status(201).json({ op: { ...op, id: info.lastInsertRowid, legs: planOpsOf(s.id).find((o) => o.id === info.lastInsertRowid).legs } });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Added operation · ${s.name} · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(s.id, seq, b.op_type, JSON.stringify(params), b.source || 'manual', now, now);
+    for (const l of legs) {
+      db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
+        .run(info.lastInsertRowid, l.source_ref, String(l.amount), now);
+    }
+    db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
+    return { value: { op: { ...op, id: info.lastInsertRowid, legs: planOpsOf(s.id).find((o) => o.id === info.lastInsertRowid).legs } }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 
 app.put('/api/planning/ops/:id', requireApiAuth, (req, res) => {
@@ -4858,13 +5463,19 @@ app.put('/api/planning/ops/:id', requireApiAuth, (req, res) => {
   const errs = planValidateStrategyOps(s.id, existing, legs);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
   const now = nowIso();
-  db.prepare('UPDATE plan_ops SET params = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(params), now, row.id);
-  if (b.legs !== undefined) {
-    db.prepare('DELETE FROM plan_legs WHERE op_id = ?').run(row.id);
-    for (const l of legs) db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)').run(row.id, l.source_ref, String(l.amount), now);
-  }
-  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
-  res.json({ op: planOpsOf(s.id).find((o) => o.id === row.id) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Updated operation · ${s.name} · ${p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_ops SET params = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(params), now, row.id);
+    if (b.legs !== undefined) {
+      db.prepare('DELETE FROM plan_legs WHERE op_id = ?').run(row.id);
+      for (const l of legs) db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)').run(row.id, l.source_ref, String(l.amount), now);
+    }
+    db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
+    return { value: { op: planOpsOf(s.id).find((o) => o.id === row.id) }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.delete('/api/planning/ops/:id', requireApiAuth, (req, res) => {
@@ -4874,8 +5485,14 @@ app.delete('/api/planning/ops/:id', requireApiAuth, (req, res) => {
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
   if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
-  db.prepare('DELETE FROM plan_ops WHERE id = ?').run(row.id);
-  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(nowIso(), s.id);
+  commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Deleted operation · ${s.name} · ${p.name}`,
+  }, () => {
+    db.prepare('DELETE FROM plan_ops WHERE id = ?').run(row.id);
+    db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(nowIso(), s.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
@@ -4892,11 +5509,17 @@ app.put('/api/planning/strategies/:id/assumptions', requireApiAuth, (req, res) =
     return res.status(400).json({ error: 'assumption value must be a number' });
   }
   const now = nowIso();
-  db.prepare(`INSERT INTO plan_assumptions (strategy_id, key, value, confirmed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(strategy_id, key) DO UPDATE SET value = excluded.value, confirmed = excluded.confirmed, updated_at = excluded.updated_at`)
-    .run(s.id, b.key, b.value == null || b.value === '' ? null : String(b.value), b.confirmed ? 1 : 0, now, now);
-  db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
-  res.json({ assumptions: planAssumptionsOf(s.id) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Updated assumption · ${s.name} · ${p.name}`,
+  }, () => {
+    db.prepare(`INSERT INTO plan_assumptions (strategy_id, key, value, confirmed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(strategy_id, key) DO UPDATE SET value = excluded.value, confirmed = excluded.confirmed, updated_at = excluded.updated_at`)
+      .run(s.id, b.key, b.value == null || b.value === '' ? null : String(b.value), b.confirmed ? 1 : 0, now, now);
+    db.prepare('UPDATE plan_strategies SET updated_at = ? WHERE id = ?').run(now, s.id);
+    return { value: { assumptions: planAssumptionsOf(s.id) }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 // Strategy factors: full replace (the client sends the whole edited
@@ -4913,8 +5536,14 @@ app.put('/api/planning/strategies/:id/factors', requireApiAuth, (req, res) => {
   const errs = validateStrategyFactors(factors, currentMonthKey());
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
   const now = nowIso();
-  db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
-  res.json({ strategy: planStrategyById(s.id), factors });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Updated factors · ${s.name} · ${p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
+    return { value: { strategy: planStrategyById(s.id), factors }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 // Investment sink: where the pool goes. Saves the sink into the
@@ -4975,6 +5604,7 @@ app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
   }
   const buySeq = sells.length + 1;
   const now = nowIso();
+  const before = snapshotByAggregate(db, 'project', p.id);
   const rebuild = db.transaction(() => {
     db.prepare('DELETE FROM plan_legs WHERE op_id IN (SELECT id FROM plan_ops WHERE strategy_id = ?)').run(s.id);
     db.prepare('DELETE FROM plan_ops WHERE strategy_id = ?').run(s.id);
@@ -4994,6 +5624,12 @@ app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
     });
     const factors = { ...planStrategyFactors(s), sink, stock: stockFactor };
     db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
+    recordCommit(db, {
+      userId: req.user.id, username: req.user.username, module: 'planning',
+      entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+      entityLabel: p.name, summary: `Updated sink · ${s.name} · ${p.name}`,
+      before, snapshot: snapshotByAggregate(db, 'project', p.id),
+    });
     return factors;
   });
   const factors = rebuild();
@@ -5259,6 +5895,17 @@ app.post('/api/planning/strategies/:id/merge', requireApiAuth, async (req, res) 
     }
   }
   finalWrites = finalWrites.filter((w) => !w._skip);
+  // Dropped ops vanish inside the transaction; capture their rows now
+  // so the merge commit's event still shows them.
+  const droppedOps = [];
+  for (const seq of droppedSeqs) {
+    const opRow = db.prepare('SELECT * FROM plan_ops WHERE strategy_id = ? AND seq = ?').get(s.id, seq);
+    if (!opRow) continue;
+    droppedOps.push({ table: 'plan_ops', pk: { id: opRow.id }, before: opRow, after: null });
+    for (const l of db.prepare('SELECT * FROM plan_legs WHERE op_id = ? ORDER BY id').all(opRow.id)) {
+      droppedOps.push({ table: 'plan_legs', pk: { id: l.id }, before: l, after: null });
+    }
+  }
   const tx = db.transaction(() => {
     const entries = planApplyWrites(finalWrites);
     for (const seq of droppedSeqs) {
@@ -5269,6 +5916,15 @@ app.post('/api/planning/strategies/:id/merge', requireApiAuth, async (req, res) 
       .run(s.id, 'merge', JSON.stringify(entries), JSON.stringify(resolutions), 'active', nowIso());
     db.prepare('UPDATE plan_strategies SET merged = 1, merge_record_id = ?, updated_at = ? WHERE id = ?')
       .run(info.lastInsertRowid, nowIso(), s.id);
+    // The merge itself is a History commit (same transaction).
+    recordCommit(db, {
+      userId: req.user.id, username: req.user.username, module: 'planning',
+      entityType: 'project', entityId: p.id, entityLabel: p.name,
+      projectId: p.id, strategyId: s.id, mergeRecordId: info.lastInsertRowid,
+      kind: 'merge', summary: `Merged strategy ${s.name} → mainline`,
+      event: [...mergeEventFromEntries(db, entries), ...droppedOps],
+      snapshot: snapshotByAggregate(db, 'project', p.id),
+    });
     return { mergeRecordId: info.lastInsertRowid, entries };
   });
   let result;
@@ -5334,25 +5990,26 @@ app.post('/api/planning/strategies/:id/revert-preview', requireApiAuth, (req, re
   res.json({ inverse, conflicts, dependents, moneyNote: PLAN_MONEY_NOTE });
 });
 
-app.post('/api/planning/strategies/:id/revert', requireApiAuth, (req, res) => {
-  const s = planStrategyById(Number(req.params.id));
-  if (!s) return res.status(404).json({ error: 'strategy not found' });
-  const p = planProjectById(s.project_id, req.user.id);
-  if (!p) return res.status(404).json({ error: 'project not found' });
-  if (!s.merged || !s.merge_record_id) return res.status(400).json({ error: 'strategy is not merged' });
+// Shared merge-revert core: the strategy endpoint and the global
+// History undo use the same code path. Throws {status, body} for
+// 400s (dependents / unresolved conflicts); anything else is a 500.
+// The revert is also a History commit (kind 'merge-revert'), recorded
+// in the same transaction as the revert itself.
+function revertMergedStrategy(s, p, user, resolutions) {
   const record = db.prepare('SELECT * FROM plan_merge_records WHERE id = ?').get(s.merge_record_id);
-  if (!record || record.status !== 'active') return res.status(400).json({ error: 'no active merge record for this strategy' });
+  if (!record || record.status !== 'active') {
+    throw { status: 400, body: { error: 'no active merge record for this strategy' } };
+  }
   const entries = JSON.parse(record.entries || '[]');
   const current = planCurrentTables();
   const { inverse, conflicts } = buildRevertInverse({ entries, current });
   const dependents = planRevertDependents(s, record);
   if (dependents.length) {
-    return res.status(400).json({ error: 'later merges or mainline records depend on this merge — revert them first (newest first)', dependents });
+    throw { status: 400, body: { error: 'later merges or mainline records depend on this merge — revert them first (newest first)', dependents } };
   }
-  const resolutions = req.body?.resolutions || [];
   const resByKey = new Map(resolutions.map((r) => [`${r.table}:${r.rowId}:${r.field}`, r]));
   const unresolved = conflicts.filter((c) => !resByKey.has(`${c.table}:${c.rowId}:${c.field}`));
-  if (unresolved.length) return res.status(400).json({ error: 'all conflicts must be resolved before reverting', conflicts: unresolved });
+  if (unresolved.length) throw { status: 400, body: { error: 'all conflicts must be resolved before reverting', conflicts: unresolved } };
   let finalInverse = inverse;
   for (const inv of finalInverse) {
     if (inv.kind !== 'update') continue;
@@ -5366,20 +6023,105 @@ app.post('/api/planning/strategies/:id/revert', requireApiAuth, (req, res) => {
   }
   finalInverse = finalInverse.filter((x) => !x._skip);
   const tx = db.transaction(() => {
+    const keys = [...new Map(finalInverse.map((inv) => [`${inv.table}:${inv.rowId}`, { table: inv.table, rowId: inv.rowId }])).values()];
+    const beforeRows = keys.map(({ table, rowId }) => ({ table, pk: { id: rowId }, before: readRow(db, table, { id: rowId }) }));
     planApplyInverse(finalInverse);
     db.prepare('UPDATE plan_merge_records SET status = ? WHERE id = ?').run('reverted', record.id);
     const info = db.prepare('INSERT INTO plan_merge_records (strategy_id, kind, entries, conflicts, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(s.id, 'revert', JSON.stringify(finalInverse), JSON.stringify(resolutions), 'active', nowIso());
     db.prepare('UPDATE plan_strategies SET merged = 0, merge_record_id = NULL, updated_at = ? WHERE id = ?').run(nowIso(), s.id);
-    return { revertRecordId: info.lastInsertRowid };
+    const event = eventFromRowStates(keys.map(({ table, rowId }, i) => ({
+      table, pk: { id: rowId },
+      before: beforeRows[i].before,
+      after: readRow(db, table, { id: rowId }),
+    })));
+    const commitId = recordCommit(db, {
+      userId: user.id, username: user.username, module: 'planning',
+      entityType: 'project', entityId: p.id, entityLabel: p.name,
+      projectId: p.id, strategyId: s.id, mergeRecordId: info.lastInsertRowid,
+      kind: 'merge-revert', summary: `Reverted merge · ${s.name}`,
+      event, snapshot: snapshotByAggregate(db, 'project', p.id),
+    });
+    return { revertRecordId: info.lastInsertRowid, commitId };
   });
-  let result;
+  return tx();
+}
+
+app.post('/api/planning/strategies/:id/revert', requireApiAuth, (req, res) => {
+  const s = planStrategyById(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'strategy not found' });
+  const p = planProjectById(s.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!s.merged || !s.merge_record_id) return res.status(400).json({ error: 'strategy is not merged' });
   try {
-    result = tx();
+    const result = revertMergedStrategy(s, p, req.user, req.body?.resolutions || []);
+    res.json({ ...result, moneyNote: PLAN_MONEY_NOTE });
   } catch (err) {
+    if (err.status) return res.status(err.status).json(err.body);
     return res.status(500).json({ error: `revert failed: ${err.message}` });
   }
-  res.json({ ...result, moneyNote: PLAN_MONEY_NOTE });
+});
+
+// ------------------------------------------------------- global history ----
+// One commit per user Apply/Save, across all modules. List payloads
+// carry metadata + event counts only — snapshots stay server-side
+// (a card snapshot can be hundreds of KB) and are never sent.
+app.get('/api/history/commits', requireApiAuth, (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const projectId = req.query.projectId != null && req.query.projectId !== '' ? Number(req.query.projectId) : null;
+  res.json(listCommits(db, {
+    module: req.query.module || null,
+    q: req.query.q || null,
+    projectId,
+    limit, offset,
+  }));
+});
+app.get('/api/history/commits/:id', requireApiAuth, (req, res) => {
+  const c = getCommit(db, Number(req.params.id));
+  if (!c) return res.status(404).json({ error: 'commit not found' });
+  res.json({ commit: c });
+});
+app.post('/api/history/commits/:id/undo', requireApiAuth, (req, res) => {
+  const c = getCommitFull(db, Number(req.params.id));
+  if (!c) return res.status(404).json({ error: 'commit not found' });
+  // Merge commits revert through the merge flow (mainline-only rule,
+  // dependency list, conflict flow) — never through generic undo.
+  if (c.kind === 'merge') {
+    const s = planStrategyById(c.strategy_id);
+    if (!s) return res.status(404).json({ error: 'strategy not found' });
+    const p = planProjectById(s.project_id, req.user.id);
+    if (!p) return res.status(404).json({ error: 'project not found' });
+    try {
+      const result = revertMergedStrategy(s, p, req.user, []);
+      res.json({ ...result, moneyNote: PLAN_MONEY_NOTE });
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ ...err.body, strategyId: s.id });
+      return res.status(500).json({ error: `revert failed: ${err.message}` });
+    }
+    return;
+  }
+  try {
+    const tx = db.transaction(() => undoCommit(db, c, req.user));
+    const commitId = tx();
+    res.json({ commitId });
+  } catch (err) {
+    if (err.dependents) return res.status(400).json({ error: 'later commits depend on this commit — revert them first (newest first)', dependents: err.dependents });
+    if (err.code === 'merge-revert') return res.status(400).json({ error: err.message });
+    return res.status(500).json({ error: `undo failed: ${err.message}` });
+  }
+});
+app.post('/api/history/commits/:id/restore', requireApiAuth, (req, res) => {
+  const c = getCommitFull(db, Number(req.params.id));
+  if (!c) return res.status(404).json({ error: 'commit not found' });
+  try {
+    const tx = db.transaction(() => restoreCommit(db, c, req.user));
+    const commitId = tx();
+    res.json({ commitId });
+  } catch (err) {
+    if (err.code === 'merge' || err.code === 'merged-flag') return res.status(400).json({ error: err.message });
+    return res.status(500).json({ error: `restore failed: ${err.message}` });
+  }
 });
 
 // ------------------------------------------------------- planning AI --------
@@ -5560,11 +6302,17 @@ app.post('/api/planning/projects/:id/strategies/from-template', requireApiAuth, 
   const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
   const now = nowIso();
   const spec = JSON.parse(t.spec || '{}');
-  const minfo = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), JSON.stringify(spec), 1, 'template', answers ? JSON.stringify(answers) : null, now, now);
-  const sinfo = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, model_id, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), planNextLetter(p.id), 'ai', minfo.lastInsertRowid, 'ai-template', JSON.stringify({ template_id: t.id, answers }), now, now);
-  res.status(201).json({ strategy: planStrategyById(sinfo.lastInsertRowid), model: { id: minfo.lastInsertRowid, spec } });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Added strategy ${String(b.name).trim()} from template · ${p.name}`,
+  }, () => {
+    const minfo = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(b.name).trim(), JSON.stringify(spec), 1, 'template', answers ? JSON.stringify(answers) : null, now, now);
+    const sinfo = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, model_id, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(b.name).trim(), planNextLetter(p.id), 'ai', minfo.lastInsertRowid, 'ai-template', JSON.stringify({ template_id: t.id, answers }), now, now);
+    return { value: { strategy: planStrategyById(sinfo.lastInsertRowid), model: { id: minfo.lastInsertRowid, spec } }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 
 app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, res) => {
@@ -5635,9 +6383,15 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   errs.push(...planAiValidateChartSpecs(parsed.charts || [], p.id));
   if (errs.length) return res.status(502).json({ error: errs.join('; ') });
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', answers ? JSON.stringify(answers) : null, now, now);
-  res.status(201).json({ model: { id: info.lastInsertRowid, spec: parsed, metadata: answers }, thread, configured: true });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
+    entityLabel: p.name, summary: `Designed model · ${s.name} · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_ai_models (project_id, name, spec, version, source, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(req.body.name || `Model ${new Date().toISOString().slice(0, 10)}`), JSON.stringify(parsed), 1, 'ai', answers ? JSON.stringify(answers) : null, now, now);
+    return { value: { model: { id: info.lastInsertRowid, spec: parsed, metadata: answers }, thread, configured: true }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 
 // AI-designed baseline (project level, designed BEFORE the strategy
@@ -5747,16 +6501,28 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
   if (req.body?.baselineId !== undefined && req.body?.baselineId !== null) {
     const row = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.body.baselineId), p.id);
     if (!row) return res.status(404).json({ error: 'baseline not found' });
-    db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
-      .run(req.body.name ? String(req.body.name).trim() : row.name, JSON.stringify(stored), nowIso(), row.id);
-    return res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) });
+    const out = commitTx(req, 'project', {
+      module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+      entityLabel: p.name, summary: `Applied AI baseline · ${p.name}`,
+    }, () => {
+      db.prepare('UPDATE plan_baselines SET name = ?, definition = ?, updated_at = ? WHERE id = ?')
+        .run(req.body.name ? String(req.body.name).trim() : row.name, JSON.stringify(stored), nowIso(), row.id);
+      return { value: { project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(row.id)) }, entityId: p.id };
+    });
+    return res.json(out);
   }
   // Append-only list: a legacy apply also appends a list entry, so the
   // baseline list never loses an applied baseline.
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_baselines (project_id, name, source, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(p.id, baseline.description || 'AI baseline', 'ai', JSON.stringify(stored), now, now);
-  res.json({ project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Applied AI baseline · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_baselines (project_id, name, source, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(p.id, baseline.description || 'AI baseline', 'ai', JSON.stringify(stored), now, now);
+    return { value: { project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res) => {
@@ -5818,9 +6584,15 @@ app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {
     def.strategies = pickedStrategies;
   }
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, baseline_id, baseline_cleared, strategy_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, baselineId, 0, JSON.stringify(pickedStrategies), now, now);
-  res.status(201).json({ report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(info.lastInsertRowid) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Added report ${String(b.name).trim()} · ${p.name}`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, baseline_id, baseline_cleared, strategy_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, baselineId, 0, JSON.stringify(pickedStrategies), now, now);
+    return { value: { report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(info.lastInsertRowid) }, entityId: p.id };
+  });
+  res.status(201).json(out);
 });
 app.put('/api/planning/reports/:id', requireApiAuth, (req, res) => {
   const r = db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(Number(req.params.id));
@@ -5847,9 +6619,15 @@ app.put('/api/planning/reports/:id', requireApiAuth, (req, res) => {
     }
     strategyIds = b.strategy_ids.map(Number);
   }
-  db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, updated_at = ? WHERE id = ?')
-    .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, nowIso(), r.id);
-  res.json({ report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(r.id) });
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Updated report · ${p.name}`,
+  }, () => {
+    db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, updated_at = ? WHERE id = ?')
+      .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, nowIso(), r.id);
+    return { value: { report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(r.id) }, entityId: p.id };
+  });
+  res.json(out);
 });
 
 app.delete('/api/planning/reports/:id', requireApiAuth, (req, res) => {
@@ -5857,7 +6635,13 @@ app.delete('/api/planning/reports/:id', requireApiAuth, (req, res) => {
   if (!row) return res.status(404).json({ error: 'report not found' });
   const p = planProjectById(row.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  db.prepare('DELETE FROM plan_reports WHERE id = ?').run(row.id);
+  commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
+    entityLabel: p.name, summary: `Deleted report · ${p.name}`,
+  }, () => {
+    db.prepare('DELETE FROM plan_reports WHERE id = ?').run(row.id);
+    return { value: { ok: true }, entityId: p.id };
+  });
   res.json({ ok: true });
 });
 
