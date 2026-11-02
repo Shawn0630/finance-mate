@@ -17573,6 +17573,184 @@ try {
     } finally { await browserP.close(); }
   }
 
+  // ------------------------------------------- comparison views
+  // Strategy detail diff section (baseline/strategy/diff columns,
+  // monthly/annual toggle, All-default range with presets) + project
+  // overlay trajectory, master table, Apple compare, and the
+  // scenario re-pick rule for the new panels. Fully self-contained
+  // fixtures: the early 'Pay down test' project is deleted by the
+  // metadata cleanup above, so this block builds its own project,
+  // strategy, property and prepay op.
+  r = await req('POST', '/api/planning/projects', { name: 'Compare test', question: 'Diff then hold' });
+  check('comparison: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const cmpProjectId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${cmpProjectId}/strategies`, { name: 'Prepay 10k', source: 'template' });
+  check('comparison: pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const cmpStrategyId = r.data.strategy.id;
+  r = await req('POST', '/api/properties', {
+    address: '88 Compare Test Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('comparison: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const cmpPropId = r.data.id;
+  r = await req('POST', `/api/properties/${cmpPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('comparison: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+  const _cmpNow = new Date();
+  const _cmpNext = new Date(Date.UTC(_cmpNow.getUTCFullYear(), _cmpNow.getUTCMonth() + 1, 1));
+  const cmpOpDate = _cmpNext.toISOString().slice(0, 10);
+  r = await req('POST', `/api/planning/strategies/${cmpStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: cmpPropId, date: cmpOpDate, amount: 10000, openClosed: 'open' },
+  });
+  check('comparison: pin prepay op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${cmpProjectId}/scenarios`, { name: 'Compare world' });
+  check('comparison: scenario created for the pin project', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('comparison browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardC = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResC = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueC = loginResC.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserC = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserC.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardC({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueC, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitC = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/strategy/${cmpStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitC(1500);
+      const diff = await page.evaluate(() => ({
+        panel: !!document.querySelector('#planDiffPanel'),
+        head: document.querySelector('#planDiffTable thead')?.textContent || '',
+        rows: document.querySelectorAll('#planDiffTable tbody tr').length,
+        chart: !!document.querySelector('#planDiffChart'),
+        allActive: !!document.querySelector('[data-plan-diff-preset="all"].active'),
+        presets: [...document.querySelectorAll('[data-plan-diff-preset]')].map((b) => b.dataset.planDiffPreset),
+      }));
+      check('comparison: strategy detail diff section renders baseline/strategy/diff columns, All default',
+        diff.panel && diff.head.includes('Baseline') && diff.head.includes('Strategy') && diff.head.includes('Δ') && diff.rows > 0 && diff.chart && diff.allActive && diff.presets.includes('all'),
+        JSON.stringify(diff));
+      // Monthly row count vs the API month union (same union the
+      // client builds: mortgage baseline/strategy + stock series).
+      r = await req('GET', `/api/planning/strategies/${cmpStrategyId}`);
+      const apiMonths = new Set();
+      for (const per of Object.values((r.data.baseline.mortgage.perProperty || {}))) for (const pt of ((per.baseline && per.baseline.series) || [])) apiMonths.add(pt.month);
+      for (const per of Object.values((r.data.projection.mortgage.perProperty || {}))) for (const pt of ((per.strategy && per.strategy.series) || [])) apiMonths.add(pt.month);
+      for (const pt of (((r.data.baseline.stocks) || {}).series || [])) apiMonths.add(pt.month);
+      for (const pt of (((r.data.projection.stocks) || {}).series || [])) apiMonths.add(pt.month);
+      check('comparison: diff monthly table covers the full projection span by default',
+        diff.rows === apiMonths.size, JSON.stringify({ rows: diff.rows, apiMonths: apiMonths.size }));
+      await page.click('[data-plan-diff-preset="1y"]');
+      await waitC(800);
+      const shortRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr').length);
+      check('comparison: diff 1y preset narrows the monthly table',
+        shortRows > 0 && shortRows <= 12 && shortRows < diff.rows, JSON.stringify({ shortRows, fullRows: diff.rows }));
+      await page.click('[data-plan-diff-preset="all"]');
+      await waitC(800);
+      const backRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr').length);
+      check('comparison: diff All preset restores the full table', backRows === diff.rows, JSON.stringify({ backRows, fullRows: diff.rows }));
+      await page.click('[data-plan-diff-gran="annual"]');
+      await waitC(800);
+      const annual = await page.evaluate(() => ({
+        head: document.querySelector('#planDiffTable thead')?.textContent || '',
+        first: document.querySelector('#planDiffTable tbody tr td')?.textContent || '',
+      }));
+      check('comparison: diff annual toggle switches to year rows with Equity Δ (peak)',
+        annual.head.includes('Equity Δ (peak)') && /^\d{4}$/.test(annual.first.trim()), JSON.stringify(annual));
+      await page.goto(`http://ff.local/#planning/project/${cmpProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitC(1500);
+      const proj = await page.evaluate(() => ({
+        trajChart: (() => { const c = document.querySelector('#planTrajectoryChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
+        trajNote: document.querySelector('#planTrajectoryNote')?.textContent || '',
+        masterHead: document.querySelector('#planMasterTable thead')?.textContent || '',
+        masterText: document.querySelector('#planMasterTable')?.textContent || '',
+        appleHead: document.querySelector('#planAppleTable thead')?.textContent || '',
+        appleDiff: !!document.querySelector('#planAppleTable .plan-diff'),
+        appleChecked: [...document.querySelectorAll('#planApplePicker input[type="checkbox"]')].map((c) => c.checked),
+      }));
+      check('comparison: project overlay chart + master table render under the picked scenario',
+        proj.trajChart && proj.trajNote.includes('Compare world') && proj.masterHead.includes('Baseline') && proj.masterText.includes('Prepay 10k'),
+        JSON.stringify(proj));
+      check('comparison: Apple compare shows baseline absolutes with highlighted strategy deltas',
+        proj.appleHead.includes('Baseline') && proj.appleHead.includes('Prepay 10k') && proj.appleDiff && proj.appleChecked.length >= 1 && proj.appleChecked.every(Boolean),
+        JSON.stringify(proj));
+      await page.evaluate(() => { document.querySelectorAll('#planApplePicker input[type="checkbox"]').forEach((cb) => { if (cb.checked) cb.click(); }); });
+      await waitC(800);
+      const unpicked = await page.evaluate(() => ({
+        head: document.querySelector('#planAppleTable thead')?.textContent || '',
+        note: document.querySelector('#planAppleTable')?.textContent || '',
+      }));
+      check('comparison: Apple picker uncheck-all leaves the baseline column + pick note',
+        unpicked.head.includes('Baseline') && !unpicked.head.includes('Prepay 10k') && unpicked.note.includes('Pick a strategy to compare.'),
+        JSON.stringify(unpicked));
+      await page.evaluate(() => { document.querySelectorAll('#planApplePicker input[type="checkbox"]').forEach((cb) => { if (!cb.checked) cb.click(); }); });
+      await waitC(800);
+      const repicked = await page.evaluate(() => document.querySelector('#planAppleTable thead')?.textContent || '');
+      check('comparison: Apple picker re-check restores the strategy column',
+        repicked.includes('Prepay 10k'), JSON.stringify(repicked));
+      // Scenario re-pick: uncheck all (one at a time with waits, so
+      // no stale load overwrites the re-pick state) → the new panels
+      // show the note only, like the legacy comparison.
+      const scenBoxes = await page.evaluate(() => document.querySelectorAll('#planCompareScenarios input[type="checkbox"]').length);
+      for (let i = 0; i < scenBoxes; i++) {
+        await page.evaluate(() => {
+          const cb = [...document.querySelectorAll('#planCompareScenarios input[type="checkbox"]')].find((x) => x.checked);
+          if (cb) cb.click();
+        });
+        await waitC(800);
+      }
+      const repick = await page.evaluate(() => ({
+        legacyNote: document.querySelector('#planCompareEmpty')?.textContent || '',
+        trajNote: document.querySelector('#planTrajectoryNote')?.textContent || '',
+        trajHidden: (() => { const c = document.querySelector('#planTrajectoryChart'); const w = c ? c.closest('.chart-wrap') : null; return !w || getComputedStyle(w).display === 'none'; })(),
+        master: (document.querySelector('#planMasterTable')?.textContent || '').trim(),
+        apple: (document.querySelector('#planAppleTable')?.textContent || '').trim(),
+      }));
+      check('comparison: uncheck-all scenarios shows the re-pick panel only (new panels cleared)',
+        repick.legacyNote.includes('Pick a scenario') && repick.trajNote.includes('Pick a scenario') && repick.trajHidden && repick.master === '' && repick.apple === '',
+        JSON.stringify(repick));
+    } finally { await browserC.close(); }
+  }
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);
   cookie = cookie; // cookie cleared server-side via Max-Age=0 header captured above

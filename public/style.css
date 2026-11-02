@@ -545,6 +545,10 @@ table.seg-table td:last-child { text-align: right; }
   .prop-outline.open .prop-outline-card { display: block; }
 }
 
+/* Planning comparison: nonzero delta cells in the diff/master/Apple
+   tables render bold so the eye lands on what changed. */
+.plan-diff { font-weight: 700; }
+
 /* Planning: plain rows in the app's list-row style (same spacing and
    divider as other list rows); leg editor rows share the row flex. */
 .plan-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid #eef2f6; flex-wrap: wrap; }
