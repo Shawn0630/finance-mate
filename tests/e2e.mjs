@@ -15834,6 +15834,94 @@ try {
       check('planning create-without starts with no baseline and no strategy',
         (r.data.project.baselines || []).length === 0 && (r.data.strategies || []).length === 0,
         JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length }));
+      // Scope categories (saving / tax_saving): no property dropdown
+      // may appear, survive a switch, or arrive late — and creation
+      // completes through recommendations with the scope entity.
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitT(1000);
+      await page.click('#planAddProjectBtn');
+      await waitT(300);
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="saving"]').click(); });
+      await waitT(800);
+      const savingFirst = await page.evaluate(() => ({
+        hasSelect: !!document.querySelector('#planCatEntitySel'),
+        scopeNote: document.querySelector('#planCategoryEntity')?.textContent || '',
+        hasGo: !!document.querySelector('#planCatEntityGo'),
+      }));
+      check('planning saving-first shows the scope picker with no property select',
+        !savingFirst.hasSelect && savingFirst.hasGo && savingFirst.scopeNote.includes('all spending'),
+        JSON.stringify(savingFirst));
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="property"]').click(); });
+      await waitT(800);
+      const propShown = await page.evaluate(() => !!document.querySelector('#planCatEntitySel'));
+      check('planning property picker renders before the switch (pin setup)',
+        propShown, JSON.stringify({ propShown }));
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="saving"]').click(); });
+      await waitT(800);
+      const afterSwitch = await page.evaluate(() => ({
+        hasSelect: !!document.querySelector('#planCatEntitySel'),
+        hasGo: !!document.querySelector('#planCatEntityGo'),
+      }));
+      check('planning property → saving switch shows no property select (scope picker instead)',
+        !afterSwitch.hasSelect && afterSwitch.hasGo, JSON.stringify(afterSwitch));
+      await page.evaluate(() => {
+        document.querySelector('#planCategoryCards [data-plan-cat="property"]').click();
+        document.querySelector('#planCategoryCards [data-plan-cat="saving"]').click();
+      });
+      await waitT(1200);
+      const rapidSettled = await page.evaluate(() => ({
+        hasSelect: !!document.querySelector('#planCatEntitySel'),
+        hasGo: !!document.querySelector('#planCatEntityGo'),
+      }));
+      check('planning rapid property → saving switch settles with no property select',
+        !rapidSettled.hasSelect && rapidSettled.hasGo, JSON.stringify(rapidSettled));
+      await page.evaluate(() => { document.querySelector('#planCatEntityGo').click(); });
+      await waitT(800);
+      const savingSubs = await page.evaluate(() => [...document.querySelectorAll('#planCategorySubs [data-plan-sub]')].map((el) => el.dataset.planSub));
+      check('planning saving recommendations render the spending_analysis subcategory',
+        savingSubs.includes('spending_analysis'), JSON.stringify(savingSubs));
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="spending_analysis"]').click(); });
+      await waitT(800);
+      await page.type('#planProjectForm [name=name]', 'Saving Scope Test');
+      await page.click('#planProjectSaveBtn');
+      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await waitT(1500);
+      const savingLanded = await page.evaluate(() => ({
+        hash: location.hash,
+        catLine: document.querySelector('#planProjectCategoryLine') ? document.querySelector('#planProjectCategoryLine').textContent : '',
+      }));
+      check('planning saving creation lands on a project page with the scope category',
+        savingLanded.hash.startsWith('#planning/project/') && savingLanded.catLine.includes('Saving'),
+        JSON.stringify(savingLanded));
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitT(1000);
+      await page.click('#planAddProjectBtn');
+      await waitT(300);
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="tax_saving"]').click(); });
+      await waitT(800);
+      const taxFirst = await page.evaluate(() => ({
+        hasSelect: !!document.querySelector('#planCatEntitySel'),
+        scopeNote: document.querySelector('#planCategoryEntity')?.textContent || '',
+        hasGo: !!document.querySelector('#planCatEntityGo'),
+      }));
+      check('planning tax_saving shows the all-earnings scope picker with no property select',
+        !taxFirst.hasSelect && taxFirst.hasGo && taxFirst.scopeNote.includes('all earnings'),
+        JSON.stringify(taxFirst));
+      await page.evaluate(() => { document.querySelector('#planCatEntityGo').click(); });
+      await waitT(800);
+      const taxSubs = await page.evaluate(() => [...document.querySelectorAll('#planCategorySubs [data-plan-sub]')].map((el) => el.dataset.planSub));
+      check('planning tax_saving recommendations render the tax_analysis subcategory',
+        taxSubs.includes('tax_analysis'), JSON.stringify(taxSubs));
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="tax_analysis"]').click(); });
+      await waitT(800);
+      await page.type('#planProjectForm [name=name]', 'Tax Scope Test');
+      await page.click('#planProjectSaveBtn');
+      try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
+      await waitT(1500);
+      const taxLanded = await page.evaluate(() => ({ hash: location.hash }));
+      check('planning tax_saving creation lands on a project page',
+        taxLanded.hash.startsWith('#planning/project/') && taxLanded.hash !== savingLanded.hash,
+        JSON.stringify(taxLanded));
       // Different entity → different recommendation figures (API-level).
       r = await req('POST', '/api/properties', { address: '1 Cat Entity Way', purchase_date: '2024-01-15', mortgage_balance: 500000 });
       const entA = r.data.id || (r.data.property && r.data.property.id);

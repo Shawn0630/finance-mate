@@ -11034,6 +11034,7 @@ function planListHtml(projects) {
 // reused for "Add baseline" on an existing project (mode addBaseline),
 // where picking a subcategory appends its recommended baseline.
 let planCatFlow = null;
+let planCatPickSeq = 0;
 function openPlanCategoryFlow(opts) {
   planCatFlow = { mode: (opts && opts.mode) || 'create', project: (opts && opts.project) || null, category: null, entity: null, subcategory: null, recommendations: null, categories: null };
   showMsg($('#planCategoryMsg'), '', '');
@@ -11059,15 +11060,22 @@ async function planCatPickCategory(key) {
   const host = $('#planCategoryEntity');
   const msg = $('#planCategoryMsg');
   showMsg(msg, '', '');
+  // Every click clears the entity host first: a previous category's
+  // picker (e.g. the property dropdown) must never survive a switch
+  // to a category whose branch renders nothing of its own.
+  host.innerHTML = '';
   $('#planCategorySubs').innerHTML = '';
+  const seq = ++planCatPickSeq;
   try {
     if (cat.entityType === 'property') {
       const pr = await api('/api/properties');
+      if (seq !== planCatPickSeq) return;
       const list = pr.properties || pr || [];
       host.innerHTML = `<div><label>Property *</label><select id="planCatEntitySel"><option value="">Select a property</option>${list.map((x) => `<option value="${x.id}">${esc(x.address)}</option>`).join('')}</select></div>`;
       $('#planCatEntitySel').addEventListener('change', (e) => { if (e.target.value) planCatPickEntity({ type: 'property', propertyId: Number(e.target.value) }); });
     } else if (cat.entityType === 'investment') {
       const inv = await api('/api/investments');
+      if (seq !== planCatPickSeq) return;
       const accounts = inv.accounts || [];
       // POOL BUILDER: the baseline's starting position is a user-defined
       // cash pool — whole accounts and/or individual stocks, each
@@ -11168,6 +11176,7 @@ async function planCatPickCategory(key) {
       });
     } else if (cat.entityType === 'earning') {
       const er = await api('/api/earnings');
+      if (seq !== planCatPickSeq) return;
       const jobs = er.jobs || [];
       const rentals = er.rentals || [];
       host.innerHTML = `<div><label>Job or rental *</label><select id="planCatEntitySel"><option value="">Select</option>${jobs.map((j) => `<option value="job:${j.id}">${esc(j.employer)} · Job</option>`).join('')}${rentals.map((r) => `<option value="rental:${r.id}">${esc(r.label)} · Rental</option>`).join('')}</select></div>`;
@@ -11177,21 +11186,23 @@ async function planCatPickCategory(key) {
         const [kind, id] = v.split(':');
         planCatPickEntity(kind === 'job' ? { type: 'job', jobId: Number(id) } : { type: 'rental', rentalId: Number(id) });
       });
-    } else if (cat.entityType === 'spending') {
+    } else if (cat.entityType === 'spending' || (cat.entityType === 'scope' && cat.key === 'saving')) {
       host.innerHTML = `<div class="note">Scope: all spending cards.</div><div class="toolbar"><button class="small primary" id="planCatEntityGo">Continue</button></div>`;
       $('#planCatEntityGo').addEventListener('click', () => planCatPickEntity({ type: 'all-spending' }));
-    } else if (cat.entityType === 'earnings') {
+    } else if (cat.entityType === 'earnings' || (cat.entityType === 'scope' && cat.key === 'tax_saving')) {
       host.innerHTML = `<div class="note">Scope: all earnings.</div><div class="toolbar"><button class="small primary" id="planCatEntityGo">Continue</button></div>`;
       $('#planCatEntityGo').addEventListener('click', () => planCatPickEntity({ type: 'all-earnings' }));
     }
-  } catch (err) { showMsg(msg, 'err', err.message); }
+  } catch (err) { if (seq === planCatPickSeq) showMsg(msg, 'err', err.message); }
 }
 async function planCatPickEntity(entity) {
   planCatFlow.entity = entity;
   const msg = $('#planCategoryMsg');
   showMsg(msg, '', '');
+  const seq = planCatPickSeq;
   try {
     const r = await api('/api/planning/recommendations', { method: 'POST', body: { category: planCatFlow.category.key, entity } });
+    if (seq !== planCatPickSeq) return;
     planCatFlow.recommendations = r.recommendations || {};
     const subs = planCatFlow.category.subcategories || [];
     $('#planCategorySubs').innerHTML = subs.map((s) => {
@@ -11208,7 +11219,7 @@ async function planCatPickEntity(entity) {
     document.querySelectorAll('#planCategorySubs [data-plan-sub]').forEach((el) => {
       el.addEventListener('click', () => planCatPickSubcategory(el.dataset.planSub));
     });
-  } catch (err) { showMsg(msg, 'err', err.message); }
+  } catch (err) { if (seq === planCatPickSeq) showMsg(msg, 'err', err.message); }
 }
 function planCatPickSubcategory(key) {
   planCatFlow.subcategory = key;
