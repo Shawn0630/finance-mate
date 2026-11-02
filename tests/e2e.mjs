@@ -7166,6 +7166,39 @@ try {
           const card = document.querySelector(`.earn-job-card[data-job-id="${args.id}"]`);
           return card && card.textContent.includes(args.label);
         }, { id: detailJobId, label: nextLabel }));
+      // Next pay date fix (user rule 2026-11-01): the list card pairs
+      // the date with the take-home figure, and the API date anchors
+      // on the RECENT payment date, not the start date. The cadence
+      // pin is run-date-proof: the next date stays on the 14-day
+      // Friday run from the recent payment (or one day early off a
+      // holiday), never on the old start-date Monday run.
+      r = await req('POST', '/api/earnings/jobs', {
+        employer: 'Meta Anchor Corp', province: 'BC', frequency: 'biweekly',
+        start_date: '2022-06-06', recent_pay_date: '2026-10-23', recent_pay_value: 3000,
+      });
+      check('meta-like job creates for the anchor pin', r.status === 201, JSON.stringify(r.data));
+      const anchorJobId = r.data.id;
+      const anchorJob = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.id === anchorJobId);
+      const anchorDiff = anchorJob && anchorJob.next_pay_date
+        ? Math.round((new Date(`${anchorJob.next_pay_date}T00:00:00Z`) - new Date('2026-10-23T00:00:00Z')) / 86400000)
+        : null;
+      check('recent-anchored next pay date stays on the 14-day cadence (or one day early off a holiday)',
+        !!anchorJob && !!anchorJob.next_pay_date && anchorDiff > 0 && (anchorDiff % 14 === 0 || anchorDiff % 14 === 13),
+        JSON.stringify(anchorJob && anchorJob.next_pay_date));
+      // (page.reload, not goto: the page is already on #earnings/salary
+      // and a same-URL goto fires no hashchange, so the list would
+      // never re-fetch the API-created job.)
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
+      const anchorNet = anchorJob ? Number(anchorJob.calc.perPeriod.net).toLocaleString('en-CA',
+        { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
+      check('list card pairs next pay date with take-home on one line',
+        await untilEval((args) => {
+          const card = document.querySelector(`.earn-job-card[data-job-id="${args.id}"]`);
+          return !!card && card.textContent.includes('Next pay date') && card.textContent.includes(`Take-home ${args.net}`);
+        }, { id: anchorJobId, net: anchorNet }));
+      r = await req('DELETE', `/api/earnings/jobs/${anchorJobId}`);
+      check('anchor pin job cleaned up', r.status === 200);
       check('card offers no Edit/Delete buttons (click navigates instead)',
         await page.evaluate((id) => {
           const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);

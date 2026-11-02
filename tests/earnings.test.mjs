@@ -312,24 +312,54 @@ test('simplified job: pay-date cadences per frequency', () => {
   assert.deepEqual(payDatesInWindow('biweekly', '2026-02-01', '2026-01-01', '2026-01-05'), []);
 });
 
-test('next pay date: same cadence as YTD, today counts, dateless is null', () => {
+test('next pay date: recent-date anchor, holiday moves a day earlier, today counts, dateless is null', () => {
   const npd = (frequency, startDate, recentDate, today) => nextPayDate({ frequency, startDate, recentDate }, today);
-  // Bi-weekly Mondays from Jan 5: today itself counts, next is +14d.
-  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-05'), '2026-01-05');
-  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-06'), '2026-01-19');
-  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-19'), '2026-01-19');
-  // Weekly: Wednesday -> next Monday.
-  assert.equal(npd('weekly', '2026-01-05', '2026-10-23', '2026-01-07'), '2026-01-12');
-  // Monthly: day-of-month, today counts; 31st clamps to month-end.
+  // Bi-weekly Fridays from the recent payment (2026-10-23), NOT the
+  // start-date Mondays: the anchor moved 2026-11-01 (user rule).
+  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-05'), '2026-01-16');
+  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-06'), '2026-01-16');
+  assert.equal(npd('biweekly', '2026-01-05', '2026-10-23', '2026-01-19'), '2026-01-30');
+  // The user's Meta job: start Monday 2022-06-06, recent Friday
+  // 2026-10-23 -> next is Fri Nov 6, 2026 (was Mon Nov 2 on the old anchor).
+  assert.equal(npd('biweekly', '2022-06-06', '2026-10-23', '2026-11-01'), '2026-11-06');
+  // Today counts on the new cadence: the recent date itself, and a Friday payday.
+  assert.equal(npd('biweekly', '2022-06-06', '2026-10-23', '2026-10-23'), '2026-10-23');
+  assert.equal(npd('biweekly', '2022-06-06', '2026-10-23', '2026-11-06'), '2026-11-06');
+  assert.equal(npd('biweekly', '2022-06-06', '2026-10-23', '2026-10-24'), '2026-11-06');
+  // Weekly: Fridays from the recent date.
+  assert.equal(npd('weekly', '2026-01-05', '2026-10-23', '2026-01-07'), '2026-01-09');
+  assert.equal(npd('weekly', '2022-06-06', '2026-10-23', '2026-10-24'), '2026-10-30');
+  // Monthly: day-of-month now from the RECENT date, not the start date.
   assert.equal(npd('monthly', '2026-01-15', '2026-10-15', '2026-01-15'), '2026-01-15');
   assert.equal(npd('monthly', '2026-01-15', '2026-10-15', '2026-01-16'), '2026-02-15');
   assert.equal(npd('monthly', '2026-01-31', '2026-10-31', '2026-02-01'), '2026-02-28');
-  // Semi-monthly: 15th and month-end.
+  assert.equal(npd('monthly', '2026-01-15', '2026-10-20', '2026-01-16'), '2026-01-20');
+  // Semi-monthly: 15th and month-end, anchor-independent.
   assert.equal(npd('semimonthly', '2026-01-05', '2026-10-23', '2026-01-15'), '2026-01-15');
   assert.equal(npd('semimonthly', '2026-01-05', '2026-10-23', '2026-01-16'), '2026-01-31');
   // Annual: the recent date's anniversary.
   assert.equal(npd('annual', '2026-01-05', '2026-03-10', '2026-03-10'), '2026-03-10');
   assert.equal(npd('annual', '2026-01-05', '2026-03-10', '2026-10-29'), '2027-03-10');
+  // Holiday rule: a payday landing on a holiday moves a day earlier.
+  // Note the cadence matters: the Oct 23 biweekly Fridays never land
+  // on Dec 25 (..., Dec 18, Jan 1), so the Christmas pin uses a
+  // weekly cadence (every Friday) and a biweekly run landing Dec 25.
+  assert.equal(npd('weekly', '2022-06-06', '2026-10-23', '2026-12-24'), '2026-12-24');
+  assert.equal(npd('biweekly', '2022-06-06', '2026-12-11', '2026-12-24'), '2026-12-24');
+  // ... and when today IS the holiday payday, it already paid yesterday.
+  assert.equal(npd('weekly', '2022-06-06', '2026-10-23', '2026-12-25'), '2026-12-31');
+  assert.equal(npd('biweekly', '2022-06-06', '2026-12-11', '2026-12-25'), '2027-01-08');
+  // Holiday chain: the Oct 23 biweekly run's next nominal after
+  // Dec 24 is Jan 1 (New Year's Day) -> Dec 31, 2026.
+  assert.equal(npd('biweekly', '2022-06-06', '2026-10-23', '2026-12-24'), '2026-12-31');
+  // Consecutive holidays loop: a Dec 26 payday moves to Dec 24, never Dec 25.
+  assert.equal(npd('monthly', '2026-01-26', '2026-11-26', '2026-12-20'), '2026-12-24');
+  // Fixed-weekday grid never drifts: a recent payment that was itself
+  // moved early (Thu Dec 24, because Fri Dec 25 is a holiday) still
+  // anchors the Friday grid — next is Fri Jan 8, not Thu Jan 7.
+  assert.equal(npd('biweekly', '2022-06-06', '2026-12-24', '2026-12-26'), '2027-01-08');
+  assert.equal(npd('biweekly', '2022-06-06', '2026-12-24', '2026-12-24'), '2026-12-24');
+  assert.equal(npd('weekly', '2022-06-06', '2026-12-24', '2027-01-02'), '2027-01-08');
   // A future start date is its own first pay date.
   assert.equal(npd('biweekly', '2026-06-01', '2026-06-01', '2026-01-06'), '2026-06-01');
   // Dateless legacy jobs and bad inputs: no guessed date.

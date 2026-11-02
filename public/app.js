@@ -8650,11 +8650,13 @@ let earnEditRentalId = null;
 let earnYearRentalId = null;
 let earnEditYearId = null;
 
-// Next pay date highlight, shared by the job card and the job detail
-// page: one rendering, one style. Dateless jobs get no line at all.
+// Next pay date highlight on the job card: date + take-home on one
+// line, mirroring the detail page's Next net pay date card. Dateless
+// jobs get no line at all. (The detail page folds this into its own
+// combo card and never renders this line.)
 function earnNextPayHtml(j) {
   return j.next_pay_date
-    ? `<div class="note earn-next-pay">Next pay date · ${esc(earnJobDateLabel(j.next_pay_date))}</div>`
+    ? `<div class="note earn-next-pay">Next pay date · ${esc(earnJobDateLabel(j.next_pay_date))} · Take-home ${money2(j.calc.perPeriod.net)}</div>`
     : '';
 }
 

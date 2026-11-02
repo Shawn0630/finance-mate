@@ -1,5 +1,6 @@
 // Earnings — salary gross-to-net and rental T776 summaries.
 //
+import { adjustPayday, isHoliday } from './holidays.js';
 // Pure computation + input validation. Region-specific numbers (tax
 // brackets, CPP/EI, T776 lines, CCA classes) come from the region
 // layer (src/regions/ca.js); nothing Canadian is hard-coded here, so
@@ -242,29 +243,63 @@ export function payDatesInWindow(frequency, from, to, anchor) {
   return [to]; // annual: one pay in the window, on the recent date
 }
 
-// Next scheduled pay date on or after today, from the same cadence
-// the YTD derivation uses — weekly / bi-weekly step from the start
-// date, monthly steps the start date's day-of-month clamped to
-// month-end, semi-monthly pays on the 15th and month-end, annual on
-// the recent payment date's anniversary. A pay date falling today
-// counts as the next one. Jobs without dates (legacy, no start or
-// recent date) get null — never a guessed date.
+// Next scheduled pay date on or after today. The cadence anchors on
+// the RECENT payment date (user rule 2026-11-01), not the start date:
+// weekly / bi-weekly step 7 / 14 days from it, monthly steps its
+// day-of-month clamped to month-end, semi-monthly pays on the 15th
+// and month-end (anchor-independent), annual on the recent date's
+// anniversary. A payday landing on a CA/US holiday moves one day
+// earlier (see src/holidays.js); the first holiday-adjusted date on
+// or after today wins, so a payday falling today counts, while a
+// today that IS a holiday payday already paid yesterday and the next
+// one follows. Jobs without dates (legacy, no start or recent date)
+// get null — never a guessed date. YTD derivation and the monthly
+// chart keep the START-date anchor deliberately — this function
+// alone moved.
 export function nextPayDate({ frequency, startDate, recentDate }, today) {
   if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today)) return null;
   if (frequency === 'annual') {
     const [, m, d] = recentDate.split('-').map(Number);
     const y = Number(today.slice(0, 4));
-    const cand = ymPad(y, m, Math.min(d, lastDayOfMonth(y, m)));
-    if (cand >= today) return cand;
-    return ymPad(y + 1, m, Math.min(d, lastDayOfMonth(y + 1, m)));
+    for (const yy of [y, y + 1]) {
+      const cand = ymPad(yy, m, Math.min(d, lastDayOfMonth(yy, m)));
+      const adj = adjustPayday(cand);
+      if (adj >= today) return adj;
+    }
+    return null;
   }
   // A future start date is its own first pay date for the anchored
   // cadences (weekly / bi-weekly step from it, monthly on its day);
   // semi-monthly ignores the anchor, so the window below covers it.
-  if (startDate > today && frequency !== 'semimonthly') return startDate;
+  if (startDate > today && frequency !== 'semimonthly') return adjustPayday(startDate);
+  if (frequency === 'weekly' || frequency === 'biweekly') {
+    // Step from the recent date in either direction to the first
+    // nominal payday on or after today (payDatesInWindow only steps
+    // forward, which strands a recent anchor after the window).
+    const step = frequency === 'weekly' ? 7 : 14;
+    const todayN = jobDayNum(today);
+    // A weekly/bi-weekly grid is a FIXED weekday: a holiday move is
+    // one-off and never drifts the grid. If the entered recent
+    // payment is itself the moved one (its next day is a holiday),
+    // the nominal anchor is that next day, not the entered date.
+    const recentN = jobDayNum(recentDate);
+    const nominal = isHoliday(jobDayStr(recentN + 1)) ? jobDayStr(recentN + 1) : recentDate;
+    let n = jobDayNum(nominal);
+    if (n < todayN) n += Math.ceil((todayN - n) / step) * step;
+    else while (n - step >= todayN) n -= step;
+    for (;;) {
+      const adj = adjustPayday(jobDayStr(n));
+      if (adj >= today) return adj;
+      n += step;
+    }
+  }
   const far = jobDayStr(jobDayNum(today) + 62);
-  const dates = payDatesInWindow(frequency, today, far, startDate);
-  return dates.length ? dates[0] : null;
+  const dates = payDatesInWindow(frequency, today, far, recentDate);
+  for (const d of dates) {
+    const adj = adjustPayday(d);
+    if (adj >= today) return adj;
+  }
+  return null;
 }
 
 export function deriveJobYtd({ frequency, startDate, recentDate, changes, recentValue, payroll, cppExempt, eiExempt }) {
@@ -649,10 +684,12 @@ export function aggregateEarningsCharts(jobs, rentals) {
 // per month, bar height = that month's total gross, segments Tax,
 // CPP/EI, RRSP (own only) and Net summing EXACTLY to the gross.
 // Monthly figures are the stored per-period calc values × paydays in
-// the month, on the same cadence nextPayDate uses (weekly /
+// the month, on the YTD cadence (start-date anchor: weekly /
 // bi-weekly step from the start date, monthly on the start day
 // clamped to month-end, semi-monthly 15th + month-end, annual on
-// the recent date's anniversary). Segments are rounded first and
+// the recent date's anniversary). nextPayDate anchors on the recent
+// date instead — the chart deliberately keeps the start anchor, so
+// the two are no longer the same cadence. Segments are rounded first and
 // the gross is their sum, so the stack never shows a 1-cent gap
 // from per-period rounding. Deliberate limits: the stored calc is
 // the CURRENT rate's, so months before a raise show the current
