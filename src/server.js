@@ -54,7 +54,8 @@ import {
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline,
   PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
-  validateStrategyFactors, primeFactorToScenario, factorsToAssumptions,
+  validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
+  primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
   currentReturnRateFromPoints, validatePoolItemShapes,
 } from './planning.js';
@@ -4524,7 +4525,18 @@ function planHoldingGrowth(mainline, currentMonth) {
 // flat). "Changes nothing" does NOT mean flat: holdings still earn
 // their current rates, so both runs grow each holding at its current
 // rate unless the strategy overrides it with a stock factor or sink.
-async function planProjectionFor(strategy, project) {
+// Projection under a world: scenario factors apply to BOTH the baseline
+// and the strategy at evaluation time (variable mortgages follow the
+// scenario prime, stocks follow the scenario return; unfactored parts
+// keep current rates/terms). The baseline spec itself belongs to no
+// scenario — it is the do-nothing reference, repriced under the world.
+// scenarioInput: undefined = the project's base scenario (the labeled
+// default); null = flat world; a scenario row = that row's factors
+// (legacy steps restated as prime points); a factors object = itself.
+// sinkInput: undefined = the strategy row's sink column; null = no sink.
+// The sink's trend overrides the scenario's stock return — the sink is
+// strategy equipment, and a picked sink always wins, as before.
+async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
   await ensureFreshPrime();
   const baseMainline = planAssembleMainline(project.id);
   const currentMonth = currentMonthKey();
@@ -4532,31 +4544,132 @@ async function planProjectionFor(strategy, project) {
   const ops = planOpsOf(strategy.id);
   const legs = [];
   for (const o of ops) for (const l of o.legs) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
-  const factors = planStrategyFactors(strategy);
-  const assumptions = factorsToAssumptions(factors, planConfirmedAssumptions(strategy.id));
+  let scenarioRow = null;
+  let factors = null;
+  if (scenarioInput === undefined) {
+    scenarioRow = planBaseScenario(project.id);
+    factors = planScenarioFactorsOfRow(scenarioRow);
+  } else if (scenarioInput === null) {
+    factors = null;
+  } else if (scenarioInput && typeof scenarioInput === 'object' && ('factors' in scenarioInput || 'steps' in scenarioInput || 'project_id' in scenarioInput)) {
+    scenarioRow = scenarioInput;
+    factors = planScenarioFactorsOfRow(scenarioInput);
+  } else {
+    factors = scenarioInput;
+  }
+  const sink = sinkInput === undefined ? planStrategySink(strategy) : sinkInput;
+  const confirmed = planConfirmedAssumptions(strategy.id);
+  const baseAssumptions = factorsToAssumptions(factors, {});
+  const strategyAssumptions = factorsToAssumptions(factors, confirmed);
+  if (sink && sink.kind === 'stock' && Number(sink.trendPct) != null) strategyAssumptions.stockReturnPct = Number(sink.trendPct);
+  if (sink && sink.kind === 'custom' && Number(sink.expectedReturnPct) != null) strategyAssumptions.stockReturnPct = Number(sink.expectedReturnPct);
   const primeHistory = getPrimeHistory();
   const cur = getCurrentPrime();
   const currentPrime = cur ? cur.rate : null;
-  const args = { mainline, ops, legs, assumptions, primeHistory, currentPrime, currentMonth };
+  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth };
   const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
-  const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: {}, scenario: null, holdingGrowth });
+  const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
   baseline.currentRates = currentRates;
   // A stock sink outside the pool is injected into the strategy run's
   // mainline with empty events + actual price points: its pre-existing
   // position outside the pool is NOT counted, only the sink buy is.
   let strategyMainline = mainline;
-  if (factors.sink && factors.sink.kind === 'stock') {
-    const sinkId = Number(factors.sink.holdingId);
+  if (sink && sink.kind === 'stock') {
+    const sinkId = Number(sink.holdingId);
     if (!mainline.holdings.some((h) => Number(h.id) === sinkId)) {
       const real = baseMainline.holdings.find((h) => Number(h.id) === sinkId);
       if (real) strategyMainline = { ...mainline, holdings: [...mainline.holdings, { ...real, events: [] }] };
     }
   }
-  const strategyProj = computeProjection({ ...args, mainline: strategyMainline, scenario: primeFactorToScenario(factors), holdingGrowth });
-  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj), factors, currentRates };
+  const strategyProj = computeProjection({ ...args, mainline: strategyMainline, assumptions: strategyAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj), factors, sink, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
 }
 function planScenarioRow(r) {
-  return { ...r, steps: r.steps ? JSON.parse(r.steps) : null };
+  if (!r) return null;
+  let factors = null;
+  try { factors = r.factors ? JSON.parse(r.factors) : null; } catch { factors = null; }
+  return { ...r, steps: r.steps ? JSON.parse(r.steps) : null, factors };
+}
+function planScenariosOf(projectId) {
+  return db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(projectId).map(planScenarioRow);
+}
+// A scenario row's world factors: the factors column when set, else a
+// legacy prime-only row's steps restated as prime points. NULL = a flat
+// world (current rates/terms throughout).
+function planScenarioFactorsOfRow(row) {
+  if (!row) return null;
+  if (row.factors && typeof row.factors === 'object') return row.factors;
+  if (Array.isArray(row.steps) && row.steps.length) {
+    return { prime: { points: row.steps.map((st) => ({ month: String(st.date || '').slice(0, 7), rate: Number(st.rate) })) } };
+  }
+  return null;
+}
+// The project's default world: the is_base scenario, else the earliest
+// scenario, else null (flat world). This is the labeled default every
+// projection uses when no scenario is explicitly picked — never a
+// silent substitution: callers surface it as appliedScenario.
+function planBaseScenario(projectId) {
+  const rows = planScenariosOf(projectId);
+  return rows.find((x) => x.is_base) || rows[0] || null;
+}
+function planStrategySink(strategy) {
+  if (!strategy) return null;
+  try { return strategy.sink ? JSON.parse(strategy.sink) : null; } catch { return null; }
+}
+// One-time migration of legacy strategy factors into scenarios, run on
+// project read (same lazy pattern as planSeedLegacyBaseline) and on
+// strategy/comparison reads. Strategies are grouped by their world
+// factor set — the common case (one set) yields exactly ONE default
+// scenario; distinct sets yield one per set, so nothing is silently
+// lost. A strategy's sink moves to its sink column, never into a
+// scenario. Runs inside one transaction; a structural migration, not a
+// user Apply, so it writes no History commit.
+function planMigrateStrategyFactors(projectId) {
+  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? AND factors IS NOT NULL').all(projectId);
+  if (!strategies.length) return [];
+  const groups = groupStrategyFactorsForMigration(strategies.map((st) => {
+    let f = null;
+    try { f = st.factors ? JSON.parse(st.factors) : null; } catch { f = null; }
+    return { id: st.id, factors: f };
+  }));
+  if (!groups.length) {
+    // Sink-only factors: move the sink, clear the column, no scenario.
+    const move = db.transaction(() => {
+      for (const st of strategies) {
+        let f = null;
+        try { f = st.factors ? JSON.parse(st.factors) : null; } catch { f = null; }
+        if (f && f.sink) db.prepare('UPDATE plan_strategies SET sink = ?, factors = NULL, updated_at = ? WHERE id = ?').run(JSON.stringify(f.sink), nowIso(), st.id);
+      }
+    });
+    move();
+    return [];
+  }
+  const existingNames = new Set(planScenariosOf(projectId).map((x) => x.name));
+  const created = [];
+  const migrate = db.transaction(() => {
+    const now = nowIso();
+    const hasBase = planScenariosOf(projectId).some((x) => x.is_base);
+    groups.forEach((g, gi) => {
+      let name = g.name;
+      let n = 2;
+      while (existingNames.has(name)) { name = `${g.name} ${n}`; n += 1; }
+      existingNames.add(name);
+      const steps = g.factors && g.factors.prime && Array.isArray(g.factors.prime.points)
+        ? g.factors.prime.points.map((pt) => ({ date: `${pt.month}-01`, rate: Number(pt.rate) })) : null;
+      const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, factors, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(projectId, name, 'flat', 'neutral', null, steps ? JSON.stringify(steps) : null, JSON.stringify(g.factors), (!hasBase && gi === 0) ? 1 : 0, now, now);
+      created.push(planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(info.lastInsertRowid)));
+      for (const sid of g.strategyIds) {
+        const st = strategies.find((x) => x.id === sid);
+        let f = null;
+        try { f = st.factors ? JSON.parse(st.factors) : null; } catch { f = null; }
+        if (f && f.sink) db.prepare('UPDATE plan_strategies SET sink = ?, factors = NULL, updated_at = ? WHERE id = ?').run(JSON.stringify(f.sink), now, sid);
+        else db.prepare('UPDATE plan_strategies SET factors = NULL, updated_at = ? WHERE id = ?').run(now, sid);
+      }
+    });
+  });
+  migrate();
+  return created;
 }
 const PLAN_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 function planNextLetter(projectId) {
@@ -5019,6 +5132,7 @@ app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
   planSeedLegacyBaseline(p);
+  planMigrateStrategyFactors(p.id);
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
   const declaredAssets = db.prepare('SELECT * FROM plan_declared_assets WHERE project_id = ? ORDER BY id').all(p.id);
@@ -5084,7 +5198,11 @@ app.post('/api/planning/recommendations', requireApiAuth, (req, res) => {
   const out = {};
   for (const sub of Object.values(PLAN_OPT_CATEGORIES[category].subcategories)) {
     const rec = planRecommendationFor(category, sub.key, entity);
-    if (!rec.error) out[sub.key] = rec;
+    // Templates carry a recommended scenario/baseline/strategy; a slot
+    // with no recommendation stays EMPTY. No subcategory has a genuine
+    // scenario recommendation from data today, so the slot is null —
+    // the creation flow renders it as an empty line, never a guess.
+    if (!rec.error) out[sub.key] = { ...rec, scenario: rec.scenario ?? null };
   }
   res.json({ category, entity, recommendations: out });
 });
@@ -5188,12 +5306,102 @@ app.post('/api/planning/projects/:id/scenarios', requireApiAuth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'project not found' });
   const b = req.body || {};
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'scenario name is required' });
-  if (!['up', 'flat', 'down'].includes(b.direction)) return res.status(400).json({ error: 'direction must be up, flat or down' });
+  const direction = b.direction === undefined || b.direction === null || b.direction === '' ? 'flat' : b.direction;
+  if (!['up', 'flat', 'down'].includes(direction)) return res.status(400).json({ error: 'direction must be up, flat or down' });
   if (b.steps !== undefined && b.steps !== null && !Array.isArray(b.steps)) return res.status(400).json({ error: 'steps must be an array of {date, rate}' });
+  let factors = null;
+  if (b.factors !== undefined && b.factors !== null) {
+    if (typeof b.factors !== 'object' || Array.isArray(b.factors)) return res.status(400).json({ error: 'factors must be an object' });
+    const errs = validateScenarioFactors(b.factors, currentMonthKey());
+    if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+    factors = b.factors;
+  }
+  // steps mirrors the prime points: one path, not two diverging ones.
+  let steps = b.steps || null;
+  if (factors && factors.prime && Array.isArray(factors.prime.points)) {
+    steps = factors.prime.points.map((pt) => ({ date: `${pt.month}-01`, rate: Number(pt.rate) }));
+  }
   const now = nowIso();
-  const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), b.direction, b.stance || 'neutral', b.magnitude != null ? Number(b.magnitude) : null, b.steps ? JSON.stringify(b.steps) : null, 0, now, now);
+  // The first scenario a project ever gets becomes its base, so detail
+  // and comparison defaults work without an extra step.
+  const isBase = planScenariosOf(p.id).some((x) => x.is_base) ? 0 : 1;
+  const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, factors, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), direction, b.stance || 'neutral', b.magnitude != null ? Number(b.magnitude) : null, steps ? JSON.stringify(steps) : null, factors ? JSON.stringify(factors) : null, isBase, now, now);
   res.status(201).json({ scenario: planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(info.lastInsertRowid)) });
+});
+
+// Scenario detail + rename/factors save. A factor never added is never
+// saved: the client sends only the active set, and this endpoint stores
+// exactly what it receives.
+app.get('/api/planning/scenarios/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'scenario not found' });
+  const p = planProjectById(row.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  res.json({ scenario: planScenarioRow(row), project: p });
+});
+app.put('/api/planning/scenarios/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'scenario not found' });
+  const p = planProjectById(row.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  const b = req.body || {};
+  const now = nowIso();
+  let name = row.name;
+  if (b.name !== undefined) {
+    if (!String(b.name).trim()) return res.status(400).json({ error: 'scenario name is required' });
+    name = String(b.name).trim();
+  }
+  let factorsSql = row.factors;
+  let stepsSql = row.steps;
+  if (b.factors !== undefined && b.factors !== null) {
+    if (typeof b.factors !== 'object' || Array.isArray(b.factors)) return res.status(400).json({ error: 'factors must be an object' });
+    const errs = validateScenarioFactors(b.factors, currentMonthKey());
+    if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+    factorsSql = JSON.stringify(b.factors);
+    stepsSql = b.factors.prime && Array.isArray(b.factors.prime.points)
+      ? JSON.stringify(b.factors.prime.points.map((pt) => ({ date: `${pt.month}-01`, rate: Number(pt.rate) }))) : null;
+  }
+  db.prepare('UPDATE plan_scenarios SET name = ?, factors = ?, steps = ?, updated_at = ? WHERE id = ?').run(name, factorsSql, stepsSql, now, row.id);
+  res.json({ scenario: planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(row.id)) });
+});
+
+// Scenario AI hook (one-shot, v1): the model proposes a factor set in
+// words the user gives; the app validates it and the client previews it
+// before any Apply creates the scenario. AI is spec, never numbers —
+// the engine computes every figure from the saved factors.
+app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  await ensureFreshPrime();
+  const cur = getCurrentPrime();
+  const holdings = db.prepare('SELECT id, symbol, label FROM invest_holdings ORDER BY id').all();
+  const prompt = [
+    'You propose a planning scenario (a future world) as JSON only. No prose outside the JSON object.',
+    'A scenario holds ONLY world factors: prime (a rate path), stock (an expected annual return %), propertyGrowth, salaryGrowth, rentGrowth. It NEVER holds a sink, an operation, or a price.',
+    'prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30.',
+    'stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one.',
+    'Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
+    `Current prime: ${cur ? cur.rate : 'unknown'}.`,
+    `Holdings: ${JSON.stringify(holdings)}`,
+    'Output: {"factors": {...}}.',
+    `User request: ${text}`,
+  ].join('\n');
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed || typeof parsed !== 'object') return res.status(502).json({ error: 'AI did not return a scenario' });
+  const factors = parsed.factors || parsed;
+  const errs = validateScenarioFactors(factors, currentMonthKey());
+  if (errs.length) return res.status(502).json({ error: `AI scenario failed validation: ${errs.join('; ')}` });
+  res.json({ factors });
 });
 
 app.post('/api/planning/scenarios/:id/set-base', requireApiAuth, (req, res) => {
@@ -5310,11 +5518,22 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
+  planMigrateStrategyFactors(p.id);
   const ops = planOpsOf(s.id);
   const assumptions = planAssumptionsOf(s.id);
-  let baseline; let strategy; let comparison; let factors;
+  const allScenarios = planScenariosOf(p.id);
+  // ?scenarioId= picks the world the detail page runs under; absent =
+  // the project's base scenario (the labeled default), never silent.
+  let scenarioArg;
+  if (req.query.scenarioId === '0') {
+    scenarioArg = null; // explicit flat world, even when scenarios exist
+  } else if (req.query.scenarioId !== undefined && req.query.scenarioId !== null && req.query.scenarioId !== '') {
+    scenarioArg = allScenarios.find((x) => x.id === Number(req.query.scenarioId));
+    if (!scenarioArg) return res.status(404).json({ error: 'scenario not found' });
+  }
+  let baseline; let strategy; let comparison; let sink; let appliedScenario;
   try {
-    ({ baseline, strategy, comparison, factors } = await planProjectionFor(s, p));
+    ({ baseline, strategy, comparison, sink, appliedScenario } = await planProjectionFor(s, p, scenarioArg));
   } catch (err) {
     return res.status(500).json({ error: `projection failed: ${err.message}` });
   }
@@ -5325,10 +5544,10 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
     const mrow = db.prepare('SELECT * FROM plan_ai_models WHERE id = ?').get(s.model_id);
     if (mrow) model = { id: mrow.id, name: mrow.name, version: mrow.version, source: mrow.source, spec: JSON.parse(mrow.spec || '{}'), metadata: mrow.metadata ? JSON.parse(mrow.metadata) : null };
   }
-  const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [] };
-  // scenarioTable/baseScenario are kept as empty/null for response
-  // shape compatibility: rate paths live on the strategy's factors now.
-  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors, scenarios: [], baseScenario: null, baseline, projection: strategy, comparison, scenarioTable: [], model });
+  // The strategy carries no factors anymore: the world lives on the
+  // scenario (appliedScenario labels which one these numbers ran under).
+  const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [], factors: null, sink: planStrategySink(s) };
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -5336,95 +5555,141 @@ app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, r
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
+  planMigrateStrategyFactors(p.id);
+  const allScenarios = planScenariosOf(p.id);
+  let scenarioArg;
+  if (req.query.scenarioId === '0') {
+    scenarioArg = null; // explicit flat world, even when scenarios exist
+  } else if (req.query.scenarioId !== undefined && req.query.scenarioId !== null && req.query.scenarioId !== '') {
+    scenarioArg = allScenarios.find((x) => x.id === Number(req.query.scenarioId));
+    if (!scenarioArg) return res.status(404).json({ error: 'scenario not found' });
+  }
   let r;
   try {
-    r = await planProjectionFor(s, p);
+    r = await planProjectionFor(s, p, scenarioArg);
   } catch (err) {
     return res.status(500).json({ error: `projection failed: ${err.message}` });
   }
-  res.json({ scenario: null, ...r });
+  res.json({ scenario: r.appliedScenario, ...r });
 });
 
 app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  // No shared world: each strategy runs under its OWN factors, and the
-  // baseline is always the do-nothing reference. A chosen baselineId
-  // is validated (404 when unknown) but is numerically inert — it only
-  // labels the reference in the report view.
+  planMigrateStrategyFactors(p.id);
+  // A chosen baselineId is validated (404 when unknown) but is
+  // numerically inert — it only labels the reference in the report view.
+  // The baseline itself is always the do-nothing reference, repriced
+  // under each selected scenario's factors.
   let chosenBaseline = null;
   if (req.query.baselineId !== undefined && req.query.baselineId !== null && req.query.baselineId !== '') {
     const brow = db.prepare('SELECT * FROM plan_baselines WHERE id = ? AND project_id = ?').get(Number(req.query.baselineId), p.id);
     if (!brow) return res.status(404).json({ error: 'baseline not found' });
     chosenBaseline = planBaselineRow(brow);
   }
-  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
-  const rows = [];
-  let baseline = null;
-  for (const s of strategies) {
-    let r;
-    try {
-      r = await planProjectionFor(s, p);
-    } catch (err) {
-      return res.status(500).json({ error: `projection failed: ${err.message}` });
+  const allScenarios = planScenariosOf(p.id);
+  // ?scenarioIds=1,2 pins the worlds this comparison runs under.
+  // Absent = the base scenario, or a single flat-world block when the
+  // project has no scenarios yet. Present-but-empty = no world selected:
+  // the response carries zero blocks and the client shows a re-pick
+  // panel only, never numbers under a substituted world.
+  let selected;
+  if (req.query.scenarioIds !== undefined && req.query.scenarioIds !== null && req.query.scenarioIds !== '') {
+    const wanted = new Set(String(req.query.scenarioIds).split(',').map((x) => Number(x)).filter((x) => Number.isFinite(x)));
+    for (const id of wanted) {
+      if (!allScenarios.some((x) => x.id === id)) return res.status(404).json({ error: 'scenario not found' });
     }
-    if (!baseline) baseline = r.baseline;
-    rows.push({ strategy: s, projection: r.strategy, comparison: r.comparison, factors: r.factors, opCount: planOpsOf(s.id).length });
+    selected = allScenarios.filter((x) => wanted.has(x.id));
+  } else {
+    const base = planBaseScenario(p.id);
+    selected = base ? [base] : [null];
   }
-  // Baseline-only projection: the reference the strategy deltas are
-  // computed against, and the chart's baseline line.
-  if (!baseline) {
-    const baseMainline = planAssembleMainline(p.id);
-    await ensureFreshPrime();
-    const cur = getCurrentPrime();
-    const currentMonth = currentMonthKey();
-    const mainline = planPoolMainline(p, baseMainline, currentMonth);
-    const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
-    baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: {}, primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: null, holdingGrowth });
-    baseline.currentRates = currentRates;
-  }
-  // Strategy-centric deltas: per strategy, Equity Δ (peak balance
-  // advantage over baseline) and Principal Δ (buyCash vs baseline).
-  // A delta is null when the strategy does not touch that asset type
-  // at all — the client renders '—' — so a buy strategy never shows a
-  // spurious $0 equity delta and vice versa. Baseline stays only the
-  // reference the deltas are computed against, never a table column.
-  for (const r of rows) {
-    const sops = planOpsOf(r.strategy.id);
-    const slegs = [];
-    for (const o of sops) for (const l of o.legs || []) slegs.push(l);
-    const touchesMortgage = sops.some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
-      || slegs.some((l) => String(l.source_ref || '').startsWith('repay:'));
-    const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
-    r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
-    r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
-    // Comparison chart inputs: which asset types each strategy touches
-    // (the client picks the chart mode from these), plus the
-    // principal-gain series for stock strategies (do-nothing
-    // baseline, one definition shared with the table's stockGain).
-    r.touchesMortgage = touchesMortgage;
-    r.touchesStocks = touchesStocks;
-    r.principalGainSeries = touchesStocks ? principalGainSeries(baseline, r.projection) : null;
-  }
-  // Report-ready series: one monthly trajectory per baseline/strategy,
-  // plus each strategy's cost breakdown. The report view renders from
-  // this block only — it never recomputes engine figures client-side.
-  const mainlineForReport = planAssembleMainline(p.id);
-  const assessedByProperty = mainlineForReport.assessed || {};
-  const assessedTotal = Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
-  const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal) }];
-  for (const r of rows) {
-    // A strategy's own property-growth factor grows its trajectory's
-    // assessed values; the baseline trajectory stays flat.
-    const growth = r.factors && r.factors.propertyGrowth ? r.factors.propertyGrowth.valuePct : null;
-    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey()) });
-  }
-  const report = {
-    assessedTotal, assessedByProperty,
-    trajectories: reportTrajectories,
-    costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
+  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  const buildBlock = async (scenarioRow) => {
+    const factors = planScenarioFactorsOfRow(scenarioRow);
+    const rows = [];
+    let baseline = null;
+    for (const st of strategies) {
+      let r;
+      try {
+        r = await planProjectionFor(st, p, scenarioRow);
+      } catch (err) {
+        throw new Error(`projection failed: ${err.message}`);
+      }
+      if (!baseline) baseline = r.baseline;
+      rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, sink: r.sink, opCount: planOpsOf(st.id).length });
+    }
+    // Baseline-only projection: the reference the strategy deltas are
+    // computed against, and the chart's baseline line.
+    if (!baseline) {
+      const baseMainline = planAssembleMainline(p.id);
+      await ensureFreshPrime();
+      const cur = getCurrentPrime();
+      const currentMonth = currentMonthKey();
+      const mainline = planPoolMainline(p, baseMainline, currentMonth);
+      const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
+      baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: factorsToAssumptions(factors, {}), primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: primeFactorToScenario(factors), holdingGrowth });
+      baseline.currentRates = currentRates;
+    }
+    // Strategy-centric deltas: per strategy, Equity Δ (peak balance
+    // advantage over baseline) and Principal Δ (buyCash vs baseline).
+    // A delta is null when the strategy does not touch that asset type
+    // at all — the client renders '—' — so a buy strategy never shows a
+    // spurious $0 equity delta and vice versa. Baseline stays only the
+    // reference the deltas are computed against, never a table column.
+    for (const r of rows) {
+      const sops = planOpsOf(r.strategy.id);
+      const slegs = [];
+      for (const o of sops) for (const l of o.legs || []) slegs.push(l);
+      const touchesMortgage = sops.some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
+        || slegs.some((l) => String(l.source_ref || '').startsWith('repay:'));
+      const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
+      r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
+      r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
+      // Comparison chart inputs: which asset types each strategy touches
+      // (the client picks the chart mode from these), plus the
+      // principal-gain series for stock strategies (do-nothing
+      // baseline, one definition shared with the table's stockGain).
+      r.touchesMortgage = touchesMortgage;
+      r.touchesStocks = touchesStocks;
+      r.principalGainSeries = touchesStocks ? principalGainSeries(baseline, r.projection) : null;
+    }
+    // Report-ready series: one monthly trajectory per baseline/strategy,
+    // plus each strategy's cost breakdown. The report view renders from
+    // this block only — it never recomputes engine figures client-side.
+    // The scenario's property growth (if any) grows BOTH the baseline
+    // and the strategy trajectories: one world, one assessed path.
+    const mainlineForReport = planAssembleMainline(p.id);
+    const assessedByProperty = mainlineForReport.assessed || {};
+    const assessedTotal = Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
+    const growth = factors && factors.propertyGrowth ? factors.propertyGrowth.valuePct : null;
+    const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey()) }];
+    for (const r of rows) {
+      reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey()) });
+    }
+    const report = {
+      assessedTotal, assessedByProperty,
+      trajectories: reportTrajectories,
+      costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
+    };
+    return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
   };
-  res.json({ project: p, scenario: null, scenarios: [], baseline, strategies: rows, report, chosenBaseline });
+  const scenarioBlocks = [];
+  try {
+    for (const sc of selected) scenarioBlocks.push(await buildBlock(sc));
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  // Back-compat top level: the FIRST block. The saved-report view reads
+  // these fields; with scenarios present it renders under the first
+  // selected world (the base scenario when no ids were pinned).
+  const first = scenarioBlocks[0] || null;
+  res.json({
+    project: p, scenarios: allScenarios, selectedScenarioIds: selected.filter(Boolean).map((x) => x.id),
+    scenarioBlocks, scenario: first ? first.scenario : null,
+    baseline: first ? first.baseline : null, strategies: first ? first.strategies : [],
+    report: first ? first.report : null, chosenBaseline,
+  });
 });
 
 app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
@@ -5537,29 +5802,19 @@ app.put('/api/planning/strategies/:id/assumptions', requireApiAuth, (req, res) =
 // Strategy factors: full replace (the client sends the whole edited
 // set, including any existing sink). Prime points, return and growth
 // percentages are validated; unknown keys are rejected.
+// Retired by the scenario restructure: factors live on scenarios now.
+// Kept as an explicit 400 (not a silent 404) so old callers fail loudly
+// instead of assuming the write landed.
 app.put('/api/planning/strategies/:id/factors', requireApiAuth, (req, res) => {
   const s = planStrategyById(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
-  const factors = (req.body || {}).factors;
-  if (factors == null || typeof factors !== 'object' || Array.isArray(factors)) return res.status(400).json({ error: 'factors must be an object' });
-  const errs = validateStrategyFactors(factors, currentMonthKey());
-  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
-  const now = nowIso();
-  const out = commitTx(req, 'project', {
-    module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
-    entityLabel: p.name, summary: `Updated factors · ${s.name} · ${p.name}`,
-  }, () => {
-    db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
-    return { value: { strategy: planStrategyById(s.id), factors }, entityId: p.id };
-  });
-  res.json(out);
+  return res.status(400).json({ error: 'strategy factors moved to scenarios — edit the scenario instead' });
 });
 
 // Investment sink: where the pool goes. Saves the sink into the
-// strategy's factors (merging with the other factors) and REPLACES the
+// strategy's sink column and REPLACES the
 // strategy's ops with generated sell-pool + buy-sink ops: every pool
 // item is sold at its current price, proceeds earmarked to one buy of
 // the sink. A stock sink uses the user-picked historical trend as its
@@ -5634,18 +5889,23 @@ app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
       db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
         .run(buyInfo.lastInsertRowid, `op:${i + 1}`, 'all', now);
     });
-    const factors = { ...planStrategyFactors(s), sink, stock: stockFactor };
-    db.prepare('UPDATE plan_strategies SET factors = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(factors), now, s.id);
+    // The sink's trend rides on the sink object itself (trendPct for a
+    // stock sink, expectedReturnPct for a custom product); evaluation
+    // applies it over the scenario's stock return.
+    const sinkOut = sink.kind === 'stock'
+      ? { ...sink, trendPct: stockFactor.valuePct, basis: stockFactor.basis, window: stockFactor.window }
+      : { ...sink, expectedReturnPct: stockFactor.valuePct };
+    db.prepare('UPDATE plan_strategies SET sink = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(sinkOut), now, s.id);
     recordCommit(db, {
       userId: req.user.id, username: req.user.username, module: 'planning',
       entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
       entityLabel: p.name, summary: `Updated sink · ${s.name} · ${p.name}`,
       before, snapshot: snapshotByAggregate(db, 'project', p.id),
     });
-    return factors;
+    return sinkOut;
   });
-  const factors = rebuild();
-  res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), factors });
+  const sinkSaved = rebuild();
+  res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), sink: sinkSaved });
 });
 
 // Prime preset paths: complete date+rate point lists from the current
@@ -5817,8 +6077,16 @@ app.post('/api/planning/strategies/:id/merge-preview', requireApiAuth, async (re
   if (!p) return res.status(404).json({ error: 'project not found' });
   if (s.merged) return res.status(400).json({ error: 'strategy is already merged' });
   const { ops, legs, snapshot, current } = planMergePreviewFor(s, p);
-  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
-  const baseScenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  const mergeBody = req.body || {};
+  let baseScenario = null;
+  if (mergeBody.scenarioId === 0 || mergeBody.scenarioId === '0') {
+    baseScenario = null; // explicit flat world
+  } else if (mergeBody.scenarioId !== undefined && mergeBody.scenarioId !== null && mergeBody.scenarioId !== '') {
+    baseScenario = planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ? AND project_id = ?').get(Number(mergeBody.scenarioId), p.id));
+    if (!baseScenario) return res.status(404).json({ error: 'scenario not found' });
+  } else {
+    baseScenario = planBaseScenario(p.id);
+  }
   let strategy;
   try {
     ({ strategy } = await planProjectionFor(s, p, baseScenario));
@@ -5847,8 +6115,15 @@ app.post('/api/planning/strategies/:id/merge', requireApiAuth, async (req, res) 
   const b = req.body || {};
   const resolutions = b.resolutions || [];
   const { ops, legs, snapshot, current } = planMergePreviewFor(s, p);
-  const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
-  const baseScenario = scenarios.find((x) => x.is_base) || scenarios[0] || null;
+  let baseScenario = null;
+  if (b.scenarioId === 0 || b.scenarioId === '0') {
+    baseScenario = null; // explicit flat world
+  } else if (b.scenarioId !== undefined && b.scenarioId !== null && b.scenarioId !== '') {
+    baseScenario = planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ? AND project_id = ?').get(Number(b.scenarioId), p.id));
+    if (!baseScenario) return res.status(404).json({ error: 'scenario not found' });
+  } else {
+    baseScenario = planBaseScenario(p.id);
+  }
   let strategy;
   try {
     ({ strategy } = await planProjectionFor(s, p, baseScenario));

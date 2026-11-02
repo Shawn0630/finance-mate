@@ -359,6 +359,10 @@ function showSection(key) {
     a.classList.toggle('active', a.dataset.section === key));
 }
 
+// Planning scenario state, declared up here because route() runs at
+// startup before the planning section below has evaluated.
+let planCompareScenarioIds = null; // null = not yet initialized for this project load
+let planStrategyScenarioId; // undefined = server default (base scenario); 0 = explicit flat world; N = scenario N
 function route() {
   const hash = location.hash || '#assets/overview';
   if (hash.startsWith('#property/')) {
@@ -435,7 +439,11 @@ function route() {
     loadPlanProject(Number(hash.split('/')[2]));
   } else if (hash.startsWith('#planning/strategy/')) {
     showView('planning');
+    planStrategyScenarioId = undefined;
     loadPlanStrategy(Number(hash.split('/')[2]));
+  } else if (hash.startsWith('#planning/scenario/')) {
+    showView('planning');
+    loadPlanScenario(Number(hash.split('/')[2]));
   } else if (hash.startsWith('#planning/report/')) {
     showView('planning');
     const parts = hash.split('/');
@@ -10914,6 +10922,7 @@ async function loadPlanning() {
     $('#planProject').classList.add('hidden');
     $('#planStrategy').classList.add('hidden');
     $('#planReport').classList.add('hidden');
+    $('#planScenario').classList.add('hidden');
     $('#planList').innerHTML = planListHtml(data.projects);
     document.querySelectorAll('[data-plan-project]').forEach((el) => {
       el.addEventListener('click', () => { location.hash = `#planning/project/${el.dataset.planProject}`; });
@@ -11107,6 +11116,7 @@ async function planCatPickEntity(entity) {
       return `<div class="card breakdown-card" data-plan-sub="${s.key}" style="cursor:pointer">
         <div class="k">${esc(s.label)}</div>
         <div class="n">Baseline: ${esc(rec.baseline.name || '')} · Strategy: ${esc(rec.strategy.name || '')}</div>
+        <div class="n">Scenario: ${rec.scenario && rec.scenario.name ? esc(rec.scenario.name) : '—'}</div>
         <div class="n">${esc(rec.strategy.summary || '')}</div>${poolLine}</div>`;
     }).join('');
     document.querySelectorAll('#planCategorySubs [data-plan-sub]').forEach((el) => {
@@ -11157,7 +11167,7 @@ function openPlanProjectModal(existing, catCtx) {
     const rec = catCtx.recommendation || null;
     form.question.value = rec ? `${rec.strategy.name} — ${rec.strategy.summary || ''}` : '';
     catRow.classList.remove('hidden');
-    $('#planProjectCategoryNote').textContent = `${catCtx.category} · ${catCtx.subcategory}${rec ? ` — Baseline: ${rec.baseline.name} · Strategy: ${rec.strategy.name}` : ''}`;
+    $('#planProjectCategoryNote').textContent = `${catCtx.category} · ${catCtx.subcategory}${rec ? ` — Scenario: ${rec.scenario && rec.scenario.name ? rec.scenario.name : '—'} · Baseline: ${rec.baseline.name} · Strategy: ${rec.strategy.name}` : ''}`;
     catBtns.classList.remove('hidden');
     $('#planProjectSaveBtn').textContent = 'Create without';
   }
@@ -11191,10 +11201,12 @@ async function loadPlanProject(id) {
   return withLoading(async () => {
     const data = await api(`/api/planning/projects/${id}`);
     planProjectData = data;
+    planCompareScenarioIds = null;
     $('#planList').classList.add('hidden');
     $('#planProject').classList.remove('hidden');
     $('#planStrategy').classList.add('hidden');
     $('#planReport').classList.add('hidden');
+    $('#planScenario').classList.add('hidden');
     $('#planProject').innerHTML = planProjectHtml(data);
     planProjectWire(data);
     await loadPlanComparison(id);
@@ -11258,6 +11270,12 @@ function planProjectHtml(d) {
     ${headerLine ? `<div class="note" id="planProjectCategoryLine">${esc(headerLine)}</div>` : ''}
     ${metaLine}
     <div class="msg" id="planProjectMsg"></div>`;
+  const scenariosPanel = `<div class="panel" id="planScenarioCardsPanel">
+      <div class="section-head"><h3>Scenarios</h3>
+        <div class="toolbar"><button class="small" id="planAiScenarioBtn">Design with AI</button><button class="primary" id="planAddScenarioBtn">+ Add scenario</button></div>
+      </div>
+      <div id="planScenarioCards"></div>
+    </div>`;
   const baselinesPanel = `<div class="panel" id="planBaselineCardsPanel">
       <div class="section-head"><h3>Baselines</h3>
         <div class="toolbar"><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
@@ -11268,6 +11286,7 @@ function planProjectHtml(d) {
       <div class="section-head"><h3>Strategies</h3>
         <div class="toolbar"><button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
       </div>
+      <div id="planStrategyCardsWorld"></div>
       <div id="planStrategyCards"></div>
     </div>`;
   const assetsPanel = `<div class="panel" id="planAssetPanel">
@@ -11282,18 +11301,22 @@ function planProjectHtml(d) {
       </div>
       <div id="planReportList"></div>
       <div class="section-head"><h3>Comparison across strategies</h3></div>
+      <div id="planCompareScenarios"></div>
       <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
       <div id="planCompareEmpty"></div>
       <div id="planCompareTable"></div>
       <div id="planBaselineRates"></div>
+      <div id="planCompareBlocksExtra"></div>
     </div>`;
-  // DETAIL ORDER (both branches): header → baselines → strategies →
-  // (declared assets for sell templates / legacy) → reports (+
-  // comparison). No prime-scenarios section, no future-world
-  // selector, no baseline-info panel anywhere, and no per-project
-  // history panel — history lives in the app-level History tab.
-  if (!templated) return header + baselinesPanel + strategiesPanel + assetsPanel + reportsPanel;
-  return header + baselinesPanel + strategiesPanel + (sections.declaredAssets ? assetsPanel : '') + reportsPanel;
+  // DETAIL ORDER (both branches): header → scenarios → baselines →
+  // strategies → (declared assets for sell templates / legacy) →
+  // reports (+ comparison). Scenario, baseline and strategy are three
+  // independent specs in three sections; the comparison runs each
+  // strategy against the baseline under the picked scenarios. No
+  // baseline-info panel anywhere, and no per-project history panel —
+  // history lives in the app-level History tab.
+  if (!templated) return header + scenariosPanel + baselinesPanel + strategiesPanel + assetsPanel + reportsPanel;
+  return header + scenariosPanel + baselinesPanel + strategiesPanel + (sections.declaredAssets ? assetsPanel : '') + reportsPanel;
 }
 function planProjectWire(d) {
   const p = d.project;
@@ -11391,7 +11414,84 @@ function planProjectWire(d) {
     try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   }));
+  planScenarioSectionWire(d);
 }
+function planScenarioSectionWire(d) {
+  const p = d.project;
+  const list = $('#planScenarioCards');
+  if (!list) return;
+  const scenarios = d.scenarios || [];
+  list.innerHTML = scenarios.map((sc) => {
+    const line = planScenarioSummaryLine(sc.factors);
+    return `<div class="card breakdown-card" data-plan-scenario="${sc.id}" style="cursor:pointer">
+      <div class="k">${esc(sc.name)}${sc.is_base ? ' · Default' : ''}</div>
+      <div class="n">${line ? esc(line) : 'Flat world — current rates'}</div>
+      <div class="toolbar">
+        <button class="small danger" data-plan-scenario-del="${sc.id}">Delete</button>
+      </div></div>`;
+  }).join('') || '<div class="note">No scenarios yet.</div>';
+  document.querySelectorAll('[data-plan-scenario]').forEach((el) => {
+    el.addEventListener('click', () => { location.hash = `#planning/scenario/${el.dataset.planScenario}`; });
+  });
+  document.querySelectorAll('[data-plan-scenario-del]').forEach((b) => {
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const row = scenarios.find((x) => x.id === Number(b.dataset.planScenarioDel));
+      if (!row || !confirm(`Delete scenario "${row.name}"?`)) return;
+      try { await api(`/api/planning/scenarios/${row.id}`, { method: 'DELETE' }); loadPlanProject(p.id); }
+      catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
+    });
+  });
+  $('#planAddScenarioBtn').addEventListener('click', () => {
+    $('#planScenarioForm').dataset.projectId = p.id;
+    $('#planScenarioName').value = '';
+    showMsg($('#planScenarioModalMsg'), '', '');
+    openModal('planScenarioModal');
+  });
+  $('#planAiScenarioBtn').addEventListener('click', () => {
+    planScenarioAiCtx = { projectId: p.id, factors: null };
+    $('#planScenarioAiName').value = '';
+    $('#planScenarioAiText').value = '';
+    $('#planScenarioAiOut').innerHTML = '';
+    showMsg($('#planScenarioAiMsg'), '', '');
+    openModal('planScenarioAiModal');
+  });
+}
+let planScenarioAiCtx = null;
+$('#planScenarioForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = $('#planScenarioModalMsg');
+  try {
+    const name = $('#planScenarioName').value.trim();
+    if (!name) throw new Error('Scenario name is required');
+    const data = await api(`/api/planning/projects/${form.dataset.projectId}/scenarios`, { method: 'POST', body: { name } });
+    closeModalEl($('#planScenarioModal'));
+    location.hash = `#planning/scenario/${data.scenario.id}`;
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+$('#planScenarioAiGoBtn').addEventListener('click', async () => {
+  const msg = $('#planScenarioAiMsg');
+  const out = $('#planScenarioAiOut');
+  const text = $('#planScenarioAiText').value.trim();
+  if (!text) { showMsg(msg, 'err', 'Describe the scenario first'); return; }
+  if (!planScenarioAiCtx) { showMsg(msg, 'err', 'Open the scenario designer from a project first'); return; }
+  try {
+    const r = await api(`/api/planning/projects/${planScenarioAiCtx.projectId}/scenarios/ai-design`, { method: 'POST', body: { text } });
+    planScenarioAiCtx.factors = r.factors;
+    const line = planScenarioSummaryLine(r.factors);
+    out.innerHTML = `<div class="n">${esc(line || 'Flat world')}</div><div class="toolbar"><button class="small primary" id="planScenarioAiApplyBtn">Create this scenario</button></div>`;
+    $('#planScenarioAiApplyBtn').addEventListener('click', async () => {
+      try {
+        const name = $('#planScenarioAiName').value.trim();
+        if (!name) throw new Error('Scenario name is required');
+        const data = await api(`/api/planning/projects/${planScenarioAiCtx.projectId}/scenarios`, { method: 'POST', body: { name, factors: planScenarioAiCtx.factors } });
+        closeModalEl($('#planScenarioAiModal'));
+        location.hash = `#planning/scenario/${data.scenario.id}`;
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
 let planBaselineEditCtx = null;
 function openPlanBaselineEditModal(projectId, baselineId) {
   api(`/api/planning/projects/${projectId}`).then((d) => {
@@ -11420,10 +11520,10 @@ $('#planBaselineEditForm').addEventListener('submit', async (e) => {
     loadPlanProject(ctx.projectId);
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
-// One-line factor summary for a strategy card. Empty = no line (a
-// strategy with no factors behaves exactly like the baseline plus its
-// ops). Investment strategies without a sink get a prompt instead.
-function planFactorSummaryLine(factors, isInvestment) {
+// One-line summary of a scenario's world factors. Empty = a flat world
+// (current rates/terms throughout). The sink is NOT part of this line:
+// it lives on the strategy, not the world.
+function planScenarioSummaryLine(factors) {
   const f = factors && typeof factors === 'object' ? factors : {};
   const parts = [];
   if (f.prime && Array.isArray(f.prime.points) && f.prime.points.length) {
@@ -11438,30 +11538,26 @@ function planFactorSummaryLine(factors, isInvestment) {
   if (f.propertyGrowth && f.propertyGrowth.valuePct != null) parts.push(`Property +${f.propertyGrowth.valuePct}%/yr`);
   if (f.salaryGrowth && f.salaryGrowth.valuePct != null) parts.push(`Salary +${f.salaryGrowth.valuePct}%/yr`);
   if (f.rentGrowth && f.rentGrowth.valuePct != null) parts.push(`Rent +${f.rentGrowth.valuePct}%/yr`);
-  if (f.sink) {
-    parts.push(f.sink.kind === 'custom' ? `Sink: ${f.sink.name}` : 'Sink: existing stock');
-  } else if (isInvestment) {
-    parts.push('Sink: not picked yet');
-  }
   return parts.join(' · ');
 }
-async function loadPlanComparison(projectId) {
-  // No shared world: each strategy runs under its own factors, and the
-  // baseline is always the do-nothing reference.
-  const data = await api(`/api/planning/projects/${projectId}/comparison`);
-  const rows = data.strategies;
+// One-line sink summary for a strategy card. Investment strategies
+// without a sink get a prompt instead.
+function planSinkLine(sink, isInvestment) {
+  if (sink) return sink.kind === 'custom' ? `Sink: ${sink.name}` : 'Sink: existing stock';
+  if (isInvestment) return 'Sink: not picked yet';
+  return '';
+}
+function planCompareTableHtml(rows) {
   // COMPARISON IS THE FINAL OUTPUT, STRATEGY-CENTRIC: with zero
   // strategies there is nothing to compare, so the table does not
   // render at all — only the baseline trajectory chart. With strategies,
   // columns are strategies only: no baseline column, no baseline
   // absolute. Baseline stays the reference the deltas are computed
   // against (and the chart's baseline line), never a displayed column.
-  if (!rows.length) {
-    $('#planCompareTable').innerHTML = '';
-  } else {
-    const head = `<tr><th></th>${rows.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('')}</tr>`;
-    const numRow = (label, fn) => `<tr><td>${label}</td>${rows.map((r) => `<td>${fn(r)}</td>`).join('')}</tr>`;
-    $('#planCompareTable').innerHTML = `
+  if (!rows.length) return '';
+  const head = `<tr><th></th>${rows.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('')}</tr>`;
+  const numRow = (label, fn) => `<tr><td>${label}</td>${rows.map((r) => `<td>${fn(r)}</td>`).join('')}</tr>`;
+  return `
     <table class="tbl"><thead>${head}</thead><tbody>
       ${numRow('Total cost', (r) => planMoney(r.comparison.cost))}
       ${numRow('Total gain', (r) => planMoney(r.comparison.gain))}
@@ -11472,10 +11568,13 @@ async function loadPlanComparison(projectId) {
       ${numRow('Monthly payment Δ', (r) => planSigned(r.comparison.paymentDelta))}
     </tbody></table>
     <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations). Stock gain = strategy value minus the do-nothing baseline value, less new cash deployed (pot/external buys) grown at the baseline ratio; sell-funded buys are swaps and are not costed again.</div>`;
-  }
-  const ratesEl = $('#planBaselineRates');
+}
+function planCompareBlockRender(block, ids) {
+  const rows = block.strategies || [];
+  $(ids.tableEl).innerHTML = planCompareTableHtml(rows);
+  const ratesEl = $(ids.ratesEl);
   if (ratesEl) {
-    const rates = data.baseline && data.baseline.currentRates;
+    const rates = block.baseline && block.baseline.currentRates;
     ratesEl.innerHTML = rates && rates.length
       ? `<div class="note">Baseline grows at current rates: ${rates.map((r) => `${esc(r.symbol)} ${r.ratePct}%/yr (${esc(r.basis)} · ${esc(r.window)})`).join(' · ')}</div>`
       : '';
@@ -11487,12 +11586,12 @@ async function loadPlanComparison(projectId) {
   // (excess over the do-nothing baseline, one definition shared with
   // the table's stockGain). The mortgage balance chart — baseline line
   // included — renders only for mortgage-touching projects.
-  const chartWrap = document.querySelector('#planCompareChart')?.closest('.chart-wrap');
-  const emptyEl = $('#planCompareEmpty');
+  const chartWrap = document.querySelector(`#${ids.chartId}`)?.closest('.chart-wrap');
+  const emptyEl = $(ids.emptyEl);
   if (!rows.length) {
     if (chartWrap) chartWrap.classList.add('hidden');
     if (emptyEl) emptyEl.innerHTML = '<div class="note">No strategies yet.</div>';
-    planDestroyChart('planCompareChart');
+    planDestroyChart(ids.chartId);
   } else {
     if (chartWrap) chartWrap.classList.remove('hidden');
     if (emptyEl) emptyEl.innerHTML = '';
@@ -11504,7 +11603,7 @@ async function loadPlanComparison(projectId) {
         const byMonth = new Map(r.principalGainSeries.map((pt) => [pt.month, pt.value]));
         return { label: `${r.strategy.letter} · ${r.strategy.name} · Principal gain`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true };
       });
-      planLineChart('planCompareChart', labels, datasets);
+      planLineChart(ids.chartId, labels, datasets);
     } else {
       // Balance lines: baseline + each strategy, summed across properties.
       const sumBalance = (proj) => {
@@ -11515,29 +11614,34 @@ async function loadPlanComparison(projectId) {
         }
         return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
       };
-      const baseSeries = sumBalance(data.baseline);
+      const baseSeries = sumBalance(block.baseline);
       const labels = baseSeries.map(([m]) => m);
       const datasets = [{ label: 'Baseline', data: baseSeries.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 }];
       rows.forEach((r, i) => {
-        const s = sumBalance(r.projection);
-        const byMonth = new Map(s);
+        const ssum = sumBalance(r.projection);
+        const byMonth = new Map(ssum);
         datasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true });
       });
-      planLineChart('planCompareChart', labels, datasets);
+      planLineChart(ids.chartId, labels, datasets);
     }
   }
+}
+function planStrategyCardsRender(rows, projectId) {
+  // Cards show figures under the FIRST selected scenario only (labeled
+  // in #planStrategyCardsWorld). Rows without a comparison (the re-pick
+  // state) render name-only — never figures from another world.
   $('#planStrategyCards').innerHTML = rows.map((r) => {
     let tp = {};
     try { tp = typeof r.strategy.template_params === 'string' ? JSON.parse(r.strategy.template_params) : (r.strategy.template_params || {}); } catch { tp = {}; }
     const isInvestment = planProjectData && planProjectData.project && planProjectData.project.category === 'investment';
-    const factorLine = planFactorSummaryLine(r.factors, isInvestment);
-    const legacySinkLine = (!r.factors || !r.factors.sink) && tp.source && tp.sink ? `<div class="n">Source: ${esc(tp.source === 'pot' ? 'cash pot' : tp.source)} → Sink: ${esc(tp.sinkLabel || tp.sink)}</div>` : '';
+    const sinkLine = planSinkLine(r.sink, isInvestment);
+    const legacySinkLine = !r.sink && tp.source && tp.sink ? `<div class="n">Source: ${esc(tp.source === 'pot' ? 'cash pot' : tp.source)} → Sink: ${esc(tp.sinkLabel || tp.sink)}</div>` : '';
     return `
     <div class="card breakdown-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
       <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
-      <div class="v">${planSigned(r.comparison.net)}</div>
-      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops</div>
-      ${factorLine ? `<div class="n">${esc(factorLine)}</div>` : ''}
+      ${r.comparison ? `<div class="v">${planSigned(r.comparison.net)}</div>
+      <div class="n">Cost ${planMoney(r.comparison.cost)} · Gain ${planMoney(r.comparison.gain)} · ${r.opCount ?? 0} ops</div>` : ''}
+      ${sinkLine ? `<div class="n">${esc(sinkLine)}</div>` : ''}
       ${legacySinkLine}
       <div class="toolbar">
         <button class="small" data-plan-strategy-edit="${r.strategy.id}">Edit</button>
@@ -11555,11 +11659,70 @@ async function loadPlanComparison(projectId) {
     b.addEventListener('click', async (e) => {
       e.stopPropagation();
       const row = rows.find((r) => r.strategy.id === Number(b.dataset.planStrategyDel));
-      if (!row || !confirm(`Delete strategy "${row.strategy.name}"?`)) return;
-      try { await api(`/api/planning/strategies/${row.strategy.id}`, { method: 'DELETE' }); loadPlanProject(projectId); }
+      const name = row ? row.strategy.name : ((planProjectData.strategies || []).find((st) => st.id === Number(b.dataset.planStrategyDel)) || {}).name || '';
+      if (!row && !name) return;
+      if (!confirm(`Delete strategy "${name}"?`)) return;
+      try { await api(`/api/planning/strategies/${b.dataset.planStrategyDel}`, { method: 'DELETE' }); loadPlanProject(projectId); }
       catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
     });
   });
+}
+async function loadPlanComparison(projectId) {
+  const scenarios = (planProjectData && planProjectData.scenarios) || [];
+  // Picker default: the base scenario pre-checked — a visible default
+  // the user can change, not a silent fallback. No scenarios = the flat
+  // world, and no picker at all.
+  if (planCompareScenarioIds === null) {
+    const base = scenarios.find((x) => x.is_base) || scenarios[0];
+    planCompareScenarioIds = base ? [base.id] : [];
+  }
+  const picker = $('#planCompareScenarios');
+  if (picker) {
+    if (!scenarios.length) {
+      picker.innerHTML = '';
+    } else {
+      picker.innerHTML = `<div class="toolbar"><span>Scenarios:</span>${scenarios.map((sc) => `<label class="btnlike"><input type="checkbox" data-plan-compare-scenario="${sc.id}"${planCompareScenarioIds.includes(sc.id) ? ' checked' : ''}> ${esc(sc.name)}${sc.is_base ? ' (Default)' : ''}</label>`).join(' ')}</div>`;
+      picker.querySelectorAll('[data-plan-compare-scenario]').forEach((cb) => cb.addEventListener('change', () => {
+        planCompareScenarioIds = [...picker.querySelectorAll('[data-plan-compare-scenario]:checked')].map((el) => Number(el.dataset.planCompareScenario));
+        loadPlanComparison(projectId);
+      }));
+    }
+  }
+  const worldEl = $('#planStrategyCardsWorld');
+  // PINNED-INPUT RULE: scenarios exist but none picked = a re-pick
+  // panel only. No table, no chart, no card figures — nothing renders
+  // under a world the user did not pick.
+  if (scenarios.length && !planCompareScenarioIds.length) {
+    if (worldEl) worldEl.innerHTML = '<div class="note">Pick a scenario to compare under.</div>';
+    planStrategyCardsRender((planProjectData.strategies || []).map((st) => ({ strategy: st, comparison: null, sink: null })), projectId);
+    $('#planCompareTable').innerHTML = '';
+    $('#planBaselineRates').innerHTML = '';
+    $('#planCompareBlocksExtra').innerHTML = '';
+    const chartWrap = document.querySelector('#planCompareChart')?.closest('.chart-wrap');
+    if (chartWrap) chartWrap.classList.add('hidden');
+    $('#planCompareEmpty').innerHTML = '<div class="note">Pick a scenario to compare under.</div>';
+    planDestroyChart('planCompareChart');
+    return;
+  }
+  const q = scenarios.length ? `?scenarioIds=${planCompareScenarioIds.join(',')}` : '';
+  const data = await api(`/api/planning/projects/${projectId}/comparison${q}`);
+  const blocks = data.scenarioBlocks && data.scenarioBlocks.length ? data.scenarioBlocks : [{ scenario: data.scenario, baseline: data.baseline, strategies: data.strategies, report: data.report }];
+  const first = blocks[0];
+  if (worldEl) worldEl.innerHTML = first.scenario ? `<div class="note">Under ${esc(first.scenario.name)}</div>` : '<div class="note">Current rates (no scenario)</div>';
+  // The first block keeps the legacy containers, so existing table/chart
+  // pins keep working; further blocks render below with suffixed ids.
+  planCompareBlockRender(first, { tableEl: '#planCompareTable', chartId: 'planCompareChart', emptyEl: '#planCompareEmpty', ratesEl: '#planBaselineRates' });
+  const extra = $('#planCompareBlocksExtra');
+  if (extra) {
+    extra.innerHTML = blocks.slice(1).map((b, i) => `
+      <div class="section-head"><h3>Under ${esc(b.scenario ? b.scenario.name : 'Current rates')}</h3></div>
+      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart-${i + 1}"></canvas></div>
+      <div id="planCompareEmpty-${i + 1}"></div>
+      <div id="planCompareTable-${i + 1}"></div>
+      <div id="planBaselineRates-${i + 1}"></div>`).join('');
+    blocks.slice(1).forEach((b, i) => planCompareBlockRender(b, { tableEl: `#planCompareTable-${i + 1}`, chartId: `planCompareChart-${i + 1}`, emptyEl: `#planCompareEmpty-${i + 1}`, ratesEl: `#planBaselineRates-${i + 1}` }));
+  }
+  planStrategyCardsRender(first.strategies, projectId);
 }
 async function planSaveReport(projectId) {
   const msg = $('#planReportSaveMsg');
@@ -11660,6 +11823,7 @@ async function loadPlanReport(projectId, reportId) {
       $('#planList').classList.add('hidden');
       $('#planProject').classList.add('hidden');
       $('#planStrategy').classList.add('hidden');
+      $('#planScenario').classList.add('hidden');
       $('#planReport').classList.remove('hidden');
       $('#planReport').innerHTML = `<div class="panel"><div class="note">Report not found.</div></div>`;
       return;
@@ -11670,6 +11834,7 @@ async function loadPlanReport(projectId, reportId) {
       $('#planList').classList.add('hidden');
       $('#planProject').classList.add('hidden');
       $('#planStrategy').classList.add('hidden');
+      $('#planScenario').classList.add('hidden');
       $('#planReport').classList.remove('hidden');
       const bases = proj.project.baselines || [];
       $('#planReport').innerHTML = `
@@ -11719,6 +11884,7 @@ async function loadPlanReport(projectId, reportId) {
     $('#planList').classList.add('hidden');
     $('#planProject').classList.add('hidden');
     $('#planStrategy').classList.add('hidden');
+    $('#planScenario').classList.add('hidden');
     $('#planReport').classList.remove('hidden');
     const rep = comp.report || {};
     const trajs = rep.trajectories || [];
@@ -11872,14 +12038,17 @@ async function loadPlanReport(projectId, reportId) {
 }
 function sidsHas(series, sid) { return (series || []).includes(sid); }
 
-async function loadPlanStrategy(id) {
+async function loadPlanStrategy(id, scenarioId) {
+  if (scenarioId !== undefined) planStrategyScenarioId = scenarioId;
+  const q = planStrategyScenarioId !== undefined ? `?scenarioId=${planStrategyScenarioId}` : '';
   return withLoading(async () => {
-    const data = await api(`/api/planning/strategies/${id}`);
+    const data = await api(`/api/planning/strategies/${id}${q}`);
     planStrategyData = data;
     $('#planList').classList.add('hidden');
     $('#planProject').classList.add('hidden');
     $('#planStrategy').classList.remove('hidden');
     $('#planReport').classList.add('hidden');
+    $('#planScenario').classList.add('hidden');
     $('#planStrategy').innerHTML = planStrategyHtml(data);
     planStrategyWire(data);
   });
@@ -11932,6 +12101,9 @@ function planStrategyHtml(d) {
           <button class="small danger" id="planStrategyDeleteBtn">Delete</button>
         </div>
       </div>
+      ${(d.scenarios && d.scenarios.length)
+        ? `<div class="toolbar"><label>Scenario</label><select id="planStrategyScenarioSel"><option value="0">Current rates (no scenario)</option>${d.scenarios.map((x) => `<option value="${x.id}"${d.appliedScenario && d.appliedScenario.id === x.id ? ' selected' : ''}>${esc(x.name)}${x.is_base ? ' (Default)' : ''}</option>`).join('')}</select></div>`
+        : `<div class="note">No scenario — current rates</div>`}
       <div class="msg" id="planStrategyMsg"></div>
       ${c.errors && c.errors.length ? `<div class="msg err">${esc(c.errors.join('; '))}</div>` : ''}
       <div class="summary-strip">
@@ -11956,16 +12128,11 @@ function planStrategyHtml(d) {
       <div class="section-head"><h3>Stock value</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
     </div>
-    <div class="panel" id="planFactorsPanel">
-      <div class="section-head"><h3>Factors</h3></div>
-      <div class="toolbar" id="planFactorAddRow"><select id="planFactorAddSel"></select><button class="small" id="planFactorAddBtn">Add factor</button></div>
-      <div id="planFactorPrime"></div>
-      <div id="planFactorStock"></div>
-      <div id="planFactorGrowth"></div>
+    ${d.project.category === 'investment' ? `<div class="panel" id="planSinkPanel">
+      <div class="section-head"><h3>Sink</h3></div>
       <div id="planFactorSink"></div>
-      <div class="toolbar"><button class="small primary" id="planFactorSaveBtn">Save factors</button></div>
-      <div class="msg" id="planFactorMsg"></div>
-    </div>
+      <div class="msg" id="planSinkMsg"></div>
+    </div>` : ''}
     <div class="panel">
       <div class="section-head"><h3>Annual interest</h3></div>
       <table class="tbl"><thead><tr><th>Year</th><th>Baseline interest</th><th>Strategy interest</th><th>Saved</th></tr></thead><tbody>${yearRows}</tbody></table>
@@ -11992,7 +12159,7 @@ function planStrategyHtml(d) {
       </div>
       <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
       <div class="msg" id="planAsmMsg"></div>
-      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Stock return lives in Factors now.</div>
+      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Stock return lives in the scenario now.</div>
     </div>
     ${(() => {
       if (!d.model || !d.model.spec) return '';
@@ -12126,7 +12293,9 @@ function planStrategyWire(d) {
       loadPlanStrategy(s.id);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
-  planFactorWire(d);
+  const scenSel = $('#planStrategyScenarioSel');
+  if (scenSel) scenSel.addEventListener('change', () => loadPlanStrategy(s.id, Number(scenSel.value)));
+  planSinkWire(d);
   // AI describe.
   $('#planAiDescribeBtn').addEventListener('click', async () => {
     const msg = $('#planAiDescribeMsg');
@@ -12167,18 +12336,178 @@ let planFactorState = null;
 let planFactorActive = new Set();
 let planFactorRedrawPrime = null;
 let planFactorMonthPopWired = false;
-function planFactorWire(d) {
+// Sink editor for the strategy detail page (investment projects only).
+// The sink is strategy equipment, not a world factor, so it renders
+// here always — no Add-factor gate. Saving rebuilds the strategy's ops
+// into sell-pool + buy-sink ops, as before. Sink Delete (clear to a
+// re-pick state) belongs to the strategy-page redesign round.
+function planSinkWire(d) {
   const s = d.strategy;
+  const sinkHost = $('#planFactorSink');
+  if (!sinkHost || d.project.category !== 'investment') return;
+  let holdings = [];
+  let sinkDraft = null;
+  const sink = d.sink || null;
+  let tp = {};
+  try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
+  const render = () => {
+    const defaultKind = tp.sinkKind === 'custom' ? 'custom' : 'stock';
+    const curLine = sink
+      ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: existing stock · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
+      : 'No sink picked yet — the strategy holds the pool until you pick one.';
+    sinkHost.innerHTML = `<div class="note">${esc(curLine)}</div>
+      <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Existing stock</label>
+      <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
+      <div id="planSinkStockBox"${defaultKind === 'custom' ? ' class="hidden"' : ''}>
+        <div><label>Stock</label><select id="planSinkHolding"></select></div>
+        <div class="toolbar"><button class="small" id="planSinkSuggestBtn">Suggest trend</button></div><div id="planSinkSuggestOut"></div>
+      </div>
+      <div id="planSinkCustomBox"${defaultKind === 'stock' ? ' class="hidden"' : ''}>
+        <div><label>Product name *</label><input id="planSinkName"></div>
+        <div><label>Expected return (% / year) *</label><input id="planSinkReturn" type="text" inputmode="decimal" data-money></div>
+      </div>
+      <div class="toolbar"><button class="small primary" id="planSinkSaveBtn">Save sink (rebuilds operations)</button></div>
+      <div class="msg" id="planSinkMsg"></div>`;
+    const sel = $('#planSinkHolding');
+    if (sel) {
+      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
+      if (tp.sink && tp.sink.holdingId && [...sel.options].some((o) => Number(o.value) === Number(tp.sink.holdingId))) sel.value = String(tp.sink.holdingId);
+      else if (sink && sink.kind === 'stock' && [...sel.options].some((o) => Number(o.value) === Number(sink.holdingId))) sel.value = String(sink.holdingId);
+      $('#planSinkSuggestBtn').addEventListener('click', async () => {
+        const out = $('#planSinkSuggestOut');
+        try {
+          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
+          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available — pick a custom product instead.')}</div>`; return; }
+          out.innerHTML = r.suggestions.map((x) => `
+            <button class="small" data-plan-sink-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-sink-basis="${esc(x.basis)}" data-plan-sink-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
+            + `<div class="note">Past returns do not predict future returns.</div>`;
+          out.querySelectorAll('[data-plan-sink-suggest]').forEach((b) => b.addEventListener('click', () => {
+            sinkDraft = { kind: 'stock', holdingId: Number(sel.value), trendPct: Number(b.dataset.planSinkSuggest), basis: b.dataset.planSinkBasis || null, window: b.dataset.planSinkWindow || null };
+            out.innerHTML = `<div class="note">Picked: trend ${sinkDraft.trendPct}%/yr (${esc(sinkDraft.basis || '')}${sinkDraft.window ? ` · ${sinkDraft.window}` : ''})</div>`;
+          }));
+        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+      });
+    }
+    sinkHost.querySelectorAll('input[name="planSinkKind"]').forEach((r) => r.addEventListener('change', () => {
+      const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
+      $('#planSinkStockBox').classList.toggle('hidden', kind !== 'stock');
+      $('#planSinkCustomBox').classList.toggle('hidden', kind !== 'custom');
+    }));
+    $('#planSinkSaveBtn').addEventListener('click', async () => {
+      const msg = $('#planSinkMsg');
+      try {
+        const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
+        let sinkBody;
+        if (kind === 'stock') {
+          if (!sinkDraft || sinkDraft.holdingId !== Number(sel.value)) throw new Error('Pick a trend suggestion for the chosen stock first');
+          sinkBody = sinkDraft;
+        } else {
+          const name = $('#planSinkName').value.trim();
+          const ret = $('#planSinkReturn').value.replace(/,/g, '').trim();
+          if (!name) throw new Error('Product name is required');
+          if (ret === '' || !isFinite(Number(ret))) throw new Error('Expected return is required');
+          sinkBody = { kind: 'custom', name, expectedReturnPct: Number(ret) };
+        }
+        if ((d.ops || []).length && !confirm('Saving a sink replaces this strategy\'s operations with sell-pool + buy-sink operations. Continue?')) return;
+        await api(`/api/planning/strategies/${s.id}/sink`, { method: 'PUT', body: { sink: sinkBody } });
+        showMsg(msg, 'ok', 'Sink saved');
+        loadPlanStrategy(s.id);
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    });
+  };
+  (async () => {
+    try {
+      const inv = await api('/api/investments');
+      holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountName: (a.account || {}).name })));
+    } catch { holdings = []; }
+    render();
+  })();
+}
+
+function planScenarioHtml(d) {
+  const sc = d.scenario;
+  const line = planScenarioSummaryLine(sc.factors);
+  return `
+    <div><a href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(sc.name)}${sc.is_base ? ' · Default' : ''}</h3>
+        <div class="toolbar">
+          ${sc.is_base ? '' : '<button class="small" id="planScenarioBaseBtn">Set as default</button>'}
+          <button class="small" id="planScenarioEditBtn">Edit</button>
+          ${sc.is_base ? '' : '<button class="small danger" id="planScenarioDeleteBtn">Delete</button>'}
+        </div>
+      </div>
+      <div class="msg" id="planScenarioMsg"></div>
+      <div class="n">${line ? esc(line) : 'Flat world — current rates'}</div>
+    </div>
+    <div class="panel" id="planFactorsPanel">
+      <div class="section-head"><h3>Factors</h3></div>
+      <div class="toolbar" id="planFactorAddRow"><select id="planFactorAddSel"></select><button class="small" id="planFactorAddBtn">Add factor</button></div>
+      <div id="planFactorPrime"></div>
+      <div id="planFactorStock"></div>
+      <div id="planFactorGrowth"></div>
+      <div class="toolbar"><button class="small primary" id="planFactorSaveBtn">Save factors</button></div>
+      <div class="msg" id="planFactorMsg"></div>
+    </div>`;
+}
+async function loadPlanScenario(id) {
+  return withLoading(async () => {
+    const data = await api(`/api/planning/scenarios/${id}`);
+    $('#planList').classList.add('hidden');
+    $('#planProject').classList.add('hidden');
+    $('#planStrategy').classList.add('hidden');
+    $('#planReport').classList.add('hidden');
+    $('#planScenario').classList.remove('hidden');
+    $('#planScenario').innerHTML = planScenarioHtml(data);
+    planScenarioWire(data);
+  });
+}
+function planScenarioWire(d) {
+  const sc = d.scenario;
+  $('#planScenarioEditBtn').addEventListener('click', () => {
+    $('#planScenarioEditForm').dataset.scenarioId = sc.id;
+    $('#planScenarioEditTitle').textContent = `Edit scenario · ${sc.name}`;
+    $('#planScenarioEditName').value = sc.name;
+    showMsg($('#planScenarioEditMsg'), '', '');
+    openModal('planScenarioEditModal');
+  });
+  const delBtn = $('#planScenarioDeleteBtn');
+  if (delBtn) delBtn.addEventListener('click', async () => {
+    if (!confirm(`Delete scenario "${sc.name}"?`)) return;
+    try { await api(`/api/planning/scenarios/${sc.id}`, { method: 'DELETE' }); location.hash = `#planning/project/${d.project.id}`; }
+    catch (err) { showMsg($('#planScenarioMsg'), 'err', err.message); }
+  });
+  const baseBtn = $('#planScenarioBaseBtn');
+  if (baseBtn) baseBtn.addEventListener('click', async () => {
+    try { await api(`/api/planning/scenarios/${sc.id}/set-base`, { method: 'POST' }); loadPlanScenario(sc.id); }
+    catch (err) { showMsg($('#planScenarioMsg'), 'err', err.message); }
+  });
+  planScenarioFactorWire(d);
+}
+$('#planScenarioEditForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const msg = $('#planScenarioEditMsg');
+  try {
+    const name = $('#planScenarioEditName').value.trim();
+    if (!name) throw new Error('Scenario name is required');
+    await api(`/api/planning/scenarios/${form.dataset.scenarioId}`, { method: 'PUT', body: { name } });
+    closeModalEl($('#planScenarioEditModal'));
+    loadPlanScenario(Number(form.dataset.scenarioId));
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+function planScenarioFactorWire(d) {
+  const sc = d.scenario;
   const isInvestment = d.project.category === 'investment';
   const hasMortgageOps = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type));
-  const cur = d.factors && typeof d.factors === 'object' ? d.factors : {};
+  const cur = d.scenario.factors && typeof d.scenario.factors === 'object' ? d.scenario.factors : {};
   planFactorState = {
     prime: { points: (cur.prime && Array.isArray(cur.prime.points) ? cur.prime.points.map((pt) => ({ month: pt.month, rate: pt.rate })) : []), preset: (cur.prime && cur.prime.preset) || null },
     stock: cur.stock ? { valuePct: cur.stock.valuePct, basis: cur.stock.basis || null, window: cur.stock.window || null } : null,
     propertyGrowth: cur.propertyGrowth ? { valuePct: cur.propertyGrowth.valuePct } : null,
     salaryGrowth: cur.salaryGrowth ? { valuePct: cur.salaryGrowth.valuePct } : null,
     rentGrowth: cur.rentGrowth ? { valuePct: cur.rentGrowth.valuePct } : null,
-    sink: cur.sink || null,
   };
   // Opt-in factors: a factor renders only once added. An already-set
   // factor counts as added, so legacy strategies render exactly as
@@ -12189,7 +12518,6 @@ function planFactorWire(d) {
   if (planFactorState.propertyGrowth) planFactorActive.add('propertyGrowth');
   if (planFactorState.salaryGrowth) planFactorActive.add('salaryGrowth');
   if (planFactorState.rentGrowth) planFactorActive.add('rentGrowth');
-  if (planFactorState.sink) planFactorActive.add('sink');
   let primeInfo = null;
   let holdings = [];
   let sinkDraft = null;
@@ -12263,12 +12591,11 @@ function planFactorWire(d) {
       if (!planFactorActive.has('salaryGrowth')) avail.push('salaryGrowth');
       if (!planFactorActive.has('rentGrowth')) avail.push('rentGrowth');
     }
-    if (isInvestment && !planFactorActive.has('sink')) avail.push('sink');
     if (!avail.length) { row.classList.add('hidden'); return; }
     row.classList.remove('hidden');
     sel.innerHTML = avail.map((k) => `<option value="${k}">${FACTOR_LABELS[k]}</option>`).join('');
   };
-  const renderAllFactors = () => { renderPrime(); renderStock(); renderGrowth(); renderSink(); renderFactorAdd(); };
+  const renderAllFactors = () => { renderPrime(); renderStock(); renderGrowth(); renderFactorAdd(); };
   const removeFactor = (key) => {
     planFactorActive.delete(key);
     if (key === 'prime') planFactorState.prime = { points: [], preset: null };
@@ -12331,11 +12658,6 @@ function planFactorWire(d) {
   const renderStock = () => {
     if (!stockHost) return;
     const st = planFactorState.stock;
-    if (isInvestment && planFactorState.sink) {
-      stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3></div>
-        <div class="note">Set by the sink below: ${st ? `${st.valuePct}%/yr${st.basis ? ` (${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''})` : ''}` : '—'}</div>`;
-      return;
-    }
     if (!planFactorActive.has('stock')) { stockHost.innerHTML = ''; return; }
     stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3><div class="toolbar"><button class="small danger" data-factor-remove="stock">Remove</button></div></div>
       <div><label>Expected return (% / year)</label><input id="planFactorStockVal" type="text" inputmode="decimal" data-money value="${st && st.valuePct != null ? st.valuePct : ''}"></div>
@@ -12380,78 +12702,6 @@ function planFactorWire(d) {
     }));
     wireFactorRemove(growthHost);
   };
-  const renderSink = () => {
-    if (!sinkHost) return;
-    if (!isInvestment || !planFactorActive.has('sink')) { sinkHost.innerHTML = ''; return; }
-    const sink = planFactorState.sink;
-    const curLine = sink
-      ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: existing stock · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
-      : 'No sink picked yet — the strategy holds the pool until you pick one.';
-    let tp = {};
-    try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
-    const defaultKind = tp.sinkKind === 'custom' ? 'custom' : 'stock';
-    sinkHost.innerHTML = `<div class="section-head"><h3>Sink — where the pool goes</h3><div class="toolbar"><button class="small danger" data-factor-remove="sink">Remove</button></div></div>
-      <div class="note">${esc(curLine)}</div>
-      <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Existing stock</label>
-      <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
-      <div id="planSinkStockBox"${defaultKind === 'custom' ? ' class="hidden"' : ''}>
-        <div><label>Stock</label><select id="planSinkHolding"></select></div>
-        <div class="toolbar"><button class="small" id="planSinkSuggestBtn">Suggest trend</button></div><div id="planSinkSuggestOut"></div>
-      </div>
-      <div id="planSinkCustomBox"${defaultKind === 'stock' ? ' class="hidden"' : ''}>
-        <div><label>Product name *</label><input id="planSinkName"></div>
-        <div><label>Expected return (% / year) *</label><input id="planSinkReturn" type="text" inputmode="decimal" data-money></div>
-      </div>
-      <div class="toolbar"><button class="small primary" id="planSinkSaveBtn">Save sink (rebuilds operations)</button></div>
-      <div class="msg" id="planSinkMsg"></div>`;
-    const sel = $('#planSinkHolding');
-    if (sel) {
-      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
-      if (tp.sink && tp.sink.holdingId && [...sel.options].some((o) => Number(o.value) === Number(tp.sink.holdingId))) sel.value = String(tp.sink.holdingId);
-      else if (sink && sink.kind === 'stock' && [...sel.options].some((o) => Number(o.value) === Number(sink.holdingId))) sel.value = String(sink.holdingId);
-      $('#planSinkSuggestBtn').addEventListener('click', async () => {
-        const out = $('#planSinkSuggestOut');
-        try {
-          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
-          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available — pick a custom product instead.')}</div>`; return; }
-          out.innerHTML = r.suggestions.map((x) => `
-            <button class="small" data-plan-sink-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-sink-basis="${esc(x.basis)}" data-plan-sink-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
-            + `<div class="note">Past returns do not predict future returns.</div>`;
-          out.querySelectorAll('[data-plan-sink-suggest]').forEach((b) => b.addEventListener('click', () => {
-            sinkDraft = { kind: 'stock', holdingId: Number(sel.value), trendPct: Number(b.dataset.planSinkSuggest), basis: b.dataset.planSinkBasis || null, window: b.dataset.planSinkWindow || null };
-            out.innerHTML = `<div class="note">Picked: trend ${sinkDraft.trendPct}%/yr (${esc(sinkDraft.basis || '')}${sinkDraft.window ? ` · ${esc(sinkDraft.window)}` : ''})</div>`;
-          }));
-        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
-      });
-    }
-    sinkHost.querySelectorAll('input[name="planSinkKind"]').forEach((r) => r.addEventListener('change', () => {
-      const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
-      $('#planSinkStockBox').classList.toggle('hidden', kind !== 'stock');
-      $('#planSinkCustomBox').classList.toggle('hidden', kind !== 'custom');
-    }));
-    $('#planSinkSaveBtn').addEventListener('click', async () => {
-      const msg = $('#planSinkMsg');
-      try {
-        const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
-        let sinkBody;
-        if (kind === 'stock') {
-          if (!sinkDraft || sinkDraft.holdingId !== Number(sel.value)) throw new Error('Pick a trend suggestion for the chosen stock first');
-          sinkBody = sinkDraft;
-        } else {
-          const name = $('#planSinkName').value.trim();
-          const ret = $('#planSinkReturn').value.replace(/,/g, '').trim();
-          if (!name) throw new Error('Product name is required');
-          if (ret === '' || !isFinite(Number(ret))) throw new Error('Expected return is required');
-          sinkBody = { kind: 'custom', name, expectedReturnPct: Number(ret) };
-        }
-        if ((d.ops || []).length && !confirm('Saving a sink replaces this strategy\'s operations with sell-pool + buy-sink operations. Continue?')) return;
-        await api(`/api/planning/strategies/${s.id}/sink`, { method: 'PUT', body: { sink: sinkBody } });
-        showMsg(msg, 'ok', 'Sink saved');
-        loadPlanStrategy(s.id);
-      } catch (err) { showMsg(msg, 'err', err.message); }
-    });
-    wireFactorRemove(sinkHost);
-  };
   $('#planFactorAddBtn').addEventListener('click', () => {
     const k = $('#planFactorAddSel').value;
     if (!k) return;
@@ -12474,10 +12724,9 @@ function planFactorWire(d) {
       if (planFactorActive.has('propertyGrowth') && st.propertyGrowth) factors.propertyGrowth = st.propertyGrowth;
       if (planFactorActive.has('salaryGrowth') && st.salaryGrowth) factors.salaryGrowth = st.salaryGrowth;
       if (planFactorActive.has('rentGrowth') && st.rentGrowth) factors.rentGrowth = st.rentGrowth;
-      if (planFactorActive.has('sink') && st.sink) factors.sink = st.sink;
-      await api(`/api/planning/strategies/${s.id}/factors`, { method: 'PUT', body: { factors } });
+      await api(`/api/planning/scenarios/${sc.id}`, { method: 'PUT', body: { factors } });
       showMsg(msg, 'ok', 'Factors saved');
-      loadPlanStrategy(s.id);
+      loadPlanScenario(sc.id);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
   // Wired once: the shared picker runs before this listener (registered
@@ -12509,7 +12758,6 @@ function planFactorWire(d) {
     renderPrime();
     renderStock();
     renderGrowth();
-    renderSink();
     renderFactorAdd();
   })();
 }
@@ -13188,7 +13436,7 @@ async function openPlanMergeModal(strategyId, isRevert) {
   try {
     const data = isRevert
       ? await api(`/api/planning/strategies/${strategyId}/revert-preview`, { method: 'POST' })
-      : await api(`/api/planning/strategies/${strategyId}/merge-preview`, { method: 'POST' });
+      : await api(`/api/planning/strategies/${strategyId}/merge-preview`, { method: 'POST', body: planStrategyScenarioId !== undefined ? { scenarioId: planStrategyScenarioId } : {} });
     let step = 1;
     const resolutions = new Map(); // key -> {resolution, customValue}
     const droppedOps = new Set();
@@ -13288,7 +13536,7 @@ async function openPlanMergeModal(strategyId, isRevert) {
             });
             for (const seq of droppedOps) resList.push({ opSeq: seq, resolution: 'drop' });
             if (isRevert) await api(`/api/planning/strategies/${strategyId}/revert`, { method: 'POST', body: { resolutions: resList } });
-            else await api(`/api/planning/strategies/${strategyId}/merge`, { method: 'POST', body: { resolutions: resList } });
+            else await api(`/api/planning/strategies/${strategyId}/merge`, { method: 'POST', body: { resolutions: resList, ...(planStrategyScenarioId !== undefined ? { scenarioId: planStrategyScenarioId } : {}) } });
             closeModalEl($('#planMergeModal'));
             loadPlanStrategy(strategyId);
           } catch (err) { showMsg(msg, 'err', err.message); }

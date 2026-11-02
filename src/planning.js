@@ -1087,6 +1087,51 @@ export function validateStrategyFactors(factors, currentMonth = null) {
   }
   return errs;
 }
+// Scenario factors: the same world-factor keys as strategy factors,
+// minus the sink — a sink is strategy equipment (where the pool goes),
+// never part of a world. A scenario carrying a sink is rejected so the
+// two specs can never be confused.
+export function validateScenarioFactors(factors, currentMonth = null) {
+  const errs = validateStrategyFactors(factors, currentMonth);
+  if (factors && typeof factors === 'object' && !Array.isArray(factors) && factors.sink != null) {
+    errs.push('sink belongs on the strategy, not the scenario');
+  }
+  return errs;
+}
+
+// Stable JSON for grouping factor sets: key order must not split one
+// world into two scenarios.
+function stableJson(v) {
+  if (v == null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableJson(v[k])}`).join(',')}}`;
+}
+
+// Migration grouping (pure): strategies carrying legacy factors are
+// grouped by their world-factor set, sink stripped out first — the sink
+// moves to the strategy's sink column, it is not a world. A strategy
+// whose factors are empty, or sink-only, yields no group (nothing to
+// migrate). Groups are named in order; the server dedupes names against
+// scenarios the project already has.
+export function groupStrategyFactorsForMigration(strategies) {
+  const groups = new Map();
+  for (const st of strategies || []) {
+    let f = st.factors;
+    if (typeof f === 'string') { try { f = JSON.parse(f); } catch { continue; } }
+    if (!f || typeof f !== 'object' || Array.isArray(f)) continue;
+    const { sink, ...world } = f;
+    if (!Object.keys(world).length) continue;
+    const key = stableJson(world);
+    if (!groups.has(key)) groups.set(key, { factors: world, strategyIds: [] });
+    groups.get(key).strategyIds.push(st.id);
+  }
+  return [...groups.values()].map((g, i) => ({
+    name: i === 0 ? 'Default scenario' : `Default scenario ${i + 1}`,
+    factors: g.factors,
+    strategyIds: g.strategyIds,
+  }));
+}
+
 // A prime factor's points as a projection scenario (steps the engine
 // merges onto the actual prime history). Empty points = no scenario:
 // the future holds at the last actual prime (do-nothing behavior).

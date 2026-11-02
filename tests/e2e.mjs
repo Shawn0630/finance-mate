@@ -15429,7 +15429,7 @@ try {
     && r.data.comparison.payoffShiftMonths > 0
     && Math.abs(r.data.comparison.net - (r.data.comparison.gain - r.data.comparison.cost)) < 0.011,
     JSON.stringify(r.data.comparison));
-  check('planning: strategy detail carries no scenario table (factors live on the strategy, not a shared world)',
+  check('planning: strategy detail carries no scenario table; with no scenarios the applied world is flat',
     Array.isArray(r.data.scenarioTable) && r.data.scenarioTable.length === 0 && r.data.baseScenario == null,
     JSON.stringify({ scenarioTable: r.data.scenarioTable, baseScenario: r.data.baseScenario }));
   r = await req('POST', `/api/planning/strategies/${planStrategyId}/merge-preview`, {});
@@ -16115,6 +16115,7 @@ try {
       await waitM(1500);
       const buyPage = await page.evaluate(() => ({
         scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        scenarioCardsPanel: !!document.querySelector('#planScenarioCardsPanel'),
         assetPanel: !!document.querySelector('#planAssetPanel'),
         baselinePanel: !!document.querySelector('#planBaselinePanel'),
         metadataPanel: !!document.querySelector('#planMetadataView'),
@@ -16126,8 +16127,8 @@ try {
         chartVisible: (() => { const c = document.querySelector('#planCompareChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
         panelOrder: [...document.querySelectorAll('#planBaselineCardsPanel, #planStrategiesPanel, #planReportsPanel')].map((el) => el.id),
       }));
-      check('planning detail: buy project order is baselines → strategies → reports, compact metadata line, no scenario/future-world panels',
-        !buyPage.scenarioPanel && !buyPage.assetPanel && !buyPage.baselinePanel && !buyPage.metadataPanel && !buyPage.futureWorld
+      check('planning detail: buy project order is scenarios → baselines → strategies → reports, compact metadata line, old scenario/future-world panels gone',
+        !buyPage.scenarioPanel && buyPage.scenarioCardsPanel && !buyPage.assetPanel && !buyPage.baselinePanel && !buyPage.metadataPanel && !buyPage.futureWorld
         && buyPage.baselinesPanel && buyPage.metaLine && buyPage.metaLineEdit
         && buyPage.tableText === '' && !buyPage.chartVisible
         && JSON.stringify(buyPage.panelOrder) === JSON.stringify(['planBaselineCardsPanel', 'planStrategiesPanel', 'planReportsPanel']),
@@ -16457,35 +16458,55 @@ try {
       && trajSum(compA.data) === trajSum(compB.data)
       && compA.data.strategies[0].comparison.net === compB.data.strategies[0].comparison.net,
     JSON.stringify({ sumA: trajSum(compA.data), sumB: trajSum(compB.data), netA: compA.data.strategies[0].comparison.net, netB: compB.data.strategies[0].comparison.net }));
-  // A strategy prime factor DOES change numbers: the strategy prices
-  // the variable segment on the factor path while the baseline stays
-  // on the flat actual-prime path.
+  // A scenario prime factor DOES change numbers: scenario factors apply
+  // to BOTH the baseline and the strategy at evaluation time — the
+  // prepay and the do-nothing plan price the variable segment on the
+  // same 9% path, and the prepay avoids far more interest there than
+  // on the flat path (the fixed payment no longer covers interest).
   const _catVan = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
   const _catY = Number(_catVan.slice(0, 4)); const _catM = Number(_catVan.slice(5, 7));
   const _catFut = new Date(Date.UTC(_catY, _catM - 1 + 12, 1));
   const catFutureYm = `${_catFut.getUTCFullYear()}-${String(_catFut.getUTCMonth() + 1).padStart(2, '0')}`;
-  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] } } });
-  check('planning category: strategy prime factor saves', r.status === 200 && r.data.factors && r.data.factors.prime && r.data.factors.prime.points && r.data.factors.prime.points[0].rate === 9.0, JSON.stringify(r.data));
-  const compF = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}`);
-  // A prepay GAINS value when prime rises: interestSaved compares the
-  // do-nothing plan against the with-prepay plan in the SAME world,
-  // and under the 9% path the fixed payment no longer covers interest,
-  // so the $10k prepay avoids far more interest than on the flat path.
-  // (The external do-nothing baseline itself stays on the flat path —
-  // pinned by the trajSum inversion above.)
-  check('planning category: prime factor changes the strategy net — a prepay saves more interest when prime rises',
+  r = await req('POST', `/api/planning/projects/${catMultiId}/scenarios`, { name: 'Hot prime' });
+  check('planning category: scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const catScenId = r.data.scenario.id;
+  r = await req('PUT', `/api/planning/scenarios/${catScenId}`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] } } });
+  check('planning category: scenario prime factor saves', r.status === 200 && r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.prime && r.data.scenario.factors.prime.points && r.data.scenario.factors.prime.points[0].rate === 9.0, JSON.stringify(r.data));
+  const compF = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}&scenarioIds=${catScenId}`);
+  check('planning category: prime scenario changes the strategy net — a prepay saves more interest when prime rises',
     compF.status === 200 && compF.data.strategies[0].comparison.net > compA.data.strategies[0].comparison.net,
     JSON.stringify({ netA: compA.data.strategies[0].comparison.net, netF: compF.data.strategies[0].comparison.net }));
-  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] }, propertyGrowth: { valuePct: 5 } } });
-  check('planning category: property-growth factor saves alongside prime', r.status === 200 && r.data.factors && r.data.factors.propertyGrowth && r.data.factors.propertyGrowth.valuePct === 5, JSON.stringify(r.data));
-  const compG = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}`);
-  check('planning category: property-growth factor grows the strategy value at horizon past the flat baseline',
-    compG.status === 200 && compG.data.strategies[0].projection.valueAtHorizon > compG.data.baseline.valueAtHorizon * 2,
-    JSON.stringify({ strat: compG.data.strategies[0].projection.valueAtHorizon, base: compG.data.baseline.valueAtHorizon }));
-  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { unknownKey: { valuePct: 1 } } });
+  r = await req('PUT', `/api/planning/scenarios/${catScenId}`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] }, propertyGrowth: { valuePct: 5 } } });
+  check('planning category: property-growth factor saves alongside prime', r.status === 200 && r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.propertyGrowth && r.data.scenario.factors.propertyGrowth.valuePct === 5, JSON.stringify(r.data));
+  const compG = await req('GET', `/api/planning/projects/${catMultiId}/comparison?baselineId=${baseA}&scenarioIds=${catScenId}`);
+  // One world, one assessed path: property growth lifts BOTH the
+  // baseline and the strategy horizons past their flat-world values.
+  check('planning category: property-growth scenario grows baseline and strategy values at horizon past the flat world',
+    compG.status === 200 && compG.data.strategies[0].projection.valueAtHorizon > compA.data.strategies[0].projection.valueAtHorizon
+    && compG.data.baseline.valueAtHorizon > compA.data.baseline.valueAtHorizon,
+    JSON.stringify({ strat: compG.data.strategies[0].projection.valueAtHorizon, stratFlat: compA.data.strategies[0].projection.valueAtHorizon, base: compG.data.baseline.valueAtHorizon, baseFlat: compA.data.baseline.valueAtHorizon }));
+  r = await req('PUT', `/api/planning/scenarios/${catScenId}`, { factors: { unknownKey: { valuePct: 1 } } });
   check('planning category: unknown factor key is rejected', r.status === 400, JSON.stringify(r.data));
-  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: '2020-01', rate: 5 }] } } });
+  r = await req('PUT', `/api/planning/scenarios/${catScenId}`, { factors: { prime: { points: [{ month: '2020-01', rate: 5 }] } } });
   check('planning category: past prime point is rejected', r.status === 400, JSON.stringify(r.data));
+  r = await req('PUT', `/api/planning/strategies/${stratX}/factors`, { factors: { prime: { points: [{ month: catFutureYm, rate: 9.0 }] } } });
+  check('planning category: strategy factors endpoint moved to scenarios', r.status === 400 && JSON.stringify(r.data).includes('scenarios'), JSON.stringify(r.data));
+  // Multi-scenario comparison: a second world renders a second block,
+  // and unchecking every world shows a re-pick panel only — no numbers.
+  r = await req('POST', `/api/planning/projects/${catMultiId}/scenarios`, { name: 'Cool prime' });
+  check('scenario restructure: second scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const catCoolId = r.data.scenario.id;
+  r = await req('PUT', `/api/planning/scenarios/${catCoolId}`, { factors: { prime: { points: [{ month: catFutureYm, rate: 2.0 }] } } });
+  check('scenario restructure: second scenario factor saves', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${catMultiId}/comparison?scenarioIds=${catScenId},${catCoolId}`);
+  check('scenario restructure: comparison returns one block per selected scenario',
+    r.status === 200 && (r.data.scenarioBlocks || []).length === 2
+    && r.data.scenarioBlocks[0].scenario && r.data.scenarioBlocks[0].scenario.id === catScenId
+    && r.data.scenarioBlocks[1].scenario && r.data.scenarioBlocks[1].scenario.id === catCoolId
+    && r.data.scenarioBlocks[0].strategies[0].comparison.net !== r.data.scenarioBlocks[1].strategies[0].comparison.net,
+    JSON.stringify({ n: (r.data.scenarioBlocks || []).length, nets: (r.data.scenarioBlocks || []).map((b) => b.strategies[0] && b.strategies[0].comparison.net) }));
+  r = await req('GET', `/api/planning/projects/${catMultiId}/comparison?scenarioIds=999999`);
+  check('scenario restructure: unknown scenario id is rejected, never substituted', r.status === 404, JSON.stringify(r.data));
   // Card edit updates only that entry.
   r = await req('PUT', `/api/planning/projects/${catMultiId}/baselines/${baseA}`, { name: 'Baseline A renamed' });
   check('planning category: baseline card rename succeeds', r.status === 200 && r.data.baseline && r.data.baseline.name === 'Baseline A renamed', JSON.stringify(r.data));
@@ -16694,17 +16715,25 @@ try {
   const baseLastBefore = growthSeries && growthSeries.length ? growthSeries[growthSeries.length - 1].value : null;
   r = await req('GET', `/api/planning/projects/${poolGrowthId}`);
   const growthStrat = (r.data.strategies || [])[0];
-  r = await req('PUT', `/api/planning/strategies/${growthStrat.id}/factors`, { factors: { stock: { valuePct: 10 } } });
-  check('planning pool: growth strategy stock factor saves', r.status === 200, JSON.stringify(r.data));
-  r = await req('GET', `/api/planning/projects/${poolGrowthId}/comparison`);
+  r = await req('POST', `/api/planning/projects/${poolGrowthId}/scenarios`, { name: 'Growth world' });
+  check('planning pool: growth scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const growthScenId = r.data.scenario.id;
+  r = await req('PUT', `/api/planning/scenarios/${growthScenId}`, { factors: { stock: { valuePct: 10 } } });
+  check('planning pool: growth scenario stock factor saves', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${poolGrowthId}/comparison?scenarioIds=${growthScenId}`);
   const growthRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === growthStrat.id);
   const growthSeriesAfter = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
-  check('planning pool: strategy factor changes the projection while the baseline stays at current rates',
-    growthRow && growthRow.projection && growthRow.projection.valueAtHorizon !== r.data.baseline.valueAtHorizon
-      && growthSeriesAfter && growthSeriesAfter[0].value === baseFirstBefore && growthSeriesAfter[growthSeriesAfter.length - 1].value === baseLastBefore,
-    JSON.stringify({ strat: growthRow && growthRow.projection.valueAtHorizon, base: r.data.baseline.valueAtHorizon, firstAfter: growthSeriesAfter && growthSeriesAfter[0].value, lastAfter: growthSeriesAfter && growthSeriesAfter[growthSeriesAfter.length - 1].value }));
+  r = await req('GET', `/api/planning/strategies/${growthStrat.id}?scenarioId=0`);
+  const growthFlat = r.data;
+  // The scenario stock factor changes the strategy projection AND the
+  // baseline follows the same world (no longer pinned at current
+  // rates) — both move off their flat-world values.
+  check('planning pool: scenario stock factor changes the projection and the baseline follows the same world',
+    growthRow && growthRow.projection && growthRow.projection.valueAtHorizon !== growthFlat.projection.valueAtHorizon
+      && growthSeriesAfter && growthSeriesAfter.length && growthSeriesAfter[growthSeriesAfter.length - 1].value !== baseLastBefore,
+    JSON.stringify({ strat: growthRow && growthRow.projection.valueAtHorizon, stratFlat: growthFlat.projection.valueAtHorizon, lastAfter: growthSeriesAfter && growthSeriesAfter[growthSeriesAfter.length - 1].value, lastBefore: baseLastBefore }));
   r = await req('PUT', `/api/planning/strategies/${poolStrat.id}/sink`, { sink: { kind: 'stock', holdingId: poolHoldA, trendPct: 10, basis: 'Price CAGR', window: '1y' } });
-  check('planning sink: stock sink saves', r.status === 200 && r.data.factors && r.data.factors.sink && r.data.factors.sink.kind === 'stock', JSON.stringify(r.data.factors));
+  check('planning sink: stock sink saves', r.status === 200 && r.data.sink && r.data.sink.kind === 'stock', JSON.stringify(r.data.sink));
   r = await req('GET', `/api/planning/strategies/${poolStrat.id}`);
   check('planning sink: stock sink ops are two sells + one buy',
     r.status === 200 && (r.data.ops || []).length === 3 && (r.data.ops || []).filter((o) => o.op_type === 'sell').length === 2 && (r.data.ops || []).filter((o) => o.op_type === 'buy').length === 1,
@@ -16718,7 +16747,7 @@ try {
   check('planning sink: custom-sink strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const customStratId = r.data.strategy.id;
   r = await req('PUT', `/api/planning/strategies/${customStratId}/sink`, { sink: { kind: 'custom', name: 'Test GIC', expectedReturnPct: 6 } });
-  check('planning sink: custom sink saves', r.status === 200 && r.data.factors && r.data.factors.sink && r.data.factors.sink.kind === 'custom', JSON.stringify(r.data.factors));
+  check('planning sink: custom sink saves', r.status === 200 && r.data.sink && r.data.sink.kind === 'custom', JSON.stringify(r.data.sink));
   r = await req('GET', `/api/planning/projects/${poolProjId}/comparison`);
   const customRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === customStratId);
   check('planning sink: custom sink grows the pool at the user-filled 6% return',
@@ -16791,7 +16820,24 @@ try {
           && poolPage.stratText.includes('Sink: existing stock')
           && poolPage.ratesText.includes('POOL.A') && poolPage.ratesText.includes('5.26%/yr'),
         JSON.stringify(poolPage));
+      // Factors live on scenarios now: the strategy detail carries no
+      // Factors panel, only the Sink panel + a scenario picker.
+      r = await req('POST', `/api/planning/projects/${poolProjId}/scenarios`, { name: 'Pool Prime' });
+      check('planning pool: scenario created for the factor UI', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      const poolScenId = r.data.scenario.id;
       await page.goto(`http://ff.local/#planning/strategy/${poolStrat.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1500);
+      const stratPage = await page.evaluate(() => ({
+        factorsPanel: !!document.querySelector('#planFactorsPanel'),
+        sinkPanel: !!document.querySelector('#planSinkPanel'),
+        scenSel: !!document.querySelector('#planStrategyScenarioSel'),
+        scenarioPanelOld: !!document.querySelector('#planScenarioPanel'),
+        fanChart: !!document.querySelector('#planStrategyFanChart'),
+      }));
+      check('planning pool: strategy detail has no Factors panel, keeps the Sink panel + scenario picker, no fan chart',
+        !stratPage.factorsPanel && stratPage.sinkPanel && stratPage.scenSel && !stratPage.scenarioPanelOld && !stratPage.fanChart,
+        JSON.stringify(stratPage));
+      await page.goto(`http://ff.local/#planning/scenario/${poolScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
       // Prime is opt-in now: add the factor first, then the chart + presets render.
       const primeAdded = await page.evaluate(async () => {
@@ -16807,16 +16853,29 @@ try {
         }
         return false;
       });
-      const stratPage = await page.evaluate(() => ({
+      const scenPage = await page.evaluate(() => ({
         factorsPanel: !!document.querySelector('#planFactorsPanel'),
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
         presetBtns: document.querySelectorAll('[data-plan-prime-preset]').length,
-        scenarioPanel: !!document.querySelector('#planScenarioPanel'),
+        scenarioPanelOld: !!document.querySelector('#planScenarioPanel'),
         fanChart: !!document.querySelector('#planStrategyFanChart'),
+        addOpts: [...document.querySelectorAll('#planFactorAddSel option')].map((o) => o.value),
       }));
-      check('planning pool: strategy detail shows the Factors panel with prime chart + view presets after Add factor, no scenario panel, no fan chart',
-        primeAdded && stratPage.factorsPanel && stratPage.primeChart && stratPage.presetBtns === 5 && !stratPage.scenarioPanel && !stratPage.fanChart,
-        JSON.stringify(stratPage));
+      check('planning pool: scenario detail shows the Factors panel with prime chart + view presets after Add factor, no fan chart',
+        primeAdded && scenPage.factorsPanel && scenPage.primeChart && scenPage.presetBtns === 5 && !scenPage.scenarioPanelOld && !scenPage.fanChart,
+        JSON.stringify(scenPage));
+      check('scenario restructure: the scenario Add-factor select never offers Sink (sink lives on the strategy)',
+        !scenPage.addOpts.includes('sink'), JSON.stringify(scenPage.addOpts));
+      // Ops + sink still work with no factors: under the factor-less
+      // Pool Prime world the strategy card keeps its figures + sink line.
+      await page.goto(`http://ff.local/#planning/project/${poolProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1500);
+      const poolAfter = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#planStrategiesPanel [data-plan-strategy]')];
+        return { text: cards.map((c) => c.textContent).join(' | '), hasValue: cards.some((c) => !!c.querySelector('.v')) };
+      });
+      check('scenario restructure: strategy ops + sink still render figures under a factor-less scenario',
+        poolAfter.hasValue && poolAfter.text.includes('Sink: existing stock'), JSON.stringify(poolAfter));
       // Pool builder: account percent + holding amount compose the same
       // 1100 total live, and the preview card carries it.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
@@ -16932,6 +16991,11 @@ try {
         }
       });
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
+      // Factors live on scenarios now: the strategy detail carries no
+      // factor UI at all, only a scenario picker.
+      r = await req('POST', `/api/planning/projects/${edProjId}/scenarios`, { name: 'Editor World' });
+      check('strategy editor: scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      const edScenId = r.data.scenario.id;
       await page.goto(`http://ff.local/#planning/strategy/${edStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
       const fresh = await page.evaluate(() => ({
@@ -16939,10 +17003,13 @@ try {
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
         stockVal: !!document.querySelector('#planFactorStockVal'),
         growthInput: !!document.querySelector('[data-growth]'),
-        sinkBox: !!document.querySelector('#planSinkStockBox'),
+        sinkPanel: !!document.querySelector('#planSinkPanel'),
+        scenSel: !!document.querySelector('#planStrategyScenarioSel'),
       }));
-      check('strategy editor: fresh property strategy shows no factor UI until Add factor is used',
-        fresh.addSel && !fresh.primeChart && !fresh.stockVal && !fresh.growthInput && !fresh.sinkBox, JSON.stringify(fresh));
+      check('strategy editor: property strategy detail carries no factor UI; scenario picker present',
+        !fresh.addSel && !fresh.primeChart && !fresh.stockVal && !fresh.growthInput && !fresh.sinkPanel && fresh.scenSel, JSON.stringify(fresh));
+      await page.goto(`http://ff.local/#planning/scenario/${edScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
       const added = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         const sel = document.querySelector('#planFactorAddSel');
@@ -16961,8 +17028,10 @@ try {
         await sleep(1500);
         return true;
       });
-      check('strategy editor: stock factor added through the UI', added);
-      r = await req('GET', `/api/planning/strategies/${edStratId}`);
+      check('strategy editor: stock factor added through the scenario UI', added);
+      r = await req('GET', `/api/planning/scenarios/${edScenId}`);
+      check('strategy editor: scenario stock factor saved', r.status === 200 && r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock && r.data.scenario.factors.stock.valuePct === 8, JSON.stringify(r.data));
+      r = await req('GET', `/api/planning/strategies/${edStratId}?scenarioId=${edScenId}`);
       const edAfter = r.data.comparison || {};
       // A stock factor is a global return override: with valued holdings
       // in the run it moves the blended total via stockGain, so gain/net
@@ -16974,17 +17043,117 @@ try {
         && edAfter.cost === edBase.cost,
         JSON.stringify({ before: edBase, after: edAfter }));
       r = await req('PUT', `/api/planning/strategies/${edStratId}/factors`, { factors: { prime: { points: [{ month: '2027-01', rate: 4.5 }], preset: null }, stock: { valuePct: 8 } } });
-      check('strategy editor: factors preset via API', r.status === 200, JSON.stringify(r.data));
-      await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitR(800);
-      await page.goto(`http://ff.local/#planning/strategy/${edStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      check('strategy editor: strategy factors endpoint moved to scenarios', r.status === 400 && JSON.stringify(r.data).includes('scenarios'), JSON.stringify(r.data));
+      r = await req('PUT', `/api/planning/scenarios/${edScenId}`, { factors: { prime: { points: [{ month: '2027-01', rate: 4.5 }], preset: null }, stock: { valuePct: 8 } } });
+      check('strategy editor: factors preset via scenario API', r.status === 200, JSON.stringify(r.data));
+      // Legacy migration: a strategy row carrying old-shape factors is
+      // lifted into a Default scenario on project read — nothing lost.
+      const seedLegacyFactors = () => {
+        const dbFile = new Database(path.join(dataDir, 'finance.db'));
+        dbFile.pragma('busy_timeout = 5000');
+        dbFile.prepare('UPDATE plan_strategies SET factors = ? WHERE id = ?').run(JSON.stringify({ prime: { points: [{ month: '2027-01', rate: 4.5 }], preset: null }, stock: { valuePct: 8 } }), edStratId);
+        dbFile.close();
+      };
+      seedLegacyFactors();
+      r = await req('GET', `/api/planning/projects/${edProjId}`);
+      const migrated = (r.data.scenarios || []).find((x) => x.name === 'Default scenario');
+      check('strategy editor: legacy strategy factors migrate into a Default scenario on project read',
+        !!migrated && migrated.factors && migrated.factors.prime && migrated.factors.prime.points && migrated.factors.prime.points[0].rate === 4.5
+        && migrated.factors.stock && migrated.factors.stock.valuePct === 8
+        && (r.data.strategies || []).find((x) => x.id === edStratId).factors == null,
+        JSON.stringify({ scenarios: (r.data.scenarios || []).map((x) => x.name), migrated: migrated && migrated.factors }));
+      await page.goto(`http://ff.local/#planning/scenario/${migrated.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
       const legacy = await page.evaluate(() => ({
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
         stockVal: document.querySelector('#planFactorStockVal')?.value || '',
       }));
-      check('strategy editor: strategy with stored factors still shows them (legacy render)',
+      check('strategy editor: migrated scenario still shows its factors (prime chart + stock 8)',
         legacy.primeChart && legacy.stockVal === '8', JSON.stringify(legacy));
+      // Growth editor on a property project: Add factor reveals it.
+      const growthAdded = await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const sel = document.querySelector('#planFactorAddSel');
+        if (!sel) return false;
+        sel.value = 'propertyGrowth';
+        document.querySelector('#planFactorAddBtn').click();
+        for (let i = 0; i < 12; i++) {
+          if (document.querySelector('[data-growth="propertyGrowth"]')) return true;
+          await sleep(500);
+        }
+        return false;
+      });
+      check('scenario restructure: Add factor reveals the property-growth editor on a property project', growthAdded);
+      // Give the two worlds different factors so their blocks differ.
+      r = await req('PUT', `/api/planning/scenarios/${migrated.id}`, { factors: { stock: { valuePct: 3 } } });
+      check('scenario restructure: migrated scenario factors replaced for the comparison check', r.status === 200, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1500);
+      await page.evaluate(() => {
+        const cbs = [...document.querySelectorAll('[data-plan-compare-scenario]')];
+        const unchecked = cbs.find((cb) => !cb.checked);
+        if (unchecked) unchecked.click();
+      });
+      await waitR(1500);
+      const multi = await page.evaluate(() => ({
+        extraTable: !!document.querySelector('#planCompareTable-1'),
+        extraText: document.querySelector('#planCompareTable-1')?.textContent || '',
+        firstText: document.querySelector('#planCompareTable')?.textContent || '',
+        extraHead: document.querySelector('#planCompareBlocksExtra')?.textContent || '',
+      }));
+      check('scenario restructure: checking a second scenario renders a second comparison block with different figures',
+        multi.extraTable && multi.extraText.includes('Total cost') && multi.extraHead.includes('Under Default scenario') && multi.extraText !== multi.firstText,
+        JSON.stringify({ extra: multi.extraText.slice(0, 200), first: multi.firstText.slice(0, 200), head: multi.extraHead.slice(0, 200) }));
+      // Uncheck one at a time (each change reloads); with none checked
+      // only the re-pick panel renders — no table, no card figures.
+      await page.evaluate(() => {
+        const checked = [...document.querySelectorAll('[data-plan-compare-scenario]:checked')];
+        if (checked[0]) checked[0].click();
+      });
+      await waitR(1200);
+      await page.evaluate(() => {
+        const checked = [...document.querySelectorAll('[data-plan-compare-scenario]:checked')];
+        if (checked[0]) checked[0].click();
+      });
+      await waitR(1200);
+      const repick = await page.evaluate(() => ({
+        emptyText: document.querySelector('#planCompareEmpty')?.textContent || '',
+        tableText: document.querySelector('#planCompareTable')?.textContent || '',
+        cardValues: document.querySelectorAll('#planStrategyCards .v').length,
+        worldText: document.querySelector('#planStrategyCardsWorld')?.textContent || '',
+      }));
+      check('scenario restructure: unchecking every scenario shows a re-pick panel only, no figures',
+        repick.emptyText.includes('Pick a scenario') && repick.tableText === '' && repick.cardValues === 0 && repick.worldText.includes('Pick a scenario'),
+        JSON.stringify(repick));
+      // Scenario cards: create / rename / delete through the UI.
+      await page.evaluate(() => {
+        const checked = [...document.querySelectorAll('[data-plan-compare-scenario]')];
+        const base = checked.find((cb) => cb.closest('label')?.textContent.includes('Default'));
+        if (base && !base.checked) base.click();
+      });
+      await waitR(1200);
+      await page.click('#planAddScenarioBtn');
+      await waitR(300);
+      await page.evaluate(() => { document.querySelector('#planScenarioName').value = 'CRUD World'; });
+      await page.evaluate(() => { document.querySelector('#planScenarioForm button[type="submit"]').click(); });
+      await waitR(1200);
+      const crudHash = await page.evaluate(() => location.hash);
+      check('scenario restructure: Add scenario lands on the new scenario detail page',
+        crudHash.startsWith('#planning/scenario/'), crudHash);
+      await page.click('#planScenarioEditBtn');
+      await waitR(300);
+      await page.evaluate(() => { document.querySelector('#planScenarioEditName').value = 'CRUD World Renamed'; });
+      await page.evaluate(() => { document.querySelector('#planScenarioEditForm button[type="submit"]').click(); });
+      await waitR(1200);
+      const crudName = await page.evaluate(() => document.querySelector('#planScenario .panel h3')?.textContent || '');
+      check('scenario restructure: scenario rename shows the new name', crudName.includes('CRUD World Renamed'), crudName);
+      page.once('dialog', (d) => d.accept());
+      await page.click('#planScenarioDeleteBtn');
+      await waitR(1200);
+      const backHash = await page.evaluate(() => location.hash);
+      check('scenario restructure: scenario delete returns to the project page', backHash === `#planning/project/${edProjId}`, backHash);
+      const crudGone = await page.evaluate(() => !(document.querySelector('#planScenarioCards')?.textContent || '').includes('CRUD World Renamed'));
+      check('scenario restructure: deleted scenario card is gone', crudGone);
       await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1200);
       await page.click('#planAddStrategyBtn');

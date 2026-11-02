@@ -911,6 +911,19 @@ CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strateg
   if (planStratCols.length && !planStratCols.includes('factors')) {
     db.exec('ALTER TABLE plan_strategies ADD COLUMN factors TEXT');
   }
+  // Scenario restructure (2026-11-01): factors move OFF strategies into
+  // scenarios — plan_scenarios gains a factors JSON column (the world:
+  // prime/stock/growth, never a sink), and plan_strategies gains a sink
+  // JSON column (strategy equipment: where the pool goes). The old
+  // strategy factors column is kept for the lazy migration on project
+  // read, then cleared; it is never written by new code.
+  const planScenCols = db.prepare('PRAGMA table_info(plan_scenarios)').all().map((c) => c.name);
+  if (planScenCols.length && !planScenCols.includes('factors')) {
+    db.exec('ALTER TABLE plan_scenarios ADD COLUMN factors TEXT');
+  }
+  if (planStratCols.length && !planStratCols.includes('sink')) {
+    db.exec('ALTER TABLE plan_strategies ADD COLUMN sink TEXT');
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS plan_templates (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
