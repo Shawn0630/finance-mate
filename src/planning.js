@@ -926,6 +926,37 @@ export function reportCostBreakdown(comparison) {
   return { fees: round2(fees), penalty: round2(penalty), cashOut, total: round2(comparison.cost || 0) };
 }
 
+// ---- Report scenario pinning -------------------------------------------
+// A report renders under PINNED scenarios only, never a silent fallback:
+// ids must be an array of this project's scenario ids, and when the
+// project has scenarios at least one must be pinned. An empty pin on a
+// scenario-less project is the flat world (labeled "Current rates (no
+// scenario)" in the view), not a fallback — it is the only world there.
+// Returns an error string, or null when the pin is valid.
+export function validateReportScenarioIds(ids, projectScenarioIds) {
+  if (!Array.isArray(ids)) return 'scenario_ids must be an array';
+  const known = new Set((projectScenarioIds || []).map(Number));
+  for (const id of ids) {
+    if (!Number.isFinite(Number(id)) || !known.has(Number(id))) return `scenario ${id} is not in this project`;
+  }
+  if (known.size > 0 && ids.length === 0) return 'pin at least one scenario';
+  return null;
+}
+
+// ---- AI report calculation methods --------------------------------------
+// Every chart in an AI-generated report must carry its own calculation
+// method (plain language, supplied by the AI). Engine-path reports get
+// their how-calculated lines from the app's own definitions instead, so
+// this check applies to the ai-report path only. Returns error strings.
+export function validateAiChartMethods(charts) {
+  const errs = [];
+  if (!Array.isArray(charts)) return ['charts must be an array'];
+  for (const c of charts) {
+    if (!c.method || !String(c.method).trim()) errs.push(`chart "${c.title || c.template || ''}" needs a calculation method`);
+  }
+  return errs;
+}
+
 // ------------------------------------------- project template metadata --
 // TEMPLATE OWNS QUESTIONS: each project template declares its own
 // question/metadata schema and which project-page sections it shows.

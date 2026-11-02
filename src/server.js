@@ -58,6 +58,7 @@ import {
   primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
   currentReturnRateFromPoints, validatePoolItemShapes,
+  validateReportScenarioIds, validateAiChartMethods,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -5139,6 +5140,9 @@ app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   const reports = db.prepare('SELECT * FROM plan_reports WHERE project_id = ? ORDER BY id').all(p.id).map((r) => ({
     ...r,
     definition: JSON.parse(r.definition || '{}'),
+    // scenarioIds: null = legacy row saved before pinning (the view
+    // prompts to pin); [] = flat world on a scenario-less project.
+    scenarioIds: r.scenario_ids ? JSON.parse(r.scenario_ids) : null,
     stale: strategies.some((s) => s.updated_at > r.updated_at) ? 1 : 0,
   }));
   const history = db.prepare(
@@ -6821,10 +6825,11 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   const strategies = db.prepare('SELECT id, name, letter FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const prompt = [
     'You compose a report definition as JSON only. No prose outside the JSON object.',
-    'A report is an ordered list of charts over already-computed results: {"charts": [{"template": "...", "title": "...", "series": ["..."]}]}.',
+    'A report is an ordered list of charts over already-computed results: {"charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
     'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
     'Series ids are: mortgage_balance, stock_value, total_value, cost, gain, net, payoff_month, monthly_payment.',
     'Never invent a number: the app computes every series; you only order and title charts.',
+    'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
     `Strategies: ${JSON.stringify(strategies)}`,
     `User request: ${text}`,
   ].join('\n');
@@ -6838,6 +6843,10 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   if (!parsed || !Array.isArray(parsed.charts)) return res.status(502).json({ error: 'the AI response did not contain a report definition' });
   const errs = planAiValidateChartSpecs(parsed.charts, p.id);
   if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  // AI-generated reports carry their own calculation method per chart
+  // (the engine path gets its how-calculated lines from the app).
+  const methodErrs = validateAiChartMethods(parsed.charts);
+  if (methodErrs.length) return res.status(502).json({ error: methodErrs.join('; ') });
   res.json({ definition: parsed, configured: true });
 });
 
@@ -6870,13 +6879,20 @@ app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {
     pickedStrategies = b.strategy_ids.map(Number);
     def.strategies = pickedStrategies;
   }
+  // Scenario pinning: a report renders under PINNED scenarios only.
+  // Absent on a project with scenarios = 400 (pin prompt client-side);
+  // absent on a scenario-less project = the flat world, stored as [].
+  const projectScenarioIds = db.prepare('SELECT id FROM plan_scenarios WHERE project_id = ?').all(p.id).map((r) => r.id);
+  const pinnedScenarios = b.scenario_ids === undefined || b.scenario_ids === null ? [] : b.scenario_ids;
+  const scenErr = validateReportScenarioIds(pinnedScenarios, projectScenarioIds);
+  if (scenErr) return res.status(400).json({ error: scenErr });
   const now = nowIso();
   const out = commitTx(req, 'project', {
     module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
     entityLabel: p.name, summary: `Added report ${String(b.name).trim()} · ${p.name}`,
   }, () => {
-    const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, baseline_id, baseline_cleared, strategy_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, baselineId, 0, JSON.stringify(pickedStrategies), now, now);
+    const info = db.prepare('INSERT INTO plan_reports (project_id, name, definition, stale, baseline_id, baseline_cleared, strategy_ids, scenario_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, String(b.name).trim(), JSON.stringify(def), 0, baselineId, 0, JSON.stringify(pickedStrategies), JSON.stringify(pinnedScenarios), now, now);
     return { value: { report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(info.lastInsertRowid) }, entityId: p.id };
   });
   res.status(201).json(out);
@@ -6906,12 +6922,19 @@ app.put('/api/planning/reports/:id', requireApiAuth, (req, res) => {
     }
     strategyIds = b.strategy_ids.map(Number);
   }
+  let scenarioIds = r.scenario_ids ? JSON.parse(r.scenario_ids) : null;
+  if (b.scenario_ids !== undefined && b.scenario_ids !== null) {
+    const projectScenarioIds = db.prepare('SELECT id FROM plan_scenarios WHERE project_id = ?').all(p.id).map((x) => x.id);
+    const scenErr = validateReportScenarioIds(b.scenario_ids, projectScenarioIds);
+    if (scenErr) return res.status(400).json({ error: scenErr });
+    scenarioIds = b.scenario_ids.map(Number);
+  }
   const out = commitTx(req, 'project', {
     module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
     entityLabel: p.name, summary: `Updated report · ${p.name}`,
   }, () => {
-    db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, updated_at = ? WHERE id = ?')
-      .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, nowIso(), r.id);
+    db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, scenario_ids = ?, updated_at = ? WHERE id = ?')
+      .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, scenarioIds ? JSON.stringify(scenarioIds) : null, nowIso(), r.id);
     return { value: { report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(r.id) }, entityId: p.id };
   });
   res.json(out);

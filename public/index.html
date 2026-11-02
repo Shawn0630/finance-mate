@@ -995,6 +995,7 @@
     <div class="msg" id="planReportSaveMsg"></div>
     <div><label>Report name *</label><input id="planReportSaveName"></div>
     <div><label>Baseline (one)</label><select id="planReportSaveBaseline"></select></div>
+    <div><label>Scenarios (pinned — at least one when scenarios exist)</label><div id="planReportSaveScenarios"></div></div>
     <div><label>Strategies (many)</label><div id="planReportSaveStrategies"></div></div>
     <div class="toolbar"><button class="primary" id="planReportSaveBtn">Save</button><button type="button" data-close-modal>Cancel</button></div>
   </div>
@@ -1115,6 +1116,16 @@
   </div>
 </div>
 
+<div class="modal-overlay hidden" id="planBaselineAiModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Design baseline with AI</h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="planBaselineAiMsg"></div>
+    <div><label>Describe the baseline in words</label><input id="planBaselineAiText"></div>
+    <div class="toolbar"><button class="small primary" id="planBaselineAiGoBtn">Propose</button></div>
+    <div id="planBaselineAiOut"></div>
+  </div>
+</div>
+
 <div class="modal-overlay hidden" id="planReportAiModal">
   <div class="modal-card">
     <div class="modal-head"><h3>Generate report with AI</h3><button class="small" data-close-modal>Close</button></div>
@@ -1122,6 +1133,7 @@
     <div><label>Report name *</label><input id="planReportAiName"></div>
     <div><label>What should the report show? *</label><textarea id="planReportAiText" rows="3" placeholder="e.g. Compare mortgage balance paths and headline costs for each strategy"></textarea></div>
     <div><label>Baseline (one)</label><select id="planReportAiBaseline"></select></div>
+    <div><label>Scenarios (pinned — at least one when scenarios exist)</label><div id="planReportAiScenarios"></div></div>
     <div><label>Strategies (many)</label><div id="planReportAiStrategies"></div></div>
     <div class="toolbar"><button class="primary" id="planReportAiGenBtn">Generate preview</button></div>
     <div id="planReportAiOut"></div>

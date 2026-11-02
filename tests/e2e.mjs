@@ -15856,15 +15856,20 @@ try {
   // AI report: generate → preview → save (nothing writes before Save),
   // report block arithmetic, fixed-default save path, attached model spec.
   const aiReportDef = { charts: [
-    { template: 'time_line', title: 'Balance path', series: ['mortgage_balance'] },
-    { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
-    { template: 'yearly_bars', title: 'Year-end balance', series: ['mortgage_balance'] },
-    { template: 'share_doughnut', title: 'Equity share', series: ['total_value'] },
+    { template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
+    { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
+    { template: 'yearly_bars', title: 'Year-end balance', series: ['mortgage_balance'], method: 'Year-end outstanding principal per year from the engine projection.' },
+    { template: 'share_doughnut', title: 'Equity share', series: ['total_value'], method: 'Each property equity at the horizon month (assessed value − outstanding principal, baseline trajectory).' },
   ] };
   fs.writeFileSync(aiStubFile, JSON.stringify(aiReportDef));
   r = await req('POST', `/api/planning/projects/${planProjectId}/ai-report`, { text: 'Compare balance paths and headlines' });
   check('planning: ai-report returns the stub definition',
     r.status === 200 && JSON.stringify(r.data.definition) === JSON.stringify(aiReportDef), JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify({ charts: [{ template: 'time_line', title: 'No method', series: ['mortgage_balance'] }] }));
+  r = await req('POST', `/api/planning/projects/${planProjectId}/ai-report`, { text: 'Compare balance paths' });
+  check('planning: ai-report without a chart method is rejected',
+    r.status === 502 && JSON.stringify(r.data).includes('calculation method'), JSON.stringify(r.data));
+  fs.writeFileSync(aiStubFile, JSON.stringify(aiReportDef));
   r = await req('GET', `/api/planning/projects/${planProjectId}`);
   check('planning: ai-report writes nothing before Save',
     r.status === 200 && !(r.data.reports || []).some((x) => x.name === 'AI report test'), JSON.stringify((r.data.reports || []).map((x) => x.name)));
@@ -17750,6 +17755,231 @@ try {
         repick.legacyNote.includes('Pick a scenario') && repick.trajNote.includes('Pick a scenario') && repick.trajHidden && repick.master === '' && repick.apple === '',
         JSON.stringify(repick));
     } finally { await browserC.close(); }
+  }
+  // ------------------------------------------- report + templates
+  // Pinned scenario/baseline/strategy for report generation (never a
+  // silent fallback), template recommendation slots (populated from
+  // real entity data, scenario empty), AI chart methods, the
+  // comparison component inside project reports, the strategy detail
+  // report panel, and the Baselines AI entry point. Self-contained
+  // fixtures, built after the comparison pins.
+  r = await req('POST', '/api/properties', {
+    address: '77 Report Test Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  check('report: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const repPropId = r.data.id;
+  r = await req('POST', `/api/properties/${repPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  check('report: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', '/api/planning/projects', { name: 'Report test', question: 'Pin then report' });
+  check('report: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const repProjectId = r.data.project.id;
+  r = await req('POST', `/api/planning/projects/${repProjectId}/strategies`, { name: 'Prepay 10k', source: 'template' });
+  check('report: pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const repStrategyId = r.data.strategy.id;
+  const _repNow = new Date();
+  const _repNext = new Date(Date.UTC(_repNow.getUTCFullYear(), _repNow.getUTCMonth() + 1, 1));
+  const repOpDate = _repNext.toISOString().slice(0, 10);
+  r = await req('POST', `/api/planning/strategies/${repStrategyId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: repPropId, date: repOpDate, amount: 10000, openClosed: 'open' },
+  });
+  check('report: pin prepay op added', r.status === 201, JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${repProjectId}/scenarios`, { name: 'Report world' });
+  check('report: pin scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const repScenId = r.data.scenario.id;
+  r = await req('POST', `/api/planning/projects/${repProjectId}/scenarios`, { name: 'Report world 2' });
+  check('report: pin second scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const repScen2Id = r.data.scenario.id;
+  // Template recommendation slots: baseline + strategy populated from
+  // the entity's real figures, scenario slot empty (never invented).
+  r = await req('POST', '/api/planning/recommendations', { category: 'property', entity: { type: 'property', propertyId: repPropId } });
+  const repRec = (r.data.recommendations || {}).refinance || {};
+  check('report: template recommendation slots (real figures, scenario empty)',
+    r.status === 200 && repRec.baseline && repRec.baseline.figures && repRec.baseline.figures.balance === 100000
+      && repRec.strategy && !!repRec.strategy.name && repRec.scenario === null,
+    JSON.stringify(repRec));
+  const repDef = { strategies: [repStrategyId], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] };
+  r = await req('POST', `/api/planning/projects/${repProjectId}/reports`, { name: 'Unpinned report', definition: repDef, strategy_ids: [repStrategyId] });
+  check('report: save without pinned scenarios is rejected on a project with scenarios',
+    r.status === 400 && JSON.stringify(r.data).includes('pin at least one scenario'), JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${repProjectId}/reports`, { name: 'Unknown scenario report', definition: repDef, strategy_ids: [repStrategyId], scenario_ids: [999999] });
+  check('report: unknown pinned scenario is rejected',
+    r.status === 400 && JSON.stringify(r.data).includes('not in this project'), JSON.stringify(r.data));
+  r = await req('POST', `/api/planning/projects/${repProjectId}/reports`, { name: 'Pinned report', definition: repDef, strategy_ids: [repStrategyId], scenario_ids: [repScenId] });
+  check('report: pinned save works', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const repPinId = r.data.report.id;
+  r = await req('GET', `/api/planning/projects/${repProjectId}`);
+  const repPinRow = (r.data.reports || []).find((x) => x.id === repPinId);
+  check('report: pinned scenario ids stored',
+    !!repPinRow && JSON.stringify(repPinRow.scenarioIds) === JSON.stringify([repScenId]), JSON.stringify(repPinRow && repPinRow.scenarioIds));
+  r = await req('PUT', `/api/planning/reports/${repPinId}`, { scenario_ids: [repScen2Id] });
+  check('report: re-pin to another scenario works', r.status === 200, JSON.stringify(r.data));
+  r = await req('GET', `/api/planning/projects/${repProjectId}`);
+  const repPinRow2 = (r.data.reports || []).find((x) => x.id === repPinId);
+  check('report: re-pinned scenario ids stored',
+    !!repPinRow2 && JSON.stringify(repPinRow2.scenarioIds) === JSON.stringify([repScen2Id]), JSON.stringify(repPinRow2 && repPinRow2.scenarioIds));
+  const repMethodDef = { strategies: [repStrategyId], charts: [{ template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs strategy.' }] };
+  r = await req('POST', `/api/planning/projects/${repProjectId}/reports`, { name: 'Method report', definition: repMethodDef, strategy_ids: [repStrategyId], scenario_ids: [repScenId] });
+  check('report: method-carrying report saves', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const repMethodId = r.data.report.id;
+  if (!puppeteer || !fs.existsSync('/opt/meta-chromium/chrome')) {
+    console.log('report browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardP = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResP = await fetch(BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueP = loginResP.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserP2 = await puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserP2.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardP({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueP, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1200);
+      const aiBaseBtn = await page.evaluate(() => !!document.querySelector('#planAiBaselineBtn'));
+      check('report: Baselines section has a Design with AI entry', aiBaseBtn);
+      await page.click('#planAddReportBtn');
+      await waitP(400);
+      const picker = await page.evaluate(() => {
+        const host = document.querySelector('#planReportSaveScenarios');
+        const boxes = host ? [...host.querySelectorAll('input:checked')].map((el) => el.parentElement.textContent.trim()) : [];
+        return { open: !document.querySelector('#planReportSaveModal').classList.contains('hidden'), checked: boxes };
+      });
+      check('report: save modal shows the scenario picker with the base pre-checked',
+        picker.open && picker.checked.some((t) => t.includes('Report world')), JSON.stringify(picker));
+      await page.evaluate(() => { document.querySelectorAll('#planReportSaveScenarios input:checked').forEach((el) => el.click()); });
+      await page.type('#planReportSaveName', 'Report browser');
+      await page.click('#planReportSaveBtn');
+      await waitP(600);
+      const pinPrompt = await page.evaluate(() => {
+        const msg = document.querySelector('#planReportSaveMsg');
+        return { text: msg ? msg.textContent : '', stillOpen: !document.querySelector('#planReportSaveModal').classList.contains('hidden') };
+      });
+      check('report: saving with no scenario pinned shows the pin prompt and saves nothing',
+        pinPrompt.stillOpen && /Pin at least one scenario/i.test(pinPrompt.text), JSON.stringify(pinPrompt));
+      await page.evaluate(() => { document.querySelector('#planReportSaveScenarios input').click(); });
+      await page.click('#planReportSaveBtn');
+      await waitP(1200);
+      const listed = await page.evaluate(() => document.querySelector('#planReportList').textContent.includes('Report browser'));
+      check('report: pinned save from the modal appears in the Reports list', listed);
+      // Pinned report view: world label + method line + comparison component.
+      await page.goto(`http://ff.local/#planning/report/${repProjectId}/${repMethodId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1500);
+      const view = await page.evaluate(() => {
+        const el = document.querySelector('#planReport');
+        const t = el ? el.textContent : '';
+        return {
+          hash: location.hash, world: t.includes('Under Report world'), method: t.includes('Monthly outstanding principal from the engine projection'),
+          traj: !!document.querySelector('#planReportTrajectoryChart'), master: (document.querySelector('#planReportMasterTable')?.textContent || '').includes('Baseline'),
+          apple: (document.querySelector('#planReportAppleTable')?.textContent || '').includes('Monthly payment'),
+        };
+      });
+      check('report: pinned view renders under its scenario with method line + comparison component',
+        view.hash.startsWith('#planning/report/') && view.world && view.method && view.traj && view.master && view.apple, JSON.stringify(view));
+      // Deleted pinned scenario re-opens the pin panel; re-pinning restores the view.
+      // (The base scenario cannot be deleted, so the second scenario becomes base first.)
+      r = await req('POST', `/api/planning/scenarios/${repScen2Id}/set-base`, {});
+      check('report: second scenario set as base', r.status === 200, JSON.stringify(r.data));
+      r = await req('DELETE', `/api/planning/scenarios/${repScenId}`);
+      check('report: pinned scenario deleted', r.status === 200, JSON.stringify(r.data));
+      // Same-hash goto fires no route change, so leave the report view
+      // first and come back — otherwise the stale render would persist.
+      await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(800);
+      await page.goto(`http://ff.local/#planning/report/${repProjectId}/${repMethodId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1500);
+      const pinPanel = await page.evaluate(() => ({
+        hash: location.hash,
+        text: document.querySelector('#planReport') ? document.querySelector('#planReport').textContent : '',
+        boxes: !!document.querySelector('#planReportPinScenarios'),
+      }));
+      check('report: deleted pinned scenario shows the pin panel, not silent numbers',
+        pinPanel.hash.startsWith('#planning/report/') && pinPanel.boxes && /deleted/i.test(pinPanel.text), JSON.stringify(pinPanel));
+      await page.click('#planReportPinBtn');
+      await waitP(1500);
+      const repinned = await page.evaluate(() => {
+        const t = document.querySelector('#planReport') ? document.querySelector('#planReport').textContent : '';
+        return { world2: t.includes('Under Report world 2'), traj: !!document.querySelector('#planReportTrajectoryChart') };
+      });
+      check('report: re-pinned view renders under the new scenario',
+        repinned.world2 && repinned.traj, JSON.stringify(repinned));
+      // Strategy detail report panel: current strategy × pinned scenarios.
+      await page.goto(`http://ff.local/#planning/strategy/${repStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1500);
+      const detailPanel = await page.evaluate(() => ({
+        panel: !!document.querySelector('#planStrategyReportPanel'),
+        scen: (document.querySelector('#planStrategyReportScenarios')?.textContent || '').includes('Report world 2'),
+      }));
+      check('report: strategy detail has a Report panel with the pinned scenarios', detailPanel.panel && detailPanel.scen, JSON.stringify(detailPanel));
+      await page.click('#planStrategyReportBtn');
+      await waitP(1500);
+      const detailReport = await page.evaluate(() => ({
+        hash: location.hash,
+        strat: (document.querySelector('#planReport')?.textContent || '').includes('Prepay 10k'),
+      }));
+      check('report: strategy detail Generate opens a report scoped to the current strategy',
+        detailReport.hash.startsWith('#planning/report/') && detailReport.strat, JSON.stringify(detailReport));
+      // Baselines AI entry: propose → preview → Apply appends a baseline.
+      fs.writeFileSync(aiStubFile, JSON.stringify({ description: 'AI baseline test', assumptions: [{ key: 'note', value: 'test' }] }));
+      await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1200);
+      await page.click('#planAiBaselineBtn');
+      await waitP(400);
+      await page.type('#planBaselineAiText', 'A plain do-nothing baseline');
+      await page.click('#planBaselineAiGoBtn');
+      await waitP(1500);
+      const basePreview = await page.evaluate(() => ({
+        text: document.querySelector('#planBaselineAiOut') ? document.querySelector('#planBaselineAiOut').textContent : '',
+        apply: !!document.querySelector('#planBaselineAiApplyBtn'),
+      }));
+      check('report: baseline AI preview shows the proposed baseline before Apply',
+        basePreview.apply && basePreview.text.includes('AI baseline test'), JSON.stringify(basePreview));
+      await page.click('#planBaselineAiApplyBtn');
+      await waitP(1200);
+      const baseListed = await page.evaluate(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('AI baseline test'));
+      check('report: applied AI baseline joins the Baselines list', baseListed);
+    } finally { await browserP2.close(); }
   }
   r = await req('POST', '/api/logout');
   check('logout', r.status === 200);

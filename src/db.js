@@ -890,6 +890,12 @@ CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strateg
   if (planReportCols.length && !planReportCols.includes('strategy_ids')) {
     db.exec('ALTER TABLE plan_reports ADD COLUMN strategy_ids TEXT');
   }
+  // Report scenario pinning: scenario_ids JSON (array of project
+  // scenario ids); NULL = legacy row saved before pinning, which the
+  // report view treats as unpinned and prompts to pin.
+  if (planReportCols.length && !planReportCols.includes('scenario_ids')) {
+    db.exec('ALTER TABLE plan_reports ADD COLUMN scenario_ids TEXT');
+  }
   const planStratCols = db.prepare('PRAGMA table_info(plan_strategies)').all().map((c) => c.name);
   if (planStratCols.length && !planStratCols.includes('template')) {
     db.exec('ALTER TABLE plan_strategies ADD COLUMN template TEXT');

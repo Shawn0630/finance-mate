@@ -11317,7 +11317,7 @@ function planProjectHtml(d) {
     </div>`;
   const baselinesPanel = `<div class="panel" id="planBaselineCardsPanel">
       <div class="section-head"><h3>Baselines</h3>
-        <div class="toolbar"><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
+        <div class="toolbar"><button class="small" id="planAiBaselineBtn">Design with AI</button><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
       </div>
       <div id="planBaselineCards"></div>
     </div>`;
@@ -11410,6 +11410,18 @@ function planProjectWire(d) {
   renderBaselineCards();
   const addBaseBtn = $('#planAddBaselineBtn');
   if (addBaseBtn) addBaseBtn.addEventListener('click', () => openPlanCategoryFlow({ mode: 'addBaseline', project: p }));
+  // Baselines section AI hook: design a baseline in words → preview →
+  // Apply appends it to the list (the ai-baseline endpoints already
+  // support this; only the entry point was missing). Scenario and
+  // strategy sections already have their own AI entries.
+  const aiBaseBtn = $('#planAiBaselineBtn');
+  if (aiBaseBtn) aiBaseBtn.addEventListener('click', () => {
+    planBaselineAiCtx = { projectId: p.id, baseline: null };
+    $('#planBaselineAiText').value = '';
+    $('#planBaselineAiOut').innerHTML = '';
+    showMsg($('#planBaselineAiMsg'), '', '');
+    openModal('planBaselineAiModal');
+  });
   // Compact metadata line: Edit swaps the line for the schema's field
   // editors (the same fields the old panel edited).
   const metaLineEdit = $('#planMetadataLineEdit');
@@ -11543,6 +11555,48 @@ $('#planScenarioAiGoBtn').addEventListener('click', async () => {
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
   } catch (err) { showMsg(msg, 'err', err.message); }
+});
+let planBaselineAiCtx = null;
+async function planBaselineAiPropose(text, answers, history) {
+  const msg = $('#planBaselineAiMsg');
+  const out = $('#planBaselineAiOut');
+  const r = await api(`/api/planning/projects/${planBaselineAiCtx.projectId}/ai-baseline`, { method: 'POST', body: { text, answers, history } });
+  if (r.ask) {
+    out.innerHTML = `
+      ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planBaselineAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}
+      <div class="toolbar"><button class="small primary" id="planBaselineAiContinueBtn">Continue design</button></div>`;
+    $('#planBaselineAiContinueBtn').onclick = async () => {
+      try {
+        const next = {};
+        for (const q of r.ask) {
+          const el = document.querySelector(`#planBaselineAsk_${CSS.escape(q.field)}`);
+          const v = el ? el.value.trim() : '';
+          if (!v) throw new Error(`${q.label} is required`);
+          next[q.field] = q.type === 'number' ? Number(v) : v;
+        }
+        await planBaselineAiPropose(text, next, r.thread);
+      } catch (err) { showMsg(msg, 'err', err.message); }
+    };
+    return;
+  }
+  const b = r.baseline;
+  planBaselineAiCtx.baseline = b;
+  out.innerHTML = `<div class="n">${esc(b.description || '')}</div>${(b.assumptions || []).map((a) => `<div class="plan-row"><span>${esc(a.key)} = ${esc(String(a.value ?? ''))}</span></div>`).join('')}<div class="toolbar"><button class="small primary" id="planBaselineAiApplyBtn">Add this baseline</button></div>`;
+  $('#planBaselineAiApplyBtn').addEventListener('click', async () => {
+    try {
+      await api(`/api/planning/projects/${planBaselineAiCtx.projectId}/ai-baseline/apply`, { method: 'POST', body: { baseline: planBaselineAiCtx.baseline } });
+      closeModalEl($('#planBaselineAiModal'));
+      loadPlanProject(planBaselineAiCtx.projectId);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+}
+$('#planBaselineAiGoBtn').addEventListener('click', async () => {
+  const msg = $('#planBaselineAiMsg');
+  const text = $('#planBaselineAiText').value.trim();
+  if (!text) { showMsg(msg, 'err', 'Describe the baseline first'); return; }
+  if (!planBaselineAiCtx) { showMsg(msg, 'err', 'Open the baseline designer from a project first'); return; }
+  try { await planBaselineAiPropose(text, null, null); }
+  catch (err) { showMsg(msg, 'err', err.message); }
 });
 let planBaselineEditCtx = null;
 function openPlanBaselineEditModal(projectId, baselineId) {
@@ -11795,15 +11849,28 @@ async function loadPlanComparison(projectId) {
   // first selected block; further blocks keep the legacy rendering.
   planCompareNewRender(first);
 }
+// Report scenario picker: base pre-checked (a visible default, not a
+// silent fallback); no scenarios = the flat world, labeled as such.
+function planReportScenarioPickerHtml(scenarios) {
+  if (!scenarios.length) return '<div class="note">Current rates (no scenario)</div>';
+  const base = scenarios.find((x) => x.is_base) || scenarios[0];
+  return scenarios.map((sc) => `<label><input type="checkbox" value="${sc.id}"${base && sc.id === base.id ? ' checked' : ''}> ${esc(sc.name)}${sc.is_base ? ' (Default)' : ''}</label>`).join(' ');
+}
+function planReportPickedScenarios(hostSel) {
+  return [...document.querySelectorAll(`${hostSel} input:checked`)].map((el) => Number(el.value));
+}
 async function planSaveReport(projectId) {
   const msg = $('#planReportSaveMsg');
   showMsg(msg, '', '');
   $('#planReportSaveName').value = '';
+  let scenarios = [];
   try {
     const d = await api(`/api/planning/projects/${projectId}`);
     const bases = d.project.baselines || [];
     const strs = d.strategies || [];
+    scenarios = d.scenarios || [];
     $('#planReportSaveBaseline').innerHTML = '<option value="">Do-nothing baseline</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+    $('#planReportSaveScenarios').innerHTML = planReportScenarioPickerHtml(scenarios);
     $('#planReportSaveStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
   } catch (err) { showMsg(msg, 'err', err.message); return; }
   openModal('planReportSaveModal');
@@ -11812,8 +11879,10 @@ async function planSaveReport(projectId) {
       const name = $('#planReportSaveName').value.trim();
       if (!name) throw new Error('report name is required');
       const baselineId = $('#planReportSaveBaseline').value ? Number($('#planReportSaveBaseline').value) : null;
+      const scenarioIds = planReportPickedScenarios('#planReportSaveScenarios');
+      if (scenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
       const strategyIds = [...document.querySelectorAll('#planReportSaveStrategies input:checked')].map((el) => Number(el.value));
-      await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: { strategies: strategyIds, charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, baseline_id: baselineId, strategy_ids: strategyIds } });
+      await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: { strategies: strategyIds, charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, baseline_id: baselineId, strategy_ids: strategyIds, scenario_ids: scenarioIds } });
       closeModalEl($('#planReportSaveModal'));
       loadPlanProject(projectId);
     } catch (err) { showMsg(msg, 'err', err.message); }
@@ -11827,11 +11896,14 @@ function openPlanReportAiModal(projectId) {
   $('#planReportAiOut').innerHTML = '';
   showMsg($('#planReportAiMsg'), '', '');
   openModal('planReportAiModal');
-  // Baseline picker (one) + strategy picker (many) for this report.
+  // Baseline picker (one) + scenario picker (pinned) + strategy picker (many) for this report.
+  let aiReportScenarios = [];
   api(`/api/planning/projects/${projectId}`).then((d) => {
     const bases = d.project.baselines || [];
     const strs = d.strategies || [];
+    aiReportScenarios = d.scenarios || [];
     $('#planReportAiBaseline').innerHTML = '<option value="">Do-nothing baseline</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+    $('#planReportAiScenarios').innerHTML = planReportScenarioPickerHtml(aiReportScenarios);
     $('#planReportAiStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
   }).catch(() => { /* pickers stay empty; save falls back to project base */ });
   $('#planReportAiGenBtn').onclick = async () => {
@@ -11844,13 +11916,15 @@ function openPlanReportAiModal(projectId) {
       const r = await api(`/api/planning/projects/${projectId}/ai-report`, { method: 'POST', body: { text } });
       const charts = (r.definition && r.definition.charts) || [];
       $('#planReportAiOut').innerHTML = `
-        ${charts.map((c) => `<div class="plan-row"><span>${esc(c.template)} · ${esc(c.title)}${c.series ? ` · ${(c.series || []).join(', ')}` : ''}</span></div>`).join('') || '<div class="note">No charts proposed.</div>'}
+        ${charts.map((c) => `<div class="plan-row"><span>${esc(c.template)} · ${esc(c.title)}${c.series ? ` · ${(c.series || []).join(', ')}` : ''}${c.method ? ` · Method: ${esc(c.method)}` : ''}</span></div>`).join('') || '<div class="note">No charts proposed.</div>'}
         <div class="toolbar"><button class="small primary" id="planReportAiSaveBtn">Save this report</button></div>`;
       $('#planReportAiSaveBtn').onclick = async () => {
         try {
           const baselineId = $('#planReportAiBaseline').value ? Number($('#planReportAiBaseline').value) : null;
+          const scenarioIds = planReportPickedScenarios('#planReportAiScenarios');
+          if (aiReportScenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
           const strategyIds = [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value));
-          await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: r.definition, baseline_id: baselineId, strategy_ids: strategyIds } });
+          await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: r.definition, baseline_id: baselineId, strategy_ids: strategyIds, scenario_ids: scenarioIds } });
           closeModalEl($('#planReportAiModal'));
           loadPlanProject(projectId);
         } catch (err) { showMsg(msg, 'err', err.message); }
@@ -11885,6 +11959,35 @@ function planReportYearRows(monthly) {
     if (m.slice(5, 7) === '12' || i === monthly.length - 1) rows.push(monthly[i]);
   }
   return rows;
+}
+// Scenario pin panel for a report: legacy rows (saved before pinning)
+// and rows whose pinned scenario was deleted never render numbers
+// under a substituted world — the user picks the worlds first.
+function planReportPinPanel(proj, report, note) {
+  const scenarios = proj.scenarios || [];
+  const base = scenarios.find((x) => x.is_base) || scenarios[0];
+  $('#planList').classList.add('hidden');
+  $('#planProject').classList.add('hidden');
+  $('#planStrategy').classList.add('hidden');
+  $('#planScenario').classList.add('hidden');
+  $('#planReport').classList.remove('hidden');
+  $('#planReport').innerHTML = `
+    <div><a href="#planning/project/${proj.project.id}">← Back to ${esc(proj.project.name)}</a></div>
+    <div class="panel">
+      <div class="section-head"><h3>${esc(report.name)}</h3></div>
+      <div class="note">${esc(note)}</div>
+      <div><label>Scenarios (pinned)</label><div id="planReportPinScenarios">${scenarios.map((sc) => `<label><input type="checkbox" value="${sc.id}"${base && sc.id === base.id ? ' checked' : ''}> ${esc(sc.name)}${sc.is_base ? ' (Default)' : ''}</label>`).join(' ')}</div></div>
+      <div class="toolbar"><button class="small primary" id="planReportPinBtn">Use these scenarios</button></div>
+      <div class="msg" id="planReportPinMsg"></div>
+    </div>`;
+  $('#planReportPinBtn').addEventListener('click', async () => {
+    try {
+      const ids = [...document.querySelectorAll('#planReportPinScenarios input:checked')].map((el) => Number(el.value));
+      if (!ids.length) throw new Error('Pin at least one scenario first');
+      await api(`/api/planning/reports/${report.id}`, { method: 'PUT', body: { scenario_ids: ids } });
+      loadPlanReport(proj.project.id, report.id);
+    } catch (err) { showMsg($('#planReportPinMsg'), 'err', err.message); }
+  });
 }
 async function loadPlanReport(projectId, reportId) {
   return withLoading(async () => {
@@ -11925,8 +12028,31 @@ async function loadPlanReport(projectId, reportId) {
       });
       return;
     }
-    const compQ = report.baseline_id ? `?baselineId=${report.baseline_id}` : '';
-    const comp = await api(`/api/planning/projects/${projectId}/comparison${compQ}`);
+    // Scenario pinning: a report renders under its PINNED scenarios
+    // only. Legacy rows (no pin) on a project with scenarios get the
+    // pin panel, never numbers under a substituted world; a flat-world
+    // pin ([]) renders without scenarioIds. A deleted pinned scenario
+    // (comparison 404) re-opens the pin panel.
+    const pinned = report.scenarioIds !== undefined ? report.scenarioIds : null;
+    const projScenarios = proj.scenarios || [];
+    if (pinned === null && projScenarios.length) {
+      planReportPinPanel(proj, report, 'This report was saved before scenario pinning. Pick the scenarios it should run under.');
+      return;
+    }
+    const scenarioIds = pinned || [];
+    const q = [];
+    if (report.baseline_id) q.push(`baselineId=${report.baseline_id}`);
+    if (scenarioIds.length) q.push(`scenarioIds=${scenarioIds.join(',')}`);
+    let comp;
+    try {
+      comp = await api(`/api/planning/projects/${projectId}/comparison${q.length ? `?${q.join('&')}` : ''}`);
+    } catch (err) {
+      if (/scenario not found/i.test(err.message || '')) {
+        planReportPinPanel(proj, report, 'A scenario this report was pinned to was deleted. Pick the scenarios it should run under.');
+        return;
+      }
+      throw err;
+    }
     // Strategy filter: only the report's picked strategies render.
     let pickedIds = null;
     try { pickedIds = report.strategy_ids ? JSON.parse(report.strategy_ids) : null; } catch { pickedIds = null; }
@@ -11967,7 +12093,9 @@ async function loadPlanReport(projectId, reportId) {
     const draws = [];
     charts.forEach((c, i) => {
       const series = (c.series && c.series.length ? c.series : null);
-      const how = planReportHowFor(series);
+      // AI-supplied method wins; engine-path charts get the app's own
+      // how-calculated line. Either way every chart states its method.
+      const how = c.method ? c.method : planReportHowFor(series);
       const cid = `planReportChart${i}`;
       if (c.template === 'time_line') {
         const sids = series || ['mortgage_balance'];
@@ -12095,16 +12223,43 @@ async function loadPlanReport(projectId, reportId) {
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: unknown template ${esc(c.template)}.</div></div>`);
       }
     });
+    // World label for the header: every pinned scenario by name, or
+    // the flat world when the pin is empty.
+    const worldLabel = scenarioIds.length
+      ? `Under ${scenarioIds.map((id) => { const sc = projScenarios.find((x) => x.id === id); return sc ? sc.name : `#${id}`; }).join(', ')}`
+      : 'Current rates (no scenario)';
     $('#planReport').innerHTML = `
       <div><a href="#planning/project/${projectId}">← Back to ${esc(proj.project.name)}</a></div>
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
-        <div class="note">Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
+        <div class="note">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         <div class="note">${PLAN_REPORT_DEFS}</div>
         <div class="msg" id="planReportMsg"></div>
       </div>
-      ${panels.join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}`;
+      ${panels.join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
+      <div class="panel" id="planReportComparePanel">
+        <div class="section-head"><h3>Strategy comparison</h3></div>
+        <div class="note" id="planReportTrajectoryNote"></div>
+        <div class="chart-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
+        <div id="planReportTrajectoryEmpty"></div>
+        <div class="section-head"><h3>Master table</h3></div>
+        <div id="planReportMasterTable"></div>
+        <div class="section-head"><h3>Compare strategies</h3></div>
+        <div id="planReportApplePicker"></div>
+        <div id="planReportAppleTable"></div>
+        <div class="note">Baseline: absolute figures. Strategy columns: deltas vs baseline. Total value = property equity + stock value; equity = assessed value − outstanding principal.</div>
+      </div>`;
     draws.forEach((d) => { try { d(); } catch { /* a failed chart never blocks the tables */ } });
+    // Project report includes the comparison component, reused from
+    // the project page (same renderers, report-scoped ids) — the
+    // block here is already filtered to the report's picked strategies.
+    try {
+      planCompareNewRender({ scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report }, {
+        note: '#planReportTrajectoryNote', chart: 'planReportTrajectoryChart', empty: '#planReportTrajectoryEmpty',
+        wrapSel: '#planReportComparePanel .chart-wrap', master: '#planReportMasterTable',
+        picker: '#planReportApplePicker', apple: '#planReportAppleTable', ctx: { block: null, appleIds: null },
+      });
+    } catch { /* a failed comparison chart never blocks the report tables */ }
   });
 }
 function sidsHas(series, sid) { return (series || []).includes(sid); }
@@ -12221,6 +12376,13 @@ function planStrategyHtml(d) {
       <div id="planDiffEmpty"></div>
       <div id="planDiffTable"></div>
     </div>
+    <div class="panel" id="planStrategyReportPanel">
+      <div class="section-head"><h3>Report</h3></div>
+      <div id="planStrategyReportScenarios"></div>
+      <div><label>Baseline (one)</label><select id="planStrategyReportBaseline"></select></div>
+      <div class="toolbar"><button class="small primary" id="planStrategyReportBtn">Generate report</button></div>
+      <div class="msg" id="planStrategyReportMsg"></div>
+    </div>
     <div class="panel">
       <div class="section-head"><h3>Operations</h3>
         <div class="toolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
@@ -12292,6 +12454,7 @@ function planStrategyWire(d) {
   });
   $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
   document.querySelectorAll('[data-plan-quick-op]').forEach((b) => b.addEventListener('click', () => openPlanOpModal(s.id, null, b.dataset.planQuickOp)));
+  planStrategyReportWire(d);
   // Model follow-up iterates the strategy spec via ai-model (stored
   // thread continues). The baseline changes nothing, so it is not a
   // follow-up target.
@@ -12569,6 +12732,34 @@ function planDiffEffectiveRange(monthly) {
   const n = planDiffState.preset === 'all' ? 0 : parseInt(planDiffState.preset, 10) * 12;
   return { from: monthly[0].month, to: n ? monthly[Math.min(n, monthly.length) - 1].month : monthly[monthly.length - 1].month };
 }
+// Strategy detail report: the CURRENT strategy × the pinned scenarios
+// vs the baseline. Generates (saves) a report scoped to this strategy
+// and navigates to the report view — the view renders it under the
+// pinned scenarios with the comparison component.
+function planStrategyReportWire(d) {
+  const s = d.strategy;
+  const host = $('#planStrategyReportScenarios');
+  if (!host) return;
+  const scenarios = d.scenarios || [];
+  const base = d.baseScenario;
+  host.innerHTML = scenarios.length
+    ? `<div><label>Scenarios (pinned)</label>${scenarios.map((sc) => `<label><input type="checkbox" value="${sc.id}"${base && sc.id === base.id ? ' checked' : ''}> ${esc(sc.name)}${sc.is_base ? ' (Default)' : ''}</label>`).join(' ')}</div>`
+    : '<div class="note">Current rates (no scenario)</div>';
+  api(`/api/planning/projects/${d.project.id}`).then((proj) => {
+    const bases = proj.project.baselines || [];
+    $('#planStrategyReportBaseline').innerHTML = '<option value="">Do-nothing baseline</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+  }).catch(() => { /* baseline select stays do-nothing */ });
+  $('#planStrategyReportBtn').addEventListener('click', async () => {
+    const msg = $('#planStrategyReportMsg');
+    try {
+      const scenarioIds = [...document.querySelectorAll('#planStrategyReportScenarios input:checked')].map((el) => Number(el.value));
+      if (scenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
+      const baselineId = $('#planStrategyReportBaseline').value ? Number($('#planStrategyReportBaseline').value) : null;
+      const r = await api(`/api/planning/projects/${d.project.id}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, baseline_id: baselineId, strategy_ids: [s.id], scenario_ids: scenarioIds } });
+      location.hash = `#planning/report/${d.project.id}/${r.report.id}`;
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+}
 function planDiffWire(d) {
   planDiffData = d;
   const host = $('#planDiffPanel');
@@ -12672,20 +12863,36 @@ function planBaselineValue(block) {
   if (base && base.monthly && base.monthly.length) return base.monthly[base.monthly.length - 1].total_value;
   return null;
 }
-function planCompareNewRender(block) {
-  planCompareNewBlock = block;
-  const note = $('#planTrajectoryNote');
+// Shared comparison renderers: the project page calls with no ids
+// (project-page elements + module state); the report view passes
+// report-scoped ids + its own state so the same code renders both
+// without duplication.
+const planCompareDefaultIds = () => ({
+  note: '#planTrajectoryNote', chart: 'planTrajectoryChart', empty: '#planTrajectoryEmpty',
+  wrapSel: '#planCompareNewPanel .chart-wrap', master: '#planMasterTable',
+  picker: '#planApplePicker', apple: '#planAppleTable',
+});
+function planCompareNewRender(block, ids) {
+  const t = ids || planCompareDefaultIds();
+  if (ids) { t.block = block; if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id); }
+  else { planCompareNewBlock = block; t.block = block; if (planAppleIds == null) planAppleIds = block.strategies.map((r) => r.strategy.id); }
+  // Apple picker state lives on the target (module globals for the
+  // project page, the passed ctx for the report view) so each view's
+  // picker re-renders only its own table.
+  t.getAppleIds = () => (ids ? t.appleIds : planAppleIds);
+  t.setAppleIds = (v) => { if (ids) t.appleIds = v; else planAppleIds = v; };
+  const note = $(t.note);
   if (note) note.textContent = block.scenario ? `Under ${block.scenario.name}` : 'Current rates (no scenario)';
   const trajs = (block.report && block.report.trajectories) || [];
   const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
-  const wrap = document.querySelector('#planCompareNewPanel .chart-wrap');
-  const empty = $('#planTrajectoryEmpty');
+  const wrap = document.querySelector(t.wrapSel);
+  const empty = $(t.empty);
   if (trajs.length && months.length) {
     if (wrap) wrap.style.display = '';
     if (empty) empty.innerHTML = '';
-    planLineChart('planTrajectoryChart', months.map(formatYM), trajs.map((t, i) => ({ label: t.label, data: (t.monthly || []).map((m) => m.total_value), borderColor: planColor(i), backgroundColor: planColor(i), spanGaps: true })));
+    planLineChart(t.chart, months.map(formatYM), trajs.map((tr, i) => ({ label: tr.label, data: (tr.monthly || []).map((m) => m.total_value), borderColor: planColor(i), backgroundColor: planColor(i), spanGaps: true })));
   } else {
-    planDestroyChart('planTrajectoryChart');
+    planDestroyChart(t.chart);
     if (wrap) wrap.style.display = 'none';
     if (empty) empty.innerHTML = '<div class="note">No trajectory data.</div>';
   }
@@ -12704,23 +12911,24 @@ function planCompareNewRender(block) {
   ];
   const masterHead = '<tr><th></th><th>Baseline</th>' + block.strategies.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('') + '</tr>';
   const masterBody = masterRows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + block.strategies.map((r) => `<td>${row.strat(r)}</td>`).join('') + '</tr>').join('');
-  const master = $('#planMasterTable');
+  const master = $(t.master);
   if (master) master.innerHTML = `<table class="tbl"><thead>${masterHead}</thead><tbody>${masterBody}</tbody></table>`;
-  if (planAppleIds == null) planAppleIds = block.strategies.map((r) => r.strategy.id);
-  const picker = $('#planApplePicker');
+  const picker = $(t.picker);
   if (picker) {
-    picker.innerHTML = block.strategies.map((r) => `<label class="chk"><input type="checkbox" data-plan-apple="${r.strategy.id}"${planAppleIds.includes(r.strategy.id) ? ' checked' : ''}> ${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</label>`).join(' ');
+    picker.innerHTML = block.strategies.map((r) => `<label class="chk"><input type="checkbox" data-plan-apple="${r.strategy.id}"${t.getAppleIds().includes(r.strategy.id) ? ' checked' : ''}> ${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</label>`).join(' ');
     picker.querySelectorAll('[data-plan-apple]').forEach((cb) => cb.addEventListener('change', () => {
-      planAppleIds = [...picker.querySelectorAll('[data-plan-apple]:checked')].map((x) => Number(x.dataset.planApple));
-      planAppleRender();
+      t.setAppleIds([...picker.querySelectorAll('[data-plan-apple]:checked')].map((x) => Number(x.dataset.planApple)));
+      planAppleRender(t);
     }));
   }
-  planAppleRender();
+  planAppleRender(t);
 }
-function planAppleRender() {
-  const block = planCompareNewBlock;
+function planAppleRender(t) {
+  t = t || planCompareDefaultIds();
+  const block = t.block || planCompareNewBlock;
   if (!block) return;
-  const picked = block.strategies.filter((r) => planAppleIds && planAppleIds.includes(r.strategy.id));
+  const appleIds = t.getAppleIds ? t.getAppleIds() : planAppleIds;
+  const picked = block.strategies.filter((r) => appleIds && appleIds.includes(r.strategy.id));
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const baseValue = planBaselineValue(block);
   const diffCls = (v) => (v != null && v !== 0) ? ' class="plan-diff"' : '';
@@ -12741,7 +12949,7 @@ function planAppleRender() {
   ];
   const head = '<tr><th></th><th>Baseline</th>' + picked.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('') + '</tr>';
   const body = appleRows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + picked.map((r) => row.strat(r)).join('') + '</tr>').join('');
-  const host = $('#planAppleTable');
+  const host = $(t.apple || '#planAppleTable');
   if (!host) return;
   host.innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table>`
     + (picked.length === 0 && block.strategies.length > 0 ? '<div class="note">Pick a strategy to compare.</div>' : '');
