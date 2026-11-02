@@ -217,27 +217,24 @@ test('invest chat prompt: a holdings-section draft must pair position with NAVs'
   assert.ok(flat.includes('never NAVs alone'));
 });
 
-test('normalizeAiFields: job context maps province names, frequency aliases, rows', () => {
+test('normalizeAiFields: job context maps province names, frequency aliases, drops rows', () => {
   const out = normalizeAiFields('job', {
     employer: 'Acme Corp', owner: 'Shawn', currency: 'cad', province: 'British Columbia',
     frequency: 'bi-weekly', start_date: 'Jan 5, 2026', recent_pay_date: '2026-10-23',
     recent_pay_value: '$3,000', evil: 'x',
+    // Rows live on the job detail page only: the job form never
+    // proposes them, so a model answer carrying them is dropped.
     pay_changes: [
       { effective_date: '2026-06-01', value: '3,000' },
-      { effective_date: 'not a date', value: 2500 },
-      { effective_date: '2026-01-05', value: -5 },
     ],
     bonuses: [
       { date: '2026-06-30', amount: 5000 },
-      { date: '2026-13-01', amount: 100 },
     ],
   });
   assert.deepEqual(out, {
     employer: 'Acme Corp', owner: 'Shawn', currency: 'CAD', province: 'BC',
     frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-23',
     recent_pay_value: 3000,
-    pay_changes: [{ effective_date: '2026-06-01', value: 3000 }],
-    bonuses: [{ date: '2026-06-30', amount: 5000 }],
   });
   assert.equal(normalizeAiFields('job', { province: 'XX' }).province, undefined);
   assert.equal(normalizeAiFields('job', { province: 'ON' }).province, 'ON');

@@ -1170,21 +1170,6 @@ function applyAiFields(form, fields, extras = {}) {
       tally(fillOneInput(extras.segForm, key.slice('segment_'.length), value));
       continue;
     }
-    if ((key === 'pay_changes' || key === 'bonuses') && extras.jobRows) {
-      const rows = Array.isArray(value) ? value : [];
-      const existing = key === 'pay_changes' ? extras.jobRows.getPayChanges() : extras.jobRows.getBonuses();
-      // Hand-entered rows are never overwritten — like hand-filled
-      // scalar fields, they count as kept. Row sections carry no
-      // per-row ✨ flag (there is no single input to flag); the
-      // filled rows sit in the form for review, and the panel
-      // summary counts them.
-      if (existing.length || !rows.length) { if (existing.length) kept += 1; continue; }
-      form._aiFilling = true;
-      if (key === 'pay_changes') extras.jobRows.setPayChanges(rows); else extras.jobRows.setBonuses(rows);
-      form._aiFilling = false;
-      filled += 1;
-      continue;
-    }
     tally(fillOneInput(form, key, value));
   }
   renderAiFlags(form);
@@ -9203,49 +9188,18 @@ function earnReadForm(form) {
 // ------------------------------------------------------------ job modal --
 // The simplified form asks only for key facts; annual gross, tax
 // year and YTD CPP / CPP2 / EI are derived server-side from the
-// start date, recent pay date and recent pay value. Pay-change rows
-// (raises) and bonus rows are repeatable lists inside the modal.
+// start date, recent pay date and recent pay value. Pay changes
+// (raises) and bonuses live on the job detail page only — the modal
+// edits scalar fields, and a save leaves the child rows untouched
+// (the server replaces them only when the PUT carries them).
 // A job edited without dates keeps its stored gross / tax year /
 // YTD untouched (the server leaves derived columns alone on a
 // legacy save), so old jobs keep computing exactly as before.
 let earnEditJobOrig = null;
 
-function earnJobRepeatRow(kind, values) {
-  const wrap = document.createElement('div');
-  if (kind === 'pay_change') {
-    const basis = values?.basis || 'gross';
-    const scope = values?.scope || 'period';
-    wrap.innerHTML = `<input type="date" data-pc-date value="${esc(values?.effective_date || '')}">
-      <input type="text" inputmode="decimal" data-money data-pc-value placeholder="Amount" value="${values?.amount == null && values?.value == null ? '' : esc(formatMoneyInput(values.amount ?? values.value))}">
-      <select data-pc-basis><option value="gross"${basis === 'gross' ? ' selected' : ''}>Gross</option><option value="takehome"${basis === 'takehome' ? ' selected' : ''}>Take-home</option></select>
-      <select data-pc-scope><option value="period"${scope === 'period' ? ' selected' : ''}>Per period</option><option value="annual"${scope === 'annual' ? ' selected' : ''}>Annual</option></select>
-      <button type="button" class="small" onclick="this.parentElement.remove()">Remove</button>`;
-  } else {
-    wrap.innerHTML = `<input type="date" data-bonus-date value="${esc(values?.date || '')}">
-      <input type="text" inputmode="decimal" data-money data-bonus-amount placeholder="Amount" value="${values?.amount == null ? '' : esc(formatMoneyInput(values.amount))}">
-      <button type="button" class="small" onclick="this.parentElement.remove()">Remove</button>`;
-  }
-  wrap.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
-  return wrap;
-}
-const earnJobPayChanges = () => [...document.querySelectorAll('#earnJobPayChangeRows > div')].map((row) => ({
-  effective_date: row.querySelector('[data-pc-date]').value,
-  amount: parseMoneyInput(row.querySelector('[data-pc-value]').value),
-  basis: row.querySelector('[data-pc-basis]').value,
-  scope: row.querySelector('[data-pc-scope]').value,
-}));
-const earnJobBonuses = () => [...document.querySelectorAll('#earnJobBonusRows > div')].map((row) => ({
-  date: row.querySelector('[data-bonus-date]').value,
-  amount: parseMoneyInput(row.querySelector('[data-bonus-amount]').value),
-}));
-$('#earnJobPayChangeAddBtn').onclick = () => $('#earnJobPayChangeRows').appendChild(earnJobRepeatRow('pay_change'));
-$('#earnJobBonusAddBtn').onclick = () => $('#earnJobBonusRows').appendChild(earnJobRepeatRow('bonus'));
-
 function earnJobResetModal(title) {
   $('#earnJobFormTitle').textContent = title;
   $('#earnJobForm').reset();
-  $('#earnJobPayChangeRows').innerHTML = '';
-  $('#earnJobBonusRows').innerHTML = '';
   showMsg($('#earnJobModalMsg'), '', '');
   earnJobPayBasisLabel();
 }
@@ -9289,21 +9243,6 @@ $('#earnJobForm').onsubmit = async (e) => {
     const recent = data.recent_pay_date || '';
     const value = data.recent_pay_value;
     const hasAny = !!(start || recent || (value !== '' && value != null));
-    // Rows: fully-empty rows are dropped; partially-filled rows are
-    // an error (the server would otherwise read a blank value as 0).
-    const dropEmpty = (rows, dateKey, valKey, label) => {
-      const kept = [];
-      for (const r of rows) {
-        const d = r[dateKey];
-        const v = r[valKey];
-        if (!d && (v === '' || v == null)) continue;
-        if (!d || v === '' || v == null) throw new Error(`Each ${label} needs a date and an amount.`);
-        kept.push(r);
-      }
-      return kept;
-    };
-    const payChanges = dropEmpty(earnJobPayChanges(), 'effective_date', 'amount', 'pay change');
-    const bonuses = dropEmpty(earnJobBonuses(), 'date', 'amount', 'bonus');
     let body;
     if (earnEditJobId == null || hasAny) {
       if (!start || !recent || value === '' || value == null) {
@@ -9315,7 +9254,6 @@ $('#earnJobForm').onsubmit = async (e) => {
         province: data.province, frequency: data.frequency,
         start_date: start, recent_pay_date: recent, recent_pay_value: value,
         pay_value_basis: data.pay_value_basis || 'gross',
-        pay_changes: payChanges, bonuses,
       };
     } else {
       // Edit without dates: preserve the stored gross / tax year /
@@ -9355,26 +9293,9 @@ window.earnEditJob = (id) => {
   setMoneyValue(f.recent_pay_value, perPeriod);
   f.querySelector('[name=pay_value_basis][value=gross]').checked = true;
   earnJobPayBasisLabel();
-  for (const c of j.pay_changes || []) $('#earnJobPayChangeRows').appendChild(earnJobRepeatRow('pay_change', c));
-  for (const b of j.bonuses || []) $('#earnJobBonusRows').appendChild(earnJobRepeatRow('bonus', b));
   openModal('earnJobModal');
 };
-attachAiFill($('#earnJobForm'), 'job', {
-  jobRows: {
-    getPayChanges: earnJobPayChanges,
-    getBonuses: earnJobBonuses,
-    setPayChanges: (rows) => {
-      const c = $('#earnJobPayChangeRows');
-      c.innerHTML = '';
-      rows.forEach((r) => c.appendChild(earnJobRepeatRow('pay_change', r)));
-    },
-    setBonuses: (rows) => {
-      const c = $('#earnJobBonusRows');
-      c.innerHTML = '';
-      rows.forEach((r) => c.appendChild(earnJobRepeatRow('bonus', r)));
-    },
-  },
-});
+attachAiFill($('#earnJobForm'), 'job');
 window.earnDeleteJob = async (id) => {
   if (!confirm('Delete this job?')) return;
   try {

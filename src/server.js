@@ -3366,15 +3366,24 @@ app.get('/api/earnings', requireApiAuth, (req, res) => {
 });
 
 // A derived save replaces a job's pay-change rows and bonus entries
-// wholesale; a legacy save leaves them (and the derived date
-// columns) untouched, so old jobs keep computing as before.
+// wholesale — but only for the sides the PUT actually carries. An
+// absent side is left untouched (same omitted-means-unchanged rule
+// as the owner field): the job form no longer edits rows, so its
+// saves carry neither side, while the detail-page row flow sends
+// both. A legacy save leaves them (and the derived date columns)
+// untouched, so old jobs keep computing as before. A null side
+// means "leave alone"; an array (possibly empty) replaces it.
 const writeJobChildren = (jobId, payChanges, bonuses, ts) => {
-  db.prepare('DELETE FROM earn_pay_changes WHERE job_id = ?').run(jobId);
-  db.prepare('DELETE FROM earn_bonuses WHERE job_id = ?').run(jobId);
-  const insC = db.prepare('INSERT INTO earn_pay_changes (job_id, effective_date, value, amount, basis, scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  const insB = db.prepare('INSERT INTO earn_bonuses (job_id, date, amount, created_at) VALUES (?, ?, ?, ?)');
-  for (const c of payChanges) insC.run(jobId, c.effective_date, c.value, c.amount, c.basis, c.scope, ts);
-  for (const b of bonuses) insB.run(jobId, b.date, b.amount, ts);
+  if (payChanges != null) {
+    db.prepare('DELETE FROM earn_pay_changes WHERE job_id = ?').run(jobId);
+    const insC = db.prepare('INSERT INTO earn_pay_changes (job_id, effective_date, value, amount, basis, scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    for (const c of payChanges) insC.run(jobId, c.effective_date, c.value, c.amount, c.basis, c.scope, ts);
+  }
+  if (bonuses != null) {
+    db.prepare('DELETE FROM earn_bonuses WHERE job_id = ?').run(jobId);
+    const insB = db.prepare('INSERT INTO earn_bonuses (job_id, date, amount, created_at) VALUES (?, ?, ?, ?)');
+    for (const b of bonuses) insB.run(jobId, b.date, b.amount, ts);
+  }
 };
 const derivedJobYtd = (v, cppExempt, eiExempt) => deriveJobYtd({
   frequency: v.frequency, startDate: v.start_date, recentDate: v.recent_pay_date,
@@ -3521,7 +3530,10 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
            tax_year = ?, start_date = ?, recent_pay_date = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?, updated_at = ? WHERE id = ?`).run(
           v.employer, owner, v.currency, v.province, v.frequency, v.gross_amount, v.gross_basis,
           v.tax_year, v.start_date, v.recent_pay_date, ytd.ytd_cpp, ytd.ytd_cpp2, ytd.ytd_ei, nowIso(), id);
-        writeJobChildren(id, v.pay_changes, v.bonuses, nowIso());
+        writeJobChildren(id,
+          (req.body || {}).pay_changes !== undefined ? v.pay_changes : null,
+          (req.body || {}).bonuses !== undefined ? v.bonuses : null,
+          nowIso());
       })();
       return { value: earnJobRow(db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(id)), entityId: id };
     });

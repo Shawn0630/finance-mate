@@ -31,7 +31,7 @@ export const TERM_FIELDS = [
 ];
 export const JOB_FIELDS = [
   'employer', 'owner', 'currency', 'province', 'frequency',
-  'start_date', 'recent_pay_date', 'recent_pay_value', 'pay_changes', 'bonuses',
+  'start_date', 'recent_pay_date', 'recent_pay_value',
 ];
 
 // The selectable models, from LLM_MODELS (comma-separated). When
@@ -90,8 +90,6 @@ const FORM_SPECS = {
     'frequency (weekly | biweekly | semimonthly | monthly | annual — the pay cadence),',
     'start_date (job start date), recent_pay_date (most recent pay date),',
     'recent_pay_value (gross of one pay period, a plain number).',
-    'Optional: pay_changes (array of {effective_date, value} — dated raises, the new per-period gross',
-    'from that date), bonuses (array of {date, amount} — one-time bonus payments).',
   ].join('\n'),
 };
 
@@ -334,18 +332,6 @@ export function normalizeAiFields(context, raw) {
     put('recent_pay_date', normDate(raw.recent_pay_date));
     const rv = normNum(raw.recent_pay_value);
     put('recent_pay_value', rv != null && rv >= 0 ? rv : null);
-    if (Array.isArray(raw.pay_changes)) {
-      const rows = raw.pay_changes
-        .map((r) => ({ effective_date: normDate(r && r.effective_date), value: normNum(r && r.value) }))
-        .filter((r) => r.effective_date && r.value != null && r.value >= 0);
-      if (rows.length) out.pay_changes = rows;
-    }
-    if (Array.isArray(raw.bonuses)) {
-      const rows = raw.bonuses
-        .map((r) => ({ date: normDate(r && r.date), amount: normNum(r && r.amount) }))
-        .filter((r) => r.date && r.amount != null && r.amount >= 0);
-      if (rows.length) out.bonuses = rows;
-    }
     return out;
   }
   // context === 'term'

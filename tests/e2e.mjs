@@ -6844,6 +6844,11 @@ try {
       check('the job modal asks only simplified fields (no gross/basis/year/TD1/YTD inputs)',
         await page.evaluate(() => ['gross_amount', 'gross_basis', 'tax_year', 'td1_federal', 'td1_provincial', 'ytd_cpp', 'ytd_cpp2', 'ytd_ei']
           .every((n) => !document.querySelector(`#earnJobForm [name=${n}]`))));
+      check('the job form carries no Pay changes or Bonuses sections',
+        await page.evaluate(() => !document.querySelector('#earnJobPayChangeRows')
+          && !document.querySelector('#earnJobBonusRows')
+          && !document.querySelector('#earnJobPayChangeAddBtn')
+          && !document.querySelector('#earnJobBonusAddBtn')));
       check('the job modal carries the ✨ Fill with AI panel',
         await page.evaluate(() => !!document.querySelector('#earnJobForm [data-ai-toggle]')));
       await until(() => document.querySelectorAll('#earnJobProvince option').length > 1);
@@ -6867,7 +6872,9 @@ try {
       const modalJob = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.employer === 'Derived Corp');
       check('the saved job carries tax year 2026 from the recent date',
         !!modalJob && modalJob.tax_year === 2026 && modalJob.gross_basis === 'period', JSON.stringify(modalJob));
-      // Edit: add a mid-year raise and a bonus, then save.
+      // Edit: the modal pre-fills the simplified fields; rows live
+      // on the detail page only now, so the raise + bonus go through
+      // the detail panels (same PUT shape, same re-derivation).
       // (Cards carry no buttons now: click into the detail page and
       // use its header Edit button, same shared modal.)
       await page.evaluate(() => {
@@ -6887,27 +6894,65 @@ try {
           return f.employer.value === 'Derived Corp' && f.start_date.value === '2026-01-05'
             && f.recent_pay_value.value === '3,000';
         }));
-      await page.click('#earnJobPayChangeAddBtn');
-      await page.click('#earnJobPayChangeAddBtn');
-      await page.click('#earnJobBonusAddBtn');
       await page.evaluate(() => {
-        const pcs = [...document.querySelectorAll('#earnJobPayChangeRows > div')];
-        pcs[0].querySelector('[data-pc-date]').value = '2026-01-05';
-        pcs[0].querySelector('[data-pc-value]').value = '2500';
-        pcs[1].querySelector('[data-pc-date]').value = '2026-06-01';
-        pcs[1].querySelector('[data-pc-value]').value = '3000';
-        const b = document.querySelector('#earnJobBonusRows > div');
-        b.querySelector('[data-bonus-date]').value = '2026-06-30';
-        b.querySelector('[data-bonus-amount]').value = '5000';
+        [...document.querySelectorAll('#earnJobModal button')].find((b) => b.textContent.trim() === 'Cancel').click();
       });
-      await page.click('#earnJobModal button[type=submit]');
+      await wait(300);
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-01-05';
+        f.row_value.value = '2500';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      await wait(900);
+      await page.click('#earnJobDetailAddPayChange');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-06-01';
+        f.row_value.value = '3000';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
+      await wait(900);
+      await page.click('#earnJobDetailAddBonus');
+      await wait(300);
+      await page.evaluate(() => {
+        const f = document.querySelector('#earnJobRowForm');
+        f.row_date.value = '2026-06-30';
+        f.row_value.value = '5000';
+      });
+      await page.click('#earnJobRowForm button[type=submit]');
       await wait(900);
       const modalJob2 = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.employer === 'Derived Corp');
-      check('raise + bonus save: YTD re-derives, annual includes the bonus, per-period rate does not',
+      check('raise + bonus from detail: YTD re-derives, annual includes the bonus, per-period rate does not',
         !!modalJob2 && modalJob2.ytd_cpp === 3175.24 && modalJob2.calc.annualGross === 83000
         && modalJob2.calc.perPeriod.gross === 3000 && modalJob2.bonus_total === 5000, JSON.stringify(modalJob2));
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await wait(900);
       check('the card now shows annual $83,000.00',
         await until(() => document.querySelector('#earnJobList').textContent.includes('$83,000.00')));
+      // A simplified-form edit must NOT touch the child rows: the
+      // form carries no row sections, so its PUT carries neither
+      // side and the server leaves them alone.
+      await page.evaluate(() => {
+        const card = document.querySelector('.earn-job-card');
+        if (card) card.click();
+      });
+      await wait(900);
+      await until(() => {
+        const d = document.querySelector('#earnJobDetail');
+        return d && !d.classList.contains('hidden') && !!document.querySelector('#earnJobDetailEditBtn');
+      });
+      await page.click('#earnJobDetailEditBtn');
+      await wait(300);
+      await page.click('#earnJobModal button[type=submit]');
+      await wait(900);
+      const modalJob3 = (await req('GET', '/api/earnings')).data.jobs.find((j) => j.employer === 'Derived Corp');
+      check('editing through the simplified form preserves pay changes and bonuses',
+        !!modalJob3 && modalJob3.pay_changes.length === 2 && modalJob3.bonuses.length === 1
+        && modalJob3.bonus_total === 5000 && modalJob3.calc.annualGross === 83000, JSON.stringify(modalJob3));
       // An old-form job still renders and computes.
       r = await req('POST', '/api/earnings/jobs', {
         employer: 'Legacy Corp', province: 'BC', frequency: 'annual',
