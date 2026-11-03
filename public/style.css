@@ -249,6 +249,9 @@ td.num, th.num { text-align: right; }
 .section-head { display: flex; align-items: center; gap: 10px; }
 .section-head h2 { margin: 4px 0 10px; }
 .section-head .spacer { flex: 1; }
+/* Strategy detail header: tools sit at the right edge (same pattern
+   as the project header), title stays left. */
+#planStrategyHeaderTools { margin-left: auto; }
 /* Properties list head: inset to the Portfolio panel's content edges
    (the panel's 1px border + 16px padding) so the title and the
    + Add property button line up with the panel content below, and

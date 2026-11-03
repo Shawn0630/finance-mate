@@ -11407,7 +11407,7 @@ function planProjectHtml(d) {
       <div class="plan-flow-grid" id="planFlowGrid">
       <div class="plan-flow-tier" id="planScenarioCardsPanel">
       <div class="section-head"><h3>Scenarios</h3>
-        <div class="toolbar"><button class="small" id="planAiScenarioBtn">Design with AI</button><button class="primary" id="planAddScenarioBtn">+ Add scenario</button></div>
+        <div class="toolbar"><button class="small" id="planAiScenarioBtn">Design with AI</button><button class="small primary" id="planAddScenarioBtn">+ Add scenario</button></div>
       </div>
       <div id="planScenarioCards"></div>
       </div>
@@ -11420,7 +11420,7 @@ function planProjectHtml(d) {
       </div>
       <div class="plan-flow-group" id="planStrategiesPanel">
       <div class="section-head"><h3>Strategies</h3>
-        <div class="toolbar"><button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
+        <div class="toolbar"><button class="small primary" id="planAddStrategyBtn">+ Add strategy</button></div>
       </div>
       <div id="planStrategyCardsWorld"></div>
       <div id="planStrategyCards"></div>
@@ -11428,7 +11428,7 @@ function planProjectHtml(d) {
       </div>
       <div class="plan-flow-tier" id="planReportsPanel">
       <div class="section-head"><h3>Reports</h3>
-        <div class="toolbar"><button class="primary" id="planFlowGenerateBtn">Generate report</button><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
+        <div class="toolbar"><button class="small primary" id="planFlowGenerateBtn">Generate report</button><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
       </div>
       <div class="note" id="planFlowGenerateNote"></div>
       <div id="planReportList"></div>
@@ -12451,9 +12451,11 @@ async function loadPlanReport(projectId, reportId) {
       throw err;
     }
     // Strategy filter: only the report's picked strategies render.
+    // Null pins (legacy, never pinned) still mean all strategies;
+    // an explicit empty pin [] means baseline-only, not all.
     let pickedIds = null;
     try { pickedIds = report.strategy_ids ? JSON.parse(report.strategy_ids) : null; } catch { pickedIds = null; }
-    if (pickedIds && pickedIds.length) {
+    if (pickedIds) {
       const kept = comp.strategies.filter((row) => pickedIds.includes(row.strategy.id));
       const allTrajs = (comp.report && comp.report.trajectories) || [];
       // Trajectories are baseline first, then one per strategy in rows order.
@@ -12630,7 +12632,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
-        <div class="toolbar"><button class="primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div>
+        <div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div>
         <div class="note" id="planReportTabNote"></div>
         <div class="msg" id="planReportMsg"></div>
       </div>
@@ -12663,6 +12665,16 @@ async function loadPlanReport(projectId, reportId) {
         breakdownWrapSel: '#planReportComparePanel .plan-traj-breakdown-wrap',
         master: '#planReportMergedTable',
         picker: '#planReportComparePicker', merged: '#planReportMergedTable', ctx: { block: null, appleIds: null },
+        // Removing a pinned strategy rewrites the report's pins from
+        // the rendered set (which equals the pins when pins exist)
+        // and reloads, so routing recomputes from the remaining pins.
+        onRemoveStrategy: async (sid) => {
+          try {
+            const remaining = comp.strategies.map((r) => r.strategy.id).filter((x) => x !== sid);
+            await api(`/api/planning/reports/${reportId}`, { method: 'PUT', body: { strategy_ids: remaining } });
+            loadPlanReport(projectId, reportId);
+          } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
+        },
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
     planReportTabsWire(projectId, reportId);
@@ -12786,7 +12798,7 @@ function planStrategyHtml(d) {
         <div class="toolbar" id="planStrategyHeaderTools">
           ${s.merged
             ? '<button class="small" id="planRevertBtn">Revert merge</button>'
-            : '<button class="primary" id="planMergeBtn">Merge</button>'}
+            : '<button class="small primary" id="planMergeBtn">Merge</button>'}
           <button class="small" id="planStrategyRenameBtn">Edit</button>
           <button class="small danger" id="planStrategyDeleteBtn">Delete</button>
         </div>
@@ -13641,15 +13653,31 @@ function planCompareNewRender(block, ids) {
   }
   // Strategy picker: horizontal toggle chips at the panel top. One
   // picker drives the difference chart, the breakdown bars and the
-  // merged table.
+  // merged table. Report view only: each pinned chip also carries a
+  // × that removes the strategy from the report's pins (PUT +
+  // reload) — persistent, unlike the chip toggle, which only hides
+  // it from this view. The project page has no report, so its chips
+  // stay toggle-only.
   const picker = $(t.picker);
   if (picker) {
-    picker.innerHTML = block.strategies.map((r) => `<button class="small plan-pick-chip${t.getAppleIds().includes(r.strategy.id) ? ' active' : ''}" data-plan-apple="${r.strategy.id}" aria-pressed="${t.getAppleIds().includes(r.strategy.id) ? 'true' : 'false'}">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</button>`).join(' ');
+    const removable = typeof t.onRemoveStrategy === 'function';
+    picker.innerHTML = block.strategies.map((r) => {
+      const chip = `<button class="small plan-pick-chip${t.getAppleIds().includes(r.strategy.id) ? ' active' : ''}" data-plan-apple="${r.strategy.id}" aria-pressed="${t.getAppleIds().includes(r.strategy.id) ? 'true' : 'false'}">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</button>`;
+      return removable
+        ? `<span class="plan-pick-chipwrap">${chip} <button class="small plan-pick-remove" data-plan-remove="${r.strategy.id}" title="Remove from report">×</button></span>`
+        : chip;
+    }).join(' ');
     picker.querySelectorAll('[data-plan-apple]').forEach((b) => b.addEventListener('click', () => {
       const id = Number(b.dataset.planApple);
       const cur = t.getAppleIds();
       t.setAppleIds(cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
       planCompareNewRender(block, ids);
+    }));
+    if (removable) picker.querySelectorAll('[data-plan-remove]').forEach((b) => b.addEventListener('click', () => {
+      const id = Number(b.dataset.planRemove);
+      const row = block.strategies.find((r) => r.strategy.id === id);
+      if (!row) return;
+      if (confirm(`Remove ${row.strategy.letter} · ${row.strategy.name} from this report?`)) t.onRemoveStrategy(id);
     }));
   }
   planMergedRender(t);
@@ -14707,7 +14735,7 @@ async function openPlanStrategyModal(projectId) {
       <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
       ${list.length ? `<div><label>Saved template *</label><select id="planSavedTemplateSel">${list.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>
       <div id="planSavedTemplateQs"></div>
-      <div class="toolbar"><button class="primary" id="planSavedTemplateApply">Apply template</button><button class="small" id="planSavedTemplateRefine">Refine with AI</button></div>`
+      <div class="toolbar"><button class="small primary" id="planSavedTemplateApply">Apply template</button><button class="small" id="planSavedTemplateRefine">Refine with AI</button></div>`
         : '<div class="note">No saved templates yet.</div>'}`;
       const sel = $('#planSavedTemplateSel');
       const backBtn = $('#planBackToPresets');

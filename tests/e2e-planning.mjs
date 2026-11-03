@@ -4579,6 +4579,169 @@ export async function run(H, S) {
       }), fRep2Id);
       H.check('reporttab: old report deep link lands on the project page with the tab open',
         deepLink.hash === `#planning/project/${fProjectId}` && deepLink.tab && deepLink.blocks.includes('Second balance'), JSON.stringify(deepLink));
+      // UI bundle: remove-a-strategy-from-report + small toolbar
+      // buttons + right-aligned strategy header.
+      const ubDef = { strategies: [fStratId, fAiStratId], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] };
+      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'UI bundle report', definition: ubDef, strategy_ids: [fStratId, fAiStratId], scenario_ids: [fScenId] });
+      H.check('uibundle: two-strategy report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const ubRepId = r.data.report.id;
+      // Diagnostic first: the exact comparison call the viewer will
+      // make for this report (null baseline + scenario pin). If this
+      // fails, the viewer cannot open the report at all.
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}/comparison?scenarioIds=${fScenId}`);
+      H.check('uibundle: viewer comparison endpoint answers for this report', r.status === 200 && Array.isArray(r.data.scenarioBlocks), JSON.stringify({ status: r.status, blocks: r.data && r.data.scenarioBlocks ? r.data.scenarioBlocks.length : null, err: r.data && r.data.error }));
+      // The report list in the DOM predates this API-created report,
+      // so leave and come back for a fresh list before opening it.
+      // Open fail-soft (30s + viewer-state dump): a slow viewer must
+      // fail the pin with diagnostics, never abort the module. The
+      // card click can lose a seq race to the project page's restore
+      // load (loadPlanProject awaits loadPlanComparison before it
+      // restores the current tab): if the tab has not appeared 10s
+      // after the first click, click again — the retry starts after
+      // the restore finished, so it wins. If both clicks fail, the
+      // deep link distinguishes a click-path fault from a load fault.
+      const openUb = async () => {
+        const clickCard = async () => { await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, ubRepId); };
+        await clickCard();
+        let via = 'card';
+        try {
+          await page.waitForFunction((id) => [...document.querySelectorAll('[data-plan-report-tab]')].some((t) => t.dataset.planReportTab === String(id)), { timeout: 10000 }, ubRepId);
+        } catch { await clickCard(); }
+        try {
+          await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 30000 });
+        } catch {
+          via = 'none';
+          await page.goto(`http://ff.local/#planning/report/${fProjectId}/${ubRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+          try {
+            await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+            via = 'deeplink';
+          } catch { /* state check below carries the diagnosis */ }
+        }
+        return { opened: via !== 'none', via, ...(await page.evaluate(() => ({
+          tabs: [...document.querySelectorAll('[data-plan-report-tab]')].map((t) => t.dataset.planReportTab),
+          blocks: [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent),
+          viewerHead: (document.querySelector('#planReport')?.textContent || '').slice(0, 200),
+        }))) };
+      };
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const ubOpen = await openUb();
+      H.check('uibundle: UI bundle report opens with its Mortgage balance block', ubOpen.opened && ubOpen.blocks.includes('Mortgage balance'), JSON.stringify(ubOpen));
+      const ubBefore = await page.evaluate(() => ({
+        removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
+        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
+        note: document.querySelector('#planReportTabNote')?.textContent || '',
+        cols: document.querySelectorAll('#planReportMergedTable thead th').length,
+      }));
+      H.check('uibundle: report picker shows a remove control per pinned strategy and AI pin disables preset Generate',
+        ubBefore.removes.length === 2 && ubBefore.removes.includes(fStratId) && ubBefore.removes.includes(fAiStratId)
+          && ubBefore.genDisabled && ubBefore.note.includes('AI-designed') && ubBefore.note.includes('strategy') && ubBefore.cols === 4,
+        JSON.stringify(ubBefore));
+      // Remove the AI strategy: routing recomputes from the
+      // remaining pins (preset Generate re-enables) and the
+      // comparison drops to one strategy column.
+      await page.evaluate((id) => { document.querySelector(`#planReportComparePicker [data-plan-remove="${id}"]`).click(); }, fAiStratId);
+      await page.waitForFunction(() => document.querySelectorAll('#planReportComparePicker [data-plan-remove]').length === 1, { timeout: 30000 });
+      const ubAfter = await page.evaluate(() => ({
+        removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
+        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
+        note: document.querySelector('#planReportTabNote')?.textContent || '',
+        cols: document.querySelectorAll('#planReportMergedTable thead th').length,
+        subtitle: document.querySelector('#planReport .plan-report-subtitle')?.textContent || '',
+      }));
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const ubRow = (r.data.reports || []).find((x) => x.id === ubRepId);
+      H.check('uibundle: removing one strategy persists in pins, re-enables preset Generate, and narrows the comparison',
+        ubAfter.removes.length === 1 && ubAfter.removes[0] === fStratId && !ubAfter.genDisabled && ubAfter.note === ''
+          && ubAfter.cols === 3 && ubAfter.subtitle.includes('Flow prepay') && !ubAfter.subtitle.includes('Flow AI strategy')
+          && !!ubRow && JSON.stringify(JSON.parse(ubRow.strategy_ids)) === JSON.stringify([fStratId]),
+        JSON.stringify({ ubAfter, pins: ubRow && ubRow.strategy_ids }));
+      // Close + reopen: the removal stays gone.
+      await page.waitForSelector(`[data-plan-report-tab-close="${ubRepId}"]`, { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${ubRepId}"]`);
+      await waitF(1000);
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const ubReopenOpen = await openUb();
+      H.check('uibundle: removed report reopens with its Mortgage balance block', ubReopenOpen.opened && ubReopenOpen.blocks.includes('Mortgage balance'), JSON.stringify(ubReopenOpen));
+      const ubReopen = await page.evaluate(() => ({
+        removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
+        cols: document.querySelectorAll('#planReportMergedTable thead th').length,
+      }));
+      H.check('uibundle: removed strategy stays gone after close + reopen',
+        ubReopen.removes.length === 1 && ubReopen.removes[0] === fStratId && ubReopen.cols === 3, JSON.stringify(ubReopen));
+      // Last-strategy removal: the server sets no minimum, so the
+      // report becomes baseline-only (pins []) rather than blocking.
+      await page.evaluate((id) => { document.querySelector(`#planReportComparePicker [data-plan-remove="${id}"]`).click(); }, fStratId);
+      await page.waitForFunction(() => (document.querySelector('#planReport .plan-report-subtitle')?.textContent || '').includes('Strategies: None'), { timeout: 30000 });
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const ubRow0 = (r.data.reports || []).find((x) => x.id === ubRepId);
+      const ubEmpty = await page.evaluate(() => ({
+        removes: document.querySelectorAll('#planReportComparePicker [data-plan-remove]').length,
+        subtitle: document.querySelector('#planReport .plan-report-subtitle')?.textContent || '',
+      }));
+      H.check('uibundle: removing the last strategy leaves a baseline-only report (pins [])',
+        ubEmpty.removes === 0 && ubEmpty.subtitle.includes('Strategies: None') && !!ubRow0 && JSON.stringify(JSON.parse(ubRow0.strategy_ids)) === JSON.stringify([]),
+        JSON.stringify({ ubEmpty, pins: ubRow0 && ubRow0.strategy_ids }));
+      // Report viewer tab buttons are small (still on the report view).
+      const ubViewer = await page.evaluate(() => ({
+        genSmall: !!document.querySelector('#planReportTabGenerateBtn.small'),
+        aiSmall: !!document.querySelector('#planReportTabAiBtn.small'),
+        saveSmall: !!document.querySelector('#planReportTabSaveBtn.small'),
+      }));
+      H.check('uibundle: report viewer tab buttons are small',
+        ubViewer.genSmall && ubViewer.aiSmall && ubViewer.saveSmall, JSON.stringify(ubViewer));
+      // Project-page comparison chips stay toggle-only (no report),
+      // and the tier buttons are small.
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => document.querySelectorAll('#planComparePicker [data-plan-apple]').length > 0, { timeout: 15000 });
+      const ubProj = await page.evaluate(() => ({
+        chips: document.querySelectorAll('#planComparePicker [data-plan-apple]').length,
+        removes: document.querySelectorAll('#planComparePicker [data-plan-remove]').length,
+        small: ['planFlowGenerateBtn', 'planAddScenarioBtn', 'planAddStrategyBtn'].map((id) => !!document.querySelector(`#${id}.small`)),
+      }));
+      H.check('uibundle: project comparison chips have no remove control and tier buttons are small',
+        ubProj.chips > 0 && ubProj.removes === 0 && ubProj.small.every(Boolean), JSON.stringify(ubProj));
+      // Saved-template form: Apply template is small.
+      r = await H.req('POST', '/api/planning/templates', { name: 'UI bundle template', spec: fAiModelDef, metadata_schema: [], metadata_answers: {} });
+      H.check('uibundle: saved template created', r.status === 201 && r.data.template && r.data.template.id > 0, JSON.stringify(r.data));
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAddStrategyBtn');
+      // Saved templates live inside the AI fallback screen of the
+      // preset chooser (Add → AI design → From saved template).
+      await page.waitForSelector('#planChooseAi', { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planChooseAi');
+      await page.waitForSelector('#planChooseSaved', { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planChooseSaved');
+      await page.waitForSelector('#planSavedTemplateApply', { timeout: 15000 });
+      const ubTpl = await page.evaluate(() => ({
+        applySmall: !!document.querySelector('#planSavedTemplateApply.small'),
+        refineSmall: !!document.querySelector('#planSavedTemplateRefine.small'),
+      }));
+      H.check('uibundle: saved-template Apply/Refine buttons are small',
+        ubTpl.applySmall && ubTpl.refineSmall, JSON.stringify(ubTpl));
+      await page.evaluate(() => { document.querySelector('[data-close-modal]')?.click(); });
+      await waitF(500);
+      // Strategy detail header: Merge is small and the tools sit at
+      // the right edge (title left, tools right, small panel gap).
+      await page.goto(`http://ff.local/#planning/strategy/${fStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('#planStrategyHeaderTools', { timeout: 15000 });
+      const ubStrat = await page.evaluate(() => {
+        const tools = document.querySelector('#planStrategyHeaderTools');
+        const title = document.querySelector('#planStrategyTitle');
+        const panel = tools ? tools.closest('.panel') : null;
+        const tr = tools ? tools.getBoundingClientRect() : null;
+        const pr = panel ? panel.getBoundingClientRect() : null;
+        const tir = title ? title.getBoundingClientRect() : null;
+        return {
+          mergeSmall: !!document.querySelector('#planMergeBtn.small'),
+          rightGap: (tr && pr) ? Math.round(pr.right - tr.right) : null,
+          toolsAfterTitle: (tr && tir) ? tr.left > tir.right : null,
+        };
+      });
+      H.check('uibundle: strategy header Merge is small and tools sit at the right edge',
+        ubStrat.mergeSmall && ubStrat.rightGap != null && ubStrat.rightGap <= 32 && ubStrat.toolsAfterTitle === true, JSON.stringify(ubStrat));
     } finally { await browserF.close(); }
   }
 }
