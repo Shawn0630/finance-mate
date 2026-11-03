@@ -768,6 +768,7 @@ CREATE TABLE IF NOT EXISTS plan_scenarios (
   magnitude REAL,                      -- total prime move, percentage points
   steps TEXT,                          -- JSON [{date, rate}] for custom scenarios; NULL = preset steps
   is_base INTEGER NOT NULL DEFAULT 0, -- the project's default scenario
+  source TEXT,                         -- 'ai' = AI-designed; NULL = engine/manual (legacy rows)
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -926,6 +927,12 @@ CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strateg
   const planScenCols = db.prepare('PRAGMA table_info(plan_scenarios)').all().map((c) => c.name);
   if (planScenCols.length && !planScenCols.includes('factors')) {
     db.exec('ALTER TABLE plan_scenarios ADD COLUMN factors TEXT');
+  }
+  // Vertical-flow routing (2026-11-02): scenarios gain a source
+  // marker so the flow can tell AI-designed worlds from engine ones
+  // (legacy rows stay NULL = engine).
+  if (planScenCols.length && !planScenCols.includes('source')) {
+    db.exec('ALTER TABLE plan_scenarios ADD COLUMN source TEXT');
   }
   if (planStratCols.length && !planStratCols.includes('sink')) {
     db.exec('ALTER TABLE plan_strategies ADD COLUMN sink TEXT');

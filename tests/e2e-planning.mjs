@@ -3863,32 +3863,39 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/project/${wProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitW(1500);
       const flow = await page.evaluate(() => {
-        const grid = document.querySelector('#planFlowGrid');
+        const mid = document.querySelector('#planFlowMidTier');
+        const tiers = [...document.querySelectorAll('#planFlowGrid > .plan-flow-tier')];
         const card = document.querySelector('#planFlowGrid .plan-flow-card');
         const selBtn = document.querySelector('[data-plan-scenario-select][aria-pressed="true"]');
         const selCard = selBtn ? selBtn.closest('.card') : null;
-        const paths = [...document.querySelectorAll('#planFlowSvg path')].map((p) => ({ line: p.dataset.flowLine, from: p.dataset.flowFrom, to: p.dataset.flowTo }));
+        const paths = [...document.querySelectorAll('#planFlowSvg path')].map((p) => ({ line: p.dataset.flowLine, from: p.dataset.flowFrom, to: p.dataset.flowTo, d: p.getAttribute('d') || '', fill: getComputedStyle(p).fill }));
         return {
           panel: !!document.querySelector('#planFlowPanel'),
-          cols: [...document.querySelectorAll('#planFlowGrid .plan-flow-col')].map((c) => c.id),
-          tracks: grid ? getComputedStyle(grid).gridTemplateColumns.split(' ').length : 0,
+          tiers: tiers.map((c) => c.id),
+          tierTops: tiers.map((c) => c.getBoundingClientRect().top),
+          midGroups: [...document.querySelectorAll('#planFlowMidTier > .plan-flow-group')].map((c) => c.id),
+          midTracks: mid ? getComputedStyle(mid).gridTemplateColumns.split(' ').length : 0,
           cardPadTop: card ? getComputedStyle(card).paddingTop : '',
           selScen: selBtn ? Number(selBtn.dataset.planScenarioSelect) : null,
           selCard: !!selCard && selCard.classList.contains('plan-selected'),
           selBorder: selCard ? getComputedStyle(selCard).borderColor : '',
           selPaths: paths.filter((p) => p.line === 'sel'),
           repPaths: paths.filter((p) => p.line === 'report'),
+          allPaths: paths,
         };
       });
-      H.check('wiring: flow panel lays out four columns with tightened cards and a selected base scenario',
-        flow.panel && JSON.stringify(flow.cols) === JSON.stringify(['planScenarioCardsPanel', 'planBaselineCardsPanel', 'planStrategiesPanel', 'planReportsPanel'])
-          && flow.tracks === 4 && flow.cardPadTop === '12px' && flow.selScen === wScen1 && flow.selCard && flow.selBorder === 'rgb(22, 104, 196)',
+      H.check('wiring: flow panel lays out three tiers with tightened cards and a selected base scenario',
+        flow.panel && JSON.stringify(flow.tiers) === JSON.stringify(['planScenarioCardsPanel', 'planFlowMidTier', 'planReportsPanel'])
+          && flow.tierTops[0] < flow.tierTops[1] && flow.tierTops[1] < flow.tierTops[2]
+          && JSON.stringify(flow.midGroups) === JSON.stringify(['planBaselineCardsPanel', 'planStrategiesPanel'])
+          && flow.midTracks === 2 && flow.cardPadTop === '12px' && flow.selScen === wScen1 && flow.selCard && flow.selBorder === 'rgb(22, 104, 196)',
         JSON.stringify(flow));
-      H.check('wiring: connector lines draw selection + stored report pins',
+      H.check('wiring: connector lines draw selection + stored report pins as strokes',
         flow.selPaths.some((p) => p.from === `scenario:${wScen1}` && p.to === `strategy:${wStrategyId}`)
-          && flow.repPaths.some((p) => p.from === `report:${wRepId}` && p.to === `scenario:${wScen1}`)
-          && flow.repPaths.some((p) => p.from === `report:${wRepId}` && p.to === `baseline:${wBaseId}`)
-          && flow.repPaths.some((p) => p.from === `report:${wRepId}` && p.to === `strategy:${wStrategyId}`),
+          && flow.repPaths.some((p) => p.from === `baseline:${wBaseId}` && p.to === `report:${wRepId}`)
+          && flow.repPaths.some((p) => p.from === `strategy:${wStrategyId}` && p.to === `report:${wRepId}`)
+          && !flow.allPaths.some((p) => p.to.startsWith('scenario:'))
+          && flow.allPaths.every((p) => p.fill === 'none' && (p.d.match(/L/g) || []).length === 3),
         JSON.stringify(flow));
       await page.click(`[data-plan-scenario-select="${wScen2}"]`);
       await waitW(1200);
@@ -3946,7 +3953,7 @@ export async function run(H, S) {
       const gone = await page.evaluate((s2, r2) => ({
         repCard: !!document.querySelector(`[data-plan-report="${r2}"]`),
         scenCard: !!document.querySelector(`[data-plan-scenario="${s2}"]`),
-        dangling: [...document.querySelectorAll('#planFlowSvg path')].some((p) => p.dataset.flowTo === `scenario:${s2}`),
+        dangling: [...document.querySelectorAll('#planFlowSvg path')].some((p) => p.dataset.flowFrom === `scenario:${s2}` || p.dataset.flowTo === `scenario:${s2}`),
       }), wScen2, wRep2Id);
       H.check('wiring: report pinned to a deleted scenario draws no line to it',
         gone.repCard && !gone.scenCard && !gone.dangling, JSON.stringify(gone));
@@ -3956,26 +3963,340 @@ export async function run(H, S) {
         node: !!document.querySelector('#planFlowFlatNode'),
         nodeText: document.querySelector('#planFlowFlatNode')?.textContent || '',
         repTag: document.querySelector(`[data-plan-report="${fr}"]`)?.textContent || '',
-        flatLine: [...document.querySelectorAll('#planFlowSvg path')].some((p) => p.dataset.flowTo === 'flat'),
+        repPaths: [...document.querySelectorAll('#planFlowSvg path')].filter((p) => p.dataset.flowLine === 'report').map((p) => ({ from: p.dataset.flowFrom, to: p.dataset.flowTo })),
       }), wFlatRepId);
-      H.check('wiring: scenario-less project shows a flat-world node with a flat report line',
-        flat.node && flat.nodeText.includes('Current rates (no scenario)') && flat.repTag.includes('Flat world') && flat.flatLine,
+      H.check('wiring: scenario-less project shows a flat-world node with an Under note and no unpinned lines',
+        flat.node && flat.nodeText.includes('Current rates (no scenario)') && flat.repTag.includes('Flat world') && flat.repTag.includes('Under Current rates (no scenario)') && flat.repPaths.length === 0,
         JSON.stringify(flat));
       await page.goto(`http://ff.local/#planning/project/${wProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitW(1500);
       await page.setViewport({ width: 700, height: 900 });
       await waitW(800);
       const narrow = await page.evaluate(() => {
-        const grid = document.querySelector('#planFlowGrid');
+        const mid = document.querySelector('#planFlowMidTier');
         return {
-          tracks: grid ? getComputedStyle(grid).gridTemplateColumns.split(' ').length : 0,
+          tracks: mid ? getComputedStyle(mid).gridTemplateColumns.split(' ').length : 0,
           paths: document.querySelectorAll('#planFlowSvg path').length,
         };
       });
-      H.check('wiring: narrow viewport stacks columns without breaking lines',
+      H.check('wiring: narrow viewport stacks the middle row without breaking lines',
         narrow.tracks === 1 && narrow.paths > 0, JSON.stringify(narrow));
       await page.setViewport({ width: 1500, height: 900 });
     } finally { await browserW.close(); }
+  }
+
+  // ------------------------------------------- project vertical flow
+  // Three tiers (scenario → baseline+strategy row → reports),
+  // vertical elbow lines, one-click Generate, multi-tab reports,
+  // AI routing, AI vs preset titles.
+  r = await H.req('POST', '/api/planning/projects', { name: 'Flow test', question: 'Flow pins' });
+  H.check('flow: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const fProjectId = r.data.project.id;
+  r = await H.req('POST', '/api/properties', {
+    address: '77 Flow Lane, Victoria, BC',
+    mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  H.check('flow: property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const fPropId = r.data.id;
+  r = await H.req('POST', `/api/properties/${fPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  H.check('flow: rate segment added', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${fProjectId}/strategies`, { name: 'Flow prepay', source: 'template' });
+  H.check('flow: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const fStratId = r.data.strategy.id;
+  const _fNow = new Date();
+  const _fNext = new Date(Date.UTC(_fNow.getUTCFullYear(), _fNow.getUTCMonth() + 1, 1));
+  r = await H.req('POST', `/api/planning/strategies/${fStratId}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: fPropId, date: _fNext.toISOString().slice(0, 10), amount: 10000, openClosed: 'open' },
+  });
+  H.check('flow: prepay op added', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${fProjectId}/scenarios`, { name: 'Flow world' });
+  H.check('flow: scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const fScenId = r.data.scenario.id;
+  r = await H.req('POST', `/api/planning/projects/${fProjectId}/baselines`, { name: 'Flow baseline', source: 'manual', definition: { description: 'Flow base path' } });
+  H.check('flow: baseline created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
+  const fBaseId = r.data.baseline.id;
+  r = await H.req('POST', `/api/planning/projects/${fProjectId}/baselines`, { name: 'Flow AI baseline', source: 'ai', definition: { description: 'AI base path' } });
+  H.check('flow: AI baseline created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
+  const fAiBaseId = r.data.baseline.id;
+  r = await H.req('POST', `/api/planning/projects/${fProjectId}/scenarios`, { name: 'Flow AI world', source: 'ai' });
+  H.check('flow: AI scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const fAiScenId = r.data.scenario.id;
+  r = await H.req('POST', `/api/planning/projects/${fProjectId}/strategies`, { name: 'Flow AI strategy', source: 'manual' });
+  H.check('flow: AI strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const fAiStratId = r.data.strategy.id;
+  const fAiModelDef = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [{ key: 'stockReturnPct', value: 5, source: 'user' }], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
+  fs.writeFileSync(H.aiStubFile, JSON.stringify(fAiModelDef));
+  r = await H.req('POST', `/api/planning/strategies/${fAiStratId}/ai-model`, { text: 'Model interest', name: 'Flow interest model' });
+  H.check('flow: ai-model saved', r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
+  r = await H.req('PUT', `/api/planning/strategies/${fAiStratId}`, { model_id: r.data.model.id });
+  H.check('flow: model attached to AI strategy', r.status === 200, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+  const fStrat = (r.data.strategies || []).find((s) => s.id === fStratId);
+  const fAiStrat = (r.data.strategies || []).find((s) => s.id === fAiStratId);
+  const fScen = (r.data.scenarios || []).find((s) => s.id === fScenId);
+  const fBase = (r.data.project.baselines || []).find((b) => b.id === fBaseId);
+  const fAiBase = (r.data.project.baselines || []).find((b) => b.id === fAiBaseId);
+  const fAiScen = (r.data.scenarios || []).find((s) => s.id === fAiScenId);
+  H.check('flow: project GET marks AI-designed entities only',
+    !!fStrat && !!fAiStrat && fAiStrat.modelSource === 'ai' && fStrat.modelSource !== 'ai'
+      && !!fScen && !!fAiScen && fAiScen.source === 'ai' && fScen.source !== 'ai'
+      && !!fBase && !!fAiBase && fAiBase.source === 'ai' && fBase.source !== 'ai',
+    JSON.stringify({ fStrat, fAiStrat, fScen, fAiScen, fBase, fAiBase }));
+  const fLetter = fStrat ? fStrat.letter : 'A';
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('flow browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardF = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResF = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueF = loginResF.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserF = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserF.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardF({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueF, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitF = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      // Tier order + vertical elbows + no crossing jog.
+      const tiers = await page.evaluate(() => {
+        const ts = [...document.querySelectorAll('#planFlowGrid > .plan-flow-tier')];
+        const cards = [...document.querySelectorAll('#planFlowGrid .plan-flow-card')].map((c) => { const b = c.getBoundingClientRect(); return { left: b.left, right: b.right, top: b.top, bottom: b.bottom }; });
+        const paths = [...document.querySelectorAll('#planFlowSvg path')].map((p) => {
+          const d = p.getAttribute('d') || '';
+          const nums = d.replace(/[ML]/g, ' ').trim().split(/\s+/).map(Number);
+          return { line: p.dataset.flowLine, from: p.dataset.flowFrom, to: p.dataset.flowTo, fill: getComputedStyle(p).fill, pts: nums };
+        });
+        return { tops: ts.map((t) => t.getBoundingClientRect().top), ids: ts.map((t) => t.id), cards, paths };
+      });
+      const jogCrosses = tiers.paths.some((p) => {
+        // Vertical elbow: M x1 y1 L x1 mid L x2 mid L x2 y2 — the only
+        // horizontal segment is the mid jog; it must not overlap any
+        // card body (vertical containment + horizontal overlap).
+        if (p.pts.length !== 8) return true;
+        const [, , , , mid, x2, ,] = p.pts;
+        const x1 = p.pts[0];
+        const lo = Math.min(x1, x2);
+        const hi = Math.max(x1, x2);
+        return tiers.cards.some((c) => c.top + 2 < mid && mid < c.bottom - 2 && Math.min(c.right, hi) - Math.max(c.left, lo) > 1);
+      });
+      H.check('flow: tiers stack scenario above baseline+strategy row above reports',
+        JSON.stringify(tiers.ids) === JSON.stringify(['planScenarioCardsPanel', 'planFlowMidTier', 'planReportsPanel'])
+          && tiers.tops[0] < tiers.tops[1] && tiers.tops[1] < tiers.tops[2], JSON.stringify(tiers));
+      H.check('flow: connector lines are vertical elbows with no fill',
+        tiers.paths.length > 0 && tiers.paths.every((p) => p.fill === 'none' && p.pts.length === 8), JSON.stringify(tiers.paths));
+      H.check('flow: no connector jog crosses a card body', !jogCrosses, JSON.stringify(tiers.paths));
+      // Guard: baseline is not picked yet (only the base scenario is).
+      // Deselect the AI strategy first, or the routing rule (not the
+      // guard) would own the button state from here on.
+      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await waitF(800);
+      const guard0 = await page.evaluate(() => ({
+        disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
+        note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
+      }));
+      H.check('flow: missing-pick guard names the missing baseline',
+        guard0.disabled && guard0.note.includes('a baseline'), JSON.stringify(guard0));
+      await page.click(`[data-plan-baseline-select="${fBaseId}"]`);
+      await waitF(800);
+      const guard1 = await page.evaluate(() => ({
+        disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
+        note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
+      }));
+      H.check('flow: guard clears once scenario + baseline + strategy are picked',
+        !guard1.disabled && guard1.note === '', JSON.stringify(guard1));
+      // Selection alone creates no report.
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const repCount0 = (r.data.reports || []).length;
+      await page.click(`[data-plan-strategy-select="${fStratId}"]`);
+      await waitF(800);
+      await page.click(`[data-plan-strategy-select="${fStratId}"]`);
+      await waitF(800);
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      H.check('flow: selection alone creates no report',
+        (r.data.reports || []).length === repCount0, JSON.stringify((r.data.reports || []).map((x) => x.name)));
+      // Select-button selection vs card-click navigation, on the
+      // strategy card: Select toggles the highlight, the card body
+      // navigates to the detail page.
+      await page.click(`[data-plan-strategy-select="${fStratId}"]`);
+      await waitF(500);
+      const selOff = await page.evaluate((sid) => ({
+        pressed: document.querySelector(`[data-plan-strategy-select="${sid}"]`)?.getAttribute('aria-pressed'),
+        sel: !!document.querySelector(`[data-plan-strategy="${sid}"]`)?.classList.contains('plan-selected'),
+      }), fStratId);
+      await page.click(`[data-plan-strategy-select="${fStratId}"]`);
+      await waitF(500);
+      const selOn = await page.evaluate((sid) => ({
+        pressed: document.querySelector(`[data-plan-strategy-select="${sid}"]`)?.getAttribute('aria-pressed'),
+        sel: !!document.querySelector(`[data-plan-strategy="${sid}"]`)?.classList.contains('plan-selected'),
+      }), fStratId);
+      H.check('flow: strategy Select toggles selection state',
+        selOff.pressed === 'false' && !selOff.sel && selOn.pressed === 'true' && selOn.sel, JSON.stringify({ selOff, selOn }));
+      await page.evaluate((sid) => { document.querySelector(`[data-plan-strategy="${sid}"] .k`).click(); }, fStratId);
+      await waitF(800);
+      const navHash = await page.evaluate(() => location.hash);
+      H.check('flow: strategy card click still navigates to the detail page',
+        navHash === `#planning/strategy/${fStratId}`, navHash);
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      // A reload resets wiring state (baseline unpicked, every
+      // strategy picked), so re-pick the engine selection first.
+      await page.click(`[data-plan-baseline-select="${fBaseId}"]`);
+      await waitF(500);
+      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await waitF(800);
+      // One-click Generate: creates + opens a report pinned to the
+      // then-current wiring selection, with no modal.
+      await page.click('#planFlowGenerateBtn');
+      await waitF(1500);
+      const genHash = await page.evaluate(() => location.hash);
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const genRep = (r.data.reports || []).find((x) => x.name === `Report · Flow world · Flow baseline · ${fLetter}`);
+      const modalHidden = await page.evaluate(() => {
+        const m = document.querySelector('#planReportSaveModal');
+        return !m || m.classList.contains('hidden');
+      });
+      H.check('flow: one-click Generate creates and opens a pinned preset report, no modal',
+        !!genRep && genHash === `#planning/report/${fProjectId}/${genRep.id}`
+          && JSON.stringify(genRep.scenarioIds) === JSON.stringify([fScenId]) && genRep.baseline_id === fBaseId
+          && JSON.stringify(JSON.parse(genRep.strategy_ids || 'null')) === JSON.stringify([fStratId])
+          && JSON.stringify(genRep.definition.charts) === JSON.stringify([
+            { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] },
+            { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
+          ]) && modalHidden,
+        JSON.stringify({ genHash, genRep, modalHidden }));
+      // Multi-tab: open a second report, switch tabs, close tabs —
+      // closing removes only the tab, never the report.
+      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Flow second report', definition: { strategies: [fStratId], charts: [{ template: 'time_line', title: 'Second balance', series: ['mortgage_balance'] }] }, strategy_ids: [fStratId], baseline_id: fBaseId, scenario_ids: [fScenId] });
+      H.check('flow: second report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const fRep2Id = r.data.report.id;
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      await page.evaluate((rid) => { document.querySelector(`[data-plan-report-view="${rid}"]`).click(); }, fRep2Id);
+      await waitF(1200);
+      const tabs2 = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-tab]')].map((b) => Number(b.dataset.planReportTab)));
+      await page.click(`[data-plan-report-tab="${genRep.id}"]`);
+      await waitF(1000);
+      const tabSwitchHash = await page.evaluate(() => location.hash);
+      await page.click(`[data-plan-report-tab-close="${genRep.id}"]`);
+      await waitF(1000);
+      const tabCloseHash = await page.evaluate(() => location.hash);
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const bothAlive = (r.data.reports || []).some((x) => x.id === genRep.id) && (r.data.reports || []).some((x) => x.id === fRep2Id);
+      await page.click(`[data-plan-report-tab-close="${fRep2Id}"]`);
+      await waitF(1000);
+      const tabEmptyHash = await page.evaluate(() => location.hash);
+      H.check('flow: tabs open, switch, and close without deleting reports',
+        JSON.stringify(tabs2.sort((a, b) => a - b)) === JSON.stringify([genRep.id, fRep2Id].sort((a, b) => a - b))
+          && tabSwitchHash === `#planning/report/${fProjectId}/${genRep.id}`
+          && tabCloseHash === `#planning/report/${fProjectId}/${fRep2Id}`
+          && bothAlive && tabEmptyHash === `#planning/project/${fProjectId}`,
+        JSON.stringify({ tabs2, tabSwitchHash, tabCloseHash, bothAlive, tabEmptyHash }));
+      // Routing: each AI-designed pick disables preset Generate with
+      // a reason, while Generate with AI stays available.
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      // Reload resets wiring state, so start from the engine-only
+      // selection (AI strategy off) before each routing case.
+      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await waitF(800);
+      const routingState = async () => page.evaluate(() => ({
+        disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
+        note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
+        aiEnabled: !document.querySelector('#planAiReportBtn')?.disabled,
+      }));
+      await page.click(`[data-plan-baseline-select="${fAiBaseId}"]`);
+      await waitF(800);
+      const routeBase = await routingState();
+      await page.click(`[data-plan-baseline-select="${fBaseId}"]`);
+      await waitF(800);
+      await page.click(`[data-plan-scenario-select="${fAiScenId}"]`);
+      await waitF(1200);
+      const routeScen = await routingState();
+      await page.click(`[data-plan-scenario-select="${fScenId}"]`);
+      await waitF(1200);
+      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await waitF(800);
+      const routeStrat = await routingState();
+      H.check('flow: AI-designed baseline/scenario/strategy each disable preset Generate with reason, AI Generate stays available',
+        routeBase.disabled && routeBase.note.includes('AI-designed') && routeBase.note.includes('baseline') && routeBase.aiEnabled
+          && routeScen.disabled && routeScen.note.includes('AI-designed') && routeScen.note.includes('scenario') && routeScen.aiEnabled
+          && routeStrat.disabled && routeStrat.note.includes('AI-designed') && routeStrat.note.includes('strategy') && routeStrat.aiEnabled,
+        JSON.stringify({ routeBase, routeScen, routeStrat }));
+      // AI title vs preset title: the AI modal prefills its name
+      // from the AI title; without one it falls back to the
+      // auto-name pattern. The preset report from Generate keeps
+      // the preset title (already pinned above).
+      const fAiCharts = [
+        { template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
+        { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
+      ];
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Flow AI outlook', charts: fAiCharts }));
+      await page.click('#planAiReportBtn');
+      await waitF(1000);
+      await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Compare balance paths and headlines'; });
+      await page.click('#planReportAiGenBtn');
+      await waitF(1200);
+      const aiPrefill = await page.evaluate(() => document.querySelector('#planReportAiName')?.value || '');
+      await page.evaluate((sid) => { const el = document.querySelector(`#planReportAiScenarios input[value="${sid}"]`); if (el) el.checked = true; }, fScenId);
+      await page.click('#planReportAiSaveBtn');
+      await waitF(1200);
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const aiTitled = (r.data.reports || []).find((x) => x.name === 'Flow AI outlook');
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: fAiCharts }));
+      await page.click('#planAiReportBtn');
+      await waitF(1000);
+      await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Compare balance paths and headlines'; });
+      await page.click('#planReportAiGenBtn');
+      await waitF(1200);
+      const aiBlank = await page.evaluate(() => document.querySelector('#planReportAiName')?.value || '');
+      await page.evaluate((sid) => { const el = document.querySelector(`#planReportAiScenarios input[value="${sid}"]`); if (el) el.checked = true; }, fScenId);
+      await page.click('#planReportAiSaveBtn');
+      await waitF(1200);
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const aiFallback = (r.data.reports || []).find((x) => x.name === `Report · ${fLetter} · Flow prepay`);
+      H.check('flow: AI report title comes from the AI, falling back to the auto-name pattern',
+        aiPrefill === 'Flow AI outlook' && !!aiTitled && aiBlank === '' && !!aiFallback,
+        JSON.stringify({ aiPrefill, aiTitled: !!aiTitled, aiBlank, aiFallback: !!aiFallback }));
+    } finally { await browserF.close(); }
   }
 }
 

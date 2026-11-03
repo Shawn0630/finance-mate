@@ -11371,39 +11371,46 @@ function planProjectHtml(d) {
     ${headerLine ? `<div class="note" id="planProjectCategoryLine">${esc(headerLine)}</div>` : ''}
     ${metaLine}
     <div class="msg" id="planProjectMsg"></div>`;
-  // FLOW: Scenarios | Baselines | Strategies | Reports as ONE
-  // connected flow panel. The column wrappers keep the old panel ids
+  // FLOW: three tiers, top to bottom — scenario tier (full width),
+  // ONE middle row holding baselines + strategies side by side at
+  // the same level (baselines first, then strategies), reports tier
+  // (full width). The tier/group wrappers keep the old panel ids
   // (planScenarioCardsPanel / planBaselineCardsPanel /
   // planStrategiesPanel / planReportsPanel) in document order, and
   // the card hosts keep their ids, so existing renders and pins keep
-  // working — only the layout changes. The SVG overlay draws the
-  // connector lines between the actual cards (see planWiringDrawLines).
+  // working — only the layout changes. The SVG overlay draws
+  // vertical connector lines between the actual cards (see
+  // planWiringDrawLines): every horizontal jog runs in the empty
+  // band between tiers, so no line ever crosses a card body.
   const flowPanel = `<div class="panel" id="planFlowPanel">
       <div class="plan-flow-grid" id="planFlowGrid">
       <svg id="planFlowSvg" aria-hidden="true"></svg>
-      <div class="plan-flow-col" id="planScenarioCardsPanel">
+      <div class="plan-flow-tier" id="planScenarioCardsPanel">
       <div class="section-head"><h3>Scenarios</h3>
         <div class="toolbar"><button class="small" id="planAiScenarioBtn">Design with AI</button><button class="primary" id="planAddScenarioBtn">+ Add scenario</button></div>
       </div>
       <div id="planScenarioCards"></div>
       </div>
-      <div class="plan-flow-col" id="planBaselineCardsPanel">
+      <div class="plan-flow-tier plan-flow-tier-mid" id="planFlowMidTier">
+      <div class="plan-flow-group" id="planBaselineCardsPanel">
       <div class="section-head"><h3>Baselines</h3>
         <div class="toolbar"><button class="small" id="planAiBaselineBtn">Design with AI</button><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
       </div>
       <div id="planBaselineCards"></div>
       </div>
-      <div class="plan-flow-col" id="planStrategiesPanel">
+      <div class="plan-flow-group" id="planStrategiesPanel">
       <div class="section-head"><h3>Strategies</h3>
         <div class="toolbar"><button class="primary" id="planAddStrategyBtn">+ Add strategy</button></div>
       </div>
       <div id="planStrategyCardsWorld"></div>
       <div id="planStrategyCards"></div>
       </div>
-      <div class="plan-flow-col" id="planReportsPanel">
-      <div class="section-head"><h3>Reports</h3>
-        <div class="toolbar"><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
       </div>
+      <div class="plan-flow-tier" id="planReportsPanel">
+      <div class="section-head"><h3>Reports</h3>
+        <div class="toolbar"><button class="primary" id="planFlowGenerateBtn">Generate report</button><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
+      </div>
+      <div class="note" id="planFlowGenerateNote"></div>
       <div id="planReportList"></div>
       </div>
       </div>
@@ -11439,8 +11446,8 @@ function planProjectHtml(d) {
       <div id="planMergedTable"></div>
       <div class="note">Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below.</div>
     </div>`;
-  // DETAIL ORDER (both branches): header → flow (scenarios →
-  // baselines → strategies → reports) → (declared assets for sell
+  // DETAIL ORDER (both branches): header → flow (scenario tier →
+  // baseline + strategy row → reports) → (declared assets for sell
   // templates / legacy) → legacy comparison → strategy comparison
   // (difference chart, breakdown bars, merged table). Scenario,
   // baseline and strategy are three independent specs in one flow;
@@ -11469,6 +11476,8 @@ function planProjectWire(d) {
   if (asBtn) asBtn.addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
   $('#planAddReportBtn').addEventListener('click', () => planSaveReport(p.id));
   $('#planAiReportBtn').addEventListener('click', () => openPlanReportAiModal(p.id));
+  $('#planFlowGenerateBtn').addEventListener('click', () => planFlowGenerate(p.id));
+  planFlowGenerateRefresh(); // initial guard state until the comparison load refreshes it
   // Baseline cards: name + summary + Edit/Delete only. Card click opens
   // the editor; buttons stop the click from propagating.
   const renderBaselineCards = () => {
@@ -11550,18 +11559,26 @@ function planProjectWire(d) {
     try { await api(`/api/planning/declared-assets/${b.dataset.planAssetDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   }));
-  // Report cards in the flow's Reports column: name navigates to
+  // Report cards in the flow's Reports tier: name navigates to
   // the report view, Delete removes it. Tags state the pin honestly:
   // Unpinned = legacy row saved before pinning (no lines); Flat world
-  // = pinned to no scenario. No Select button — reports are not part
-  // of the wiring selection.
+  // = pinned to no scenario. The Under note names the pinned world
+  // (the scenario side of the pin is not drawn as a line — the
+  // scenario already feeds the middle tier above). No Select button
+  // — reports are not part of the wiring selection.
   $('#planReportList').innerHTML = d.reports.map((r) => {
     const tags = [];
     if (r.scenarioIds === null || r.scenarioIds === undefined) tags.push('Unpinned');
     else if (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) tags.push('Flat world');
     if (r.stale) tags.push('Stale — regenerate');
+    let under = null;
+    if (r.scenarioIds !== null && r.scenarioIds !== undefined) {
+      under = (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) ? 'Current rates (no scenario)'
+        : (r.scenarioIds || []).map((id) => { const sc = (d.scenarios || []).find((x) => x.id === id); return sc ? sc.name : `#${id}`; }).join(', ');
+    }
     return `<div class="card plan-flow-card" data-plan-report="${r.id}">
     <div class="k"><span data-plan-report-view="${r.id}" style="cursor:pointer">${esc(r.name)}</span></div>
+    ${under ? `<div class="n">Under ${esc(under)}</div>` : ''}
     ${tags.length ? `<div class="n">${esc(tags.join(' · '))}</div>` : ''}
     <div class="toolbar"><button class="small danger" data-plan-report-del="${r.id}">Delete</button></div></div>`;
   }).join('') || '<div class="note">No reports yet.</div>';
@@ -11657,7 +11674,98 @@ function planWiringRefresh() {
     b.disabled = repick;
     b.closest('.card')?.classList.toggle('plan-selected', on);
   });
+  planFlowGenerateRefresh();
   planWiringDrawLines();
+}
+// ---- one-click Generate report (flow panel) ----
+// Strictly on demand: selecting never creates, pre-computes, or
+// pre-renders a report — only this button's click POSTs, via the
+// existing report endpoint (pinning rules untouched), and opens the
+// computed report. The preset title names the pinned world +
+// baseline + strategy letters, so a preset report is recognizable
+// against an AI-titled one.
+// Picked strategies = the comparison picker's current set (shared
+// wiring state); before the comparison block loads, every project
+// strategy counts.
+function planFlowPickedStrategies() {
+  const d = planProjectData || {};
+  if (planCompareNewBlock && planCompareNewBlock.strategies) {
+    const all = planCompareNewBlock.strategies.map((r) => r.strategy.id);
+    return planAppleIds == null ? all : all.filter((id) => planAppleIds.includes(id));
+  }
+  return (d.strategies || []).map((s) => s.id);
+}
+// Routing rule: any AI-designed entity in the wiring selection
+// (scenario source 'ai', baseline source 'ai', or a strategy whose
+// attached model row carries source 'ai') blocks the preset button —
+// the written static model cannot cover AI-authored specs. Unmarked
+// legacy entities count as engine.
+function planFlowAiHits() {
+  const d = planProjectData || {};
+  const hits = [];
+  const scenId = planWiringScenarioId();
+  if (scenId != null) {
+    const sc = (d.scenarios || []).find((x) => x.id === scenId);
+    if (sc && sc.source === 'ai') hits.push(`scenario ${sc.name}`);
+  }
+  if (planWiringBaselineId != null) {
+    const b = (d.project && d.project.baselines ? d.project.baselines : []).find((x) => x.id === planWiringBaselineId);
+    if (b && b.source === 'ai') hits.push(`baseline ${b.name}`);
+  }
+  for (const sid of planFlowPickedStrategies()) {
+    const s = (d.strategies || []).find((x) => x.id === sid);
+    if (s && s.modelSource === 'ai') hits.push(`strategy ${s.letter} · ${s.name}`);
+  }
+  return hits;
+}
+function planFlowPresetTitle() {
+  const d = planProjectData || {};
+  const scenId = planWiringScenarioId();
+  const scen = scenId != null ? (d.scenarios || []).find((x) => x.id === scenId) : null;
+  const base = planWiringBaselineId != null ? (d.project && d.project.baselines ? d.project.baselines : []).find((x) => x.id === planWiringBaselineId) : null;
+  const letters = planFlowPickedStrategies().map((id) => { const s = (d.strategies || []).find((x) => x.id === id); return s ? s.letter : `#${id}`; }).join(', ');
+  return `Report · ${scen ? scen.name : 'Current rates'} · ${base ? base.name : 'Do-nothing'} · ${letters}`;
+}
+function planFlowGenerateRefresh() {
+  const btn = $('#planFlowGenerateBtn');
+  const note = $('#planFlowGenerateNote');
+  if (!btn || !note) return;
+  const d = planProjectData || {};
+  const missing = [];
+  if ((d.scenarios || []).length && planWiringScenarioId() == null) missing.push('a scenario');
+  if ((d.project && d.project.baselines ? d.project.baselines : []).length && planWiringBaselineId == null) missing.push('a baseline');
+  if (!planFlowPickedStrategies().length) missing.push('at least one strategy');
+  const aiHits = planFlowAiHits();
+  if (missing.length) {
+    btn.disabled = true;
+    note.textContent = `Pick ${missing.join(', ')} to generate.`;
+  } else if (aiHits.length) {
+    btn.disabled = true;
+    note.textContent = `Selection includes AI-designed ${aiHits.join(', ')} — use Generate with AI.`;
+  } else {
+    btn.disabled = false;
+    note.textContent = '';
+  }
+}
+async function planFlowGenerate(projectId) {
+  const btn = $('#planFlowGenerateBtn');
+  if (btn && btn.disabled) return;
+  const scenId = planWiringScenarioId();
+  const picked = planFlowPickedStrategies();
+  try {
+    const r = await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: {
+      name: planFlowPresetTitle(),
+      definition: { strategies: picked, charts: [
+        { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] },
+        { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
+      ] },
+      baseline_id: planWiringBaselineId,
+      strategy_ids: picked,
+      scenario_ids: scenId != null ? [scenId] : [],
+    } });
+    const id = r.report && r.report.id;
+    if (id) location.hash = `#planning/report/${projectId}/${id}`;
+  } catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
 }
 async function planWiringSelectScenario(id) {
   if (planWiringScenarioId() === id) return; // radio behavior: no empty world via wiring
@@ -11690,15 +11798,25 @@ function planWiringDrawLines() {
   const svg = $('#planFlowSvg');
   if (!grid || !svg) return;
   const gr = grid.getBoundingClientRect();
-  const pt = (node, side) => {
+  // Vertical flow: a line runs from a card's bottom-center down to
+  // the next tier's top-center. The horizontal jog sits at the
+  // midpoint of the empty band between the two tiers, so it can
+  // never cross a card body. Every path is a stroke (fill: none in
+  // CSS) — never a filled shape.
+  const topPt = (node) => {
     if (!node) return null;
     const r = node.getBoundingClientRect();
-    return side === 'left' ? { x: r.left - gr.left, y: r.top + r.height / 2 - gr.top } : { x: r.right - gr.left, y: r.top + r.height / 2 - gr.top };
+    return { x: r.left + r.width / 2 - gr.left, y: r.top - gr.top };
+  };
+  const botPt = (node) => {
+    if (!node) return null;
+    const r = node.getBoundingClientRect();
+    return { x: r.left + r.width / 2 - gr.left, y: r.bottom - gr.top };
   };
   const path = (a, b, cls, from, to) => {
     if (!a || !b) return '';
-    const mx = (a.x + b.x) / 2;
-    return `<path class="${cls}" data-flow-line="${cls === 'plan-flow-line-sel' ? 'sel' : 'report'}" data-flow-from="${from}" data-flow-to="${to}" d="M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}" />`;
+    const midY = (a.y + b.y) / 2;
+    return `<path class="${cls}" data-flow-line="${cls === 'plan-flow-line-sel' ? 'sel' : 'report'}" data-flow-from="${from}" data-flow-to="${to}" d="M ${a.x} ${a.y} L ${a.x} ${midY} L ${b.x} ${midY} L ${b.x} ${b.y}" />`;
   };
   const d = planProjectData || {};
   const strategies = d.strategies || [];
@@ -11709,41 +11827,40 @@ function planWiringDrawLines() {
   const repCard = (id) => document.querySelector(`[data-plan-report="${id}"]`);
   let paths = '';
   const scenId = planWiringScenarioId();
-  const scenEl = scenId != null ? scenCard(scenId) : null;
+  // Scenario-less projects flow from the flat-world node instead.
+  const scenEl = scenId != null ? scenCard(scenId)
+    : (!(d.scenarios || []).length ? document.querySelector('#planFlowFlatNode') : null);
   if (scenEl) {
-    const sRight = pt(scenEl, 'right');
+    const sBot = botPt(scenEl);
     if (planWiringBaselineId != null) {
       const bEl = baseCard(planWiringBaselineId);
-      if (bEl) paths += path(sRight, pt(bEl, 'left'), 'plan-flow-line-sel', `scenario:${scenId}`, `baseline:${planWiringBaselineId}`);
+      if (bEl) paths += path(sBot, topPt(bEl), 'plan-flow-line-sel', `scenario:${scenId ?? 'flat'}`, `baseline:${planWiringBaselineId}`);
     }
     for (const st of strategies) {
       if (!planWiringStrategyPicked(st.id)) continue;
       const tEl = stratCard(st.id);
-      if (tEl) paths += path(sRight, pt(tEl, 'left'), 'plan-flow-line-sel', `scenario:${scenId}`, `strategy:${st.id}`);
+      if (tEl) paths += path(sBot, topPt(tEl), 'plan-flow-line-sel', `scenario:${scenId ?? 'flat'}`, `strategy:${st.id}`);
     }
   }
+  // Reports hang off the middle cards that feed them: each pinned
+  // baseline/strategy card's bottom-center down to the report card's
+  // top-center. A report's scenario pin is shown as an "Under X"
+  // note on the card (see the report list render), not as a line —
+  // the scenario already feeds the middle tier above.
   for (const r of reports) {
     const rEl = repCard(r.id);
     if (!rEl) continue;
-    const rLeft = pt(rEl, 'left');
     if (r.scenarioIds === null || r.scenarioIds === undefined) continue; // legacy unpinned: no lines
-    for (const sid of (r.scenarioIds || [])) {
-      const sEl = scenCard(sid);
-      if (sEl) paths += path(rLeft, pt(sEl, 'right'), 'plan-flow-line', `report:${r.id}`, `scenario:${sid}`);
-    }
-    if (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) {
-      const flat = document.querySelector('#planFlowFlatNode');
-      if (flat) paths += path(rLeft, pt(flat, 'right'), 'plan-flow-line', `report:${r.id}`, 'flat');
-    }
+    const rTop = topPt(rEl);
     if (r.baseline_id) {
       const bEl = baseCard(r.baseline_id);
-      if (bEl) paths += path(rLeft, pt(bEl, 'right'), 'plan-flow-line', `report:${r.id}`, `baseline:${r.baseline_id}`);
+      if (bEl) paths += path(botPt(bEl), rTop, 'plan-flow-line', `baseline:${r.baseline_id}`, `report:${r.id}`);
     }
     let sids = null;
     try { sids = r.strategy_ids ? JSON.parse(r.strategy_ids) : null; } catch { sids = null; }
     for (const sid of (sids || [])) {
       const tEl = stratCard(sid);
-      if (tEl) paths += path(rLeft, pt(tEl, 'right'), 'plan-flow-line', `report:${r.id}`, `strategy:${sid}`);
+      if (tEl) paths += path(botPt(tEl), rTop, 'plan-flow-line', `strategy:${sid}`, `report:${r.id}`);
     }
   }
   svg.innerHTML = paths;
@@ -11781,7 +11898,7 @@ $('#planScenarioAiGoBtn').addEventListener('click', async () => {
       try {
         const name = $('#planScenarioAiName').value.trim();
         if (!name) throw new Error('Scenario name is required');
-        const data = await api(`/api/planning/projects/${planScenarioAiCtx.projectId}/scenarios`, { method: 'POST', body: { name, factors: planScenarioAiCtx.factors } });
+        const data = await api(`/api/planning/projects/${planScenarioAiCtx.projectId}/scenarios`, { method: 'POST', body: { name, factors: planScenarioAiCtx.factors, source: 'ai' } });
         closeModalEl($('#planScenarioAiModal'));
         location.hash = `#planning/scenario/${data.scenario.id}`;
       } catch (err) { showMsg(msg, 'err', err.message); }
@@ -12123,6 +12240,14 @@ async function planSaveReport(projectId) {
 }
 
 // ---- AI report: generate → preview → save (nothing writes before Save) ----
+// Fallback name for an AI report with no AI title and no typed
+// name: the existing auto-name pattern on the first picked
+// strategy, else a plain 'AI report'.
+function planReportAiFallbackName(strategyIds) {
+  const d = planProjectData || {};
+  const first = (strategyIds || []).map((id) => (d.strategies || []).find((s) => s.id === id)).find(Boolean);
+  return first ? `Report · ${first.letter} · ${first.name}` : 'AI report';
+}
 function openPlanReportAiModal(projectId) {
   $('#planReportAiName').value = '';
   $('#planReportAiText').value = '';
@@ -12144,12 +12269,16 @@ function openPlanReportAiModal(projectId) {
   $('#planReportAiGenBtn').onclick = async () => {
     const msg = $('#planReportAiMsg');
     try {
-      const name = $('#planReportAiName').value.trim();
       const text = $('#planReportAiText').value.trim();
-      if (!name) throw new Error('report name is required');
       if (!text) throw new Error('describe the report first');
       const r = await api(`/api/planning/projects/${projectId}/ai-report`, { method: 'POST', body: { text } });
       const charts = (r.definition && r.definition.charts) || [];
+      // AI title: the model is asked for a short report title; when
+      // the name field is still empty it is prefilled from the AI
+      // title (the user can still overwrite it before saving).
+      if (!$('#planReportAiName').value.trim() && typeof r.definition.title === 'string' && r.definition.title.trim()) {
+        $('#planReportAiName').value = r.definition.title.trim();
+      }
       $('#planReportAiOut').innerHTML = `
         ${charts.map((c) => `<div class="plan-row"><span>${esc(c.template)} · ${esc(c.title)}${c.series ? ` · ${(c.series || []).join(', ')}` : ''}${c.method ? ` · Method: ${esc(c.method)}` : ''}</span></div>`).join('') || '<div class="note">No charts proposed.</div>'}
         <div class="toolbar"><button class="small primary" id="planReportAiSaveBtn">Save this report</button></div>`;
@@ -12159,6 +12288,9 @@ function openPlanReportAiModal(projectId) {
           const scenarioIds = planReportPickedScenarios('#planReportAiScenarios');
           if (aiReportScenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
           const strategyIds = [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value));
+          // Name chain: typed name → AI title → auto-name pattern.
+          const aiTitle = (r.definition && typeof r.definition.title === 'string' && r.definition.title.trim()) ? r.definition.title.trim() : '';
+          const name = $('#planReportAiName').value.trim() || aiTitle || planReportAiFallbackName(strategyIds);
           await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: r.definition, baseline_id: baselineId, strategy_ids: strategyIds, scenario_ids: scenarioIds } });
           closeModalEl($('#planReportAiModal'));
           loadPlanProject(projectId);
@@ -12206,7 +12338,9 @@ function planReportPinPanel(proj, report, note) {
   $('#planStrategy').classList.add('hidden');
   $('#planScenario').classList.add('hidden');
   $('#planReport').classList.remove('hidden');
+  planReportTabsOpen(proj.project.id, report.id, report.name);
   $('#planReport').innerHTML = `
+    ${planReportTabBarHtml(proj.project.id, report.id)}
     <div><a href="#planning/project/${proj.project.id}">← Back to ${esc(proj.project.name)}</a></div>
     <div class="panel">
       <div class="section-head"><h3>${esc(report.name)}</h3></div>
@@ -12223,6 +12357,41 @@ function planReportPinPanel(proj, report, note) {
       loadPlanReport(proj.project.id, report.id);
     } catch (err) { showMsg($('#planReportPinMsg'), 'err', err.message); }
   });
+  planReportTabsWire(proj.project.id, report.id);
+}
+// Report tabs: per-visit, in-memory only (never persisted, and
+// closing one never deletes its report). Opening a report adds a
+// tab; switching tabs loses nothing; closing the current tab falls
+// back to the most recently opened tab, else the project page.
+let planReportTabs = [];
+let planReportTabsProject = null;
+function planReportTabBarHtml(projectId, currentId) {
+  if (!planReportTabs.length) return '';
+  return `<div class="toolbar plan-report-tabs" id="planReportTabsBar">${planReportTabs.map((t) => `<span><button class="small${t.id === currentId ? ' primary' : ''}" data-plan-report-tab="${t.id}">${esc(t.name)}</button><button class="small" data-plan-report-tab-close="${t.id}" aria-label="Close tab">×</button></span>`).join('')}</div>`;
+}
+function planReportTabsWire(projectId, currentId) {
+  document.querySelectorAll('[data-plan-report-tab]').forEach((b) => b.addEventListener('click', () => { location.hash = `#planning/report/${projectId}/${b.dataset.planReportTab}`; }));
+  document.querySelectorAll('[data-plan-report-tab-close]').forEach((b) => b.addEventListener('click', () => {
+    const id = Number(b.dataset.planReportTabClose);
+    // Live hash, not the render-time currentId: a delayed report render
+    // can re-wire the bar with a stale currentId, which used to leave
+    // the view on a closed report. An emptied bar always returns to
+    // the project page, even when the last-closed tab was not active.
+    const wasCurrent = location.hash === `#planning/report/${projectId}/${id}`;
+    planReportTabs = planReportTabs.filter((t) => t.id !== id);
+    if (!planReportTabs.length) {
+      location.hash = `#planning/project/${projectId}`;
+    } else if (wasCurrent) {
+      location.hash = `#planning/report/${projectId}/${planReportTabs[planReportTabs.length - 1].id}`;
+    } else {
+      const bar = $('#planReportTabsBar');
+      if (bar) { bar.outerHTML = planReportTabBarHtml(projectId, currentId); planReportTabsWire(projectId, currentId); }
+    }
+  }));
+}
+function planReportTabsOpen(projectId, reportId, name) {
+  if (planReportTabsProject !== projectId) { planReportTabs = []; planReportTabsProject = projectId; }
+  if (!planReportTabs.some((t) => t.id === reportId)) planReportTabs.push({ id: reportId, name });
 }
 async function loadPlanReport(projectId, reportId) {
   return withLoading(async () => {
@@ -12463,7 +12632,9 @@ async function loadPlanReport(projectId, reportId) {
     const worldLabel = scenarioIds.length
       ? `Under ${scenarioIds.map((id) => { const sc = projScenarios.find((x) => x.id === id); return sc ? sc.name : `#${id}`; }).join(', ')}`
       : 'Current rates (no scenario)';
+    planReportTabsOpen(projectId, reportId, report.name);
     $('#planReport').innerHTML = `
+      ${planReportTabBarHtml(projectId, reportId)}
       <div><a href="#planning/project/${projectId}">← Back to ${esc(proj.project.name)}</a></div>
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
@@ -12502,6 +12673,7 @@ async function loadPlanReport(projectId, reportId) {
         picker: '#planReportComparePicker', merged: '#planReportMergedTable', ctx: { block: null, appleIds: null },
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
+    planReportTabsWire(projectId, reportId);
   });
 }
 function sidsHas(series, sid) { return (series || []).includes(sid); }

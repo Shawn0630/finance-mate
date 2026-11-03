@@ -5136,6 +5136,11 @@ app.get('/api/planning/projects/:id', requireApiAuth, (req, res) => {
   planSeedLegacyBaseline(p);
   planMigrateStrategyFactors(p.id);
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  // Routing marker for the flow: an AI-designed strategy is one whose
+  // attached model row carries source 'ai' (strategy.source alone is
+  // NOT reliable — template-created strategies also carry 'ai').
+  const modelSources = new Map(db.prepare('SELECT id, source FROM plan_ai_models WHERE project_id = ?').all(p.id).map((m) => [m.id, m.source]));
+  for (const s of strategies) s.modelSource = s.model_id ? (modelSources.get(s.model_id) || null) : null;
   const scenarios = db.prepare('SELECT * FROM plan_scenarios WHERE project_id = ? ORDER BY id').all(p.id).map(planScenarioRow);
   const declaredAssets = db.prepare('SELECT * FROM plan_declared_assets WHERE project_id = ? ORDER BY id').all(p.id);
   const reports = db.prepare('SELECT * FROM plan_reports WHERE project_id = ? ORDER BY id').all(p.id).map((r) => ({
@@ -5330,8 +5335,8 @@ app.post('/api/planning/projects/:id/scenarios', requireApiAuth, (req, res) => {
   // The first scenario a project ever gets becomes its base, so detail
   // and comparison defaults work without an extra step.
   const isBase = planScenariosOf(p.id).some((x) => x.is_base) ? 0 : 1;
-  const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, factors, is_base, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(p.id, String(b.name).trim(), direction, b.stance || 'neutral', b.magnitude != null ? Number(b.magnitude) : null, steps ? JSON.stringify(steps) : null, factors ? JSON.stringify(factors) : null, isBase, now, now);
+  const info = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, factors, is_base, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(p.id, String(b.name).trim(), direction, b.stance || 'neutral', b.magnitude != null ? Number(b.magnitude) : null, steps ? JSON.stringify(steps) : null, factors ? JSON.stringify(factors) : null, isBase, b.source === 'ai' ? 'ai' : null, now, now);
   res.status(201).json({ scenario: planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(info.lastInsertRowid)) });
 });
 
@@ -6929,7 +6934,7 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   const strategies = db.prepare('SELECT id, name, letter FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const prompt = [
     'You compose a report definition as JSON only. No prose outside the JSON object.',
-    'A report is an ordered list of charts over already-computed results: {"charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
+    'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
     'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
     'Series ids are: mortgage_balance, stock_value, total_value, cost, gain, net, payoff_month, monthly_payment.',
     'Never invent a number: the app computes every series; you only order and title charts.',

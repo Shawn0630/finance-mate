@@ -559,20 +559,27 @@ table.seg-table td:last-child { text-align: right; }
    Reports as ONE connected flow, not three stacked lists. Columns
    share the app's 12px gap; cards are tightened (12px vs the 16px
    breakdown-card padding) and the selected nodes carry the accent
-   border. Narrow screens stack the columns; the SVG lines are drawn
-   from live card rects, so they follow the stack. */
-.plan-flow-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; position: relative; }
-@media (max-width: 1100px) { .plan-flow-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 700px) { .plan-flow-grid { grid-template-columns: 1fr; } }
-.plan-flow-col { min-width: 0; }
-.plan-flow-col .card { margin-bottom: 12px; }
+   border. The tiers stack top to bottom (scenario → baseline +
+   strategy row → reports); narrow screens stack the middle row too.
+   The SVG lines are drawn from live card rects, so they follow the
+   stack. Every line is a stroke only — a missing fill here once
+   painted the selection curves as solid black blobs. */
+.plan-flow-grid { position: relative; }
+.plan-flow-tier { margin-bottom: 16px; }
+.plan-flow-tier:last-child { margin-bottom: 0; }
+.plan-flow-tier-mid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 1100px) { .plan-flow-tier-mid { grid-template-columns: 1fr; } }
+.plan-flow-group { min-width: 0; }
+.plan-flow-group .card { margin-bottom: 12px; }
+.plan-flow-tier .card { margin-bottom: 12px; }
 .plan-flow-card { padding: 12px 14px; }
 .plan-flow-card.plan-selected { border-color: #1668c4; background: #f0f6fc; }
 .plan-flow-card.plan-flow-flat { border-style: dashed; }
 .plan-flow-select[aria-pressed="true"] { background: #1668c4; color: #fff; border-color: #1668c4; }
 #planFlowSvg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .plan-flow-line { fill: none; stroke: #9fb2c3; stroke-width: 1.5; }
-.plan-flow-line-sel { stroke: #1668c4; stroke-width: 2.5; }
+.plan-flow-line-sel { fill: none; stroke: #1668c4; stroke-width: 2.5; }
+.plan-report-tabs { gap: 6px; flex-wrap: wrap; }
 
 /* Planning: plain rows in the app's list-row style (same spacing and
    divider as other list rows); leg editor rows share the row flex. */
