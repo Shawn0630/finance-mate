@@ -445,9 +445,12 @@ function route() {
     showView('planning');
     loadPlanScenario(Number(hash.split('/')[2]));
   } else if (hash.startsWith('#planning/report/')) {
+    // Retired separate report page: old deep links land on the
+    // project page with that report's tab open (inline viewer).
     showView('planning');
     const parts = hash.split('/');
-    loadPlanReport(Number(parts[2]), Number(parts[3]));
+    planReportPendingOpen = { projectId: Number(parts[2]), reportId: Number(parts[3]) };
+    location.hash = `#planning/project/${parts[2]}`;
   } else if (hash === '#history') {
     showView('history');
     loadHistory();
@@ -11007,7 +11010,6 @@ async function loadPlanning() {
     $('#planList').classList.remove('hidden');
     $('#planProject').classList.add('hidden');
     $('#planStrategy').classList.add('hidden');
-    $('#planReport').classList.add('hidden');
     $('#planScenario').classList.add('hidden');
     $('#planList').innerHTML = planListHtml(data.projects);
     document.querySelectorAll('[data-plan-project]').forEach((el) => {
@@ -11305,11 +11307,31 @@ async function loadPlanProject(id) {
     $('#planList').classList.add('hidden');
     $('#planProject').classList.remove('hidden');
     $('#planStrategy').classList.add('hidden');
-    $('#planReport').classList.add('hidden');
     $('#planScenario').classList.add('hidden');
     $('#planProject').innerHTML = planProjectHtml(data);
     planProjectWire(data);
     await loadPlanComparison(id);
+    // Inline viewer restore: a pending deep link opens its tab; else
+    // a surviving tab re-renders (a deleted report's tab drops, and
+    // the viewer empties when no tabs remain).
+    if (planReportPendingOpen && planReportPendingOpen.projectId === id) {
+      const pending = planReportPendingOpen;
+      planReportPendingOpen = null;
+      planReportTabsOpen(id, pending.reportId, (data.reports || []).find((r) => r.id === pending.reportId)?.name || 'Report');
+      await loadPlanReport(id, pending.reportId);
+    } else if (planReportTabsProject === id && planReportTabs.length) {
+      const cur = planReportTabs.find((t) => t.id === planReportCurrentId) || planReportTabs[planReportTabs.length - 1];
+      if (!(data.reports || []).some((r) => r.id === cur.id)) {
+        planReportTabs = planReportTabs.filter((t) => t.id !== cur.id);
+        if (!planReportTabs.length) { planReportCurrentId = null; planReportCurrentPins = null; planReportHighlightApply(); }
+        else await loadPlanReport(id, planReportTabs[planReportTabs.length - 1].id);
+      } else {
+        await loadPlanReport(id, cur.id);
+      }
+    } else {
+      planReportCurrentId = null;
+      planReportCurrentPins = null;
+    }
   });
 }
 function planBaselineCardHtml(b) {
@@ -11378,13 +11400,11 @@ function planProjectHtml(d) {
   // (planScenarioCardsPanel / planBaselineCardsPanel /
   // planStrategiesPanel / planReportsPanel) in document order, and
   // the card hosts keep their ids, so existing renders and pins keep
-  // working — only the layout changes. The SVG overlay draws
-  // vertical connector lines between the actual cards (see
-  // planWiringDrawLines): every horizontal jog runs in the empty
-  // band between tiers, so no line ever crosses a card body.
+  // working. No connector lines: linkage is highlight only — the
+  // wiring selection (blue) and, for the current report tab, that
+  // report's pins (amber) on the tier cards above the viewer.
   const flowPanel = `<div class="panel" id="planFlowPanel">
       <div class="plan-flow-grid" id="planFlowGrid">
-      <svg id="planFlowSvg" aria-hidden="true"></svg>
       <div class="plan-flow-tier" id="planScenarioCardsPanel">
       <div class="section-head"><h3>Scenarios</h3>
         <div class="toolbar"><button class="small" id="planAiScenarioBtn">Design with AI</button><button class="primary" id="planAddScenarioBtn">+ Add scenario</button></div>
@@ -11412,6 +11432,7 @@ function planProjectHtml(d) {
       </div>
       <div class="note" id="planFlowGenerateNote"></div>
       <div id="planReportList"></div>
+      <div id="planReport"></div>
       </div>
       </div>
     </div>`;
@@ -11583,7 +11604,7 @@ function planProjectWire(d) {
     <div class="toolbar"><button class="small danger" data-plan-report-del="${r.id}">Delete</button></div></div>`;
   }).join('') || '<div class="note">No reports yet.</div>';
   document.querySelectorAll('[data-plan-report-view]').forEach((el) => {
-    el.addEventListener('click', () => { location.hash = `#planning/report/${p.id}/${el.dataset.planReportView}`; });
+    el.addEventListener('click', () => { planOpenReportTab(p.id, Number(el.dataset.planReportView)); });
   });
   document.querySelectorAll('[data-plan-report-del]').forEach((b) => b.addEventListener('click', async () => {
     try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
@@ -11648,7 +11669,6 @@ function planScenarioSectionWire(d) {
 // navigation/edit behavior; selection happens ONLY through the
 // explicit Select button (stopPropagation, like Edit/Delete).
 let planWiringBaselineId = null;
-let planWiringResizeBound = false;
 const planWiringScenarioId = () => (planCompareScenarioIds && planCompareScenarioIds.length ? planCompareScenarioIds[0] : null);
 const planWiringRepick = () => { const d = planProjectData; return !!(d && (d.scenarios || []).length && !(planCompareScenarioIds && planCompareScenarioIds.length)); };
 const planWiringStrategyPicked = (id) => (planAppleIds == null ? true : planAppleIds.includes(id));
@@ -11675,7 +11695,6 @@ function planWiringRefresh() {
     b.closest('.card')?.classList.toggle('plan-selected', on);
   });
   planFlowGenerateRefresh();
-  planWiringDrawLines();
 }
 // ---- one-click Generate report (flow panel) ----
 // Strictly on demand: selecting never creates, pre-computes, or
@@ -11764,7 +11783,7 @@ async function planFlowGenerate(projectId) {
       scenario_ids: scenId != null ? [scenId] : [],
     } });
     const id = r.report && r.report.id;
-    if (id) location.hash = `#planning/report/${projectId}/${id}`;
+    if (id) planOpenReportTab(projectId, id);
   } catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
 }
 async function planWiringSelectScenario(id) {
@@ -11784,91 +11803,6 @@ function planWiringSelectStrategy(id) {
   planAppleIds = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
   planCompareNewRender(planCompareNewBlock);
   planWiringRefresh();
-}
-// Lines are drawn from live card rects into the flow grid's SVG
-// overlay (pointer-events none, so cards stay clickable). Selection
-// lines (accent) run active scenario → picked baseline / picked
-// strategies. Report lines (grey) run report → its STORED pins only:
-// pinned scenario / baseline / strategy cards that exist. Legacy
-// unpinned reports (scenarioIds null) get no lines; flat-world
-// reports ([]) connect to the flat node when it exists, else to
-// nothing on the scenario side (baseline/strategy lines still draw).
-function planWiringDrawLines() {
-  const grid = $('#planFlowGrid');
-  const svg = $('#planFlowSvg');
-  if (!grid || !svg) return;
-  const gr = grid.getBoundingClientRect();
-  // Vertical flow: a line runs from a card's bottom-center down to
-  // the next tier's top-center. The horizontal jog sits at the
-  // midpoint of the empty band between the two tiers, so it can
-  // never cross a card body. Every path is a stroke (fill: none in
-  // CSS) — never a filled shape.
-  const topPt = (node) => {
-    if (!node) return null;
-    const r = node.getBoundingClientRect();
-    return { x: r.left + r.width / 2 - gr.left, y: r.top - gr.top };
-  };
-  const botPt = (node) => {
-    if (!node) return null;
-    const r = node.getBoundingClientRect();
-    return { x: r.left + r.width / 2 - gr.left, y: r.bottom - gr.top };
-  };
-  const path = (a, b, cls, from, to) => {
-    if (!a || !b) return '';
-    const midY = (a.y + b.y) / 2;
-    return `<path class="${cls}" data-flow-line="${cls === 'plan-flow-line-sel' ? 'sel' : 'report'}" data-flow-from="${from}" data-flow-to="${to}" d="M ${a.x} ${a.y} L ${a.x} ${midY} L ${b.x} ${midY} L ${b.x} ${b.y}" />`;
-  };
-  const d = planProjectData || {};
-  const strategies = d.strategies || [];
-  const reports = d.reports || [];
-  const scenCard = (id) => document.querySelector(`[data-plan-scenario="${id}"]`);
-  const baseCard = (id) => document.querySelector(`[data-plan-baseline="${id}"]`);
-  const stratCard = (id) => document.querySelector(`[data-plan-strategy="${id}"]`);
-  const repCard = (id) => document.querySelector(`[data-plan-report="${id}"]`);
-  let paths = '';
-  const scenId = planWiringScenarioId();
-  // Scenario-less projects flow from the flat-world node instead.
-  const scenEl = scenId != null ? scenCard(scenId)
-    : (!(d.scenarios || []).length ? document.querySelector('#planFlowFlatNode') : null);
-  if (scenEl) {
-    const sBot = botPt(scenEl);
-    if (planWiringBaselineId != null) {
-      const bEl = baseCard(planWiringBaselineId);
-      if (bEl) paths += path(sBot, topPt(bEl), 'plan-flow-line-sel', `scenario:${scenId ?? 'flat'}`, `baseline:${planWiringBaselineId}`);
-    }
-    for (const st of strategies) {
-      if (!planWiringStrategyPicked(st.id)) continue;
-      const tEl = stratCard(st.id);
-      if (tEl) paths += path(sBot, topPt(tEl), 'plan-flow-line-sel', `scenario:${scenId ?? 'flat'}`, `strategy:${st.id}`);
-    }
-  }
-  // Reports hang off the middle cards that feed them: each pinned
-  // baseline/strategy card's bottom-center down to the report card's
-  // top-center. A report's scenario pin is shown as an "Under X"
-  // note on the card (see the report list render), not as a line —
-  // the scenario already feeds the middle tier above.
-  for (const r of reports) {
-    const rEl = repCard(r.id);
-    if (!rEl) continue;
-    if (r.scenarioIds === null || r.scenarioIds === undefined) continue; // legacy unpinned: no lines
-    const rTop = topPt(rEl);
-    if (r.baseline_id) {
-      const bEl = baseCard(r.baseline_id);
-      if (bEl) paths += path(botPt(bEl), rTop, 'plan-flow-line', `baseline:${r.baseline_id}`, `report:${r.id}`);
-    }
-    let sids = null;
-    try { sids = r.strategy_ids ? JSON.parse(r.strategy_ids) : null; } catch { sids = null; }
-    for (const sid of (sids || [])) {
-      const tEl = stratCard(sid);
-      if (tEl) paths += path(botPt(tEl), rTop, 'plan-flow-line', `strategy:${sid}`, `report:${r.id}`);
-    }
-  }
-  svg.innerHTML = paths;
-  if (!planWiringResizeBound) {
-    planWiringResizeBound = true;
-    let t = null;
-    window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => { if ($('#planFlowGrid')) planWiringDrawLines(); }, 150); });
-  }
 }
 let planScenarioAiCtx = null;
 $('#planScenarioForm').addEventListener('submit', async (e) => {
@@ -12248,12 +12182,29 @@ function planReportAiFallbackName(strategyIds) {
   const first = (strategyIds || []).map((id) => (d.strategies || []).find((s) => s.id === id)).find(Boolean);
   return first ? `Report · ${first.letter} · ${first.name}` : 'AI report';
 }
-function openPlanReportAiModal(projectId) {
+function openPlanReportAiModal(projectId, opts = {}) {
+  const appendTo = opts.appendTo || null;
   $('#planReportAiName').value = '';
   $('#planReportAiText').value = '';
   $('#planReportAiOut').innerHTML = '';
   showMsg($('#planReportAiMsg'), '', '');
   openModal('planReportAiModal');
+  // Append mode (per-tab AI Generate): pin pickers are irrelevant —
+  // the report keeps its pins, only charts are appended. Reset the
+  // picker visibility on every open so a previous append open never
+  // leaks hidden pickers into a fresh-report open.
+  for (const id of ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
+    document.getElementById(id)?.closest('div')?.classList.remove('hidden');
+  }
+  const appendNote = $('#planReportAiAppendNote');
+  appendNote.classList.add('hidden');
+  if (appendTo) {
+    for (const id of ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
+      document.getElementById(id)?.closest('div')?.classList.add('hidden');
+    }
+    appendNote.textContent = `Appends to ${appendTo.reportName} · pins unchanged.`;
+    appendNote.classList.remove('hidden');
+  }
   // Baseline picker (one) + scenario picker (pinned) + strategy picker (many) for this report.
   let aiReportScenarios = [];
   api(`/api/planning/projects/${projectId}`).then((d) => {
@@ -12281,9 +12232,20 @@ function openPlanReportAiModal(projectId) {
       }
       $('#planReportAiOut').innerHTML = `
         ${charts.map((c) => `<div class="plan-row"><span>${esc(c.template)} · ${esc(c.title)}${c.series ? ` · ${(c.series || []).join(', ')}` : ''}${c.method ? ` · Method: ${esc(c.method)}` : ''}</span></div>`).join('') || '<div class="note">No charts proposed.</div>'}
-        <div class="toolbar"><button class="small primary" id="planReportAiSaveBtn">Save this report</button></div>`;
+        <div class="toolbar"><button class="small primary" id="planReportAiSaveBtn">${appendTo ? 'Append to this report' : 'Save this report'}</button></div>`;
       $('#planReportAiSaveBtn').onclick = async () => {
         try {
+          if (appendTo) {
+            const d = await api(`/api/planning/projects/${projectId}`);
+            const rep = (d.reports || []).find((x) => x.id === appendTo.reportId);
+            if (!rep) throw new Error('report not found');
+            const def = rep.definition || {};
+            const newCharts = (r.definition && r.definition.charts) || [];
+            await api(`/api/planning/reports/${appendTo.reportId}`, { method: 'PUT', body: { definition: { ...def, charts: [...(def.charts || []), ...newCharts] } } });
+            closeModalEl($('#planReportAiModal'));
+            loadPlanReport(projectId, appendTo.reportId);
+            return;
+          }
           const baselineId = $('#planReportAiBaseline').value ? Number($('#planReportAiBaseline').value) : null;
           const scenarioIds = planReportPickedScenarios('#planReportAiScenarios');
           if (aiReportScenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
@@ -12333,15 +12295,11 @@ function planReportYearRows(monthly) {
 function planReportPinPanel(proj, report, note) {
   const scenarios = proj.scenarios || [];
   const base = scenarios.find((x) => x.is_base) || scenarios[0];
-  $('#planList').classList.add('hidden');
-  $('#planProject').classList.add('hidden');
-  $('#planStrategy').classList.add('hidden');
-  $('#planScenario').classList.add('hidden');
-  $('#planReport').classList.remove('hidden');
   planReportTabsOpen(proj.project.id, report.id, report.name);
+  planReportCurrentId = report.id;
+  planReportCurrentPins = null;
   $('#planReport').innerHTML = `
     ${planReportTabBarHtml(proj.project.id, report.id)}
-    <div><a href="#planning/project/${proj.project.id}">← Back to ${esc(proj.project.name)}</a></div>
     <div class="panel">
       <div class="section-head"><h3>${esc(report.name)}</h3></div>
       <div class="note">${esc(note)}</div>
@@ -12362,27 +12320,61 @@ function planReportPinPanel(proj, report, note) {
 // Report tabs: per-visit, in-memory only (never persisted, and
 // closing one never deletes its report). Opening a report adds a
 // tab; switching tabs loses nothing; closing the current tab falls
-// back to the most recently opened tab, else the project page.
+// back to the most recently opened tab, else the viewer empties.
+// INLINE model: report content renders in the project page's Reports
+// tier (#planReport inside #planReportsPanel) — there is no separate
+// report page, no Back link, and tab switches never change the hash.
+// The current tab's pinned scenario / baseline / strategies highlight
+// on the real tier cards above (amber plan-report-pin, distinct from
+// the wiring Selected blue); with no tab open, no report-highlight
+// shows. Old #planning/report/... deep links land on the project
+// page with that report's tab open (see route() + planOpenReportTab).
 let planReportTabs = [];
 let planReportTabsProject = null;
+let planReportCurrentId = null;
+let planReportCurrentPins = null;
+let planReportPendingOpen = null;
+// Monotonic load generation: a tab close (or project re-render)
+// invalidates any loadPlanReport still in flight, so a stale fetch
+// can never resurrect a closed tab or overwrite a newer tab.
+let planReportLoadSeq = 0;
+function planOpenReportTab(projectId, reportId) {
+  if (planProjectData && planProjectData.project && planProjectData.project.id === projectId
+    && location.hash === `#planning/project/${projectId}`) {
+    loadPlanReport(projectId, reportId);
+  } else {
+    planReportPendingOpen = { projectId, reportId };
+    location.hash = `#planning/project/${projectId}`;
+  }
+}
+function planReportHighlightApply() {
+  document.querySelectorAll('.plan-report-pin').forEach((el) => el.classList.remove('plan-report-pin'));
+  const pins = planReportCurrentPins;
+  if (!pins) return;
+  for (const id of pins.scenarioIds) { const c = document.querySelector(`[data-plan-scenario="${id}"]`); if (c) c.classList.add('plan-report-pin'); }
+  if (!pins.scenarioIds.length) { const f = document.querySelector('#planFlowFlatNode'); if (f) f.classList.add('plan-report-pin'); }
+  if (pins.baselineId != null) { const c = document.querySelector(`[data-plan-baseline="${pins.baselineId}"]`); if (c) c.classList.add('plan-report-pin'); }
+  for (const id of pins.strategyIds) { const c = document.querySelector(`[data-plan-strategy="${id}"]`); if (c) c.classList.add('plan-report-pin'); }
+}
 function planReportTabBarHtml(projectId, currentId) {
   if (!planReportTabs.length) return '';
-  return `<div class="toolbar plan-report-tabs" id="planReportTabsBar">${planReportTabs.map((t) => `<span><button class="small${t.id === currentId ? ' primary' : ''}" data-plan-report-tab="${t.id}">${esc(t.name)}</button><button class="small" data-plan-report-tab-close="${t.id}" aria-label="Close tab">×</button></span>`).join('')}</div>`;
+  return `<div class="toolbar plan-report-tabs" id="planReportTabsBar">${planReportTabs.map((t) => `<span class="plan-report-tabwrap${t.id === currentId ? ' plan-report-tabwrap-current' : ''}"><button class="small plan-report-tab-name" data-plan-report-tab="${t.id}">${esc(t.name)}</button><button class="small plan-report-tab-close" data-plan-report-tab-close="${t.id}" aria-label="Close tab">×</button></span>`).join('')}</div>`;
 }
 function planReportTabsWire(projectId, currentId) {
-  document.querySelectorAll('[data-plan-report-tab]').forEach((b) => b.addEventListener('click', () => { location.hash = `#planning/report/${projectId}/${b.dataset.planReportTab}`; }));
+  document.querySelectorAll('[data-plan-report-tab]').forEach((b) => b.addEventListener('click', () => { loadPlanReport(projectId, Number(b.dataset.planReportTab)); }));
   document.querySelectorAll('[data-plan-report-tab-close]').forEach((b) => b.addEventListener('click', () => {
     const id = Number(b.dataset.planReportTabClose);
-    // Live hash, not the render-time currentId: a delayed report render
-    // can re-wire the bar with a stale currentId, which used to leave
-    // the view on a closed report. An emptied bar always returns to
-    // the project page, even when the last-closed tab was not active.
-    const wasCurrent = location.hash === `#planning/report/${projectId}/${id}`;
+    const wasCurrent = planReportCurrentId === id;
+    planReportLoadSeq++;
     planReportTabs = planReportTabs.filter((t) => t.id !== id);
     if (!planReportTabs.length) {
-      location.hash = `#planning/project/${projectId}`;
+      planReportCurrentId = null;
+      planReportCurrentPins = null;
+      const viewer = $('#planReport');
+      if (viewer) viewer.innerHTML = '';
+      planReportHighlightApply();
     } else if (wasCurrent) {
-      location.hash = `#planning/report/${projectId}/${planReportTabs[planReportTabs.length - 1].id}`;
+      loadPlanReport(projectId, planReportTabs[planReportTabs.length - 1].id);
     } else {
       const bar = $('#planReportTabsBar');
       if (bar) { bar.outerHTML = planReportTabBarHtml(projectId, currentId); planReportTabsWire(projectId, currentId); }
@@ -12395,28 +12387,26 @@ function planReportTabsOpen(projectId, reportId, name) {
 }
 async function loadPlanReport(projectId, reportId) {
   return withLoading(async () => {
+    const mySeq = ++planReportLoadSeq;
     const proj = await api(`/api/planning/projects/${projectId}`);
+    if (mySeq !== planReportLoadSeq) return;
     const report = (proj.reports || []).find((r) => r.id === reportId);
     if (!report) {
-      $('#planList').classList.add('hidden');
-      $('#planProject').classList.add('hidden');
-      $('#planStrategy').classList.add('hidden');
-      $('#planScenario').classList.add('hidden');
-      $('#planReport').classList.remove('hidden');
+      planReportCurrentId = null;
+      planReportCurrentPins = null;
       $('#planReport').innerHTML = `<div class="panel"><div class="note">Report not found.</div></div>`;
+      planReportHighlightApply();
       return;
     }
     // A report whose baseline was deleted shows a re-pick panel only —
     // never charts against a silently substituted baseline.
     if (report.baseline_cleared) {
-      $('#planList').classList.add('hidden');
-      $('#planProject').classList.add('hidden');
-      $('#planStrategy').classList.add('hidden');
-      $('#planScenario').classList.add('hidden');
-      $('#planReport').classList.remove('hidden');
+      planReportTabsOpen(projectId, reportId, report.name);
+      planReportCurrentId = reportId;
+      planReportCurrentPins = null;
       const bases = proj.project.baselines || [];
       $('#planReport').innerHTML = `
-      <div><a href="#planning/project/${projectId}">← Back to ${esc(proj.project.name)}</a></div>
+      ${planReportTabBarHtml(projectId, reportId)}
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3></div>
         <div class="note">The baseline this report compared against was deleted. Pick a baseline to regenerate it.</div>
@@ -12430,6 +12420,8 @@ async function loadPlanReport(projectId, reportId) {
           loadPlanReport(projectId, reportId);
         } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
       });
+      planReportTabsWire(projectId, reportId);
+      planReportHighlightApply();
       return;
     }
     // Scenario pinning: a report renders under its PINNED scenarios
@@ -12452,6 +12444,7 @@ async function loadPlanReport(projectId, reportId) {
       comp = await api(`/api/planning/projects/${projectId}/comparison${q.length ? `?${q.join('&')}` : ''}`);
     } catch (err) {
       if (/scenario not found/i.test(err.message || '')) {
+        if (mySeq !== planReportLoadSeq) return;
         planReportPinPanel(proj, report, 'A scenario this report was pinned to was deleted. Pick the scenarios it should run under.');
         return;
       }
@@ -12482,11 +12475,8 @@ async function loadPlanReport(projectId, reportId) {
         catch { fanData[row.strategy.id] = []; }
       }
     }
+    if (mySeq !== planReportLoadSeq) return;
     $('#planList').classList.add('hidden');
-    $('#planProject').classList.add('hidden');
-    $('#planStrategy').classList.add('hidden');
-    $('#planScenario').classList.add('hidden');
-    $('#planReport').classList.remove('hidden');
     const rep = comp.report || {};
     const trajs = rep.trajectories || [];
     const baseTraj = trajs[0] || { monthly: [] };
@@ -12525,7 +12515,7 @@ async function loadPlanReport(projectId, reportId) {
         const sids = series || ['cost', 'gain', 'net'];
         const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'stock_gain' ? row.comparison.stockGain : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
         const fmt = (sid, v) => v == null ? '—' : sid === 'payoff_month' ? `${v} months` : sid === 'monthly_payment' ? planSigned(v) : money2(v);
-        const cards = comp.strategies.map((row) => `<div class="cards">${sids.map((sid) => `<div class="card breakdown-card"><div class="k">${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</div><div class="v">${fmt(sid, valOf(row, sid))}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`).join('')}</div>`).join('') || '<div class="note">No strategies yet.</div>';
+        const cards = comp.strategies.map((row) => `<div class="cards">${sids.map((sid) => `<div class="card breakdown-card plan-metric-card"><div class="k">${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</div><div class="v">${fmt(sid, valOf(row, sid))}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`).join('')}</div>`).join('') || '<div class="note">No strategies yet.</div>';
         const head = `<tr><th>Strategy</th>${sids.map((sid) => `<th>${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</th>`).join('')}</tr>`;
         const body = comp.strategies.map((row) => `<tr><td>${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</td>${sids.map((sid) => `<td>${fmt(sid, valOf(row, sid))}</td>`).join('')}</tr>`).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${cards}<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
@@ -12633,16 +12623,18 @@ async function loadPlanReport(projectId, reportId) {
       ? `Under ${scenarioIds.map((id) => { const sc = projScenarios.find((x) => x.id === id); return sc ? sc.name : `#${id}`; }).join(', ')}`
       : 'Current rates (no scenario)';
     planReportTabsOpen(projectId, reportId, report.name);
+    const renderedStrategyIds = comp.strategies.map((r) => r.strategy.id);
     $('#planReport').innerHTML = `
       ${planReportTabBarHtml(projectId, reportId)}
-      <div><a href="#planning/project/${projectId}">← Back to ${esc(proj.project.name)}</a></div>
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
-        <div class="note">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
-        <div class="note">${PLAN_REPORT_DEFS}</div>
+        <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
+        <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
+        <div class="toolbar"><button class="primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div>
+        <div class="note" id="planReportTabNote"></div>
         <div class="msg" id="planReportMsg"></div>
       </div>
-      ${panels.join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
+      ${panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
       <div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
@@ -12674,6 +12666,52 @@ async function loadPlanReport(projectId, reportId) {
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
     planReportTabsWire(projectId, reportId);
+    // Per-tab actions. Routing applies per tab by THIS report's pins:
+    // any AI-designed pinned entity disables preset Generate (AI
+    // Generate stays enabled). Preset Generate re-pins the report,
+    // which bumps updated_at and clears the computed stale flag; the
+    // view itself always renders live comparison data. Save exports
+    // the tab as PDF via the browser print path. Block Delete drops
+    // one chart from the saved definition and reloads.
+    const tabAiHits = [];
+    const tabBase = (proj.project.baselines || []).find((x) => x.id === report.baseline_id);
+    if (tabBase && tabBase.source === 'ai') tabAiHits.push(`baseline ${tabBase.name}`);
+    for (const sid of scenarioIds) { const sc = projScenarios.find((x) => x.id === sid); if (sc && sc.source === 'ai') tabAiHits.push(`scenario ${sc.name}`); }
+    const stratById = new Map((proj.strategies || []).map((s) => [s.id, s]));
+    for (const row of comp.strategies) { const s = stratById.get(row.strategy.id); if (s && s.modelSource === 'ai') tabAiHits.push(`strategy ${s.letter} · ${s.name}`); }
+    const tabGenBtn = $('#planReportTabGenerateBtn');
+    if (tabAiHits.length) {
+      tabGenBtn.disabled = true;
+      $('#planReportTabNote').textContent = `This report includes AI-designed ${tabAiHits.join(', ')} — use Generate with AI.`;
+    }
+    tabGenBtn.addEventListener('click', async () => {
+      try {
+        const body = { scenario_ids: scenarioIds };
+        if (report.baseline_id != null) body.baseline_id = report.baseline_id;
+        if (pickedIds != null) body.strategy_ids = pickedIds;
+        await api(`/api/planning/reports/${reportId}`, { method: 'PUT', body });
+        loadPlanReport(projectId, reportId);
+      } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
+    });
+    $('#planReportTabAiBtn').addEventListener('click', () => openPlanReportAiModal(projectId, { appendTo: { reportId, reportName: report.name } }));
+    $('#planReportTabSaveBtn').addEventListener('click', () => window.print());
+    document.querySelectorAll('[data-plan-report-block-del]').forEach((b) => b.addEventListener('click', async () => {
+      const idx = Number(b.dataset.planReportBlockDel);
+      if (!confirm('Delete this block from the report?')) return;
+      try {
+        const d = await api(`/api/planning/projects/${projectId}`);
+        const rep = (d.reports || []).find((x) => x.id === reportId);
+        const def = (rep && rep.definition) || {};
+        const charts = [...(def.charts || [])];
+        charts.splice(idx, 1);
+        await api(`/api/planning/reports/${reportId}`, { method: 'PUT', body: { definition: { ...def, charts } } });
+        loadPlanReport(projectId, reportId);
+      } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
+    }));
+    // Current tab + its pins: the tier cards above highlight them.
+    planReportCurrentId = reportId;
+    planReportCurrentPins = { scenarioIds, baselineId: report.baseline_id, strategyIds: renderedStrategyIds };
+    planReportHighlightApply();
   });
 }
 function sidsHas(series, sid) { return (series || []).includes(sid); }
@@ -12687,7 +12725,6 @@ async function loadPlanStrategy(id, scenarioId) {
     $('#planList').classList.add('hidden');
     $('#planProject').classList.add('hidden');
     $('#planStrategy').classList.remove('hidden');
-    $('#planReport').classList.add('hidden');
     $('#planScenario').classList.add('hidden');
     $('#planStrategy').innerHTML = planStrategyHtml(data);
     planStrategyWire(data);
@@ -13295,7 +13332,7 @@ function planStrategyReportWire(d) {
       if (scenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
       const baselineId = $('#planStrategyReportBaseline').value ? Number($('#planStrategyReportBaseline').value) : null;
       const r = await api(`/api/planning/projects/${d.project.id}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, baseline_id: baselineId, strategy_ids: [s.id], scenario_ids: scenarioIds } });
-      location.hash = `#planning/report/${d.project.id}/${r.report.id}`;
+      planOpenReportTab(d.project.id, r.report.id);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
 }
@@ -13716,7 +13753,6 @@ async function loadPlanScenario(id) {
     $('#planList').classList.add('hidden');
     $('#planProject').classList.add('hidden');
     $('#planStrategy').classList.add('hidden');
-    $('#planReport').classList.add('hidden');
     $('#planScenario').classList.remove('hidden');
     $('#planScenario').innerHTML = planScenarioHtml(data);
     planScenarioWire(data);

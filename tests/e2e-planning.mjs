@@ -717,7 +717,7 @@ export async function run(H, S) {
         metric: document.querySelector('#planReport').textContent.includes('Total cost'),
       }));
       H.check('planning: report view renders charts, tables and how-calculated lines',
-        view.hash.startsWith('#planning/report/') && view.line && view.yearly && view.doughnut && view.defs && view.lane && view.metric,
+        view.hash.startsWith('#planning/project/') && view.line && view.yearly && view.doughnut && view.defs && view.lane && view.metric,
         JSON.stringify(view));
       await page.goto(`http://ff.local/#planning/strategy/${planStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
@@ -2847,7 +2847,7 @@ export async function run(H, S) {
         ps2Legacy && ps2Legacy.cells[1] === ps2Exp.delta && ps2Legacy.cells[2] === '—',
         JSON.stringify({ legacy: ps2Legacy, exp: ps2Exp }));
       await page.goto(`http://ff.local/#planning/report/${ps1Proj}/${ps1Rep}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitPS(1500);
+      await waitPS(2500);
       const psRepMerged = await readMergedPayRow('#planReportMergedTable');
       H.check('payscope: report view merged row names A with A-only absolute + delta',
         psRepMerged && psRepMerged.label.includes('11 PayScope A Lane')
@@ -3145,7 +3145,7 @@ export async function run(H, S) {
       H.check('report: pinned save from the modal appears in the Reports list', listed);
       // Pinned report view: world label + method line + comparison component.
       await page.goto(`http://ff.local/#planning/report/${repProjectId}/${repMethodId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitP(1500);
+      await waitP(2500);
       const view = await page.evaluate(() => {
         const el = document.querySelector('#planReport');
         const t = el ? el.textContent : '';
@@ -3156,7 +3156,7 @@ export async function run(H, S) {
         };
       });
       H.check('report: pinned view renders under its scenario with method line + comparison component',
-        view.hash.startsWith('#planning/report/') && view.world && view.method && view.traj && view.merged && view.mergedPay, JSON.stringify(view));
+        view.hash.startsWith('#planning/project/') && view.world && view.method && view.traj && view.merged && view.mergedPay, JSON.stringify(view));
       // Deleted pinned scenario re-opens the pin panel; re-pinning restores the view.
       // (The base scenario cannot be deleted, so the second scenario becomes base first.)
       r = await H.req('POST', `/api/planning/scenarios/${repScen2Id}/set-base`, {});
@@ -3168,14 +3168,14 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(800);
       await page.goto(`http://ff.local/#planning/report/${repProjectId}/${repMethodId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitP(1500);
+      await waitP(2500);
       const pinPanel = await page.evaluate(() => ({
         hash: location.hash,
         text: document.querySelector('#planReport') ? document.querySelector('#planReport').textContent : '',
         boxes: !!document.querySelector('#planReportPinScenarios'),
       }));
       H.check('report: deleted pinned scenario shows the pin panel, not silent numbers',
-        pinPanel.hash.startsWith('#planning/report/') && pinPanel.boxes && /deleted/i.test(pinPanel.text), JSON.stringify(pinPanel));
+        pinPanel.hash.startsWith('#planning/project/') && pinPanel.boxes && /deleted/i.test(pinPanel.text), JSON.stringify(pinPanel));
       await page.click('#planReportPinBtn');
       await waitP(1500);
       const repinned = await page.evaluate(() => {
@@ -3193,13 +3193,13 @@ export async function run(H, S) {
       }));
       H.check('report: strategy detail has a Report panel with the pinned scenarios', detailPanel.panel && detailPanel.scen, JSON.stringify(detailPanel));
       await page.click('#planStrategyReportBtn');
-      await waitP(1500);
+      await waitP(2500);
       const detailReport = await page.evaluate(() => ({
         hash: location.hash,
         strat: (document.querySelector('#planReport')?.textContent || '').includes('Prepay 10k'),
       }));
       H.check('report: strategy detail Generate opens a report scoped to the current strategy',
-        detailReport.hash.startsWith('#planning/report/') && detailReport.strat, JSON.stringify(detailReport));
+        detailReport.hash.startsWith('#planning/project/') && detailReport.strat, JSON.stringify(detailReport));
       // Baselines AI entry: propose → preview → Apply appends a baseline.
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ description: 'AI baseline test', assumptions: [{ key: 'note', value: 'test' }] }));
       await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -3738,7 +3738,7 @@ export async function run(H, S) {
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(1500);
+      await waitD(2500);
       const repView = await page.evaluate(() => ({
         title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC balance path'),
         axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
@@ -3748,7 +3748,7 @@ export async function run(H, S) {
       H.check('detail-clarity: template report chart has title + axis caption, embedded comparison too',
         repView.title && repView.axis && repView.trajTitle && repView.trajBreak, JSON.stringify(repView));
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcAiRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(1500);
+      await waitD(2500);
       const aiView = await page.evaluate(() => ({
         title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC AI balance path'),
         axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
@@ -3890,12 +3890,8 @@ export async function run(H, S) {
           && JSON.stringify(flow.midGroups) === JSON.stringify(['planBaselineCardsPanel', 'planStrategiesPanel'])
           && flow.midTracks === 2 && flow.cardPadTop === '12px' && flow.selScen === wScen1 && flow.selCard && flow.selBorder === 'rgb(22, 104, 196)',
         JSON.stringify(flow));
-      H.check('wiring: connector lines draw selection + stored report pins as strokes',
-        flow.selPaths.some((p) => p.from === `scenario:${wScen1}` && p.to === `strategy:${wStrategyId}`)
-          && flow.repPaths.some((p) => p.from === `baseline:${wBaseId}` && p.to === `report:${wRepId}`)
-          && flow.repPaths.some((p) => p.from === `strategy:${wStrategyId}` && p.to === `report:${wRepId}`)
-          && !flow.allPaths.some((p) => p.to.startsWith('scenario:'))
-          && flow.allPaths.every((p) => p.fill === 'none' && (p.d.match(/L/g) || []).length === 3),
+      H.check('wiring: no connector lines; selection + stored pins shown by highlight only',
+        flow.allPaths.length === 0 && flow.selCard && flow.selBorder === 'rgb(22, 104, 196)',
         JSON.stringify(flow));
       await page.click(`[data-plan-scenario-select="${wScen2}"]`);
       await waitW(1200);
@@ -3979,16 +3975,16 @@ export async function run(H, S) {
           paths: document.querySelectorAll('#planFlowSvg path').length,
         };
       });
-      H.check('wiring: narrow viewport stacks the middle row without breaking lines',
-        narrow.tracks === 1 && narrow.paths > 0, JSON.stringify(narrow));
+      H.check('wiring: narrow viewport stacks the middle row, still no lines',
+        narrow.tracks === 1 && narrow.paths === 0, JSON.stringify(narrow));
       await page.setViewport({ width: 1500, height: 900 });
     } finally { await browserW.close(); }
   }
 
   // ------------------------------------------- project vertical flow
   // Three tiers (scenario → baseline+strategy row → reports),
-  // vertical elbow lines, one-click Generate, multi-tab reports,
-  // AI routing, AI vs preset titles.
+  // no connector lines (highlight only), one-click Generate,
+  // multi-tab reports, AI routing, AI vs preset titles.
   r = await H.req('POST', '/api/planning/projects', { name: 'Flow test', question: 'Flow pins' });
   H.check('flow: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const fProjectId = r.data.project.id;
@@ -4099,31 +4095,13 @@ export async function run(H, S) {
       // Tier order + vertical elbows + no crossing jog.
       const tiers = await page.evaluate(() => {
         const ts = [...document.querySelectorAll('#planFlowGrid > .plan-flow-tier')];
-        const cards = [...document.querySelectorAll('#planFlowGrid .plan-flow-card')].map((c) => { const b = c.getBoundingClientRect(); return { left: b.left, right: b.right, top: b.top, bottom: b.bottom }; });
-        const paths = [...document.querySelectorAll('#planFlowSvg path')].map((p) => {
-          const d = p.getAttribute('d') || '';
-          const nums = d.replace(/[ML]/g, ' ').trim().split(/\s+/).map(Number);
-          return { line: p.dataset.flowLine, from: p.dataset.flowFrom, to: p.dataset.flowTo, fill: getComputedStyle(p).fill, pts: nums };
-        });
-        return { tops: ts.map((t) => t.getBoundingClientRect().top), ids: ts.map((t) => t.id), cards, paths };
-      });
-      const jogCrosses = tiers.paths.some((p) => {
-        // Vertical elbow: M x1 y1 L x1 mid L x2 mid L x2 y2 — the only
-        // horizontal segment is the mid jog; it must not overlap any
-        // card body (vertical containment + horizontal overlap).
-        if (p.pts.length !== 8) return true;
-        const [, , , , mid, x2, ,] = p.pts;
-        const x1 = p.pts[0];
-        const lo = Math.min(x1, x2);
-        const hi = Math.max(x1, x2);
-        return tiers.cards.some((c) => c.top + 2 < mid && mid < c.bottom - 2 && Math.min(c.right, hi) - Math.max(c.left, lo) > 1);
+        return { tops: ts.map((t) => t.getBoundingClientRect().top), ids: ts.map((t) => t.id), svg: !!document.querySelector('#planFlowSvg'), paths: document.querySelectorAll('#planFlowGrid path').length };
       });
       H.check('flow: tiers stack scenario above baseline+strategy row above reports',
         JSON.stringify(tiers.ids) === JSON.stringify(['planScenarioCardsPanel', 'planFlowMidTier', 'planReportsPanel'])
           && tiers.tops[0] < tiers.tops[1] && tiers.tops[1] < tiers.tops[2], JSON.stringify(tiers));
-      H.check('flow: connector lines are vertical elbows with no fill',
-        tiers.paths.length > 0 && tiers.paths.every((p) => p.fill === 'none' && p.pts.length === 8), JSON.stringify(tiers.paths));
-      H.check('flow: no connector jog crosses a card body', !jogCrosses, JSON.stringify(tiers.paths));
+      H.check('flow: no connector lines in the flow panel',
+        !tiers.svg && tiers.paths === 0, JSON.stringify(tiers));
       // Guard: baseline is not picked yet (only the base scenario is).
       // Deselect the AI strategy first, or the routing rule (not the
       // guard) would own the button state from here on.
@@ -4179,81 +4157,127 @@ export async function run(H, S) {
       await waitF(1500);
       // A reload resets wiring state (baseline unpicked, every
       // strategy picked), so re-pick the engine selection first.
-      await page.click(`[data-plan-baseline-select="${fBaseId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fBaseId}"]`);
       await waitF(500);
-      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       // One-click Generate: creates + opens a report pinned to the
-      // then-current wiring selection, with no modal.
-      await page.click('#planFlowGenerateBtn');
+      // then-current wiring selection, with no modal. Inline: the
+      // hash stays on the project page and the viewer shows the tab.
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planFlowGenerateBtn');
       await waitF(1500);
       const genHash = await page.evaluate(() => location.hash);
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const genRep = (r.data.reports || []).find((x) => x.name === `Report · Flow world · Flow baseline · ${fLetter}`);
+      const genInline = await page.evaluate((rid) => ({
+        inline: !!document.querySelector('#planProject #planReport'),
+        tab: !!document.querySelector(`[data-plan-report-tab="${rid}"]`),
+      }), genRep ? genRep.id : -1);
       const modalHidden = await page.evaluate(() => {
         const m = document.querySelector('#planReportSaveModal');
         return !m || m.classList.contains('hidden');
       });
       H.check('flow: one-click Generate creates and opens a pinned preset report, no modal',
-        !!genRep && genHash === `#planning/report/${fProjectId}/${genRep.id}`
+        !!genRep && genHash === `#planning/project/${fProjectId}` && genInline.inline && genInline.tab
           && JSON.stringify(genRep.scenarioIds) === JSON.stringify([fScenId]) && genRep.baseline_id === fBaseId
           && JSON.stringify(JSON.parse(genRep.strategy_ids || 'null')) === JSON.stringify([fStratId])
           && JSON.stringify(genRep.definition.charts) === JSON.stringify([
             { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] },
             { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
           ]) && modalHidden,
-        JSON.stringify({ genHash, genRep, modalHidden }));
-      // Multi-tab: open a second report, switch tabs, close tabs —
-      // closing removes only the tab, never the report.
+        JSON.stringify({ genHash, genInline, genRep, modalHidden }));
+      // Multi-tab (inline): open a second report, switch tabs, close
+      // tabs — closing removes only the tab, never the report, and
+      // the user never leaves the project page (no separate report
+      // page is navigated to at any point).
       r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Flow second report', definition: { strategies: [fStratId], charts: [{ template: 'time_line', title: 'Second balance', series: ['mortgage_balance'] }] }, strategy_ids: [fStratId], baseline_id: fBaseId, scenario_ids: [fScenId] });
       H.check('flow: second report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
       const fRep2Id = r.data.report.id;
-      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitF(1500);
-      await page.evaluate((rid) => { document.querySelector(`[data-plan-report-view="${rid}"]`).click(); }, fRep2Id);
-      await waitF(1200);
+      // Open the second report via its deep link: the card list only
+      // re-renders on a project load, and the page is already on the
+      // project hash (a same-hash goto would be a no-op), so the
+      // API-created report has no card yet. The redirect lands on
+      // the project page with this tab open.
+      await page.goto(`http://ff.local/#planning/report/${fProjectId}/${fRep2Id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // Deep-link render races the same async viewer as the other tabs
+      // pins: wait for the tab and its blocks instead of a fixed sleep
+      // (a fixed 2000ms read the not-yet-rendered viewer: tab=false).
+      await page.waitForSelector(`[data-plan-report-tab="${fRep2Id}"]`, { timeout: 15000 });
+      await page.waitForFunction((rid) => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent).includes('Second balance'), { timeout: 15000 }, fRep2Id);
+      // The redirect chain renders the tab bar asynchronously, and
+      // page.click does NOT wait for its selector — wait for the bar
+      // explicitly before any tab click.
+      await page.waitForSelector(`[data-plan-report-tab="${fRep2Id}"]`, { timeout: 15000 });
       const tabs2 = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-tab]')].map((b) => Number(b.dataset.planReportTab)));
-      await page.click(`[data-plan-report-tab="${genRep.id}"]`);
+      const viewerState = async () => page.evaluate(() => ({
+        hash: location.hash,
+        inline: !!document.querySelector('#planProject #planReport'),
+        strip: !!document.querySelector('#planReportTabsBar'),
+        blocks: [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent),
+        currentWrap: !!document.querySelector('.plan-report-tabwrap-current'),
+      }));
+      const st2 = await viewerState();
+      await page.waitForSelector(`[data-plan-report-tab="${genRep.id}"]`, { timeout: 15000 });
+      // Click via evaluate (re-query at click time): a plain page.click
+      // holds the handle from waitForSelector, and the switch render can
+      // replace the tab bar between the two ("Node is detached from
+      // document" killed full runs #4/#5's planning module here).
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab="${id}"]`).click(); }, genRep.id);
       await waitF(1000);
-      const tabSwitchHash = await page.evaluate(() => location.hash);
-      await page.click(`[data-plan-report-tab-close="${genRep.id}"]`);
+      // Wait for the switch render itself before reading state: a fixed
+      // 1000ms read the pre-switch viewer (stSwitch still showed the
+      // old tab's blocks) when the render ran long.
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+      const stSwitch = await viewerState();
+      await page.waitForSelector(`[data-plan-report-tab-close="${genRep.id}"]`, { timeout: 15000 });
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab-close="${id}"]`).click(); }, genRep.id);
       await waitF(1000);
-      const tabCloseHash = await page.evaluate(() => location.hash);
+      // Post-close fallback re-renders the remaining tab (project +
+      // comparison + properties fetches): under full-run load this took
+      // over 15s once, so the budget here is 30s (a genuinely broken
+      // render still fails, just later).
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Second balance'), { timeout: 30000 });
+      const stClose = await viewerState();
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const bothAlive = (r.data.reports || []).some((x) => x.id === genRep.id) && (r.data.reports || []).some((x) => x.id === fRep2Id);
-      await page.click(`[data-plan-report-tab-close="${fRep2Id}"]`);
+      await page.waitForSelector(`[data-plan-report-tab-close="${fRep2Id}"]`, { timeout: 15000 });
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab-close="${id}"]`).click(); }, fRep2Id);
       await waitF(1000);
-      const tabEmptyHash = await page.evaluate(() => location.hash);
-      H.check('flow: tabs open, switch, and close without deleting reports',
+      await page.waitForFunction(() => !document.querySelector('[data-plan-report-tab]'), { timeout: 15000 });
+      const stEmpty = await viewerState();
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const bothAlive2 = (r.data.reports || []).some((x) => x.id === genRep.id) && (r.data.reports || []).some((x) => x.id === fRep2Id);
+      H.check('flow: tabs open, switch, and close without deleting reports (inline)',
         JSON.stringify(tabs2.sort((a, b) => a - b)) === JSON.stringify([genRep.id, fRep2Id].sort((a, b) => a - b))
-          && tabSwitchHash === `#planning/report/${fProjectId}/${genRep.id}`
-          && tabCloseHash === `#planning/report/${fProjectId}/${fRep2Id}`
-          && bothAlive && tabEmptyHash === `#planning/project/${fProjectId}`,
-        JSON.stringify({ tabs2, tabSwitchHash, tabCloseHash, bothAlive, tabEmptyHash }));
+          && st2.hash === `#planning/project/${fProjectId}` && st2.inline && st2.strip && st2.blocks.includes('Second balance')
+          && stSwitch.hash === `#planning/project/${fProjectId}` && stSwitch.blocks.includes('Mortgage balance') && stSwitch.currentWrap
+          && stClose.hash === `#planning/project/${fProjectId}` && stClose.blocks.includes('Second balance') && bothAlive
+          && stEmpty.hash === `#planning/project/${fProjectId}` && !stEmpty.strip && stEmpty.blocks.length === 0 && bothAlive2,
+        JSON.stringify({ tabs2, st2, stSwitch, stClose, bothAlive, stEmpty, bothAlive2 }));
       // Routing: each AI-designed pick disables preset Generate with
       // a reason, while Generate with AI stays available.
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitF(1500);
       // Reload resets wiring state, so start from the engine-only
       // selection (AI strategy off) before each routing case.
-      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const routingState = async () => page.evaluate(() => ({
         disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
         aiEnabled: !document.querySelector('#planAiReportBtn')?.disabled,
       }));
-      await page.click(`[data-plan-baseline-select="${fAiBaseId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fAiBaseId}"]`);
       await waitF(800);
       const routeBase = await routingState();
-      await page.click(`[data-plan-baseline-select="${fBaseId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fBaseId}"]`);
       await waitF(800);
-      await page.click(`[data-plan-scenario-select="${fAiScenId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fAiScenId}"]`);
       await waitF(1200);
       const routeScen = await routingState();
-      await page.click(`[data-plan-scenario-select="${fScenId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fScenId}"]`);
       await waitF(1200);
-      await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const routeStrat = await routingState();
       H.check('flow: AI-designed baseline/scenario/strategy each disable preset Generate with reason, AI Generate stays available',
@@ -4270,32 +4294,212 @@ export async function run(H, S) {
         { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
       ];
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Flow AI outlook', charts: fAiCharts }));
-      await page.click('#planAiReportBtn');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiReportBtn');
       await waitF(1000);
       await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Compare balance paths and headlines'; });
-      await page.click('#planReportAiGenBtn');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiGenBtn');
       await waitF(1200);
       const aiPrefill = await page.evaluate(() => document.querySelector('#planReportAiName')?.value || '');
       await page.evaluate((sid) => { const el = document.querySelector(`#planReportAiScenarios input[value="${sid}"]`); if (el) el.checked = true; }, fScenId);
-      await page.click('#planReportAiSaveBtn');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiSaveBtn');
       await waitF(1200);
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const aiTitled = (r.data.reports || []).find((x) => x.name === 'Flow AI outlook');
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: fAiCharts }));
-      await page.click('#planAiReportBtn');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiReportBtn');
       await waitF(1000);
       await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Compare balance paths and headlines'; });
-      await page.click('#planReportAiGenBtn');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiGenBtn');
       await waitF(1200);
       const aiBlank = await page.evaluate(() => document.querySelector('#planReportAiName')?.value || '');
       await page.evaluate((sid) => { const el = document.querySelector(`#planReportAiScenarios input[value="${sid}"]`); if (el) el.checked = true; }, fScenId);
-      await page.click('#planReportAiSaveBtn');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiSaveBtn');
       await waitF(1200);
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const aiFallback = (r.data.reports || []).find((x) => x.name === `Report · ${fLetter} · Flow prepay`);
       H.check('flow: AI report title comes from the AI, falling back to the auto-name pattern',
         aiPrefill === 'Flow AI outlook' && !!aiTitled && aiBlank === '' && !!aiFallback,
         JSON.stringify({ aiPrefill, aiTitled: !!aiTitled, aiBlank, aiFallback: !!aiFallback }));
+      // ---- report-tab refinement pins (inline model) ----
+      // Fixture: an AI-pinned report (baseline/scenario/strategy all AI).
+      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Reporttab AI', definition: { charts: [{ template: 'time_line', title: 'AI balance', series: ['mortgage_balance'] }] }, baseline_id: fAiBaseId, strategy_ids: [fAiStratId], scenario_ids: [fAiScenId] });
+      H.check('reporttab: AI-pinned report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const rtAiId = r.data.report.id;
+      // No report-highlight when no report tab is selected: close any
+      // tab left open, then the tiers show wiring blue only.
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      for (;;) {
+        const closeBtn = await page.$('[data-plan-report-tab-close]');
+        if (!closeBtn) break;
+        await closeBtn.click();
+        await waitF(800);
+      }
+      const noPin = await page.evaluate(() => ({
+        pins: [...document.querySelectorAll('.plan-report-pin')].filter((el) => el.offsetParent !== null).length,
+        viewerEmpty: (document.querySelector('#planReport')?.innerHTML || '').trim() === '',
+      }));
+      H.check('reporttab: no report-highlight when no report tab is selected', noPin.pins === 0 && noPin.viewerEmpty, JSON.stringify(noPin));
+      // Wiring scenario = engine scenario, so the engine report's
+      // scenario card can show both states at once (radio: no-op if set).
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fScenId}"]`);
+      await waitF(800);
+      const readTier = (scenId, baseId, stratId) => page.evaluate((s, b, t) => {
+        const card = (kind, id) => document.querySelector(`[data-plan-${kind}="${id}"]`);
+        const styleOf = (el) => el ? { pin: el.classList.contains('plan-report-pin'), sel: el.classList.contains('plan-selected'), border: getComputedStyle(el).borderColor, outline: getComputedStyle(el).outlineColor } : null;
+        return {
+          scenPins: [...document.querySelectorAll('[data-plan-scenario].plan-report-pin')].map((el) => Number(el.dataset.planScenario)),
+          basePins: [...document.querySelectorAll('[data-plan-baseline].plan-report-pin')].map((el) => Number(el.dataset.planBaseline)),
+          stratPins: [...document.querySelectorAll('[data-plan-strategy].plan-report-pin')].map((el) => Number(el.dataset.planStrategy)),
+          scen: styleOf(card('scenario', s)), base: styleOf(card('baseline', b)), strat: styleOf(card('strategy', t)),
+          inline: !!document.querySelector('#planProject #planReport'),
+          hash: location.hash,
+        };
+      }, scenId, baseId, stratId);
+      const openCard = async (rid, blockTitle) => { await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, rid); await waitF(1200); await page.waitForFunction((t) => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === t), { timeout: 15000 }, blockTitle); };
+      // Per-tab buttons present on the engine report tab.
+      await openCard(genRep.id, 'Mortgage balance');
+      const tabBtns = await page.evaluate(() => ({
+        gen: !!document.querySelector('#planReportTabGenerateBtn'),
+        ai: !!document.querySelector('#planReportTabAiBtn'),
+        save: !!document.querySelector('#planReportTabSaveBtn'),
+        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
+      }));
+      H.check('reporttab: per-tab Generate, AI Generate, Save buttons present; preset enabled for engine pins', tabBtns.gen && tabBtns.ai && tabBtns.save && !tabBtns.genDisabled, JSON.stringify(tabBtns));
+      // Highlight: engine tab highlights its own pins on the tiers
+      // above (amber); the scenario card — wiring-selected AND
+      // report-pinned — shows both states with distinct styles; the
+      // viewer sits inline on the project page.
+      const tierEngine = await readTier(fScenId, fBaseId, fStratId);
+      H.check('reporttab: engine tab highlights its own pins on the tiers above; scenario card shows both states distinctly; viewer inline',
+        JSON.stringify(tierEngine.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierEngine.basePins) === JSON.stringify([fBaseId]) && tierEngine.stratPins.includes(fStratId)
+          && tierEngine.scen && tierEngine.scen.pin && tierEngine.scen.sel
+          && tierEngine.scen.border === 'rgb(22, 104, 196)' && tierEngine.scen.outline === 'rgb(183, 121, 31)'
+          && tierEngine.inline && tierEngine.hash === `#planning/project/${fProjectId}`, JSON.stringify(tierEngine));
+      // Preset regenerate: touching the strategy stales the report;
+      // per-tab Generate clears the stale badge (reopening the tab
+      // re-reads the report, so no page reload is needed).
+      r = await H.req('PUT', `/api/planning/strategies/${fStratId}`, { name: 'Flow prepay' });
+      H.check('reporttab: strategy touch succeeds', r.status === 200, JSON.stringify(r.data));
+      await openCard(genRep.id, 'Mortgage balance');
+      // Wait for the post-touch render itself: the badge must appear
+      // (the touch bumped the strategy past the report), so a read
+      // taken before that render lands sees a stale-free viewer.
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length > 0, { timeout: 15000 });
+      const staleBefore = await page.evaluate(() => !!document.querySelector('#planReport .msg.warn') || [...document.querySelectorAll('#planReport .section-head .msg.warn')].length > 0);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabGenerateBtn');
+      // Regenerate re-renders after a PUT + comparison fetch: wait for
+      // the badge to clear instead of a fixed sleep (1500ms was too
+      // short under full-run load: staleAfter stayed 1).
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length === 0, { timeout: 15000 });
+      const staleAfter = await page.evaluate(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length);
+      H.check('reporttab: per-tab Generate clears the stale badge', staleBefore && staleAfter === 0, JSON.stringify({ staleBefore, staleAfter }));
+      // Per-tab routing on the AI-pinned report + its highlight.
+      // First open is via deep link: the report was created via API
+      // after the last project render, so it has no card yet.
+      await page.goto(`http://ff.local/#planning/report/${fProjectId}/${rtAiId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(2000);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'AI balance'), { timeout: 15000 });
+      const tabRoute = await page.evaluate(() => ({
+        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
+        note: document.querySelector('#planReportTabNote')?.textContent || '',
+        aiEnabled: !document.querySelector('#planReportTabAiBtn')?.disabled,
+      }));
+      H.check('reporttab: AI-pinned tab disables preset Generate with reason, AI stays enabled', tabRoute.genDisabled && tabRoute.note.includes('AI-designed') && tabRoute.aiEnabled, JSON.stringify(tabRoute));
+      const tierAi = await readTier(fAiScenId, fAiBaseId, fAiStratId);
+      H.check('reporttab: AI tab highlights its own pins above, not the engine pins',
+        JSON.stringify(tierAi.scenPins) === JSON.stringify([fAiScenId]) && JSON.stringify(tierAi.basePins) === JSON.stringify([fAiBaseId]) && JSON.stringify(tierAi.stratPins) === JSON.stringify([fAiStratId]), JSON.stringify(tierAi));
+      // Round-trip: back to the engine tab, its highlight returns.
+      await page.waitForSelector(`[data-plan-report-tab="${genRep.id}"]`, { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab="${genRep.id}"]`);
+      await waitF(1000);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+      const tierBack = await readTier(fScenId, fBaseId, fStratId);
+      H.check('reporttab: highlight follows the tab back to the engine pins',
+        JSON.stringify(tierBack.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierBack.basePins) === JSON.stringify([fBaseId]) && tierBack.stratPins.includes(fStratId), JSON.stringify(tierBack));
+      // AI append on the AI tab: new charts join, old ones stay, and
+      // the append persists across a close + reopen.
+      await page.waitForSelector(`[data-plan-report-tab="${rtAiId}"]`, { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab="${rtAiId}"]`);
+      await waitF(1000);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'AI balance'), { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabAiBtn');
+      await waitF(1000);
+      const appendUi = await page.evaluate(() => ({
+        modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
+        pickersHidden: ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('div')?.classList.contains('hidden')),
+        note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
+      }));
+      H.check('reporttab: per-tab AI opens append mode (pickers hidden, pins-unchanged note)', appendUi.modalOpen && appendUi.pickersHidden && appendUi.note.includes('pins unchanged'), JSON.stringify(appendUi));
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', charts: [{ template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
+      await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Add an extra balance path'; });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiGenBtn');
+      await waitF(1200);
+      const appendSaveLabel = await page.evaluate(() => document.querySelector('#planReportAiSaveBtn')?.textContent || '');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiSaveBtn');
+      await waitF(1500);
+      const appendTitles = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const rtAiDef = ((r.data.reports || []).find((x) => x.id === rtAiId) || {}).definition || {};
+      H.check('reporttab: AI charts append (not replace) and persist',
+        appendSaveLabel === 'Append to this report' && appendTitles.includes('AI balance') && appendTitles.includes('Extra balance') && (rtAiDef.charts || []).length === 2, JSON.stringify({ appendSaveLabel, appendTitles, charts: rtAiDef.charts }));
+      await page.waitForSelector(`[data-plan-report-tab-close="${rtAiId}"]`, { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${rtAiId}"]`);
+      await waitF(1000);
+      await openCard(rtAiId, 'AI balance');
+      const appendTitles2 = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
+      H.check('reporttab: appended charts survive a close + reopen', appendTitles2.includes('AI balance') && appendTitles2.includes('Extra balance'), JSON.stringify(appendTitles2));
+      // Block delete on the engine tab persists across a close + reopen.
+      await page.waitForSelector(`[data-plan-report-tab="${genRep.id}"]`, { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab="${genRep.id}"]`);
+      await waitF(1000);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+      const blocksBefore = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '[data-plan-report-block-del="0"]');
+      // Wait for the post-delete render (server already applied the
+      // delete; a fixed sleep read the pre-delete DOM).
+      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 1 && b[0] === 'Headlines'; }, { timeout: 15000 });
+      const blocksAfter = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const genDef = ((r.data.reports || []).find((x) => x.id === genRep.id) || {}).definition || {};
+      H.check('reporttab: block delete removes one block and persists',
+        blocksBefore.length === 2 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 1 && blocksAfter[0] === 'Headlines' && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
+      await page.waitForSelector(`[data-plan-report-tab-close="${genRep.id}"]`, { timeout: 15000 });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${genRep.id}"]`);
+      await waitF(1000);
+      await openCard(genRep.id, 'Headlines');
+      const blocksReopen = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
+      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 1 && blocksReopen[0] === 'Headlines', JSON.stringify(blocksReopen));
+      // Polish: quiet defs note + subtitle + metric cards + current tab wrap.
+      const polish = await page.evaluate(() => ({
+        defs: !!document.querySelector('#planReport .plan-report-defs'),
+        subtitle: !!document.querySelector('#planReport .plan-report-subtitle'),
+        metric: [...document.querySelectorAll('#planReport .plan-metric-card')].length,
+        currentWrap: !!document.querySelector('.plan-report-tabwrap-current'),
+      }));
+      H.check('reporttab: polished elements render (quiet defs note, subtitle, metric cards, current tab wrap)',
+        polish.defs && polish.subtitle && polish.metric === 3 && polish.currentWrap, JSON.stringify(polish));
+      // Per-tab Save triggers the browser print/export path.
+      await page.evaluate(() => { window.__printCalled = false; window.print = () => { window.__printCalled = true; }; });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabSaveBtn');
+      await waitF(500);
+      const printCalled = await page.evaluate(() => !!window.__printCalled);
+      H.check('reporttab: per-tab Save invokes the print/export path', printCalled, JSON.stringify({ printCalled }));
+      // Old deep link: a #planning/report/... URL lands on the project
+      // page with that report's tab open.
+      await page.goto(`http://ff.local/#planning/report/${fProjectId}/${fRep2Id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // Same race as the other tabs pins: wait for the tab and its
+      // blocks instead of a fixed sleep (a fixed 2000ms read the
+      // not-yet-rendered viewer: tab=false, blocks=[]).
+      await page.waitForSelector(`[data-plan-report-tab="${fRep2Id}"]`, { timeout: 15000 });
+      await page.waitForFunction((rid) => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent).includes('Second balance'), { timeout: 15000 }, fRep2Id);
+      const deepLink = await page.evaluate((rid) => ({
+        hash: location.hash,
+        tab: !!document.querySelector(`[data-plan-report-tab="${rid}"]`),
+        blocks: [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent),
+      }), fRep2Id);
+      H.check('reporttab: old report deep link lands on the project page with the tab open',
+        deepLink.hash === `#planning/project/${fProjectId}` && deepLink.tab && deepLink.blocks.includes('Second balance'), JSON.stringify(deepLink));
     } finally { await browserF.close(); }
   }
 }

@@ -59,7 +59,7 @@ import {
   primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
   currentReturnRateFromPoints, validatePoolItemShapes,
-  validateReportScenarioIds, validateAiChartMethods,
+  validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -7038,12 +7038,20 @@ app.put('/api/planning/reports/:id', requireApiAuth, (req, res) => {
     if (scenErr) return res.status(400).json({ error: scenErr });
     scenarioIds = b.scenario_ids.map(Number);
   }
+  // Definition edit (block delete / AI append): structural validation
+  // only; absent means keep the stored definition (COALESCE below).
+  let definition = null;
+  if (b.definition !== undefined && b.definition !== null) {
+    const defErrs = validateReportDefinition(b.definition);
+    if (defErrs.length) return res.status(400).json({ error: defErrs.join('; ') });
+    definition = b.definition;
+  }
   const out = commitTx(req, 'project', {
     module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id,
     entityLabel: p.name, summary: `Updated report · ${p.name}`,
   }, () => {
-    db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, scenario_ids = ?, updated_at = ? WHERE id = ?')
-      .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, scenarioIds ? JSON.stringify(scenarioIds) : null, nowIso(), r.id);
+    db.prepare('UPDATE plan_reports SET baseline_id = ?, baseline_cleared = ?, strategy_ids = ?, scenario_ids = ?, definition = COALESCE(?, definition), updated_at = ? WHERE id = ?')
+      .run(baselineId, cleared, strategyIds ? JSON.stringify(strategyIds) : null, scenarioIds ? JSON.stringify(scenarioIds) : null, definition ? JSON.stringify(definition) : null, nowIso(), r.id);
     return { value: { report: db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(r.id) }, entityId: p.id };
   });
   res.json(out);

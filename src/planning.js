@@ -997,6 +997,23 @@ export function validateAiChartMethods(charts) {
   return errs;
 }
 
+// Report definition edit (block delete / AI append): structural only,
+// deliberately looser than the POST spec check — a delete must never
+// be blocked by a legacy chart the renderer already tolerates as
+// "Not rendered". Each chart still needs a template and a title so
+// the block list stays renderable.
+export function validateReportDefinition(def) {
+  if (def == null || typeof def !== 'object' || Array.isArray(def)) return ['definition must be an object'];
+  const errs = [];
+  if (def.charts !== undefined) {
+    if (!Array.isArray(def.charts)) errs.push('definition.charts must be an array');
+    else for (const c of def.charts) {
+      if (!c || typeof c !== 'object' || typeof c.template !== 'string' || !c.template || typeof c.title !== 'string' || !c.title) errs.push('each chart needs a template and a title');
+    }
+  }
+  return errs;
+}
+
 // ------------------------------------------- project template metadata --
 // TEMPLATE OWNS QUESTIONS: each project template declares its own
 // question/metadata schema and which project-page sections it shows.

@@ -576,10 +576,19 @@ table.seg-table td:last-child { text-align: right; }
 .plan-flow-card.plan-selected { border-color: #1668c4; background: #f0f6fc; }
 .plan-flow-card.plan-flow-flat { border-style: dashed; }
 .plan-flow-select[aria-pressed="true"] { background: #1668c4; color: #fff; border-color: #1668c4; }
-#planFlowSvg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-.plan-flow-line { fill: none; stroke: #9fb2c3; stroke-width: 1.5; }
-.plan-flow-line-sel { fill: none; stroke: #1668c4; stroke-width: 2.5; }
-.plan-report-tabs { gap: 6px; flex-wrap: wrap; }
+.plan-report-tabs { gap: 6px; flex-wrap: wrap; border-bottom: 1px solid #dde4ec; }
+/* Browser-like tabs: the wrap is the tab (card border/radius on top,
+   current tab white with a blue top accent, connected to the viewer
+   below); the name/close buttons inside are borderless. */
+.plan-report-tabwrap { display: inline-flex; align-items: center; gap: 2px; background: #f4f7fa; border: 1px solid #dde4ec; border-bottom: none; border-radius: 8px 8px 0 0; padding: 2px 2px 2px 8px; }
+.plan-report-tabwrap-current { background: #fff; box-shadow: inset 0 2px 0 #1668c4; }
+.plan-report-tabwrap button { border: none; background: transparent; }
+.plan-report-tabwrap-current .plan-report-tab-name { font-weight: 650; }
+.plan-report-tab-close { color: #71808f; padding: 2px 6px; }
+/* Inline report viewer: spacing below the report cards; the header
+   subtitle and the definitions line are quiet notes, not body text. */
+#planReport:not(:empty) { margin-top: 12px; }
+.plan-report-defs { font-size: 12px; color: #71808f; }
 
 /* Planning: plain rows in the app's list-row style (same spacing and
    divider as other list rows); leg editor rows share the row flex. */
@@ -587,3 +596,22 @@ table.seg-table td:last-child { text-align: right; }
 .plan-row:last-child { border-bottom: none; }
 .plan-leg-row { justify-content: flex-start; }
 .plan-leg-row select, .plan-leg-row input { flex: 1 1 auto; min-width: 0; }
+
+/* Report PDF export (per-tab Save): print only the open report —
+   no topbar, no other views, no tab bar, no buttons, no modals. */
+@media print {
+  body > header, #mainNav { display: none !important; }
+  main > section:not(#view-planning) { display: none !important; }
+  #view-planning > div:not(#planProject) { display: none !important; }
+  #planProject > :not(#planFlowPanel) { display: none !important; }
+  #planFlowPanel > :not(#planFlowGrid) { display: none !important; }
+  #planFlowGrid > :not(#planReportsPanel) { display: none !important; }
+  #planReportsPanel > :not(#planReport) { display: none !important; }
+  #planReportTabsBar, #planReport button { display: none !important; }
+  .modal-overlay { display: none !important; }
+}
+
+/* Report-pin highlight: amber frame + left bar. It never touches
+   border/background, so it combines unambiguously with the wiring
+   Selected state (blue border + light-blue background). */
+.plan-report-pin { outline: 2px solid #b7791f; outline-offset: 1px; box-shadow: inset 4px 0 0 #b7791f; }
