@@ -112,7 +112,7 @@ export function scenarioPrimeHistory(actualHistory, scenario) {
 // ------------------------------------------------------------ validation --
 // Op shapes (params is the op's JSON params object):
 //  prepay {propertyId, date(YYYY-MM-DD), amount, recurringYears?}
-//  rate_switch {propertyId, date, rateType fixed|variable, annualRate?, spread?, termMonths?}
+//  rate_switch {propertyId, date, rateType fixed|variable, annualRate?, spread?, termMonths?, amortizationYears? (fixed only, blank = remaining amortization)}
 //  refinance {propertyId, date, termMonths, amortizationYears, rateType, annualRate?, spread?, fees?, cashOut?, lender?}
 //  payment_change {propertyId, date, payment}
 //  buy {accountId, holdingId?, symbol?, currency?, date, units?, amount?, price?}
@@ -141,6 +141,14 @@ export function validateOp(op, ctx = {}) {
     if (p.rateType === 'fixed') pos(p.annualRate, 'fixed rate');
     else if (p.rateType === 'variable') { if (num(p.spread) == null) errs.push('spread must be a number'); }
     else errs.push('rateType must be fixed or variable');
+    // Optional amortization override, fixed switches only: blank =
+    // the term's remaining amortization; a filled value re-amortizes
+    // over that many years (it also matters for refinance, whose own
+    // amortizationYears is required).
+    if (p.amortizationYears != null) {
+      if (!(Number(p.amortizationYears) >= 1 && Number(p.amortizationYears) <= 35)) errs.push('amortization must be 1..35 years');
+      else if (p.rateType === 'variable') errs.push('amortization override applies to fixed switches only');
+    }
   }
   if (op.op_type === 'refinance') {
     if (!Number.isInteger(Number(p.propertyId))) errs.push('refinance needs a property');
@@ -348,6 +356,30 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     if (op.op_type === 'rate_switch') {
       const pen = breakPenalty(plan, p.date, balanceAt(plan, p.date.slice(0, 7)) ?? 0, { openClosed: p.openClosed || 'closed' });
       if (pen && pen.penalty > 0) penalties.push({ ...pen, opSeq: op.seq, reason: 'early rate switch' });
+      // A fixed switch with an amortization override re-amortizes
+      // over X years: split the term at the switch date (the
+      // contract term continues — term_months carries the
+      // governing term's remaining contract months, so the break
+      // horizon is unchanged — and the new term's start derivation
+      // prices the payment over exactly X years). Without an
+      // override no term is split: the engine's fixed-switch
+      // boundary rule derives over the governing term's remaining
+      // amortization counted from its start.
+      if (p.rateType === 'fixed' && num(p.amortizationYears) != null) {
+        const gov = termCovering(plan, p.date);
+        const bal = balanceAt(plan, p.date.slice(0, 7));
+        const endIdx = termEndMonthIdx(gov);
+        const switchIdx = monthIdxOf(p.date.slice(0, 7));
+        plan.terms.push({
+          property_id: plan.property.id, start_date: p.date,
+          term_months: endIdx >= 0 ? Math.max(1, endIdx - switchIdx) : 60,
+          amortization_years: Number(p.amortizationYears),
+          opening_balance: bal, repayment_method: (gov && gov.repayment_method) || 'equal_payment',
+          payment_override: null,
+          lender: (gov && gov.lender) || null, payment_frequency: null, payment_day: null,
+        });
+        plan.terms.sort((a, b) => (a.start_date < b.start_date ? -1 : 1));
+      }
       plan.segments = plan.segments.filter((s) => s.start_date < p.date);
       plan.segments.push({
         property_id: plan.property.id, start_date: p.date,
@@ -1649,6 +1681,21 @@ export function buildMergeWrites({ ops, legs, snapshot, current, projection }) {
       if (op.op_type === 'refinance') {
         const bal = projection && projection.refinanceBalance && projection.refinanceBalance[op.seq];
         writes.push({ kind: 'insert', table: 'mortgage_terms', opSeq: op.seq, label: `Refinance term from ${p.date}`, values: { property_id: Number(p.propertyId), start_date: p.date, term_months: Number(p.termMonths), amortization_years: Number(p.amortizationYears), opening_balance: bal ?? null, repayment_method: p.repaymentMethod || 'equal_payment', payment_override: num(p.paymentOverride) ?? null, lender: p.lender || null } });
+      }
+      // A fixed switch with an amortization override splits the
+      // term at the switch date, mirroring the projection: the new
+      // term amortizes over X years while the contract term
+      // continues (term_months = the governing term's remaining
+      // contract months). Without an override the merge stays
+      // segment-only — the engine's fixed-switch boundary rule
+      // derives over the governing term's remaining amortization.
+      if (op.op_type === 'rate_switch' && p.rateType === 'fixed' && num(p.amortizationYears) != null) {
+        const gov = (cur.mortgage_terms || []).filter((t) => t.property_id === Number(p.propertyId) && t.start_date <= p.date).pop()
+          || (cur.mortgage_terms || []).find((t) => t.property_id === Number(p.propertyId));
+        const govEnd = gov ? monthIdxOf(String(gov.start_date).slice(0, 7)) + (Number(gov.term_months) || 60) : -1;
+        const switchIdx = monthIdxOf(String(p.date).slice(0, 7));
+        const bal = projection && projection.switchBalance && projection.switchBalance[op.seq];
+        writes.push({ kind: 'insert', table: 'mortgage_terms', opSeq: op.seq, label: `Switch term from ${p.date}`, values: { property_id: Number(p.propertyId), start_date: p.date, term_months: govEnd >= 0 ? Math.max(1, govEnd - switchIdx) : 60, amortization_years: Number(p.amortizationYears), opening_balance: bal ?? null, repayment_method: (gov && gov.repayment_method) || 'equal_payment', payment_override: null, lender: (gov && gov.lender) || null } });
       }
       writes.push({ kind: 'insert', table: 'rate_segments', opSeq: op.seq, label: `Rate segment from ${p.date}`, values: { property_id: Number(p.propertyId), start_date: p.date, rate_type: p.rateType, rate_mode: p.rateType === 'variable' ? 'prime_spread' : 'absolute', annual_rate: p.rateType === 'fixed' ? num(p.annualRate) : null, spread: p.rateType === 'variable' ? num(p.spread) : null, compounding: p.compounding || 'semi_annual', accrual: p.accrual || 'monthly', locked_on: p.rateType === 'variable' ? p.date : null } });
     }

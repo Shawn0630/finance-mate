@@ -17,6 +17,7 @@ import {
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
   factorsToAssumptions,
 } from '../src/planning.js';
+import { derivePayment } from '../src/engine.js';
 
 const PROP = () => ({
   id: 1, mortgage_balance: 500000, mortgage_balance_date: '2026-01-01',
@@ -90,6 +91,104 @@ test('validateStrategyFactors: shape errors for points, percents and sinks', () 
 });
 
 // ------------------------------------------------------------- validation
+test('validateOp: rate_switch amortization override is fixed-only, 1..35 years', () => {
+  const ctx = { currentMonth: '2026-11' };
+  assert.deepEqual(validateOp({ op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'fixed', annualRate: 4.5 } }, ctx), []);
+  assert.deepEqual(validateOp({ op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'fixed', annualRate: 4.5, amortizationYears: 10 } }, ctx), []);
+  assert.ok(validateOp({ op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'fixed', annualRate: 4.5, amortizationYears: 0 } }, ctx).some((e) => /amortization/.test(e)));
+  assert.ok(validateOp({ op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'fixed', annualRate: 4.5, amortizationYears: 36 } }, ctx).some((e) => /amortization/.test(e)));
+  assert.ok(validateOp({ op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'variable', spread: -1, amortizationYears: 10 } }, ctx).some((e) => /fixed switches only/.test(e)));
+});
+
+// ------------------------------------------------------- switch-to-fixed
+// Fixture: term start 2026-01, 25y amortization, fixed 5%, $500,000
+// anchor at the term start, current month 2026-11.
+const switchRow = (proj, month) => proj.mortgage.perProperty[1].strategy.series.find((r) => r.month === month);
+const baseRow = (proj, month) => proj.mortgage.perProperty[1].baseline.series.find((r) => r.month === month);
+test('computeProjection: fixed switch (default) re-derives over the term remaining amortization', () => {
+  const base = computeProjection(ARGS());
+  const strat = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'fixed', annualRate: 4.0, openClosed: 'open' } }],
+  }));
+  assert.deepEqual(strat.errors, []);
+  // Switch state point 2026-11, term start 2026-01: 300 - 10 = 290
+  // months of amortization remain; the December payment amortizes
+  // the November balance over exactly that.
+  const nov = baseRow(base, '2026-11');
+  const dec = switchRow(strat, '2026-12');
+  assert.equal(dec.rate, 4.0);
+  assert.ok(Math.abs(dec.payment - derivePayment(nov.balance, 4.0, 290 / 12, 'semi_annual')) < 0.02, dec.payment);
+  assert.equal(strat.mortgage.perProperty[1].strategy.paymentAtEffect, dec.payment);
+  // A pure switch does not move the payoff date.
+  assert.equal(strat.mortgage.perProperty[1].strategy.payoffMonth, base.mortgage.perProperty[1].baseline.payoffMonth);
+});
+test('computeProjection: fixed switch with an amortization override re-amortizes over X years', () => {
+  const strat = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'fixed', annualRate: 4.0, amortizationYears: 10, openClosed: 'open' } }],
+  }));
+  assert.deepEqual(strat.errors, []);
+  const base = computeProjection(ARGS());
+  const nov = baseRow(base, '2026-11');
+  const dec = switchRow(strat, '2026-12');
+  assert.ok(Math.abs(dec.payment - derivePayment(nov.balance, 4.0, 10, 'semi_annual')) < 0.02, dec.payment);
+  // Payoff moves to the switch + X years (plus the engine's usual
+  // final-payment rounding month).
+  const pay = strat.mortgage.perProperty[1].strategy.payoffMonth;
+  assert.ok(pay === '2036-12' || pay === '2037-01', pay);
+});
+test('computeProjection: variable switch keeps the payment', () => {
+  const base = computeProjection(ARGS());
+  const strat = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'rate_switch', params: { propertyId: 1, date: '2026-12-01', rateType: 'variable', spread: -1.0, openClosed: 'open' } }],
+  }));
+  assert.deepEqual(strat.errors, []);
+  const dec = switchRow(strat, '2026-12');
+  assert.equal(dec.rate, 3.7);
+  assert.equal(dec.payment, baseRow(base, '2026-12').payment);
+  assert.equal(strat.mortgage.perProperty[1].strategy.paymentAtEffect, base.mortgage.perProperty[1].baseline.paymentAtEffect);
+});
+test('computeProjection: refinance amortizationYears drives the payment derivation', () => {
+  const refi = (years) => computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'refinance', params: { propertyId: 1, date: '2026-12-01', termMonths: 60, amortizationYears: years, rateType: 'fixed', annualRate: 4.0, openClosed: 'open' } }],
+  }));
+  const r20 = refi(20);
+  const r25 = refi(25);
+  assert.deepEqual(r20.errors, []);
+  assert.deepEqual(r25.errors, []);
+  const base = computeProjection(ARGS());
+  const nov = baseRow(base, '2026-11');
+  // The new term's start derivation prices the November balance
+  // over the refinance amortization.
+  assert.ok(Math.abs(switchRow(r20, '2026-12').payment - derivePayment(nov.balance, 4.0, 20, 'semi_annual')) < 0.02, switchRow(r20, '2026-12').payment);
+  assert.ok(Math.abs(switchRow(r25, '2026-12').payment - derivePayment(nov.balance, 4.0, 25, 'semi_annual')) < 0.02, switchRow(r25, '2026-12').payment);
+  assert.ok(switchRow(r20, '2026-12').payment > switchRow(r25, '2026-12').payment);
+});
+test('buildMergeWrites: fixed switch with an amortization override inserts a split term', () => {
+  const snapshot = {
+    properties: [{ id: 1 }], mortgage_terms: [{ id: 1, property_id: 1, start_date: '2026-01-01', term_months: 60, amortization_years: 25, repayment_method: 'equal_payment' }],
+    rate_segments: [{ id: 1, property_id: 1, start_date: '2026-01-01', rate_type: 'fixed' }],
+    lump_sums: [], invest_accounts: [], invest_holdings: [], invest_events: [],
+  };
+  const current = JSON.parse(JSON.stringify(snapshot));
+  const ops = [
+    { seq: 1, op_type: 'rate_switch', params: { propertyId: 1, date: '2027-01-01', rateType: 'fixed', annualRate: 4.0, amortizationYears: 10 } },
+  ];
+  const { writes, conflicts } = buildMergeWrites({ ops, legs: [], snapshot, current, projection: { switchBalance: { 1: 480000 } } });
+  const term = writes.find((w) => w.kind === 'insert' && w.table === 'mortgage_terms');
+  assert.ok(term, 'split term inserted');
+  assert.equal(term.values.start_date, '2027-01-01');
+  assert.equal(term.values.amortization_years, 10);
+  assert.equal(term.values.opening_balance, 480000);
+  // Contract term continues: governing term ends 2026-01 + 60 =
+  // 2031-01, so the split term carries 48 months.
+  assert.equal(term.values.term_months, 48);
+  assert.equal(term.values.payment_override, null);
+  assert.ok(writes.some((w) => w.kind === 'insert' && w.table === 'rate_segments'));
+  assert.deepEqual(conflicts, []);
+  // Without an override no term is split: segment-only merge.
+  const plain = buildMergeWrites({ ops: [{ seq: 1, op_type: 'rate_switch', params: { propertyId: 1, date: '2027-01-01', rateType: 'fixed', annualRate: 4.0 } }], legs: [], snapshot, current, projection: {} });
+  assert.ok(!plain.writes.some((w) => w.table === 'mortgage_terms'));
+});
 test('validateOp: shape errors, past dates, sell guards, position price ban', () => {
   assert.ok(validateOp({ op_type: 'buy', params: { accountId: 1, date: '2026-12-01' } }, { currentMonth: '2026-11' }).length > 0);
   assert.ok(validateOp({ op_type: 'prepay', params: { propertyId: 1, date: '2026-10-01', amount: 1000 } }, { currentMonth: '2026-11' }).some((e) => /before the current month/.test(e)));

@@ -14125,7 +14125,8 @@ function planOpFormHtml(type, params, ctx) {
   if (type === 'rate_switch') body = `
     <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
     <div><label>Plan type</label><select id="planOpOpenClosed"><option value="closed"${p.openClosed !== 'open' ? ' selected' : ''}>Closed</option><option value="open"${p.openClosed === 'open' ? ' selected' : ''}>Open</option></select></div>
-    ${dateRow}${rateRows}`;
+    ${dateRow}${rateRows}
+    <div><label>Amortization (years, fixed only; blank = remaining)</label><input id="planOpAmortYears" type="number" min="1" max="35" value="${p.amortizationYears != null ? esc(String(p.amortizationYears)) : ''}"></div>`;
   if (type === 'refinance') body = `
     <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
     <div><label>Plan type</label><select id="planOpOpenClosed"><option value="closed"${p.openClosed !== 'open' ? ' selected' : ''}>Closed</option><option value="open"${p.openClosed === 'open' ? ' selected' : ''}>Open</option></select></div>
@@ -14314,6 +14315,11 @@ function planReadOpForm(type, root) {
     params.rateType = rt ? rt.value : 'fixed';
     params.annualRate = params.rateType === 'fixed' ? m('planOpAnnualRate') : null;
     params.spread = params.rateType === 'variable' ? m('planOpSpread') : null;
+    // Fixed-only amortization override (blank = remaining amortization).
+    if (type === 'rate_switch' && params.rateType === 'fixed') {
+      const ay = v('planOpAmortYears');
+      params.amortizationYears = ay != null && String(ay).trim() !== '' ? Number(ay) : null;
+    }
   }
   if (type === 'refinance') {
     params.termMonths = Number(v('planOpTermMonths')); params.amortizationYears = Number(v('planOpAmortYears'));
@@ -14497,13 +14503,18 @@ async function openPlanStrategyModal(projectId) {
       if (opType === 'buy') planOpSourceWire(stratCard, ctx);
       // A rate preset fixes its direction: hide the rate-type radios
       // and the irrelevant rate input, leaving only the number the
-      // user actually sets.
+      // user actually sets. The amortization override is fixed-only,
+      // so it hides on the variable form too.
       if (ratePreset) {
         const fields = $('#planStrategyOpFields');
         const radio = fields.querySelector('input[name="planOpRateType"]');
         if (radio && radio.closest('div')) radio.closest('div').style.display = 'none';
         const hideInput = fields.querySelector(ratePreset === 'fixed' ? '#planOpSpread' : '#planOpAnnualRate');
         if (hideInput && hideInput.closest('div')) hideInput.closest('div').style.display = 'none';
+        if (ratePreset === 'variable') {
+          const amort = fields.querySelector('#planOpAmortYears');
+          if (amort && amort.closest('div')) amort.closest('div').style.display = 'none';
+        }
       }
     }
     $('#planStrategyTemplateSave').addEventListener('click', async () => {

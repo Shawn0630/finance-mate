@@ -321,13 +321,19 @@ test('buildSchedule: a $100k lump sum on the $1.35M shape keeps $6,381.36 and pu
   assert.ok(close(withLump.totalInterest, 758293.51), withLump.totalInterest);
 });
 
-test('buildSchedule: a rate change after a lump sum recasts against the post-lump trajectory endpoint', () => {
+test('buildSchedule: a fixed switch after a lump sum re-derives over the term remaining amortization', () => {
   // 6% for the first stretch, a $20,000 lump sum in September 2026,
-  // then the rate drops to 3% in March 2027. The lump keeps the
-  // $639.81 payment and pulls the trajectory's payoff in to
-  // 2042-07; the March 2027 recast must target THAT endpoint (185
-  // months out), not the term's remaining amortization (287
-  // months), which is what the pre-change rule derived.
+  // then the rate drops to 3% in March 2027. User rule 2026-11-02
+  // (superseding the old trajectory-endpoint recast): a switch to
+  // fixed re-derives the payment from the current outstanding
+  // balance over the term's REMAINING amortization counted from
+  // the term's start — 287 months here — never a fresh full
+  // amortization, and the payoff lands on the amortization end.
+  // The lump keeps its smaller balance (hence a smaller payment
+  // than a no-lump switch), but the switch itself does not
+  // preserve the lump's earlier payoff: the loan re-extends to
+  // the amortization end. The old rule targeted the post-lump
+  // trajectory endpoint (185 months, $522.69, payoff 2042-07).
   const segments = [
     { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 6 },
     { start_date: '2027-03-01', rate_type: 'fixed', annual_rate: 3 },
@@ -340,24 +346,54 @@ test('buildSchedule: a rate change after a lump sum recasts against the post-lum
   // and up to the rate change.
   const throughFeb = r.series.filter((row) => row.month <= '2027-02');
   assert.ok(throughFeb.every((row) => row.payment === r.paymentUsed), 'payment constant until the rate change');
-  // The pre-change trajectory endpoint, extrapolated independently:
-  // the February 2027 balance at the old payment and old rate.
   const feb = r.series.find((row) => row.month === '2027-02');
-  const hypo = simulate({
-    balance: feb.balance, balanceDate: feb.date, payment: r.paymentUsed,
-    segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: 6 }],
-  });
-  assert.equal(hypo.payoffMonth, '2042-07');
-  const monthsLeft = 185; // 2027-02 -> 2042-07
+  const monthsLeft = 287; // 2027-02 state -> amortization end (term start 2026-01 + 300 months)
   const mar = r.series.find((row) => row.month === '2027-03');
   assert.equal(mar.rate, 3);
   assert.ok(close(mar.payment, derivePayment(feb.balance, 3, monthsLeft / 12), 0.02), mar.payment);
-  assert.ok(close(mar.payment, 522.69), mar.payment);
-  // The old remaining-amortization derivation would have given a
-  // materially smaller payment ($377.71) and re-extended the loan.
-  assert.ok(Math.abs(mar.payment - derivePayment(feb.balance, 3, 287 / 12)) > 100);
-  // And the loan indeed ends at the preserved endpoint.
-  assert.equal(r.payoffMonth, '2042-07');
+  assert.ok(close(mar.payment, 377.71), mar.payment);
+  // And the loan ends at the amortization end (2051-01) plus the
+  // engine's usual final-payment rounding month, exactly as the
+  // baseline carries it — not at the old trajectory endpoint.
+  assert.equal(r.payoffMonth, '2051-02');
+});
+
+test('buildSchedule: a fixed switch counts remaining amortization from the term start, not the anchor', () => {
+  // The Christina pattern: the term started 2024-12, the balance
+  // anchor sits at 2026-11 (years into the term), the switch lands
+  // 2027-01. User rule 2026-11-02: the new payment amortizes the
+  // switch balance over the term's REMAINING amortization — 360
+  // minus the 24 months elapsed from the term's start to the
+  // switch state point = 336 months. The anchor-counted figure
+  // (360 minus 1 month from the anchor = 359) would nearly reset
+  // the clock to a fresh 30 years and is explicitly NOT the rule.
+  const terms = [{ id: 1, start_date: '2024-12-01', amortization_years: 30, repayment_method: 'equal_payment' }];
+  const varSeg = { start_date: '2024-12-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1.0, compounding: 'semi_annual', accrual: 'monthly' };
+  const base = { balance: 1350000, balanceDate: '2024-12-01', terms, segments: [varSeg], paymentDay: 17, frequency: 'monthly', primeRate: 4.45, primeHistory: [{ date: '2024-12-01', prime: 4.45 }], region: 'CA' };
+  const baseline = buildSchedule(base);
+  const fixSeg = { start_date: '2027-01-01', rate_type: 'fixed', rate_mode: 'absolute', annual_rate: 4.5, compounding: 'semi_annual', accrual: 'monthly' };
+  const strat = buildSchedule({ ...base, segments: [varSeg, fixSeg] });
+  const dec = strat.series.find((r) => r.month === '2026-12');
+  const jan = strat.series.find((r) => r.month === '2027-01');
+  assert.equal(jan.rate, 4.5);
+  assert.ok(close(jan.payment, derivePayment(dec.balance, 4.5, 336 / 12, 'semi_annual'), 0.02), jan.payment);
+  assert.ok(Math.abs(jan.payment - derivePayment(dec.balance, 4.5, 359 / 12, 'semi_annual')) > 5, 'not the anchor-counted derivation');
+  // A pure switch does not move the payoff date: the strategy
+  // payoff equals the baseline payoff.
+  assert.equal(strat.payoffMonth, baseline.payoffMonth);
+});
+
+test('buildSchedule: a switch to variable keeps the payment and only reprices the split', () => {
+  const terms = [{ id: 1, start_date: '2024-12-01', amortization_years: 30, repayment_method: 'equal_payment' }];
+  const varSeg = { start_date: '2024-12-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1.0, compounding: 'semi_annual', accrual: 'monthly' };
+  const base = { balance: 1350000, balanceDate: '2024-12-01', terms, segments: [varSeg], paymentDay: 17, frequency: 'monthly', primeRate: 4.45, primeHistory: [{ date: '2024-12-01', prime: 4.45 }], region: 'CA' };
+  const varSeg2 = { start_date: '2027-01-01', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.85, compounding: 'semi_annual', accrual: 'monthly' };
+  const r = buildSchedule({ ...base, segments: [varSeg, varSeg2] });
+  const dec = r.series.find((x) => x.month === '2026-12');
+  const jan = r.series.find((x) => x.month === '2027-01');
+  assert.equal(jan.rate, 3.6);
+  assert.equal(jan.payment, dec.payment);
+  assert.equal(jan.payment, r.paymentUsed);
 });
 
 test('buildSchedule: a mid-term rate change recasts the payment against the trajectory endpoint', () => {
@@ -657,13 +693,15 @@ test('buildSchedule: a segment locked_on anchors the derivations it governs to t
   assert.equal(fixedLocked.paymentDerived, fixedBlank.paymentDerived);
 });
 
-test('buildSchedule: a mid-term segment change recasts at the incoming segment’s locked_on', () => {
+test('buildSchedule: a switch to variable keeps the payment (locked_on prices no recast)', () => {
   // Fixed 6% for six months, then Prime - 1 from 2026-07-01.
-  // Prime steps down inside July (4.95 -> 4.45 on the 29th), so
-  // the recast month's own pricing is 4.45 - 1 = 3.45%; the
-  // incoming segment locked on 2026-07-15 — when prime was still
-  // 4.95 — so its recast derives at 3.95% instead. Accrual of the
-  // July row charges July's own prime (3.45%) either way.
+  // User rule 2026-11-02 (fixed-payment variable convention): a
+  // switch to variable does NOT recast — the payment in effect
+  // carries over unchanged, and the incoming segment's locked_on
+  // prices no derivation at the boundary (locks still price
+  // term-start derivations). Accrual of the July row charges
+  // July's own prime (3.45%) either way: prime steps down inside
+  // July (4.95 -> 4.45 on the 29th).
   const primeHistory = [{ date: '2026-06-03', rate: 4.95 }, { date: '2026-07-29', rate: 4.45 }];
   const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];
   const segs = (lock) => [
@@ -678,17 +716,12 @@ test('buildSchedule: a mid-term segment change recasts at the incoming segment�
   assert.equal(
     JSON.stringify(locked.series.filter((x) => x.month <= '2026-06')),
     JSON.stringify(plain.series.filter((x) => x.month <= '2026-06')));
-  // The recast targets the pre-change trajectory's payoff month
-  // (the plain run's own payoff: its derivation rate and accrual
-  // rate agree at 3.45%, so it lands exactly on the target). The
-  // July payment derives the June balance over the months left
-  // to that target at the segment's pricing rate.
-  const idx = (ym) => Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7));
-  const monthsLeft = idx(plain.payoffMonth) - idx('2026-06');
-  const jun = row(locked, '2026-06');
-  assert.equal(row(locked, '2026-07').payment, derivePayment(jun.balance, 3.95, monthsLeft / 12, 'semi_annual'));
-  assert.equal(row(plain, '2026-07').payment, derivePayment(jun.balance, 3.45, monthsLeft / 12, 'semi_annual'));
-  assert.notEqual(row(locked, '2026-07').payment, row(plain, '2026-07').payment);
+  // No recast at the variable switch: July's payment equals the
+  // payment in effect (the 6% derivation), in both runs, and the
+  // two runs agree — the lock changes nothing at the boundary.
+  assert.equal(row(locked, '2026-07').payment, locked.paymentUsed);
+  assert.equal(row(plain, '2026-07').payment, plain.paymentUsed);
+  assert.equal(row(locked, '2026-07').payment, row(plain, '2026-07').payment);
   // Accrual untouched by the lock: July charges its own prime.
   assert.equal(row(locked, '2026-07').rate, 3.45);
   assert.equal(row(locked, '2026-07').interest, row(plain, '2026-07').interest);

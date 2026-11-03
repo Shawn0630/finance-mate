@@ -523,20 +523,28 @@ function monthIdxOf(dateStr) {
 //     rate then in effect and the new term's amortization (equal
 //     payment: derivePayment over the amortization; equal
 //     principal: balance / amortization months);
-//   - a RATE CHANGE (a segment starting): equal payment re-derives
-//     against the payoff the loan was already heading to — the
-//     pre-change trajectory (previous payment, previous rate, held
-//     constant) is extrapolated to its projected payoff month and
-//     the new payment amortizes the balance to that same month at
-//     the new rate, so a rate change moves the payment only through
-//     the rate itself and never re-sets the payoff. If the
-//     pre-change trajectory never pays off (negative amortization),
-//     the fallback is the active term's REMAINING amortization (its
-//     amortization minus the months already elapsed in the term,
-//     counted from the balance anchor for the anchor's term and
-//     from the term's start for later terms). Equal principal
-//     re-anchors instead: balance at the segment's start / the
-//     amortization months remaining at that point;
+//   - a RATE CHANGE (a segment starting) inside the running term:
+//     the plan is re-derived under the NEW segment's own terms, and
+//     the derivation never re-sets the amortization clock:
+//       - to FIXED: the new payment amortizes the balance at the
+//         switch over the governing term's REMAINING amortization
+//         counted from the term's start (user rule 2026-11-02: a
+//         pure switch re-derives the payment from the current
+//         outstanding balance and never moves the payoff off the
+//         amortization end (up to the engine's usual final-payment
+//         rounding month, exactly as the baseline carries it); a lump sum that landed earlier keeps
+//         its smaller balance, hence a smaller payment, but the
+//         switch itself does not preserve the lump's earlier
+//         payoff — the remaining-amortization derivation governs);
+//       - to VARIABLE: the plan is NOT recast at all — the payment
+//         (or monthly principal) in effect carries over unchanged,
+//         matching the fixed-payment variable convention (a
+//         variable plan's payment is set when the plan starts and
+//         never recasts on rate moves; only the interest/principal
+//         split follows the new rate);
+//     a segment that starts WITH its term is the term's opening rate
+//     plan, not a mid-stream rate change (handled by the term-start
+//     branch below, which derives on the new term's amortization);
 //   - a LUMP SUM landing: the plan does NOT change. The lump sum
 //     deducts from the balance FIRST (in its month, before that
 //     month's interest) and the unchanged payment (or unchanged
@@ -771,52 +779,36 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
     return { principalPerMonth: round2(balNow / remaining) };
   };
 
-  // The payment after a RATE CHANGE at state point S (a new segment
-  // governs months from S + 1 on). Bank-standard recast: find the
-  // payoff month the loan was already heading to — extrapolate the
-  // pre-change trajectory (the previous payment at the previous
-  // rate, held constant) — and derive the new payment so the
-  // balance still amortizes to that same month at the new rate.
-  // A lump sum that landed earlier therefore keeps its earlier
-  // payoff through a rate change; only the rate moves the payment.
-  // `lastPayment` / `balanceDateAtS` describe the pre-change state.
-  // If the pre-change trajectory never pays off (negative
-  // amortization, or beyond the projection cap), fall back to the
-  // term's remaining amortization (computePayment).
-  const computeRateChangePayment = (S, balNow, lastPayment, balanceDateAtS) => {
-    const newSeg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
-    let newRate = segmentRateForMonth(newSeg, ymKeyOfIdx(S + 1), primeForMonth);
-    // The incoming segment's own lock prices the recast when it
-    // carries one — the lock belongs to the rate, so a segment
-    // that takes effect mid-term derives at its locked prime just
-    // as a term's first segment does at the term's start.
-    const lockedNew = lockedRateFor(newSeg);
-    if (lockedNew === null) return { error: 'no_prime' };
-    if (lockedNew !== undefined) newRate = lockedNew;
-    if (newRate === null) return { error: 'no_prime' };
-    const prevSeg = segmentForMonth(segments, ymKeyOfIdx(S));
-    const prevRate = segmentRateForMonth(prevSeg, ymKeyOfIdx(S), primeForMonth);
-    if (prevRate !== null && lastPayment > 0) {
-      // The pre-change trajectory is extrapolated under the OLD
-      // segment's compounding; the recast payment is derived
-      // under the NEW segment's.
-      const hypo = simulate({
-        balance: balNow, balanceDate: balanceDateAtS, payment: lastPayment,
-        segments: [{ start_date: '0001-01-01', rate_type: 'fixed', annual_rate: prevRate, compounding: prevSeg ? prevSeg.compounding : undefined }],
-        paymentDay: scheduleAt(S).paymentDay, frequency: scheduleAt(S).frequency, maxMonths: A + maxMonths - S, primeRate, region,
-      });
-      if (hypo.payoffMonth) {
-        const monthsLeft = monthIdxOf(hypo.payoffMonth) - S;
-        if (monthsLeft > 0) return { payment: derivePayment(balNow, newRate, monthsLeft / 12, newSeg ? newSeg.compounding : undefined) };
-      }
-    }
-    // The fallback derives the term's remaining-amortization
-    // payment under the NEW segment — priced exactly like the
-    // recast above, including the new segment's locked_on when it
-    // carries one (computePayment reads the governing segment):
-    // the lock belongs to the rate, not to the event that
-    // triggered the derivation.
-    return computePayment(S, balNow);
+  // The payment after a FIXED switch at state point S (a new fixed
+  // segment governs months from S + 1 on). User rule 2026-11-02:
+  // re-derive from the CURRENT outstanding balance at the switch
+  // over the governing term's REMAINING amortization counted from
+  // the term's start — never a fresh full amortization, and never
+  // the anchor-counted figure (the anchor term's amortization
+  // counts from the balance anchor in computePayment, which would
+  // nearly reset the clock for a loan years into its term). The
+  // payoff therefore lands on the amortization end. The rate is
+  // the fixed segment's nominal rate under its own compounding.
+  const computeFixedSwitchPayment = (S, balNow) => {
+    const term = termAtMonth(S + 1);
+    if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
+    const remaining = Math.round(Number(term.amortization_years) * 12) - (S - monthIdxOf(term.start_date));
+    if (remaining <= 0) return { payment: round2(balNow) }; // past the amortization: clear it (simulate caps at balance + interest)
+    const seg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
+    const rate = segmentRateForMonth(seg, ymKeyOfIdx(S + 1), primeForMonth);
+    if (rate === null) return { error: 'no_prime' };
+    return { payment: derivePayment(balNow, rate, remaining / 12, seg ? seg.compounding : undefined) };
+  };
+
+  // The equal-principal plan after a FIXED switch: the monthly
+  // principal re-anchors on the balance over the same remaining
+  // amortization counted from the term's start.
+  const computeFixedSwitchPrincipal = (S, balNow) => {
+    const term = termAtMonth(S + 1);
+    if (!term || !(Number(term.amortization_years) > 0)) return { error: 'no_payment' };
+    const remaining = Math.round(Number(term.amortization_years) * 12) - (S - monthIdxOf(term.start_date));
+    if (remaining <= 0) return { principalPerMonth: round2(balNow) };
+    return { principalPerMonth: round2(balNow / remaining) };
   };
 
   // Lump sums grouped by the state point they land on (the point
@@ -865,7 +857,6 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   let negativeAmortization = false;
   let payoffMonth = null;
   let paymentUsed = null;
-  let lastPayment = null;
 
   if (initialLump) {
     bal = round2(bal - initialLump.total);
@@ -897,7 +888,6 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   let chunkBalanceDate = balanceDate;
   let lastPlan = null; // the running plan: { payment } or { principalPerMonth }
   let lastDerivedPlan = null; // the same, with every override ignored
-  let lastDerivedPayment = null;
   let anchorPlan = null;
   let anchorDerivedPlan = null;
   let anchorOverridden = false;
@@ -928,11 +918,20 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
       // one (computePayment reads the governing segment).
       derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
     } else if (segStates.has(S)) {
-      // A rate change inside the running schedule: equal payment
-      // recasts against the trajectory's payoff; equal principal
-      // re-anchors the monthly principal on the balance and the
-      // amortization months left.
-      derivedCp = principalPlan ? computePrincipal(S, bal) : computeRateChangePayment(S, bal, lastDerivedPayment, chunkBalanceDate);
+      // A rate change inside the running schedule (user rule
+      // 2026-11-02): to FIXED, re-derive over the term's remaining
+      // amortization counted from the term's start; to VARIABLE,
+      // keep the plan unchanged (fixed-payment variable
+      // convention). A segment that cannot be read falls back to
+      // the term's own derivation, as before.
+      const newSeg = segmentForMonth(segments, ymKeyOfIdx(S + 1));
+      if (newSeg && newSeg.rate_type === 'variable') {
+        derivedCp = lastDerivedPlan;
+      } else if (newSeg && newSeg.rate_type === 'fixed') {
+        derivedCp = principalPlan ? computeFixedSwitchPrincipal(S, bal) : computeFixedSwitchPayment(S, bal);
+      } else {
+        derivedCp = principalPlan ? computePrincipal(S, bal) : computePayment(S, bal);
+      }
     } else {
       // A lump-sum-only boundary: the balance was already reduced
       // below; the plan carries over unchanged (same payment, or
@@ -962,9 +961,7 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
     lastPlan = cp;
     if (derivedCp && !derivedCp.error) {
       lastDerivedPlan = derivedCp;
-      if (derivedCp.payment !== undefined) lastDerivedPayment = derivedCp.payment;
     }
-    if (cp.payment !== undefined) lastPayment = cp.payment;
     const spanBal = bal;
     const spanDate = chunkBalanceDate;
     const span = Math.min(nextS, A + maxMonths) - S;
@@ -981,10 +978,6 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
       if (r.series.length) {
         bal = r.series[r.series.length - 1].balance;
         chunkBalanceDate = r.series[r.series.length - 1].date;
-        // For a later recast that needs "the previous payment", an
-        // equal-principal span's most recent actual payment is the
-        // closest stand-in (its payments decline month by month).
-        if (cp.principalPerMonth !== undefined) lastPayment = r.series[r.series.length - 1].payment;
         // Record the term's opening triple the first time a span
         // governed by it actually runs.
         const gov = termAtMonth(S + 1);

@@ -6,6 +6,7 @@ import http from 'node:http';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { runModuleMain } from './e2e-child.mjs';
+import { derivePayment } from '../src/engine.js';
 import { run as runCore } from './e2e-core.mjs';
 import { run as runCosts } from './e2e-costs.mjs';
 import { run as runNollm } from './e2e-nollm.mjs';
@@ -2205,17 +2206,23 @@ export async function run(H, S) {
         const radio = fields ? fields.querySelector('input[name="planOpRateType"]') : null;
         const annual = fields ? fields.querySelector('#planOpAnnualRate') : null;
         const spread = fields ? fields.querySelector('#planOpSpread') : null;
+        const amort = fields ? fields.querySelector('#planOpAmortYears') : null;
         return {
           title: document.querySelector('#planStrategyModalTitle')?.textContent || '',
           radioHidden: radio ? radio.closest('div').style.display : 'missing',
           annualHidden: annual ? annual.closest('div').style.display : 'missing',
           spreadHidden: spread ? spread.closest('div').style.display : 'missing',
           checked: fields ? (fields.querySelector('input[name="planOpRateType"]:checked') || {}).value || '' : '',
+          amortPresent: !!amort,
+          amortBlank: amort ? amort.value === '' : false,
+          amortHidden: amort ? amort.closest('div').style.display : 'missing',
         };
       });
       H.check('strategy editor: Switch to fixed form shows Fixed rate only (radios + Spread hidden, Fixed checked)',
         fixedOpened && fixedFormState.title === 'Switch to fixed' && fixedFormState.radioHidden === 'none'
         && fixedFormState.annualHidden !== 'none' && fixedFormState.spreadHidden === 'none' && fixedFormState.checked === 'fixed', JSON.stringify(fixedFormState));
+      H.check('switchfix: Switch to fixed form carries a blank amortization override (fixed only)',
+        fixedOpened && fixedFormState.amortPresent && fixedFormState.amortBlank && fixedFormState.amortHidden !== 'none', JSON.stringify(fixedFormState));
       await page.evaluate(() => { document.querySelector('#planStrategyName').value = 'Fixed Strat'; });
       await pickTemplateMonth(futYm);
       await waitR(500);
@@ -2752,6 +2759,78 @@ export async function run(H, S) {
   H.check('payscope: legacy stock-only delta is summed 0 but scoped null',
     ps2StkRow.comparison && ps2StkRow.comparison.paymentDelta === 0 && ps2StkScope.delta == null,
     JSON.stringify({ summed: ps2StkRow.comparison && ps2StkRow.comparison.paymentDelta, scoped: ps2StkScope.delta }));
+  // --- switch-to-fixed (user rule 2026-11-02): the payment
+  // re-derives from the current outstanding balance over the
+  // remaining amortization; a pure switch does not move the
+  // payoff; a variable switch keeps the payment; an override
+  // re-amortizes over X years; refinance amortizationYears
+  // drives its payment. Fixture terms start 2026-10-01 at 25y
+  // (psMkProp), so the remaining amortization at the switch
+  // state point is 300 minus the months from 2026-10 to it.
+  const sfIdx = (ym) => Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7));
+  const sfSwitchYm = psOpDate.slice(0, 7);
+  const sfStateYm = (() => { const d = new Date(Date.UTC(Number(sfSwitchYm.slice(0, 4)), Number(sfSwitchYm.slice(5, 7)) - 2, 1)); return d.toISOString().slice(0, 7); })();
+  const sfRemaining = 300 - (sfIdx(sfStateYm) - sfIdx('2026-10'));
+  r = await H.req('POST', '/api/planning/projects', { name: 'SwitchFix', question: 'Fix or keep' });
+  H.check('switchfix: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const sfProj = r.data.project.id;
+  const sfA = await psMkProp('77 SwitchFix Lane, Victoria, BC', 200000);
+  const sfMkStrat = async (name, op) => {
+    let rr = await H.req('POST', `/api/planning/projects/${sfProj}/strategies`, { name, source: 'template' });
+    H.check(`switchfix: strategy ${name} created`, rr.status === 201 && rr.data.strategy && rr.data.strategy.id > 0, JSON.stringify(rr.data));
+    const sid = rr.data.strategy.id;
+    rr = await H.req('POST', `/api/planning/strategies/${sid}/ops`, op);
+    H.check(`switchfix: strategy ${name} op added`, rr.status === 201, JSON.stringify(rr.data));
+    return sid;
+  };
+  const sfFix = await sfMkStrat('Fix default', { op_type: 'rate_switch', params: { propertyId: sfA, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  const sfOver = await sfMkStrat('Fix 10y', { op_type: 'rate_switch', params: { propertyId: sfA, date: psOpDate, rateType: 'fixed', annualRate: 4.5, amortizationYears: 10 } });
+  const sfVar = await sfMkStrat('To variable', { op_type: 'rate_switch', params: { propertyId: sfA, date: psOpDate, rateType: 'variable', spread: -1.0 } });
+  const sfRef20 = await sfMkStrat('Refi 20y', { op_type: 'refinance', params: { propertyId: sfA, date: psOpDate, termMonths: 60, amortizationYears: 20, rateType: 'fixed', annualRate: 4.0 } });
+  const sfRef25 = await sfMkStrat('Refi 25y', { op_type: 'refinance', params: { propertyId: sfA, date: psOpDate, termMonths: 60, amortizationYears: 25, rateType: 'fixed', annualRate: 4.0 } });
+  r = await H.req('POST', `/api/planning/projects/${sfProj}/scenarios`, { name: 'SF world' });
+  H.check('switchfix: scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/projects/${sfProj}/comparison`);
+  H.check('switchfix: comparison loads', r.status === 200 && r.data.strategies && r.data.strategies.length === 5, JSON.stringify(r.status));
+  const sfBasePer = (r.data.baseline && r.data.baseline.mortgage && r.data.baseline.mortgage.perProperty) || {};
+  const sfRow = (name) => (r.data.strategies || []).find((x) => x.strategy.name === name) || {};
+  const sfPer = (name) => { const row = sfRow(name); return (row.projection && row.projection.mortgage && row.projection.mortgage.perProperty) || {}; };
+  const sfBasePay = psPay(sfBasePer, sfA, 'baseline');
+  const sfBaseOff = (sfBasePer[sfA] && sfBasePer[sfA].baseline && sfBasePer[sfA].baseline.payoffMonth) || null;
+  const sfSeries = (name) => { const per = sfPer(name); return (per[sfA] && per[sfA].strategy && per[sfA].strategy.series) || []; };
+  const sfStateBal = (() => { const row = sfSeries('Fix default').find((x) => x.month === sfStateYm); return row ? row.balance : null; })();
+  const sfExpFix = sfStateBal != null ? derivePayment(sfStateBal, 4.5, sfRemaining / 12, 'semi_annual') : null;
+  const sfFixPay = psPay(sfPer('Fix default'), sfA, 'strategy');
+  const sfFixOff = (sfPer('Fix default')[sfA] && sfPer('Fix default')[sfA].strategy && sfPer('Fix default')[sfA].strategy.payoffMonth) || null;
+  H.check('switchfix: pure fixed switch re-derives over remaining amortization and keeps the payoff',
+    sfStateBal != null && sfExpFix != null && Math.abs(sfFixPay - sfExpFix) < 0.02 && sfFixPay !== sfBasePay && sfFixOff === sfBaseOff,
+    JSON.stringify({ stateBal: sfStateBal, remaining: sfRemaining, expected: sfExpFix, strategy: sfFixPay, baseline: sfBasePay, payoff: sfFixOff, basePayoff: sfBaseOff }));
+  const sfOverPay = psPay(sfPer('Fix 10y'), sfA, 'strategy');
+  const sfOverOff = (sfPer('Fix 10y')[sfA] && sfPer('Fix 10y')[sfA].strategy && sfPer('Fix 10y')[sfA].strategy.payoffMonth) || null;
+  const sfOverIdx = sfOverOff ? sfIdx(sfOverOff) - sfIdx(sfSwitchYm) : null;
+  // The switch month is payment #1 of the 120, so the last
+  // payment falls at switch + 119 months; a cent-rounding
+  // stub month can push the payoff to switch + 120.
+  H.check('switchfix: fixed switch with a 10y override re-amortizes over 10 years',
+    sfStateBal != null && Math.abs(sfOverPay - derivePayment(sfStateBal, 4.5, 10, 'semi_annual')) < 0.02 && (sfOverIdx === 119 || sfOverIdx === 120),
+    JSON.stringify({ strategy: sfOverPay, expected: sfStateBal != null ? derivePayment(sfStateBal, 4.5, 10, 'semi_annual') : null, payoff: sfOverOff, monthsOut: sfOverIdx }));
+  const sfVarRow = sfSeries('To variable').find((x) => x.month === sfSwitchYm);
+  const sfVarPay = psPay(sfPer('To variable'), sfA, 'strategy');
+  H.check('switchfix: variable switch keeps the payment and reprices only the split',
+    sfVarRow && sfVarRow.rateType === 'variable' && Math.abs(sfVarRow.rate - 3.95) < 0.01 && sfVarPay === sfBasePay,
+    JSON.stringify({ row: sfVarRow, strategy: sfVarPay, baseline: sfBasePay }));
+  const sfRef20Pay = psPay(sfPer('Refi 20y'), sfA, 'strategy');
+  const sfRef25Pay = psPay(sfPer('Refi 25y'), sfA, 'strategy');
+  H.check('switchfix: refinance amortizationYears drives the payment (20y above 25y, both on formula)',
+    sfStateBal != null && Math.abs(sfRef20Pay - derivePayment(sfStateBal, 4.0, 20, 'semi_annual')) < 0.02
+    && Math.abs(sfRef25Pay - derivePayment(sfStateBal, 4.0, 25, 'semi_annual')) < 0.02 && sfRef20Pay > sfRef25Pay,
+    JSON.stringify({ ref20: sfRef20Pay, ref25: sfRef25Pay, stateBal: sfStateBal }));
+  r = await H.req('POST', `/api/planning/strategies/${sfOver}/merge-preview`, {});
+  const sfWrites = (r.data && r.data.writes) || [];
+  const sfTerm = sfWrites.find((w) => w.kind === 'insert' && w.table === 'mortgage_terms');
+  H.check('switchfix: merge preview for the override switch inserts a 10y split term',
+    r.status === 200 && sfTerm && sfTerm.values && sfTerm.values.start_date === psOpDate && sfTerm.values.amortization_years === 10 && sfTerm.values.payment_override == null,
+    JSON.stringify({ status: r.status, term: sfTerm }));
   // Report view for the single project: same scoped payment.
   r = await H.req('POST', `/api/planning/projects/${ps1Proj}/reports`, { name: 'PS report', definition: { strategies: [ps1Strat], charts: [{ template: 'time_line', title: 'T', series: ['mortgage_balance'] }] }, strategy_ids: [ps1Strat], scenario_ids: [ps1Scen] });
   H.check('payscope: single report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));

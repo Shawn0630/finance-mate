@@ -2520,9 +2520,9 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
 // a NO_RATE_PLAN state instead of projecting at 0%. The payment comes
 // from the term schedule (engine buildSchedule): auto-computed from the
 // balance, the rate in effect and the current term's amortization —
-// re-derived at a term start, recast against the current trajectory's
-// payoff at a rate change (equal payment) or re-anchored at the term's
-// remaining amortization (equal principal), left unchanged by lump
+// re-derived at a term start, re-derived over the governing term's
+// remaining amortization at a fixed switch (never a fresh full
+// amortization), kept unchanged at a variable switch and by lump
 // sums (they shorten the loan instead) and by prime moves (a variable
 // plan's payment is set when the plan starts; prime only reprices
 // each month's interest split, against the tracked prime history).
@@ -6151,7 +6151,17 @@ app.post('/api/planning/strategies/:id/merge-preview', requireApiAuth, async (re
     const row = per && per.strategy && per.strategy.series ? per.strategy.series.find((r) => r.month === String(op.params.date || '').slice(0, 7)) : null;
     refinanceBalance[op.seq] = row ? row.balance : null;
   }
-  const { writes, conflicts } = buildMergeWrites({ ops, legs, snapshot, current, projection: { refinanceBalance } });
+  // Fixed-switch split terms take the same series balance at the
+  // switch month (only switches carrying an amortization override
+  // split a term).
+  const switchBalance = {};
+  for (const op of ops) {
+    if (op.op_type !== 'rate_switch' || op.params.rateType !== 'fixed' || op.params.amortizationYears == null) continue;
+    const per = strategy.mortgage.perProperty[Number(op.params.propertyId)];
+    const row = per && per.strategy && per.strategy.series ? per.strategy.series.find((r) => r.month === String(op.params.date || '').slice(0, 7)) : null;
+    switchBalance[op.seq] = row ? row.balance : null;
+  }
+  const { writes, conflicts } = buildMergeWrites({ ops, legs, snapshot, current, projection: { refinanceBalance, switchBalance } });
   res.json({ writes, conflicts, penalties: strategy.penalties, fees: strategy.fees, moneyNote: PLAN_MONEY_NOTE });
 });
 
@@ -6186,7 +6196,14 @@ app.post('/api/planning/strategies/:id/merge', requireApiAuth, async (req, res) 
     const row = per && per.strategy && per.strategy.series ? per.strategy.series.find((r) => r.month === String(op.params.date || '').slice(0, 7)) : null;
     refinanceBalance[op.seq] = row ? row.balance : null;
   }
-  const { writes, conflicts } = buildMergeWrites({ ops, legs, snapshot, current, projection: { refinanceBalance } });
+  const switchBalance = {};
+  for (const op of ops) {
+    if (op.op_type !== 'rate_switch' || op.params.rateType !== 'fixed' || op.params.amortizationYears == null) continue;
+    const per = strategy.mortgage.perProperty[Number(op.params.propertyId)];
+    const row = per && per.strategy && per.strategy.series ? per.strategy.series.find((r) => r.month === String(op.params.date || '').slice(0, 7)) : null;
+    switchBalance[op.seq] = row ? row.balance : null;
+  }
+  const { writes, conflicts } = buildMergeWrites({ ops, legs, snapshot, current, projection: { refinanceBalance, switchBalance } });
   // Validate references before touching mainline: a property, account
   // or holding deleted since the snapshot must fail the merge with a
   // plain 400, never with a database constraint error.
