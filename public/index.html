@@ -1116,6 +1116,16 @@
     <div><label>Baseline (one)</label><select id="planReportAiBaseline"></select></div>
     <div><label>Scenarios (pinned — at least one when scenarios exist)</label><div id="planReportAiScenarios"></div></div>
     <div><label>Strategies (many)</label><div id="planReportAiStrategies"></div></div>
+    <div id="planReportAiModelSection">
+      <div class="section-head"><h3>Model</h3></div>
+      <div><label>Strategy</label><select id="planReportAiModelStrategy"></select></div>
+      <div><label>Describe the model</label><textarea id="planReportAiModelText" rows="2" placeholder="e.g. Model interest as balance times monthly rate"></textarea></div>
+      <div class="toolbar"><button class="small primary" id="planReportAiModelBtn">Propose model</button></div>
+      <div id="planReportAiModelThread"></div>
+      <div id="planReportAiModelAsk"></div>
+      <div id="planReportAiModelOut"></div>
+      <div class="msg" id="planReportAiModelMsg"></div>
+    </div>
     <div class="toolbar"><button class="primary" id="planReportAiGenBtn">Generate preview</button></div>
     <div id="planReportAiOut"></div>
   </div>

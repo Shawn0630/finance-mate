@@ -11491,10 +11491,11 @@ function planProjectHtml(d) {
       <div id="planAssetList"></div>
     </div>`;
   // AI PANEL: the ONE in-project design entry — scenario, baseline,
-  // strategy operations, strategy model — as an inline dropdown
-  // conversation panel in Fill-with-AI parity: thread across turns,
-  // preview, Apply-only. Report generation keeps its own separate
-  // button (planAiReportBtn) and is never folded in here.
+  // strategy operations — as an inline dropdown conversation panel
+  // in Fill-with-AI parity: thread across turns, preview, Apply-only.
+  // Report generation keeps its own separate button (planAiReportBtn)
+  // and is never folded in here. Model design lives in the Generate
+  // with AI modal, not in this panel.
   const aiPanel = `<div class="panel hidden" id="planAiPanel">
       <div class="section-head"><h3>✨ Design with AI</h3>
         <div class="toolbar"><button class="small" id="planAiPanelCloseBtn">Close</button></div>
@@ -11503,7 +11504,6 @@ function planProjectHtml(d) {
         <button class="small" data-plan-ai-target="scenario">Scenario</button>
         <button class="small" data-plan-ai-target="baseline">Baseline</button>
         <button class="small" data-plan-ai-target="ops">Strategy · operations</button>
-        <button class="small" data-plan-ai-target="model">Strategy · model</button>
       </div>
       <div id="planAiPanelStrategyRow" class="hidden">
         <label>Strategy</label><select id="planAiPanelStrategy"></select>
@@ -11547,7 +11547,7 @@ function planProjectWire(d) {
   $('#planAiReportBtn').addEventListener('click', () => openPlanReportAiModal(p.id));
   $('#planFlowGenerateBtn').addEventListener('click', () => planFlowGenerate(p.id));
   planFlowGenerateRefresh(); // initial guard state until the comparison load refreshes it
-  planAiPanelWire(p); // the ONE in-project design entry (scenario, baseline, strategy ops/model)
+  planAiPanelWire(p); // the ONE in-project design entry (scenario, baseline, strategy ops)
   // Baseline cards: name + summary + Edit/Delete only. Card click opens
   // the editor; buttons stop the click from propagating.
   const renderBaselineCards = () => {
@@ -11882,13 +11882,6 @@ function planAiPanelHistoryText() {
     return `You: ${t.text || ''}`;
   }).join('\n');
 }
-// Structured Q&A turns only, for the model endpoint's history param
-// (its stored thread is per-strategy; the panel thread travels with
-// the panel conversation instead).
-function planAiPanelStructuredHistory() {
-  if (!planAiPanelCtx) return [];
-  return (planAiPanelCtx.threads[planAiPanelCtx.target] || []).filter((t) => (t.role === 'ai' && t.questions) || (t.role === 'user' && t.answers));
-}
 function planAiPanelSetTarget(target) {
   const ctx = planAiPanelCtx;
   if (!ctx) return;
@@ -11898,7 +11891,7 @@ function planAiPanelSetTarget(target) {
     b.setAttribute('aria-pressed', on ? 'true' : 'false');
     b.classList.toggle('primary', on);
   });
-  $('#planAiPanelStrategyRow').classList.toggle('hidden', target !== 'ops' && target !== 'model');
+  $('#planAiPanelStrategyRow').classList.toggle('hidden', target !== 'ops');
   $('#planAiPanelScenarioNameRow').classList.toggle('hidden', target !== 'scenario');
   $('#planAiPanelAsk').innerHTML = '';
   $('#planAiPanelOut').innerHTML = '';
@@ -11914,7 +11907,7 @@ function planAiPanelRefreshStrategies(selectedId) {
   $('#planAiPanelStrategyNameRow').classList.toggle('hidden', cur !== 'new' && cur !== '');
 }
 function planAiPanelWire(p) {
-  planAiPanelCtx = { projectId: p.id, target: 'scenario', threads: { scenario: [], baseline: [], ops: [], model: [] }, pending: null };
+  planAiPanelCtx = { projectId: p.id, target: 'scenario', threads: { scenario: [], baseline: [], ops: [] }, pending: null };
   const panel = $('#planAiPanel');
   const toggle = $('#planAiPanelToggleBtn');
   if (toggle) toggle.addEventListener('click', () => panel.classList.toggle('hidden'));
@@ -11942,8 +11935,7 @@ async function planAiPanelPropose() {
   try {
     if (ctx.target === 'scenario') await planAiPanelProposeScenario(text, historyText);
     else if (ctx.target === 'baseline') await planAiPanelProposeBaseline(text, null, null);
-    else if (ctx.target === 'ops') await planAiPanelProposeOps(text, historyText);
-    else await planAiPanelProposeModel(text, null);
+    else await planAiPanelProposeOps(text, historyText);
   } catch (err) { showMsg(msg, 'err', err.message); }
 }
 async function planAiPanelProposeScenario(text, historyText) {
@@ -12033,46 +12025,6 @@ async function planAiPanelProposeOps(text, historyText) {
       loadPlanProject(ctx.projectId);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
-}
-async function planAiPanelProposeModel(text, answers) {
-  const ctx = planAiPanelCtx; const msg = $('#planAiPanelMsg'); const out = $('#planAiPanelOut'); const askHost = $('#planAiPanelAsk');
-  const sid = await planAiPanelEnsureStrategy();
-  const design = async (answers) => {
-    const r = await api(`/api/planning/strategies/${sid}/ai-model`, { method: 'POST', body: { text, answers, history: planAiPanelStructuredHistory() } });
-    if (r.ask) {
-      ctx.threads.model.push({ role: 'ai', questions: r.ask });
-      planAiPanelRenderThread();
-      askHost.innerHTML = `${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planAiPanelAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}<div class="toolbar"><button class="small primary" id="planAiPanelContinueBtn">Continue design</button></div>`;
-      $('#planAiPanelContinueBtn').onclick = async () => {
-        try {
-          const next = {};
-          for (const q of r.ask) {
-            const el = document.querySelector(`#planAiPanelAsk_${CSS.escape(q.field)}`);
-            const v = el ? el.value.trim() : '';
-            if (!v) throw new Error('Please answer all questions before continuing.');
-            next[q.field] = q.type === 'number' ? Number(v) : v;
-          }
-          ctx.threads.model.push({ role: 'user', answers: next });
-          planAiPanelRenderThread();
-          askHost.innerHTML = '';
-          await design(next);
-        } catch (err) { showMsg(msg, 'err', err.message); }
-      };
-      return;
-    }
-    const spec = r.model.spec;
-    ctx.pending = { kind: 'model', strategyId: sid, modelId: r.model.id };
-    ctx.threads.model.push({ role: 'ai', summary: `Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}` });
-    planAiPanelRenderThread();
-    out.innerHTML = `<div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div><div class="toolbar"><button class="small primary" id="planAiPanelApplyBtn">Use this model</button></div>`;
-    $('#planAiPanelApplyBtn').addEventListener('click', async () => {
-      try {
-        await api(`/api/planning/strategies/${sid}`, { method: 'PUT', body: { model_id: ctx.pending.modelId } });
-        loadPlanProject(ctx.projectId);
-      } catch (err) { showMsg(msg, 'err', err.message); }
-    });
-  };
-  await design(answers);
 }
 let planBaselineEditCtx = null;
 function openPlanBaselineEditModal(projectId, baselineId) {
@@ -12249,6 +12201,13 @@ function openPlanReportAiModal(projectId, opts = {}) {
   $('#planReportAiText').value = '';
   $('#planReportAiOut').innerHTML = '';
   showMsg($('#planReportAiMsg'), '', '');
+  // Model-design section resets on every open (its thread is per-open;
+  // the modal is transient, unlike the project-page panel).
+  $('#planReportAiModelText').value = '';
+  $('#planReportAiModelThread').innerHTML = '';
+  $('#planReportAiModelAsk').innerHTML = '';
+  $('#planReportAiModelOut').innerHTML = '';
+  showMsg($('#planReportAiModelMsg'), '', '');
   openModal('planReportAiModal');
   // Append mode (per-tab AI Generate): pin pickers are irrelevant —
   // the report keeps its pins, only charts are appended. Reset the
@@ -12257,12 +12216,15 @@ function openPlanReportAiModal(projectId, opts = {}) {
   for (const id of ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
     document.getElementById(id)?.closest('div')?.classList.remove('hidden');
   }
+  $('#planReportAiModelSection').classList.remove('hidden');
   const appendNote = $('#planReportAiAppendNote');
   appendNote.classList.add('hidden');
   if (appendTo) {
     for (const id of ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
       document.getElementById(id)?.closest('div')?.classList.add('hidden');
     }
+    // Append mode appends charts only: model design stays out of it.
+    $('#planReportAiModelSection').classList.add('hidden');
     appendNote.textContent = `Appends to ${appendTo.reportName} · pins unchanged.`;
     appendNote.classList.remove('hidden');
   }
@@ -12277,6 +12239,7 @@ function openPlanReportAiModal(projectId, opts = {}) {
     $('#planReportAiScenarios').innerHTML = planReportScenarioPickerHtml(aiReportScenarios);
     if (planWiringScenarioId() != null) { document.querySelectorAll('#planReportAiScenarios input').forEach((el) => { el.checked = Number(el.value) === planWiringScenarioId(); }); }
     $('#planReportAiStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
+    $('#planReportAiModelStrategy').innerHTML = '<option value="">Select a strategy</option>' + strs.map((s) => `<option value="${s.id}">${esc(s.letter)} · ${esc(s.name)}</option>`).join('');
   }).catch(() => { /* pickers stay empty; save falls back to project base */ });
   $('#planReportAiGenBtn').onclick = async () => {
     const msg = $('#planReportAiMsg');
@@ -12321,6 +12284,85 @@ function openPlanReportAiModal(projectId, opts = {}) {
       };
     } catch (err) { showMsg(msg, 'err', err.message); }
   };
+  $('#planReportAiModelBtn').onclick = () => planReportAiModelDesign(projectId);
+}
+
+// Model design inside the Generate with AI modal (moved here from the
+// project-page AI panel, user decision 2026-11-03): same ai-model
+// endpoint, same ask/answer/thread rules — the designed model still
+// attaches to the STRATEGY via PUT model_id (modelSource 'ai'), never
+// to the report. The modal's thread is per-open (the modal is
+// transient); the strategy page's Refine with AI keeps the stored
+// thread for follow-ups on an attached model. Model design is
+// independent of the report's pins: the strategy picker here is its
+// own picker, and attaching a model does not change the report.
+async function planReportAiModelDesign(projectId) {
+  const msg = $('#planReportAiModelMsg');
+  const askHost = $('#planReportAiModelAsk');
+  const out = $('#planReportAiModelOut');
+  const threadEl = $('#planReportAiModelThread');
+  const thread = [];
+  const renderThread = () => {
+    const labels = {};
+    threadEl.innerHTML = thread.map((t) => {
+      if (t.role === 'ai' && t.questions) {
+        for (const q of t.questions) if (q.field) labels[q.field] = q.label;
+        return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
+      }
+      if (t.role === 'ai') return `<div class="plan-row"><span>AI: ${esc(t.summary || '')}</span></div>`;
+      if (t.answers) return Object.entries(t.answers).map(([k, v]) => `<div class="plan-row"><span>You: ${labels[k] ? `${esc(labels[k])}: ` : ''}${esc(String(v))}</span></div>`).join('');
+      return '';
+    }).join('');
+  };
+  try {
+    const sid = Number($('#planReportAiModelStrategy').value);
+    if (!sid) throw new Error('Select a strategy first');
+    const text = $('#planReportAiModelText').value.trim();
+    if (!text) throw new Error('Describe the model first');
+    const design = async (answers) => {
+      const history = thread.filter((t) => (t.role === 'ai' && t.questions) || (t.role === 'user' && t.answers));
+      const r = await api(`/api/planning/strategies/${sid}/ai-model`, { method: 'POST', body: { text, answers, history } });
+      if (r.ask) {
+        thread.push({ role: 'ai', questions: r.ask });
+        renderThread();
+        askHost.innerHTML = `${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planReportAiModelAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}<div class="toolbar"><button class="small primary" id="planReportAiModelContinueBtn">Continue design</button></div>`;
+        $('#planReportAiModelContinueBtn').onclick = async () => {
+          try {
+            const next = {};
+            for (const q of r.ask) {
+              const el = document.querySelector(`#planReportAiModelAsk_${CSS.escape(q.field)}`);
+              const v = el ? el.value.trim() : '';
+              if (!v) throw new Error('Please answer all questions before continuing.');
+              next[q.field] = q.type === 'number' ? Number(v) : v;
+            }
+            thread.push({ role: 'user', answers: next });
+            renderThread();
+            askHost.innerHTML = '';
+            await design(next);
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        };
+        return;
+      }
+      const spec = r.model.spec;
+      const summary = `Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}`;
+      thread.push({ role: 'ai', summary });
+      renderThread();
+      out.innerHTML = `<div class="plan-row"><span>${summary}</span></div><div class="toolbar"><button class="small primary" id="planReportAiModelApplyBtn">Use this model</button></div>`;
+      $('#planReportAiModelApplyBtn').onclick = async () => {
+        try {
+          await api(`/api/planning/strategies/${sid}`, { method: 'PUT', body: { model_id: r.model.id } });
+          out.innerHTML = '';
+          showMsg(msg, '', 'Model attached');
+          // The page snapshot is stale: mark the strategy AI-modelled
+          // in memory so preset Generate disables immediately.
+          const s = (planProjectData && planProjectData.strategies || []).find((x) => x.id === sid);
+          if (s) s.modelSource = 'ai';
+          planFlowGenerateRefresh();
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      };
+    };
+    await design(null);
+  } catch (err) { showMsg(msg, 'err', err.message); }
 }
 
 // ---- report view: charts + tables + how each figure is calculated ----

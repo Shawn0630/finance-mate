@@ -1097,34 +1097,88 @@ export async function run(H, S) {
       const aiWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
       await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await aiWait(1500);
-      // Model design now lives in the project-page AI panel (the old
-      // Add-strategy AI fallback is gone); same ask/answer/thread
-      // rules, driven through the panel's model target.
-      await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
-      await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('[data-plan-ai-target="model"]').click());
-      await page.waitForFunction(() => !document.querySelector('#planAiPanelStrategyRow').classList.contains('hidden'), { timeout: 10000 });
-      await page.evaluate(() => {
-        document.querySelector('#planAiPanelStrategyName').value = 'AiModel Browser';
-        document.querySelector('#planAiPanelText').value = 'design a model';
-      });
+      // Model design now lives in the Generate with AI modal (user
+      // decision 2026-11-03: the panel keeps scenario/baseline/ops
+      // only); same ask/answer/thread rules, and the designed model
+      // still attaches to the STRATEGY via PUT model_id.
+      await page.evaluate(() => document.querySelector('#planAiReportBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      await page.waitForFunction((sid) => [...document.querySelectorAll('#planReportAiModelStrategy option')].some((o) => Number(o.value) === sid), { timeout: 10000 }, aiModelStratId);
+      await page.evaluate((sid) => {
+        document.querySelector('#planReportAiModelStrategy').value = String(sid);
+        document.querySelector('#planReportAiModelText').value = 'design a model';
+      }, aiModelStratId);
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
-      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planAiPanelAsk_target_contribution'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('#planAiPanelContinueBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planAiPanelMsg')?.textContent || '').length > 0, { timeout: 10000 });
-      const errText = await page.evaluate(() => document.querySelector('#planAiPanelMsg')?.textContent || '');
-      H.check('ai-model browser: empty answer shows a generic error, never the question text as a field name',
+      await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiModelAsk_target_contribution'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planReportAiModelContinueBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planReportAiModelMsg')?.textContent || '').length > 0, { timeout: 10000 });
+      const errText = await page.evaluate(() => document.querySelector('#planReportAiModelMsg')?.textContent || '');
+      H.check('modelmove: empty answer shows a generic error, never the question text as a field name',
         errText.includes('Please answer all questions before continuing.') && !errText.includes('Target monthly contribution? is required'),
         JSON.stringify({ errText }));
       fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
-      await page.evaluate(() => { document.querySelector('#planAiPanelAsk_target_contribution').value = '600'; });
-      await page.evaluate(() => document.querySelector('#planAiPanelContinueBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planAiPanelOut')?.textContent || '').includes('Bindings:'), { timeout: 10000 });
-      const threadText = await page.evaluate(() => document.querySelector('#planAiPanelThread')?.textContent || '');
-      H.check('ai-model browser: thread pairs the answer with its question, no raw key = value line',
+      await page.evaluate(() => { document.querySelector('#planReportAiModelAsk_target_contribution').value = '600'; });
+      await page.evaluate(() => document.querySelector('#planReportAiModelContinueBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planReportAiModelOut')?.textContent || '').includes('Bindings:'), { timeout: 10000 });
+      const threadText = await page.evaluate(() => document.querySelector('#planReportAiModelThread')?.textContent || '');
+      H.check('modelmove: thread pairs the answer with its question, no raw key = value line',
         threadText.includes('You: Target monthly contribution?: 600') && !threadText.includes('target_contribution = 600'),
         JSON.stringify({ threadText }));
+      await page.evaluate(() => document.querySelector('#planReportAiModelApplyBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planReportAiModelMsg')?.textContent || '').includes('Model attached'), { timeout: 10000 });
+      // Close the modal before navigating: the overlay is body-level
+      // and survives hash routing, so a later click would land on it
+      // instead of the page underneath.
+      await page.evaluate(() => document.querySelector('#planReportAiModal [data-close-modal]').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      const stratAfter = await H.req('GET', `/api/planning/strategies/${aiModelStratId}`);
+      const projAfter = await H.req('GET', `/api/planning/projects/${metaBuyId}`);
+      const projStrat = (projAfter.data.strategies || []).find((x) => x.id === aiModelStratId);
+      H.check('modelmove: modal-designed model attaches to the strategy with modelSource ai',
+        stratAfter.data.model && stratAfter.data.model.source === 'ai' && projStrat && projStrat.modelSource === 'ai',
+        JSON.stringify({ modelSource: stratAfter.data.model && stratAfter.data.model.source, projModelSource: projStrat && projStrat.modelSource }));
+      // Strategy Model panel still shows the attached model with Detach
+      // and Refine (view/detach/follow-up stay; only design moved).
+      await page.goto(`http://ff.local/#planning/strategy/${aiModelStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await aiWait(1200);
+      const modelBefore = await page.evaluate(() => ({
+        panel: [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'),
+        detach: !!document.querySelector('#planModelDetachBtn'),
+        follow: !!document.querySelector('#planModelFollowBtn'),
+      }));
+      H.check('modelmove: strategy Model panel shows the modal-designed model with Detach + Refine',
+        modelBefore.panel && modelBefore.detach && modelBefore.follow, JSON.stringify(modelBefore));
+      // Routing: a fresh project load picks every strategy (wiring
+      // null = all), so the modal-designed model disables preset
+      // Generate from the server-derived modelSource alone.
+      await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await aiWait(1500);
+      await page.waitForFunction(() => {
+        const b = document.querySelector('#planFlowGenerateBtn');
+        const n = document.querySelector('#planFlowGenerateNote')?.textContent || '';
+        return !!b?.disabled && n.includes('AI-designed');
+      }, { timeout: 15000 }).catch(() => {});
+      const routeState = await page.evaluate(() => ({
+        disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
+        note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
+        aiEnabled: !document.querySelector('#planAiReportBtn')?.disabled,
+      }));
+      H.check('modelmove: preset Generate stays disabled for a modal-designed AI model, AI Generate stays available',
+        routeState.disabled && routeState.note.includes('AI-designed') && routeState.note.includes('strategy') && routeState.aiEnabled,
+        JSON.stringify(routeState));
+      // Detach still works from the strategy page.
+      page.on('dialog', (d) => d.accept());
+      await page.goto(`http://ff.local/#planning/strategy/${aiModelStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await aiWait(1200);
+      await page.click('#planModelDetachBtn');
+      // Wait for the detach reload itself, not a fixed sleep: under
+      // load the old panel lingers past 1200ms.
+      await page.waitForFunction(() => ![...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'), { timeout: 15000 }).catch(() => {});
+      const modelAfter = await page.evaluate(() => [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'));
+      const stratDetached = await H.req('GET', `/api/planning/strategies/${aiModelStratId}`);
+      H.check('modelmove: Detach removes the model link and the panel leaves',
+        !modelAfter && stratDetached.data.model === null, JSON.stringify({ panelLeft: modelAfter, model: stratDetached.data.model }));
     } finally { await aiBrowser.close(); }
   }
   // ---- Unified AI panel (browser) -------------------------------------
@@ -1207,8 +1261,8 @@ export async function run(H, S) {
         stratRowHidden: !!document.querySelector('#planAiPanelStrategyRow.hidden'),
         scenNameShown: !document.querySelector('#planAiPanelScenarioNameRow.hidden'),
       }));
-      H.check('aipanel browser: panel opens with four targets, scenario default, strategy row hidden',
-        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'baseline', 'ops', 'model']) && targets.stratRowHidden && targets.scenNameShown, JSON.stringify(targets));
+      H.check('modelmove: panel shows exactly three targets (no Strategy·model), scenario default, strategy row hidden',
+        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'baseline', 'ops']) && targets.stratRowHidden && targets.scenNameShown, JSON.stringify(targets));
       await page.evaluate(() => document.querySelector('[data-plan-ai-target="ops"]').click());
       const opsRow = await page.evaluate(() => !document.querySelector('#planAiPanelStrategyRow.hidden'));
       H.check('aipanel browser: ops target shows the strategy picker', opsRow);
@@ -4770,9 +4824,11 @@ export async function run(H, S) {
       const appendUi = await page.evaluate(() => ({
         modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
         pickersHidden: ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('div')?.classList.contains('hidden')),
+        modelHidden: !!document.querySelector('#planReportAiModelSection.hidden'),
         note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
       }));
       H.check('reporttab: per-tab AI opens append mode (pickers hidden, pins-unchanged note)', appendUi.modalOpen && appendUi.pickersHidden && appendUi.note.includes('pins unchanged'), JSON.stringify(appendUi));
+      H.check('modelmove: model-design section stays out of append mode', appendUi.modelHidden, JSON.stringify(appendUi));
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', charts: [{ template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
       await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Add an extra balance path'; });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiGenBtn');
