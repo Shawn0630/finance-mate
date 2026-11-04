@@ -1103,30 +1103,30 @@ export async function run(H, S) {
       // still attaches to the STRATEGY via PUT model_id.
       await page.evaluate(() => document.querySelector('#planAiReportBtn').click());
       await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
-      await page.waitForFunction((sid) => [...document.querySelectorAll('#planReportAiModelStrategy option')].some((o) => Number(o.value) === sid), { timeout: 10000 }, aiModelStratId);
+      await page.waitForFunction((sid) => [...document.querySelectorAll('#planReportAiModelStrategies input')].some((o) => Number(o.value) === sid), { timeout: 10000 }, aiModelStratId);
       await page.evaluate((sid) => {
-        document.querySelector('#planReportAiModelStrategy').value = String(sid);
+        document.querySelector(`#planReportAiModelStrategies input[value="${sid}"]`).checked = true;
         document.querySelector('#planReportAiModelText').value = 'design a model';
       }, aiModelStratId);
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
       await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planReportAiModelAsk_target_contribution'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('#planReportAiModelContinueBtn').click());
+      await page.waitForFunction((sid) => !!document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-ask-field="target_contribution"]`), { timeout: 10000 }, aiModelStratId);
+      await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-continue]`).click(), aiModelStratId);
       await page.waitForFunction(() => (document.querySelector('#planReportAiModelMsg')?.textContent || '').length > 0, { timeout: 10000 });
       const errText = await page.evaluate(() => document.querySelector('#planReportAiModelMsg')?.textContent || '');
       H.check('modelmove: empty answer shows a generic error, never the question text as a field name',
         errText.includes('Please answer all questions before continuing.') && !errText.includes('Target monthly contribution? is required'),
         JSON.stringify({ errText }));
       fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
-      await page.evaluate(() => { document.querySelector('#planReportAiModelAsk_target_contribution').value = '600'; });
-      await page.evaluate(() => document.querySelector('#planReportAiModelContinueBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planReportAiModelOut')?.textContent || '').includes('Bindings:'), { timeout: 10000 });
-      const threadText = await page.evaluate(() => document.querySelector('#planReportAiModelThread')?.textContent || '');
+      await page.evaluate((sid) => { document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-ask-field="target_contribution"]`).value = '600'; }, aiModelStratId);
+      await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-continue]`).click(), aiModelStratId);
+      await page.waitForFunction((sid) => (document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-out]`)?.textContent || '').includes('Bindings:'), { timeout: 10000 }, aiModelStratId);
+      const threadText = await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-thread]`)?.textContent || '', aiModelStratId);
       H.check('modelmove: thread pairs the answer with its question, no raw key = value line',
         threadText.includes('You: Target monthly contribution?: 600') && !threadText.includes('target_contribution = 600'),
         JSON.stringify({ threadText }));
-      await page.evaluate(() => document.querySelector('#planReportAiModelApplyBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planReportAiModelMsg')?.textContent || '').includes('Model attached'), { timeout: 10000 });
+      await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-apply]`).click(), aiModelStratId);
+      await page.waitForFunction((sid) => (document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-status]`)?.textContent || '') === 'Designed', { timeout: 10000 }, aiModelStratId);
       // Close the modal before navigating: the overlay is body-level
       // and survives hash routing, so a later click would land on it
       // instead of the page underneath.
@@ -1180,6 +1180,255 @@ export async function run(H, S) {
       H.check('modelmove: Detach removes the model link and the panel leaves',
         !modelAfter && stratDetached.data.model === null, JSON.stringify({ panelLeft: modelAfter, model: stratDetached.data.model }));
     } finally { await aiBrowser.close(); }
+  }
+  // ---- Generate-with-AI modal beautify + Model multi-select + tier alignment ----
+  // Modal: compact cards, pill-chip picks, small buttons; Model picker
+  // is multi-checkbox; tier world note spans the middle row.
+  r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'MB Strat One', source: 'manual' });
+  H.check('modalbeautify: fixture strategy one created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const mbStrat1 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'MB Strat Two', source: 'manual' });
+  H.check('modalbeautify: fixture strategy two created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const mbStrat2 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'MB Strat Three', source: 'manual' });
+  H.check('modalbeautify: fixture strategy three created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const mbStrat3 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'MB Strat Four', source: 'manual' });
+  H.check('modalbeautify: fixture strategy four created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const mbStrat4 = r.data.strategy.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'Tieralign Plan' });
+  H.check('tieralign: fixture project created',
+    r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const taPid = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${taPid}/baselines`, { name: 'TA Base', definition: {} });
+  H.check('tieralign: fixture baseline created',
+    r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${taPid}/strategies`, { name: 'TA Strat', source: 'manual' });
+  H.check('tieralign: fixture strategy created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  let mbPptr = null;
+  try {
+    const { createRequire } = await import('node:module');
+    const mbReqmod = createRequire(import.meta.url);
+    try { mbPptr = mbReqmod('puppeteer-core'); } catch { mbPptr = mbReqmod('/tmp/pptr/node_modules/puppeteer-core'); }
+  } catch { mbPptr = null; }
+  if (!mbPptr || !H.chromeAvailable) {
+    console.log('modalbeautify browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const mbForward = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const mbLogin = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const mbCookie = mbLogin.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const mbBrowser = await mbPptr.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await mbBrowser.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await mbForward({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: mbCookie, domain: 'ff.local', path: '/', httpOnly: true });
+      const mbWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      // --- modal styling + multi-select on metaBuyId ---
+      await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await mbWait(1500);
+      await page.evaluate(() => document.querySelector('#planAiReportBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      await page.waitForFunction((s1, s2) => [...document.querySelectorAll('#planReportAiModelStrategies input')].some((o) => Number(o.value) === s1)
+        && [...document.querySelectorAll('#planReportAiModelStrategies input')].some((o) => Number(o.value) === s2), { timeout: 10000 }, mbStrat1, mbStrat2);
+      const styleState = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#planReportAiModal .plan-ai-modal-card')];
+        const card = cards[0];
+        const head = document.querySelector('#planReportAiModal .plan-ai-modal-card .section-head h3');
+        const pick = document.querySelector('#planReportAiModal .plan-ai-picks label');
+        const gen = document.querySelector('#planReportAiGenBtn');
+        const cs = card ? getComputedStyle(card) : null;
+        const hs = head ? getComputedStyle(head) : null;
+        const ps = pick ? getComputedStyle(pick) : null;
+        return {
+          cardCount: cards.length,
+          cardPad: cs ? `${cs.paddingTop} ${cs.paddingRight}` : '',
+          headSize: hs ? hs.fontSize : '',
+          headWeight: hs ? hs.fontWeight : '',
+          pickRadius: ps ? ps.borderRadius : '',
+          genSmall: !!gen?.classList.contains('small'),
+          genPrimary: !!gen?.classList.contains('primary'),
+          modelBoxes: document.querySelectorAll('#planReportAiModelStrategies input[type="checkbox"]').length > 0,
+          modelSelectGone: !document.querySelector('#planReportAiModelStrategy'),
+        };
+      });
+      H.check('modalbeautify: modal sections render as compact cards with pill-chip picks and small buttons',
+        styleState.cardCount === 4 && styleState.cardPad === '10px 14px' && styleState.headSize === '15px' && styleState.headWeight === '650'
+          && styleState.pickRadius === '999px' && styleState.genSmall && styleState.genPrimary
+          && styleState.modelBoxes && styleState.modelSelectGone,
+        JSON.stringify(styleState));
+      // --- multi-select: two strategies designed + attached ---
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
+      const pinsBefore = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b));
+      await page.evaluate((s1, s2) => {
+        document.querySelector(`#planReportAiModelStrategies input[value="${s1}"]`).checked = true;
+        document.querySelector(`#planReportAiModelStrategies input[value="${s2}"]`).checked = true;
+        document.querySelector('#planReportAiModelText').value = 'design a model';
+      }, mbStrat1, mbStrat2);
+      const checkedBoth = await page.evaluate((s1, s2) => [...document.querySelectorAll('#planReportAiModelStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b).join(',') === [s1, s2].sort((a, b) => a - b).join(','), mbStrat1, mbStrat2);
+      H.check('modalbeautify: Model section shows checkboxes, checking two lists both',
+        checkedBoth, JSON.stringify({ checkedBoth }));
+      await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
+      // Sequential by design: each model's Apply gates the next
+      // strategy's design, so Apply 1 must be clicked before Apply 2
+      // even exists; a failed design skips the gate and continues.
+      await page.waitForFunction((s1) => !!document.querySelector(`[data-plan-model-strategy="${s1}"] [data-plan-model-apply]`), { timeout: 20000 }, mbStrat1);
+      await page.evaluate((s1) => document.querySelector(`[data-plan-model-strategy="${s1}"] [data-plan-model-apply]`).click(), mbStrat1);
+      await page.waitForFunction((s2) => !!document.querySelector(`[data-plan-model-strategy="${s2}"] [data-plan-model-apply]`), { timeout: 20000 }, mbStrat2);
+      await page.evaluate((s2) => document.querySelector(`[data-plan-model-strategy="${s2}"] [data-plan-model-apply]`).click(), mbStrat2);
+      await page.waitForFunction((s1, s2) => (document.querySelector(`[data-plan-model-strategy="${s1}"] [data-plan-model-status]`)?.textContent || '') === 'Designed'
+        && (document.querySelector(`[data-plan-model-strategy="${s2}"] [data-plan-model-status]`)?.textContent || '') === 'Designed', { timeout: 15000 }, mbStrat1, mbStrat2);
+      const m1 = await H.req('GET', `/api/planning/strategies/${mbStrat1}`);
+      const m2 = await H.req('GET', `/api/planning/strategies/${mbStrat2}`);
+      H.check('modalbeautify: Propose designs models for both checked strategies and both attach',
+        m1.data.model && m1.data.model.source === 'ai' && m2.data.model && m2.data.model.source === 'ai',
+        JSON.stringify({ m1: m1.data.model && m1.data.model.source, m2: m2.data.model && m2.data.model.source }));
+      const pinsAfter = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b));
+      H.check('modalbeautify: model picks leave the report Strategies pins unchanged',
+        JSON.stringify(pinsBefore) === JSON.stringify(pinsAfter), JSON.stringify({ pinsBefore, pinsAfter }));
+      // --- failure on one does not block the other: the failing
+      // strategy is checked FIRST (DOM order), so the later strategy
+      // must still design after the failure.
+      await page.evaluate((s1, s2, s3, s4) => {
+        document.querySelector(`#planReportAiModelStrategies input[value="${s1}"]`).checked = false;
+        document.querySelector(`#planReportAiModelStrategies input[value="${s2}"]`).checked = false;
+        document.querySelector(`#planReportAiModelStrategies input[value="${s3}"]`).checked = true;
+        document.querySelector(`#planReportAiModelStrategies input[value="${s4}"]`).checked = true;
+      }, mbStrat1, mbStrat2, mbStrat3, mbStrat4);
+      r = await H.req('DELETE', `/api/planning/strategies/${mbStrat3}`);
+      H.check('modalbeautify: fixture strategy three deleted for the failure run',
+        r.status === 200, JSON.stringify(r.data));
+      await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
+      await page.waitForFunction((s4) => !!document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-apply]`), { timeout: 20000 }, mbStrat4);
+      await page.evaluate((s4) => document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-apply]`).click(), mbStrat4);
+      await page.waitForFunction((s3, s4) => (document.querySelector(`[data-plan-model-strategy="${s3}"] [data-plan-model-status]`)?.textContent || '').startsWith('Failed')
+        && (document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-status]`)?.textContent || '') === 'Designed', { timeout: 20000 }, mbStrat3, mbStrat4);
+      const failState = await page.evaluate((s3, s4) => ({
+        fail: document.querySelector(`[data-plan-model-strategy="${s3}"] [data-plan-model-status]`)?.textContent || '',
+        other: document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-status]`)?.textContent || '',
+      }), mbStrat3, mbStrat4);
+      H.check('modalbeautify: one strategy design failure does not block the other',
+        failState.fail.startsWith('Failed') && failState.other === 'Designed', JSON.stringify(failState));
+      // Close the modal before navigating: the overlay is body-level
+      // and survives hash routing.
+      await page.evaluate(() => document.querySelector('#planReportAiModal [data-close-modal]').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      // --- append mode still hides the Model section ---
+      const mbProj = await H.req('GET', `/api/planning/projects/${metaBuyId}`);
+      const mbScenIds = (mbProj.data.scenarios || []).map((s) => s.id);
+      r = await H.req('POST', `/api/planning/projects/${metaBuyId}/reports`, { name: 'MB Append Report', definition: { charts: [] }, strategy_ids: [mbStrat1], scenario_ids: mbScenIds });
+      const mbRepId = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+      H.check('modalbeautify: fixture report created for append mode',
+        r.status === 201 && mbRepId > 0, JSON.stringify(r.data));
+      // Full reload, not goto: the page is ALREADY on this project's
+      // hash, so goto to the identical URL is a same-document no-op
+      // and the list would never pick up the API-created report.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await mbWait(1500);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-view]')].some((el) => el.textContent.includes('MB Append Report')), { timeout: 15000 });
+      await page.evaluate((rid) => {
+        const el = document.querySelector(`[data-plan-report-view="${rid}"]`);
+        if (el) el.click();
+      }, mbRepId);
+      await page.waitForFunction(() => !!document.querySelector('#planReportTabAiBtn'), { timeout: 30000 });
+      await page.evaluate(() => document.querySelector('#planReportTabAiBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      const appendState = await page.evaluate(() => ({
+        modelHidden: !!document.querySelector('#planReportAiModelSection')?.classList.contains('hidden'),
+        note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
+      }));
+      H.check('modalbeautify: append mode still hides the Model section',
+        appendState.modelHidden && appendState.note.includes('pins unchanged'), JSON.stringify(appendState));
+      await page.evaluate(() => document.querySelector('#planReportAiModal [data-close-modal]').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      // --- tier alignment on the fresh project (flat world first) ---
+      await page.goto(`http://ff.local/#planning/project/${taPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await mbWait(1500);
+      const flatState = await page.evaluate(() => {
+        const world = document.querySelector('#planStrategyCardsWorld');
+        const bCard = document.querySelector('#planBaselineCards [data-plan-baseline]');
+        const sCard = document.querySelector('#planStrategyCards [data-plan-strategy]');
+        return {
+          parent: world?.parentElement?.id || '',
+          inStratCol: !!document.querySelector('#planStrategiesPanel #planStrategyCardsWorld'),
+          note: world?.textContent || '',
+          bTop: bCard ? bCard.getBoundingClientRect().top : null,
+          sTop: sCard ? sCard.getBoundingClientRect().top : null,
+        };
+      });
+      H.check('tieralign: world note is a single element above the row, not inside the Strategies column',
+        flatState.parent === 'planFlowMidTier' && !flatState.inStratCol, JSON.stringify(flatState));
+      H.check('tieralign: baseline and strategy cards share the same top offset (flat world)',
+        flatState.bTop !== null && flatState.sTop !== null && Math.abs(flatState.bTop - flatState.sTop) <= 1, JSON.stringify(flatState));
+      H.check('tieralign: flat-world note text correct',
+        flatState.note.includes('Current rates (no scenario)'), JSON.stringify(flatState));
+      r = await H.req('POST', `/api/planning/projects/${taPid}/scenarios`, { name: 'TA World' });
+      H.check('tieralign: fixture scenario created',
+        r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      // Same trap as the append card above: the page is already on
+      // this project's hash, so goto is a same-document no-op and the
+      // note would still read flat-world. Reload to re-render.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await mbWait(1500);
+      const pickedState = await page.evaluate(() => {
+        const world = document.querySelector('#planStrategyCardsWorld');
+        const bCard = document.querySelector('#planBaselineCards [data-plan-baseline]');
+        const sCard = document.querySelector('#planStrategyCards [data-plan-strategy]');
+        return {
+          note: world?.textContent || '',
+          bTop: bCard ? bCard.getBoundingClientRect().top : null,
+          sTop: sCard ? sCard.getBoundingClientRect().top : null,
+        };
+      });
+      H.check('tieralign: note text correct for a picked scenario',
+        pickedState.note.includes('Under TA World'), JSON.stringify(pickedState));
+      H.check('tieralign: baseline and strategy cards share the same top offset (picked world)',
+        pickedState.bTop !== null && pickedState.sTop !== null && Math.abs(pickedState.bTop - pickedState.sTop) <= 1, JSON.stringify(pickedState));
+    } finally { await mbBrowser.close(); }
   }
   // ---- Unified AI panel (browser) -------------------------------------
   // Panel toggle/targets, scattered entries gone, scenario + baseline
@@ -4996,7 +5245,9 @@ export async function run(H, S) {
       await waitF(1000);
       const appendUi = await page.evaluate(() => ({
         modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
-        pickersHidden: ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('div')?.classList.contains('hidden')),
+        // Pickers hide by their .plan-ai-modal-card (modalbeautify
+        // restructure): the picker's closest div is now .plan-ai-picks.
+        pickersHidden: ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.contains('hidden')),
         modelHidden: !!document.querySelector('#planReportAiModelSection.hidden'),
         note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
       }));

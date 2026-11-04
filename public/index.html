@@ -1128,20 +1128,18 @@
     <div class="note hidden" id="planReportAiAppendNote"></div>
     <div><label>Report name *</label><input id="planReportAiName"></div>
     <div><label>What should the report show? *</label><textarea id="planReportAiText" rows="3" placeholder="e.g. Compare mortgage balance paths and headline costs for each strategy"></textarea></div>
-    <div><label>Baseline (one)</label><select id="planReportAiBaseline"></select></div>
-    <div><label>Scenarios (pinned — at least one when scenarios exist)</label><div id="planReportAiScenarios"></div></div>
-    <div><label>Strategies (many)</label><div id="planReportAiStrategies"></div></div>
-    <div id="planReportAiModelSection">
+    <div class="plan-ai-modal-card"><div class="section-head"><h3>Baseline</h3></div><select id="planReportAiBaseline"></select></div>
+    <div class="plan-ai-modal-card"><div class="section-head"><h3>Scenarios</h3></div><div class="plan-ai-picks" id="planReportAiScenarios"></div></div>
+    <div class="plan-ai-modal-card"><div class="section-head"><h3>Strategies</h3></div><div class="plan-ai-picks" id="planReportAiStrategies"></div></div>
+    <div class="plan-ai-modal-card" id="planReportAiModelSection">
       <div class="section-head"><h3>Model</h3></div>
-      <div><label>Strategy</label><select id="planReportAiModelStrategy"></select></div>
+      <div><label>Strategies</label><div class="plan-ai-picks" id="planReportAiModelStrategies"></div></div>
       <div><label>Describe the model</label><textarea id="planReportAiModelText" rows="2" placeholder="e.g. Model interest as balance times monthly rate"></textarea></div>
       <div class="toolbar"><button class="small primary" id="planReportAiModelBtn">Propose model</button></div>
-      <div id="planReportAiModelThread"></div>
-      <div id="planReportAiModelAsk"></div>
-      <div id="planReportAiModelOut"></div>
+      <div id="planReportAiModelResults"></div>
       <div class="msg" id="planReportAiModelMsg"></div>
     </div>
-    <div class="toolbar"><button class="primary" id="planReportAiGenBtn">Generate preview</button></div>
+    <div class="toolbar"><button class="small primary" id="planReportAiGenBtn">Generate preview</button></div>
     <div id="planReportAiOut"></div>
   </div>
 </div>

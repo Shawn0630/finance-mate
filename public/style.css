@@ -632,6 +632,19 @@ table.seg-table td:last-child { text-align: right; }
 .plan-report-card .k { font-size: 15px; font-weight: 650; }
 .plan-report-card .n { color: #71808f; font-size: 12px; margin-top: 2px; }
 .plan-report-card .toolbar { margin: 6px 0 0; }
+/* Generate-with-AI modal, project-page language: compact cards with
+   section-head titles; picks render as pill chips (checked = blue
+   tint, same as wiring Selected). Scoped to the modal only. */
+#planReportAiModal .plan-ai-modal-card { border: 1px solid #e6ecf2; border-radius: 10px; padding: 10px 14px; margin: 12px 0; }
+#planReportAiModal .plan-ai-modal-card .section-head { margin-bottom: 8px; }
+#planReportAiModal .plan-ai-modal-card .section-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+#planReportAiModal .plan-ai-picks { display: flex; flex-wrap: wrap; gap: 8px; }
+#planReportAiModal .plan-ai-picks label { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d5dde5; border-radius: 999px; padding: 4px 10px; font-size: 13px; cursor: pointer; }
+#planReportAiModal .plan-ai-picks label:has(input:checked) { border-color: #1668c4; background: #f0f6fc; }
+/* Shared world note above the middle row: the scenario applies to
+   BOTH baseline and strategy (both are evaluated inside its world),
+   so the note spans the row instead of sitting in one column. */
+#planFlowMidTier > #planStrategyCardsWorld { grid-column: 1 / -1; }
 /* Planning project title tags: category/subcategory/entity as pills on the title row. */
 .plan-title-tags { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .plan-title-tag { display: inline-block; font-size: 11px; line-height: 1.4; padding: 2px 8px; border-radius: 999px; background: #eef2f7; color: #33424f; border: 1px solid #dde4ec; white-space: nowrap; }

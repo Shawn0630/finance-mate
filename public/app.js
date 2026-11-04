@@ -11631,6 +11631,7 @@ function planProjectHtml(d) {
       <div id="planScenarioCards"></div>
       </div>
       <div class="plan-flow-tier plan-flow-tier-mid" id="planFlowMidTier">
+      <div id="planStrategyCardsWorld"></div>
       <div class="plan-flow-group" id="planBaselineCardsPanel">
       <div class="section-head"><h3>Baselines</h3>
         <div class="toolbar"><button class="small" id="planAddBaselineBtn">+ Add baseline</button></div>
@@ -11641,7 +11642,6 @@ function planProjectHtml(d) {
       <div class="section-head"><h3>Strategies</h3>
         <div class="toolbar"><button class="small primary" id="planAddStrategyBtn">+ Add strategy</button></div>
       </div>
-      <div id="planStrategyCardsWorld"></div>
       <div id="planStrategyCards"></div>
       </div>
       </div>
@@ -12459,24 +12459,24 @@ function openPlanReportAiModal(projectId, opts = {}) {
   // Model-design section resets on every open (its thread is per-open;
   // the modal is transient, unlike the project-page panel).
   $('#planReportAiModelText').value = '';
-  $('#planReportAiModelThread').innerHTML = '';
-  $('#planReportAiModelAsk').innerHTML = '';
-  $('#planReportAiModelOut').innerHTML = '';
+  $('#planReportAiModelResults').innerHTML = '';
   showMsg($('#planReportAiModelMsg'), '', '');
   openModal('planReportAiModal');
   // Append mode (per-tab AI Generate): pin pickers are irrelevant —
   // the report keeps its pins, only charts are appended. Reset the
   // picker visibility on every open so a previous append open never
-  // leaks hidden pickers into a fresh-report open.
+  // leaks hidden pickers into a fresh-report open. Each picker lives
+  // in its own .plan-ai-modal-card, so hiding the card hides the
+  // whole section (head + picker).
   for (const id of ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
-    document.getElementById(id)?.closest('div')?.classList.remove('hidden');
+    document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.remove('hidden');
   }
   $('#planReportAiModelSection').classList.remove('hidden');
   const appendNote = $('#planReportAiAppendNote');
   appendNote.classList.add('hidden');
   if (appendTo) {
     for (const id of ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
-      document.getElementById(id)?.closest('div')?.classList.add('hidden');
+      document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.add('hidden');
     }
     // Append mode appends charts only: model design stays out of it.
     $('#planReportAiModelSection').classList.add('hidden');
@@ -12494,7 +12494,7 @@ function openPlanReportAiModal(projectId, opts = {}) {
     $('#planReportAiScenarios').innerHTML = planReportScenarioPickerHtml(aiReportScenarios);
     if (planWiringScenarioId() != null) { document.querySelectorAll('#planReportAiScenarios input').forEach((el) => { el.checked = Number(el.value) === planWiringScenarioId(); }); }
     $('#planReportAiStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
-    $('#planReportAiModelStrategy').innerHTML = '<option value="">Select a strategy</option>' + strs.map((s) => `<option value="${s.id}">${esc(s.letter)} · ${esc(s.name)}</option>`).join('');
+    $('#planReportAiModelStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}"> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
   }).catch(() => { /* pickers stay empty; save falls back to project base */ });
   $('#planReportAiGenBtn').onclick = async () => {
     const msg = $('#planReportAiMsg');
@@ -12551,11 +12551,50 @@ function openPlanReportAiModal(projectId, opts = {}) {
 // thread for follow-ups on an attached model. Model design is
 // independent of the report's pins: the strategy picker here is its
 // own picker, and attaching a model does not change the report.
+// Multi-select: Propose walks the checked strategies IN ORDER, each
+// with its own ask/answer thread (bindings differ per strategy, so
+// questions may differ). A failure on one strategy is shown on its
+// block and does NOT block the others. A fresh Propose supersedes a
+// running one (run token); the modal stays open showing results.
+let planReportAiModelRunSeq = 0;
 async function planReportAiModelDesign(projectId) {
   const msg = $('#planReportAiModelMsg');
-  const askHost = $('#planReportAiModelAsk');
-  const out = $('#planReportAiModelOut');
-  const threadEl = $('#planReportAiModelThread');
+  const resultsEl = $('#planReportAiModelResults');
+  const sids = [...document.querySelectorAll('#planReportAiModelStrategies input:checked')].map((el) => Number(el.value));
+  const text = $('#planReportAiModelText').value.trim();
+  if (!sids.length) { showMsg(msg, 'err', 'Select at least one strategy first'); return; }
+  if (!text) { showMsg(msg, 'err', 'Describe the model first'); return; }
+  showMsg(msg, '', '');
+  resultsEl.innerHTML = '';
+  const runSeq = ++planReportAiModelRunSeq;
+  const names = {};
+  document.querySelectorAll('#planReportAiModelStrategies label').forEach((lab) => {
+    const inp = lab.querySelector('input');
+    if (inp) names[Number(inp.value)] = lab.textContent.trim();
+  });
+  for (const sid of sids) {
+    if (runSeq !== planReportAiModelRunSeq) return;
+    const block = document.createElement('div');
+    block.className = 'plan-row';
+    block.dataset.planModelStrategy = String(sid);
+    block.innerHTML = `<span>${esc(names[sid] || `Strategy ${sid}`)} — <span data-plan-model-status>Designing…</span></span><div data-plan-model-thread></div><div data-plan-model-ask></div><div data-plan-model-out></div>`;
+    resultsEl.appendChild(block);
+    const setStatus = (t) => { const el = block.querySelector('[data-plan-model-status]'); if (el) el.textContent = t; };
+    try {
+      await designOnePlanReportAiModel(sid, text, block, projectId);
+      if (runSeq !== planReportAiModelRunSeq) return;
+      setStatus('Designed');
+    } catch (err) {
+      if (runSeq !== planReportAiModelRunSeq) return;
+      setStatus(`Failed: ${err.message}`);
+    }
+  }
+}
+async function designOnePlanReportAiModel(sid, text, block, projectId) {
+  const msg = $('#planReportAiModelMsg');
+  const askHost = block.querySelector('[data-plan-model-ask]');
+  const out = block.querySelector('[data-plan-model-out]');
+  const threadEl = block.querySelector('[data-plan-model-thread]');
   const thread = [];
   const renderThread = () => {
     const labels = {};
@@ -12569,55 +12608,60 @@ async function planReportAiModelDesign(projectId) {
       return '';
     }).join('');
   };
-  try {
-    const sid = Number($('#planReportAiModelStrategy').value);
-    if (!sid) throw new Error('Select a strategy first');
-    const text = $('#planReportAiModelText').value.trim();
-    if (!text) throw new Error('Describe the model first');
-    const design = async (answers) => {
+  const design = async (answers) => {
       const history = thread.filter((t) => (t.role === 'ai' && t.questions) || (t.role === 'user' && t.answers));
       const r = await api(`/api/planning/strategies/${sid}/ai-model`, { method: 'POST', body: { text, answers, history } });
       if (r.ask) {
         thread.push({ role: 'ai', questions: r.ask });
         renderThread();
-        askHost.innerHTML = `${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planReportAiModelAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}<div class="toolbar"><button class="small primary" id="planReportAiModelContinueBtn">Continue design</button></div>`;
-        $('#planReportAiModelContinueBtn').onclick = async () => {
-          try {
-            const next = {};
-            for (const q of r.ask) {
-              const el = document.querySelector(`#planReportAiModelAsk_${CSS.escape(q.field)}`);
-              const v = el ? el.value.trim() : '';
-              if (!v) throw new Error('Please answer all questions before continuing.');
-              next[q.field] = q.type === 'number' ? Number(v) : v;
-            }
+        askHost.innerHTML = `${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input data-plan-model-ask-field="${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}<div class="toolbar"><button class="small primary" data-plan-model-continue>Continue design</button></div>`;
+        // Wait for this strategy's Continue click. A missing answer
+        // is a retry-in-place (message shown, form kept); only an API
+        // failure rejects the strategy so the next one still runs.
+        await new Promise((resolve, reject) => {
+          block.querySelector('[data-plan-model-continue]').onclick = async () => {
+            let next;
+            try {
+              next = {};
+              for (const q of r.ask) {
+                const el = askHost.querySelector(`[data-plan-model-ask-field="${CSS.escape(q.field)}"]`);
+                const v = el ? el.value.trim() : '';
+                if (!v) throw new Error('Please answer all questions before continuing.');
+                next[q.field] = q.type === 'number' ? Number(v) : v;
+              }
+            } catch (err) { showMsg(msg, 'err', err.message); return; }
             thread.push({ role: 'user', answers: next });
             renderThread();
             askHost.innerHTML = '';
-            await design(next);
-          } catch (err) { showMsg(msg, 'err', err.message); }
-        };
+            try { await design(next); resolve(); } catch (err) { reject(err); }
+          };
+        });
         return;
       }
       const spec = r.model.spec;
       const summary = `Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}`;
       thread.push({ role: 'ai', summary });
       renderThread();
-      out.innerHTML = `<div class="plan-row"><span>${summary}</span></div><div class="toolbar"><button class="small primary" id="planReportAiModelApplyBtn">Use this model</button></div>`;
-      $('#planReportAiModelApplyBtn').onclick = async () => {
-        try {
-          await api(`/api/planning/strategies/${sid}`, { method: 'PUT', body: { model_id: r.model.id } });
-          out.innerHTML = '';
-          showMsg(msg, '', 'Model attached');
-          // The page snapshot is stale: mark the strategy AI-modelled
-          // in memory so preset Generate disables immediately.
-          const s = (planProjectData && planProjectData.strategies || []).find((x) => x.id === sid);
-          if (s) s.modelSource = 'ai';
-          planFlowGenerateRefresh();
-        } catch (err) { showMsg(msg, 'err', err.message); }
-      };
+      out.innerHTML = `<div class="plan-row"><span>${summary}</span></div><div class="toolbar"><button class="small primary" data-plan-model-apply>Use this model</button></div>`;
+      // Wait for this strategy's Use this model click; a failed attach
+      // keeps the button so the user can retry, and never fails the
+      // strategy outright.
+      await new Promise((resolve) => {
+        block.querySelector('[data-plan-model-apply]').onclick = async () => {
+          try {
+            await api(`/api/planning/strategies/${sid}`, { method: 'PUT', body: { model_id: r.model.id } });
+            out.innerHTML = '';
+            // The page snapshot is stale: mark the strategy AI-modelled
+            // in memory so preset Generate disables immediately.
+            const s = (planProjectData && planProjectData.strategies || []).find((x) => x.id === sid);
+            if (s) s.modelSource = 'ai';
+            planFlowGenerateRefresh();
+            resolve();
+          } catch (err) { showMsg(msg, 'err', err.message); }
+        };
+      });
     };
-    await design(null);
-  } catch (err) { showMsg(msg, 'err', err.message); }
+  await design(null);
 }
 
 // ---- report view: charts + tables + how each figure is calculated ----
