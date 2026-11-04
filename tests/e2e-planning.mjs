@@ -3151,6 +3151,18 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1200);
       await page.click('#planAiBaselineBtn');
+      // The open click can silently miss its target while the project
+      // page is still settling layout (the click reports success but
+      // the modal stays hidden — proven by a diagnostic run: the
+      // handler IS attached, a direct dispatch opens it). Wait for
+      // the modal to actually open; retry once via dispatch if the
+      // first click missed, same pattern as the uibundle card click.
+      try {
+        await page.waitForFunction(() => !document.querySelector('#planBaselineAiModal').classList.contains('hidden'), { timeout: 5000 });
+      } catch {
+        await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiBaselineBtn');
+        await page.waitForFunction(() => !document.querySelector('#planBaselineAiModal').classList.contains('hidden'), { timeout: 10000 });
+      }
       await waitP(400);
       await page.type('#planBaselineAiText', 'A plain do-nothing baseline');
       await page.click('#planBaselineAiGoBtn');
@@ -4507,6 +4519,55 @@ export async function run(H, S) {
       }), fRep2Id);
       H.check('reporttab: old report deep link lands on the project page with the tab open',
         deepLink.hash === `#planning/project/${fProjectId}` && deepLink.tab && deepLink.blocks.includes('Second balance'), JSON.stringify(deepLink));
+      // Browser mode: deep link lands in OPEN state — list hidden,
+      // tab bar at the top of the Reports tier with a back control.
+      const openState = await page.evaluate(() => {
+        const list = document.querySelector('#planReportList');
+        const host = document.querySelector('#planReportTabsHost');
+        const viewer = document.querySelector('#planReport');
+        return {
+          listHidden: !!list && list.classList.contains('hidden'),
+          hostBar: !!host && !!host.querySelector('#planReportTabsBar'),
+          backBtn: !!host && !!host.querySelector('#planReportBackBtn'),
+          hostAboveViewer: !!(host && viewer && (host.compareDocumentPosition(viewer) & Node.DOCUMENT_POSITION_FOLLOWING)),
+          viewerHasBlocks: [...document.querySelectorAll('#planReport [data-plan-report-block] h3')].length > 0,
+        };
+      });
+      H.check('browsermode: deep link lands in OPEN state (list hidden, tabs on top with back control, viewer filled)',
+        openState.listHidden && openState.hostBar && openState.backBtn && openState.hostAboveViewer && openState.viewerHasBlocks, JSON.stringify(openState));
+      // Back returns to LIST without deleting the report.
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportBackBtn');
+      await waitF(800);
+      const backState = await page.evaluate(() => ({
+        listVisible: !!document.querySelector('#planReportList') && !document.querySelector('#planReportList').classList.contains('hidden'),
+        viewerEmpty: (document.querySelector('#planReport')?.innerHTML || '').trim() === '',
+        tabs: [...document.querySelectorAll('[data-plan-report-tab]')].length,
+        cards: [...document.querySelectorAll('[data-plan-report-view]')].length,
+        pins: [...document.querySelectorAll('.plan-report-pin')].filter((el) => el.offsetParent !== null).length,
+      }));
+      H.check('browsermode: back returns to the list without deleting (cards present, no tabs, no highlight)',
+        backState.listVisible && backState.viewerEmpty && backState.tabs === 0 && backState.cards > 0 && backState.pins === 0, JSON.stringify(backState));
+      // Whole-card click: clicking the card's note (not its name)
+      // opens the report — the card itself is the opener now.
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"] .n`).click(); }, fRep2Id);
+      await page.waitForSelector(`[data-plan-report-tab="${fRep2Id}"]`, { timeout: 15000 });
+      await waitF(800);
+      const wholeCard = await page.evaluate(() => ({
+        listHidden: !!document.querySelector('#planReportList') && document.querySelector('#planReportList').classList.contains('hidden'),
+        tab: !!document.querySelector('#planReportTabsBar'),
+      }));
+      H.check('browsermode: whole-card click (note area, not the name) opens the report',
+        wholeCard.listHidden && wholeCard.tab, JSON.stringify(wholeCard));
+      // Last-tab close returns to LIST.
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab-close="${id}"]`).click(); }, fRep2Id);
+      await waitF(800);
+      const lastClose = await page.evaluate(() => ({
+        listVisible: !!document.querySelector('#planReportList') && !document.querySelector('#planReportList').classList.contains('hidden'),
+        viewerEmpty: (document.querySelector('#planReport')?.innerHTML || '').trim() === '',
+        tabs: [...document.querySelectorAll('[data-plan-report-tab]')].length,
+      }));
+      H.check('browsermode: closing the last tab returns to the list',
+        lastClose.listVisible && lastClose.viewerEmpty && lastClose.tabs === 0, JSON.stringify(lastClose));
       // UI bundle: remove-a-strategy-from-report + small toolbar
       // buttons + right-aligned strategy header.
       const ubDef = { strategies: [fStratId, fAiStratId], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] };

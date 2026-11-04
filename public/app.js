@@ -11429,6 +11429,7 @@ function planProjectHtml(d) {
         <div class="toolbar"><button class="small primary" id="planFlowGenerateBtn">Generate report</button><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
       </div>
       <div class="note" id="planFlowGenerateNote"></div>
+      <div id="planReportTabsHost"></div>
       <div id="planReportList"></div>
       <div id="planReport"></div>
       </div>
@@ -11551,8 +11552,9 @@ function planProjectWire(d) {
     try { await api(`/api/planning/declared-assets/${b.dataset.planAssetDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   }));
-  // Report cards in the flow's Reports tier: name navigates to
-  // the report view, Delete removes it. Tags state the pin honestly:
+  // Report cards in the flow's Reports tier: the WHOLE card opens
+  // the report view, Delete removes it (stopPropagation, so Delete
+  // never opens the card). Tags state the pin honestly:
   // Unpinned = legacy row saved before pinning (no lines); Flat world
   // = pinned to no scenario. The Under note names the pinned world
   // (the scenario side of the pin is not drawn as a line — the
@@ -11568,8 +11570,8 @@ function planProjectWire(d) {
       under = (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) ? 'Current rates (no scenario)'
         : (r.scenarioIds || []).map((id) => { const sc = (d.scenarios || []).find((x) => x.id === id); return sc ? sc.name : `#${id}`; }).join(', ');
     }
-    return `<div class="card plan-flow-card" data-plan-report="${r.id}">
-    <div class="k"><span data-plan-report-view="${r.id}" style="cursor:pointer">${esc(r.name)}</span></div>
+    return `<div class="card plan-flow-card" data-plan-report="${r.id}" data-plan-report-view="${r.id}" style="cursor:pointer">
+    <div class="k"><span>${esc(r.name)}</span></div>
     ${under ? `<div class="n">Under ${esc(under)}</div>` : ''}
     ${tags.length ? `<div class="n">${esc(tags.join(' · '))}</div>` : ''}
     <div class="toolbar"><button class="small danger" data-plan-report-del="${r.id}">Delete</button></div></div>`;
@@ -11577,7 +11579,8 @@ function planProjectWire(d) {
   document.querySelectorAll('[data-plan-report-view]').forEach((el) => {
     el.addEventListener('click', () => { planOpenReportTab(p.id, Number(el.dataset.planReportView)); });
   });
-  document.querySelectorAll('[data-plan-report-del]').forEach((b) => b.addEventListener('click', async () => {
+  document.querySelectorAll('[data-plan-report-del]').forEach((b) => b.addEventListener('click', async (e) => {
+    e.stopPropagation();
     try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanProject(p.id); }
     catch (err) { showMsg($('#planProjectMsg'), 'err', err.message); }
   }));
@@ -12135,7 +12138,6 @@ function planReportPinPanel(proj, report, note) {
   planReportCurrentId = report.id;
   planReportCurrentPins = null;
   $('#planReport').innerHTML = `
-    ${planReportTabBarHtml(proj.project.id, report.id)}
     <div class="panel">
       <div class="section-head"><h3>${esc(report.name)}</h3></div>
       <div class="note">${esc(note)}</div>
@@ -12151,20 +12153,24 @@ function planReportPinPanel(proj, report, note) {
       loadPlanReport(proj.project.id, report.id);
     } catch (err) { showMsg($('#planReportPinMsg'), 'err', err.message); }
   });
-  planReportTabsWire(proj.project.id, report.id);
+  planReportViewSync(proj.project.id, report.id);
 }
+
 // Report tabs: per-visit, in-memory only (never persisted, and
 // closing one never deletes its report). Opening a report adds a
 // tab; switching tabs loses nothing; closing the current tab falls
 // back to the most recently opened tab, else the viewer empties.
-// INLINE model: report content renders in the project page's Reports
-// tier (#planReport inside #planReportsPanel) — there is no separate
-// report page, no Back link, and tab switches never change the hash.
-// The current tab's pinned scenario / baseline / strategies highlight
-// on the real tier cards above (amber plan-report-pin, distinct from
-// the wiring Selected blue); with no tab open, no report-highlight
-// shows. Old #planning/report/... deep links land on the project
-// page with that report's tab open (see route() + planOpenReportTab).
+// BROWSER MODE: the Reports tier has two states, driven by the tab
+// list alone. LIST (no tabs open): the report cards show, the tab
+// host is empty, the viewer is empty. OPEN (tabs open): the cards
+// hide, the tab bar sits at the TOP of the tier (host above the
+// viewer) with a ← All reports back control, and the viewer fills
+// the tier. The current tab's pinned scenario / baseline /
+// strategies highlight on the real tier cards above (amber
+// plan-report-pin, distinct from the wiring Selected blue); with
+// no tab open, no report-highlight shows. Old #planning/report/...
+// deep links land on the project page with that report's tab open
+// (see route() + planOpenReportTab) — i.e. straight into OPEN.
 let planReportTabs = [];
 let planReportTabsProject = null;
 let planReportCurrentId = null;
@@ -12209,13 +12215,40 @@ function planReportTabsWire(projectId, currentId) {
       const viewer = $('#planReport');
       if (viewer) viewer.innerHTML = '';
       planReportHighlightApply();
+      planReportViewSync(projectId, null);
     } else if (wasCurrent) {
       loadPlanReport(projectId, planReportTabs[planReportTabs.length - 1].id);
     } else {
-      const bar = $('#planReportTabsBar');
-      if (bar) { bar.outerHTML = planReportTabBarHtml(projectId, currentId); planReportTabsWire(projectId, currentId); }
+      planReportViewSync(projectId, currentId);
     }
   }));
+}
+// LIST/OPEN sync: the single place that renders the tab host and
+// shows/hides the report cards. Callers set the viewer content (or
+// empty it) and then sync; the bar lives in the host, never inside
+// the viewer HTML, so a viewer re-render never duplicates it.
+function planReportViewSync(projectId, currentId) {
+  const host = $('#planReportTabsHost');
+  const list = $('#planReportList');
+  if (!host) return;
+  if (!planReportTabs.length) {
+    host.innerHTML = '';
+    if (list) list.classList.remove('hidden');
+    return;
+  }
+  if (list) list.classList.add('hidden');
+  host.innerHTML = `<div class="toolbar plan-report-tabs-host"><button class="small" id="planReportBackBtn">← All reports</button>${planReportTabBarHtml(projectId, currentId)}</div>`;
+  $('#planReportBackBtn').addEventListener('click', () => {
+    planReportLoadSeq++;
+    planReportTabs = [];
+    planReportCurrentId = null;
+    planReportCurrentPins = null;
+    const viewer = $('#planReport');
+    if (viewer) viewer.innerHTML = '';
+    planReportHighlightApply();
+    planReportViewSync(projectId, null);
+  });
+  planReportTabsWire(projectId, currentId);
 }
 function planReportTabsOpen(projectId, reportId, name) {
   if (planReportTabsProject !== projectId) { planReportTabs = []; planReportTabsProject = projectId; }
@@ -12232,6 +12265,7 @@ async function loadPlanReport(projectId, reportId) {
       planReportCurrentPins = null;
       $('#planReport').innerHTML = `<div class="panel"><div class="note">Report not found.</div></div>`;
       planReportHighlightApply();
+      planReportViewSync(projectId, null);
       return;
     }
     // A report whose baseline was deleted shows a re-pick panel only —
@@ -12242,7 +12276,6 @@ async function loadPlanReport(projectId, reportId) {
       planReportCurrentPins = null;
       const bases = proj.project.baselines || [];
       $('#planReport').innerHTML = `
-      ${planReportTabBarHtml(projectId, reportId)}
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3></div>
         <div class="note">The baseline this report compared against was deleted. Pick a baseline to regenerate it.</div>
@@ -12256,7 +12289,7 @@ async function loadPlanReport(projectId, reportId) {
           loadPlanReport(projectId, reportId);
         } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
       });
-      planReportTabsWire(projectId, reportId);
+      planReportViewSync(projectId, reportId);
       planReportHighlightApply();
       return;
     }
@@ -12463,7 +12496,6 @@ async function loadPlanReport(projectId, reportId) {
     planReportTabsOpen(projectId, reportId, report.name);
     const renderedStrategyIds = comp.strategies.map((r) => r.strategy.id);
     $('#planReport').innerHTML = `
-      ${planReportTabBarHtml(projectId, reportId)}
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
@@ -12513,7 +12545,7 @@ async function loadPlanReport(projectId, reportId) {
         },
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
-    planReportTabsWire(projectId, reportId);
+    planReportViewSync(projectId, reportId);
     // Per-tab actions. Routing applies per tab by THIS report's pins:
     // any AI-designed pinned entity disables preset Generate (AI
     // Generate stays enabled). Preset Generate re-pins the report,
