@@ -53,7 +53,7 @@ import {
   planAiEntityCandidates, rewriteAiIdQuestions, dropAnsweredAiQuestions, bindAiNameAnswers,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
-  principalGainSeries, validateAiBaseline, paymentScopeFor,
+  principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
   PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
   validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
   primeFactorToScenario, factorsToAssumptions,
@@ -7059,6 +7059,155 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
     return { value: { project: planProjectViewRow(planProjectById(p.id, req.user.id)), baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(info.lastInsertRowid)) }, entityId: p.id };
   });
   res.json(out);
+});
+
+// Pure-AI project creation: a NEW project designed from one stated
+// need. The entry lives in the creation flow AFTER the category /
+// entity / scope pickers, so the trio below is already scoped to a
+// validated optimization (same taxonomy + entity rules as project
+// creation). The snapshot is project-less by construction —
+// planAiSnapshotForProject reads only global tables — and a new
+// project has no existing entities, so the prompt says so instead of
+// inventing a refinement target. Propose NEVER writes: semantic
+// failures surface as per-part flags (the preview shows them and
+// Apply re-validates), never as silently dropped ops or guessed
+// bindings. No self-repair retry here (unlike ai-baseline/ai-model):
+// the preview is the correction surface, and a repair loop over a
+// four-part object would hide which part failed.
+app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => {
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const b = req.body || {};
+  const text = String(b.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  const category = b.category ? String(b.category) : null;
+  const subcategory = b.subcategory ? String(b.subcategory) : null;
+  const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
+  if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
+  if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
+  const entErr = planValidateOptEntity(category, entity);
+  if (entErr) return res.status(400).json({ error: entErr });
+  const fileCheck = validateChatFiles(b.files);
+  if (fileCheck.error) return res.status(fileCheck.status).json({ error: fileCheck.error });
+  const modelCheck = planAiPanelModel(b);
+  if (modelCheck.error) return res.status(modelCheck.status).json({ error: modelCheck.error });
+  const historyText = String(b.historyText || '').trim().slice(0, 4000);
+  const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
+  const snapshot = await planAiSnapshotForProject();
+  const prompt = [
+    'You design ONE coherent planning project as JSON only. No prose outside the JSON object.',
+    'Output: {"project": {"name": "...", "question": "..."}, "scenario": {"name": "...", "factors": {...}}, "baseline": {"name": "...", "description": "one line", "assumptions": [{"key": "...", "value": ...}]}, "strategy": {"name": "...", "ops": [{"op_type": "...", "params": {...}, "legs": [...]}]}}.',
+    'The scenario holds ONLY world factors: prime (a rate path), stock (an expected annual return %), propertyGrowth, salaryGrowth, rentGrowth. It NEVER holds a sink, an operation, or a price. prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30. stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one. Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
+    'The baseline changes nothing: a pure do-nothing reference (name + one-line description + assumptions only). It carries NO prime path and NO stock reference.',
+    'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position. A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price. Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas). Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids. For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
+    'Bind ONLY to values in the snapshot below; never cite a number that is not there. This is a NEW project: it has no existing scenarios, baselines, or strategies yet.',
+    `Optimization: category ${category}, subcategory ${subcategory}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
+    `App data snapshot: ${JSON.stringify(snapshot)}`,
+    ...(answers ? [`User-provided answers (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
+    ...(historyText ? [`Conversation so far:\n${historyText}`, 'Continue this conversation: do not repeat parts already proposed unless the user contradicts them.'] : []),
+    `User need: ${text}`,
+  ].join('\n');
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: planAiUserContent(prompt, fileCheck.fileInfos) }], process.env, modelCheck.model);
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed || typeof parsed !== 'object') return res.status(502).json({ error: 'the AI response did not contain a project proposal' });
+  if (parsed.ask) {
+    const questions = normalizeAiAsk(parsed.ask);
+    if (!questions) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+    return res.json({ ask: questions, configured: true });
+  }
+  const { proposal, errors: shapeErrors } = validateAiCreateProposal(parsed);
+  const factors = expandScenarioPrimePreset(proposal.scenario.factors || {}, snapshot.prime, currentMonthKey());
+  const scenarioErrs = validateScenarioFactors(factors, currentMonthKey());
+  const baselineErrs = validateAiBaseline({ description: proposal.baseline.description, assumptions: proposal.baseline.assumptions });
+  const { resolved, unresolved } = planResolveNameRefs(proposal.strategy.ops, null);
+  const seqOps = resolved.map((o, i) => ({ ...o, seq: i + 1 }));
+  const legs = [];
+  for (const o of seqOps) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+  const opErrs = planValidateStrategyOps(null, seqOps, legs);
+  res.json({
+    proposal: { ...proposal, scenario: { ...proposal.scenario, factors }, strategy: { ...proposal.strategy, ops: seqOps } },
+    unresolved,
+    warnings: { shape: shapeErrors, scenario: scenarioErrs, baseline: baselineErrs, ops: opErrs },
+    configured: true,
+  });
+});
+
+// Apply a proposed trio: project + scenario + baseline + strategy in
+// ONE History commit. Every part is re-validated here; any failure
+// is a 400 and NOTHING is written (the commitTx transaction rolls
+// back), so a half-created project is never presented as done. The
+// created trio is AI-designed throughout (scenario source 'ai',
+// baseline source 'ai', strategy source 'ai'), so the report routing
+// rule disables preset Generate on the created project and only
+// Generate with AI may be used.
+app.post('/api/planning/ai-create/apply', requireApiAuth, async (req, res) => {
+  const b = req.body || {};
+  const proposal = b.proposal && typeof b.proposal === 'object' ? b.proposal : null;
+  if (!proposal) return res.status(400).json({ error: 'proposal is required' });
+  const category = b.category ? String(b.category) : null;
+  const subcategory = b.subcategory ? String(b.subcategory) : null;
+  const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
+  if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
+  if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
+  const entErr = planValidateOptEntity(category, entity);
+  if (entErr) return res.status(400).json({ error: entErr });
+  const { proposal: norm, errors: shapeErrors } = validateAiCreateProposal(proposal);
+  if (shapeErrors.length) return res.status(400).json({ error: shapeErrors.join('; ') });
+  const snapshot = await planAiSnapshotForProject();
+  const factors = expandScenarioPrimePreset(norm.scenario.factors || {}, snapshot.prime, currentMonthKey());
+  const scenarioErrs = validateScenarioFactors(factors, currentMonthKey());
+  if (scenarioErrs.length) return res.status(400).json({ error: scenarioErrs.join('; ') });
+  const baselineDef = { description: norm.baseline.description, assumptions: Array.isArray(norm.baseline.assumptions) ? norm.baseline.assumptions : [] };
+  const baselineErrs = validateAiBaseline(baselineDef);
+  if (baselineErrs.length) return res.status(400).json({ error: baselineErrs.join('; ') });
+  const { resolved, unresolved } = planResolveNameRefs(norm.strategy.ops, null);
+  if (unresolved.length) return res.status(400).json({ error: unresolved.map((u) => u.reason).join('; ') });
+  const seqOps = resolved.map((o, i) => ({ ...o, seq: i + 1 }));
+  const legs = [];
+  for (const o of seqOps) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+  const opErrs = planValidateStrategyOps(null, seqOps, legs);
+  if (opErrs.length) return res.status(400).json({ error: opErrs.join('; ') });
+  const now = nowIso();
+  const snap = JSON.stringify(planSnapshotMainline());
+  const out = commitTx(req, 'project', {
+    module: 'planning', entityType: 'project', entityId: null,
+    entityLabel: norm.project.name, summary: `Created project ${norm.project.name} with AI`,
+  }, () => {
+    const info = db.prepare('INSERT INTO plan_projects (user_id, name, question, snapshot, template, metadata, category, subcategory, entity, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(req.user.id, norm.project.name, norm.project.question || null, snap, null, null, category, subcategory, JSON.stringify(entity), now, now);
+    const pid = info.lastInsertRowid;
+    const steps = factors.prime && Array.isArray(factors.prime.points)
+      ? factors.prime.points.map((pt) => ({ date: `${pt.month}-01`, rate: Number(pt.rate) })) : null;
+    const sc = db.prepare('INSERT INTO plan_scenarios (project_id, name, direction, stance, magnitude, steps, factors, is_base, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(pid, norm.scenario.name, 'flat', 'neutral', null, steps ? JSON.stringify(steps) : null, JSON.stringify(factors), 1, 'ai', now, now);
+    const def = { ...baselineDef, stockReference: 'current-plan' };
+    const bl = db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(pid, norm.baseline.name, 'ai', category, subcategory, JSON.stringify(entity), JSON.stringify(def), now, now);
+    const st = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(pid, norm.strategy.name, planNextLetter(pid), 'ai', null, null, now, now);
+    for (const o of seqOps) {
+      const oi = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(st.lastInsertRowid, o.seq, o.op_type, JSON.stringify(o.params), 'ai', now, now);
+      for (const l of (o.legs || [])) {
+        db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
+          .run(oi.lastInsertRowid, l.source_ref, String(l.amount), now);
+      }
+    }
+    return {
+      value: {
+        project: planProjectViewRow(planProjectById(pid, req.user.id)),
+        scenario: planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(sc.lastInsertRowid)),
+        baseline: planBaselineRow(db.prepare('SELECT * FROM plan_baselines WHERE id = ?').get(bl.lastInsertRowid)),
+        strategy: planStrategyById(st.lastInsertRowid),
+      },
+      entityId: pid,
+    };
+  });
+  res.status(201).json(out);
 });
 
 app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res) => {

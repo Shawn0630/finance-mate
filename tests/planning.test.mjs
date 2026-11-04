@@ -15,7 +15,7 @@ import {
   validateAiReportChartSeries, aiReportPrompt,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
-  principalGainSeries, validateAiBaseline, paymentScopeFor,
+  principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
   validateScenarioFactors,
   factorsToAssumptions,
@@ -703,4 +703,53 @@ test('ai-report prompt grounds the model in template/series support and snapshot
   assert.match(prompt, /User request: Compare costs/);
   const singular = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 1, text: 'x' });
   assert.match(singular, /1 property carries a mortgage, 1 stock holding exists/);
+});
+
+// Pure-AI project creation: trio shape validation (user spec
+// 2026-11-02). Semantic checks run server-side on top of this.
+test('validateAiCreateProposal accepts a well-formed trio, trimming names', () => {
+  const { proposal, errors } = validateAiCreateProposal({
+    project: { name: '  AI plan  ', question: 'q' },
+    scenario: { name: 'Up world', factors: { prime: { preset: 'up' } } },
+    baseline: { name: 'Do nothing', description: 'd', assumptions: [{ key: 'k', value: 1 }] },
+    strategy: { name: 'Fix it', ops: [{ op_type: 'prepay', params: { date: '2027-01-01', amount: 10000 } }] },
+  });
+  assert.deepEqual(errors, []);
+  assert.equal(proposal.project.name, 'AI plan');
+  assert.equal(proposal.strategy.ops.length, 1);
+});
+
+test('validateAiCreateProposal flags missing names, bad ops, and non-array assumptions', () => {
+  const { proposal, errors } = validateAiCreateProposal({
+    project: {},
+    scenario: { factors: 'nope' },
+    baseline: { assumptions: 'nope' },
+    strategy: { name: 'S', ops: [{ op_type: 'teleport', params: {} }, { op_type: 'prepay' }, 'junk'] },
+  });
+  assert.ok(proposal !== null); // shape errors flag, but the proposal still returns for preview flagging
+  assert.ok(errors.includes('project name is required'));
+  assert.ok(errors.includes('scenario name is required'));
+  assert.ok(errors.includes('scenario factors must be an object'));
+  assert.ok(errors.includes('baseline needs a name or a description'));
+  assert.ok(errors.includes('baseline assumptions must be an array'));
+  assert.ok(errors.some((e) => /unknown type teleport/.test(e)));
+  assert.ok(errors.some((e) => /needs params/.test(e)));
+  assert.ok(errors.some((e) => /must be an object/.test(e)));
+});
+
+test('validateAiCreateProposal falls back to the baseline description for its name', () => {
+  const { proposal, errors } = validateAiCreateProposal({
+    project: { name: 'P' },
+    scenario: { name: 'S', factors: {} },
+    baseline: { description: 'Do nothing at all' },
+    strategy: { name: 'T', ops: [] },
+  });
+  assert.deepEqual(errors, []);
+  assert.equal(proposal.baseline.name, 'Do nothing at all');
+});
+
+test('validateAiCreateProposal rejects a non-object reply', () => {
+  const { proposal, errors } = validateAiCreateProposal('nope');
+  assert.equal(proposal, null);
+  assert.deepEqual(errors, ['proposal must be an object']);
 });

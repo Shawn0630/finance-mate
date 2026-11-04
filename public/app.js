@@ -11316,6 +11316,7 @@ function openPlanProjectModal(existing, catCtx) {
 }
 $('#planProjectForm').question.addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
 $('#planProjectApplyRecBtn').addEventListener('click', () => { const f = $('#planProjectForm'); f.dataset.planApply = '1'; f.requestSubmit(); });
+$('#planAiCreateBtn').addEventListener('click', openPlanAiCreateModal);
 $('#planProjectForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -11336,6 +11337,177 @@ $('#planProjectForm').addEventListener('submit', async (e) => {
     location.hash = `#planning/project/${newId}`;
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
+
+// PURE-AI PROJECT CREATION: entry sits in the project modal's
+// category toolbar, so it only appears in the creation flow AFTER
+// the category / entity / scope pickers (planCatFlow carries the
+// validated pick). One need → propose → preview → Apply; nothing
+// writes before Apply. Preview edits: names + baseline description
+// inputs, per-op params JSON textareas, per-op Remove. Full op-form
+// editing lives on the strategy page after creation — the preview
+// edits the drafted list, it does not rebuild the op form.
+let planAiCreateCtx = null;
+let planAiCreateQueue = [];
+let planAiCreateProposal = null;
+let planAiCreateAnswers = null;
+let planAiCreateHistoryText = '';
+function openPlanAiCreateModal() {
+  const f = planCatFlow;
+  if (!f || !f.category || !f.subcategory || !f.entity) return;
+  const sub = (f.category.subcategories || []).find((s) => s.key === f.subcategory);
+  planAiCreateCtx = { category: f.category.key, subcategory: f.subcategory, entity: f.entity };
+  planAiCreateProposal = null;
+  planAiCreateAnswers = null;
+  planAiCreateHistoryText = '';
+  planAiCreateQueue = [];
+  $('#planAiCreateCtx').textContent = `${f.category.label} · ${sub ? sub.label : f.subcategory}`;
+  $('#planAiCreateText').value = '';
+  $('#planAiCreateQueue').innerHTML = '';
+  $('#planAiCreateAsk').innerHTML = '';
+  $('#planAiCreatePreview').innerHTML = '';
+  $('#planAiCreateApplyBar').classList.add('hidden');
+  showMsg($('#planAiCreateMsg'), '', '');
+  closeModalEl($('#planProjectModal'));
+  openModal('planAiCreateModal');
+}
+function planAiCreateRenderQueue() {
+  const host = $('#planAiCreateQueue');
+  if (!host) return;
+  host.innerHTML = planAiCreateQueue.map((f, i) => `<span class="chip">${esc(f.name)} <button type="button" class="small" data-plan-ai-create-queue-remove="${i}">×</button></span>`).join('');
+}
+async function planAiCreateSerializeQueue() {
+  return Promise.all(planAiCreateQueue.map((f) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: f.name, type: f.type, data: String(reader.result).split(',')[1] || '' });
+    reader.onerror = reject;
+    reader.readAsDataURL(f);
+  })));
+}
+function planAiCreateRenderPreview() {
+  const r = planAiCreateProposal;
+  const host = $('#planAiCreatePreview');
+  if (!r || !r.proposal) { host.innerHTML = ''; $('#planAiCreateApplyBar').classList.add('hidden'); return; }
+  const p = r.proposal;
+  const warns = [];
+  if (r.unresolved && r.unresolved.length) warns.push(`Could not resolve: ${r.unresolved.map((u) => u.reason).join('; ')}`);
+  const w = r.warnings || {};
+  for (const k of ['shape', 'scenario', 'baseline', 'ops']) if (w[k] && w[k].length) warns.push(`${k}: ${w[k].join('; ')}`);
+  const ops = p.strategy.ops || [];
+  host.innerHTML = `${warns.length ? `<div class="msg warn">${esc(warns.join(' | '))}</div>` : ''}
+    <div><label>Project name *</label><input id="planAiCreateProjectName" value="${esc(p.project.name || '')}"></div>
+    <div><label>Scenario name *</label><input id="planAiCreateScenarioName" value="${esc(p.scenario.name || '')}"></div>
+    <div class="n">Scenario factors: ${esc(JSON.stringify(p.scenario.factors || {}))}</div>
+    <div><label>Baseline name *</label><input id="planAiCreateBaselineName" value="${esc(p.baseline.name || '')}"></div>
+    <div><label>Baseline description</label><input id="planAiCreateBaselineDesc" value="${esc(p.baseline.description || '')}"></div>
+    <div><label>Strategy name *</label><input id="planAiCreateStrategyName" value="${esc(p.strategy.name || '')}"></div>
+    <div><label>Operations</label>${ops.length ? ops.map((o, i) => `<div class="plan-row" data-plan-ai-create-op="${i}"><span>${esc(o.op_type)}</span><textarea data-plan-ai-create-op-params rows="2" style="flex:1">${esc(JSON.stringify(o.params || {}))}</textarea><button type="button" class="small" data-plan-ai-create-op-remove="${i}">Remove</button></div>`).join('') : '<div class="note">No operations proposed.</div>'}</div>
+    ${(r.unresolved && r.unresolved.length) ? `<div><label>Not included (unresolved)</label>${r.unresolved.map((u) => `<div class="plan-row"><span>${esc(u.op ? u.op.op_type : '')} · ${esc(u.reason)}</span></div>`).join('')}</div>` : ''}`;
+  host.querySelectorAll('[data-plan-ai-create-op-remove]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      planAiCreateProposal.proposal.strategy.ops.splice(Number(btn.dataset.planAiCreateOpRemove), 1);
+      planAiCreateRenderPreview();
+    });
+  });
+  $('#planAiCreateApplyBar').classList.remove('hidden');
+}
+async function planAiCreateSend() {
+  const msg = $('#planAiCreateMsg');
+  const text = $('#planAiCreateText').value.trim();
+  if (!text) { showMsg(msg, 'err', 'Describe what you want first'); return; }
+  showMsg(msg, '', '');
+  try {
+    const files = await planAiCreateSerializeQueue();
+    const model = $('#planAiCreateModel').value || undefined;
+    const body = { text, category: planAiCreateCtx.category, subcategory: planAiCreateCtx.subcategory, entity: planAiCreateCtx.entity };
+    if (files.length) body.files = files;
+    if (model) body.model = model;
+    if (planAiCreateAnswers) body.answers = planAiCreateAnswers;
+    if (planAiCreateHistoryText) body.historyText = planAiCreateHistoryText;
+    const r = await api('/api/planning/ai-create/propose', { method: 'POST', body });
+    planAiCreateHistoryText = `${planAiCreateHistoryText}\nYou: ${text}`.trim();
+    if (r.ask) {
+      const askHost = $('#planAiCreateAsk');
+      askHost.innerHTML = `<div>${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input data-plan-ai-create-ask="${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}</div><div class="toolbar"><button class="small primary" id="planAiCreateAskSend">Send</button></div>`;
+      $('#planAiCreateAskSend').addEventListener('click', () => {
+        const answers = {};
+        let ok = true;
+        askHost.querySelectorAll('[data-plan-ai-create-ask]').forEach((inp) => {
+          if (!inp.value.trim()) ok = false;
+          answers[inp.dataset.planAiCreateAsk] = inp.value.trim();
+        });
+        if (!ok) { showMsg(msg, 'err', 'Please answer all questions before continuing.'); return; }
+        planAiCreateAnswers = { ...(planAiCreateAnswers || {}), ...answers };
+        planAiCreateHistoryText = `${planAiCreateHistoryText}\nYou: ${r.ask.map((q) => `${q.label}: ${answers[q.field]}`).join(', ')}`.trim();
+        askHost.innerHTML = '';
+        planAiCreateSend();
+      });
+      return;
+    }
+    $('#planAiCreateAsk').innerHTML = '';
+    planAiCreateProposal = r;
+    planAiCreateRenderPreview();
+  } catch (err) { showMsg(msg, 'err', err.message); }
+}
+async function planAiCreateApply() {
+  const msg = $('#planAiCreateMsg');
+  const r = planAiCreateProposal;
+  if (!r || !r.proposal) return;
+  const p = r.proposal;
+  const ops = [];
+  try {
+    document.querySelectorAll('#planAiCreatePreview [data-plan-ai-create-op]').forEach((row) => {
+      const idx = Number(row.dataset.planAiCreateOp);
+      const orig = p.strategy.ops[idx];
+      const params = JSON.parse(row.querySelector('[data-plan-ai-create-op-params]').value);
+      ops.push({ ...orig, params });
+    });
+  } catch { showMsg(msg, 'err', 'An operation params field must be valid JSON'); return; }
+  const proposal = {
+    project: { name: $('#planAiCreateProjectName').value.trim(), question: p.project.question || null },
+    scenario: { name: $('#planAiCreateScenarioName').value.trim(), factors: p.scenario.factors || {} },
+    baseline: { name: $('#planAiCreateBaselineName').value.trim(), description: $('#planAiCreateBaselineDesc').value.trim(), assumptions: p.baseline.assumptions },
+    strategy: { name: $('#planAiCreateStrategyName').value.trim(), ops },
+  };
+  try {
+    const data = await api('/api/planning/ai-create/apply', { method: 'POST', body: { proposal, category: planAiCreateCtx.category, subcategory: planAiCreateCtx.subcategory, entity: planAiCreateCtx.entity } });
+    const newId = (data.project || {}).id;
+    closeModalEl($('#planAiCreateModal'));
+    location.hash = `#planning/project/${newId}`;
+  } catch (err) { showMsg(msg, 'err', err.message); }
+}
+(function planAiCreateWire() {
+  const goBtn = $('#planAiCreateGoBtn');
+  if (goBtn) goBtn.addEventListener('click', planAiCreateSend);
+  const applyBtn = $('#planAiCreateApplyBtn');
+  if (applyBtn) applyBtn.addEventListener('click', planAiCreateApply);
+  const fileInput = $('#planAiCreateFiles');
+  if (fileInput) fileInput.addEventListener('change', () => {
+    planAiCreateQueue.push(...fileInput.files);
+    fileInput.value = '';
+    planAiCreateRenderQueue();
+  });
+  const queueHost = $('#planAiCreateQueue');
+  if (queueHost) queueHost.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-plan-ai-create-queue-remove]');
+    if (!btn) return;
+    planAiCreateQueue.splice(Number(btn.dataset.planAiCreateQueueRemove), 1);
+    planAiCreateRenderQueue();
+  });
+  const ta = $('#planAiCreateText');
+  if (ta) ta.addEventListener('paste', (e) => {
+    const files = e.clipboardData ? [...e.clipboardData.files] : [];
+    if (!files.length) return;
+    e.preventDefault();
+    planAiCreateQueue.push(...files);
+    planAiCreateRenderQueue();
+  });
+  const modelSel = $('#planAiCreateModel');
+  if (modelSel) loadAiConfig().then((cfg) => {
+    const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
+    modelSel.innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    if (cfg.model) modelSel.value = cfg.model;
+  });
+})();
 
 async function loadPlanProject(id) {
   return withLoading(async () => {

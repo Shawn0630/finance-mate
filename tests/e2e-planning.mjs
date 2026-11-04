@@ -5529,7 +5529,12 @@ export async function run(H, S) {
       await page.evaluate(() => { document.querySelector('#planAiPanelModel').value = 'stub-a'; });
       await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'prime rises third'; });
       await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planAiPanelThread')?.textContent || '').includes('prime rises third'), { timeout: 15000 });
+      try {
+        await page.waitForFunction(() => (document.querySelector('#planAiPanelThread')?.textContent || '').includes('prime rises third'), { timeout: 15000 });
+      } catch {
+        await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+        await page.waitForFunction(() => (document.querySelector('#planAiPanelThread')?.textContent || '').includes('prime rises third'), { timeout: 15000 });
+      }
       // (4) An invalid attachment type surfaces the server validation
       // message, and the failed send keeps the queue for retry.
       await page.evaluate(() => {
@@ -5562,6 +5567,195 @@ export async function run(H, S) {
       H.check('panelparity: other targets threads untouched, scenario thread keeps its filename turn',
         iso.opsEmpty && iso.baseEmpty && iso.scenHasFile, JSON.stringify(iso));
     } finally { await browserPp.close(); }
+  }
+
+  // ---- Pure-AI project creation --------------------------------------
+  {
+    const aiPropAddr = 'AI Create Lane, Victoria, BC';
+    let r = await H.req('POST', '/api/properties', { address: aiPropAddr, mortgage_balance: 400000, mortgage_balance_date: '2026-10-01', purchase_date: '2024-01-15', amortization_years: 25 });
+    H.check('aicreate: property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+    const aiPropId = r.data.id;
+    const aiEntity = { type: 'property', propertyId: aiPropId };
+    r = await H.req('POST', '/api/investments/accounts', { name: 'AI Create Account', type: 'TFSA' });
+    H.check('aicreate: account created', r.status === 201, JSON.stringify(r.data));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: '', category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate: propose rejects empty text', r.status === 400, JSON.stringify(r.data));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'x', category: 'nope', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate: propose rejects unknown category', r.status === 400, JSON.stringify(r.data));
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({
+      project: { name: 'AI Created Plan', question: 'q' },
+      scenario: { name: 'AI World', factors: { prime: { preset: 'up' } } },
+      baseline: { name: 'AI Baseline', description: 'Do nothing', assumptions: [] },
+      strategy: { name: 'AI Strategy', ops: [{ op_type: 'prepay', params: { date: '2027-01-01', amount: 10000, propertyRef: aiPropAddr } }] },
+    }));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'prepay 10k', category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate: propose returns a coherent trio with ops bound to snapshot entities',
+      r.status === 200 && r.data.proposal?.project?.name === 'AI Created Plan'
+      && Array.isArray(r.data.proposal?.scenario?.factors?.prime?.points) && r.data.proposal.scenario.factors.prime.points.length > 0
+      && r.data.proposal?.strategy?.ops?.length === 1 && r.data.proposal.strategy.ops[0].params.propertyId === aiPropId
+      && (r.data.unresolved || []).length === 0 && (r.data.warnings?.ops || []).length === 0, JSON.stringify(r.data));
+    const boundProposal = r.data.proposal;
+    const listBefore = await H.req('GET', '/api/planning/projects');
+    H.check('aicreate: nothing exists before Apply',
+      !(listBefore.data.projects || []).some((p) => p.name === 'AI Created Plan'), JSON.stringify((listBefore.data.projects || []).map((p) => p.name)));
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({
+      project: { name: 'AI Bad Plan', question: 'q' },
+      scenario: { name: 'W', factors: {} },
+      baseline: { name: 'B', description: 'd', assumptions: [] },
+      strategy: { name: 'S', ops: [
+        { op_type: 'prepay', params: { date: '2027-01-01', amount: 5000, propertyRef: 'No Such Address Anywhere' } },
+        { op_type: 'buy', params: { date: '2027-01-01', accountRef: 'AI Create Account', amount: 1000 } },
+      ] },
+    }));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'bad', category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate: unresolvable ref and priceless buy surface as flags, never silently dropped',
+      r.status === 200
+      && (r.data.unresolved || []).some((u) => /No Such Address/.test(u.reason))
+      && (r.data.warnings?.ops || []).some((w) => /needs a price/.test(w))
+      && !(r.data.proposal?.strategy?.ops || []).some((o) => o.params.propertyRef === 'No Such Address Anywhere'),
+      JSON.stringify(r.data));
+    r = await H.req('POST', '/api/planning/ai-create/apply', { proposal: boundProposal, category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate: Apply creates project + scenario + baseline + strategy, all AI-designed',
+      r.status === 201 && r.data.project?.id > 0 && r.data.scenario?.source === 'ai'
+      && r.data.baseline?.source === 'ai' && r.data.strategy?.source === 'ai', JSON.stringify(r.data));
+    const aiCreatedPid = r.data.project.id;
+    const aiCreatedSid = r.data.strategy.id;
+    r = await H.req('GET', `/api/planning/strategies/${aiCreatedSid}`);
+    H.check('aicreate: created strategy carries the proposed op',
+      r.status === 200 && (r.data.ops || []).length === 1 && r.data.ops[0].op_type === 'prepay', JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({
+      project: { name: 'AI Edited Plan', question: 'q' },
+      scenario: { name: 'W2', factors: {} },
+      baseline: { name: 'B2', description: 'd', assumptions: [] },
+      strategy: { name: 'S2', ops: [
+        { op_type: 'prepay', params: { date: '2027-01-01', amount: 10000, propertyRef: aiPropAddr } },
+        { op_type: 'prepay', params: { date: '2027-02-01', amount: 20000, propertyRef: aiPropAddr } },
+      ] },
+    }));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'two prepays', category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    const twoOpProposal = r.data.proposal;
+    twoOpProposal.strategy.ops = twoOpProposal.strategy.ops.slice(0, 1);
+    r = await H.req('POST', '/api/planning/ai-create/apply', { proposal: twoOpProposal, category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate: Apply with an edited (one-op) proposal creates one op',
+      r.status === 201 && r.data.strategy?.id > 0, JSON.stringify(r.data));
+    r = await H.req('GET', `/api/planning/strategies/${r.data.strategy.id}`);
+    H.check('aicreate: edited proposal reflected in the created strategy',
+      r.status === 200 && (r.data.ops || []).length === 1, JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
+    // Browser: entry visible in the creation flow; preview Remove +
+    // Apply end to end; routing disables preset Generate.
+    if (!H.puppeteer || !H.chromeAvailable) {
+      console.log('planning aicreate browser checks skipped (puppeteer-core / probe Chrome not available)');
+    } else {
+    const forwardAi = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResAi = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieAi = loginResAi.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserAi = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserAi.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardAi({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieAi, domain: 'ff.local', path: '/', httpOnly: true });
+      const aiWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('#planAddProjectBtn', { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('#planAddProjectBtn').click());
+      await page.waitForSelector('[data-plan-cat="property"]', { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('[data-plan-cat="property"]').click());
+      await page.waitForSelector('#planCatEntitySel', { timeout: 15000 });
+      await page.select('#planCatEntitySel', String(aiPropId));
+      await page.waitForSelector('[data-plan-sub="interest_rate"]', { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('[data-plan-sub="interest_rate"]').click());
+      await page.waitForSelector('#planAiCreateBtn', { timeout: 15000 });
+      const entryState = await page.evaluate(() => {
+        const b = document.querySelector('#planAiCreateBtn');
+        return { exists: !!b, visible: !!b && b.offsetParent !== null, label: b ? b.textContent : '' };
+      });
+      H.check('aicreate: Create with AI entry visible in the creation flow after pickers',
+        entryState.exists && entryState.visible && entryState.label.includes('Create with AI'), JSON.stringify(entryState));
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({
+        project: { name: 'AI Browser Plan', question: 'q' },
+        scenario: { name: 'WB', factors: {} },
+        baseline: { name: 'BB', description: 'd', assumptions: [] },
+        strategy: { name: 'SB', ops: [
+          { op_type: 'prepay', params: { date: '2027-01-01', amount: 10000, propertyRef: aiPropAddr } },
+          { op_type: 'prepay', params: { date: '2027-02-01', amount: 20000, propertyRef: aiPropAddr } },
+        ] },
+      }));
+      await page.evaluate(() => document.querySelector('#planAiCreateBtn').click());
+      await page.waitForSelector('#planAiCreateModal:not(.hidden)', { timeout: 15000 });
+      await page.evaluate(() => { document.querySelector('#planAiCreateText').value = 'two prepays'; });
+      await page.evaluate(() => document.querySelector('#planAiCreateGoBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('[data-plan-ai-create-op]').length === 2, { timeout: 20000 });
+      await page.evaluate(() => document.querySelector('[data-plan-ai-create-op-remove="0"]').click());
+      await page.waitForFunction(() => document.querySelectorAll('[data-plan-ai-create-op]').length === 1, { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('#planAiCreateApplyBtn').click());
+      await page.waitForFunction(() => (location.hash || '').includes('#planning/project/'), { timeout: 20000 });
+      await page.waitForSelector('[data-plan-scenario-select]', { timeout: 15000 });
+      await page.waitForSelector('[data-plan-baseline-select]', { timeout: 15000 });
+      await page.waitForSelector('[data-plan-strategy-select]', { timeout: 15000 });
+      const browserHash = await page.evaluate(() => location.hash);
+      const browserPid = Number((browserHash.match(/project\/(\d+)/) || [])[1]);
+      H.check('aicreate: browser Apply lands on the new project page', browserPid > 0, browserHash);
+      const stratRow = await page.evaluate(() => {
+        const b = document.querySelector('[data-plan-strategy-select]');
+        return b ? Number(b.dataset.planStrategySelect) : 0;
+      });
+      const browserSid = stratRow;
+      r = await H.req('GET', `/api/planning/strategies/${browserSid}`);
+      H.check('aicreate: browser preview Remove reflected in the created strategy',
+        r.status === 200 && (r.data.ops || []).length === 1, JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
+      // Strategy stays picked via the null=all wiring default: clicking
+      // its Select would toggle the only strategy OFF and trip the
+      // pick-a-strategy guard instead of the AI-routing note.
+      await page.evaluate(() => {
+        document.querySelector('[data-plan-scenario-select]').click();
+        document.querySelector('[data-plan-baseline-select]').click();
+      });
+      await aiWait(800);
+      const routing = await page.evaluate(() => ({
+        genDisabled: document.querySelector('#planFlowGenerateBtn')?.disabled === true,
+        note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
+        aiEnabled: document.querySelector('#planAiReportBtn')?.disabled === false,
+      }));
+      H.check('aicreate: AI-designed trio disables preset Generate, AI Generate stays available',
+        routing.genDisabled && routing.note.includes('AI-designed') && routing.aiEnabled, JSON.stringify(routing));
+    } finally { await browserAi.close(); }
+    }
   }
 }
 

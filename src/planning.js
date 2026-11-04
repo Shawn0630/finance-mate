@@ -941,6 +941,43 @@ export function validateAiBaseline(b) {
   return errs;
 }
 
+// Pure-AI project creation: structural shape of a proposed trio.
+// Semantic checks (scenario factors, baseline definition, op engine
+// validation, name-ref binding) run server-side on top of this; this
+// helper only pins the shape so a malformed model reply surfaces as
+// named errors instead of a crash or a half-shaped preview. The
+// baseline name falls back to its description, mirroring the
+// ai-baseline apply path; assumptions are kept raw so a non-array
+// value is flagged by validateAiBaseline instead of silently coerced.
+export function validateAiCreateProposal(parsed) {
+  const errs = [];
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { proposal: null, errors: ['proposal must be an object'] };
+  const project = parsed.project && typeof parsed.project === 'object' && !Array.isArray(parsed.project) ? parsed.project : {};
+  const scenario = parsed.scenario && typeof parsed.scenario === 'object' && !Array.isArray(parsed.scenario) ? parsed.scenario : {};
+  const baseline = parsed.baseline && typeof parsed.baseline === 'object' && !Array.isArray(parsed.baseline) ? parsed.baseline : {};
+  const strategy = parsed.strategy && typeof parsed.strategy === 'object' && !Array.isArray(parsed.strategy) ? parsed.strategy : {};
+  if (!project.name || !String(project.name).trim()) errs.push('project name is required');
+  if (!scenario.name || !String(scenario.name).trim()) errs.push('scenario name is required');
+  if (scenario.factors !== undefined && (typeof scenario.factors !== 'object' || scenario.factors === null || Array.isArray(scenario.factors))) errs.push('scenario factors must be an object');
+  if (!baseline.name && !baseline.description) errs.push('baseline needs a name or a description');
+  if (baseline.assumptions !== undefined && baseline.assumptions !== null && !Array.isArray(baseline.assumptions)) errs.push('baseline assumptions must be an array');
+  if (!strategy.name || !String(strategy.name).trim()) errs.push('strategy name is required');
+  if (strategy.ops !== undefined && !Array.isArray(strategy.ops)) errs.push('strategy ops must be an array');
+  const ops = Array.isArray(strategy.ops) ? strategy.ops : [];
+  for (const [i, o] of ops.entries()) {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) { errs.push(`operation ${i + 1} must be an object`); continue; }
+    if (!OP_TYPES.includes(o.op_type)) errs.push(`operation ${i + 1} has unknown type ${o.op_type}`);
+    if (!o.params || typeof o.params !== 'object' || Array.isArray(o.params)) errs.push(`operation ${i + 1} needs params`);
+  }
+  const proposal = {
+    project: { name: project.name ? String(project.name).trim() : '', question: project.question ? String(project.question) : null },
+    scenario: { name: scenario.name ? String(scenario.name).trim() : '', factors: scenario.factors && typeof scenario.factors === 'object' && !Array.isArray(scenario.factors) ? scenario.factors : {} },
+    baseline: { name: baseline.name ? String(baseline.name).trim() : (baseline.description ? String(baseline.description).trim() : ''), description: baseline.description ? String(baseline.description) : '', assumptions: baseline.assumptions },
+    strategy: { name: strategy.name ? String(strategy.name).trim() : '', ops },
+  };
+  return { proposal, errors: errs };
+}
+
 // ------------------------------------------- report-ready series --------
 // Pure derivations over one projection trajectory, shared by the report
 // view: monthly mortgage balance (summed across properties), monthly
