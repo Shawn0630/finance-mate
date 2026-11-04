@@ -11,6 +11,7 @@ import path from 'node:path';
 import {
   normalizeAiFields, parseModelJson, handleAiFill, llmConfigured, extractPdfText,
   llmModels, llmDefaultModel, callLlm, INVEST_CHAT_PROMPT,
+  validateChatFiles, fileContentParts,
 } from '../src/aiFill.js';
 
 test('normalizeAiFields: unknown keys are dropped, garbage values are dropped', () => {
@@ -257,4 +258,41 @@ test('handleAiFill: job context maps the earner name, drops an unknown one', asy
   assert.equal(dropped.body.fields.owner, undefined);
   const bad = await handleAiFill({ context: 'salary', text: 'x' }, { env: CONFIGURED, callLlm: stubCall('{}') });
   assert.equal(bad.status, 400);
+});
+
+// Panel attachment intake (user 2026-11-03): same rules as the
+// costs/invest chats — array, at most 5, each validated.
+test('validateChatFiles: null is empty, non-array and over-cap are 400, bad types rejected', () => {
+  assert.deepEqual(validateChatFiles(null), { fileInfos: [] });
+  assert.deepEqual(validateChatFiles(undefined), { fileInfos: [] });
+  assert.equal(validateChatFiles({}).status, 400);
+  assert.equal(validateChatFiles({}).error, 'files must be an array.');
+  const six = Array.from({ length: 6 }, (_, i) => ({ name: `f${i}.txt`, type: 'text/plain', data: Buffer.from('x').toString('base64') }));
+  assert.equal(validateChatFiles(six).status, 400);
+  assert.match(validateChatFiles(six).error, /at most 5 files/);
+  const zip = validateChatFiles([{ name: 'a.zip', type: 'application/zip', data: Buffer.from('PK').toString('base64') }]);
+  assert.equal(zip.status, 400);
+  assert.equal(zip.error, 'Attachments must be an image, a PDF, or a text file (.csv / .txt).');
+  const ok = validateChatFiles([{ name: 'shot.png', type: 'image/png', data: Buffer.from('png').toString('base64') }]);
+  assert.equal(ok.fileInfos.length, 1);
+  assert.equal(ok.fileInfos[0].name, 'shot.png');
+  assert.equal(ok.fileInfos[0].data, Buffer.from('png').toString('base64'));
+  const txt = validateChatFiles([{ name: 'note.txt', type: 'text/plain', data: Buffer.from('hello').toString('base64') }]);
+  assert.equal(txt.fileInfos[0].text, 'hello');
+});
+
+test('fileContentParts: image rides as an image part, text as a named block, PDF without text as a note', () => {
+  const img = fileContentParts([{ name: 'shot.png', type: 'image/png', data: Buffer.from('pngbytes').toString('base64') }]);
+  assert.equal(img.length, 1);
+  assert.equal(img[0].type, 'image_url');
+  assert.equal(img[0].image_url.url, `data:image/png;base64,${Buffer.from('pngbytes').toString('base64')}`);
+  const txt = fileContentParts([{ name: 'note.txt', type: 'text/plain', data: 'aGVsbG8=', text: 'hello' }]);
+  assert.equal(txt.length, 1);
+  assert.equal(txt[0].type, 'text');
+  assert.match(txt[0].text, /note\.txt/);
+  assert.match(txt[0].text, /hello/);
+  const pdf = fileContentParts([{ name: 'doc.pdf', type: 'application/pdf', bytes: Buffer.from('not a pdf'), data: 'bm90IGEgcGRm' }]);
+  assert.equal(pdf.length, 1);
+  assert.match(pdf[0].text, /no text could be extracted/);
+  assert.deepEqual(fileContentParts([]), []);
 });

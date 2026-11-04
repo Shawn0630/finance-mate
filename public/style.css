@@ -476,6 +476,10 @@ table.costs-table { width: 100%; }
    shown as removable chips until Send carries them off. */
 .costs-chat-queue { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .costs-chat-queue.hidden { display: none; }
+/* Planning panel attachment queue: same chips as the costs chat,
+   plus a thumbnail for image attachments. */
+#planAiPanelQueue { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+#planAiPanelQueue .file-chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; }
 .file-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; background: #eef3f9; border: 1px solid #cfdae7; border-radius: 999px; padding: 2px 4px 2px 10px; max-width: 100%; }
 .file-chip .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-chip button { border: none; background: none; cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; color: #5a6b7d; }

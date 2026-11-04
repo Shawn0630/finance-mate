@@ -11511,7 +11511,8 @@ function planProjectHtml(d) {
       </div>
       <div id="planAiPanelScenarioNameRow" class="hidden"><label>Scenario name *</label><input id="planAiPanelScenarioName" placeholder="e.g. Prime rises"></div>
       <div><label>Describe what you want *</label><textarea id="planAiPanelText" rows="3" placeholder="e.g. Prime rises 1 point over the next year, then holds"></textarea></div>
-      <div class="toolbar"><button class="small primary" id="planAiPanelGoBtn">Propose</button></div>
+      <div id="planAiPanelQueue"></div>
+      <div class="toolbar"><input type="file" id="planAiPanelFiles" multiple accept="image/*,application/pdf,.csv,.txt"><select id="planAiPanelModel" title="Model" style="width:auto;flex:0 1 auto"></select><button class="small primary" id="planAiPanelGoBtn">Send</button></div>
       <div id="planAiPanelThread"></div>
       <div id="planAiPanelAsk"></div>
       <div id="planAiPanelOut"></div>
@@ -11853,6 +11854,38 @@ $('#planScenarioForm').addEventListener('submit', async (e) => {
 // Panel threads reset on project reload (per-visit state, like the
 // old modals); baseline/model server threads persist on their rows.
 let planAiPanelCtx = null;
+// Attachment queue for the panel (fill-chat pattern): files ride
+// on the turn that includes them, never on the plain-lines
+// historyText thread. Image chips carry a thumbnail preview.
+let planAiPanelQueue = [];
+function planAiPanelRenderQueue() {
+  const host = $('#planAiPanelQueue');
+  if (!host) return;
+  host.classList.toggle('hidden', !planAiPanelQueue.length);
+  host.innerHTML = planAiPanelQueue.map((q, i) => {
+    const thumb = q.thumb ? `<img src="${q.thumb}" alt="">` : '';
+    return `<span class="file-chip">${thumb}<span class="chip-name">${esc(q.file.name || 'attachment')}</span><button type="button" data-plan-ai-panel-queue-remove="${i}" title="Remove">×</button></span>`;
+  }).join('');
+}
+function planAiPanelQueueFiles(list) {
+  for (const f of list || []) planAiPanelQueue.push({ file: f, thumb: f.type.startsWith('image/') ? URL.createObjectURL(f) : null });
+  planAiPanelRenderQueue();
+}
+function planAiPanelClearQueue() {
+  for (const q of planAiPanelQueue) if (q.thumb) URL.revokeObjectURL(q.thumb);
+  planAiPanelQueue = [];
+  planAiPanelRenderQueue();
+  const fi = $('#planAiPanelFiles');
+  if (fi) fi.value = '';
+}
+async function planAiPanelSerializeQueue() {
+  return Promise.all(planAiPanelQueue.map((q) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: q.file.name, type: q.file.type, data: String(reader.result).split(',')[1] || '' });
+    reader.onerror = reject;
+    reader.readAsDataURL(q.file);
+  })));
+}
 function planAiPanelRenderThread() {
   const el = $('#planAiPanelThread');
   if (!el || !planAiPanelCtx) return;
@@ -11866,7 +11899,8 @@ function planAiPanelRenderThread() {
     }
     if (t.role === 'ai') return `<div class="plan-row"><span>AI: ${esc(t.summary || '')}</span></div>`;
     if (t.answers) return Object.entries(t.answers).map(([k, v]) => `<div class="plan-row"><span>You: ${labels[k] ? `${esc(labels[k])}: ` : ''}${esc(String(v))}</span></div>`).join('');
-    return `<div class="plan-row"><span>You: ${esc(t.text || '')}</span></div>`;
+    const filesLine = t.files && t.files.length ? ` · Attachments: ${esc(t.files.join(', '))}` : '';
+    return `<div class="plan-row"><span>You: ${esc(t.text || '')}${filesLine}</span></div>`;
   }).join('');
 }
 // Plain-lines conversation context for the scenario/describe
@@ -11919,6 +11953,34 @@ function planAiPanelWire(p) {
     $('#planAiPanelStrategyNameRow').classList.toggle('hidden', sel.value !== 'new');
   });
   $('#planAiPanelGoBtn').addEventListener('click', () => planAiPanelPropose());
+  const fileInput = $('#planAiPanelFiles');
+  if (fileInput) fileInput.addEventListener('change', () => { planAiPanelQueueFiles(fileInput.files); fileInput.value = ''; });
+  const queueHost = $('#planAiPanelQueue');
+  if (queueHost) queueHost.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-plan-ai-panel-queue-remove]');
+    if (!btn) return;
+    const q = planAiPanelQueue[Number(btn.dataset.planAiPanelQueueRemove)];
+    if (q && q.thumb) URL.revokeObjectURL(q.thumb);
+    planAiPanelQueue.splice(Number(btn.dataset.planAiPanelQueueRemove), 1);
+    planAiPanelRenderQueue();
+  });
+  // Paste: a clipboard carrying files joins the queue instead of
+  // pasting; a clipboard without files is left alone and pastes
+  // as text (same rule as the costs chat).
+  const ta = $('#planAiPanelText');
+  if (ta) ta.addEventListener('paste', (e) => {
+    const files = e.clipboardData ? [...e.clipboardData.files] : [];
+    if (!files.length) return;
+    e.preventDefault();
+    planAiPanelQueueFiles(files);
+  });
+  const modelSel = $('#planAiPanelModel');
+  if (modelSel) loadAiConfig().then((cfg) => {
+    const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
+    modelSel.innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    if (cfg.model) modelSel.value = cfg.model;
+  });
+  planAiPanelRenderQueue();
   planAiPanelRefreshStrategies(null);
   planAiPanelSetTarget('scenario');
 }
@@ -11930,17 +11992,32 @@ async function planAiPanelPropose() {
   if (!text) { showMsg(msg, 'err', 'Describe what you want first'); return; }
   // History BEFORE this turn: the request carries the new text itself.
   const historyText = planAiPanelHistoryText();
-  ctx.threads[ctx.target].push({ role: 'user', text });
+  let files;
+  try {
+    files = await planAiPanelSerializeQueue();
+  } catch (err) { showMsg(msg, 'err', err.message); return; }
+  const modelSel = $('#planAiPanelModel');
+  const model = modelSel ? modelSel.value : '';
+  ctx.threads[ctx.target].push({ role: 'user', text, files: planAiPanelQueue.map((q) => q.file.name || 'attachment') });
   planAiPanelRenderThread();
   try {
-    if (ctx.target === 'scenario') await planAiPanelProposeScenario(text, historyText);
-    else if (ctx.target === 'baseline') await planAiPanelProposeBaseline(text, null, null);
-    else await planAiPanelProposeOps(text, historyText);
+    if (ctx.target === 'scenario') await planAiPanelProposeScenario(text, historyText, files, model);
+    else if (ctx.target === 'baseline') await planAiPanelProposeBaseline(text, null, null, files, model);
+    else await planAiPanelProposeOps(text, historyText, files, model);
+    // Success clears the input + queue, like fill-chat; a failed
+    // send keeps both so the user can retry. (The baseline ask
+    // flow keeps its text in a closure, so clearing here is safe.)
+    $('#planAiPanelText').value = '';
+    planAiPanelClearQueue();
+    if (model && aiConfigCache) aiConfigCache.model = model;
   } catch (err) { showMsg(msg, 'err', err.message); }
 }
-async function planAiPanelProposeScenario(text, historyText) {
+async function planAiPanelProposeScenario(text, historyText, files, model) {
   const ctx = planAiPanelCtx; const msg = $('#planAiPanelMsg'); const out = $('#planAiPanelOut');
-  const r = await api(`/api/planning/projects/${ctx.projectId}/scenarios/ai-design`, { method: 'POST', body: { text, historyText } });
+  const body = { text, historyText };
+  if (files && files.length) body.files = files;
+  if (model) body.model = model;
+  const r = await api(`/api/planning/projects/${ctx.projectId}/scenarios/ai-design`, { method: 'POST', body });
   ctx.pending = { kind: 'scenario', factors: r.factors };
   const line = planScenarioSummaryLine(r.factors) || 'Flat world';
   ctx.threads.scenario.push({ role: 'ai', summary: line });
@@ -11955,9 +12032,12 @@ async function planAiPanelProposeScenario(text, historyText) {
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
 }
-async function planAiPanelProposeBaseline(text, answers, history) {
+async function planAiPanelProposeBaseline(text, answers, history, files, model) {
   const ctx = planAiPanelCtx; const msg = $('#planAiPanelMsg'); const out = $('#planAiPanelOut'); const askHost = $('#planAiPanelAsk');
-  const r = await api(`/api/planning/projects/${ctx.projectId}/ai-baseline`, { method: 'POST', body: { text, answers, history } });
+  const body = { text, answers, history };
+  if (files && files.length) body.files = files;
+  if (model) body.model = model;
+  const r = await api(`/api/planning/projects/${ctx.projectId}/ai-baseline`, { method: 'POST', body });
   if (r.ask) {
     ctx.threads.baseline.push({ role: 'ai', questions: r.ask });
     planAiPanelRenderThread();
@@ -12005,10 +12085,13 @@ async function planAiPanelEnsureStrategy() {
   planAiPanelRefreshStrategies(s.strategy.id);
   return s.strategy.id;
 }
-async function planAiPanelProposeOps(text, historyText) {
+async function planAiPanelProposeOps(text, historyText, files, model) {
   const ctx = planAiPanelCtx; const msg = $('#planAiPanelMsg'); const out = $('#planAiPanelOut');
   const sid = await planAiPanelEnsureStrategy();
-  const r = await api(`/api/planning/strategies/${sid}/ai-describe`, { method: 'POST', body: { text, historyText } });
+  const body = { text, historyText };
+  if (files && files.length) body.files = files;
+  if (model) body.model = model;
+  const r = await api(`/api/planning/strategies/${sid}/ai-describe`, { method: 'POST', body });
   ctx.pending = { kind: 'ops', strategyId: sid, ops: r.ops };
   ctx.threads.ops.push({ role: 'ai', summary: r.ops.length ? r.ops.map((o) => o.op_type).join(', ') : 'No operations proposed.' });
   planAiPanelRenderThread();

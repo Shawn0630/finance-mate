@@ -15,7 +15,7 @@ import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
-import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured, callLlm, parseModelJson } from './aiFill.js';
+import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured, callLlm, parseModelJson, validateChatFiles, fileContentParts } from './aiFill.js';
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
@@ -5409,12 +5409,34 @@ function planAiExistingSummaries(projectId) {
   for (const s of strategies) opsByStrategy[s.id] = db.prepare('SELECT * FROM plan_ops WHERE strategy_id = ? ORDER BY seq').all(s.id);
   return planProjectAiSummaries({ scenarios, baselines, strategies, opsByStrategy });
 }
+// Panel attachment + model wiring (shared by the three Design
+// with AI endpoints): validated files become extra content parts
+// on the turn's user message; no files = the plain prompt string,
+// unchanged. An explicitly named, configured model is used for
+// this call and persisted as the app default for subsequent
+// sends, exactly like the fill-chat model picker.
+function planAiPanelModel(body) {
+  const raw = body?.model;
+  if (raw == null || String(raw).trim() === '') return { model: getAiFillModel() };
+  const model = String(raw).trim();
+  if (!llmModels().includes(model)) return { status: 400, error: `model "${model}" is not in the configured model list` };
+  setAiFillModel(model);
+  return { model };
+}
+function planAiUserContent(prompt, fileInfos) {
+  if (!fileInfos || !fileInfos.length) return prompt;
+  return [{ type: 'text', text: prompt }, ...fileContentParts(fileInfos)];
+}
 app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
+  const fileCheck = validateChatFiles(req.body?.files);
+  if (fileCheck.error) return res.status(fileCheck.status).json({ error: fileCheck.error });
+  const modelCheck = planAiPanelModel(req.body);
+  if (modelCheck.error) return res.status(modelCheck.status).json({ error: modelCheck.error });
   // Panel conversation context: the panel's display thread rendered as
   // plain lines (the structured thread shape does not fit free-text
   // turns, so this endpoint takes text, not the sanitized thread).
@@ -5435,7 +5457,7 @@ app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async
   ].join('\n');
   let raw;
   try {
-    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+    raw = await callLlm([{ role: 'user', content: planAiUserContent(prompt, fileCheck.fileInfos) }], process.env, modelCheck.model);
   } catch (e) {
     return res.status(502).json({ error: `AI call failed: ${e.message}` });
   }
@@ -6602,6 +6624,10 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
+  const fileCheck = validateChatFiles(req.body?.files);
+  if (fileCheck.error) return res.status(fileCheck.status).json({ error: fileCheck.error });
+  const modelCheck = planAiPanelModel(req.body);
+  if (modelCheck.error) return res.status(modelCheck.status).json({ error: modelCheck.error });
   // Panel conversation context, same plain-lines shape as ai-design.
   const historyText = String(req.body?.historyText || '').trim().slice(0, 4000);
   const props = db.prepare('SELECT id, address FROM properties ORDER BY id').all();
@@ -6623,7 +6649,7 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
   ].join('\n');
   let raw;
   try {
-    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+    raw = await callLlm([{ role: 'user', content: planAiUserContent(prompt, fileCheck.fileInfos) }], process.env, modelCheck.model);
   } catch (e) {
     return res.status(502).json({ error: `AI call failed: ${e.message}` });
   }
@@ -6895,6 +6921,10 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
+  const fileCheck = validateChatFiles(req.body?.files);
+  if (fileCheck.error) return res.status(fileCheck.status).json({ error: fileCheck.error });
+  const modelCheck = planAiPanelModel(req.body);
+  if (modelCheck.error) return res.status(modelCheck.status).json({ error: modelCheck.error });
   const answers = req.body?.answers && typeof req.body.answers === 'object' ? req.body.answers : null;
   // Targeted follow-up: a baselineId pins the thread to one baseline
   // card; without it the legacy project-level thread is used.
@@ -6931,7 +6961,7 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
   ].join('\n');
   let raw;
   try {
-    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+    raw = await callLlm([{ role: 'user', content: planAiUserContent(prompt, fileCheck.fileInfos) }], process.env, modelCheck.model);
   } catch (e) {
     return res.status(502).json({ error: `AI call failed: ${e.message}` });
   }
@@ -6955,7 +6985,7 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
     // path, a repair that still fails surfaces its own errors.
     let rawR;
     try {
-      rawR = await callLlm([{ role: 'user', content: aiRepairPrompt(prompt, errs) }], process.env, getAiFillModel());
+      rawR = await callLlm([{ role: 'user', content: planAiUserContent(aiRepairPrompt(prompt, errs), fileCheck.fileInfos) }], process.env, modelCheck.model);
     } catch (e) {
       return res.status(502).json({ error: `AI call failed: ${e.message}` });
     }

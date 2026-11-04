@@ -526,6 +526,44 @@ export const COSTS_CHAT_HISTORY_TURNS = 20;
 export const COSTS_CHAT_TURN_CHARS = 12000;
 export const MAX_CHAT_FILES = 5;
 
+// Panel (and any future chat) attachment intake: the same rules
+// the costs/invest chats apply — an array, at most MAX_CHAT_FILES,
+// each validated by validateFile. Returns { fileInfos } or
+// { status, error }.
+export function validateChatFiles(files) {
+  if (files == null) return { fileInfos: [] };
+  if (!Array.isArray(files)) return { status: 400, error: 'files must be an array.' };
+  if (files.length > MAX_CHAT_FILES) return { status: 400, error: `Attach at most ${MAX_CHAT_FILES} files per message.` };
+  const fileInfos = [];
+  for (const f of files) {
+    const v = validateFile(f);
+    if (v.error) return { status: v.status, error: v.error };
+    fileInfos.push(v);
+  }
+  return { fileInfos };
+}
+
+// One content part per validated attachment, mirroring the
+// costs-chat loop: images ride as image parts, text files as
+// named blocks, PDFs as extracted text (or a no-text note).
+export function fileContentParts(fileInfos) {
+  const parts = [];
+  for (const f of fileInfos || []) {
+    if (f.type.startsWith('image/')) {
+      parts.push({ type: 'image_url', image_url: { url: `data:${f.type};base64,${f.data}` } });
+    } else if (f.text != null) {
+      parts.push({ type: 'text', text: textFileBlock(f) });
+    } else if (f.type === 'application/pdf') {
+      const extracted = extractPdfText(f.bytes);
+      parts.push({
+        type: 'text',
+        text: extracted ? `Document text (${f.name || 'attachment'}):\n${extracted.slice(0, 20000)}` : `A PDF (${f.name || 'attachment'}) was attached, but no text could be extracted from it.`,
+      });
+    }
+  }
+  return parts;
+}
+
 const COSTS_CHAT_PROMPT = [
   'You help the user record one property\'s yearly running costs (property tax, strata fees,',
   'utilities, insurance and similar) from bills and notes they paste or attach.',

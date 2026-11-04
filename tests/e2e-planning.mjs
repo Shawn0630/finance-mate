@@ -5239,6 +5239,157 @@ export async function run(H, S) {
         aeState.headText.includes('$0.00'), JSON.stringify(aeState));
     } finally { await browserAe.close(); }
   }
+  // ------------------------------------------- panel parity: fill-chat-style input
+  // (user 2026-11-03): paste/Choose Files queue with thumbnails,
+  // model picker, Send. Self-contained browser block.
+  r = await H.req('POST', '/api/planning/projects', { name: 'Panel Parity', question: 'Parity' });
+  H.check('panelparity: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const ppProjectId = r.data.project.id;
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('planning panelparity browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardPp = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResPp = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValuePp = loginResPp.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserPp = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserPp.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardPp({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValuePp, domain: 'ff.local', path: '/', httpOnly: true });
+      const ppWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${ppProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await ppWait(1500);
+      await page.click('#planAiPanelToggleBtn');
+      try {
+        await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 5000 });
+      } catch {
+        await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiPanelToggleBtn');
+        await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
+      }
+      // (1) Pasting an image creates an attachment chip with a thumbnail + remove.
+      const pasteState = await page.evaluate(() => {
+        const ta = document.querySelector('#planAiPanelText');
+        const dt = new DataTransfer();
+        dt.items.add(new File(['fake-png-bytes'], 'shot.png', { type: 'image/png' }));
+        const e = new Event('paste', { bubbles: true, cancelable: true });
+        e.clipboardData = dt;
+        ta.dispatchEvent(e);
+        const chip = document.querySelector('#planAiPanelQueue .file-chip');
+        return { chip: !!chip, name: chip ? chip.textContent : '', thumb: !!chip?.querySelector('img') };
+      });
+      H.check('panelparity: pasting an image creates an attachment chip with thumbnail',
+        pasteState.chip && pasteState.name.includes('shot.png') && pasteState.thumb, JSON.stringify(pasteState));
+      await page.evaluate(() => document.querySelector('[data-plan-ai-panel-queue-remove]').click());
+      const removed = await page.evaluate(() => !document.querySelector('#planAiPanelQueue .file-chip'));
+      H.check('panelparity: chip remove button clears the queue', removed);
+      // (2) Choose Files queues a file; Send round-trips the proposal,
+      // the thread shows the filename, and input + queue clear.
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.items.add(new File(['col a\n1\n'], 'rates.csv', { type: 'text/csv' }));
+        const input = document.querySelector('#planAiPanelFiles');
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('#planAiPanelText').value = 'prime rises';
+      });
+      const queued = await page.evaluate(() => (document.querySelector('#planAiPanelQueue')?.textContent || '').includes('rates.csv'));
+      H.check('panelparity: Choose Files queues the file as a chip', queued);
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
+      const sendState = await page.evaluate(() => ({
+        thread: document.querySelector('#planAiPanelThread')?.textContent || '',
+        queueEmpty: !document.querySelector('#planAiPanelQueue .file-chip'),
+        taEmpty: document.querySelector('#planAiPanelText').value === '',
+        sendLabel: document.querySelector('#planAiPanelGoBtn')?.textContent || '',
+      }));
+      H.check('panelparity: Send round-trips the proposal, thread shows the filename, input + queue clear',
+        sendState.thread.includes('rates.csv') && sendState.queueEmpty && sendState.taEmpty, JSON.stringify(sendState));
+      H.check('panelparity: panel action button is labeled Send', sendState.sendLabel === 'Send', JSON.stringify(sendState));
+      // (3) The model picker changes the model used (persisted default).
+      await page.waitForFunction(() => [...document.querySelectorAll('#planAiPanelModel option')].map((o) => o.value).includes('stub-b'), { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#planAiPanelModel').value = 'stub-b'; });
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'prime rises again'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planAiPanelThread')?.textContent || '').includes('prime rises again'), { timeout: 15000 });
+      const cfg = await H.req('GET', '/api/ai/config');
+      H.check('panelparity: model picker persists the chosen model for subsequent sends',
+        cfg.data && cfg.data.model === 'stub-b', JSON.stringify(cfg.data));
+      // Restore stub-a so later pins keep the default.
+      await page.evaluate(() => { document.querySelector('#planAiPanelModel').value = 'stub-a'; });
+      await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'prime rises third'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planAiPanelThread')?.textContent || '').includes('prime rises third'), { timeout: 15000 });
+      // (4) An invalid attachment type surfaces the server validation
+      // message, and the failed send keeps the queue for retry.
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.items.add(new File(['PK'], 'a.zip', { type: 'application/zip' }));
+        const input = document.querySelector('#planAiPanelFiles');
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('#planAiPanelText').value = 'with a zip';
+      });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planAiPanelMsg')?.textContent || '').includes('Attachments must be an image'), { timeout: 15000 });
+      const zipState = await page.evaluate(() => ({
+        msg: document.querySelector('#planAiPanelMsg')?.textContent || '',
+        kept: (document.querySelector('#planAiPanelQueue')?.textContent || '').includes('a.zip'),
+      }));
+      H.check('panelparity: invalid attachment type surfaces the server validation message and keeps the queue',
+        zipState.msg.includes('Attachments must be an image') && zipState.kept, JSON.stringify(zipState));
+      // (5) Other targets' threads are untouched; the scenario thread
+      // keeps its filename turn across switches.
+      const iso = await page.evaluate(() => {
+        document.querySelector('[data-plan-ai-target="ops"]').click();
+        const opsThread = document.querySelector('#planAiPanelThread')?.textContent || '';
+        document.querySelector('[data-plan-ai-target="baseline"]').click();
+        const baseThread = document.querySelector('#planAiPanelThread')?.textContent || '';
+        document.querySelector('[data-plan-ai-target="scenario"]').click();
+        const scenThread = document.querySelector('#planAiPanelThread')?.textContent || '';
+        return { opsEmpty: opsThread === '', baseEmpty: baseThread === '', scenHasFile: scenThread.includes('rates.csv') };
+      });
+      H.check('panelparity: other targets threads untouched, scenario thread keeps its filename turn',
+        iso.opsEmpty && iso.baseEmpty && iso.scenHasFile, JSON.stringify(iso));
+    } finally { await browserPp.close(); }
+  }
 }
 
 runModuleMain(import.meta.url, { name: 'planning', deps, depNames: SLIM_PLAN ? [] : ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm', 'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings', 'spending'], run });
