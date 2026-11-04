@@ -319,7 +319,7 @@ const yahooStub = http.createServer((req, res) => {
       res.end('search unavailable');
       return;
     }
-    const quotes = q.includes('XQQ') ? [
+    const quotes = (q.includes('XQQ') || q.includes('ISHARES')) ? [
       { symbol: 'XQQ.TO', shortname: 'ISHARES NASDAQ 100 INDEX ETF', longname: 'iShares NASDAQ 100 Index ETF', exchange: 'TOR', exchDisp: 'Toronto', quoteType: 'ETF' },
       { symbol: 'QQQ', shortname: 'Invesco QQQ Trust', exchange: 'NMS', exchDisp: 'NASDAQ', quoteType: 'ETF' },
     ] : [];

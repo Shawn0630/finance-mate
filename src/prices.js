@@ -359,6 +359,20 @@ function clearMeta(db, key) {
   db.prepare('DELETE FROM app_meta WHERE key = ?').run(key);
 }
 
+// Current price for one symbol, via the same three tiers as the
+// history fetch (Stooq → Yahoo → Nasdaq). Returns the latest
+// close, or null when no tier has data — never a guessed price.
+// Used by the buy-op autocomplete: picking a suggestion fills
+// Price with this, and a null simply leaves Price untouched.
+export async function latestPrice(symbol, timeoutMs = 10000) {
+  const sym = String(symbol || '').trim();
+  if (!sym) return null;
+  const { rows, source } = await tryPriceTiers(sym, timeoutMs);
+  if (!rows || !rows.length) return null;
+  const last = rows[rows.length - 1];
+  return { price: last.price, date: last.date, source };
+}
+
 // Price-fetch stamps are keyed by holding id, and SQLite
 // reuses a deleted row's id — so a deleted holding's stamps
 // must die with it. Otherwise the next holding to reuse the

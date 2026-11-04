@@ -2657,6 +2657,179 @@ export async function run(H, S) {
     } finally { await browserP.close(); }
   }
 
+  // ------------------------------------------- buy-op price autocomplete
+  // Buy form: the symbol input suggests by ticker or company name
+  // (existing holdings + Yahoo search + typed ticker) and picking
+  // fills Price from the price tiers; manual edits stick; the
+  // buy-needs-price error is unchanged.
+  r = await H.req('POST', '/api/investments/accounts', { name: 'Buy Auto Acct', type: 'NonRegistered' });
+  H.check('buyautocomplete: account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const baAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${baAcct}/holdings`, { label: 'Buy Auto ETF', kind: 'exchange', symbol: 'BAUTO.TO', currency: 'CAD' });
+  H.check('buyautocomplete: existing holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/projects', { name: 'Buy Auto Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'account', accountId: baAcct } });
+  H.check('buyautocomplete: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const baProj = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${baProj}/strategies`, { name: 'Buy Auto Strat', source: 'template' });
+  H.check('buyautocomplete: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const baStrat = r.data.strategy.id;
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('planning buyautocomplete browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardBa = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResBa = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueBa = loginResBa.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserBa = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserBa.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardBa({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueBa, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitBa = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      const setSym = (text) => page.evaluate((t) => {
+        const el = document.querySelector('#planOpSymbol');
+        el.value = t;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }, text);
+      const suggestItems = () => page.evaluate(() => [...document.querySelectorAll('#planOpSymbolSuggest li')].map((li) => li.textContent));
+      const waitSuggest = (needle) => page.waitForFunction((n) => {
+        const l = document.querySelector('#planOpSymbolSuggest');
+        return l && !l.classList.contains('hidden') && [...l.querySelectorAll('li')].some((li) => li.textContent.includes(n));
+      }, { timeout: 15000 }, needle);
+      await page.goto(`http://ff.local/#planning/strategy/${baStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitBa(1500);
+      await page.click('#planAddOpBtn');
+      await waitBa(500);
+      await page.select('#planOpTypeSel', 'buy');
+      await waitBa(500);
+      // (1) Ticker prefix suggests the existing holding.
+      await setSym('BAU');
+      await waitSuggest('BAUTO.TO');
+      let items = await suggestItems();
+      H.check('buyautocomplete: ticker prefix suggests the existing holding',
+        items.some((t) => t.includes('BAUTO.TO')), JSON.stringify(items));
+      // (2) Company-name label suggests the existing holding.
+      await setSym('Buy Auto');
+      await waitSuggest('BAUTO.TO');
+      items = await suggestItems();
+      H.check('buyautocomplete: company-name label suggests the existing holding',
+        items.some((t) => t.includes('BAUTO.TO')), JSON.stringify(items));
+      // (3) Yahoo company-name search suggests an unknown symbol.
+      await setSym('ISHARES');
+      await waitSuggest('XQQ.TO');
+      items = await suggestItems();
+      H.check('buyautocomplete: company-name search suggests an unknown symbol',
+        items.some((t) => t.includes('XQQ.TO')), JSON.stringify(items));
+      // (4) Picking fills Price from the price tiers — compared
+      // against the endpoint in the same run, never hardcoded.
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#planOpSymbolSuggest li')].find((li) => li.textContent.includes('XQQ.TO'))
+          .dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const el = document.querySelector('#planOpPrice');
+        return el && el.value.trim() !== '';
+      }, { timeout: 15000 });
+      const filled = await page.evaluate(() => ({
+        price: document.querySelector('#planOpPrice').value,
+        symbol: document.querySelector('#planOpSymbol').value,
+        holding: document.querySelector('#planOpHolding').value,
+      }));
+      const tier = await H.req('GET', '/api/invest/price?symbol=XQQ.TO');
+      H.check('buyautocomplete: picking a suggestion fills Price from the price tiers',
+        filled.symbol === 'XQQ.TO' && filled.holding === '' && tier.data && tier.data.price != null
+          && Number(String(filled.price).replace(/,/g, '')) === Number(tier.data.price),
+        JSON.stringify({ filled, tier: tier.data }));
+      // (5) Manual edit after pick persists through save.
+      await page.evaluate((acct) => {
+        document.querySelector('#planOpAccount').value = String(acct);
+        document.querySelector('#planOpPrice').value = '170';
+        document.querySelector('#planOpUnits').value = '10';
+        document.querySelector('#planOpDateVal').value = '2027-01-01';
+      }, baAcct);
+      await page.click('#planOpSaveBtn');
+      await waitBa(1200);
+      r = await H.req('GET', `/api/planning/strategies/${baStrat}`);
+      const savedBuy = (r.data.ops || []).find((o) => o.op_type === 'buy');
+      H.check('buyautocomplete: manual edit after pick persists through save',
+        !!savedBuy && savedBuy.params.symbol === 'XQQ.TO' && Number(savedBuy.params.price) === 170 && Number(savedBuy.params.units) === 10,
+        JSON.stringify(savedBuy));
+      // (6) Buy with no price keeps the unchanged error.
+      await page.click('#planAddOpBtn');
+      await waitBa(500);
+      await page.select('#planOpTypeSel', 'buy');
+      await waitBa(500);
+      await page.evaluate(() => {
+        document.querySelector('#planOpSymbol').value = 'NOPRICE';
+        document.querySelector('#planOpUnits').value = '5';
+        document.querySelector('#planOpDateVal').value = '2027-01-01';
+      });
+      await page.click('#planOpSaveBtn');
+      await waitBa(800);
+      const msg = await page.evaluate(() => document.querySelector('#planOpModalMsg') ? document.querySelector('#planOpModalMsg').textContent : '');
+      H.check('buyautocomplete: buy with no price keeps the unchanged error',
+        msg.includes('needs a price'), JSON.stringify(msg));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitBa(500);
+      // (7) Picking from the Holding dropdown fills Price the same way.
+      r = await H.req('POST', `/api/investments/accounts/${baAcct}/holdings`, { label: 'XQQ holding', kind: 'exchange', symbol: 'XQQ.TO', currency: 'CAD' });
+      H.check('buyautocomplete: XQQ holding created for dropdown pick', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const baXqq = r.data.id;
+      await page.click('#planAddOpBtn');
+      await waitBa(500);
+      await page.select('#planOpTypeSel', 'buy');
+      await waitBa(500);
+      await page.select('#planOpHolding', String(baXqq));
+      await page.waitForFunction(() => {
+        const el = document.querySelector('#planOpPrice');
+        return el && el.value.trim() !== '';
+      }, { timeout: 15000 });
+      const ddFilled = await page.evaluate(() => document.querySelector('#planOpPrice').value);
+      H.check('buyautocomplete: picking from the Holding dropdown fills Price from the tiers',
+        tier.data && Number(String(ddFilled).replace(/,/g, '')) === Number(tier.data.price),
+        JSON.stringify({ ddFilled, tier: tier.data }));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitBa(500);
+    } finally { await browserBa.close(); }
+  }
+  r = await H.req('DELETE', `/api/planning/projects/${baProj}`);
+  H.check('buyautocomplete: project cleanup', r.status === 200);
+
   // ------------------------------------------- comparison views
   // Strategy detail diff section (baseline/strategy/diff columns,
   // monthly/annual toggle, All-default range with presets) + project

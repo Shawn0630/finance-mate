@@ -24,7 +24,7 @@ import {
   computeHolding, computeAccount, computePortfolio, computeFillPreview, unitsOn,
   effectiveAccountDefaultCurrency, pinCadReturnPct,
 } from './investments.js';
-import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, clearHoldingPriceMeta } from './prices.js';
+import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, latestPrice, clearHoldingPriceMeta } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
@@ -2762,6 +2762,17 @@ app.get('/api/investments', requireApiAuth, async (req, res) => {
 // never an error — the form always works fully manual.
 app.get('/api/invest/search', requireApiAuth, async (req, res) => {
   res.json({ results: await searchSecurities(req.query.q) });
+});
+
+// Current price for the buy-op autocomplete, via the existing
+// price tiers. Best-effort by the same contract: no data yields
+// price null, never an error and never a guessed price — the
+// form still works fully manual.
+app.get('/api/invest/price', requireApiAuth, async (req, res) => {
+  const sym = String(req.query.symbol || '').trim();
+  if (!sym) return res.json({ price: null });
+  const p = await latestPrice(sym);
+  res.json(p ? { price: p.price, date: p.date, source: p.source } : { price: null });
 });
 
 // Fill-with-AI preview: what each holding in a checked draft

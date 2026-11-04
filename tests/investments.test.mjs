@@ -23,7 +23,7 @@ import {
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, parseNasdaqHistorical, ensureHoldingPrices, ensureHoldingPricesDetailed,
   refreshAllPrices, priceStatusFor, clearHoldingPriceMeta,
-  parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory,
+  parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory, latestPrice,
   fetchFxRates, FX_SERIES,
 } from '../src/prices.js';
 import { handleAiInvestFillChat, normalizeProposedInvestments } from '../src/aiFill.js';
@@ -1023,6 +1023,36 @@ test('searchSecurities: stub Yahoo answers through the YAHOO_BASE_URL seam; fail
     globalThis.fetch = realFetch;
     if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
     if (savedEnv.s === undefined) delete process.env.YAHOO_SEARCH_BASE_URL; else process.env.YAHOO_SEARCH_BASE_URL = savedEnv.s;
+  }
+});
+
+// Buy-op autocomplete price fill: latestPrice returns the latest
+// close via the existing tiers, and null — never a guess — when
+// no tier has data.
+test('latestPrice: Stooq latest close wins; empty tiers yield null', async () => {
+  const realFetch = globalThis.fetch;
+  const savedEnv = { s: process.env.STOOQ_BASE_URL, y: process.env.YAHOO_BASE_URL, n: process.env.NASDAQ_BASE_URL };
+  process.env.STOOQ_BASE_URL = 'http://stub.test/stooq/';
+  process.env.YAHOO_BASE_URL = 'http://stub.test/yahoo/';
+  process.env.NASDAQ_BASE_URL = 'http://stub.test/nasdaq/';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/stooq/')) {
+      return { ok: true, text: async () => (String(url).includes('xqq.to')
+        ? 'Date,Open,High,Low,Close,Volume\n2026-01-02,1,1,1,140,1\n2026-03-20,1,1,1,165,1\n'
+        : 'No data') };
+    }
+    return { ok: false, json: async () => ({}) };
+  };
+  try {
+    assert.deepEqual(await latestPrice('XQQ.TO'), { price: 165, date: '2026-03-20', source: 'stooq' });
+    assert.equal(await latestPrice('ACME'), null);
+    assert.equal(await latestPrice(''), null);
+    assert.equal(await latestPrice('  '), null);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedEnv.s === undefined) delete process.env.STOOQ_BASE_URL; else process.env.STOOQ_BASE_URL = savedEnv.s;
+    if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
+    if (savedEnv.n === undefined) delete process.env.NASDAQ_BASE_URL; else process.env.NASDAQ_BASE_URL = savedEnv.n;
   }
 });
 

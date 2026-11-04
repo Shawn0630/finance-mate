@@ -14394,7 +14394,7 @@ function planOpFormHtml(type, params, ctx) {
   if (type === 'buy') body = `
     <div><label>Account *</label><select id="planOpAccount">${acctOpts}</select></div>
     <div><label>Holding</label><select id="planOpHolding"><option value="">New holding…</option>${holdOpts}</select>
-    <input id="planOpSymbol" placeholder="Symbol for a new holding" value="${p.symbol ? esc(p.symbol) : ''}"></div>
+    <div class="suggest-wrap"><input id="planOpSymbol" placeholder="Symbol for a new holding" autocomplete="off" value="${p.symbol ? esc(p.symbol) : ''}"><ul class="suggest-list hidden" id="planOpSymbolSuggest"></ul></div></div>
     ${dateRow}
     <div class="grid2">
       <div><label>Units</label><input id="planOpUnits" type="text" inputmode="decimal" data-money value="${p.units != null ? esc(String(p.units)) : ''}"></div>
@@ -14465,6 +14465,123 @@ function planLegRowHtml(type, ctx, leg, withDel = true) {
 // leg unchecks its box; changing a row's source re-checks to match.
 // The legs themselves (mode/amount) stay editable per row, and the
 // existing legs validation applies across all of them unchanged.
+// Buy-op holding autocomplete: the symbol input suggests by
+// ticker OR company name, from three sources merged in order:
+// (a) the app's existing holdings (symbol or label match),
+// (b) Yahoo security search via GET /api/invest/search (company
+// name → ticker for symbols the app has never seen; best-effort,
+// empty on failure), (c) the typed ticker itself when it looks
+// like a ticker and matches nothing exactly. Picking a suggestion
+// fills Price with the current price from the existing price
+// tiers (GET /api/invest/price) — a pick is an explicit action,
+// so it fills even over a typed price, and the user can then
+// edit Price freely; the fill happens once per pick, never
+// again on later keystrokes. A failed price lookup leaves Price
+// untouched, never a guessed price. Picking an existing holding
+// from the Holding dropdown fills Price the same way.
+function planBuyAutocompleteWire(root, ctx) {
+  const input = root.querySelector('#planOpSymbol');
+  const list = root.querySelector('#planOpSymbolSuggest');
+  const priceEl = root.querySelector('#planOpPrice');
+  const holdingSel = root.querySelector('#planOpHolding');
+  if (!input || !list || !priceEl) return;
+  const acctName = (id) => (ctx.accounts.find((a) => a.id === id) || {}).name || '';
+  let items = [];
+  let active = -1;
+  let timer = null;
+  let seq = 0;
+  function close() {
+    list.classList.add('hidden');
+    list.innerHTML = '';
+    items = [];
+    active = -1;
+  }
+  function render() {
+    if (!items.length) { close(); return; }
+    list.innerHTML = '';
+    items.forEach((c, i) => {
+      const li = document.createElement('li');
+      const sym = document.createElement('span');
+      sym.className = 'sg-sym';
+      sym.textContent = c.symbol;
+      li.appendChild(sym);
+      if (c.label) li.appendChild(document.createTextNode(' ' + c.label));
+      const meta = [c.exchange, c.currency, c.account].filter(Boolean).join(' · ');
+      if (meta) {
+        const m = document.createElement('span');
+        m.className = 'sg-meta';
+        m.textContent = meta;
+        li.appendChild(m);
+      }
+      if (i === active) li.classList.add('active');
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); pick(i); });
+      list.appendChild(li);
+    });
+    list.classList.remove('hidden');
+  }
+  async function fillPrice(symbol) {
+    try {
+      const data = await api('/api/invest/price?symbol=' + encodeURIComponent(symbol));
+      if (data && data.price != null) priceEl.value = formatMoneyInput(String(data.price));
+    } catch { /* best-effort: leave Price untouched */ }
+  }
+  function pick(i) {
+    const c = items[i];
+    if (!c) return;
+    close();
+    if (holdingSel) holdingSel.value = c.holdingId ? String(c.holdingId) : '';
+    input.value = c.symbol;
+    input.focus();
+    fillPrice(c.symbol);
+  }
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { close(); return; }
+    timer = setTimeout(async () => {
+      const my = ++seq;
+      const needle = q.toLowerCase();
+      const held = (ctx.holdings || []).filter((h) =>
+        (h.symbol || '').toLowerCase().includes(needle) || (h.label || '').toLowerCase().includes(needle))
+        .map((h) => ({ symbol: (h.symbol || '').toUpperCase(), label: h.label || '', account: acctName(h.accountId), holdingId: h.id }));
+      let remote = [];
+      try {
+        const data = await api('/api/invest/search?q=' + encodeURIComponent(q));
+        remote = data.results || [];
+      } catch { remote = []; }
+      if (my !== seq) return;
+      const seen = new Set(held.map((h) => h.symbol));
+      const merged = held.slice();
+      for (const r of remote) {
+        if (!r.symbol || seen.has(r.symbol)) continue;
+        seen.add(r.symbol);
+        merged.push({ symbol: r.symbol, label: r.label || '', exchange: r.exchange || '', currency: r.currency || '' });
+      }
+      if (/^[A-Za-z][A-Za-z0-9.]{1,11}$/.test(q) && !seen.has(q.toUpperCase())) {
+        merged.push({ symbol: q.toUpperCase(), label: '' });
+      }
+      items = merged;
+      active = items.length ? 0 : -1;
+      render();
+    }, 250);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (list.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, items.length - 1); render(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); render(); }
+    else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); pick(active); }
+    else if (e.key === 'Escape') { close(); }
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (!list.contains(e.target) && e.target !== input) close();
+  });
+  if (holdingSel) holdingSel.addEventListener('change', () => {
+    const h = (ctx.holdings || []).find((x) => String(x.id) === holdingSel.value);
+    if (!h || !h.symbol) return;
+    input.value = h.symbol;
+    fillPrice(h.symbol);
+  });
+}
 function planOpSourceWire(root, ctx) {
   const btn = root.querySelector('#planOpSourceBtn');
   const panel = root.querySelector('#planOpSourcePanel');
@@ -14624,6 +14741,7 @@ async function openPlanOpModal(strategyId, existing, presetType) {
       }
     }
     if (typeEl.value === 'buy') planOpSourceWire(opCard, ctx);
+    if (typeEl.value === 'buy') planBuyAutocompleteWire(opCard, ctx);
   });
   planLegsWire(type, ctx, opCard);
   if ((type === 'buy' || type === 'sell') && existing && existing.legs) {
@@ -14638,6 +14756,7 @@ async function openPlanOpModal(strategyId, existing, presetType) {
     }
   }
   if (type === 'buy') planOpSourceWire(opCard, ctx);
+  if (type === 'buy') planBuyAutocompleteWire(opCard, ctx);
   // Recommendation prefill: a strategy created from a subcategory
   // recommendation opens its op form already bound to the entity
   // (account/holding + cash-pot funding leg for buys; property for
@@ -14664,6 +14783,7 @@ async function openPlanOpModal(strategyId, existing, presetType) {
         }
       }
       if (tp.opType === 'buy') planOpSourceWire(opCard, ctx);
+      if (tp.opType === 'buy') planBuyAutocompleteWire(opCard, ctx);
     }
   }
   showMsg($('#planOpModalMsg'), '', '');
@@ -14737,6 +14857,7 @@ async function openPlanStrategyModal(projectId) {
         if (box && !box.children.length) box.insertAdjacentHTML('beforeend', planLegRowHtml(opType, ctx, null));
       }
       if (opType === 'buy') planOpSourceWire(stratCard, ctx);
+      if (opType === 'buy') planBuyAutocompleteWire(stratCard, ctx);
       // A rate preset fixes its direction: hide the rate-type radios
       // and the irrelevant rate input, leaving only the number the
       // user actually sets. The amortization override is fixed-only,
