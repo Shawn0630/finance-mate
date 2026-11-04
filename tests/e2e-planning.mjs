@@ -4741,6 +4741,17 @@ export async function run(H, S) {
       // the right edge (title left, tools right, small panel gap).
       await page.goto(`http://ff.local/#planning/strategy/${fStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await page.waitForSelector('#planStrategyHeaderTools', { timeout: 15000 });
+      // Wait until the header is actually rendered: the tools div
+      // enters the DOM while the detail section is still hidden, so
+      // an immediate measure reads all-zero rects (rightGap 0,
+      // toolsAfterTitle false) even though the laid-out header is
+      // correct. Waiting for a non-zero rect keeps the geometry
+      // check exactly as strong — a truly hidden/broken header
+      // times out here and the check below still fails.
+      await page.waitForFunction(() => {
+        const t = document.querySelector('#planStrategyHeaderTools');
+        return !!t && t.getBoundingClientRect().width > 0;
+      }, { timeout: 15000 }).catch(() => {});
       const ubStrat = await page.evaluate(() => {
         const tools = document.querySelector('#planStrategyHeaderTools');
         const title = document.querySelector('#planStrategyTitle');
