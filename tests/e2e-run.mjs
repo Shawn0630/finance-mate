@@ -8,6 +8,24 @@
 // Logs: E2E_LOG_DIR (default: os.tmpdir()/ff-e2e-split-logs) gets
 // e2e-split.log (combined, with per-module summaries) plus one
 // e2e-split-<module>.log per module (full child output).
+// Per-module landing (user decision 2026-11-03): changing a module
+// means running ONLY that module (+ its direct dependency setup) to
+// verify — a full split run is for measurement, not a landing
+// requirement. So `--only <module>` IS the landing run for that
+// module's change; run it with the same env as the suite
+// (TZ=America/Vancouver, CHROME_EXTRA_FLAGS carrying the WebGL policy).
+// Dependency setup each module still replays (its `deps` array runs in
+// the setup bucket before its own checks; setup failures BLOCK the
+// module with exit 3, they never count toward own totals):
+//   no deps: core, costs, nollm, photos, costs-nollm, assessments,
+//     chart-colors, investments, spending, epilogue
+//   terms <- core; ui-property <- core
+//   veil <- core + ui-property
+//   csv-wizard <- investments; earnings <- investments + csv-wizard
+//   planning <- all 14 preceding modules, OR (E2E_PLAN_SLIM=1) the slim
+//     fixture in tests/e2e-plan-fixture.mjs, which rebuilds only the
+//     dep-survivor mortgage properties planning projections observe —
+//     same own-check coverage, no 1413-check replay (see that file).
 // Exit codes: 0 all modules green; 2 pre-flight probe failed, or a module
 // exhausted its infra retries; 1 assertion failures or blocked modules.
 // Infra policy: a module exiting 2 (EPERM/IOERR/launch crash/frame-detach)

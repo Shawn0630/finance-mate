@@ -1,6 +1,10 @@
 // planning: Planning: projects, strategies, merge, scenarios, comparison, reports, wiring — split from tests/e2e.mjs (Phase 1: harness-only split).
 // Run standalone: node tests/e2e-planning.mjs  (deps run first, in setup mode)
 // Run via the suite runner: node tests/e2e-run.mjs [--only planning]
+// Slim mode: E2E_PLAN_SLIM=1 replaces the 14-module dep replay with the
+// minimal fixture in tests/e2e-plan-fixture.mjs (same own-check
+// coverage, no 1413-check replay). Default (unset) keeps the full chain.
+import { runSlimPlanFixture } from './e2e-plan-fixture.mjs';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -21,7 +25,8 @@ import { run as runInvestments } from './e2e-investments.mjs';
 import { run as runCsvWizard } from './e2e-csv-wizard.mjs';
 import { run as runEarnings } from './e2e-earnings.mjs';
 import { run as runSpending } from './e2e-spending.mjs';
-export const deps = [runCore, runCosts, runNollm, runTerms, runPhotos, runUiProperty, runCostsNollm, runAssessments, runChartColors, runVeil, runInvestments, runCsvWizard, runEarnings, runSpending];
+const SLIM_PLAN = process.env.E2E_PLAN_SLIM === '1';
+export const deps = SLIM_PLAN ? [runSlimPlanFixture] : [runCore, runCosts, runNollm, runTerms, runPhotos, runUiProperty, runCostsNollm, runAssessments, runChartColors, runVeil, runInvestments, runCsvWizard, runEarnings, runSpending];
 export async function run(H, S) {
   let r;
   // Project → strategy → prepay op → comparison → merge-preview →
@@ -4352,7 +4357,16 @@ export async function run(H, S) {
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fBaseId}"]`);
       await waitF(800);
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fAiScenId}"]`);
-      await waitF(1200);
+      // Wait for the scenario-click render itself, not a fixed sleep:
+      // a fixed 1200ms read the pre-click routing (disabled false, note
+      // empty) under full-run load and flaked this check. Waiting for
+      // the asserted state keeps the pin exactly as strong — a broken
+      // render times out here and the check below still fails.
+      await page.waitForFunction(() => {
+        const b = document.querySelector('#planFlowGenerateBtn');
+        const n = document.querySelector('#planFlowGenerateNote')?.textContent || '';
+        return !!b?.disabled && n.includes('scenario');
+      }, { timeout: 15000 }).catch(() => {});
       const routeScen = await routingState();
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fScenId}"]`);
       await waitF(1200);
@@ -4746,4 +4760,4 @@ export async function run(H, S) {
   }
 }
 
-runModuleMain(import.meta.url, { name: 'planning', deps, depNames: ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm', 'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings', 'spending'], run });
+runModuleMain(import.meta.url, { name: 'planning', deps, depNames: SLIM_PLAN ? [] : ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm', 'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings', 'spending'], run });
