@@ -856,14 +856,13 @@ export async function run(H, S) {
         futureWorld: !!document.querySelector('#planCompareScenarioWrap'),
         metaLine: !!document.querySelector('#planMetadataLine'),
         metaLineEdit: !!document.querySelector('#planMetadataLineEdit'),
-        tableText: (document.querySelector('#planCompareTable')?.textContent || '').trim(),
-        chartVisible: (() => { const c = document.querySelector('#planCompareChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
+        noLegacyCompare: !document.querySelector('#planLegacyComparePanel') && !document.querySelector('#planCompareTable') && !document.querySelector('#planCompareChart'),
         panelOrder: [...document.querySelectorAll('#planBaselineCardsPanel, #planStrategiesPanel, #planReportsPanel')].map((el) => el.id),
       }));
       H.check('planning detail: buy project order is scenarios → baselines → strategies → reports, compact metadata line, old scenario/future-world panels gone',
         !buyPage.scenarioPanel && buyPage.scenarioCardsPanel && !buyPage.assetPanel && !buyPage.baselinePanel && !buyPage.metadataPanel && !buyPage.futureWorld
         && buyPage.baselinesPanel && buyPage.metaLine && buyPage.metaLineEdit
-        && buyPage.tableText === '' && !buyPage.chartVisible
+        && buyPage.noLegacyCompare
         && JSON.stringify(buyPage.panelOrder) === JSON.stringify(['planBaselineCardsPanel', 'planStrategiesPanel', 'planReportsPanel']),
         JSON.stringify(buyPage));
       await page.goto(`http://ff.local/#planning/project/${metaMortgageId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -888,20 +887,19 @@ export async function run(H, S) {
       H.check('planning detail: legacy project keeps baselines/strategies/assets/reports, no scenario panel, no metadata line',
         !legPage.scenarioPanel && legPage.assetPanel && legPage.baselinesPanel && !legPage.metaLine, JSON.stringify(legPage));
       // Strategy template recording on the From-template path; once a
-      // strategy exists the comparison table appears.
+      // strategy exists the strategy card shows figures.
       r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'Meta Strat', source: 'template', template: 'prepay', template_params: { propertyId: planPid, date: planOpDate, amount: 5000 } });
       H.check('planning metadata: strategy records its applied template',
         r.status === 201 && r.data.strategy && r.data.strategy.template === 'prepay', JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1500);
-      const buyTable = await page.evaluate(() => ({
-        text: document.querySelector('#planCompareTable')?.textContent || '',
-        head: document.querySelector('#planCompareTable thead')?.textContent || '',
-      }));
-      H.check('planning metadata: comparison table appears once a strategy exists, strategy columns only, Equity/Principal Δ rows',
-        buyTable.text.includes('Total cost') && buyTable.text.includes('Equity Δ') && buyTable.text.includes('Principal Δ')
-        && !buyTable.head.includes('Baseline') && buyTable.head.includes('Meta Strat'),
-        JSON.stringify({ head: buyTable.head, body: buyTable.text.slice(0, 200) }));
+      const buyCard = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#planStrategyCards [data-plan-strategy]')].find((c) => (c.textContent || '').includes('Meta Strat'));
+        return card ? card.textContent : '';
+      });
+      H.check('planning metadata: strategy card shows figures once a strategy exists',
+        buyCard.includes('Meta Strat') && buyCard.includes('Cost') && buyCard.includes('Gain'),
+        JSON.stringify({ card: buyCard.slice(0, 200) }));
     } finally { await browserM.close(); }
   }
   r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies/from-template`, { name: 'From saved', template_id: metaTplId, answers: { target_contribution: 600 } });
@@ -1218,16 +1216,6 @@ export async function run(H, S) {
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueD, domain: 'ff.local', path: '/', httpOnly: true });
       await page.goto(`http://ff.local/#planning/project/${detailBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(2000);
-      const gainChart = await page.evaluate(() => {
-        const canvas = document.querySelector('#planCompareChart');
-        if (!canvas || !window.Chart) return {};
-        const ch = Chart.getChart(canvas);
-        if (!ch) return {};
-        return { labels: ch.data.datasets.map((d) => d.label), visible: getComputedStyle(canvas.closest('.chart-wrap')).display !== 'none' };
-      });
-      H.check('planning detail: buy project chart shows principal gain, no property baseline line',
-        gainChart.visible && gainChart.labels.some((l) => String(l).includes('Principal gain')) && !gainChart.labels.some((l) => l === 'Baseline'),
-        JSON.stringify(gainChart));
       // Diagnostic split: what does the page's own fetch see?
       const pageTpl = await page.evaluate(() => fetch('/api/planning/templates').then((x) => x.json()).catch((e) => ({ error: String(e) })));
       H.check('planning detail: page fetch sees the saved templates',
@@ -1687,13 +1675,11 @@ export async function run(H, S) {
         return {
           baseText: baseCards.map((c) => c.textContent).join(' | '),
           stratText: stratCards.map((c) => c.textContent).join(' | '),
-          ratesText: document.querySelector('#planBaselineRates')?.textContent || '',
         };
       });
-      H.check('planning pool: baseline cards carry no factor UI, strategy card shows the sink line, baseline rates line shows current rates',
+      H.check('planning pool: baseline cards carry no factor UI, strategy card shows the sink line',
         !poolPage.baseText.includes('Prime →') && !poolPage.baseText.includes('Sink:')
-          && poolPage.stratText.includes('Sink: existing stock')
-          && poolPage.ratesText.includes('POOL.A') && poolPage.ratesText.includes('5.26%/yr'),
+          && poolPage.stratText.includes('Sink: existing stock'),
         JSON.stringify(poolPage));
       // Factors live on scenarios now: the strategy detail carries no
       // Factors panel, only the Sink panel + a scenario picker.
@@ -1959,54 +1945,9 @@ export async function run(H, S) {
         return false;
       });
       H.check('scenario restructure: Add factor reveals the property-growth editor on a property project', growthAdded);
-      // Give the two worlds different factors so their blocks differ.
-      r = await H.req('PUT', `/api/planning/scenarios/${migrated.id}`, { factors: { stock: { valuePct: 3 } } });
-      H.check('scenario restructure: migrated scenario factors replaced for the comparison check', r.status === 200, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
-      await page.evaluate(() => {
-        const cbs = [...document.querySelectorAll('[data-plan-compare-scenario]')];
-        const unchecked = cbs.find((cb) => !cb.checked);
-        if (unchecked) unchecked.click();
-      });
-      await waitR(1500);
-      const multi = await page.evaluate(() => ({
-        extraTable: !!document.querySelector('#planCompareTable-1'),
-        extraText: document.querySelector('#planCompareTable-1')?.textContent || '',
-        firstText: document.querySelector('#planCompareTable')?.textContent || '',
-        extraHead: document.querySelector('#planCompareBlocksExtra')?.textContent || '',
-      }));
-      H.check('scenario restructure: checking a second scenario renders a second comparison block with different figures',
-        multi.extraTable && multi.extraText.includes('Total cost') && multi.extraHead.includes('Under Default scenario') && multi.extraText !== multi.firstText,
-        JSON.stringify({ extra: multi.extraText.slice(0, 200), first: multi.firstText.slice(0, 200), head: multi.extraHead.slice(0, 200) }));
-      // Uncheck one at a time (each change reloads); with none checked
-      // only the re-pick panel renders — no table, no card figures.
-      await page.evaluate(() => {
-        const checked = [...document.querySelectorAll('[data-plan-compare-scenario]:checked')];
-        if (checked[0]) checked[0].click();
-      });
-      await waitR(1200);
-      await page.evaluate(() => {
-        const checked = [...document.querySelectorAll('[data-plan-compare-scenario]:checked')];
-        if (checked[0]) checked[0].click();
-      });
-      await waitR(1200);
-      const repick = await page.evaluate(() => ({
-        emptyText: document.querySelector('#planCompareEmpty')?.textContent || '',
-        tableText: document.querySelector('#planCompareTable')?.textContent || '',
-        cardValues: document.querySelectorAll('#planStrategyCards .v').length,
-        worldText: document.querySelector('#planStrategyCardsWorld')?.textContent || '',
-      }));
-      H.check('scenario restructure: unchecking every scenario shows a re-pick panel only, no figures',
-        repick.emptyText.includes('Pick a scenario') && repick.tableText === '' && repick.cardValues === 0 && repick.worldText.includes('Pick a scenario'),
-        JSON.stringify(repick));
       // Scenario cards: create / rename / delete through the UI.
-      await page.evaluate(() => {
-        const checked = [...document.querySelectorAll('[data-plan-compare-scenario]')];
-        const base = checked.find((cb) => cb.closest('label')?.textContent.includes('Default'));
-        if (base && !base.checked) base.click();
-      });
-      await waitR(1200);
       await page.click('#planAddScenarioBtn');
       await waitR(300);
       await page.evaluate(() => { document.querySelector('#planScenarioName').value = 'CRUD World'; });
@@ -2578,84 +2519,6 @@ export async function run(H, S) {
       }));
       H.check('comparison: diff annual toggle switches to year rows with Equity Δ (peak)',
         annual.head.includes('Equity Δ (peak)') && /^\d{4}$/.test(annual.first.trim()), JSON.stringify(annual));
-      await page.goto(`http://ff.local/#planning/project/${cmpProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitC(1500);
-      const proj = await page.evaluate(() => ({
-        deltaChart: (() => { const c = document.querySelector('#planTrajectoryChart'); if (!c) return false; const w = c.closest('.chart-wrap'); return !!w && getComputedStyle(w).display !== 'none'; })(),
-        trajNote: document.querySelector('#planTrajectoryNote')?.textContent || '',
-        mergedHead: document.querySelector('#planMergedTable thead')?.textContent || '',
-        mergedText: document.querySelector('#planMergedTable')?.textContent || '',
-        mergedDiff: !!document.querySelector('#planMergedTable .plan-diff'),
-        mergedCellLines: (() => { const tr = [...document.querySelectorAll('#planMergedTable tbody tr')].find((x) => (x.cells[0]?.textContent || '').startsWith('Monthly payment')); if (!tr || !tr.cells[2]) return null; return [...tr.cells[2].querySelectorAll('div')].map((d) => d.textContent.trim()); })(),
-        pickerTop: (() => { const panel = document.querySelector('#planCompareNewPanel'); if (!panel) return false; const picker = panel.querySelector('#planComparePicker'); const chart = panel.querySelector('#planTrajectoryChart'); return !!picker && !!chart && (picker.compareDocumentPosition(chart) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0; })(),
-        payoffCell: (() => { const tr = [...document.querySelectorAll('#planMergedTable tbody tr')].find((x) => (x.cells[0]?.textContent || '') === 'Payoff'); if (!tr || !tr.cells[2]) return null; return { divs: [...tr.cells[2].querySelectorAll('div')].map((d) => d.textContent.trim()), text: tr.cells[2].textContent.trim() }; })(),
-        chips: [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')),
-        deltaSets: (() => { try { const ch = window.Chart && Chart.getChart ? Chart.getChart(document.getElementById('planTrajectoryChart')) : null; return ch ? ch.data.datasets.map((d) => ({ label: d.label, maxAbs: Math.max(...d.data.map((v) => Math.abs(v || 0))) })) : []; } catch { return []; } })(),
-        oldHosts: !!document.querySelector('#planMasterTable') || !!document.querySelector('#planAppleTable'),
-      }));
-      H.check('comparison: project difference chart + merged table render under the picked scenario',
-        proj.deltaChart && proj.trajNote.includes('Compare world') && proj.mergedHead.includes('Baseline') && proj.mergedText.includes('Prepay 10k'),
-        JSON.stringify(proj));
-      H.check('comparison: merged table shows baseline absolutes with strategy absolute + delta cells and highlighted deltas',
-        proj.mergedHead.includes('Baseline') && proj.mergedHead.includes('Prepay 10k') && proj.mergedDiff && proj.mergedCellLines && proj.mergedCellLines.length === 2 && proj.chips.length >= 1 && proj.chips.every((v) => v === 'true') && !proj.oldHosts,
-        JSON.stringify(proj));
-      H.check('comparison: picker is chips at the panel top, not a checkbox stack',
-        proj.pickerTop && proj.chips.length >= 1, JSON.stringify(proj));
-      H.check('comparison: difference chart plots a nonzero Balance Δ line for the prepay strategy',
-        proj.deltaSets.some((d) => d.label.includes('Balance Δ') && d.maxAbs > 0), JSON.stringify(proj.deltaSets));
-      H.check('comparison: merged Payoff cell shows shift alone when it differs from the displayed months',
-        proj.payoffCell && proj.payoffCell.divs.length === 0 && proj.payoffCell.text.includes('+53 months'), JSON.stringify(proj.payoffCell));
-      for (;;) {
-        const more = await page.evaluate(() => {
-          const b = document.querySelector('#planComparePicker button[data-plan-apple][aria-pressed="true"]');
-          if (!b) return false;
-          b.click();
-          return true;
-        });
-        if (!more) break;
-        await waitC(500);
-      }
-      const unpicked = await page.evaluate(() => ({
-        head: document.querySelector('#planMergedTable thead')?.textContent || '',
-        note: document.querySelector('#planMergedTable')?.textContent || '',
-        chartSets: (() => { try { const ch = window.Chart && Chart.getChart ? Chart.getChart(document.getElementById('planTrajectoryChart')) : null; return ch ? ch.data.datasets.map((d) => d.label) : null; } catch { return null; } })(),
-      }));
-      H.check('comparison: picker uncheck-all leaves the baseline column + pick note, chart emptied',
-        unpicked.head.includes('Baseline') && !unpicked.head.includes('Prepay 10k') && unpicked.note.includes('Pick a strategy to compare.') && (unpicked.chartSets === null || unpicked.chartSets.length === 0),
-        JSON.stringify(unpicked));
-      for (;;) {
-        const more = await page.evaluate(() => {
-          const b = document.querySelector('#planComparePicker button[data-plan-apple][aria-pressed="false"]');
-          if (!b) return false;
-          b.click();
-          return true;
-        });
-        if (!more) break;
-        await waitC(500);
-      }
-      const repicked = await page.evaluate(() => document.querySelector('#planMergedTable thead')?.textContent || '');
-      H.check('comparison: picker re-check restores the strategy column',
-        repicked.includes('Prepay 10k'), JSON.stringify(repicked));
-      // Scenario re-pick: uncheck all (one at a time with waits, so
-      // no stale load overwrites the re-pick state) → the new panels
-      // show the note only, like the legacy comparison.
-      const scenBoxes = await page.evaluate(() => document.querySelectorAll('#planCompareScenarios input[type="checkbox"]').length);
-      for (let i = 0; i < scenBoxes; i++) {
-        await page.evaluate(() => {
-          const cb = [...document.querySelectorAll('#planCompareScenarios input[type="checkbox"]')].find((x) => x.checked);
-          if (cb) cb.click();
-        });
-        await waitC(800);
-      }
-      const repick = await page.evaluate(() => ({
-        legacyNote: document.querySelector('#planCompareEmpty')?.textContent || '',
-        trajNote: document.querySelector('#planTrajectoryNote')?.textContent || '',
-        trajHidden: (() => { const c = document.querySelector('#planTrajectoryChart'); const w = c ? c.closest('.chart-wrap') : null; return !w || getComputedStyle(w).display === 'none'; })(),
-        merged: (document.querySelector('#planMergedTable')?.textContent || '').trim(),
-      }));
-      H.check('comparison: uncheck-all scenarios shows the re-pick panel only (new panels cleared)',
-        repick.legacyNote.includes('Pick a scenario') && repick.trajNote.includes('Pick a scenario') && repick.trajHidden && repick.merged === '',
-        JSON.stringify(repick));
     } finally { await browserC.close(); }
   }
   // ------------------------------------------- monthly payment scope
@@ -2893,11 +2756,6 @@ export async function run(H, S) {
       });
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValuePS, domain: 'ff.local', path: '/', httpOnly: true });
       const waitPS = (ms) => new Promise((res2) => setTimeout(res2, ms));
-      const readPayRow = async (sel) => page.evaluate((sel2) => {
-        const tr = [...document.querySelectorAll(`${sel2} tbody tr`)].find((x) => (x.cells[0]?.textContent || '').startsWith('Monthly payment'));
-        if (!tr) return null;
-        return { label: tr.cells[0].textContent, cells: [...tr.cells].map((c) => c.textContent.trim()) };
-      }, sel);
       // Merged table: baseline cell is plain text; each strategy cell
       // carries absolute + delta as two divs (stock-only: single '—').
       const readMergedPayRow = async (sel) => page.evaluate((sel2) => {
@@ -2909,27 +2767,6 @@ export async function run(H, S) {
         });
         return { label: tr.cells[0].textContent, baseline: tr.cells[1] ? tr.cells[1].textContent.trim() : null, cols };
       }, sel);
-      await page.goto(`http://ff.local/#planning/project/${ps1Proj}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitPS(1500);
-      const ps1Merged = await readMergedPayRow('#planMergedTable');
-      H.check('payscope: single project page merged row names A with A-only absolute + delta',
-        ps1Merged && ps1Merged.label.includes('11 PayScope A Lane')
-        && ps1Merged.baseline === ps1Exp.baseline && ps1Merged.cols[0].abs === ps1Exp.strategy && ps1Merged.cols[0].delta === ps1Exp.delta,
-        JSON.stringify({ merged: ps1Merged, exp: ps1Exp }));
-      const ps1Legacy = await readPayRow('#planCompareTable');
-      H.check('payscope: single project page legacy row shows the A-only delta',
-        ps1Legacy && ps1Legacy.cells[1] === ps1Exp.delta,
-        JSON.stringify({ legacy: ps1Legacy, exp: ps1Exp }));
-      await page.goto(`http://ff.local/#planning/project/${ps2Proj}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitPS(1500);
-      const ps2Merged = await readMergedPayRow('#planMergedTable');
-      H.check('payscope: multi project page merged row sums A2 + B2 with absolute + delta, stocks-only is —',
-        ps2Merged && ps2Merged.baseline === ps2Exp.baseline && ps2Merged.cols[0].abs === ps2Exp.strategy && ps2Merged.cols[0].delta === ps2Exp.delta && ps2Merged.cols[1].abs === '—',
-        JSON.stringify({ merged: ps2Merged, exp: ps2Exp }));
-      const ps2Legacy = await readPayRow('#planCompareTable');
-      H.check('payscope: multi project page legacy row shows the A2 + B2 delta, stocks-only is —',
-        ps2Legacy && ps2Legacy.cells[1] === ps2Exp.delta && ps2Legacy.cells[2] === '—',
-        JSON.stringify({ legacy: ps2Legacy, exp: ps2Exp }));
       await page.goto(`http://ff.local/#planning/report/${ps1Proj}/${ps1Rep}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitPS(2500);
       const psRepMerged = await readMergedPayRow('#planReportMergedTable');
@@ -2993,6 +2830,10 @@ export async function run(H, S) {
   H.check('stockgain: property position op added', r.status === 201, JSON.stringify(r.data));
   r = await H.req('POST', `/api/planning/projects/${sgPropProjectId}/scenarios`, { name: 'SG world' });
   H.check('stockgain: scenario created for the property project', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const sgScenId = r.data.scenario.id;
+  r = await H.req('POST', `/api/planning/projects/${sgPropProjectId}/reports`, { name: 'SG report', definition: { strategies: [sgPropStrategyId], charts: [] }, baseline_id: null, strategy_ids: [sgPropStrategyId], scenario_ids: [sgScenId] });
+  H.check('stockgain: pin report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const sgRepId = r.data.report.id;
   r = await H.req('GET', `/api/planning/strategies/${sgPropStrategyId}`);
   const sgC = (r.data && r.data.comparison) || {};
   const sgClose = (a, b) => Math.abs((a || 0) - (b || 0)) < 0.005;
@@ -3070,14 +2911,11 @@ export async function run(H, S) {
       const sgCards = await pageSG.evaluate(() => [...document.querySelectorAll('.breakdown-card')].map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' })));
       const sgCard = sgCards.find((c) => c.k === 'Stock gain');
       H.check('stockgain: strategy detail shows Stock gain as its own card', !!sgCard && sgCard.v !== '—' && sgCard.v !== '', JSON.stringify(sgCards));
-      await pageSG.goto(`http://ff.local/#planning/project/${sgPropProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitSG(1500);
-      const sgTables = await pageSG.evaluate(() => ({
-        legacy: document.querySelector('#planCompareTable')?.textContent || '',
-        merged: document.querySelector('#planMergedTable')?.textContent || '',
-      }));
-      H.check('stockgain: legacy and merged tables show a Stock gain row', sgTables.legacy.includes('Stock gain') && sgTables.merged.includes('Stock gain'),
-        JSON.stringify({ legacy: sgTables.legacy.slice(0, 200), merged: sgTables.merged.slice(0, 200) }));
+      await pageSG.goto(`http://ff.local/#planning/report/${sgPropProjectId}/${sgRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitSG(2500);
+      const sgRepMerged = await pageSG.evaluate(() => document.querySelector('#planReportMergedTable')?.textContent || '');
+      H.check('stockgain: report merged table shows a Stock gain row', sgRepMerged.includes('Stock gain'),
+        JSON.stringify(sgRepMerged.slice(0, 200)));
     } finally { await browserSG.close(); }
   }
   // ------------------------------------------- report + templates
@@ -3793,32 +3631,6 @@ export async function run(H, S) {
       });
       H.check('detail-clarity: diff monthly table groups by year with annual-sum rows (flows summed, balances year-end)',
         grouping.groups >= 2 && grouping.checked.length > 0 && grouping.checked.every((c) => c.intSavedOk && c.intBaseOk && c.balOk), JSON.stringify(grouping));
-      // Project comparison: difference-chart title + caption + picker +
-      // breakdown chart; 1y narrows both charts (via Chart.getChart).
-      await page.goto(`http://ff.local/#planning/project/${dcProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(1500);
-      const traj = await page.evaluate(() => {
-        const panel = document.querySelector('#planCompareNewPanel');
-        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
-        return {
-          title: [...(panel ? panel.querySelectorAll('h3') : [])].map((h) => h.textContent.trim()).includes('Difference vs baseline'),
-          caption: (panel?.textContent || '').includes('X: month') && (panel?.textContent || '').includes('Balance Δ'),
-          picker: !!panel?.querySelector('[data-plan-traj-preset="1y"]'),
-          breakdown: !!document.querySelector('#planTrajectoryBreakdownChart'),
-          labelsAll: chartOf('planTrajectoryChart'),
-          labelsBreak: chartOf('planTrajectoryBreakdownChart'),
-        };
-      });
-      H.check('detail-clarity: comparison difference chart has title, axis caption, picker and breakdown bars',
-        traj.title && traj.caption && traj.picker && traj.breakdown && traj.labelsAll > 12 && traj.labelsBreak > 12, JSON.stringify(traj));
-      await page.click('[data-plan-traj-preset="1y"]');
-      await waitD(800);
-      const narrowed = await page.evaluate(() => {
-        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
-        return { labels: chartOf('planTrajectoryChart'), labelsBreak: chartOf('planTrajectoryBreakdownChart'), active: !!document.querySelector('[data-plan-traj-preset="1y"].active') };
-      });
-      H.check('detail-clarity: difference 1y preset narrows both the difference chart and the breakdown bars',
-        narrowed.labels === 12 && narrowed.labelsBreak === 12 && narrowed.active, JSON.stringify(narrowed));
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -3831,6 +3643,14 @@ export async function run(H, S) {
       }));
       H.check('detail-clarity: template report chart has title + axis caption, embedded comparison too',
         repView.title && repView.axis && repView.trajTitle && repView.trajBreak, JSON.stringify(repView));
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportComparePanel [data-plan-traj-preset="1y"]');
+      await waitD(800);
+      const repNarrowed = await page.evaluate(() => {
+        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
+        return { labels: chartOf('planReportTrajectoryChart'), labelsBreak: chartOf('planReportTrajectoryBreakdownChart'), active: !!document.querySelector('#planReportComparePanel [data-plan-traj-preset="1y"].active') };
+      });
+      H.check('detail-clarity: report difference 1y preset narrows both the difference chart and the breakdown bars',
+        repNarrowed.labels === 12 && repNarrowed.labelsBreak === 12 && repNarrowed.active, JSON.stringify(repNarrowed));
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcAiRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(2500);
       const aiView = await page.evaluate(() => ({
@@ -3980,13 +3800,12 @@ export async function run(H, S) {
       await page.click(`[data-plan-scenario-select="${wScen2}"]`);
       await waitW(1200);
       const world2 = await page.evaluate((s1, s2) => ({
-        note: document.querySelector('#planTrajectoryNote')?.textContent || '',
-        legacyChecked: [...document.querySelectorAll('#planCompareScenarios input:checked')].map((el) => Number(el.dataset.planCompareScenario)),
+        note: document.querySelector('#planStrategyCardsWorld')?.textContent || '',
         selCard: !!document.querySelector(`[data-plan-scenario="${s2}"]`)?.classList.contains('plan-selected'),
         oldSel: !!document.querySelector(`[data-plan-scenario="${s1}"]`)?.classList.contains('plan-selected'),
       }), wScen1, wScen2);
-      H.check('wiring: wiring scenario pick switches the comparison world and the legacy picker',
-        world2.note.includes('Wiring world 2') && JSON.stringify(world2.legacyChecked) === JSON.stringify([wScen2]) && world2.selCard && !world2.oldSel,
+      H.check('wiring: wiring scenario pick switches the card world',
+        world2.note.includes('Wiring world 2') && world2.selCard && !world2.oldSel,
         JSON.stringify(world2));
       await page.click(`[data-plan-baseline-select="${wBaseId}"]`);
       await waitW(500);
@@ -4008,19 +3827,37 @@ export async function run(H, S) {
       H.check('wiring: modal save pins the wiring selection into the report',
         !!modalRep && modalRep.baseline_id === wBaseId && JSON.stringify(modalRep.scenarioIds) === JSON.stringify([wScen2]),
         JSON.stringify(modalRep));
-      const chipBefore = await page.evaluate(() => [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')));
+      // The modal save reloaded the project, which reset wiring
+      // picks (baseline null, strategies null = all). Re-pick the
+      // baseline first so the Generate guard below reflects ONLY
+      // the strategy toggle, not a missing baseline.
+      await page.click(`[data-plan-baseline-select="${wBaseId}"]`);
+      await waitW(500);
+      const selBefore = await page.evaluate((sid) => {
+        const b = document.querySelector(`[data-plan-strategy-select="${sid}"]`);
+        return { pressed: b?.getAttribute('aria-pressed'), selected: !!b?.closest('.card')?.classList.contains('plan-selected') };
+      }, wStrategyId);
       await page.click(`[data-plan-strategy-select="${wStrategyId}"]`);
       await waitW(800);
-      const chipAfter = await page.evaluate(() => [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')));
-      H.check('wiring: wiring strategy toggle drives the comparison picker chips',
-        chipBefore.length >= 1 && chipBefore.every((v) => v === 'true')
-          && chipAfter.length === chipBefore.length && chipAfter.every((v) => v === 'false'),
-        JSON.stringify({ chipBefore, chipAfter }));
+      const selAfter = await page.evaluate((sid) => {
+        const b = document.querySelector(`[data-plan-strategy-select="${sid}"]`);
+        const gen = document.querySelector('#planFlowGenerateBtn');
+        const note = document.querySelector('#planFlowGenerateNote')?.textContent || '';
+        return { pressed: b?.getAttribute('aria-pressed'), selected: !!b?.closest('.card')?.classList.contains('plan-selected'), genDisabled: !!gen?.disabled, genNote: note };
+      }, wStrategyId);
+      H.check('wiring: wiring strategy toggle drives the Select state and the Generate guard',
+        selBefore.pressed === 'true' && selBefore.selected
+          && selAfter.pressed === 'false' && !selAfter.selected && selAfter.genDisabled && selAfter.genNote === 'Pick at least one strategy to generate.',
+        JSON.stringify({ selBefore, selAfter }));
       await page.click(`[data-plan-strategy-select="${wStrategyId}"]`);
       await waitW(800);
-      const chipBack = await page.evaluate(() => [...document.querySelectorAll('#planComparePicker button[data-plan-apple]')].map((b) => b.getAttribute('aria-pressed')));
-      H.check('wiring: wiring strategy toggle back restores the chip',
-        chipBack.length >= 1 && chipBack.every((v) => v === 'true'), JSON.stringify(chipBack));
+      const selBack = await page.evaluate((sid) => {
+        const b = document.querySelector(`[data-plan-strategy-select="${sid}"]`);
+        const gen = document.querySelector('#planFlowGenerateBtn');
+        return { pressed: b?.getAttribute('aria-pressed'), selected: !!b?.closest('.card')?.classList.contains('plan-selected'), genDisabled: !!gen?.disabled };
+      }, wStrategyId);
+      H.check('wiring: wiring strategy toggle back restores the Select state and the Generate guard',
+        selBack.pressed === 'true' && selBack.selected && !selBack.genDisabled, JSON.stringify(selBack));
       await page.evaluate((sid) => { document.querySelector(`[data-plan-strategy="${sid}"] .k`).click(); }, wStrategyId);
       await waitW(800);
       const navHash = await page.evaluate(() => location.hash);
@@ -4707,17 +4544,16 @@ export async function run(H, S) {
       }));
       H.check('uibundle: report viewer tab buttons are small',
         ubViewer.genSmall && ubViewer.aiSmall && ubViewer.saveSmall, JSON.stringify(ubViewer));
-      // Project-page comparison chips stay toggle-only (no report),
-      // and the tier buttons are small.
+      // The project-page comparison panel is gone; the tier buttons
+      // are small.
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await page.waitForFunction(() => document.querySelectorAll('#planComparePicker [data-plan-apple]').length > 0, { timeout: 15000 });
+      await page.waitForSelector('#planFlowGenerateBtn', { timeout: 15000 });
       const ubProj = await page.evaluate(() => ({
-        chips: document.querySelectorAll('#planComparePicker [data-plan-apple]').length,
-        removes: document.querySelectorAll('#planComparePicker [data-plan-remove]').length,
+        panelGone: !document.querySelector('#planCompareNewPanel'),
         small: ['planFlowGenerateBtn', 'planAddScenarioBtn', 'planAddStrategyBtn'].map((id) => !!document.querySelector(`#${id}.small`)),
       }));
-      H.check('uibundle: project comparison chips have no remove control and tier buttons are small',
-        ubProj.chips > 0 && ubProj.removes === 0 && ubProj.small.every(Boolean), JSON.stringify(ubProj));
+      H.check('uibundle: project comparison panel is gone and tier buttons are small',
+        ubProj.panelGone && ubProj.small.every(Boolean), JSON.stringify(ubProj));
       // Saved-template form: Apply template is small.
       r = await H.req('POST', '/api/planning/templates', { name: 'UI bundle template', spec: fAiModelDef, metadata_schema: [], metadata_answers: {} });
       H.check('uibundle: saved template created', r.status === 201 && r.data.template && r.data.template.id > 0, JSON.stringify(r.data));

@@ -8358,12 +8358,11 @@ function monthPopField() {
     const which = monthPopFor.split(':')[1];
     return document.querySelector(`#planDiffRange [data-plan-diff-month="${which}"]`);
   }
-  // Comparison-trajectory range fields live in the active panel's
-  // range bar (project page or report view, per planTrajActive).
+  // Comparison-trajectory range fields live in the report panel's
+  // range bar (per planTrajActive).
   if (monthPopFor && monthPopFor.startsWith('planTraj:')) {
     const which = monthPopFor.split(':')[1];
-    const host = planTrajActive && planTrajActive.ids ? '#planReportComparePanel' : '#planCompareNewPanel';
-    return document.querySelector(`${host} [data-plan-traj-month="${which}"]`);
+    return document.querySelector(`#planReportComparePanel [data-plan-traj-month="${which}"]`);
   }
   return { start: $('#rangeStart'), end: $('#rangeEnd'), entryStart: $('#earnEntryStartBtn'), entryEnd: $('#earnEntryEndBtn') }[monthPopFor] || null;
 }
@@ -8563,7 +8562,7 @@ $('#monthPop').addEventListener('click', (e) => {
     closeMonthPop();
     const active = planTrajActive;
     if (!active || !ym) return;
-    const st = active.ids ? (active.ids.trajState || (active.ids.trajState = { preset: 'all', from: '', to: '' })) : planTrajState;
+    const st = active.ids.trajState || (active.ids.trajState = { preset: 'all', from: '', to: '' });
     const trajs = (active.block.report && active.block.report.trajectories) || [];
     const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
     const eff = planTrajEffectiveRange(months, st);
@@ -11301,16 +11300,15 @@ async function loadPlanProject(id) {
     const data = await api(`/api/planning/projects/${id}`);
     planProjectData = data;
     planCompareScenarioIds = null;
-    planAppleIds = null;
+    planWiringStrategyIds = null;
     planWiringBaselineId = null;
-    planCompareNewBlock = null;
     $('#planList').classList.add('hidden');
     $('#planProject').classList.remove('hidden');
     $('#planStrategy').classList.add('hidden');
     $('#planScenario').classList.add('hidden');
     $('#planProject').innerHTML = planProjectHtml(data);
     planProjectWire(data);
-    await loadPlanComparison(id);
+    await loadPlanStrategyCards(id);
     // Inline viewer restore: a pending deep link opens its tab; else
     // a surviving tab re-renders (a deleted report's tab drops, and
     // the viewer empties when no tabs remain).
@@ -11442,42 +11440,15 @@ function planProjectHtml(d) {
       </div>
       <div id="planAssetList"></div>
     </div>`;
-  const legacyComparePanel = `<div class="panel" id="planLegacyComparePanel">
-      <div class="section-head"><h3>Comparison across strategies</h3></div>
-      <div id="planCompareScenarios"></div>
-      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart"></canvas></div>
-      <div id="planCompareEmpty"></div>
-      <div id="planCompareTable"></div>
-      <div id="planBaselineRates"></div>
-      <div id="planCompareBlocksExtra"></div>
-    </div>`;
-  const compareNewPanel = `<div class="panel" id="planCompareNewPanel">
-      <div class="section-head"><h3>Strategy comparison</h3></div>
-      <div class="note" id="planTrajectoryNote"></div>
-      <div id="planComparePicker" class="toolbar"></div>
-      <div class="section-head"><h3>Difference vs baseline</h3></div>
-      <div class="note">X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.</div>
-      <div id="planTrajRange"></div>
-      <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planTrajectoryChart"></canvas></div>
-      <div id="planTrajectoryEmpty"></div>
-      <div class="section-head"><h3>Monthly payment breakdown</h3></div>
-      <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
-      <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planTrajectoryBreakdownChart"></canvas></div>
-      <div id="planTrajectoryBreakdownEmpty"></div>
-      <div id="planMergedTable"></div>
-      <div class="note">Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below.</div>
-    </div>`;
   // DETAIL ORDER (both branches): header → flow (scenario tier →
   // baseline + strategy row → reports) → (declared assets for sell
-  // templates / legacy) → legacy comparison → strategy comparison
-  // (difference chart, breakdown bars, merged table). Scenario,
-  // baseline and strategy are three independent specs in one flow;
-  // the comparison runs each strategy against the baseline under the
-  // picked scenarios. No baseline-info panel anywhere, and no
-  // per-project history panel — history lives in the app-level
-  // History tab.
-  if (!templated) return header + flowPanel + assetsPanel + legacyComparePanel + compareNewPanel;
-  return header + flowPanel + (sections.declaredAssets ? assetsPanel : '') + legacyComparePanel + compareNewPanel;
+  // templates / legacy). Scenario, baseline and strategy are three
+  // independent specs in one flow; strategy comparison lives in
+  // reports only (same renderers, report-scoped ids). No
+  // baseline-info panel anywhere, and no per-project history
+  // panel — history lives in the app-level History tab.
+  if (!templated) return header + flowPanel + assetsPanel;
+  return header + flowPanel + (sections.declaredAssets ? assetsPanel : '');
 }
 function planProjectWire(d) {
   const p = d.project;
@@ -11658,9 +11629,9 @@ function planScenarioSectionWire(d) {
   });
 }
 // ---- Project flow wiring: one shared selection + connector lines ----
-// Selection lives in the comparison's own state, not a second picker:
+// Selection lives in wiring state, not a second picker:
 // scenario = first of planCompareScenarioIds (single-select, the
-// active world); strategies = planAppleIds (multi, null = all);
+// active world); strategies = planWiringStrategyIds (multi, null = all);
 // baseline = planWiringBaselineId (single-select label/pin only —
 // the engine's comparison baseline is always the do-nothing
 // reference, so a baseline pick changes no comparison numbers; it
@@ -11669,9 +11640,10 @@ function planScenarioSectionWire(d) {
 // navigation/edit behavior; selection happens ONLY through the
 // explicit Select button (stopPropagation, like Edit/Delete).
 let planWiringBaselineId = null;
+let planWiringStrategyIds = null; // null = every project strategy
 const planWiringScenarioId = () => (planCompareScenarioIds && planCompareScenarioIds.length ? planCompareScenarioIds[0] : null);
 const planWiringRepick = () => { const d = planProjectData; return !!(d && (d.scenarios || []).length && !(planCompareScenarioIds && planCompareScenarioIds.length)); };
-const planWiringStrategyPicked = (id) => (planAppleIds == null ? true : planAppleIds.includes(id));
+const planWiringStrategyPicked = (id) => (planWiringStrategyIds == null ? true : planWiringStrategyIds.includes(id));
 function planWiringRefresh() {
   const scenId = planWiringScenarioId();
   const repick = planWiringRepick();
@@ -11703,16 +11675,12 @@ function planWiringRefresh() {
 // computed report. The preset title names the pinned world +
 // baseline + strategy letters, so a preset report is recognizable
 // against an AI-titled one.
-// Picked strategies = the comparison picker's current set (shared
-// wiring state); before the comparison block loads, every project
-// strategy counts.
+// Picked strategies = the wiring's current set (null = every
+// project strategy).
 function planFlowPickedStrategies() {
   const d = planProjectData || {};
-  if (planCompareNewBlock && planCompareNewBlock.strategies) {
-    const all = planCompareNewBlock.strategies.map((r) => r.strategy.id);
-    return planAppleIds == null ? all : all.filter((id) => planAppleIds.includes(id));
-  }
-  return (d.strategies || []).map((s) => s.id);
+  const all = (d.strategies || []).map((s) => s.id);
+  return planWiringStrategyIds == null ? all : all.filter((id) => planWiringStrategyIds.includes(id));
 }
 // Routing rule: any AI-designed entity in the wiring selection
 // (scenario source 'ai', baseline source 'ai', or a strategy whose
@@ -11790,7 +11758,7 @@ async function planWiringSelectScenario(id) {
   if (planWiringScenarioId() === id) return; // radio behavior: no empty world via wiring
   planCompareScenarioIds = [id];
   const pid = planProjectData && planProjectData.project && planProjectData.project.id;
-  if (pid) await loadPlanComparison(pid);
+  if (pid) await loadPlanStrategyCards(pid);
   planWiringRefresh();
 }
 function planWiringSelectBaseline(id) {
@@ -11798,10 +11766,10 @@ function planWiringSelectBaseline(id) {
   planWiringRefresh();
 }
 function planWiringSelectStrategy(id) {
-  if (planWiringRepick() || !planCompareNewBlock) return;
-  const cur = planAppleIds == null ? (planCompareNewBlock.strategies || []).map((r) => r.strategy.id) : [...planAppleIds];
-  planAppleIds = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
-  planCompareNewRender(planCompareNewBlock);
+  if (planWiringRepick()) return;
+  const all = (planProjectData.strategies || []).map((s) => s.id);
+  const cur = planWiringStrategyIds == null ? [...all] : [...planWiringStrategyIds];
+  planWiringStrategyIds = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
   planWiringRefresh();
 }
 let planScenarioAiCtx = null;
@@ -11936,86 +11904,6 @@ function planSinkLine(sink, isInvestment) {
   if (isInvestment) return 'Sink: not picked yet';
   return '';
 }
-function planCompareTableHtml(rows) {
-  // COMPARISON IS THE FINAL OUTPUT, STRATEGY-CENTRIC: with zero
-  // strategies there is nothing to compare, so the table does not
-  // render at all — only the baseline trajectory chart. With strategies,
-  // columns are strategies only: no baseline column, no baseline
-  // absolute. Baseline stays the reference the deltas are computed
-  // against (and the chart's baseline line), never a displayed column.
-  if (!rows.length) return '';
-  const head = `<tr><th></th>${rows.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('')}</tr>`;
-  const numRow = (label, fn) => `<tr><td>${label}</td>${rows.map((r) => `<td>${fn(r)}</td>`).join('')}</tr>`;
-  return `
-    <table class="tbl"><thead>${head}</thead><tbody>
-      ${numRow('Total cost', (r) => planMoney(r.comparison.cost))}
-      ${numRow('Total gain', (r) => planMoney(r.comparison.gain))}
-      ${numRow('Stock gain', (r) => planMoney(r.comparison.stockGain))}
-      ${numRow('Net benefit', (r) => planSigned(r.comparison.net))}
-      ${numRow('Equity Δ', (r) => (r.equityDelta != null ? planSigned(r.equityDelta) : '—'))}
-      ${numRow('Principal Δ', (r) => (r.principalDelta != null ? planSigned(r.principalDelta) : '—'))}
-      ${numRow('Payoff shift (months)', (r) => (r.comparison.payoffShiftMonths != null ? r.comparison.payoffShiftMonths : '—'))}
-      ${numRow('Monthly payment Δ', (r) => planSigned(r.paymentScope ? r.paymentScope.delta : r.comparison.paymentDelta))}
-    </tbody></table>
-    <div class="note">Equity Δ = peak balance advantage over baseline across the trajectory (assessed cancels). Principal Δ = strategy buyCash − baseline buyCash (cash deployed into holdings by buy operations). Stock gain = strategy value minus the do-nothing baseline value, less new cash deployed (pot/external buys) grown at the baseline ratio; sell-funded buys are swaps and are not costed again.</div>`;
-}
-function planCompareBlockRender(block, ids) {
-  const rows = block.strategies || [];
-  $(ids.tableEl).innerHTML = planCompareTableHtml(rows);
-  const ratesEl = $(ids.ratesEl);
-  if (ratesEl) {
-    const rates = block.baseline && block.baseline.currentRates;
-    ratesEl.innerHTML = rates && rates.length
-      ? `<div class="note">Baseline grows at current rates: ${rates.map((r) => `${esc(r.symbol)} ${r.ratePct}%/yr (${esc(r.basis)} · ${esc(r.window)})`).join(' · ')}</div>`
-      : '';
-  }
-  // CHART RULES: the chart renders ONLY after at least one strategy
-  // exists, and it is strategy-driven. Funding/sell (non-mortgage)
-  // projects never get a property baseline line: when any strategy
-  // touches stocks, the chart shows PRINCIPAL GAIN per stock strategy
-  // (excess over the do-nothing baseline, one definition shared with
-  // the table's stockGain). The mortgage balance chart — baseline line
-  // included — renders only for mortgage-touching projects.
-  const chartWrap = document.querySelector(`#${ids.chartId}`)?.closest('.chart-wrap');
-  const emptyEl = $(ids.emptyEl);
-  if (!rows.length) {
-    if (chartWrap) chartWrap.classList.add('hidden');
-    if (emptyEl) emptyEl.innerHTML = '<div class="note">No strategies yet.</div>';
-    planDestroyChart(ids.chartId);
-  } else {
-    if (chartWrap) chartWrap.classList.remove('hidden');
-    if (emptyEl) emptyEl.innerHTML = '';
-    const anyStocks = rows.some((r) => r.touchesStocks);
-    if (anyStocks) {
-      const gainRows = rows.filter((r) => r.principalGainSeries && r.principalGainSeries.length);
-      const labels = gainRows.length ? gainRows[0].principalGainSeries.map((pt) => pt.month) : [];
-      const datasets = gainRows.map((r, i) => {
-        const byMonth = new Map(r.principalGainSeries.map((pt) => [pt.month, pt.value]));
-        return { label: `${r.strategy.letter} · ${r.strategy.name} · Principal gain`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true };
-      });
-      planLineChart(ids.chartId, labels, datasets);
-    } else {
-      // Balance lines: baseline + each strategy, summed across properties.
-      const sumBalance = (proj) => {
-        const byMonth = new Map();
-        for (const per of Object.values(proj.mortgage.perProperty)) {
-          const series = per.strategy && per.strategy.series ? per.strategy.series : (per.baseline && per.baseline.series ? per.baseline.series : []);
-          for (const row of series) byMonth.set(row.month, (byMonth.get(row.month) || 0) + row.balance);
-        }
-        return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
-      };
-      const baseSeries = sumBalance(block.baseline);
-      const labels = baseSeries.map(([m]) => m);
-      const datasets = [{ label: 'Baseline', data: baseSeries.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 }];
-      rows.forEach((r, i) => {
-        const ssum = sumBalance(r.projection);
-        const byMonth = new Map(ssum);
-        datasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data: labels.map((m) => byMonth.get(m) ?? null), borderColor: planColor(i), backgroundColor: planColor(i), fill: false, pointRadius: 0, spanGaps: true });
-      });
-      planLineChart(ids.chartId, labels, datasets);
-    }
-  }
-}
 function planStrategyCardsRender(rows, projectId) {
   // Cards show figures under the FIRST selected scenario only (labeled
   // in #planStrategyCardsWorld). Rows without a comparison (the re-pick
@@ -12043,62 +11931,24 @@ function planStrategyCardsRender(rows, projectId) {
     b.addEventListener('click', (e) => { e.stopPropagation(); planWiringSelectStrategy(Number(b.dataset.planStrategySelect)); });
   });
 }
-async function loadPlanComparison(projectId) {
+async function loadPlanStrategyCards(projectId) {
   const scenarios = (planProjectData && planProjectData.scenarios) || [];
   // Picker default: the base scenario pre-checked — a visible default
   // the user can change, not a silent fallback. No scenarios = the flat
-  // world, and no picker at all.
+  // world. (Wiring scenario selection lives on the scenario cards;
+  // there is no scenario picker on the project page anymore.)
   if (planCompareScenarioIds === null) {
     const base = scenarios.find((x) => x.is_base) || scenarios[0];
     planCompareScenarioIds = base ? [base.id] : [];
   }
-  const picker = $('#planCompareScenarios');
-  if (picker) {
-    if (!scenarios.length) {
-      picker.innerHTML = '';
-    } else {
-      picker.innerHTML = `<div class="toolbar"><span>Scenarios:</span>${scenarios.map((sc) => `<label class="btnlike"><input type="checkbox" data-plan-compare-scenario="${sc.id}"${planCompareScenarioIds.includes(sc.id) ? ' checked' : ''}> ${esc(sc.name)}${sc.is_base ? ' (Default)' : ''}</label>`).join(' ')}</div>`;
-      picker.querySelectorAll('[data-plan-compare-scenario]').forEach((cb) => cb.addEventListener('change', () => {
-        planCompareScenarioIds = [...picker.querySelectorAll('[data-plan-compare-scenario]:checked')].map((el) => Number(el.dataset.planCompareScenario));
-        loadPlanComparison(projectId);
-      }));
-    }
-  }
   const worldEl = $('#planStrategyCardsWorld');
   // PINNED-INPUT RULE: scenarios exist but none picked = a re-pick
-  // panel only. No table, no chart, no card figures — nothing renders
-  // under a world the user did not pick.
+  // panel only. No card figures — nothing renders under a world the
+  // user did not pick. (Unreachable via UI since wiring is
+  // single-select, but kept defensively.)
   if (scenarios.length && !planCompareScenarioIds.length) {
     if (worldEl) worldEl.innerHTML = '<div class="note">Pick a scenario to compare under.</div>';
     planStrategyCardsRender((planProjectData.strategies || []).map((st) => ({ strategy: st, comparison: null, sink: null })), projectId);
-    $('#planCompareTable').innerHTML = '';
-    $('#planBaselineRates').innerHTML = '';
-    $('#planCompareBlocksExtra').innerHTML = '';
-    const chartWrap = document.querySelector('#planCompareChart')?.closest('.chart-wrap');
-    if (chartWrap) chartWrap.classList.add('hidden');
-    $('#planCompareEmpty').innerHTML = '<div class="note">Pick a scenario to compare under.</div>';
-    planDestroyChart('planCompareChart');
-    // The new comparison panel follows the same rule: no numbers
-    // under an unpicked world — chart hidden, tables cleared.
-    planCompareNewBlock = null;
-    planDestroyChart('planTrajectoryChart');
-    planDestroyChart('planTrajectoryBreakdownChart');
-    const trajWrap = document.querySelector('#planCompareNewPanel .plan-traj-wrap');
-    if (trajWrap) trajWrap.style.display = 'none';
-    const trajBreakWrap = document.querySelector('#planCompareNewPanel .plan-traj-breakdown-wrap');
-    if (trajBreakWrap) trajBreakWrap.style.display = 'none';
-    const trajRange = $('#planTrajRange');
-    if (trajRange) trajRange.innerHTML = '';
-    const trajBreakEmpty = $('#planTrajectoryBreakdownEmpty');
-    if (trajBreakEmpty) trajBreakEmpty.innerHTML = '';
-    const trajNote = $('#planTrajectoryNote');
-    if (trajNote) trajNote.textContent = 'Pick a scenario to compare under.';
-    const trajEmpty = $('#planTrajectoryEmpty');
-    if (trajEmpty) trajEmpty.innerHTML = '';
-    const merged = $('#planMergedTable');
-    if (merged) merged.innerHTML = '';
-    const pickerNew = $('#planComparePicker');
-    if (pickerNew) pickerNew.innerHTML = '';
     planWiringRefresh();
     return;
   }
@@ -12107,23 +11957,9 @@ async function loadPlanComparison(projectId) {
   const blocks = data.scenarioBlocks && data.scenarioBlocks.length ? data.scenarioBlocks : [{ scenario: data.scenario, baseline: data.baseline, strategies: data.strategies, report: data.report }];
   const first = blocks[0];
   if (worldEl) worldEl.innerHTML = first.scenario ? `<div class="note">Under ${esc(first.scenario.name)}</div>` : '<div class="note">Current rates (no scenario)</div>';
-  // The first block keeps the legacy containers, so existing table/chart
-  // pins keep working; further blocks render below with suffixed ids.
-  planCompareBlockRender(first, { tableEl: '#planCompareTable', chartId: 'planCompareChart', emptyEl: '#planCompareEmpty', ratesEl: '#planBaselineRates' });
-  const extra = $('#planCompareBlocksExtra');
-  if (extra) {
-    extra.innerHTML = blocks.slice(1).map((b, i) => `
-      <div class="section-head"><h3>Under ${esc(b.scenario ? b.scenario.name : 'Current rates')}</h3></div>
-      <div class="chart-wrap" style="height:280px"><canvas id="planCompareChart-${i + 1}"></canvas></div>
-      <div id="planCompareEmpty-${i + 1}"></div>
-      <div id="planCompareTable-${i + 1}"></div>
-      <div id="planBaselineRates-${i + 1}"></div>`).join('');
-    blocks.slice(1).forEach((b, i) => planCompareBlockRender(b, { tableEl: `#planCompareTable-${i + 1}`, chartId: `planCompareChart-${i + 1}`, emptyEl: `#planCompareEmpty-${i + 1}`, ratesEl: `#planBaselineRates-${i + 1}` }));
-  }
+  // Strategy cards carry the per-strategy figures under the picked
+  // world; the comparison itself (table/chart) lives in reports only.
   planStrategyCardsRender(first.strategies, projectId);
-  // Overlay trajectory + master table + Apple compare follow the
-  // first selected block; further blocks keep the legacy rendering.
-  planCompareNewRender(first);
   planWiringRefresh();
 }
 // Report scenario picker: base pre-checked (a visible default, not a
@@ -13487,15 +13323,10 @@ function planDiffRender(d) {
 }
 
 // -------------------------------------------- project comparison --
-// Project page "Strategy comparison" panel: an overlaid total-value
-// trajectory chart (baseline + all strategies, from the comparison
-// block's report trajectories), a master table of absolute figures,
-// and an Apple-style compare (baseline absolute, strategies as
-// deltas, nonzero deltas bold). It follows the FIRST selected
-// scenario block, labeled under its world; the re-pick state clears
-// it like the legacy comparison.
-let planAppleIds = null;
-let planCompareNewBlock = null;
+// Shared comparison renderers: report-only since the project-page
+// panel was removed. The report view passes report-scoped ids +
+// its own picker/range state; the same code renders the Δ chart,
+// the breakdown bars and the merged table.
 function planMortAbs(proj, side) {
   let payment = null, payoff = null;
   for (const per of Object.values((proj.mortgage && proj.mortgage.perProperty) || {})) {
@@ -13537,23 +13368,10 @@ function planBaselineValue(block) {
   if (base && base.monthly && base.monthly.length) return base.monthly[base.monthly.length - 1].total_value;
   return null;
 }
-// Shared comparison renderers: the project page calls with no ids
-// (project-page elements + module state); the report view passes
-// report-scoped ids + its own state so the same code renders both
-// without duplication.
-const planCompareDefaultIds = () => ({
-  note: '#planTrajectoryNote', chart: 'planTrajectoryChart', empty: '#planTrajectoryEmpty',
-  wrapSel: '#planCompareNewPanel .plan-traj-wrap',
-  range: '#planTrajRange', breakdown: 'planTrajectoryBreakdownChart', breakdownEmpty: '#planTrajectoryBreakdownEmpty',
-  breakdownWrapSel: '#planCompareNewPanel .plan-traj-breakdown-wrap',
-  picker: '#planComparePicker', merged: '#planMergedTable',
-});
-// Difference-chart range state: module-global for the project page,
-// per-ctx for the report view (mirrors the picker split). The active
-// target lets the shared month picker re-render the panel it came
-// from; only one comparison panel is visible at a time, so a single
-// active target is safe.
-let planTrajState = { preset: 'all', from: '', to: '' };
+// Difference-chart range state: per-ctx for the report view. The
+// active target lets the shared month picker re-render the panel
+// it came from; only one comparison panel is visible at a time, so
+// a single active target is safe.
 let planTrajSpan = null;
 let planTrajActive = null;
 function planTrajEffectiveRange(months, st) {
@@ -13573,22 +13391,21 @@ function planTrajRangeHtml(st, months) {
   return `<div class="toolbar">${presets.map((p) => `<button class="small${st.preset === p ? ' active' : ''}" data-plan-traj-preset="${p}">${p === 'all' ? 'All' : p}</button>`).join(' ')} <span class="range-label">${eff.length ? `${formatYM(eff[0])} – ${formatYM(eff[eff.length - 1])}` : '—'}</span> <button class="small month-field" data-plan-traj-month="from" data-value="${st.from || ''}">${st.from ? formatYM(st.from) : 'From'}</button> <button class="small month-field" data-plan-traj-month="to" data-value="${st.to || ''}">${st.to ? formatYM(st.to) : 'To'}</button></div>`;
 }
 function planCompareNewRender(block, ids) {
-  const t = ids || planCompareDefaultIds();
-  if (ids) { t.block = block; if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id); }
-  else { planCompareNewBlock = block; t.block = block; if (planAppleIds == null) planAppleIds = block.strategies.map((r) => r.strategy.id); }
-  // Picker state lives on the target (module globals for the
-  // project page, the passed ctx for the report view) so each view's
+  const t = ids;
+  t.block = block;
+  if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id);
+  // Picker state lives on the passed ctx so each report view's
   // picker re-renders only its own panel.
-  t.getAppleIds = () => (ids ? t.appleIds : planAppleIds);
-  t.setAppleIds = (v) => { if (ids) t.appleIds = v; else planAppleIds = v; };
+  t.getAppleIds = () => t.appleIds;
+  t.setAppleIds = (v) => { t.appleIds = v; };
   const note = $(t.note);
   if (note) note.textContent = block.scenario ? `Under ${block.scenario.name}` : 'Current rates (no scenario)';
   const trajs = (block.report && block.report.trajectories) || [];
   const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
   // Range state + active target (month picker re-renders this panel).
-  if (ids) { if (t.trajState == null) t.trajState = { preset: 'all', from: '', to: '' }; }
-  const trajState = ids ? t.trajState : planTrajState;
-  planTrajActive = { block, ids: ids || null };
+  if (t.trajState == null) t.trajState = { preset: 'all', from: '', to: '' };
+  const trajState = t.trajState;
+  planTrajActive = { block, ids };
   planTrajSpan = months.length ? { start: months[0], end: months[months.length - 1] } : null;
   const rangeEl = $(t.range);
   if (rangeEl) {
@@ -13653,11 +13470,10 @@ function planCompareNewRender(block, ids) {
   }
   // Strategy picker: horizontal toggle chips at the panel top. One
   // picker drives the difference chart, the breakdown bars and the
-  // merged table. Report view only: each pinned chip also carries a
-  // × that removes the strategy from the report's pins (PUT +
-  // reload) — persistent, unlike the chip toggle, which only hides
-  // it from this view. The project page has no report, so its chips
-  // stay toggle-only.
+  // merged table. Each pinned chip also carries a × that removes
+  // the strategy from the report's pins (PUT + reload) —
+  // persistent, unlike the chip toggle, which only hides it from
+  // this view.
   const picker = $(t.picker);
   if (picker) {
     const removable = typeof t.onRemoveStrategy === 'function';
@@ -13697,10 +13513,9 @@ function planCompareNewRender(block, ids) {
 // (strategy month = baseline month − shift); otherwise the shift
 // alone (old Apple form), never a pair that contradicts itself.
 function planMergedRender(t) {
-  t = t || planCompareDefaultIds();
-  const block = t.block || planCompareNewBlock;
+  const block = t.block;
   if (!block) return;
-  const appleIds = t.getAppleIds ? t.getAppleIds() : planAppleIds;
+  const appleIds = t.getAppleIds();
   const picked = block.strategies.filter((r) => appleIds && appleIds.includes(r.strategy.id));
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const payMeta = planPaymentScopeMeta(block);
@@ -13743,7 +13558,7 @@ function planMergedRender(t) {
     : `<td><div>${c.abs}</div><div class="plan-cell-delta${c.bold ? ' plan-diff' : ''}">${c.delta}</div></td>`);
   const head = '<tr><th></th><th>Baseline</th>' + picked.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('') + '</tr>';
   const body = rows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + picked.map((r) => cell(row.strat(r))).join('') + '</tr>').join('');
-  const host = $(t.merged || '#planMergedTable');
+  const host = $(t.merged);
   if (!host) return;
   host.innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table>`
     + (picked.length === 0 && block.strategies.length > 0 ? '<div class="note">Pick a strategy to compare.</div>' : '');
