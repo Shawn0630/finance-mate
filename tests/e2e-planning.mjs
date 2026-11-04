@@ -2488,9 +2488,12 @@ export async function run(H, S) {
         chart: !!document.querySelector('#planDiffChart'),
         allActive: !!document.querySelector('[data-plan-diff-preset="all"].active'),
         presets: [...document.querySelectorAll('[data-plan-diff-preset]')].map((b) => b.dataset.planDiffPreset),
+        pagerYears: [...document.querySelectorAll('#planDiffYearPager [data-plan-diff-year]')].map((b) => b.dataset.planDiffYear),
+        pagerActive: document.querySelector('#planDiffYearPager [data-plan-diff-year].active')?.dataset.planDiffYear || null,
+        totalRows: document.querySelectorAll('#planDiffTable tbody tr.plan-year-total').length,
       }));
       H.check('comparison: strategy detail diff section renders baseline/strategy/diff columns, All default',
-        diff.panel && diff.head.includes('Baseline') && diff.head.includes('Strategy') && diff.head.includes('Δ') && diff.rows > 0 && diff.chart && diff.allActive && diff.presets.includes('all'),
+        diff.panel && diff.head.includes('Baseline') && diff.head.includes('Strategy') && diff.head.includes('Δ') && diff.rows > 0 && diff.chart && diff.allActive && diff.presets.includes('all') && diff.totalRows === 1,
         JSON.stringify(diff));
       // Monthly row count vs the API month union (same union the
       // client builds: mortgage baseline/strategy + stock series).
@@ -2500,17 +2503,38 @@ export async function run(H, S) {
       for (const per of Object.values((r.data.projection.mortgage.perProperty || {}))) for (const pt of ((per.strategy && per.strategy.series) || [])) apiMonths.add(pt.month);
       for (const pt of (((r.data.baseline.stocks) || {}).series || [])) apiMonths.add(pt.month);
       for (const pt of (((r.data.projection.stocks) || {}).series || [])) apiMonths.add(pt.month);
-      H.check('comparison: diff monthly table covers the full projection span by default',
-        diff.rows === apiMonths.size, JSON.stringify({ rows: diff.rows, apiMonths: apiMonths.size }));
+      // Year pager semantics: the default page is the FIRST year of
+      // the span (not the whole span); the pager lists every span
+      // year, and paging through all years covers the full span.
+      const spanYears = [...new Set([...apiMonths].map((m) => m.slice(0, 4)))].sort();
+      const firstYearMonths = [...apiMonths].filter((m) => m.slice(0, 4) === spanYears[0]).length;
+      H.check('cleanup: diff table pages by year — default first year, pager lists the span years',
+        JSON.stringify(diff.pagerYears) === JSON.stringify(spanYears) && diff.pagerActive === spanYears[0] && diff.rows === firstYearMonths && diff.totalRows === 1,
+        JSON.stringify({ pagerYears: diff.pagerYears, pagerActive: diff.pagerActive, rows: diff.rows, firstYearMonths, spanYears }));
+      let pagedRows = diff.rows;
+      for (const y of spanYears.slice(1)) {
+        await page.click(`#planDiffYearPager [data-plan-diff-year="${y}"]`);
+        await waitC(300);
+        pagedRows += await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
+      }
+      H.check('cleanup: diff pager pages sum to the full projection span',
+        pagedRows === apiMonths.size, JSON.stringify({ pagedRows, apiMonths: apiMonths.size }));
+      await page.click(`#planDiffYearPager [data-plan-diff-year="${spanYears[0]}"]`);
+      await waitC(300);
       await page.click('[data-plan-diff-preset="1y"]');
       await waitC(800);
-      const shortRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
-      H.check('comparison: diff 1y preset narrows the monthly table',
-        shortRows > 0 && shortRows <= 12 && shortRows < diff.rows, JSON.stringify({ shortRows, fullRows: diff.rows }));
+      const shortState = await page.evaluate(() => ({
+        rows: document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length,
+        pagerYears: [...document.querySelectorAll('#planDiffYearPager [data-plan-diff-year]')].map((b) => b.dataset.planDiffYear),
+      }));
+      const first12Years = [...new Set([...apiMonths].sort().slice(0, 12).map((m) => m.slice(0, 4)))];
+      H.check('cleanup: diff 1y preset narrows the pager to the first 12 months',
+        shortState.rows > 0 && shortState.rows <= 12 && JSON.stringify(shortState.pagerYears) === JSON.stringify(first12Years),
+        JSON.stringify({ shortState, first12Years }));
       await page.click('[data-plan-diff-preset="all"]');
       await waitC(800);
       const backRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
-      H.check('comparison: diff All preset restores the full table', backRows === diff.rows, JSON.stringify({ backRows, fullRows: diff.rows }));
+      H.check('comparison: diff All preset restores the first-year page', backRows === diff.rows, JSON.stringify({ backRows, fullRows: diff.rows }));
       await page.click('[data-plan-diff-gran="annual"]');
       await waitC(800);
       const annual = await page.evaluate(() => ({
@@ -3570,6 +3594,7 @@ export async function run(H, S) {
           modelLast: idx('Model') === heads.length - 1 || idx('Model') > idx('Penalties'),
           mortCap: !!document.querySelector('#planStrategyMortChart')?.closest('.panel')?.textContent.includes('X: month'),
           stockCap: !!document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent.includes('X: month'),
+          stockPanel: !!document.querySelector('#planStrategyStockChart'),
           diffCap: (document.querySelector('#planDiffCaption')?.textContent || '').includes('X: month'),
           diffBreak: !!document.querySelector('#planDiffBreakdownChart'),
           diffBreakLabels: chartLabels('planDiffBreakdownChart'),
@@ -3582,7 +3607,11 @@ export async function run(H, S) {
       H.check('detail-clarity: panel order — Assumptions top, Describe after Operations, Report + Penalties above Model',
         order.asmTop && order.describeAfterOps && order.reportAfterDiff && order.penAfterReport && order.modelLast, JSON.stringify(order.heads));
       H.check('detail-clarity: detail charts + diff carry axis captions and a breakdown chart',
-        order.mortCap && order.stockCap && order.diffCap && order.diffBreak && order.diffBreakLabels > 12 && order.diffBreakCap, JSON.stringify(order));
+        order.mortCap && order.diffCap && order.diffBreak && order.diffBreakLabels > 12 && order.diffBreakCap, JSON.stringify(order));
+      // DC strat is mortgage-only (prepay + rate switch, no stock
+      // op, no sink) — the Stock value chart must be hidden.
+      H.check('cleanup: mortgage-only strategy hides the Stock value chart',
+        !order.stockPanel && !order.stockCap, JSON.stringify(order));
       H.check('detail-clarity: assumptions panel has per-assumption Delete, privilege preset from API',
         order.asmDel.includes('comparableRate') && order.asmDel.includes('privilegePct') && order.privVal.replace(/,/g, '') === '10' && order.privChecked, JSON.stringify(order));
       await page.click('[data-plan-asm-del="privilegePct"]');
@@ -3598,39 +3627,63 @@ export async function run(H, S) {
       const privAsm = (r.data.assumptions || []).find((a) => a.key === 'privilegePct');
       H.check('detail-clarity: deleted assumption is NULL + unconfirmed in the API',
         r.status === 200 && privAsm && privAsm.value == null && !privAsm.confirmed, JSON.stringify(privAsm));
-      // Diff year grouping: annual-sum rows equal the year's monthly
-      // sums (flows, ±10¢ rounding) and year-end balances. Column
-      // indices come from the header, so a stock column never shifts
-      // the comparison.
-      const grouping = await page.evaluate(() => {
-        const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
-        const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
-        const col = (name) => headCells.indexOf(name);
-        const rows = [...document.querySelectorAll('#planDiffTable tbody tr')];
-        const groups = [];
-        let cur = null;
-        for (const tr of rows) {
-          if (tr.classList.contains('plan-year-head')) { cur = { year: tr.textContent.trim(), months: [], total: null }; groups.push(cur); }
-          else if (tr.classList.contains('plan-year-total')) { if (cur) cur.total = [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()); }
-          else if (cur) cur.months.push([...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
-        }
-        const full = groups.filter((g) => g.months.length >= 12 && g.total);
-        const checked = full.map((g) => {
-          const sum = (i) => g.months.reduce((a, m) => a + (parse(m[i]) || 0), 0);
-          const last = g.months[g.months.length - 1];
+      // Diff year pager: each page holds one year's months + its
+      // annual-sum row (same arithmetic as the old grouped table —
+      // flows summed, balances year-end), verified page by page.
+      await page.click('[data-plan-diff-gran="monthly"]');
+      await waitD(800);
+      const pagerYears = await page.evaluate(() => [...document.querySelectorAll('#planDiffYearPager [data-plan-diff-year]')].map((b) => b.dataset.planDiffYear));
+      const grouped = [];
+      for (const y of pagerYears) {
+        await page.click(`#planDiffYearPager [data-plan-diff-year="${y}"]`);
+        await waitD(300);
+        grouped.push(await page.evaluate(() => {
+          const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+          const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+          const col = (name) => headCells.indexOf(name);
+          const rows = [...document.querySelectorAll('#planDiffTable tbody tr')];
+          let cur = null;
+          for (const tr of rows) {
+            if (tr.classList.contains('plan-year-head')) { cur = { year: tr.textContent.trim(), months: [], total: null }; }
+            else if (tr.classList.contains('plan-year-total')) { if (cur) cur.total = [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()); }
+            else if (cur) cur.months.push([...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+          }
+          if (!cur || !cur.total || !cur.months.length) return null;
+          const sum = (i) => cur.months.reduce((a, m) => a + (parse(m[i]) || 0), 0);
+          const last = cur.months[cur.months.length - 1];
           return {
-            year: g.year,
-            intSavedOk: Math.abs(sum(col('Interest saved')) - (parse(g.total[col('Interest saved')]) || 0)) <= 0.10,
-            intBaseOk: Math.abs(sum(col('Baseline interest')) - (parse(g.total[col('Baseline interest')]) || 0)) <= 0.10,
-            balOk: g.total[col('Baseline balance')] === last[col('Baseline balance')]
-              && g.total[col('Strategy balance')] === last[col('Strategy balance')]
-              && g.total[col('Balance Δ')] === last[col('Balance Δ')],
+            year: cur.year,
+            months: cur.months.length,
+            intSavedOk: Math.abs(sum(col('Interest saved')) - (parse(cur.total[col('Interest saved')]) || 0)) <= 0.10,
+            intBaseOk: Math.abs(sum(col('Baseline interest')) - (parse(cur.total[col('Baseline interest')]) || 0)) <= 0.10,
+            balOk: cur.total[col('Baseline balance')] === last[col('Baseline balance')]
+              && cur.total[col('Strategy balance')] === last[col('Strategy balance')]
+              && cur.total[col('Balance Δ')] === last[col('Balance Δ')],
           };
-        });
-        return { groups: groups.length, full: full.length, checked };
-      });
-      H.check('detail-clarity: diff monthly table groups by year with annual-sum rows (flows summed, balances year-end)',
-        grouping.groups >= 2 && grouping.checked.length > 0 && grouping.checked.every((c) => c.intSavedOk && c.intBaseOk && c.balOk), JSON.stringify(grouping));
+        }));
+      }
+      H.check('detail-clarity: diff monthly table pages by year with annual-sum rows (flows summed, balances year-end)',
+        grouped.length >= 2 && grouped.every((g) => g && g.intSavedOk && g.intBaseOk && g.balOk) && grouped.some((g) => g.months >= 12),
+        JSON.stringify({ years: grouped.length, checked: grouped }));
+      // A strategy with a buy op shows the Stock value chart.
+      // Self-contained fixture: the earlier Detail Buy project is
+      // deleted by its own block's cleanup, so it cannot be reused.
+      r = await H.req('POST', '/api/planning/projects', { name: 'Cleanup Stock Chart', question: 'q' });
+      H.check('cleanup: stock-chart pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+      const scProjectId = r.data.project.id;
+      r = await H.req('POST', `/api/planning/projects/${scProjectId}/strategies`, { name: 'Cleanup Buy Strat', source: 'template' });
+      H.check('cleanup: stock-chart pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const scStrategyId = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/strategies/${scStrategyId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
+      H.check('cleanup: stock-chart pin buy op posted', r.status === 201, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${scStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const buyStock = await page.evaluate(() => ({
+        panel: !!document.querySelector('#planStrategyStockChart'),
+        cap: !!document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent.includes('X: month'),
+      }));
+      H.check('cleanup: stock-op strategy shows the Stock value chart',
+        buyStock.panel && buyStock.cap, JSON.stringify(buyStock));
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });

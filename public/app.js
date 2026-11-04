@@ -12627,6 +12627,14 @@ function planStrategyHtml(d) {
     <tr><td>${y}</td><td>${money2(v.base)}</td><td>${money2(v.strat)}</td><td>${planSigned(v.base - v.strat)}</td></tr>`).join('');
   const asm = {};
   for (const a of d.assumptions) asm[a.key] = a;
+  // Stock value chart only when the strategy touches stocks: a stock
+  // op (buy/sell/position) makes the strategy series differ from the
+  // do-nothing baseline, while a mortgage-only strategy's two lines
+  // coincide exactly (same holdings, no unit deltas). A sink also
+  // counts: saving a sink generates sink buy ops, and even a sink
+  // without ops overrides the strategy run's growth rate
+  // (stockReturnPct), so its series differs from baseline.
+  const showStockChart = (d.ops || []).some((o) => ['buy', 'sell', 'position'].includes(o.op_type)) || !!d.sink;
   return `
     <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
     <div class="panel">
@@ -12687,11 +12695,11 @@ function planStrategyHtml(d) {
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyMortChart"></canvas></div>
       <div class="note">X: month · Y: outstanding principal (CAD), baseline vs strategy, summed across properties.</div>
     </div>
-    <div class="panel">
+    ${showStockChart ? `<div class="panel">
       <div class="section-head"><h3>Stock value</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
       <div class="note">X: month · Y: stock value (CAD), baseline vs strategy.</div>
-    </div>
+    </div>` : ''}
     ${d.project.category === 'investment' ? `<div class="panel" id="planSinkPanel">
       <div class="section-head"><h3>Sink</h3></div>
       <div id="planFactorSink"></div>
@@ -12717,6 +12725,7 @@ function planStrategyHtml(d) {
       <div class="note" id="planDiffBreakdownCaption"></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planDiffBreakdownChart"></canvas></div>
       <div id="planDiffBreakdownEmpty"></div>
+      <div class="toolbar" id="planDiffYearPager"></div>
       <div id="planDiffTable"></div>
     </div>
     <div class="panel" id="planStrategyReportPanel">
@@ -13109,7 +13118,7 @@ function planSinkWire(d) {
 // months); All is the default — projections have no 1-year
 // trailing default. Charts are legend-toggle-only like every
 // planning chart (never wired to the Colors panel).
-let planDiffState = { strategyId: null, gran: 'monthly', preset: 'all', from: '', to: '' };
+let planDiffState = { strategyId: null, gran: 'monthly', preset: 'all', from: '', to: '', year: null };
 let planDiffData = null;
 let planDiffSpan = null;
 function planDiffMonthly(d) {
@@ -13197,7 +13206,7 @@ function planDiffRender(d) {
   d = planDiffData;
   const host = $('#planDiffPanel');
   if (!host || !d) return;
-  if (planDiffState.strategyId !== d.strategy.id) planDiffState = { strategyId: d.strategy.id, gran: 'monthly', preset: 'all', from: '', to: '' };
+  if (planDiffState.strategyId !== d.strategy.id) planDiffState = { strategyId: d.strategy.id, gran: 'monthly', preset: 'all', from: '', to: '', year: null };
   const monthly = planDiffMonthly(d);
   const hasMort = monthly.some((r) => r.balBase != null || r.balStrat != null);
   const hasStock = monthly.some((r) => r.valBase != null || r.valStrat != null);
@@ -13221,6 +13230,7 @@ function planDiffRender(d) {
     if (empty) empty.innerHTML = '<div class="note">No months in this range.</div>';
     const cap0 = $('#planDiffCaption'); if (cap0) cap0.textContent = '';
     const bCap0 = $('#planDiffBreakdownCaption'); if (bCap0) bCap0.textContent = '';
+    const pg0 = $('#planDiffYearPager'); if (pg0) pg0.innerHTML = '';
     $('#planDiffTable').innerHTML = '';
     return;
   }
@@ -13232,6 +13242,7 @@ function planDiffRender(d) {
   const bWrap = document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap');
   if (bWrap) bWrap.style.display = '';
   if (planDiffState.gran === 'annual') {
+    const pgA = $('#planDiffYearPager'); if (pgA) pgA.innerHTML = '';
     if (cap) cap.textContent = 'X: year · Y: CAD — Equity Δ = the year\'s peak monthly balance advantage; Value Δ = year-end.';
     if (bTitle) bTitle.textContent = 'Annual payment breakdown';
     if (bCap) bCap.textContent = 'X: year · Y: CAD per year — scheduled payment split into interest (solid) + principal (light), baseline vs strategy, summed over the year\'s months.';
@@ -13293,6 +13304,18 @@ function planDiffRender(d) {
     if (hasMort) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Balance Δ</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
     if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
     head += '</tr>';
+    // Year pager, table only (charts keep the full filtered range):
+    // one year per page — the year's months + its annual total row.
+    // Default = first year of the filtered span; a year outside the
+    // span (after a preset/range change) falls back to the first.
+    const pageYears = [...new Set(filtered.map((r) => r.month.slice(0, 4)))];
+    if (!planDiffState.year || !pageYears.includes(planDiffState.year)) planDiffState.year = pageYears[0] || null;
+    const pager = $('#planDiffYearPager');
+    if (pager) {
+      pager.innerHTML = pageYears.length > 1 ? pageYears.map((y) => `<button class="small${y === planDiffState.year ? ' active' : ''}" data-plan-diff-year="${y}">${y}</button>`).join('') : '';
+      pager.querySelectorAll('[data-plan-diff-year]').forEach((b) => b.addEventListener('click', () => { planDiffState.year = b.dataset.planDiffYear; planDiffRender(); }));
+    }
+    const pageRows = filtered.filter((r) => r.month.slice(0, 4) === planDiffState.year);
     // Monthly rows group BY YEAR: a year header, the year's months,
     // then an annual-sum row — flows summed over the year's months,
     // balances/value at year-end.
@@ -13308,7 +13331,7 @@ function planDiffRender(d) {
       if (hasStock) rows += `<td>${planMoney(last.valBase)}</td><td>${planMoney(last.valStrat)}</td><td${diffCls(last.valDiff)}>${planSigned(last.valDiff)}</td>`;
       rows += '</tr>';
     };
-    for (const r of filtered) {
+    for (const r of pageRows) {
       const y = r.month.slice(0, 4);
       if (y !== curYear) { flushYear(); curYear = y; yearRows = []; rows += `<tr class="plan-year-head"><td colspan="${cols}">${y}</td></tr>`; }
       yearRows.push(r);
