@@ -1200,6 +1200,10 @@ export async function run(H, S) {
   H.check('modalbeautify: fixture strategy four created',
     r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const mbStrat4 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${metaBuyId}/strategies`, { name: 'MB Strat With A Very Long Name That Must Wrap Gracefully Inside Its Own Chip And Never Break Out Of The Row Layout At All', source: 'manual' });
+  H.check('modalchips: fixture long-name strategy created',
+    r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const mbStratLong = r.data.strategy.id;
   r = await H.req('POST', '/api/planning/projects', { name: 'Tieralign Plan' });
   H.check('tieralign: fixture project created',
     r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
@@ -1301,6 +1305,43 @@ export async function run(H, S) {
           && styleState.pickRadius === '999px' && styleState.genSmall && styleState.genPrimary
           && styleState.modelBoxes && styleState.modelSelectGone,
         JSON.stringify(styleState));
+      // --- pick-chip geometry (modalchips): horizontal chips, flowing
+      // rows, graceful wrap for long names, checked styling kept ---
+      const chipState = await page.evaluate(() => {
+        const box = document.querySelector('#planReportAiStrategies');
+        const chips = [...box.querySelectorAll('label')];
+        const bRect = box.getBoundingClientRect();
+        const short = chips[0];
+        const sRect = short ? short.getBoundingClientRect() : null;
+        const sCb = short ? short.querySelector('input[type="checkbox"]') : null;
+        const long = chips.find((c) => c.textContent.includes('Very Long Name'));
+        const lRect = long ? long.getBoundingClientRect() : null;
+        const sCs = short ? getComputedStyle(short) : null;
+        const tops = chips.slice(0, 2).map((c) => c.getBoundingClientRect().top);
+        return {
+          shortH: sRect ? sRect.height : null,
+          shortCbW: sCb ? sCb.getBoundingClientRect().width : null,
+          rowTopsEqual: tops.length === 2 && Math.abs(tops[0] - tops[1]) < 1,
+          longRight: lRect ? lRect.right : null,
+          boxRight: bRect.right,
+          longLeft: lRect ? lRect.left : null,
+          boxLeft: bRect.left,
+          longH: lRect ? lRect.height : null,
+          checkedBorder: sCs ? sCs.borderColor : '',
+          checkedBg: sCs ? sCs.backgroundColor : '',
+        };
+      });
+      H.check('modalchips: short pick renders as a single-line horizontal chip',
+        chipState.shortH !== null && chipState.shortH <= 32 && chipState.shortCbW !== null && chipState.shortCbW <= 20,
+        JSON.stringify(chipState));
+      H.check('modalchips: several chips flow on one row',
+        chipState.rowTopsEqual, JSON.stringify(chipState));
+      H.check('modalchips: long strategy name wraps inside its chip without breaking the row',
+        chipState.longRight !== null && chipState.longRight <= chipState.boxRight + 1 && chipState.longLeft >= chipState.boxLeft - 1 && chipState.longH > 32,
+        JSON.stringify(chipState));
+      H.check('modalchips: checked chip keeps the blue border + light-blue background',
+        chipState.checkedBorder === 'rgb(22, 104, 196)' && chipState.checkedBg === 'rgb(240, 246, 252)',
+        JSON.stringify(chipState));
       // --- multi-select: two strategies designed + attached ---
       fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
       const pinsBefore = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b));
@@ -1330,6 +1371,9 @@ export async function run(H, S) {
       const pinsAfter = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b));
       H.check('modalbeautify: model picks leave the report Strategies pins unchanged',
         JSON.stringify(pinsBefore) === JSON.stringify(pinsAfter), JSON.stringify({ pinsBefore, pinsAfter }));
+      H.check('modalchips: Model multi-select flow still attaches both models after the chip fix',
+        m1.data.model && m1.data.model.source === 'ai' && m2.data.model && m2.data.model.source === 'ai',
+        JSON.stringify({ m1: m1.data.model && m1.data.model.source, m2: m2.data.model && m2.data.model.source }));
       // --- failure on one does not block the other: the failing
       // strategy is checked FIRST (DOM order), so the later strategy
       // must still design after the failure.

@@ -639,7 +639,12 @@ table.seg-table td:last-child { text-align: right; }
 #planReportAiModal .plan-ai-modal-card .section-head { margin-bottom: 8px; }
 #planReportAiModal .plan-ai-modal-card .section-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
 #planReportAiModal .plan-ai-picks { display: flex; flex-wrap: wrap; gap: 8px; }
-#planReportAiModal .plan-ai-picks label { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d5dde5; border-radius: 999px; padding: 4px 10px; font-size: 13px; cursor: pointer; }
+#planReportAiModal .plan-ai-picks label { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d5dde5; border-radius: 999px; padding: 4px 10px; font-size: 13px; cursor: pointer; margin: 0; }
+/* The global input rule (width: 100%) also hits checkboxes: inside a
+   pick label it inflated the checkbox to ~45% of the chip and squeezed
+   the text into a word-per-line column. Native size + no flex here,
+   same as the spending category checkboxes. */
+#planReportAiModal .plan-ai-picks label input[type="checkbox"] { width: auto; flex: none; margin: 0; padding: 0; }
 #planReportAiModal .plan-ai-picks label:has(input:checked) { border-color: #1668c4; background: #f0f6fc; }
 /* Shared world note above the middle row: the scenario applies to
    BOTH baseline and strategy (both are evaluated inside its world),
