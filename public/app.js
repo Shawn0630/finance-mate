@@ -12841,6 +12841,28 @@ function planStrategyHtml(d) {
   // without ops overrides the strategy run's growth rate
   // (stockReturnPct), so its series differs from baseline.
   const showStockChart = (d.ops || []).some((o) => ['buy', 'sell', 'position'].includes(o.op_type)) || !!d.sink;
+  // Assumptions follow THIS strategy, never one global set: the
+  // sections shown depend on the strategy's own ops (a sink counts
+  // as stock — it is investment equipment that overrides the
+  // strategy run's growth rate). Empty strategies get a neutral
+  // note, never a guessed set.
+  const asmHasStock = (d.ops || []).some((o) => ['buy', 'sell', 'position'].includes(o.op_type)) || !!d.sink;
+  const asmHasMortgage = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type));
+  const asmNum = (v) => { const x = Number(v); return Number.isFinite(x) ? x : null; };
+  // Effective stock return, mirroring how the numbers are computed
+  // (server planProjectionFor): a sink return wins over the picked
+  // scenario's stock factor, which wins over per-holding historical
+  // rates. Displayed read-only with its source labeled; editing
+  // stays on the scenario page (or the Sink panel for a sink).
+  const asmSinkRet = d.sink ? (d.sink.kind === 'custom' ? asmNum(d.sink.expectedReturnPct) : asmNum(d.sink.trendPct)) : null;
+  const asmPickedScen = d.appliedScenario ? (d.scenarios || []).find((x) => x.id === d.appliedScenario.id) : null;
+  const asmScenStock = asmPickedScen && asmPickedScen.factors && asmPickedScen.factors.stock ? asmPickedScen.factors.stock : null;
+  const asmScenRet = asmScenStock ? asmNum(asmScenStock.valuePct) : null;
+  const asmStockBlock = !asmHasStock ? '' : asmSinkRet != null
+    ? `<div><label>Stock return (%/yr)</label><div>${asmSinkRet}%/yr · From sink${d.sink.kind === 'custom' && d.sink.name ? ` ${esc(d.sink.name)}` : ' trend'}</div><div class="note">The sink's return overrides the scenario return. Edit it in the Sink panel.</div>${asmScenRet != null ? `<div class="note">Scenario ${esc(asmPickedScen.name)} sets ${asmScenRet}%/yr — overridden by the sink.</div>` : ''}</div>`
+    : asmScenRet != null
+      ? `<div><label>Stock return (%/yr)</label><div>${asmScenRet}%/yr · From scenario ${esc(asmPickedScen.name)}${asmScenStock.basis ? ` (${esc(asmScenStock.basis)}${asmScenStock.window ? ` · ${esc(asmScenStock.window)}` : ''})` : ''}</div><div class="note">Set on the scenario page — shown here read-only.</div></div>`
+      : `<div><label>Stock return (%/yr)</label><div class="note">${asmPickedScen ? `Scenario ${esc(asmPickedScen.name)} sets no stock return — holdings compound at their own historical rates.` : 'Current rates (no scenario) — holdings compound at their own historical rates.'} Set a global return on the scenario page.</div></div>`;
   return `
     <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
     <div class="panel">
@@ -12874,13 +12896,15 @@ function planStrategyHtml(d) {
     </div>
     <div class="panel" id="planStrategyAsmPanel">
       <div class="section-head"><h3>Assumptions</h3></div>
-      <div class="grid2">
+      ${asmHasMortgage ? `<div class="grid2">
         <div><label>Comparable rate (%)</label><input id="planAsmComparable" type="text" inputmode="decimal" data-money value="${asm.comparableRate ? esc(asm.comparableRate.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmComparableOk"${asm.comparableRate && asm.comparableRate.confirmed ? ' checked' : ''}> Confirmed</label><div class="toolbar"><button class="small danger" data-plan-asm-del="comparableRate">Delete</button></div></div>
         <div><label>Annual prepayment privilege (%)</label><input id="planAsmPrivilege" type="text" inputmode="decimal" data-money value="${asm.privilegePct ? esc(asm.privilegePct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmPrivilegeOk"${asm.privilegePct && asm.privilegePct.confirmed ? ' checked' : ''}> Confirmed</label><div class="toolbar"><button class="small danger" data-plan-asm-del="privilegePct">Delete</button></div></div>
       </div>
       <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
       <div class="msg" id="planAsmMsg"></div>
-      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound). Stock return lives in the scenario now.</div>
+      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound).</div>` : ''}
+      ${asmStockBlock}
+      ${!asmHasMortgage && !asmHasStock ? '<div class="note">No operations yet — assumptions appear once the strategy has operations.</div>' : ''}
     </div>
     <div class="panel">
       <div class="section-head"><h3>Operations</h3>
@@ -13136,8 +13160,11 @@ function planStrategyWire(d) {
     { label: s.name, data: d.projection.stocks.series.map((r) => r.value), borderColor: planColor(1), backgroundColor: planColor(1), fill: false, pointRadius: 0 },
   ]);
   // Assumptions save (comparable rate + privilege only — stock return
-  // lives in Factors now).
-  $('#planAsmSaveBtn').addEventListener('click', async () => {
+  // lives in the scenario and is displayed read-only above). The
+  // button exists only when the mortgage section renders, so guard
+  // the binding: a stock-only or empty strategy has no Save button.
+  const asmSaveBtn = $('#planAsmSaveBtn');
+  if (asmSaveBtn) asmSaveBtn.addEventListener('click', async () => {
     const msg = $('#planAsmMsg');
     const parse = (id) => { const el = $(id); const v = el.value.replace(/,/g, '').trim(); return v === '' ? null : v; };
     try {

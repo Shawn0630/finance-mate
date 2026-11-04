@@ -3860,6 +3860,115 @@ export async function run(H, S) {
       }));
       H.check('cleanup: stock-op strategy shows the Stock value chart',
         buyStock.panel && buyStock.cap, JSON.stringify(buyStock));
+      // Assumptions follow THAT strategy: stock strategies show the
+      // picked scenario's stock return (read-only) and hide the
+      // mortgage pair; mortgage strategies keep the pair and hide
+      // the return; mixed shows both; empty shows a neutral note.
+      // (a) Stock-only, flat world (Cleanup Buy Strat's project has
+      // no scenarios): no mortgage inputs, no Save, historical note.
+      await page.goto(`http://ff.local/#planning/strategy/${scStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const asmStock = await page.evaluate(() => {
+        const t = document.querySelector('#planStrategyAsmPanel')?.textContent || '';
+        return {
+          comparable: !!document.querySelector('#planAsmComparable'),
+          privilege: !!document.querySelector('#planAsmPrivilege'),
+          save: !!document.querySelector('#planAsmSaveBtn'),
+          stockLabel: t.includes('Stock return'),
+          flatNote: t.includes('Current rates (no scenario)') && t.includes('own historical rates'),
+        };
+      });
+      H.check('asmfollow: stock strategy shows stock return, hides mortgage pair (flat world)',
+        !asmStock.comparable && !asmStock.privilege && !asmStock.save && asmStock.stockLabel && asmStock.flatNote, JSON.stringify(asmStock));
+      // (b) Mortgage-only (DC strat) keeps the pair, hides the return.
+      await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const asmMort = await page.evaluate(() => {
+        const t = document.querySelector('#planStrategyAsmPanel')?.textContent || '';
+        return {
+          comparable: !!document.querySelector('#planAsmComparable'),
+          privilege: !!document.querySelector('#planAsmPrivilege'),
+          save: !!document.querySelector('#planAsmSaveBtn'),
+          stockLabel: t.includes('Stock return'),
+        };
+      });
+      H.check('asmfollow: mortgage strategy keeps the pair, hides stock return',
+        asmMort.comparable && asmMort.privilege && asmMort.save && !asmMort.stockLabel, JSON.stringify(asmMort));
+      // (c) Picked-scenario switch changes the displayed return.
+      r = await H.req('POST', '/api/planning/projects', { name: 'Asm Follow', question: 'q' });
+      H.check('asmfollow: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+      const afProjectId = r.data.project.id;
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/strategies`, { name: 'Asm Buy Strat', source: 'template' });
+      H.check('asmfollow: pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const afBuyId = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/strategies/${afBuyId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
+      H.check('asmfollow: pin buy op posted', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/scenarios`, { name: 'Asm Stock World' });
+      H.check('asmfollow: pin stock scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      const afScenStockId = r.data.scenario.id;
+      r = await H.req('PUT', `/api/planning/scenarios/${afScenStockId}`, { factors: { stock: { valuePct: 7, basis: 'Price CAGR', window: '2025-11 → 2026-10' } } });
+      H.check('asmfollow: pin stock factor saved', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/scenarios`, { name: 'Asm Plain World' });
+      H.check('asmfollow: pin plain scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      const afScenPlainId = r.data.scenario.id;
+      await page.goto(`http://ff.local/#planning/strategy/${afBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      await page.select('#planStrategyScenarioSel', String(afScenStockId));
+      await waitD(1500);
+      const asmPicked = await page.evaluate(() => ({
+        text: document.querySelector('#planStrategyAsmPanel')?.textContent || '',
+        comparable: !!document.querySelector('#planAsmComparable'),
+      }));
+      H.check('asmfollow: picked scenario stock factor shows with source',
+        asmPicked.text.includes('7%/yr') && asmPicked.text.includes('From scenario Asm Stock World') && asmPicked.text.includes('Price CAGR') && !asmPicked.comparable, JSON.stringify(asmPicked));
+      await page.select('#planStrategyScenarioSel', String(afScenPlainId));
+      await waitD(1500);
+      const asmPlain = await page.evaluate(() => document.querySelector('#planStrategyAsmPanel')?.textContent || '');
+      H.check('asmfollow: switching to a scenario without a stock factor shows the historical-rates note',
+        asmPlain.includes('sets no stock return') && asmPlain.includes('own historical rates') && !asmPlain.includes('From scenario'), JSON.stringify(asmPlain));
+      // (d) Mixed (buy + prepay) shows both sections.
+      r = await H.req('POST', '/api/properties', {
+        address: '88 Asm Follow Lane, Victoria, BC',
+        mortgage_balance: 100000, mortgage_balance_date: '2026-10-01', amortization_years: 25,
+        purchase_date: '2020-03-15',
+      });
+      H.check('asmfollow: pin property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const afPropId = r.data.id;
+      r = await H.req('POST', `/api/properties/${afPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+      H.check('asmfollow: pin rate segment added', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/strategies`, { name: 'Asm Mixed Strat', source: 'template' });
+      H.check('asmfollow: pin mixed strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const afMixedId = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/strategies/${afMixedId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
+      H.check('asmfollow: pin mixed buy op posted', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/planning/strategies/${afMixedId}/ops`, { op_type: 'prepay', params: { propertyId: afPropId, date: planOpDate, amount: 10000, openClosed: 'open' } });
+      H.check('asmfollow: pin mixed prepay op posted', r.status === 201, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${afMixedId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const asmMixed = await page.evaluate(() => ({
+        text: document.querySelector('#planStrategyAsmPanel')?.textContent || '',
+        comparable: !!document.querySelector('#planAsmComparable'),
+        save: !!document.querySelector('#planAsmSaveBtn'),
+      }));
+      H.check('asmfollow: mixed strategy shows both sections',
+        asmMixed.comparable && asmMixed.save && asmMixed.text.includes('Stock return'), JSON.stringify(asmMixed));
+      // (e) Empty strategy (no ops) shows a neutral note, no sections.
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/strategies`, { name: 'Asm Empty Strat', source: 'template' });
+      H.check('asmfollow: pin empty strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const afEmptyId = r.data.strategy.id;
+      await page.goto(`http://ff.local/#planning/strategy/${afEmptyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const asmEmpty = await page.evaluate(() => ({
+        text: document.querySelector('#planStrategyAsmPanel')?.textContent || '',
+        comparable: !!document.querySelector('#planAsmComparable'),
+        save: !!document.querySelector('#planAsmSaveBtn'),
+      }));
+      H.check('asmfollow: empty strategy shows a neutral note, no sections',
+        !asmEmpty.comparable && !asmEmpty.save && asmEmpty.text.includes('No operations yet'), JSON.stringify(asmEmpty));
+      // Leave the picker on flat world so no cross-project scenario id
+      // leaks into later strategy visits in this browser session.
+      await page.select('#planStrategyScenarioSel', '0');
+      await waitD(1000);
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
