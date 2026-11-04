@@ -4276,7 +4276,7 @@ export async function run(H, S) {
       await waitF(800);
       const readTier = (scenId, baseId, stratId) => page.evaluate((s, b, t) => {
         const card = (kind, id) => document.querySelector(`[data-plan-${kind}="${id}"]`);
-        const styleOf = (el) => el ? { pin: el.classList.contains('plan-report-pin'), sel: el.classList.contains('plan-selected'), border: getComputedStyle(el).borderColor, outline: getComputedStyle(el).outlineColor } : null;
+        const styleOf = (el) => el ? { pin: el.classList.contains('plan-report-pin'), sel: el.classList.contains('plan-selected'), border: getComputedStyle(el).borderColor, outline: getComputedStyle(el).outlineColor, outlineStyle: getComputedStyle(el).outlineStyle, bg: getComputedStyle(el).backgroundColor, shadow: getComputedStyle(el).boxShadow } : null;
         return {
           scenPins: [...document.querySelectorAll('[data-plan-scenario].plan-report-pin')].map((el) => Number(el.dataset.planScenario)),
           basePins: [...document.querySelectorAll('[data-plan-baseline].plan-report-pin')].map((el) => Number(el.dataset.planBaseline)),
@@ -4298,14 +4298,38 @@ export async function run(H, S) {
       H.check('reporttab: per-tab Generate, AI Generate, Save buttons present; preset enabled for engine pins', tabBtns.gen && tabBtns.ai && tabBtns.save && !tabBtns.genDisabled, JSON.stringify(tabBtns));
       // Highlight: engine tab highlights its own pins on the tiers
       // above (amber); the scenario card — wiring-selected AND
-      // report-pinned — shows both states with distinct styles; the
-      // viewer sits inline on the project page.
+      // report-pinned — shows ONE combined frame: selection border
+      // + background kept, report left bar kept, amber outline
+      // dropped (no double frame); the viewer sits inline on the
+      // project page.
       const tierEngine = await readTier(fScenId, fBaseId, fStratId);
-      H.check('reporttab: engine tab highlights its own pins on the tiers above; scenario card shows both states distinctly; viewer inline',
+      H.check('reporttab: engine tab highlights its own pins on the tiers above; scenario card shows one combined frame; viewer inline',
         JSON.stringify(tierEngine.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierEngine.basePins) === JSON.stringify([fBaseId]) && tierEngine.stratPins.includes(fStratId)
           && tierEngine.scen && tierEngine.scen.pin && tierEngine.scen.sel
-          && tierEngine.scen.border === 'rgb(22, 104, 196)' && tierEngine.scen.outline === 'rgb(183, 121, 31)'
+          && tierEngine.scen.border === 'rgb(22, 104, 196)' && tierEngine.scen.bg === 'rgb(240, 246, 252)'
+          && tierEngine.scen.outlineStyle === 'none' && tierEngine.scen.shadow.includes('183, 121, 31') && tierEngine.scen.shadow.includes('inset')
           && tierEngine.inline && tierEngine.hash === `#planning/project/${fProjectId}`, JSON.stringify(tierEngine));
+      // Highlight de-stacking: the other two states. The AI
+      // strategy card is wiring-picked (all picked by default) but
+      // not engine-pinned: selected-only. Toggling the engine
+      // strategy's Select off leaves it report-pinned only; toggling
+      // back restores the combined frame. Mouse moved away first so
+      // the breakdown-card hover border cannot tint the reads.
+      const stratStyle = (id) => page.evaluate((sid) => { const el = document.querySelector(`[data-plan-strategy="${sid}"]`); if (!el) return null; const cs = getComputedStyle(el); return { pin: el.classList.contains('plan-report-pin'), sel: el.classList.contains('plan-selected'), border: cs.borderColor, bg: cs.backgroundColor, outline: cs.outlineColor, outlineStyle: cs.outlineStyle, shadow: cs.boxShadow }; }, id);
+      await page.mouse.move(0, 0);
+      const selOnly = await stratStyle(fAiStratId);
+      H.check('highlight: selected-only card shows blue border/bg, no amber frame',
+        selOnly && selOnly.sel && !selOnly.pin && selOnly.border === 'rgb(22, 104, 196)' && selOnly.bg === 'rgb(240, 246, 252)' && selOnly.outlineStyle === 'none' && selOnly.shadow === 'none', JSON.stringify(selOnly));
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fStratId}"]`);
+      await waitF(800);
+      await page.mouse.move(0, 0);
+      const pinOnly = await stratStyle(fStratId);
+      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fStratId}"]`);
+      await waitF(800);
+      const restored = await stratStyle(fStratId);
+      H.check('highlight: pinned-only card shows amber frame + left bar, no blue border; toggling back restores the combined frame',
+        pinOnly && pinOnly.pin && !pinOnly.sel && pinOnly.outline === 'rgb(183, 121, 31)' && pinOnly.outlineStyle === 'solid' && pinOnly.shadow.includes('183, 121, 31') && pinOnly.shadow.includes('inset') && pinOnly.border === 'rgb(221, 228, 236)' && pinOnly.bg === 'rgb(255, 255, 255)'
+        && restored && restored.pin && restored.sel && restored.outlineStyle === 'none' && restored.border === 'rgb(22, 104, 196)', JSON.stringify({ pinOnly, restored }));
       // Preset regenerate: touching the strategy stales the report;
       // per-tab Generate clears the stale badge (reopening the tab
       // re-reads the report, so no page reload is needed).

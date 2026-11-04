@@ -614,7 +614,12 @@ table.seg-table td:last-child { text-align: right; }
   .modal-overlay { display: none !important; }
 }
 
-/* Report-pin highlight: amber frame + left bar. It never touches
-   border/background, so it combines unambiguously with the wiring
-   Selected state (blue border + light-blue background). */
+/* Report-pin highlight: amber frame + left bar. On a card that is
+   also wiring-Selected, the amber outline drops so the two states
+   share one frame: selection border/background + report left bar,
+   no double frame (see the combined rule below). */
 .plan-report-pin { outline: 2px solid #b7791f; outline-offset: 1px; box-shadow: inset 4px 0 0 #b7791f; }
+/* Combined Selected + report-pinned: one frame carrying both
+   meanings — selection border/background kept, report left bar
+   kept (from .plan-report-pin), amber outline dropped. */
+.plan-flow-card.plan-selected.plan-report-pin { outline: none; }
