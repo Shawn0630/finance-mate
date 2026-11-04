@@ -12,6 +12,7 @@ import {
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel,
   buildPlanAiSnapshot, normalizeAiAsk,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
+  validateAiReportChartSeries, aiReportPrompt,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline, paymentScopeFor,
@@ -657,4 +658,49 @@ test('paymentScopeFor: payment covers only mortgage-op properties, never the pro
     { propertyIds: [], baseline: null, strategy: null, delta: null });
   assert.deepEqual(paymentScopeFor(base, strat, []),
     { propertyIds: [], baseline: null, strategy: null, delta: null });
+});
+
+// AI-report empty chart (user bug 2026-11-03): a series its template
+// cannot render used to come out as an all-zero stacked_bar Total.
+test('ai-report series validation rejects unrenderable template/series pairs', () => {
+  // The reported case: cost on stacked_bar.
+  assert.equal(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'Cost Comparison', series: ['cost'] }]).length, 1);
+  assert.match(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'Cost Comparison', series: ['cost'] }])[0], /cannot render series "cost"/);
+  // Same series on a template that renders it passes.
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]), []);
+  // Renderable pairs pass on every series-bearing template.
+  assert.deepEqual(validateAiReportChartSeries([
+    { template: 'time_line', title: 'T', series: ['mortgage_balance', 'stock_value', 'total_value'] },
+    { template: 'yearly_bars', title: 'Y', series: ['mortgage_balance'] },
+    { template: 'stacked_bar', title: 'S', series: ['mortgage_balance', 'stock_value'] },
+    { template: 'metric_cards', title: 'M', series: ['cost', 'gain', 'net', 'stock_gain', 'payoff_month', 'monthly_payment'] },
+    { template: 'share_doughnut', title: 'D', series: ['cost'] },
+    { template: 'share_doughnut', title: 'E', series: ['total_value'] },
+  ]), []);
+  // Other mismatches are rejected too.
+  assert.equal(validateAiReportChartSeries([{ template: 'time_line', title: 'T', series: ['cost'] }]).length, 1);
+  assert.equal(validateAiReportChartSeries([{ template: 'metric_cards', title: 'M', series: ['mortgage_balance'] }]).length, 1);
+  assert.equal(validateAiReportChartSeries([{ template: 'share_doughnut', title: 'D', series: ['gain'] }]).length, 1);
+  // Absent or empty series is not an error: the renderer falls back
+  // to its default series for that template.
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'S' }]), []);
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'S', series: [] }]), []);
+  // fan_band / funds_flow ignore series, so they are not validated.
+  assert.deepEqual(validateAiReportChartSeries([
+    { template: 'fan_band', title: 'F', series: ['cost'] },
+    { template: 'funds_flow', title: 'W', series: ['cost'] },
+  ]), []);
+  assert.deepEqual(validateAiReportChartSeries('nope'), ['charts must be an array']);
+});
+
+test('ai-report prompt grounds the model in template/series support and snapshot availability', () => {
+  const prompt = aiReportPrompt({ strategies: [{ id: 1, name: 'A', letter: 'A' }], mortgagedCount: 2, holdingCount: 0, text: 'Compare costs' });
+  assert.match(prompt, /stacked_bar renders only mortgage_balance \(stacked by property\) and stock_value/);
+  assert.match(prompt, /metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment/);
+  assert.match(prompt, /2 properties carry a mortgage, 0 stock holdings exist/);
+  assert.match(prompt, /do not use stock_value when no stock holding exists/);
+  assert.match(prompt, /"id":1,"name":"A"/);
+  assert.match(prompt, /User request: Compare costs/);
+  const singular = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 1, text: 'x' });
+  assert.match(singular, /1 property carries a mortgage, 1 stock holding exists/);
 });

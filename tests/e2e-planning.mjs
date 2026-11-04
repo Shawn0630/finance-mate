@@ -5083,6 +5083,106 @@ export async function run(H, S) {
         ubStrat.mergeSmall && ubStrat.rightGap != null && ubStrat.rightGap <= 32 && ubStrat.toolsAfterTitle === true, JSON.stringify(ubStrat));
     } finally { await browserF.close(); }
   }
+
+  // ------------------------------------------- ai-report empty chart
+  // User bug 2026-11-03: an AI chart titled "Cost Comparison Across
+  // Strategies" rendered a single Total line flat at 0 with a
+  // MONTH | TOTAL table of $0.00 — stacked_bar given series "cost",
+  // which it cannot render, so it totalled over zero datasets.
+  // (1) Generation-time rejection: ai-report 502 on an unrenderable
+  // template/series pair. (2) A legacy chart that slipped through
+  // (the definition-edit path is structural-only) renders a no-data
+  // note, never zeros. (3) Genuine zeros still render as $0.00.
+  // NOTE: the early 'Pay down test' project is deleted by the
+  // metadata cleanup above, so the ai-report pin runs against this
+  // section's own project, not planProjectId.
+  r = await H.req('POST', '/api/planning/projects', { name: 'Aireportempty test', question: 'Empty chart pins' });
+  H.check('aireportempty: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const aeProjectId = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${aeProjectId}/strategies`, { name: 'Zero Strat', source: 'template' });
+  H.check('aireportempty: no-op strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const aeStratId = r.data.strategy.id;
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: [{ template: 'stacked_bar', title: 'Cost Comparison', series: ['cost'], method: 'Cost per strategy from the comparison.' }] }));
+  r = await H.req('POST', `/api/planning/projects/${aeProjectId}/ai-report`, { text: 'Compare costs' });
+  H.check('aireportempty: ai-report rejects stacked_bar with an unrenderable series',
+    r.status === 502 && JSON.stringify(r.data).includes('cannot render'), JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${aeProjectId}/reports`, { name: 'Empty chart report', definition: { strategies: [aeStratId], charts: [{ template: 'time_line', title: 'Placeholder', series: ['mortgage_balance'] }] }, strategy_ids: [aeStratId] });
+  H.check('aireportempty: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const aeRepId = r.data.report.id;
+  r = await H.req('PUT', `/api/planning/reports/${aeRepId}`, { definition: { strategies: [aeStratId], charts: [
+    { template: 'stacked_bar', title: 'Cost Comparison', series: ['cost'], method: 'Cost per strategy from the comparison.' },
+    { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
+  ] } });
+  H.check('aireportempty: legacy unrenderable definition accepted by the structural-only edit path', r.status === 200, JSON.stringify(r.data));
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('planning aireportempty browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardAe = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResAe = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueAe = loginResAe.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserAe = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserAe.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardAe({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueAe, domain: 'ff.local', path: '/', httpOnly: true });
+      // Deep link: the API-created report has no card yet, so the
+      // redirect lands on the project page with this tab open.
+      await page.goto(`http://ff.local/#planning/report/${aeProjectId}/${aeRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector(`[data-plan-report-tab="${aeRepId}"]`, { timeout: 15000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent).includes('Cost Comparison'), { timeout: 15000 });
+      const aeState = await page.evaluate(() => {
+        const blocks = [...document.querySelectorAll('[data-plan-report-block]')];
+        const costBlock = blocks.find((b) => (b.querySelector('h3')?.textContent || '') === 'Cost Comparison');
+        const headBlock = blocks.find((b) => (b.querySelector('h3')?.textContent || '') === 'Headlines');
+        return {
+          costNote: costBlock ? (costBlock.querySelector('.note')?.textContent || '') : 'MISSING BLOCK',
+          costTable: !!costBlock?.querySelector('table'),
+          costCanvas: !!costBlock?.querySelector('canvas'),
+          headText: headBlock ? headBlock.textContent : 'MISSING BLOCK',
+        };
+      });
+      H.check('aireportempty: stacked_bar with no renderable data shows a no-data note, never zeros',
+        aeState.costNote.includes('no data for this chart') && !aeState.costTable && !aeState.costCanvas, JSON.stringify(aeState));
+      H.check('aireportempty: genuine-zero metric cards still render $0.00',
+        aeState.headText.includes('$0.00'), JSON.stringify(aeState));
+    } finally { await browserAe.close(); }
+  }
 }
 
 runModuleMain(import.meta.url, { name: 'planning', deps, depNames: SLIM_PLAN ? [] : ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm', 'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings', 'spending'], run });

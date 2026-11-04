@@ -61,6 +61,7 @@ import {
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
   currentReturnRateFromPoints, validatePoolItemShapes,
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
+  validateAiReportChartSeries, aiReportPrompt,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -7026,16 +7027,13 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
   const strategies = db.prepare('SELECT id, name, letter FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
-  const prompt = [
-    'You compose a report definition as JSON only. No prose outside the JSON object.',
-    'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
-    'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
-    'Series ids are: mortgage_balance, stock_value, total_value, cost, gain, net, payoff_month, monthly_payment.',
-    'Never invent a number: the app computes every series; you only order and title charts.',
-    'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
-    `Strategies: ${JSON.stringify(strategies)}`,
-    `User request: ${text}`,
-  ].join('\n');
+  // Generation-time grounding (user bug 2026-11-03): the viewer
+  // renders over the whole snapshot, so tell the model what series
+  // actually exist — a series on a template that cannot render it
+  // used to come out as an all-zero chart instead of an error.
+  const mortgagedCount = db.prepare(`SELECT COUNT(*) AS n FROM properties WHERE mortgage_balance IS NOT NULL AND mortgage_balance > 0 AND EXISTS (SELECT 1 FROM rate_segments WHERE rate_segments.property_id = properties.id)`).get().n;
+  const holdingCount = db.prepare('SELECT COUNT(*) AS n FROM invest_holdings').get().n;
+  const prompt = aiReportPrompt({ strategies, mortgagedCount, holdingCount, text });
   let raw;
   try {
     raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
@@ -7046,6 +7044,11 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   if (!parsed || !Array.isArray(parsed.charts)) return res.status(502).json({ error: 'the AI response did not contain a report definition' });
   const errs = planAiValidateChartSpecs(parsed.charts, p.id);
   if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  // Series/template compatibility: a series its template cannot
+  // render used to come out as an all-zero chart (2026-11-03 bug).
+  // Same 502 path as the spec check; no retry loop.
+  const seriesErrs = validateAiReportChartSeries(parsed.charts);
+  if (seriesErrs.length) return res.status(502).json({ error: seriesErrs.join('; ') });
   // AI-generated reports carry their own calculation method per chart
   // (the engine path gets its how-calculated lines from the app).
   const methodErrs = validateAiChartMethods(parsed.charts);
@@ -7061,6 +7064,8 @@ app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {
   const def = b.definition || {};
   const errs = planAiValidateChartSpecs(def.charts || [], p.id);
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
+  const defSeriesErrs = validateAiReportChartSeries(def.charts || []);
+  if (defSeriesErrs.length) return res.status(400).json({ error: defSeriesErrs.join('; ') });
   const strategyIds = db.prepare('SELECT id FROM plan_strategies WHERE project_id = ?').all(p.id).map((r) => r.id);
   for (const sid of def.strategies || []) {
     if (!strategyIds.includes(Number(sid))) return res.status(400).json({ error: `strategy ${sid} is not in this project` });

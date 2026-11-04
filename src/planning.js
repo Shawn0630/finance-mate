@@ -1029,6 +1029,56 @@ export function validateAiChartMethods(charts) {
   return errs;
 }
 
+// Report-viewer series support: which series ids each report chart
+// template can actually render. The viewer silently drops anything
+// else — stacked_bar totals over the surviving datasets, so a
+// cost-only stacked_bar used to render an all-zero "Total" line
+// (user bug 2026-11-03: "Cost Comparison Across Strategies" with a
+// MONTH | TOTAL table of $0.00). fan_band and funds_flow ignore
+// series entirely, so they are not validated here. Absent or empty
+// series is NOT an error: the renderer falls back to its default
+// series for that template.
+export const PLAN_REPORT_SERIES_BY_TEMPLATE = {
+  time_line: ['mortgage_balance', 'stock_value', 'total_value'],
+  yearly_bars: ['mortgage_balance', 'stock_value', 'total_value'],
+  stacked_bar: ['mortgage_balance', 'stock_value'],
+  metric_cards: ['cost', 'gain', 'net', 'stock_gain', 'payoff_month', 'monthly_payment'],
+  share_doughnut: ['cost', 'mortgage_balance', 'total_value'],
+};
+export function validateAiReportChartSeries(charts) {
+  const errs = [];
+  if (!Array.isArray(charts)) return ['charts must be an array'];
+  for (const c of charts) {
+    const allowed = PLAN_REPORT_SERIES_BY_TEMPLATE[c.template];
+    if (!allowed) continue;
+    if (!Array.isArray(c.series) || !c.series.length) continue;
+    for (const sid of c.series) {
+      if (!allowed.includes(sid)) errs.push(`chart "${c.title || c.template}" (${c.template}) cannot render series "${sid}" — allowed: ${allowed.join(', ')}`);
+    }
+  }
+  return errs;
+}
+
+// AI-report prompt, built pure so unit tests can pin its grounding.
+// The viewer renders over the whole snapshot (not the project
+// entity), so availability counts are snapshot-wide. A cash-pool
+// project's stock series covers only its pool — the render-time
+// no-data note is the backstop for that case.
+export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text }) {
+  return [
+    'You compose a report definition as JSON only. No prose outside the JSON object.',
+    'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
+    'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
+    'Series ids are: mortgage_balance, stock_value, total_value, cost, gain, net, payoff_month, monthly_payment.',
+    'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
+    'Never invent a number: the app computes every series; you only order and title charts.',
+    'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
+    `Charts render over the whole snapshot: ${mortgagedCount} ${mortgagedCount === 1 ? 'property carries' : 'properties carry'} a mortgage, ${holdingCount} stock ${holdingCount === 1 ? 'holding exists' : 'holdings exist'}. Do not use mortgage_balance when no property carries a mortgage, and do not use stock_value when no stock holding exists.`,
+    `Strategies: ${JSON.stringify(strategies)}`,
+    `User request: ${text}`,
+  ].join('\n');
+}
+
 // Report definition edit (block delete / AI append): structural only,
 // deliberately looser than the POST spec check — a delete must never
 // be blocked by a legacy chart the renderer already tolerates as

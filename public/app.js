@@ -12640,9 +12640,20 @@ async function loadPlanReport(projectId, reportId) {
           });
         }
         if (sids.includes('stock_value')) {
-          const byMonth = new Map((base.stocks.series || []).map((r) => [r.month, r.value]));
+          // Null-safe: a missing baseline used to throw here and abort
+          // the whole report render; with no baseline there is simply
+          // no stock series, and the guard below renders the note.
+          const byMonth = new Map(((base && base.stocks && base.stocks.series) || []).map((r) => [r.month, r.value]));
           datasets.push({ label: 'Stocks', data: months.map((m) => byMonth.get(m) ?? null), backgroundColor: planColor(pids.length), stack: 's' });
         }
+        // No component data at all — a series this template cannot
+        // render, or no mortgage/stock data for this project — renders
+        // a no-data note, never a Total line summed over nothing
+        // (that used to draw as all-$0.00). Genuine zeros still render:
+        // only all-null counts as absent, a present 0 stays a 0.
+        if (!datasets.some((d) => d.data.some((v) => v != null))) {
+          panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no data for this chart in this project.</div></div>`);
+        } else {
         const totals = months.map((m, mi) => datasets.reduce((s, d) => s + (d.data[mi] || 0), 0));
         datasets.push({ label: 'Total', data: totals, type: 'line', borderColor: '#22303c', backgroundColor: '#22303c', fill: false, pointRadius: 0 });
         const snapIdx = planReportYearRows(baseTraj.monthly).map((r) => monthIndex.get(r.month));
@@ -12650,6 +12661,7 @@ async function loadPlanReport(projectId, reportId) {
         const body = snapIdx.map((mi) => `<tr><td>${months[mi]}</td>${datasets.map((d) => `<td>${d.data[mi] == null ? '—' : money2(d.data[mi])}</td>`).join('')}</tr>`).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline uses actual prime history. ${esc(how)}</div></div>`);
         draws.push(() => planBarChart(cid, months, datasets));
+        }
       } else if (c.template === 'share_doughnut') {
         if (sidsHas(series, 'cost') && !sidsHas(series, 'mortgage_balance') && !sidsHas(series, 'total_value')) {
           const row = comp.strategies[0];
