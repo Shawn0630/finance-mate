@@ -11,10 +11,12 @@ import {
   resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel,
   buildPlanAiSnapshot, normalizeAiAsk,
+  expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline, paymentScopeFor,
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
+  validateScenarioFactors,
   factorsToAssumptions,
 } from '../src/planning.js';
 import { derivePayment } from '../src/engine.js';
@@ -422,6 +424,60 @@ test('buildPlanAiSnapshot: carries balances, terms, segments, prime and capped h
   assert.equal(snap.primeHistory.length, 12);
   assert.equal(snap.accounts[0].type, 'TFSA');
   assert.equal(snap.holdings[0].symbol, 'XQQ.TO');
+});
+
+test('buildPlanAiSnapshot: carries jobs and rentals alongside properties and holdings', () => {
+  const snap = buildPlanAiSnapshot({
+    jobs: [{ id: 1, employer: 'Meta', province: 'BC', frequency: 'bi-weekly', gross_amount: 7300, gross_basis: 'period' }],
+    rentals: [{ id: 2, label: '2985 Basement', address: '2985 Christina Pl', rental_type: 'long_term', ownership_pct: 66.67 }],
+  });
+  assert.equal(snap.jobs[0].employer, 'Meta');
+  assert.equal(snap.jobs[0].province, 'BC');
+  assert.equal(snap.rentals[0].label, '2985 Basement');
+  assert.equal(snap.rentals[0].ownership_pct, 66.67);
+});
+
+test('expandScenarioPrimePreset: preset-only prime gains points, flat gains none, present points untouched', () => {
+  const up = expandScenarioPrimePreset({ prime: { preset: 'up' }, stock: { valuePct: 5 } }, 4.70, '2026-11');
+  assert.equal(up.prime.preset, 'up');
+  assert.ok(Array.isArray(up.prime.points) && up.prime.points.length > 0);
+  assert.ok(up.prime.points.every((pt, i) => (i === 0 || pt.month > up.prime.points[i - 1].month) && pt.rate >= 0 && pt.rate <= 30));
+  assert.equal(up.prime.points[up.prime.points.length - 1].rate, 5.70);
+  assert.deepEqual(expandScenarioPrimePreset({ prime: { preset: 'flat' } }, 4.70, '2026-11').prime.points, []);
+  const kept = { prime: { preset: 'up', points: [{ month: '2027-01', rate: 5.0 }] } };
+  assert.equal(expandScenarioPrimePreset(kept, 4.70, '2026-11').prime.points[0].rate, 5.0);
+  assert.equal(expandScenarioPrimePreset({ prime: { preset: 'sideways' } }, 4.70, '2026-11').prime.points, undefined);
+  assert.equal(expandScenarioPrimePreset({ stock: { valuePct: 5 } }, 4.70, '2026-11').stock.valuePct, 5);
+});
+
+test('expandScenarioPrimePreset: expanded preset passes scenario validation (the old 502)', () => {
+  const expanded = expandScenarioPrimePreset({ prime: { preset: 'up' } }, 4.70, '2026-11');
+  assert.deepEqual(validateScenarioFactors(expanded, '2026-11'), []);
+  assert.deepEqual(validateScenarioFactors({ prime: { preset: 'up' } }, '2026-11'), ['prime points must be an array']);
+});
+
+test('planProjectAiSummaries: compact names + factors + definitions + op summaries + sink, no full dumps', () => {
+  const out = planProjectAiSummaries({
+    scenarios: [{ name: 'Prime up', is_base: 1, factors: { prime: { preset: 'up', points: [] } } }],
+    baselines: [{ name: 'Current path', source: 'ai', definition: { description: 'Do nothing', assumptions: [{ key: 'x', value: 1 }] } }],
+    strategies: [{ id: 7, name: 'Prepay', letter: 'A', source: 'manual', sink: JSON.stringify({ kind: 'custom', name: 'Cash', expectedReturnPct: 2 }) }],
+    opsByStrategy: { 7: [{ seq: 1, op_type: 'prepay', params: JSON.stringify({ date: '2027-01-01', amount: 50000 }) }] },
+  });
+  assert.equal(out.scenarios[0].name, 'Prime up');
+  assert.equal(out.scenarios[0].is_base, true);
+  assert.equal(out.baselines[0].description, 'Do nothing');
+  assert.equal(out.baselines[0].assumptions[0].key, 'x');
+  assert.equal(out.strategies[0].ops[0].op_type, 'prepay');
+  assert.equal(out.strategies[0].ops[0].date, '2027-01-01');
+  assert.equal(out.strategies[0].ops[0].params.amount, 50000);
+  assert.equal(out.strategies[0].sink.name, 'Cash');
+});
+
+test('aiRepairPrompt: names the exact failing rules and demands a complete corrected spec', () => {
+  const p = aiRepairPrompt('Base prompt.', ['model spec is missing charts', 'unknown chart template']);
+  assert.ok(p.startsWith('Base prompt.'));
+  assert.ok(p.includes('model spec is missing charts; unknown chart template'));
+  assert.ok(p.includes('do not return an ask list'));
 });
 
 test('normalizeAiAsk: structured questions pass through; a legacy string becomes one question; junk is rejected', () => {

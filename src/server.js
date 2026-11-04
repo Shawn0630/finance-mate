@@ -58,6 +58,7 @@ import {
   validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
   primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
+  expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
   currentReturnRateFromPoints, validatePoolItemShapes,
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
 } from './planning.js';
@@ -5376,27 +5377,58 @@ app.put('/api/planning/scenarios/:id', requireApiAuth, (req, res) => {
   res.json({ scenario: planScenarioRow(db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(row.id)) });
 });
 
-// Scenario AI hook (one-shot, v1): the model proposes a factor set in
-// words the user gives; the app validates it and the client previews it
-// before any Apply creates the scenario. AI is spec, never numbers —
-// the engine computes every figure from the saved factors.
+// Scenario AI hook: the model proposes a factor set in words the user
+// gives; the app validates it and the client previews it before any
+// Apply creates the scenario. AI is spec, never numbers — the engine
+// computes every figure from the saved factors.
+// Shared AI-design inputs: the FULL app snapshot (properties, terms,
+// segments, accounts, holdings, jobs, rentals, prime + history) plus
+// the project's existing scenario/baseline/strategy summaries, so the
+// model refines what exists instead of duplicating it.
+async function planAiSnapshotForProject() {
+  await ensureFreshPrime();
+  const curPrime = getCurrentPrime();
+  return buildPlanAiSnapshot({
+    properties: db.prepare('SELECT * FROM properties ORDER BY id').all(),
+    terms: db.prepare('SELECT * FROM mortgage_terms ORDER BY id').all(),
+    segments: db.prepare('SELECT * FROM rate_segments ORDER BY id').all(),
+    accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
+    holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
+    jobs: db.prepare('SELECT * FROM earn_jobs ORDER BY id').all(),
+    rentals: db.prepare('SELECT * FROM earn_rentals ORDER BY id').all(),
+    prime: curPrime ? curPrime.rate : null,
+    primeHistory: getPrimeHistory(),
+  });
+}
+function planAiExistingSummaries(projectId) {
+  const scenarios = planScenariosOf(projectId);
+  const baselines = planBaselinesOf(projectId);
+  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(projectId);
+  const opsByStrategy = {};
+  for (const s of strategies) opsByStrategy[s.id] = db.prepare('SELECT * FROM plan_ops WHERE strategy_id = ? ORDER BY seq').all(s.id);
+  return planProjectAiSummaries({ scenarios, baselines, strategies, opsByStrategy });
+}
 app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
-  await ensureFreshPrime();
-  const cur = getCurrentPrime();
-  const holdings = db.prepare('SELECT id, symbol, label FROM invest_holdings ORDER BY id').all();
+  // Panel conversation context: the panel's display thread rendered as
+  // plain lines (the structured thread shape does not fit free-text
+  // turns, so this endpoint takes text, not the sanitized thread).
+  const historyText = String(req.body?.historyText || '').trim().slice(0, 4000);
+  const snapshot = await planAiSnapshotForProject();
+  const existing = planAiExistingSummaries(p.id);
   const prompt = [
     'You propose a planning scenario (a future world) as JSON only. No prose outside the JSON object.',
     'A scenario holds ONLY world factors: prime (a rate path), stock (an expected annual return %), propertyGrowth, salaryGrowth, rentGrowth. It NEVER holds a sink, an operation, or a price.',
     'prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30.',
     'stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one.',
     'Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
-    `Current prime: ${cur ? cur.rate : 'unknown'}.`,
-    `Holdings: ${JSON.stringify(holdings)}`,
+    `App data snapshot: ${JSON.stringify(snapshot)}`,
+    `This project already has: ${JSON.stringify(existing)}. Refine what exists where the user asks; do not duplicate an existing scenario under a new name.`,
+    ...(historyText ? [`Conversation so far:\n${historyText}`, 'Continue this conversation: do not repeat factors already proposed unless the user contradicts them.'] : []),
     'Output: {"factors": {...}}.',
     `User request: ${text}`,
   ].join('\n');
@@ -5408,7 +5440,9 @@ app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async
   }
   const parsed = parseModelJson(raw);
   if (!parsed || typeof parsed !== 'object') return res.status(502).json({ error: 'AI did not return a scenario' });
-  const factors = parsed.factors || parsed;
+  // Preset-only prime replies are legal per the prompt: expand the
+  // preset to its points before validation (flat = hold, no points).
+  const factors = expandScenarioPrimePreset(parsed.factors || parsed, snapshot.prime, currentMonthKey());
   const errs = validateScenarioFactors(factors, currentMonthKey());
   if (errs.length) return res.status(502).json({ error: `AI scenario failed validation: ${errs.join('; ')}` });
   res.json({ factors });
@@ -6567,6 +6601,8 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
+  // Panel conversation context, same plain-lines shape as ai-design.
+  const historyText = String(req.body?.historyText || '').trim().slice(0, 4000);
   const props = db.prepare('SELECT id, address FROM properties ORDER BY id').all();
   const accounts = db.prepare('SELECT id, name FROM invest_accounts ORDER BY id').all();
   const holdings = db.prepare('SELECT id, account_id, symbol, label FROM invest_holdings ORDER BY id').all();
@@ -6581,6 +6617,7 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
     `Properties: ${JSON.stringify(props)}`,
     `Accounts: ${JSON.stringify(accounts)}`,
     `Holdings: ${JSON.stringify(holdings)}`,
+    ...(historyText ? [`Conversation so far:\n${historyText}`, 'Continue this conversation: do not repeat operations already proposed unless the user contradicts them.'] : []),
     `User request: ${text}`,
   ].join('\n');
   let raw;
@@ -6687,18 +6724,11 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
   if (answers && Object.keys(answers).length) thread = appendAiThread(thread, { role: 'user', answers });
   db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(thread), s.id);
   // Feed the model the app snapshot so it stops asking for numbers the
-  // app already holds (balances, terms, segments, prime + history).
-  await ensureFreshPrime();
-  const curPrime = getCurrentPrime();
-  const snapshot = buildPlanAiSnapshot({
-    properties: db.prepare('SELECT * FROM properties ORDER BY id').all(),
-    terms: db.prepare('SELECT * FROM mortgage_terms ORDER BY id').all(),
-    segments: db.prepare('SELECT * FROM rate_segments ORDER BY id').all(),
-    accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
-    holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
-    prime: curPrime ? curPrime.rate : null,
-    primeHistory: getPrimeHistory(),
-  });
+  // app already holds (balances, terms, segments, prime + history,
+  // jobs, rentals), plus the project's existing specs so it refines
+  // instead of duplicating them.
+  const snapshot = await planAiSnapshotForProject();
+  const existing = planAiExistingSummaries(p.id);
   // Name binding: the user picks entities by NAME, never by database
   // id. Resolve the latest answers against the snapshot now: a value
   // matching nothing (or several candidates) comes back as a mismatch
@@ -6740,6 +6770,7 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
     ...(projectContext ? [projectContext] : []),
     ...(binding.resolved.length ? [`Already resolved by name: ${binding.resolved.map((r) => `${r.field} "${r.label}" = ${r.entity} id ${r.id}`).join('; ')}. Bind to these ids in the spec.`] : []),
     `App data snapshot: ${JSON.stringify(snapshot)}`,
+    `This project already has: ${JSON.stringify(existing)}. Refine what exists where the user asks; do not duplicate an existing strategy under a new name.`,
     ...(planProjectMetadataOf(p).aiBaseline ? [`Confirmed baseline for this project: ${JSON.stringify(planProjectMetadataOf(p).aiBaseline)}`, 'Design the spec against this confirmed baseline.'] : []),
     ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
     ...(answers ? [`User-provided metadata (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
@@ -6793,12 +6824,41 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
     db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(newThread), s.id);
     return res.json({ ask: askQuestions, thread: newThread, configured: true, ...(binding.resolved.length ? { resolved: binding.resolved } : {}) });
   }
-  const errs = [];
-  for (const part of ['bindings', 'formulas', 'assumptions', 'outputs', 'charts']) {
-    if (!Array.isArray(parsed[part])) errs.push(`model spec is missing ${part}`);
+  const specErrs = () => {
+    const e = [];
+    for (const part of ['bindings', 'formulas', 'assumptions', 'outputs', 'charts']) {
+      if (!Array.isArray(parsed[part])) e.push(`model spec is missing ${part}`);
+    }
+    e.push(...planAiValidateChartSpecs(parsed.charts || [], p.id));
+    return e;
+  };
+  let errs = specErrs();
+  if (errs.length) {
+    // ONE self-repair retry: feed the exact failing rules back, so a
+    // lite model that omitted or invented a part gets one chance to
+    // fix it. A repair that asks again goes through the same ask
+    // hygiene; a repair that still fails surfaces its own errors
+    // exactly (the UI shows the rule, never a generic failure).
+    let rawR;
+    try {
+      rawR = await callLlm([{ role: 'user', content: aiRepairPrompt(prompt, errs) }], process.env, getAiFillModel());
+    } catch (e) {
+      return res.status(502).json({ error: `AI call failed: ${e.message}` });
+    }
+    const parsedR = parseModelJson(rawR);
+    if (!parsedR) return res.status(502).json({ error: errs.join('; ') });
+    if (parsedR.ask) {
+      const f = filterAsk(parsedR.ask);
+      if (f.malformed) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+      if (!f.questions.length) return res.status(502).json({ error: 'the AI kept asking questions that are already answered — please rephrase the request' });
+      const repairThread = appendAiThread(thread, { role: 'ai', questions: f.questions });
+      db.prepare('UPDATE plan_strategies SET ai_thread = ? WHERE id = ?').run(JSON.stringify(repairThread), s.id);
+      return res.json({ ask: f.questions, thread: repairThread, configured: true, ...(binding.resolved.length ? { resolved: binding.resolved } : {}) });
+    }
+    parsed = parsedR;
+    errs = specErrs();
+    if (errs.length) return res.status(502).json({ error: errs.join('; ') });
   }
-  errs.push(...planAiValidateChartSpecs(parsed.charts || [], p.id));
-  if (errs.length) return res.status(502).json({ error: errs.join('; ') });
   const now = nowIso();
   const out = commitTx(req, 'project', {
     module: 'planning', entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
@@ -6854,23 +6914,15 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
     : sanitizeAiThread(storedThread || null);
   if (answers && Object.keys(answers).length) thread = appendAiThread(thread, { role: 'user', answers });
   writeThread(thread);
-  await ensureFreshPrime();
-  const curPrime = getCurrentPrime();
-  const snapshot = buildPlanAiSnapshot({
-    properties: db.prepare('SELECT * FROM properties ORDER BY id').all(),
-    terms: db.prepare('SELECT * FROM mortgage_terms ORDER BY id').all(),
-    segments: db.prepare('SELECT * FROM rate_segments ORDER BY id').all(),
-    accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
-    holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
-    prime: curPrime ? curPrime.rate : null,
-    primeHistory: getPrimeHistory(),
-  });
+  const snapshot = await planAiSnapshotForProject();
+  const existing = planAiExistingSummaries(p.id);
   const prompt = [
     'You design a planning baseline definition as JSON only. No prose outside the JSON object.',
     'The baseline changes nothing: it is a pure do-nothing reference (name + one-line description only). It carries NO prime path and NO stock reference — rate paths live on strategies as factors, never on the baseline. The baseline has: description (one line), assumptions: [{key, value}].',
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. Do not propose a prime path or a stock reference.',
     'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
     `App data snapshot: ${JSON.stringify(snapshot)}`,
+    `This project already has: ${JSON.stringify(existing)}. Refine what exists where the user asks; do not duplicate an existing baseline under a new name.`,
     ...(confirmedBaseline ? [`Currently confirmed baseline: ${JSON.stringify(confirmedBaseline)}`, 'Refine it: keep what the user does not contradict.'] : []),
     ...(thread.length ? [`Conversation so far:\n${renderAiThreadText(thread)}`, 'Continue this conversation: do not repeat questions already answered; ask only for values still missing.'] : []),
     ...(answers ? [`User-provided metadata (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
@@ -6891,11 +6943,36 @@ app.post('/api/planning/projects/:id/ai-baseline', requireApiAuth, async (req, r
     writeThread(newThread);
     return res.json({ ask: questions, thread: newThread, configured: true });
   }
-  const baseline = parsed.baseline || parsed;
-  delete baseline.primeScenario;
-  delete baseline.stockReference;
-  const errs = validateAiBaseline(baseline);
-  if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  const baseline0 = parsed.baseline || parsed;
+  delete baseline0.primeScenario;
+  delete baseline0.stockReference;
+  let baseline = baseline0;
+  let errs = validateAiBaseline(baseline);
+  if (errs.length) {
+    // ONE self-repair retry, same shape as ai-model: feed the exact
+    // failing rules back; a repair that asks goes through the ask
+    // path, a repair that still fails surfaces its own errors.
+    let rawR;
+    try {
+      rawR = await callLlm([{ role: 'user', content: aiRepairPrompt(prompt, errs) }], process.env, getAiFillModel());
+    } catch (e) {
+      return res.status(502).json({ error: `AI call failed: ${e.message}` });
+    }
+    const parsedR = parseModelJson(rawR);
+    if (!parsedR) return res.status(502).json({ error: errs.join('; ') });
+    if (parsedR.ask) {
+      const questions = normalizeAiAsk(parsedR.ask);
+      if (!questions) return res.status(502).json({ error: 'the AI response did not contain usable questions' });
+      const repairThread = appendAiThread(thread, { role: 'ai', questions });
+      writeThread(repairThread);
+      return res.json({ ask: questions, thread: repairThread, configured: true });
+    }
+    baseline = parsedR.baseline || parsedR;
+    delete baseline.primeScenario;
+    delete baseline.stockReference;
+    errs = validateAiBaseline(baseline);
+    if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  }
   const newThread = appendAiThread(thread, { role: 'ai', baseline });
   writeThread(newThread);
   res.json({ baseline, thread: newThread, configured: true });

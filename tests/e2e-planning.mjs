@@ -142,6 +142,42 @@ export async function run(H, S) {
     JSON.stringify(r.data.suggestions));
   r = await H.req('POST', `/api/planning/strategies/${planStrategyId}/ai-describe`, { text: '' });
   H.check('planning: ai-describe rejects empty text', r.status === 400, JSON.stringify(r.data));
+  // ---- Unified AI panel: server fixes --------------------------------
+  r = await H.req('POST', '/api/planning/projects', { name: 'Panel API', question: 'panel server pins' });
+  H.check('aipanel: panel API project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const panelApiPid = r.data.project.id;
+  // (a) preset-only scenario reply expands to points instead of 502.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+  r = await H.req('POST', `/api/planning/projects/${panelApiPid}/scenarios/ai-design`, { text: 'prime rises', historyText: 'You: prime rises' });
+  H.check('aipanel: ai-design expands a preset-only prime to points instead of 502',
+    r.status === 200 && Array.isArray(r.data.factors?.prime?.points) && r.data.factors.prime.points.length > 0, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${panelApiPid}/scenarios/ai-design`, { text: '', historyText: 'You: hi' });
+  H.check('aipanel: ai-design still rejects empty text', r.status === 400, JSON.stringify(r.data));
+  // Ops describe accepts historyText; the described op applies for real.
+  r = await H.req('POST', `/api/planning/projects/${panelApiPid}/strategies`, { name: 'Panel ops', source: 'ai' });
+  const panelOpsSid = r.data.strategy.id;
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ ops: [{ op_type: 'prepay', params: { date: '2027-01-01', amount: 10000, propertyRef: '77 Planning Test Lane, Victoria, BC' } }] }));
+  r = await H.req('POST', `/api/planning/strategies/${panelOpsSid}/ai-describe`, { text: 'prepay 10k', historyText: 'You: prepay' });
+  H.check('aipanel: ai-describe accepts historyText and resolves the op',
+    r.status === 200 && Array.isArray(r.data.ops) && r.data.ops.length === 1 && r.data.ops[0].op_type === 'prepay', JSON.stringify(r.data));
+  const describedOp = (r.data.ops || [])[0];
+  if (describedOp) {
+    r = await H.req('POST', `/api/planning/strategies/${panelOpsSid}/ops`, { op_type: describedOp.op_type, params: describedOp.params, legs: describedOp.legs || [], source: 'ai' });
+    H.check('aipanel: described op applies through the normal op endpoint', r.status === 201, JSON.stringify(r.data));
+  }
+  // (b) ai-model invalid spec → 502 naming the exact rule (the repair
+  // retry returns the same stub response, so it still fails — but
+  // honestly, naming the rule; repair-success is not pinnable with
+  // the single-response stub, same precedent as the ask retry).
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ bindings: [], formulas: [], assumptions: [], outputs: [] }));
+  r = await H.req('POST', `/api/planning/strategies/${panelOpsSid}/ai-model`, { text: 'model', history: [] });
+  H.check('aipanel: ai-model invalid spec fails with the exact rule, not a generic error',
+    r.status === 502 && /model spec is missing charts/.test(r.data.error || ''), JSON.stringify(r.data));
+  // (c) ai-baseline invalid → 502 naming the exact rule.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ baseline: { description: 'x', assumptions: 'nope' } }));
+  r = await H.req('POST', `/api/planning/projects/${panelApiPid}/ai-baseline`, { text: 'baseline' });
+  H.check('aipanel: ai-baseline invalid spec fails with the exact rule, not a generic error',
+    r.status === 502 && /assumptions must be an array/.test(r.data.error || ''), JSON.stringify(r.data));
   // ---- App-global History tab -------------------------------------------
   // A save creates exactly one commit; undo restores the prior state;
   // restore-to writes back a snapshot; a later touch blocks undo with
@@ -1054,35 +1090,159 @@ export async function run(H, S) {
       const aiWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
       await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await aiWait(1500);
-      await page.evaluate(() => document.querySelector('#planAddStrategyBtn').click());
-      await page.waitForFunction(() => !document.querySelector('#planStrategyModal').classList.contains('hidden'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('#planChooseAi').click());
-      await page.waitForFunction(() => !!document.querySelector('#planChooseModel'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('#planChooseModel').click());
-      await page.waitForFunction(() => !!document.querySelector('#planStrategyModelText'), { timeout: 10000 });
+      // Model design now lives in the project-page AI panel (the old
+      // Add-strategy AI fallback is gone); same ask/answer/thread
+      // rules, driven through the panel's model target.
+      await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="model"]').click());
+      await page.waitForFunction(() => !document.querySelector('#planAiPanelStrategyRow').classList.contains('hidden'), { timeout: 10000 });
       await page.evaluate(() => {
-        document.querySelector('#planStrategyName').value = 'AiModel Browser';
-        document.querySelector('#planStrategyModelText').value = 'design a model';
+        document.querySelector('#planAiPanelStrategyName').value = 'AiModel Browser';
+        document.querySelector('#planAiPanelText').value = 'design a model';
       });
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
-      await page.evaluate(() => document.querySelector('#planStrategyModelBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planModelAsk_target_contribution'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('#planStrategyModelContinue').click());
-      await page.waitForFunction(() => (document.querySelector('#planStrategyModalMsg')?.textContent || '').length > 0, { timeout: 10000 });
-      const errText = await page.evaluate(() => document.querySelector('#planStrategyModalMsg')?.textContent || '');
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelAsk_target_contribution'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planAiPanelContinueBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planAiPanelMsg')?.textContent || '').length > 0, { timeout: 10000 });
+      const errText = await page.evaluate(() => document.querySelector('#planAiPanelMsg')?.textContent || '');
       H.check('ai-model browser: empty answer shows a generic error, never the question text as a field name',
         errText.includes('Please answer all questions before continuing.') && !errText.includes('Target monthly contribution? is required'),
         JSON.stringify({ errText }));
       fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
-      await page.evaluate(() => { document.querySelector('#planModelAsk_target_contribution').value = '600'; });
-      await page.evaluate(() => document.querySelector('#planStrategyModelContinue').click());
-      await page.waitForFunction(() => (document.querySelector('#planStrategyModelOut')?.textContent || '').includes('Bindings:'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('#planStrategyModelThreadToggle').click());
-      const threadText = await page.evaluate(() => document.querySelector('#planStrategyModelThread')?.textContent || '');
+      await page.evaluate(() => { document.querySelector('#planAiPanelAsk_target_contribution').value = '600'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelContinueBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planAiPanelOut')?.textContent || '').includes('Bindings:'), { timeout: 10000 });
+      const threadText = await page.evaluate(() => document.querySelector('#planAiPanelThread')?.textContent || '');
       H.check('ai-model browser: thread pairs the answer with its question, no raw key = value line',
         threadText.includes('You: Target monthly contribution?: 600') && !threadText.includes('target_contribution = 600'),
         JSON.stringify({ threadText }));
     } finally { await aiBrowser.close(); }
+  }
+  // ---- Unified AI panel (browser) -------------------------------------
+  // Panel toggle/targets, scattered entries gone, scenario + baseline
+  // design through the panel, Describe panel gone from strategy page.
+  let panelPptr = null;
+  try {
+    const { createRequire } = await import('node:module');
+    const panelReqmod = createRequire(import.meta.url);
+    try { panelPptr = panelReqmod('puppeteer-core'); } catch { panelPptr = panelReqmod('/tmp/pptr/node_modules/puppeteer-core'); }
+  } catch { panelPptr = null; }
+  if (!panelPptr || !H.chromeAvailable) {
+    console.log('aipanel browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const panelForward = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const panelLogin = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const panelCookie = panelLogin.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const panelBrowser = await panelPptr.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await panelBrowser.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await panelForward({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: panelCookie, domain: 'ff.local', path: '/', httpOnly: true });
+      const panelProj = await H.req('POST', '/api/planning/projects', { name: 'Panel Test', question: 'Panel' });
+      H.check('aipanel browser: dedicated panel project created', panelProj.status === 201 && panelProj.data.project && panelProj.data.project.id > 0, JSON.stringify(panelProj.data));
+      const panelProjectId = panelProj.data.project.id;
+      const panelWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${panelProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await panelWait(1500);
+      const panelInit = await page.evaluate(() => ({
+        toggle: !!document.querySelector('#planAiPanelToggleBtn'),
+        hidden: !!document.querySelector('#planAiPanel.hidden'),
+        noScenBtn: !document.querySelector('#planAiScenarioBtn'),
+        noBaseBtn: !document.querySelector('#planAiBaselineBtn'),
+      }));
+      H.check('aipanel browser: panel toggle exists, panel starts hidden, scattered tier buttons gone',
+        panelInit.toggle && panelInit.hidden && panelInit.noScenBtn && panelInit.noBaseBtn, JSON.stringify(panelInit));
+      await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
+      const targets = await page.evaluate(() => ({
+        targets: [...document.querySelectorAll('[data-plan-ai-target]')].map((b) => b.dataset.planAiTarget),
+        stratRowHidden: !!document.querySelector('#planAiPanelStrategyRow.hidden'),
+        scenNameShown: !document.querySelector('#planAiPanelScenarioNameRow.hidden'),
+      }));
+      H.check('aipanel browser: panel opens with four targets, scenario default, strategy row hidden',
+        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'baseline', 'ops', 'model']) && targets.stratRowHidden && targets.scenNameShown, JSON.stringify(targets));
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="ops"]').click());
+      const opsRow = await page.evaluate(() => !document.querySelector('#planAiPanelStrategyRow.hidden'));
+      H.check('aipanel browser: ops target shows the strategy picker', opsRow);
+      // Scenario through the panel: preset-only stub factors expand
+      // server-side; Apply navigates to the new scenario page.
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="scenario"]').click());
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+      await page.evaluate(() => {
+        document.querySelector('#planAiPanelScenarioName').value = 'Panel Scenario';
+        document.querySelector('#planAiPanelText').value = 'prime rises';
+      });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('#planAiPanelApplyBtn').click());
+      await page.waitForFunction(() => location.hash.startsWith('#planning/scenario/'), { timeout: 15000 });
+      await page.goto(`http://ff.local/#planning/project/${panelProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await panelWait(1500);
+      const scenCard = await page.evaluate(() => (document.querySelector('#planScenarioCards')?.textContent || '').includes('Panel Scenario'));
+      H.check('aipanel browser: scenario designed in the panel joins the Scenarios list', scenCard);
+      // Baseline through the panel: ask → answer → Apply.
+      await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="baseline"]').click());
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ ask: [{ field: 'prime_direction', label: 'Prime direction?', type: 'text' }] }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'Prime rises'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelAsk_prime_direction'), { timeout: 15000 });
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ baseline: { description: 'Panel baseline desc', assumptions: [] } }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelAsk_prime_direction').value = 'up'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelContinueBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('#planAiPanelApplyBtn').click());
+      await page.waitForFunction(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('Panel baseline desc'), { timeout: 15000 });
+      const baseListed = await page.evaluate(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('Panel baseline desc'));
+      H.check('aipanel browser: baseline designed in the panel joins the Baselines list', baseListed);
+      // Strategy page: the Describe panel is gone (absorbed).
+      await page.goto(`http://ff.local/#planning/strategy/${planStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await panelWait(1500);
+      const noDescribe = await page.evaluate(() => !document.querySelector('#planStrategyDescribePanel'));
+      H.check('aipanel browser: strategy page Describe panel is gone (absorbed into the panel)', noDescribe);
+    } finally { await panelBrowser.close(); }
   }
   // Strategy-centric comparison deltas: template_params alone create
   // no ops, so the prepay and buy ops are posted for real. The prepay
@@ -1220,16 +1380,13 @@ export async function run(H, S) {
       const pageTpl = await page.evaluate(() => fetch('/api/planning/templates').then((x) => x.json()).catch((e) => ({ error: String(e) })));
       H.check('planning detail: page fetch sees the saved templates',
         Array.isArray(pageTpl.templates) && pageTpl.templates.length >= 1, JSON.stringify(pageTpl).slice(0, 200));
-      // Template refine: saved templates now live inside the AI
-      // fallback screen of the preset chooser; Refine with AI still
-      // opens the model form prefilled with the template summary.
+      // Template refine: saved templates live as a card in the preset
+      // chooser; Refine with AI still opens the model form prefilled
+      // with the template summary.
       await page.click('#planAddStrategyBtn');
       const refinePresent = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         for (let i = 0; i < 12; i++) {
-          const ai = document.querySelector('#planChooseAi');
-          if (ai) ai.click();
-          await sleep(300);
           const card = document.querySelector('#planChooseSaved');
           if (card) card.click();
           await sleep(500);
@@ -1976,11 +2133,12 @@ export async function run(H, S) {
       await waitR(1200);
       const modal = await page.evaluate(() => ({
         presets: [...document.querySelectorAll('[data-plan-preset]')].map((c) => c.dataset.planPreset),
-        oldCards: ['#planChooseTemplate', '#planChooseDescribe', '#planChooseModel', '#planChooseSaved'].some((s) => !!document.querySelector(s)),
+        oldCards: ['#planChooseTemplate', '#planChooseDescribe', '#planChooseModel'].some((s) => !!document.querySelector(s)),
         aiBtn: !!document.querySelector('#planChooseAi'),
+        savedCard: !!document.querySelector('#planChooseSaved'),
       }));
-      H.check('strategy editor: Add strategy modal shows property presets first, AI only as fallback, old cards gone',
-        JSON.stringify(modal.presets) === JSON.stringify(['prepay', 'rate_fixed', 'rate_variable', 'refinance', 'payment_change']) && !modal.oldCards && modal.aiBtn, JSON.stringify(modal));
+      H.check('strategy editor: Add strategy modal shows property presets first, saved templates as a card, no AI fallback',
+        JSON.stringify(modal.presets) === JSON.stringify(['prepay', 'rate_fixed', 'rate_variable', 'refinance', 'payment_change']) && !modal.oldCards && !modal.aiBtn && modal.savedCard, JSON.stringify(modal));
       const presetClicked = await page.evaluate(() => {
         const c = document.querySelector('[data-plan-preset="refinance"]');
         if (c) c.click();
@@ -3063,8 +3221,8 @@ export async function run(H, S) {
       const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
       await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1200);
-      const aiBaseBtn = await page.evaluate(() => !!document.querySelector('#planAiBaselineBtn'));
-      H.check('report: Baselines section has a Design with AI entry', aiBaseBtn);
+      const aiPanelBtn = await page.evaluate(() => !!document.querySelector('#planAiPanelToggleBtn'));
+      H.check('report: project page has the unified Design with AI panel entry', aiPanelBtn);
       await page.click('#planAddReportBtn');
       await waitP(400);
       const picker = await page.evaluate(() => {
@@ -3146,34 +3304,36 @@ export async function run(H, S) {
       }));
       H.check('report: strategy detail Generate opens a report scoped to the current strategy',
         detailReport.hash.startsWith('#planning/project/') && detailReport.strat, JSON.stringify(detailReport));
-      // Baselines AI entry: propose → preview → Apply appends a baseline.
+      // Baselines AI entry (now in the project-page AI panel):
+      // propose → preview → Apply appends a baseline.
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ description: 'AI baseline test', assumptions: [{ key: 'note', value: 'test' }] }));
       await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1200);
-      await page.click('#planAiBaselineBtn');
+      await page.click('#planAiPanelToggleBtn');
       // The open click can silently miss its target while the project
       // page is still settling layout (the click reports success but
-      // the modal stays hidden — proven by a diagnostic run: the
+      // the panel stays hidden — proven by a diagnostic run: the
       // handler IS attached, a direct dispatch opens it). Wait for
-      // the modal to actually open; retry once via dispatch if the
+      // the panel to actually open; retry once via dispatch if the
       // first click missed, same pattern as the uibundle card click.
       try {
-        await page.waitForFunction(() => !document.querySelector('#planBaselineAiModal').classList.contains('hidden'), { timeout: 5000 });
+        await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 5000 });
       } catch {
-        await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiBaselineBtn');
-        await page.waitForFunction(() => !document.querySelector('#planBaselineAiModal').classList.contains('hidden'), { timeout: 10000 });
+        await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiPanelToggleBtn');
+        await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
       }
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="baseline"]').click());
       await waitP(400);
-      await page.type('#planBaselineAiText', 'A plain do-nothing baseline');
-      await page.click('#planBaselineAiGoBtn');
+      await page.type('#planAiPanelText', 'A plain do-nothing baseline');
+      await page.click('#planAiPanelGoBtn');
       await waitP(1500);
       const basePreview = await page.evaluate(() => ({
-        text: document.querySelector('#planBaselineAiOut') ? document.querySelector('#planBaselineAiOut').textContent : '',
-        apply: !!document.querySelector('#planBaselineAiApplyBtn'),
+        text: document.querySelector('#planAiPanelOut') ? document.querySelector('#planAiPanelOut').textContent : '',
+        apply: !!document.querySelector('#planAiPanelApplyBtn'),
       }));
       H.check('report: baseline AI preview shows the proposed baseline before Apply',
         basePreview.apply && basePreview.text.includes('AI baseline test'), JSON.stringify(basePreview));
-      await page.click('#planBaselineAiApplyBtn');
+      await page.click('#planAiPanelApplyBtn');
       await waitP(1200);
       const baseListed = await page.evaluate(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('AI baseline test'));
       H.check('report: applied AI baseline joins the Baselines list', baseListed);
@@ -3457,14 +3617,18 @@ export async function run(H, S) {
       r = await H.req('GET', `/api/planning/strategies/${rdPoolStrat.id}`);
       H.check('redesign: sink Delete clears to the pick state and drops the sink ops',
         sinkCleared && r.data.sink === null && !(r.data.ops || []).some((o) => o.source === 'sink'), JSON.stringify({ cleared: sinkCleared, sink: r.data.sink, ops: (r.data.ops || []).map((o) => o.source) }));
-      // Model thread display starts collapsed behind its toggle.
+      // Model thread display starts collapsed behind its toggle (the
+      // modal model form now opens via saved-template Refine with AI;
+      // the old Add → AI → Model path is gone with the fallback).
+      r = await H.req('POST', '/api/planning/templates', { name: 'Redesign thread template', spec: { bindings: [], formulas: [], assumptions: [], outputs: [], charts: [] }, metadata_schema: [], metadata_answers: {} });
+      H.check('redesign: thread template created', r.status === 201, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/project/${rdProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1200);
       await page.click('#planAddStrategyBtn');
       await waitR(800);
-      await page.click('#planChooseAi');
-      await waitR(400);
-      await page.click('#planChooseModel');
+      await page.click('#planChooseSaved');
+      await waitR(800);
+      await page.click('#planSavedTemplateRefine');
       await waitR(800);
       const thread = await page.evaluate(() => ({
         toggle: !!document.querySelector('#planStrategyModelThreadToggle'),
@@ -3481,8 +3645,9 @@ export async function run(H, S) {
   // Titles + axis captions on report charts (template + AI paths),
   // interest/principal stacked bars + range picker on time charts,
   // year-grouped diff table with annual-sum rows, Assumptions as top
-  // metadata with Delete, Describe next to Operations, Report +
-  // Penalties above Model.
+  // metadata with Delete, Report + Penalties above Model. (The old
+  // Describe panel is gone — ops drafting lives in the project-page
+  // AI panel now.)
   r = await H.req('POST', '/api/planning/projects', { name: 'DC Clarity', question: 'q' });
   H.check('detail-clarity: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const dcProjectId = r.data.project.id;
@@ -3600,7 +3765,6 @@ export async function run(H, S) {
         return {
           heads,
           asmTop: idx('Assumptions') === 1,
-          describeAfterOps: idx('Describe in words') === idx('Operations') + 1,
           reportAfterDiff: idx('Report') === idx('Difference vs baseline') + 2,
           penAfterReport: idx('Penalties') === idx('Report') + 1,
           modelLast: idx('Model') === heads.length - 1 || idx('Model') > idx('Penalties'),
@@ -3616,8 +3780,8 @@ export async function run(H, S) {
           privChecked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
         };
       });
-      H.check('detail-clarity: panel order — Assumptions top, Describe after Operations, Report + Penalties above Model',
-        order.asmTop && order.describeAfterOps && order.reportAfterDiff && order.penAfterReport && order.modelLast, JSON.stringify(order.heads));
+      H.check('detail-clarity: panel order — Assumptions top, Report + Penalties above Model, no Describe panel',
+        order.asmTop && order.reportAfterDiff && order.penAfterReport && order.modelLast && !order.heads.includes('Describe in words'), JSON.stringify(order.heads));
       H.check('detail-clarity: detail charts + diff carry axis captions and a breakdown chart',
         order.mortCap && order.diffCap && order.diffBreak && order.diffBreakLabels > 12 && order.diffBreakCap, JSON.stringify(order));
       // DC strat is mortgage-only (prepay + rate switch, no stock
@@ -4696,10 +4860,7 @@ export async function run(H, S) {
       r = await H.req('POST', '/api/planning/templates', { name: 'UI bundle template', spec: fAiModelDef, metadata_schema: [], metadata_answers: {} });
       H.check('uibundle: saved template created', r.status === 201 && r.data.template && r.data.template.id > 0, JSON.stringify(r.data));
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAddStrategyBtn');
-      // Saved templates live inside the AI fallback screen of the
-      // preset chooser (Add → AI design → From saved template).
-      await page.waitForSelector('#planChooseAi', { timeout: 15000 });
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planChooseAi');
+      // Saved templates live as a card in the preset chooser.
       await page.waitForSelector('#planChooseSaved', { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planChooseSaved');
       await page.waitForSelector('#planSavedTemplateApply', { timeout: 15000 });

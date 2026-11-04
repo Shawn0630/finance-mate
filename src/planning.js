@@ -1293,14 +1293,60 @@ export function primeFactorPresetPoints(preset, currentPrime, currentMonth) {
   if (preset === 'down') return [at(3, -0.25), at(6, -0.5), at(9, -0.75), at(12, -1.0)];
   return []; // flat or unknown: no points = hold at today's rate
 }
+// Scenario prime preset expansion (pure): the ai-design prompt allows
+// prime as {"preset": ...} with NO points, but validateScenarioFactors
+// demands points be an array — a preset-only reply failed validation
+// deterministically. Expanding here aligns the two: a known preset
+// with missing/empty points gains its path (flat = [] = hold); a
+// preset with points already present, or an unknown preset, passes
+// through untouched (the validator still rejects the unknown one).
+export function expandScenarioPrimePreset(factors, currentPrime, currentMonth) {
+  if (!factors || typeof factors !== 'object' || Array.isArray(factors)) return factors;
+  const p = factors.prime;
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return factors;
+  if (p.preset == null || !PLAN_PRIME_PRESETS.includes(p.preset)) return factors;
+  if (Array.isArray(p.points) && p.points.length) return factors;
+  return { ...factors, prime: { ...p, points: primeFactorPresetPoints(p.preset, currentPrime, currentMonth) } };
+}
+// Compact existing-project summaries for AI design prompts (pure):
+// names + factor/definition/op summaries, never full JSON dumps — the
+// model sees what the project already holds so it refines instead of
+// duplicating. Callers supply parsed rows (scenario factors objects,
+// baseline definitions, strategy ops with parsed params).
+export function planProjectAiSummaries({ scenarios = [], baselines = [], strategies = [], opsByStrategy = {} } = {}) {
+  return {
+    scenarios: (scenarios || []).map((sc) => ({ name: sc.name, is_base: !!sc.is_base, factors: sc.factors || null })),
+    baselines: (baselines || []).map((b) => {
+      const def = b.definition || {};
+      return { name: b.name, source: b.source || null, description: def.description || null, assumptions: Array.isArray(def.assumptions) ? def.assumptions : [] };
+    }),
+    strategies: (strategies || []).map((s) => ({
+      name: s.name, letter: s.letter || null, source: s.source || null,
+      ops: (opsByStrategy[s.id] || []).map((o) => {
+        let params = o.params || {};
+        if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = {}; } }
+        return { seq: o.seq, op_type: o.op_type, date: params.date || null, params };
+      }),
+      sink: (() => { try { return s.sink ? JSON.parse(s.sink) : null; } catch { return null; } })(),
+    })),
+  };
+}
+// Self-repair prompt builder (pure): one retry feeding the exact
+// validation errors back, so the model fixes the named rules instead
+// of re-emitting the same invalid spec. The caller still validates
+// the repair and surfaces its errors if it fails too.
+export function aiRepairPrompt(basePrompt, errs) {
+  return `${basePrompt}\nYour previous response failed validation: ${(errs || []).join('; ')}. Fix exactly these problems and return the complete corrected JSON now (do not return an ask list).`;
+}
 export function planStrategyTemplateLabel(key) {
   return PLAN_STRATEGY_TEMPLATE_LABELS[key] || key || '';
 }
 // AI snapshot: the app data the ai-model prompt is fed, so it stops
 // asking for numbers the app already holds (balances, terms, segments,
-// current prime + recent history, accounts, holdings). Pure: the caller
-// supplies rows; history is capped to the 12 latest points.
-export function buildPlanAiSnapshot({ properties = [], terms = [], segments = [], accounts = [], holdings = [], prime = null, primeHistory = [] } = {}) {
+// current prime + recent history, accounts, holdings, jobs, rentals).
+// Pure: the caller supplies rows; history is capped to the 12 latest
+// points.
+export function buildPlanAiSnapshot({ properties = [], terms = [], segments = [], accounts = [], holdings = [], jobs = [], rentals = [], prime = null, primeHistory = [] } = {}) {
   const props = (properties || []).map((p) => ({
     id: p.id, address: p.address, mortgage_balance: p.mortgage_balance ?? null,
     mortgage_balance_date: p.mortgage_balance_date || null, assessed_value: p.assessed_value ?? null,
@@ -1320,6 +1366,8 @@ export function buildPlanAiSnapshot({ properties = [], terms = [], segments = []
     properties: props, terms: termRows, segments: segRows,
     accounts: (accounts || []).map((a) => ({ id: a.id, name: a.name, type: a.type })),
     holdings: (holdings || []).map((h) => ({ id: h.id, account_id: h.account_id, symbol: h.symbol, label: h.label, currency: h.currency })),
+    jobs: (jobs || []).map((j) => ({ id: j.id, employer: j.employer, province: j.province || null, frequency: j.frequency || null, gross_amount: j.gross_amount ?? null, gross_basis: j.gross_basis || null })),
+    rentals: (rentals || []).map((r) => ({ id: r.id, label: r.label, address: r.address || null, rental_type: r.rental_type || null, ownership_pct: r.ownership_pct ?? null })),
     prime: prime != null ? prime : null, primeHistory: hist,
   };
 }
