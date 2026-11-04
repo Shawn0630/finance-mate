@@ -460,6 +460,13 @@ export async function run(H, S) {
       H.check('planning detail shows the category as read-only metadata',
         landed.catLine.includes('Property') && landed.catLine.includes('Refinance') && landed.catLine.includes('77 Planning Test Lane'),
         JSON.stringify({ catLine: landed.catLine }));
+      const titleTags = await page.evaluate(() => ({
+        tags: [...document.querySelectorAll('#planProjectHeader .plan-title-tag')].map((el) => el.textContent),
+        noteLine: !!document.querySelector('div.note#planProjectCategoryLine'),
+      }));
+      H.check('beautify: project title row carries category/subcategory/entity as tags (no separate note line)',
+        titleTags.tags.length === 3 && titleTags.tags[0] === 'Property' && titleTags.tags[1] === 'Refinance' && titleTags.tags[2].includes('77 Planning Test Lane') && !titleTags.noteLine,
+        JSON.stringify(titleTags));
       H.check('planning applied recommendation renders baseline cards with Edit/Delete and strategy cards as click-to-navigate only (no card toolbar)',
         landed.baseCards.length === 1 && landed.baseCards[0].edit && !landed.baseCards[0].ai && landed.baseCards[0].del
           && landed.stratCards.length === 1 && !landed.stratCards[0].edit && !landed.stratCards[0].del,
@@ -1928,6 +1935,49 @@ export async function run(H, S) {
       const preview = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
       H.check('planning pool: builder preview card carries the 1,100.00 pool value over 2 stocks',
         preview.includes('1,100.00') && preview.includes('2 stocks'), JSON.stringify(preview.slice(0, 300)));
+      // Beautify: pool builder groups holdings collapsibly with $0
+      // holdings tucked behind a show control (presentation only —
+      // the total/validation pins above already cover the model).
+      r = await H.req('POST', `/api/investments/accounts/${poolAcctB}/holdings`, { label: 'Pool Zero', kind: 'exchange', symbol: 'POOL.Z', currency: 'CAD', events: [] });
+      H.check('beautify: zero-value fixture holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1200);
+      await page.click('#planAddProjectBtn');
+      await waitQ(300);
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="investment"]').click(); });
+      await waitQ(1200);
+      const poolUi = await page.evaluate((acctB) => {
+        const group = document.querySelector(`[data-pool-group="${acctB}"]`);
+        if (!group) return { error: 'no group' };
+        const toggle = group.querySelector('[data-pool-toggle]');
+        const box = group.querySelector('[data-pool-holdings]');
+        const zeroBox = group.querySelector('[data-pool-zero]');
+        const zeroBtn = group.querySelector('[data-pool-zero-btn]');
+        const out = {
+          toggle: !!toggle, boxHidden: box ? box.hidden : null,
+          zeroHidden: zeroBox ? zeroBox.hidden : null, zeroBtn: !!zeroBtn,
+          zeroBtnText: zeroBtn ? zeroBtn.textContent : '',
+        };
+        if (toggle) toggle.click();
+        out.afterExpandHidden = box ? box.hidden : null;
+        out.zeroStillHidden = zeroBox ? zeroBox.hidden : null;
+        if (zeroBtn) zeroBtn.click();
+        out.zeroAfterShow = zeroBox ? zeroBox.hidden : null;
+        const firstNz = [...group.querySelectorAll('[data-pool-holding]')].find((cb) => {
+          const row = cb.closest('.plan-row');
+          return row && !row.closest('[data-pool-zero]');
+        });
+        if (firstNz) firstNz.click();
+        out.toggleLabel = toggle ? toggle.textContent : '';
+        if (toggle) toggle.click();
+        out.afterCollapseHidden = box ? box.hidden : null;
+        return out;
+      }, poolAcctB);
+      H.check('beautify: pool builder groups holdings collapsibly with $0 holdings tucked (expand → show → picked → collapse)',
+        poolUi.toggle && poolUi.boxHidden === true && poolUi.zeroHidden === true && poolUi.zeroBtn && poolUi.zeroBtnText.includes('$0')
+          && poolUi.afterExpandHidden === false && poolUi.zeroStillHidden === true && poolUi.zeroAfterShow === false
+          && poolUi.toggleLabel.includes('picked') && poolUi.afterCollapseHidden === true,
+        JSON.stringify(poolUi));
     } finally { await browserQ.close(); }
   }
   r = await H.req('DELETE', `/api/planning/projects/${poolProjId}`);
@@ -4729,7 +4779,11 @@ export async function run(H, S) {
       await waitF(1200);
       const appendSaveLabel = await page.evaluate(() => document.querySelector('#planReportAiSaveBtn')?.textContent || '');
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiSaveBtn');
-      await waitF(1500);
+      // Append Save re-renders after a PUT + comparison fetch: wait for
+      // the appended chart to appear instead of a fixed sleep (1500ms
+      // was too short under load: the persisted definition already had
+      // both charts while the viewer still showed only the first).
+      try { await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent).includes('Extra balance'), { timeout: 15000 }); } catch {}
       const appendTitles = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const rtAiDef = ((r.data.reports || []).find((x) => x.id === rtAiId) || {}).definition || {};
@@ -4841,6 +4895,22 @@ export async function run(H, S) {
       }));
       H.check('browsermode: closing the last tab returns to the list',
         lastClose.listVisible && lastClose.viewerEmpty && lastClose.tabs === 0, JSON.stringify(lastClose));
+      // Beautify: report cards are compact — one meta line at most,
+      // tight padding, Delete intact; click-to-tab is covered above.
+      const cardStyle = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('[data-plan-report-view]')];
+        return {
+          count: cards.length,
+          allCompact: cards.every((c) => c.classList.contains('plan-report-card')),
+          maxMeta: cards.length ? Math.max(...cards.map((c) => c.querySelectorAll('.n').length)) : -1,
+          someMeta: cards.some((c) => c.querySelectorAll('.n').length === 1),
+          allDelete: cards.every((c) => !!c.querySelector('[data-plan-report-del]')),
+          padding: cards.length ? getComputedStyle(cards[0]).padding : '',
+        };
+      });
+      H.check('beautify: report cards are compact (compact class, at most one meta line, Delete intact)',
+        cardStyle.count > 0 && cardStyle.allCompact && cardStyle.maxMeta <= 1 && cardStyle.someMeta && cardStyle.allDelete,
+        JSON.stringify(cardStyle));
       // UI bundle: remove-a-strategy-from-report + small toolbar
       // buttons + right-aligned strategy header.
       const ubDef = { strategies: [fStratId, fAiStratId], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] };

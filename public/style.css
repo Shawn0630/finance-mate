@@ -623,3 +623,11 @@ table.seg-table td:last-child { text-align: right; }
    meanings — selection border/background kept, report left bar
    kept (from .plan-report-pin), amber outline dropped. */
 .plan-flow-card.plan-selected.plan-report-pin { outline: none; }
+/* Planning report cards: compact — prominent title, one meta line, tight actions. */
+.plan-report-card { padding: 10px 14px; }
+.plan-report-card .k { font-size: 15px; font-weight: 650; }
+.plan-report-card .n { color: #71808f; font-size: 12px; margin-top: 2px; }
+.plan-report-card .toolbar { margin: 6px 0 0; }
+/* Planning project title tags: category/subcategory/entity as pills on the title row. */
+.plan-title-tags { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.plan-title-tag { display: inline-block; font-size: 11px; line-height: 1.4; padding: 2px 8px; border-radius: 999px; background: #eef2f7; color: #33424f; border: 1px solid #dde4ec; white-space: nowrap; }

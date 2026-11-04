@@ -11088,15 +11088,27 @@ async function planCatPickCategory(key) {
         id: a.account.id, name: (a.account || {}).name || '', value: (a.summary || {}).value || 0,
         holdings: (a.holdings || []).map((h) => ({ id: h.holding.id, symbol: h.holding.symbol || h.holding.label || '', value: (h.summary || {}).value || 0 })),
       }));
-      host.innerHTML = `<div class="note">Build the cash pool — pick whole accounts or individual stocks. For each, give a percent of that source, or a CAD amount from it. The pool total is the sum of the contributions.</div>
-        <div id="planPoolRows">${acctRows.map((a) => `
-          <div class="plan-row"><label style="flex:1"><input type="checkbox" data-pool-account="${a.id}"> ${esc(a.name)} · ${money2(a.value)}</label>
-          <select data-pool-mode="${a.id}" disabled><option value="percent">% of account</option><option value="amount">Amount (CAD)</option></select>
-          <input type="number" min="0" max="100" step="0.01" placeholder="%" data-pool-input="${a.id}" style="width:100px" disabled></div>
-          ${a.holdings.map((h) => `
+      host.innerHTML = `<div class="note">Build the cash pool — pick whole accounts or individual stocks. For each, give a percent of that source, or a CAD amount from it. The pool total is the sum of the contributions. Holdings sit under their account — expand it to pick individual stocks; $0 stocks are tucked behind Show $0 holdings.</div>
+        <div id="planPoolRows">${acctRows.map((a) => {
+          const nz = a.holdings.filter((h) => h.value > 0);
+          const z = a.holdings.filter((h) => h.value <= 0);
+          const holdRow = (h) => `
           <div class="plan-row" style="margin-left:16px"><label style="flex:1"><input type="checkbox" data-pool-holding="${h.id}" data-pool-account-of="${a.id}"> ${esc(h.symbol)} · ${money2(h.value)}</label>
           <select data-pool-mode-h="${h.id}" disabled><option value="percent">% of stock</option><option value="amount">Amount (CAD)</option></select>
-          <input type="number" min="0" max="100" step="0.01" placeholder="%" data-pool-input-h="${h.id}" style="width:100px" disabled></div>`).join('')}`).join('') || '<div class="note">No holdings yet.</div>'}
+          <input type="number" min="0" max="100" step="0.01" placeholder="%" data-pool-input-h="${h.id}" style="width:100px" disabled></div>`;
+          return `
+          <div class="plan-pool-group" data-pool-group="${a.id}">
+          <div class="plan-row"><label style="flex:1"><input type="checkbox" data-pool-account="${a.id}"> ${esc(a.name)} · ${money2(a.value)}</label>
+          <select data-pool-mode="${a.id}" disabled><option value="percent">% of account</option><option value="amount">Amount (CAD)</option></select>
+          <input type="number" min="0" max="100" step="0.01" placeholder="%" data-pool-input="${a.id}" style="width:100px" disabled>
+          ${a.holdings.length ? `<button type="button" class="small" data-pool-toggle="${a.id}">▸ ${a.holdings.length} holding${a.holdings.length === 1 ? '' : 's'}</button>` : ''}</div>
+          ${a.holdings.length ? `<div data-pool-holdings="${a.id}" hidden>
+          ${nz.map(holdRow).join('')}
+          ${z.length ? `<div data-pool-zero="${a.id}" hidden>${z.map(holdRow).join('')}</div>
+          <div class="plan-row" style="margin-left:16px"><button type="button" class="small" data-pool-zero-btn="${a.id}">Show $0 holdings (${z.length})</button></div>` : ''}
+          </div>` : ''}
+          </div>`;
+        }).join('') || '<div class="note">No holdings yet.</div>'}
         </div>
         <div class="note" id="planPoolTotal">Pool total: $0.00</div>
         <div class="toolbar"><button class="small primary" id="planCatEntityGo">Continue</button></div>`;
@@ -11133,6 +11145,7 @@ async function planCatPickCategory(key) {
             });
           }
           updateTotal();
+          poolToggleLabel(cb.dataset.poolAccount);
         });
       });
       host.querySelectorAll('[data-pool-holding]').forEach((cb) => {
@@ -11142,6 +11155,7 @@ async function planCatPickCategory(key) {
             const acb = host.querySelector(`[data-pool-account="${cb.dataset.poolAccountOf}"]`);
             if (acb && acb.checked) { acb.checked = false; syncRow('account', cb.dataset.poolAccountOf, false); }
           }
+          poolToggleLabel(cb.dataset.poolAccountOf);
           updateTotal();
         });
       });
@@ -11152,6 +11166,34 @@ async function planCatPickCategory(key) {
         else { inp.placeholder = '$'; inp.removeAttribute('max'); }
         updateTotal();
       };
+      // Collapsible account groups + tucked $0 holdings (presentation
+      // only: every checkbox/select/input keeps its data attribute, so
+      // the total, the mutual exclusion, and Continue validation below
+      // are untouched, and hidden rows still count when checked).
+      const poolToggleLabel = (id) => {
+        const btn = host.querySelector(`[data-pool-toggle="${id}"]`);
+        const box = host.querySelector(`[data-pool-holdings="${id}"]`);
+        if (!btn || !box) return;
+        const n = host.querySelectorAll(`[data-pool-holding][data-pool-account-of="${id}"]`).length;
+        const picked = host.querySelectorAll(`[data-pool-holding][data-pool-account-of="${id}"]:checked`).length;
+        btn.textContent = `${box.hidden ? '▸' : '▾'} ${n} holding${n === 1 ? '' : 's'}${picked ? ` · ${picked} picked` : ''}`;
+      };
+      host.querySelectorAll('[data-pool-toggle]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const box = host.querySelector(`[data-pool-holdings="${btn.dataset.poolToggle}"]`);
+          if (!box) return;
+          box.hidden = !box.hidden;
+          poolToggleLabel(btn.dataset.poolToggle);
+        });
+      });
+      host.querySelectorAll('[data-pool-zero-btn]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const box = host.querySelector(`[data-pool-zero="${btn.dataset.poolZeroBtn}"]`);
+          if (!box) return;
+          box.hidden = !box.hidden;
+          btn.textContent = box.hidden ? `Show $0 holdings (${box.querySelectorAll('[data-pool-holding]').length})` : 'Hide $0 holdings';
+        });
+      });
       host.querySelectorAll('[data-pool-mode]').forEach((sel) => sel.addEventListener('change', () => syncMode('account', sel.dataset.poolMode)));
       host.querySelectorAll('[data-pool-mode-h]').forEach((sel) => sel.addEventListener('change', () => syncMode('holding', sel.dataset.poolModeH)));
       host.querySelectorAll('[data-pool-input]').forEach((inp) => inp.addEventListener('input', updateTotal));
@@ -11366,6 +11408,11 @@ function planProjectHtml(d) {
   const headerLine = d.project.categoryLabels
     ? `${d.project.categoryLabels.category} · ${d.project.categoryLabels.subcategory} · ${d.project.categoryLabels.entity}`
     : (p.question || '');
+  // Title tags: the category pieces as pills on the title row (the old
+  // note line below the title is replaced by them when they exist).
+  const catTags = d.project.categoryLabels
+    ? [d.project.categoryLabels.category, d.project.categoryLabels.subcategory, d.project.categoryLabels.entity].filter((x) => x !== undefined && x !== null && x !== '')
+    : [];
   // Legacy template answers (old template flow) render as ONE compact
   // line under the header; no answers → no line at all.
   let metaLine = '';
@@ -11382,6 +11429,7 @@ function planProjectHtml(d) {
   const header = `
     <div><a id="planProjectBackLink" href="#planning">← Back to Planning</a></div>
     <div class="toolbar" id="planProjectHeader"><h3>${esc(p.name)}</h3>
+      ${catTags.length ? `<span id="planProjectCategoryLine" class="plan-title-tags">${catTags.map((t) => `<span class="plan-title-tag">${esc(t)}</span>`).join('')}</span>` : ''}
       <div class="spacer"></div>
       <div class="toolbar">
         ${d.stale ? '<span class="msg warn" style="margin:0">Stale baseline</span><button class="small" id="planSyncBtn">Sync latest mainline</button>' : ''}
@@ -11389,7 +11437,7 @@ function planProjectHtml(d) {
         <button class="small" id="planProjectEditBtn">Edit</button>
         <button class="small danger" id="planProjectDeleteBtn">Delete</button>
       </div></div>
-    ${headerLine ? `<div class="note" id="planProjectCategoryLine">${esc(headerLine)}</div>` : ''}
+    ${!d.project.categoryLabels && headerLine ? `<div class="note" id="planProjectCategoryLine">${esc(headerLine)}</div>` : ''}
     ${metaLine}
     <div class="msg" id="planProjectMsg"></div>`;
   // FLOW: three tiers, top to bottom — scenario tier (full width),
@@ -11587,10 +11635,10 @@ function planProjectWire(d) {
       under = (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) ? 'Current rates (no scenario)'
         : (r.scenarioIds || []).map((id) => { const sc = (d.scenarios || []).find((x) => x.id === id); return sc ? sc.name : `#${id}`; }).join(', ');
     }
-    return `<div class="card plan-flow-card" data-plan-report="${r.id}" data-plan-report-view="${r.id}" style="cursor:pointer">
+    const meta = [under ? `Under ${under}` : null, tags.length ? tags.join(' · ') : null].filter(Boolean).join(' · ');
+    return `<div class="card plan-flow-card plan-report-card" data-plan-report="${r.id}" data-plan-report-view="${r.id}" style="cursor:pointer">
     <div class="k"><span>${esc(r.name)}</span></div>
-    ${under ? `<div class="n">Under ${esc(under)}</div>` : ''}
-    ${tags.length ? `<div class="n">${esc(tags.join(' · '))}</div>` : ''}
+    ${meta ? `<div class="n">${esc(meta)}</div>` : ''}
     <div class="toolbar"><button class="small danger" data-plan-report-del="${r.id}">Delete</button></div></div>`;
   }).join('') || '<div class="note">No reports yet.</div>';
   document.querySelectorAll('[data-plan-report-view]').forEach((el) => {
