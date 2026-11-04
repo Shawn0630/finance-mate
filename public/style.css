@@ -552,6 +552,23 @@ table.seg-table td:last-child { text-align: right; }
   .prop-outline.open .prop-outline-card { display: block; }
 }
 
+/* OPEN report view: the tab host sticks below the sticky app
+   topbar (52px) while the report scrolls. Sticky sits on the HOST
+   (a direct child of the tall tier), not on the inner bar: a sticky
+   child cannot leave its own parent's box, and the host used to be
+   exactly the bar's height, so the bar just rode up with the page.
+   The header title/subtitle/definitions scroll away normally. */
+#planReportTabsHost { position: sticky; top: 52px; z-index: 20; }
+#planReportStickyBar { background: #f2f4f7; border-bottom: 1px solid #e6ecf2; }
+#planReportTabActionsBar:empty { display: none; }
+/* Reports LIST: compact cards in a responsive grid, same card
+   language as the beautify round (10px 14px, 15px/650 title, one
+   meta line). The toolbar + wiring note above stay full-width;
+   only the list itself grids. */
+#planReportList { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+@media (max-width: 700px) {
+  #planReportList { grid-template-columns: 1fr; }
+}
 /* Planning comparison: nonzero delta cells in the diff/master/Apple
    tables render bold so the eye lands on what changed. */
 .plan-diff { font-weight: 700; }
@@ -615,6 +632,8 @@ table.seg-table td:last-child { text-align: right; }
   #planFlowGrid > :not(#planReportsPanel) { display: none !important; }
   #planReportsPanel > :not(#planReport) { display: none !important; }
   #planReportTabsBar, #planReport button { display: none !important; }
+  #planReportTabsHost { position: static; }
+  #planReportOutline { display: none !important; }
   .modal-overlay { display: none !important; }
 }
 

@@ -3793,30 +3793,19 @@ export async function run(H, S) {
       await waitP(1200);
       const aiPanelBtn = await page.evaluate(() => !!document.querySelector('#planAiPanelToggleBtn'));
       H.check('report: project page has the unified Design with AI panel entry', aiPanelBtn);
-      await page.click('#planAddReportBtn');
+      const toolbar = await page.evaluate(() => ({
+        saveBtn: !!document.querySelector('#planAddReportBtn'),
+        btns: [...document.querySelectorAll('#planReportsPanel .section-head .toolbar button')].map((b) => b.textContent.trim()),
+      }));
+      H.check('saveremove: Reports toolbar has exactly Generate report + Generate with AI, no + Save report',
+        !toolbar.saveBtn && JSON.stringify(toolbar.btns) === JSON.stringify(['Generate report', 'Generate with AI']),
+        JSON.stringify(toolbar));
+      await page.click('#planAiReportBtn');
       await waitP(400);
-      const picker = await page.evaluate(() => {
-        const host = document.querySelector('#planReportSaveScenarios');
-        const boxes = host ? [...host.querySelectorAll('input:checked')].map((el) => el.parentElement.textContent.trim()) : [];
-        return { open: !document.querySelector('#planReportSaveModal').classList.contains('hidden'), checked: boxes };
-      });
-      H.check('report: save modal shows the scenario picker with the base pre-checked',
-        picker.open && picker.checked.some((t) => t.includes('Report world')), JSON.stringify(picker));
-      await page.evaluate(() => { document.querySelectorAll('#planReportSaveScenarios input:checked').forEach((el) => el.click()); });
-      await page.type('#planReportSaveName', 'Report browser');
-      await page.click('#planReportSaveBtn');
-      await waitP(600);
-      const pinPrompt = await page.evaluate(() => {
-        const msg = document.querySelector('#planReportSaveMsg');
-        return { text: msg ? msg.textContent : '', stillOpen: !document.querySelector('#planReportSaveModal').classList.contains('hidden') };
-      });
-      H.check('report: saving with no scenario pinned shows the pin prompt and saves nothing',
-        pinPrompt.stillOpen && /Pin at least one scenario/i.test(pinPrompt.text), JSON.stringify(pinPrompt));
-      await page.evaluate(() => { document.querySelector('#planReportSaveScenarios input').click(); });
-      await page.click('#planReportSaveBtn');
-      await waitP(1200);
-      const listed = await page.evaluate(() => document.querySelector('#planReportList').textContent.includes('Report browser'));
-      H.check('report: pinned save from the modal appears in the Reports list', listed);
+      const aiOpen = await page.evaluate(() => !document.querySelector('#planReportAiModal').classList.contains('hidden'));
+      H.check('saveremove: Generate with AI modal still opens', aiOpen);
+      await page.evaluate(() => { document.querySelector('#planReportAiModal [data-close-modal]').click(); });
+      await waitP(400);
       // Pinned report view: world label + method line + comparison component.
       await page.goto(`http://ff.local/#planning/report/${repProjectId}/${repMethodId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(2500);
@@ -4717,30 +4706,23 @@ export async function run(H, S) {
         JSON.stringify(world2));
       await page.click(`[data-plan-baseline-select="${wBaseId}"]`);
       await waitW(500);
-      await page.click('#planAddReportBtn');
+      // The Save modal is gone (user 13:51); the AI modal carries the
+      // same wiring-default pins, so the defaults check moves there.
+      await page.click('#planAiReportBtn');
       await waitW(1000);
       const modal = await page.evaluate((b, s) => ({
-        baseVal: document.querySelector('#planReportSaveBaseline')?.value || '',
-        scenChecked: [...document.querySelectorAll('#planReportSaveScenarios input:checked')].map((el) => Number(el.value)),
-        open: !document.querySelector('#planReportSaveModal').classList.contains('hidden'),
+        baseVal: document.querySelector('#planReportAiBaseline')?.value || '',
+        scenChecked: [...document.querySelectorAll('#planReportAiScenarios input:checked')].map((el) => Number(el.value)),
+        open: !document.querySelector('#planReportAiModal').classList.contains('hidden'),
       }), wBaseId, wScen2);
-      H.check('wiring: report modal defaults to the wiring baseline + wiring scenario',
+      H.check('wiring: AI report modal defaults to the wiring baseline + wiring scenario',
         modal.open && modal.baseVal === String(wBaseId) && JSON.stringify(modal.scenChecked) === JSON.stringify([wScen2]),
         JSON.stringify(modal));
-      await page.evaluate(() => { document.querySelector('#planReportSaveName').value = 'Wiring modal report'; });
-      await page.click('#planReportSaveBtn');
-      await waitW(1200);
-      r = await H.req('GET', `/api/planning/projects/${wProjectId}`);
-      const modalRep = (r.data.reports || []).find((x) => x.name === 'Wiring modal report');
-      H.check('wiring: modal save pins the wiring selection into the report',
-        !!modalRep && modalRep.baseline_id === wBaseId && JSON.stringify(modalRep.scenarioIds) === JSON.stringify([wScen2]),
-        JSON.stringify(modalRep));
-      // The modal save reloaded the project, which reset wiring
-      // picks (baseline null, strategies null = all). Re-pick the
-      // baseline first so the Generate guard below reflects ONLY
-      // the strategy toggle, not a missing baseline.
-      await page.click(`[data-plan-baseline-select="${wBaseId}"]`);
+      await page.evaluate(() => { document.querySelector('#planReportAiModal [data-close-modal]').click(); });
       await waitW(500);
+      // No modal save reloads the project anymore, so the wiring
+      // baseline picked above stays picked; the Generate guard below
+      // reflects ONLY the strategy toggle, not a missing baseline.
       const selBefore = await page.evaluate((sid) => {
         const b = document.querySelector(`[data-plan-strategy-select="${sid}"]`);
         return { pressed: b?.getAttribute('aria-pressed'), selected: !!b?.closest('.card')?.classList.contains('plan-selected') };
@@ -5002,10 +4984,7 @@ export async function run(H, S) {
         inline: !!document.querySelector('#planProject #planReport'),
         tab: !!document.querySelector(`[data-plan-report-tab="${rid}"]`),
       }), genRep ? genRep.id : -1);
-      const modalHidden = await page.evaluate(() => {
-        const m = document.querySelector('#planReportSaveModal');
-        return !m || m.classList.contains('hidden');
-      });
+      const modalGone = await page.evaluate(() => !document.querySelector('#planReportSaveModal'));
       H.check('flow: one-click Generate creates and opens a pinned preset report, no modal',
         !!genRep && genHash === `#planning/project/${fProjectId}` && genInline.inline && genInline.tab
           && JSON.stringify(genRep.scenarioIds) === JSON.stringify([fScenId]) && genRep.baseline_id === fBaseId
@@ -5013,8 +4992,8 @@ export async function run(H, S) {
           && JSON.stringify(genRep.definition.charts) === JSON.stringify([
             { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] },
             { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
-          ]) && modalHidden,
-        JSON.stringify({ genHash, genInline, genRep, modalHidden }));
+          ]) && modalGone,
+        JSON.stringify({ genHash, genInline, genRep, modalGone }));
       // Multi-tab (inline): open a second report, switch tabs, close
       // tabs — closing removes only the tab, never the report, and
       // the user never leaves the project page (no separate report
@@ -5083,6 +5062,131 @@ export async function run(H, S) {
           && stClose.hash === `#planning/project/${fProjectId}` && stClose.blocks.includes('Second balance') && bothAlive
           && stEmpty.hash === `#planning/project/${fProjectId}` && !stEmpty.strip && stEmpty.blocks.length === 0 && bothAlive2,
         JSON.stringify({ tabs2, st2, stSwitch, stClose, bothAlive, stEmpty, bothAlive2 }));
+      // Sticky tab bar + floating report outline (user 13:57/13:59):
+      // a fresh report so the block-delete pin below mutates nothing
+      // any other check depends on.
+      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Sticky outline report', definition: { strategies: [fStratId], charts: [{ template: 'time_line', title: 'Sticky balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Sticky headlines', series: ['cost', 'gain', 'net'] }] }, strategy_ids: [fStratId], baseline_id: fBaseId, scenario_ids: [fScenId] });
+      H.check('reportsticky: fresh report created for sticky/outline pins', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const stRepId = r.data.report.id;
+      await page.goto(`http://ff.local/#planning/report/${fProjectId}/${stRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky balance'), { timeout: 30000 });
+      await waitF(1500);
+      const stickyRects = async () => page.evaluate(() => {
+        const rr = (el) => el ? { top: el.getBoundingClientRect().top, bottom: el.getBoundingClientRect().bottom, height: el.getBoundingClientRect().height } : null;
+        return {
+          bar: rr(document.querySelector('#planReportStickyBar')), acts: rr(document.querySelector('#planReportTabActionsBar')),
+          title: rr(document.querySelector('#planReport > .panel .section-head h3')),
+          scrollH: document.documentElement.scrollHeight, vh: window.innerHeight, scrollY: window.scrollY,
+        };
+      });
+      const top0 = await stickyRects();
+      H.check('reportsticky: page is scrollable with a tab open', top0.scrollH > top0.vh + 500, JSON.stringify(top0));
+      await page.evaluate(() => window.scrollTo(0, 2000));
+      await waitF(600);
+      const sc = await stickyRects();
+      H.check('reportsticky: tab strip + buttons stick below the 52px topbar, header title scrolled out',
+        Math.abs(sc.bar.top - 52) <= 2 && sc.acts.top >= sc.bar.top && sc.acts.top < sc.bar.top + 120 && sc.acts.bottom <= sc.vh && sc.title.top < 0,
+        JSON.stringify({ top0, sc }));
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await waitF(600);
+      const back = await stickyRects();
+      H.check('reportsticky: scrolling back to top restores the layout exactly',
+        Math.abs(back.bar.top - top0.bar.top) <= 1 && Math.abs(back.acts.top - top0.acts.top) <= 1 && Math.abs(back.title.top - top0.title.top) <= 1,
+        JSON.stringify({ top0, back }));
+      await page.emulateMediaType('print');
+      const pr = await page.evaluate(() => ({
+        pos: getComputedStyle(document.querySelector('#planReportTabsHost')).position,
+        out: getComputedStyle(document.querySelector('#planReportOutline')).display,
+      }));
+      await page.emulateMediaType('screen');
+      H.check('reportsticky: print keeps the sticky bar static and hides the outline', pr.pos === 'static' && pr.out === 'none', JSON.stringify(pr));
+      const outEntries = async () => page.evaluate(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent));
+      const entries = await outEntries();
+      H.check('reportoutline: OPEN shows one entry per block + comparison',
+        JSON.stringify(entries) === JSON.stringify(['Sticky balance', 'Sticky headlines', 'Strategy comparison']),
+        JSON.stringify(entries));
+      await page.evaluate(() => { [...document.querySelectorAll('#planReportOutlineList a')].find((a) => a.textContent === 'Strategy comparison').click(); });
+      await waitF(1500);
+      const land = await page.evaluate(() => ({
+        cmpTop: document.querySelector('#planReportComparePanel').getBoundingClientRect().top,
+        barBottom: document.querySelector('#planReportStickyBar').getBoundingClientRect().bottom,
+      }));
+      H.check('reportoutline: clicking an entry lands the block below the sticky header',
+        land.cmpTop >= land.barBottom && land.cmpTop <= land.barBottom + 60, JSON.stringify(land));
+      await page.evaluate(() => window.__fmReportOutline.setHideDelay(100));
+      await page.evaluate(() => window.scrollTo(0, 300));
+      await waitF(30);
+      const wok1 = await page.evaluate(() => document.querySelector('#planReportOutline').classList.contains('awake'));
+      await waitF(300);
+      const hid = await page.evaluate(() => document.querySelector('#planReportOutline').classList.contains('awake'));
+      await page.evaluate(() => window.scrollTo(0, 500));
+      await waitF(30);
+      const wok2 = await page.evaluate(() => document.querySelector('#planReportOutline').classList.contains('awake'));
+      await page.evaluate(() => window.__fmReportOutline.setHideDelay(2500));
+      H.check('reportoutline: nav appears on scroll, auto-hides after scroll stops, reappears on scroll',
+        wok1 && !hid && wok2, JSON.stringify({ wok1, hid, wok2 }));
+      await page.goto(`http://ff.local/#planning/report/${fProjectId}/${genRep.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 30000 });
+      await waitF(1000);
+      const entriesGen = await outEntries();
+      H.check('reportoutline: tab switch refreshes entries to the new report',
+        JSON.stringify(entriesGen) === JSON.stringify(['Mortgage balance', 'Headlines', 'Strategy comparison']),
+        JSON.stringify(entriesGen));
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab="${id}"]`).click(); }, stRepId);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky balance'), { timeout: 30000 });
+      await waitF(1000);
+      const entriesBack = await outEntries();
+      H.check('reportoutline: switching back restores the first report entries',
+        JSON.stringify(entriesBack) === JSON.stringify(['Sticky balance', 'Sticky headlines', 'Strategy comparison']),
+        JSON.stringify(entriesBack));
+      await page.evaluate(() => { document.querySelector('[data-plan-report-block-del="0"]').click(); });
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Sticky headlines|Strategy comparison', { timeout: 30000 });
+      const entriesDel = await outEntries();
+      H.check('reportoutline: per-block Delete removes that block entry',
+        JSON.stringify(entriesDel) === JSON.stringify(['Sticky headlines', 'Strategy comparison']),
+        JSON.stringify(entriesDel));
+      await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
+      await page.waitForFunction(() => !document.querySelector('[data-plan-report-tab]'), { timeout: 15000 });
+      const listState = await page.evaluate(() => ({
+        entries: [...document.querySelectorAll('#planReportOutlineList a')].length,
+        awake: document.querySelector('#planReportOutline').classList.contains('awake'),
+      }));
+      H.check('reportoutline: LIST state shows no nav', listState.entries === 0 && !listState.awake, JSON.stringify(listState));
+      // Report LIST as a card grid (user 14:11): several compact
+      // cards per row on desktop, one column when narrow. The flow
+      // section runs at 1500px wide; the list here holds genRep,
+      // fRep2Id, and stRep (block deleted above, report alive).
+      const gridRects = async () => page.evaluate(() => [...document.querySelectorAll('#planReportList [data-plan-report]')].map((c) => {
+        const r = c.getBoundingClientRect();
+        return { id: Number(c.dataset.planReport), top: r.top, left: r.left, width: r.width };
+      }));
+      const gridWide = await gridRects();
+      H.check('reportgrid: at desktop width two or more cards share a row top',
+        gridWide.length >= 2 && Math.abs(gridWide[0].top - gridWide[1].top) <= 1,
+        JSON.stringify(gridWide));
+      await page.setViewport({ width: 700, height: 900 });
+      await waitF(800);
+      const gridNarrow = await gridRects();
+      const narrowLefts = [...new Set(gridNarrow.map((c) => Math.round(c.left)))];
+      const narrowTops = gridNarrow.map((c) => c.top);
+      H.check('reportgrid: at narrow width the grid collapses to one column',
+        gridNarrow.length >= 2 && narrowLefts.length === 1 && narrowTops.every((t, i) => i === 0 || t > narrowTops[i - 1]),
+        JSON.stringify(gridNarrow));
+      await page.setViewport({ width: 1500, height: 900 });
+      await waitF(800);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, stRepId);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky headlines'), { timeout: 30000 });
+      const gridOpened = await page.evaluate((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), stRepId);
+      H.check('reportgrid: clicking a grid card opens its tab', gridOpened);
+      await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
+      await page.waitForFunction(() => !document.querySelector('[data-plan-report-tab]'), { timeout: 15000 });
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-del="${id}"]`).click(); }, stRepId);
+      await page.waitForFunction((id) => !document.querySelector(`[data-plan-report="${id}"]`), { timeout: 15000 }, stRepId);
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const gridLeft = (r.data.reports || []).map((x) => x.id);
+      H.check('reportgrid: Delete on a grid card deletes only that report',
+        !gridLeft.includes(stRepId) && gridLeft.includes(genRep.id) && gridLeft.includes(fRep2Id),
+        JSON.stringify(gridLeft));
       // Routing: each AI-designed pick disables preset Generate with
       // a reason, while Generate with AI stays available.
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });

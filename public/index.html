@@ -534,6 +534,12 @@
     <div id="planProject" class="hidden"></div>
     <div id="planStrategy" class="hidden"></div>
     <div id="planScenario" class="hidden"></div>
+    <nav class="prop-outline" id="planReportOutline" aria-label="Report sections">
+      <button type="button" class="prop-outline-toggle" id="planReportOutlineToggle" aria-label="Report sections" aria-expanded="false">&#9776;</button>
+      <div class="prop-outline-card">
+        <ul class="prop-outline-list" id="planReportOutlineList"></ul>
+      </div>
+    </nav>
   </section>
   <section id="view-history" class="hidden">
     <div class="section-head"><h2>History</h2></div>
@@ -985,18 +991,6 @@
         <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>
-  </div>
-</div>
-
-<div class="modal-overlay hidden" id="planReportSaveModal">
-  <div class="modal-card">
-    <div class="modal-head"><h3>Save report</h3><button class="small" data-close-modal>Close</button></div>
-    <div class="msg" id="planReportSaveMsg"></div>
-    <div><label>Report name *</label><input id="planReportSaveName"></div>
-    <div><label>Baseline (one)</label><select id="planReportSaveBaseline"></select></div>
-    <div><label>Scenarios (pinned — at least one when scenarios exist)</label><div id="planReportSaveScenarios"></div></div>
-    <div><label>Strategies (many)</label><div id="planReportSaveStrategies"></div></div>
-    <div class="toolbar"><button class="primary" id="planReportSaveBtn">Save</button><button type="button" data-close-modal>Cancel</button></div>
   </div>
 </div>
 

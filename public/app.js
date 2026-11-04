@@ -11008,6 +11008,7 @@ async function loadPlanning() {
     planListData = data;
     $('#planList').classList.remove('hidden');
     $('#planProject').classList.add('hidden');
+    planReportOutlineClear();
     $('#planStrategy').classList.add('hidden');
     $('#planScenario').classList.add('hidden');
     $('#planList').innerHTML = planListHtml(data.projects);
@@ -11535,7 +11536,7 @@ async function loadPlanProject(id) {
       const cur = planReportTabs.find((t) => t.id === planReportCurrentId) || planReportTabs[planReportTabs.length - 1];
       if (!(data.reports || []).some((r) => r.id === cur.id)) {
         planReportTabs = planReportTabs.filter((t) => t.id !== cur.id);
-        if (!planReportTabs.length) { planReportCurrentId = null; planReportCurrentPins = null; planReportHighlightApply(); }
+        if (!planReportTabs.length) { planReportCurrentId = null; planReportCurrentPins = null; planReportHighlightApply(); planReportOutlineClear(); }
         else await loadPlanReport(id, planReportTabs[planReportTabs.length - 1].id);
       } else {
         await loadPlanReport(id, cur.id);
@@ -11543,6 +11544,7 @@ async function loadPlanProject(id) {
     } else {
       planReportCurrentId = null;
       planReportCurrentPins = null;
+      planReportOutlineClear();
     }
   });
 }
@@ -11647,7 +11649,7 @@ function planProjectHtml(d) {
       </div>
       <div class="plan-flow-tier" id="planReportsPanel">
       <div class="section-head"><h3>Reports</h3>
-        <div class="toolbar"><button class="small primary" id="planFlowGenerateBtn">Generate report</button><button class="small" id="planAiReportBtn">Generate with AI</button><button class="small" id="planAddReportBtn">+ Save report</button></div>
+        <div class="toolbar"><button class="small primary" id="planFlowGenerateBtn">Generate report</button><button class="small" id="planAiReportBtn">Generate with AI</button></div>
       </div>
       <div class="note" id="planFlowGenerateNote"></div>
       <div id="planReportTabsHost"></div>
@@ -11716,7 +11718,6 @@ function planProjectWire(d) {
   $('#planAddStrategyBtn').addEventListener('click', () => openPlanStrategyModal(p.id));
   const asBtn = $('#planAddAssetBtn');
   if (asBtn) asBtn.addEventListener('click', () => openPlanDeclaredAssetModal(p.id));
-  $('#planAddReportBtn').addEventListener('click', () => planSaveReport(p.id));
   $('#planAiReportBtn').addEventListener('click', () => openPlanReportAiModal(p.id));
   $('#planFlowGenerateBtn').addEventListener('click', () => planFlowGenerate(p.id));
   planFlowGenerateRefresh(); // initial guard state until the comparison load refreshes it
@@ -12404,43 +12405,6 @@ function planReportScenarioPickerHtml(scenarios) {
 function planReportPickedScenarios(hostSel) {
   return [...document.querySelectorAll(`${hostSel} input:checked`)].map((el) => Number(el.value));
 }
-async function planSaveReport(projectId) {
-  const msg = $('#planReportSaveMsg');
-  showMsg(msg, '', '');
-  $('#planReportSaveName').value = '';
-  let scenarios = [];
-  try {
-    const d = await api(`/api/planning/projects/${projectId}`);
-    const bases = d.project.baselines || [];
-    const strs = d.strategies || [];
-    scenarios = d.scenarios || [];
-    $('#planReportSaveBaseline').innerHTML = '<option value="">Do-nothing baseline</option>' + bases.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
-    // The wiring's picked baseline defaults the modal (a label/pin,
-    // not a numeric input — the comparison baseline is always the
-    // do-nothing reference).
-    if (planWiringBaselineId != null) { const sel = $('#planReportSaveBaseline'); if (sel && [...sel.options].some((o) => Number(o.value) === planWiringBaselineId)) sel.value = String(planWiringBaselineId); }
-    $('#planReportSaveScenarios').innerHTML = planReportScenarioPickerHtml(scenarios);
-    // The wiring's picked world defaults the modal's scenario pins
-    // (same shared selection — the modal is not a second picker).
-    if (planWiringScenarioId() != null) { document.querySelectorAll('#planReportSaveScenarios input').forEach((el) => { el.checked = Number(el.value) === planWiringScenarioId(); }); }
-    $('#planReportSaveStrategies').innerHTML = strs.map((s) => `<label><input type="checkbox" value="${s.id}" checked> ${esc(s.letter)} · ${esc(s.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
-  } catch (err) { showMsg(msg, 'err', err.message); return; }
-  openModal('planReportSaveModal');
-  $('#planReportSaveBtn').onclick = async () => {
-    try {
-      const name = $('#planReportSaveName').value.trim();
-      if (!name) throw new Error('report name is required');
-      const baselineId = $('#planReportSaveBaseline').value ? Number($('#planReportSaveBaseline').value) : null;
-      const scenarioIds = planReportPickedScenarios('#planReportSaveScenarios');
-      if (scenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
-      const strategyIds = [...document.querySelectorAll('#planReportSaveStrategies input:checked')].map((el) => Number(el.value));
-      await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: { name, definition: { strategies: strategyIds, charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, baseline_id: baselineId, strategy_ids: strategyIds, scenario_ids: scenarioIds } });
-      closeModalEl($('#planReportSaveModal'));
-      loadPlanProject(projectId);
-    } catch (err) { showMsg(msg, 'err', err.message); }
-  };
-}
-
 // ---- AI report: generate → preview → save (nothing writes before Save) ----
 // Fallback name for an AI report with no AI title and no typed
 // name: the existing auto-name pattern on the first picked
@@ -12716,6 +12680,7 @@ function planReportPinPanel(proj, report, note) {
       loadPlanReport(proj.project.id, report.id);
     } catch (err) { showMsg($('#planReportPinMsg'), 'err', err.message); }
   });
+  planReportOutlineClear();
   planReportViewSync(proj.project.id, report.id);
 }
 
@@ -12796,11 +12761,12 @@ function planReportViewSync(projectId, currentId) {
   if (!host) return;
   if (!planReportTabs.length) {
     host.innerHTML = '';
+    planReportOutlineClear();
     if (list) list.classList.remove('hidden');
     return;
   }
   if (list) list.classList.add('hidden');
-  host.innerHTML = `<div class="toolbar plan-report-tabs-host"><button class="small" id="planReportBackBtn">← All reports</button>${planReportTabBarHtml(projectId, currentId)}</div>`;
+  host.innerHTML = `<div id="planReportStickyBar"><div class="toolbar plan-report-tabs-host"><button class="small" id="planReportBackBtn">← All reports</button>${planReportTabBarHtml(projectId, currentId)}</div><div id="planReportTabActionsBar"></div></div>`;
   $('#planReportBackBtn').addEventListener('click', () => {
     planReportLoadSeq++;
     planReportTabs = [];
@@ -12817,6 +12783,149 @@ function planReportTabsOpen(projectId, reportId, name) {
   if (planReportTabsProject !== projectId) { planReportTabs = []; planReportTabsProject = projectId; }
   if (!planReportTabs.some((t) => t.id === reportId)) planReportTabs.push({ id: reportId, name });
 }
+// ------------------------------------------------- report outline --
+// Floating outline nav for the OPEN report view, mirroring the
+// property detail page's floating outline (.prop-outline styles
+// reused as-is): translucent, fixed left, auto-hides ~2.5s after
+// scrolling stops, reappears on scroll, hover/focus hold the
+// countdown. Entries = one per definition.charts block (by title)
+// plus the comparison panel when present. Clicking an entry jumps
+// the block below the sticky header (app topbar 52px + sticky tab
+// bar, measured live) — a plain scrollIntoView would land it under
+// the sticky header, so the jump is a computed offset instead.
+// Entries rebuild on every report render (tab switch, AI append,
+// block delete all reload the viewer); every non-report viewer
+// path clears it, and it never renders in LIST state.
+let planReportOutlineTargets = [];
+let planReportOutlineHideMs = 2500;
+let planReportOutlineHideTimer = null;
+const planReportOutlineHolds = new Set();
+window.__fmReportOutline = { setHideDelay: (ms) => { planReportOutlineHideMs = ms; } };
+
+function planReportOutlineArmHide() {
+  clearTimeout(planReportOutlineHideTimer);
+  planReportOutlineHideTimer = null;
+  if (planReportOutlineHolds.size) return;
+  planReportOutlineHideTimer = setTimeout(() => {
+    planReportOutlineHideTimer = null;
+    const nav = $('#planReportOutline');
+    if (nav && !planReportOutlineHolds.size) nav.classList.remove('awake');
+  }, planReportOutlineHideMs);
+}
+function planReportOutlineWake() {
+  const nav = $('#planReportOutline');
+  if (!nav || !planReportOutlineTargets.length) return;
+  nav.classList.add('awake');
+  planReportOutlineArmHide();
+}
+function planReportOutlineHold(reason, on) {
+  if (on) {
+    planReportOutlineHolds.add(reason);
+    const nav = $('#planReportOutline');
+    if (nav) nav.classList.add('awake');
+  } else {
+    planReportOutlineHolds.delete(reason);
+  }
+  planReportOutlineArmHide();
+}
+function planReportOutlineClear() {
+  const list = $('#planReportOutlineList');
+  if (list) list.innerHTML = '';
+  planReportOutlineTargets = [];
+  planReportOutlineHolds.clear();
+  clearTimeout(planReportOutlineHideTimer);
+  planReportOutlineHideTimer = null;
+  const nav = $('#planReportOutline');
+  if (nav) nav.classList.remove('awake', 'open');
+}
+function planReportOutlineSetActive(idx) {
+  document.querySelectorAll('#planReportOutlineList a[data-idx]').forEach((a) =>
+    a.classList.toggle('active', Number(a.dataset.idx) === idx));
+}
+function planReportOutlineOffset() {
+  const bar = document.querySelector('#planReportStickyBar');
+  const h = bar ? bar.getBoundingClientRect().height : 0;
+  return 52 + h + 12;
+}
+function planReportOutlineSpy() {
+  if (!planReportOutlineTargets.length) return;
+  if ($('#planProject').classList.contains('hidden')) return;
+  const LINE = planReportOutlineOffset();
+  let current = 0;
+  for (let i = 0; i < planReportOutlineTargets.length; i++) {
+    if (planReportOutlineTargets[i].el.getBoundingClientRect().top <= LINE) current = i;
+  }
+  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) {
+    current = planReportOutlineTargets.length - 1;
+  }
+  planReportOutlineSetActive(current);
+}
+function planReportOutlineJump(el) {
+  const top = el.getBoundingClientRect().top + window.scrollY - planReportOutlineOffset();
+  window.scrollTo({ top, behavior: 'smooth' });
+}
+function planReportOutlineClose() {
+  const nav = $('#planReportOutline');
+  if (!nav) return;
+  nav.classList.remove('open');
+  const t = $('#planReportOutlineToggle');
+  if (t) t.setAttribute('aria-expanded', 'false');
+  planReportOutlineHold('open', false);
+}
+function planReportOutlineBuild() {
+  const list = $('#planReportOutlineList');
+  if (!list) return;
+  planReportOutlineClear();
+  const add = (title, el) => {
+    const idx = planReportOutlineTargets.length;
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.textContent = title;
+    a.dataset.idx = String(idx);
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      planReportOutlineJump(el);
+      planReportOutlineSetActive(idx);
+      planReportOutlineClose();
+    });
+    li.appendChild(a);
+    list.appendChild(li);
+    planReportOutlineTargets.push({ el });
+  };
+  document.querySelectorAll('#planReport [data-plan-report-block]').forEach((wrap) => {
+    const h3 = wrap.querySelector('.panel .section-head h3');
+    add(h3 ? h3.textContent.trim() : 'Chart', wrap);
+  });
+  const cmp = document.querySelector('#planReportComparePanel');
+  if (cmp) add('Strategy comparison', cmp);
+  if (!planReportOutlineTargets.length) { planReportOutlineClear(); return; }
+  planReportOutlineSpy();
+}
+const planReportOutlineNav = $('#planReportOutline');
+if (planReportOutlineNav) {
+  planReportOutlineNav.addEventListener('mouseenter', () => planReportOutlineHold('hover', true));
+  planReportOutlineNav.addEventListener('mouseleave', () => planReportOutlineHold('hover', false));
+  planReportOutlineNav.addEventListener('focusin', () => planReportOutlineHold('focus', true));
+  planReportOutlineNav.addEventListener('focusout', (e) => {
+    if (!planReportOutlineNav.contains(e.relatedTarget)) planReportOutlineHold('focus', false);
+  });
+}
+const planReportOutlineToggle = $('#planReportOutlineToggle');
+if (planReportOutlineToggle) planReportOutlineToggle.addEventListener('click', () => {
+  const nav = $('#planReportOutline');
+  const open = nav.classList.toggle('open');
+  planReportOutlineToggle.setAttribute('aria-expanded', String(open));
+  planReportOutlineHold('open', open);
+});
+document.addEventListener('click', (e) => {
+  const nav = $('#planReportOutline');
+  if (nav && nav.classList.contains('open') && !nav.contains(e.target)) planReportOutlineClose();
+});
+window.addEventListener('scroll', () => {
+  planReportOutlineSpy();
+  if (!$('#view-planning').classList.contains('hidden') && !$('#planProject').classList.contains('hidden') && planReportOutlineTargets.length) planReportOutlineWake();
+}, { passive: true });
+
 async function loadPlanReport(projectId, reportId) {
   return withLoading(async () => {
     const mySeq = ++planReportLoadSeq;
@@ -12828,6 +12937,7 @@ async function loadPlanReport(projectId, reportId) {
       planReportCurrentPins = null;
       $('#planReport').innerHTML = `<div class="panel"><div class="note">Report not found.</div></div>`;
       planReportHighlightApply();
+      planReportOutlineClear();
       planReportViewSync(projectId, null);
       return;
     }
@@ -12852,6 +12962,7 @@ async function loadPlanReport(projectId, reportId) {
           loadPlanReport(projectId, reportId);
         } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
       });
+      planReportOutlineClear();
       planReportViewSync(projectId, reportId);
       planReportHighlightApply();
       return;
@@ -13075,9 +13186,6 @@ async function loadPlanReport(projectId, reportId) {
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
-        <div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div>
-        <div class="note" id="planReportTabNote"></div>
-        <div class="msg" id="planReportMsg"></div>
       </div>
       ${panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
       <div class="panel" id="planReportComparePanel">
@@ -13121,6 +13229,11 @@ async function loadPlanReport(projectId, reportId) {
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
     planReportViewSync(projectId, reportId);
+    // Per-tab actions live in the sticky bar above the viewer (the
+    // sync above rebuilds the bar, so fill it here before wiring);
+    // the header panel keeps title/subtitle/definitions only.
+    const planTabActions = $('#planReportTabActionsBar');
+    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="note" id="planReportTabNote"></div><div class="msg" id="planReportMsg"></div>`;
     // Per-tab actions. Routing applies per tab by THIS report's pins:
     // any AI-designed pinned entity disables preset Generate (AI
     // Generate stays enabled). Preset Generate re-pins the report,
@@ -13167,6 +13280,7 @@ async function loadPlanReport(projectId, reportId) {
     planReportCurrentId = reportId;
     planReportCurrentPins = { scenarioIds, baselineId: report.baseline_id, strategyIds: renderedStrategyIds };
     planReportHighlightApply();
+    planReportOutlineBuild();
   });
 }
 function sidsHas(series, sid) { return (series || []).includes(sid); }
@@ -13179,6 +13293,7 @@ async function loadPlanStrategy(id, scenarioId) {
     planStrategyData = data;
     $('#planList').classList.add('hidden');
     $('#planProject').classList.add('hidden');
+    planReportOutlineClear();
     $('#planStrategy').classList.remove('hidden');
     $('#planScenario').classList.add('hidden');
     $('#planStrategy').innerHTML = planStrategyHtml(data);
@@ -14217,6 +14332,7 @@ async function loadPlanScenario(id) {
     const data = await api(`/api/planning/scenarios/${id}`);
     $('#planList').classList.add('hidden');
     $('#planProject').classList.add('hidden');
+    planReportOutlineClear();
     $('#planStrategy').classList.add('hidden');
     $('#planScenario').classList.remove('hidden');
     $('#planScenario').innerHTML = planScenarioHtml(data);
