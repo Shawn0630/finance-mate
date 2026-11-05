@@ -19,10 +19,10 @@ import {
   principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
   scopeMainlineToProperty, validatePoolItemShapes, poolExternalCash,
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
-  validateScenarioFactors,
+  validateScenarioFactors, droppedScenarioPrimeSteps, primeStepDroppedMessage,
   factorsToAssumptions,
 } from '../src/planning.js';
-import { derivePayment } from '../src/engine.js';
+import { derivePayment, primeHistoryResolver } from '../src/engine.js';
 
 const PROP = () => ({
   id: 1, mortgage_balance: 500000, mortgage_balance_date: '2026-01-01',
@@ -79,6 +79,34 @@ test('scenarioPrimeHistory: only steps after the last actual observation survive
   assert.ok(out.every((o) => o.date >= '2026-10-28'));
   assert.equal(out[out.length - 1].rate, 6.00);
   assert.equal(out.filter((o) => o.date === '2026-10-01').length, 0);
+});
+test('scenarioPrimeHistory: a current-month step applies even when a later-in-month actual observation exists (user repro)', () => {
+  // Prime rise: step 2026-11-01 @ 5.45%, latest Valet observation
+  // 2026-11-04 @ 4.70%. The exact-date drop rule silently discarded
+  // the step, so projections priced everything at prime 4.70% flat.
+  const actual = [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-04', rate: 4.70 }];
+  const scenario = { steps: [{ date: '2026-11-01', rate: 5.45 }] };
+  const out = scenarioPrimeHistory(actual, scenario, '2026-11');
+  assert.deepEqual(out, [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-01', rate: 5.45 }]);
+  // The step supersedes the same-month actual observation: the
+  // month-end rule and daily accrual would otherwise let the later
+  // actual win the month back.
+  const primeForMonth = primeHistoryResolver(out, null);
+  assert.equal(primeForMonth('2026-10'), 4.45);
+  assert.equal(primeForMonth('2026-11'), 5.45);
+  assert.equal(primeForMonth('2027-01'), 5.45);
+  // No clock passed: falls back to the last actual observation's month.
+  assert.deepEqual(scenarioPrimeHistory(actual, scenario), out);
+});
+test('droppedScenarioPrimeSteps: a past-month step is dropped and named, a current-month step is not', () => {
+  const actual = [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-04', rate: 4.70 }];
+  const dropped = droppedScenarioPrimeSteps(actual, { steps: [{ date: '2026-09-01', rate: 5.00 }, { date: '2026-11-01', rate: 5.45 }] }, '2026-11');
+  assert.deepEqual(dropped.map((d) => d.date), ['2026-09-01']);
+  assert.equal(dropped[0].rate, 5.00);
+  assert.equal(dropped[0].lastActual, '2026-11-04');
+  assert.equal(primeStepDroppedMessage(dropped[0]), 'Prime step 2026-09-01 → 5% ignored: dated in a past month (last actual prime observation 2026-11-04).');
+  assert.deepEqual(droppedScenarioPrimeSteps(actual, { steps: [{ date: '2026-11-01', rate: 5.45 }] }, '2026-11'), []);
+  assert.deepEqual(droppedScenarioPrimeSteps(actual, null, '2026-11'), []);
 });
 test('validateStrategyFactors: shape errors for points, percents and sinks', () => {
   assert.deepEqual(validateStrategyFactors(null), []);
@@ -161,6 +189,42 @@ test('computeProjection: variable switch keeps the payment', () => {
   assert.equal(dec.rate, 3.7);
   assert.equal(dec.payment, baseRow(base, '2026-12').payment);
   assert.equal(strat.mortgage.perProperty[1].strategy.paymentAtEffect, base.mortgage.perProperty[1].baseline.paymentAtEffect);
+});
+test('computeProjection: current-month prime step prices the baseline variable rate (user repro)', () => {
+  // Prime rise: step 2026-11-01 @ 5.45% against a latest actual
+  // observation of 2026-11-04 @ 4.70%. Before the fix the step was
+  // dropped and the Jan 2027 baseline priced at prime 4.70% − 1.00 =
+  // 3.70%; after it, at 5.45% − 1.00 = 4.45%. The interest figure is
+  // what the user sees, so assert it from the December balance the
+  // engine itself produced (daily accrual: 31 December days).
+  const varProp = () => ({
+    ...PROP(),
+    segments: [{ id: 1, property_id: 1, start_date: '2026-01-01', rate_type: 'variable', rate_mode: 'prime_spread', annual_rate: null, spread: -1.0, compounding: 'monthly', accrual: 'daily' }],
+  });
+  const proj = computeProjection(ARGS({
+    mainline: MAINLINE({ properties: [varProp()] }),
+    primeHistory: [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-04', rate: 4.70 }],
+    scenario: { steps: [{ date: '2026-11-01', rate: 5.45 }] },
+    currentPrime: 4.70, currentMonth: '2026-11',
+  }));
+  assert.deepEqual(proj.errors, []);
+  assert.deepEqual(proj.warnings, []);
+  const rows = proj.mortgage.perProperty[1].baseline.series;
+  const dec = rows.find((r) => r.month === '2026-12');
+  const jan = rows.find((r) => r.month === '2027-01');
+  assert.equal(jan.rate, 4.45);
+  const expected = Math.round(dec.balance * 0.0445 * 31 / 365 * 100) / 100;
+  assert.ok(Math.abs(jan.interest - expected) < 0.05, `Jan interest ${jan.interest} vs ${expected} on Dec balance ${dec.balance}`);
+  // The dropped-step warning rides the projection when a step IS past.
+  const past = computeProjection(ARGS({
+    mainline: MAINLINE({ properties: [varProp()] }),
+    primeHistory: [{ date: '2026-10-28', rate: 4.45 }, { date: '2026-11-04', rate: 4.70 }],
+    scenario: { steps: [{ date: '2026-09-01', rate: 5.00 }] },
+    currentPrime: 4.70, currentMonth: '2026-11',
+  }));
+  assert.deepEqual(past.errors, []);
+  assert.equal(past.warnings.length, 1);
+  assert.equal(past.warnings[0], 'Prime step 2026-09-01 → 5% ignored: dated in a past month (last actual prime observation 2026-11-04).');
 });
 test('computeProjection: refinance amortizationYears drives the payment derivation', () => {
   const refi = (years) => computeProjection(ARGS({

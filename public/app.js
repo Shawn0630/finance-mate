@@ -12802,7 +12802,7 @@ const PLAN_REPORT_SERIES_LABEL = {
 };
 const PLAN_REPORT_DEFS = 'Cost = fees + penalty + cash out. Gain = interest saved vs baseline + asset growth under assumptions. Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
 const PLAN_REPORT_HOW = {
-  mortgage_balance: 'Mortgage balance = outstanding principal by month from the engine projection, summed across properties. Baseline uses actual prime history; strategies use the base scenario prime path.',
+  mortgage_balance: 'Mortgage balance = outstanding principal by month from the engine projection, summed across properties. Baseline and strategies price the variable rate off the same prime history: actual observations plus the scenario steps.',
   stock_value: 'Stock value = units × last price at or before the month (last price carried forward, never invented). The cash pot is included only at the horizon month.',
   total_value: 'Total value = property equity + stock value. Equity = assessed value − outstanding principal; assessed value is the current roll, held flat across months.',
   pool_balance: 'Cash pool balance = the strategy cash pot by month: sell proceeds parked in the pot, less pot-funded buys. The baseline pot starts at the pool\'s external cash, if any, and never moves (the baseline runs no operations).',
@@ -13579,6 +13579,9 @@ async function loadPlanReport(projectId, reportId) {
       const errs = (row.comparison && row.comparison.errors) || [];
       for (const e of errs) projErrLines.push(`${row.strategy.letter} · ${row.strategy.name}: ${e}`);
     }
+    // Projection warnings (e.g. a dropped prime step) are scenario-level,
+    // identical across strategies — render each once, no per-strategy prefix.
+    const projWarnLines = [...new Set(comp.strategies.flatMap((row) => (row.comparison && row.comparison.warnings) || []))];
     let propNames = {};
     try {
       const pp = await api('/api/properties');
@@ -13700,7 +13703,7 @@ async function loadPlanReport(projectId, reportId) {
         const snapIdx = planReportYearRows(baseTraj.monthly).map((r) => monthIndex.get(r.month));
         const head = `<tr><th>Month</th>${datasets.map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
         const body = snapIdx.map((mi) => `<tr><td>${months[mi]}</td>${datasets.map((d) => `<td>${d.data[mi] == null ? '—' : money2(d.data[mi])}</td>`).join('')}</tr>`).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline uses actual prime history. ${esc(how)}</div></div>`);
+        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline and strategies share the same prime history. ${esc(how)}</div></div>`);
         draws.push(() => planBarChart(cid, months, datasets));
         }
       } else if (c.template === 'share_doughnut') {
@@ -13793,6 +13796,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
+        ${projWarnLines.map((l) => `<div class="msg warn">${esc(l)}</div>`).join('')}
         ${mortHidden ? `<div class="note">Mortgage charts hidden — this report's baseline is a cash pool.</div>` : ''}
         <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
       </div>
@@ -14639,6 +14643,7 @@ function planScenarioHtml(d) {
       </div>
       <div class="msg" id="planScenarioMsg"></div>
       <div class="n">${line ? esc(line) : 'Flat world — current rates'}</div>
+      ${(d.droppedPrimeSteps || []).map((s) => `<div class="msg warn">${esc(s.message)}</div>`).join('')}
     </div>
     <div class="panel" id="planFactorsPanel">
       <div class="section-head"><h3>Factors</h3></div>

@@ -2324,6 +2324,44 @@ export async function run(H, S) {
         JSON.stringify(scenPage));
       H.check('scenario restructure: the factor checkboxes never offer Sink (sink lives on the strategy)',
         !scenPage.checkOpts.includes('sink'), JSON.stringify(scenPage.checkOpts));
+      // Prime-step drop: a step that aged into a past month is dropped
+      // from projections and must WARN, never silently vanish. The API
+      // rejects past-month points on save, so the stale step is seeded
+      // directly (the shape a step ages into): factors + legacy steps.
+      const _staleNow = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+      const _stalePrev = new Date(Date.UTC(Number(_staleNow.slice(0, 4)), Number(_staleNow.slice(5, 7)) - 2, 1));
+      const staleYm = `${_stalePrev.getUTCFullYear()}-${String(_stalePrev.getUTCMonth() + 1).padStart(2, '0')}`;
+      r = await H.req('POST', `/api/planning/projects/${poolProjId}/scenarios`, { name: 'Stale prime' });
+      H.check('primestep: stale scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      const staleScenId = r.data.scenario.id;
+      {
+        const sdb = new Database(path.join(H.dataDir, 'finance.db'), { timeout: 5000 });
+        sdb.prepare('UPDATE plan_scenarios SET factors = ?, steps = ? WHERE id = ?').run(
+          JSON.stringify({ prime: { points: [{ month: staleYm, rate: 5.00 }] } }),
+          JSON.stringify([{ date: `${staleYm}-01`, rate: 5.00 }]),
+          staleScenId);
+        sdb.close();
+      }
+      r = await H.req('GET', `/api/planning/scenarios/${staleScenId}`);
+      H.check('primestep: scenario GET names the dropped past-month prime step',
+        r.status === 200 && Array.isArray(r.data.droppedPrimeSteps) && r.data.droppedPrimeSteps.length === 1
+          && r.data.droppedPrimeSteps[0].date === `${staleYm}-01` && r.data.droppedPrimeSteps[0].rate === 5
+          && (r.data.droppedPrimeSteps[0].message || '').includes(`${staleYm}-01`),
+        JSON.stringify(r.data));
+      r = await H.req('GET', `/api/planning/projects/${poolProjId}/comparison?scenarioIds=${staleScenId}`);
+      const staleBlock = ((r.data || {}).scenarioBlocks || [])[0] || {};
+      const staleWarns = (staleBlock.strategies || []).flatMap((row) => (row.comparison && row.comparison.warnings) || []);
+      H.check('primestep: comparison carries the dropped-step warning for the report view',
+        r.status === 200 && staleWarns.some((w) => w.includes(`${staleYm}-01`) && w.includes('past month')),
+        JSON.stringify({ warns: staleWarns }));
+      await page.goto(`http://ff.local/#planning/scenario/${staleScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1500);
+      const stalePage = await page.evaluate(() => ({
+        warn: [...document.querySelectorAll('#planScenario .msg.warn')].map((w) => w.textContent),
+      }));
+      H.check('primestep: scenario detail warns about the dropped prime step',
+        stalePage.warn.some((t) => t.includes(`${staleYm}-01`) && t.includes('5%') && t.includes('past month')),
+        JSON.stringify(stalePage));
       // Ops + sink still work with no factors: under the factor-less
       // Pool Prime world the strategy card keeps its figures + sink line.
       await page.goto(`http://ff.local/#planning/project/${poolProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -3822,6 +3860,21 @@ export async function run(H, S) {
     const rr = await H.req('GET', '/api/earnings');
     return (rr.data.jobs || []).find((j) => j.id === thJob)?.calc;
   };
+  // Displayed take-home (b8a2590 contract): the solver prices the
+  // DISPLAYED cash — per-period cashNet minus the per-period tax
+  // benefit — so a take-home target and its round-trip assertion
+  // must use these figures, never the raw cashNet. Rounded to cents
+  // first (the raw subtraction can sit 1 ulp below the cent double).
+  const thDisplayed = async () => {
+    const rr = await H.req('GET', '/api/earnings');
+    const j = (rr.data.jobs || []).find((x) => x.id === thJob);
+    if (!j) return null;
+    const ben = j.taxBenefit || null;
+    return {
+      perPeriod: Math.round((j.calc.perPeriod.cashNet - (ben ? ben.perPeriod : 0)) * 100) / 100,
+      annual: Math.round((j.calc.cashNetAnnual - (ben ? ben.annual : 0)) * 100) / 100,
+    };
+  };
   let c = await thCalc();
   // (a) per-period take-home = economic net − own total, to the cent.
   H.check('takehome: per-period cash = economic net − own total',
@@ -3861,13 +3914,17 @@ export async function run(H, S) {
   // deduction — the entered paystub figure round-trips on the
   // FIRST save, with no second edit needed. (Before the fix the
   // solve priced the pre-edit deduction, storing a gross off by
-  // the percent of the gross delta.)
-  const thTarget = Math.round((c.perPeriod.cashNet + 100) * 100) / 100;
+  // the percent of the gross delta.) The target is the DISPLAYED
+  // cash (b8a2590: the solver prices displayed cash), not the raw
+  // cashNet — the re-read displayed cash is what must match.
+  const thDispBefore = await thDisplayed();
+  const thTarget = Math.round((thDispBefore.perPeriod + 100) * 100) / 100;
   r = await H.req('PUT', `/api/earnings/jobs/${thJob}`, { employer: 'TakeHome Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: thTarget, pay_value_basis: 'takehome' });
   H.check('takehome: take-home-basis edit accepted', r.status === 200, JSON.stringify(r.data));
   c = await thCalc();
+  const thDispAfter = await thDisplayed();
   H.check('takehome: take-home edit round-trips to the cent on first save (no second edit)',
-    c && c.perPeriod.cashNet === thTarget, JSON.stringify(c?.perPeriod));
+    thDispAfter && Math.abs(thDispAfter.perPeriod - thTarget) < 0.001, JSON.stringify({ displayed: thDispAfter, target: thTarget, cash: c?.perPeriod }));
   r = await H.req('GET', `/api/investments/accounts/${thAcct}`);
   const pctAfterTh = (r.data.plans || []).find((p) => p.id === thPctPlan);
   const fixAfterTh = (r.data.plans || []).find((p) => p.id === thFixedPlan);
@@ -3880,6 +3937,7 @@ export async function run(H, S) {
   H.check('takehome: repeating the same take-home edit stores the same gross',
     r.status === 200 && cRepeat && cRepeat.perPeriod.gross === solvedGross, JSON.stringify(cRepeat?.perPeriod));
   c = cRepeat;
+  const thDispStrip = await thDisplayed();
   // (c) browser: detail strip shows the cash take-home, chart carries an RRSP segment.
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('planning takehome browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -3945,7 +4003,7 @@ export async function run(H, S) {
       });
       const num = (s) => (s == null ? null : parseFloat(String(s).replace(/[^0-9.-]/g, '')));
       H.check('takehome: detail strip shows the cash take-home + chart carries an RRSP segment',
-        c && Math.abs(num(strip.nextNet) - c.perPeriod.cashNet) < 0.01 && Math.abs(num(strip.annualNet) - c.cashNetAnnual) < 0.01 && strip.rrspHasData === true, JSON.stringify({ strip, cash: c.perPeriod, cashAnnual: c.cashNetAnnual }));
+        thDispStrip && c && Math.abs(num(strip.nextNet) - thDispStrip.perPeriod) < 0.01 && Math.abs(num(strip.annualNet) - thDispStrip.annual) < 0.01 && strip.rrspHasData === true, JSON.stringify({ strip, cash: c.perPeriod, cashAnnual: c.cashNetAnnual, displayed: thDispStrip }));
     } finally {
       await browserTh.close();
     }
@@ -4289,7 +4347,7 @@ export async function run(H, S) {
     /unknown property/.test(psEdgeErrs) && psEdgeErrs.includes(String(psO)) && JSON.stringify(psEdgeKeys) === JSON.stringify([String(psE)]) && r.data.comparison.cost === 0,
     JSON.stringify({ errors: psEdgeErrs, keys: psEdgeKeys, cost: r.data.comparison.cost }));
   // Report for the caption pins (pinned to the Fix E strategy).
-  r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope report', definition: { strategies: [psStrat], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }] }, strategy_ids: [psStrat], scenario_ids: [] });
+  r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope report', definition: { strategies: [psStrat], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'stacked_bar', title: 'Stacked balance', series: ['mortgage_balance'] }] }, strategy_ids: [psStrat], scenario_ids: [] });
   H.check('propscope: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const psRep = r.data.report.id;
   if (!H.puppeteer || !H.chromeAvailable) {
@@ -4378,10 +4436,12 @@ export async function run(H, S) {
             ? planCharts[canvas.id].data.datasets.map((d) => d.data.filter((v) => v != null).length) : null;
         };
         const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Mortgage balance');
+        const stackBlock = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Stacked balance');
         return {
           headline: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((k) => k.textContent),
           mortData: chartByTitle('Mortgage balance'),
           how: block ? [...block.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
+          stackHow: stackBlock ? [...stackBlock.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
         };
       });
       H.check('stratpanels: report shows the Mortgage balance chart (baseline + strategy, both with data)',
@@ -4393,6 +4453,10 @@ export async function run(H, S) {
         JSON.stringify({ headline: repState.headline }));
       H.check('propscope: report Mortgage balance how-line names the entity property, not summed across properties',
         repState.how.includes('Mortgage balance = outstanding principal') && repState.how.includes('777 PropScope Entity Lane') && !repState.how.includes('summed across properties'), JSON.stringify({ how: repState.how }));
+      H.check('primestep: report how-line states the shared prime history, not the stale baseline-only caption',
+        repState.how.includes('Baseline and strategies price the variable rate off the same prime history') && !repState.how.includes('Baseline uses actual prime history'), JSON.stringify({ how: repState.how }));
+      H.check('primestep: stacked chart note states the shared prime history, not the stale caption',
+        repState.stackHow.includes('Baseline and strategies share the same prime history') && !repState.stackHow.includes('Baseline uses actual prime history'), JSON.stringify({ stackHow: repState.stackHow }));
       // (opform): in a property project the op form's property
       // picker offers ONLY the entity property, and a form-created
       // op lands on it.
@@ -4419,6 +4483,14 @@ export async function run(H, S) {
           return !!pre && Number(pre.params.propertyId) === psE;
         })()), JSON.stringify({ formOpMsg }));
     } finally { await browserP.close(); }
+  }
+  // Prime-step caption: the stale baseline-only wording survives
+  // nowhere in the client (runs even when the browser is unavailable).
+  {
+    const appJs = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+    H.check('primestep: no stale "Baseline uses actual prime history" caption remains in the client',
+      !appJs.includes('Baseline uses actual prime history'),
+      JSON.stringify({ present: appJs.includes('Baseline uses actual prime history') }));
   }
   // --- strategy-page Reports tier (user 2026-11-04): the project
   // Reports tier, scoped to THIS strategy. Fixture: one project,

@@ -65,6 +65,7 @@ import {
   validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind, aiSuggestNamePrompt, cleanAiSuggestedName,
   validateReportVariables, applyReportVariables, validateAiEngine, evaluateAiEngine,
   aiReportRefinePrompt, aiReportDefinitionDiff,
+  droppedScenarioPrimeSteps, primeStepDroppedMessage,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -5614,12 +5615,19 @@ app.post('/api/planning/projects/:id/scenarios', requireApiAuth, (req, res) => {
 // Scenario detail + rename/factors save. A factor never added is never
 // saved: the client sends only the active set, and this endpoint stores
 // exactly what it receives.
-app.get('/api/planning/scenarios/:id', requireApiAuth, (req, res) => {
+app.get('/api/planning/scenarios/:id', requireApiAuth, async (req, res) => {
   const row = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(Number(req.params.id));
   if (!row) return res.status(404).json({ error: 'scenario not found' });
   const p = planProjectById(row.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  res.json({ scenario: planScenarioRow(row), project: p });
+  // Prime steps in a past month never reach a projection (the merge
+  // drops them) — name them here so the scenario page can warn
+  // instead of advertising a rise that does not apply. The row is
+  // raw: parse it first (planScenarioFactorsOfRow takes a parsed row).
+  await ensureFreshPrime();
+  const droppedPrimeSteps = droppedScenarioPrimeSteps(getPrimeHistory(), primeFactorToScenario(planScenarioFactorsOfRow(planScenarioRow(row))), currentMonthKey())
+    .map((d) => ({ date: d.date, rate: d.rate, message: primeStepDroppedMessage(d) }));
+  res.json({ scenario: planScenarioRow(row), project: p, droppedPrimeSteps });
 });
 app.put('/api/planning/scenarios/:id', requireApiAuth, (req, res) => {
   const row = db.prepare('SELECT * FROM plan_scenarios WHERE id = ?').get(Number(req.params.id));

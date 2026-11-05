@@ -93,20 +93,48 @@ export function calcPenalty({
 // A scenario is direction × stance × magnitude/pace. Steps are dated the
 // first of the month they take effect (the engine's month-end rule then
 // prices that month at the new rate). startMonth is 'YYYY-MM'.
-// Merge actual prime history with a strategy's prime-factor steps. Steps
-// dated on or before the last actual observation are dropped (future
-// only). Between steps the rate holds at the last point's value until
-// the next point (the engine's month-end rule).
-export function scenarioPrimeHistory(actualHistory, scenario) {
-  const actual = (actualHistory || []).map((o) => ({ date: String(o.date).slice(0, 10), rate: Number(o.rate) }))
-    .filter((o) => /^\d{4}-\d{2}-\d{2}$/.test(o.date) && isFinite(o.rate))
-    .sort((a, b) => (a.date < b.date ? -1 : 1));
-  if (!scenario || !Array.isArray(scenario.steps)) return actual;
-  const steps = scenario.steps.map((o) => ({ date: String(o.date).slice(0, 10), rate: Number(o.rate) }))
-    .filter((o) => /^\d{4}-\d{2}-\d{2}$/.test(o.date) && isFinite(o.rate));
-  const lastActual = actual.length ? actual[actual.length - 1].date : '0000-00-00';
-  const future = steps.filter((o) => o.date > lastActual);
-  return [...actual, ...future].sort((a, b) => (a.date < b.date ? -1 : 1));
+// Merge actual prime history with a strategy's prime-factor steps. The
+// comparison is MONTH-granular against the current month: a step dated
+// in the current month or later applies — even when a weekly actual
+// observation with a later date in that same month exists (a step dated
+// 2026-11-01 must take effect although the latest observation is
+// 2026-11-04; an exact-date comparison silently dropped it). A step in
+// a genuinely past month is dropped: observed history cannot be
+// rewritten. Between steps the rate holds at the last point's value
+// until the next point (the engine's month-end rule).
+// A kept step also supersedes the actual observations in its own
+// month: the step is the month's effective scenario rate, and the
+// month-end rule (plus daily accrual) would otherwise let a
+// later-in-month actual observation win the month back.
+const normalizePrimePoints = (list) => (list || []).map((o) => ({ date: String(o.date).slice(0, 10), rate: Number(o.rate) }))
+  .filter((o) => /^\d{4}-\d{2}-\d{2}$/.test(o.date) && isFinite(o.rate))
+  .sort((a, b) => (a.date < b.date ? -1 : 1));
+const primeStepsOf = (scenario) => (!scenario || !Array.isArray(scenario.steps) ? [] : normalizePrimePoints(scenario.steps));
+// The month a step must be in (or after) to apply. Defaults to the
+// last actual observation's month when the caller passes no clock
+// (direct calls and tests without one).
+const primeStepCurrentMonth = (actual, currentMonth) => currentMonth || (actual.length ? actual[actual.length - 1].date.slice(0, 7) : '0000-00');
+export function scenarioPrimeHistory(actualHistory, scenario, currentMonth) {
+  const actual = normalizePrimePoints(actualHistory);
+  const curMonth = primeStepCurrentMonth(actual, currentMonth);
+  const kept = primeStepsOf(scenario).filter((o) => o.date.slice(0, 7) >= curMonth);
+  const stepMonths = new Set(kept.map((o) => o.date.slice(0, 7)));
+  const actualKept = actual.filter((o) => !stepMonths.has(o.date.slice(0, 7)));
+  return [...actualKept, ...kept].sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+// Steps the merge drops, with the last actual observation attached for
+// the warning: [{ date, rate, lastActual }]. Never silent — callers
+// surface these (projection warnings, scenario page).
+export function droppedScenarioPrimeSteps(actualHistory, scenario, currentMonth) {
+  const actual = normalizePrimePoints(actualHistory);
+  const curMonth = primeStepCurrentMonth(actual, currentMonth);
+  const lastActual = actual.length ? actual[actual.length - 1].date : null;
+  return primeStepsOf(scenario)
+    .filter((o) => o.date.slice(0, 7) < curMonth)
+    .map((o) => ({ ...o, lastActual }));
+}
+export function primeStepDroppedMessage(d) {
+  return `Prime step ${d.date} → ${d.rate}% ignored: dated in a past month${d.lastActual ? ` (last actual prime observation ${d.lastActual})` : ''}.`;
 }
 
 // ------------------------------------------------------------ validation --
@@ -242,7 +270,8 @@ export function validateLegs(ops, legs) {
 export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null, potInitial = 0 }) {
   const errors = [];
   const warnings = [];
-  const primeHist = scenarioPrimeHistory(primeHistory, scenario);
+  const primeHist = scenarioPrimeHistory(primeHistory, scenario, currentMonth);
+  for (const d of droppedScenarioPrimeSteps(primeHistory, scenario, currentMonth)) warnings.push(primeStepDroppedMessage(d));
   const primeForMonth = primeHistoryResolver(primeHist, currentPrime);
   const horizonMonth = addMonthsYm(currentMonth, horizonMonths);
 
