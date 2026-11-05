@@ -62,7 +62,7 @@ import {
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
   currentReturnRateFromPoints, validatePoolItemShapes, poolExternalCash,
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
-  validateAiReportChartSeries, aiReportPrompt,
+  validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind, aiSuggestNamePrompt, cleanAiSuggestedName,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -3289,28 +3289,38 @@ const earnJobRow = (row) => {
   const bonuses = db.prepare('SELECT date, amount FROM earn_bonuses WHERE job_id = ? ORDER BY date').all(row.id);
   const bonusTotal = bonuses.filter((b) => Number(String(b.date).slice(0, 4)) === row.tax_year)
     .reduce((s, b) => s + b.amount, 0);
-  // Pre-tax RRSP: linked plans' OWN per-period amount active today
-  // reduces taxable income in the calc (federal and provincial);
-  // the employer match never enters. Percent plans derive from the
-  // job's CURRENT per-period gross, so a pay change flows into the
-  // deduction (and the cash take-home) with no stored figure to
-  // refresh. The calc runs on read, so a plan create/edit/delete
-  // flows into every surface — list cards, detail summary,
-  // breakdown table, charts — with no history row touched. The
-  // gross is deduction-independent, so a zero-deduction calc gives
-  // the exact gross the percent derivation prices from.
+  // Pre-tax RRSP: linked plans' OWN per-period amount reduces taxable
+  // income in the calc (federal and provincial); the employer match
+  // never enters. Percent plans derive from the job's CURRENT
+  // per-period gross, so a pay change flows into the deduction (and
+  // the cash take-home) with no stored figure to refresh. The calc
+  // runs on read, so a plan create/edit/delete flows into every
+  // surface — list cards, detail summary, breakdown table, charts —
+  // with no history row touched. The gross is deduction-independent,
+  // so a zero-deduction calc gives the exact gross the percent
+  // derivation prices from.
+  // Per-payday rule (user 2026-11-04): a plan's own amount counts
+  // for a payday iff plan start ≤ THAT payday (inclusive). The
+  // per-period calc prices the NEXT payday, so the deduction is
+  // evaluated at the next pay date — not today. A plan starting
+  // 11/6 contributes $0 on 11/4 but is fully active in the 11/6
+  // next-pay figure (and in the annual run-rate, which annualizes
+  // that per-period value). The next payday is always ≥ today, so
+  // this set only grows vs the old today rule; a dateless job (no
+  // next payday) keeps the today rule.
   const today = vancouverToday();
+  const nextDate = nextPayDate(
+    { frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date }, today);
   const linkedPlans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id);
   const gross0 = calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction: 0 }, earnRegion().payroll).perPeriod.gross;
   const rrspDeduction = linkedPlans
-    .reduce((s, p) => s + (p.start_date <= today ? planPeriodAmounts(p, gross0).own : 0), 0);
+    .reduce((s, p) => s + ((nextDate == null ? p.start_date <= today : p.start_date <= nextDate) ? planPeriodAmounts(p, gross0).own : 0), 0);
   return {
     ...row,
     owner: row.owner || null,
     cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
     pay_changes: payChanges, bonuses, bonus_total: bonusTotal,
-    next_pay_date: nextPayDate(
-      { frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date }, today),
+    next_pay_date: nextDate,
     calc: calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction }, earnRegion().payroll),
   };
 };
@@ -3522,20 +3532,39 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   if (!existing) return res.status(404).json({ error: 'job not found' });
   // Take-home back-solves price the displayed net definition, so a
   // job with linked plans solves with the same pre-tax deduction
-  // the read-time calc applies (current-rate convention: plans
-  // active today; a new job has no plans, so POST keeps the 0).
-  // Percent plans derive from the job's PRE-EDIT gross here — the
-  // read path re-derives from the new gross on every read, so the
-  // display is always exact; only a take-home-basis edit combined
-  // with a simultaneous pay change can drift by the percent of
-  // the gross delta until the next read, which recomputes exactly.
-  const preGross = earnJobRow(existing).calc.perPeriod.gross;
-  const rrspDed = db.prepare('SELECT * FROM invest_plans WHERE job_id = ? AND start_date <= ?').all(id, vancouverToday())
-    .reduce((s, p) => s + planPeriodAmounts(p, preGross).own, 0);
-  const pcErr = derivePayChangeValues(v, existing, rrspDed);
-  if (pcErr) return res.status(400).json({ error: pcErr });
-  const takeErr = resolveTakeHome(req.body || {}, v, existing, rrspDed);
-  if (takeErr) return res.status(400).json({ error: takeErr });
+  // the read-time calc applies (per-payday rule: plans active at the
+  // edited job's next payday, falling back to today for a dateless
+  // job; a new job has no plans, so POST keeps the 0). Percent plans
+  // derive from the job's POST-edit gross: the derive/solve/pin cycle
+  // iterates until the deduction implied by the resulting gross
+  // matches the deduction used (fixed point, cent tolerance). The
+  // read path re-derives on every read, but the STORED values — a
+  // take-home-solved gross, take-home-basis pay-change values — are
+  // priced with this deduction, so a pre-edit figure would store a
+  // gross off by the percent of the gross delta until the next edit.
+  // Already-generated plan events keep generation-time amounts; only
+  // newly generated periods use the new derived amount.
+  const putToday = vancouverToday();
+  const putNext = nextPayDate({ frequency: v.frequency || existing.frequency, startDate: v.start_date || existing.start_date, recentDate: v.recent_pay_date || existing.recent_pay_date }, putToday);
+  const activePlans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(id)
+    .filter((p) => putNext == null ? p.start_date <= putToday : p.start_date <= putNext);
+  const dedForGross = (g) => activePlans.reduce((s, p) => s + planPeriodAmounts(p, g).own, 0);
+  const takeHomeTarget = (req.body || {}).pay_value_basis === 'takehome' ? v.recent_pay_value : null;
+  let rrspDed = dedForGross(earnJobRow(existing).calc.perPeriod.gross);
+  for (let iter = 0; iter < 10; iter++) {
+    // resolveTakeHome rewrites recent_pay_value with the solved
+    // gross, so restore the entered take-home target each pass.
+    if (takeHomeTarget != null) v.recent_pay_value = takeHomeTarget;
+    const pcErr = derivePayChangeValues(v, existing, rrspDed);
+    if (pcErr) return res.status(400).json({ error: pcErr });
+    const takeErr = resolveTakeHome(req.body || {}, v, existing, rrspDed);
+    if (takeErr) return res.status(400).json({ error: takeErr });
+    if (v.mode === 'derived') pinPositionToLatest(v);
+    const postGross = planJobPerPeriodGross({ gross_amount: v.gross_amount, frequency: v.frequency, gross_basis: v.gross_basis });
+    const newDed = postGross == null ? rrspDed : dedForGross(postGross);
+    if (Math.abs(newDed - rrspDed) < 0.005) { rrspDed = newDed; break; }
+    rrspDed = newDed;
+  }
   // Owner follows the property rule: omitted means unchanged, an
   // explicit empty value clears to unassigned.
   let owner = existing.owner || null;
@@ -5221,7 +5250,7 @@ function planFixedBaseline(view) {
       const pts = listPricePoints(db, hid).filter((pt) => String(pt.date) <= vancouverToday());
       const sug = returnSuggestionsFromPoints(pts, currentMonthKey());
       const win = sug.find((s) => s.annualizedReturn != null);
-      if (win) returns.push({ holdingId: hid, label: h.symbol || h.label || '', pct: Math.round(win.annualizedReturn * 10000) / 100, window: win.window });
+      if (win) returns.push({ holdingId: hid, label: h.symbol || h.label || '', pct: Math.round(win.annualizedReturn * 10000) / 100, basis: win.basis || null, window: win.window || null });
     }
     return { ...base, label, figures: figs, returns };
   }
@@ -5615,10 +5644,11 @@ app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async
     'prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30.',
     'stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one.',
     'Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
+    'Also propose a short name for the scenario from the user request (a few words, e.g. "Prime rises", "High stock return") — the user confirms or edits it before anything is created.',
     `App data snapshot: ${JSON.stringify(snapshot)}`,
     `This project already has: ${JSON.stringify(existing)}. Refine what exists where the user asks; do not duplicate an existing scenario under a new name.`,
     ...(historyText ? [`Conversation so far:\n${historyText}`, 'Continue this conversation: do not repeat factors already proposed unless the user contradicts them.'] : []),
-    'Output: {"factors": {...}}.',
+    'Output: {"factors": {...}, "name": "short scenario name"}. A missing name is tolerated (the client falls back to a plain default).',
     `User request: ${text}`,
   ].join('\n');
   let raw;
@@ -5634,7 +5664,10 @@ app.post('/api/planning/projects/:id/scenarios/ai-design', requireApiAuth, async
   const factors = expandScenarioPrimePreset(parsed.factors || parsed, snapshot.prime, currentMonthKey());
   const errs = validateScenarioFactors(factors, currentMonthKey());
   if (errs.length) return res.status(502).json({ error: `AI scenario failed validation: ${errs.join('; ')}` });
-  res.json({ factors });
+  // Naming is automatic, not a ✨ click: the design carries a
+  // proposed name (or null — the client falls back to "AI scenario").
+  const aiName = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim().slice(0, 80) : null;
+  res.json({ factors, name: aiName });
 });
 
 app.post('/api/planning/scenarios/:id/set-base', requireApiAuth, (req, res) => {
@@ -5780,7 +5813,37 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
   // The strategy carries no factors anymore: the world lives on the
   // scenario (appliedScenario labels which one these numbers ran under).
   const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [], factors: null, sink: planStrategySink(s) };
-  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: planEntityProperty(p), fixedBaseline: planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity: planProjectEntityOf(p) }) });
+  // Equity-chart inputs, computed exactly as the report path does
+  // (same assessed map, same entity rule, same growth factor): the
+  // entity property's assessed value for property projects, the
+  // all-properties sum for legacy/non-property projects; the applied
+  // scenario's property-growth factor grows it month by month, and
+  // with no factor it is held flat at the current roll.
+  const entityProp = planEntityProperty(p);
+  const assessedByProperty = (planAssembleMainline(p.id).assessed || {});
+  const equityAssessedTotal = entityProp
+    ? (Number(assessedByProperty[entityProp.id]) || 0)
+    : Object.values(assessedByProperty).reduce((sum, v) => sum + (Number(v) || 0), 0);
+  const scenFactors = scenarioArg ? planScenarioFactorsOfRow(scenarioArg) : null;
+  const equityGrowthPct = scenFactors && scenFactors.propertyGrowth ? Number(scenFactors.propertyGrowth.valuePct) : null;
+  // Generate-gating + baseline-kind content (user 2026-11-04): the
+  // strategy page's headline and chart panels render only when a
+  // report exists pinning this strategy (a null strategy_ids legacy
+  // row pins all strategies), and their content follows the baseline
+  // kind — pool for investment projects, property for property
+  // projects, other for everything else. Deleting all such reports
+  // re-hides the panels.
+  const baselineKind = p.category === 'investment' ? 'pool' : p.category === 'property' ? 'property' : 'other';
+  let hasGeneratedReport = false;
+  try {
+    for (const r of db.prepare('SELECT strategy_ids FROM plan_reports WHERE project_id = ?').all(p.id)) {
+      if (r.strategy_ids == null) { hasGeneratedReport = true; break; }
+      let ids = null;
+      try { ids = JSON.parse(r.strategy_ids); } catch { ids = null; }
+      if (Array.isArray(ids) && ids.includes(s.id)) { hasGeneratedReport = true; break; }
+    }
+  } catch { /* no reports table rows = gate closed */ }
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: entityProp, equityAssessedTotal, equityGrowthPct, equityCurrentMonth: currentMonthKey(), baselineKind, hasGeneratedReport, fixedBaseline: planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity: planProjectEntityOf(p) }) });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -6821,7 +6884,8 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
     'Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas).',
     'Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids.',
     'For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
-    'Output: {"ops": [{"op_type": "...", "params": {...}, "legs": [...]}]}.',
+    'Also propose a short name for the strategy from the operation sequence (op types + key params, e.g. a January switch to fixed is "Jan to Fix", a $50,000 prepay is "pre pay 50000") — the user confirms or edits it before applying.',
+    'Output: {"ops": [{"op_type": "...", "params": {...}, "legs": [...]}], "name": "short strategy name"}. A missing name is tolerated (the client falls back to a plain default).',
     `Properties: ${JSON.stringify(props)}`,
     `Accounts: ${JSON.stringify(accounts)}`,
     `Holdings: ${JSON.stringify(holdings)}`,
@@ -6842,7 +6906,10 @@ app.post('/api/planning/strategies/:id/ai-describe', requireApiAuth, async (req,
   const legs = [];
   for (const o of withSeq) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
   const errs = planValidateStrategyOps(s.id, [...planOpsOf(s.id), ...withSeq], legs);
-  res.json({ ops: withSeq, unresolved, warnings: errs, configured: true });
+  // Naming is automatic: the design carries a proposed name (or null
+  // — the client falls back to "AI strategy").
+  const aiName = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim().slice(0, 80) : null;
+  res.json({ ops: withSeq, unresolved, warnings: errs, configured: true, name: aiName });
 });
 
 // Reusable AI templates: an ai-model spec saved with its metadata
@@ -7393,7 +7460,8 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   // used to come out as an all-zero chart instead of an error.
   const mortgagedCount = db.prepare(`SELECT COUNT(*) AS n FROM properties WHERE mortgage_balance IS NOT NULL AND mortgage_balance > 0 AND EXISTS (SELECT 1 FROM rate_segments WHERE rate_segments.property_id = properties.id)`).get().n;
   const holdingCount = db.prepare('SELECT COUNT(*) AS n FROM invest_holdings').get().n;
-  const prompt = aiReportPrompt({ strategies, mortgagedCount, holdingCount, text });
+  const baselineKind = p.category === 'investment' ? 'pool' : p.category === 'property' ? 'property' : 'other';
+  const prompt = aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind });
   let raw;
   try {
     raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
@@ -7409,11 +7477,37 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   // Same 502 path as the spec check; no retry loop.
   const seriesErrs = validateAiReportChartSeries(parsed.charts);
   if (seriesErrs.length) return res.status(502).json({ error: seriesErrs.join('; ') });
+  // Baseline-kind rule (AI endpoint only): a mortgage-family chart
+  // on a cash-pool baseline is rejected, same 502 style.
+  const kindErrs = validateAiReportBaselineKind(parsed.charts, baselineKind);
+  if (kindErrs.length) return res.status(502).json({ error: kindErrs.join('; ') });
   // AI-generated reports carry their own calculation method per chart
   // (the engine path gets its how-calculated lines from the app).
   const methodErrs = validateAiChartMethods(parsed.charts);
   if (methodErrs.length) return res.status(502).json({ error: methodErrs.join('; ') });
   res.json({ definition: parsed, configured: true });
+});
+
+// AI name suggestion: a NAME only, never auto-saved — the client
+// fills the Name field as an editable draft. Unconfigured LLM =
+// the existing 503 guidance, field untouched client-side.
+app.post('/api/planning/ai-suggest-name', requireApiAuth, async (req, res) => {
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const b = req.body || {};
+  const kind = b.kind === 'strategy' ? 'strategy' : b.kind === 'scenario' ? 'scenario' : null;
+  if (!kind) return res.status(400).json({ error: 'kind must be scenario or strategy' });
+  const context = b.context && typeof b.context === 'object' && !Array.isArray(b.context) ? b.context : {};
+  const prompt = aiSuggestNamePrompt(kind, context);
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  const name = cleanAiSuggestedName(parsed != null ? parsed : raw);
+  if (!name) return res.status(502).json({ error: 'AI did not return a name' });
+  res.json({ name });
 });
 
 app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {

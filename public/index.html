@@ -1003,7 +1003,8 @@
     <div class="modal-head"><h3>Add scenario</h3><button class="small" data-close-modal>Close</button></div>
     <div class="msg" id="planScenarioModalMsg"></div>
     <form id="planScenarioForm">
-      <div><label>Name *</label><input id="planScenarioName" required></div>
+      <div><label>Name *</label><div style="display:flex;gap:8px"><input id="planScenarioName" required style="flex:1"><button type="button" class="small" id="planScenarioAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
+      <div id="planScenarioModalFactors"></div>
       <div class="toolbar">
         <button type="submit" class="primary">Create</button>
         <button type="button" data-close-modal>Cancel</button>
@@ -1038,6 +1039,7 @@
       <div id="planProjectAccountRow" class="hidden"><label>Account type</label><select id="planProjectAccountType"><option value="">Any</option><option value="TFSA">TFSA</option><option value="RRSP">RRSP</option><option value="NonRegistered">NonRegistered</option></select></div>
       <div id="planProjectCategoryRow" class="hidden"><div class="note" id="planProjectCategoryNote"></div></div>
       <div class="toolbar">
+        <button type="button" class="small hidden" id="planProjectBackBtn">← Back</button>
         <button type="submit" class="primary" id="planProjectSaveBtn">Save</button>
         <button type="button" class="primary hidden" id="planAiCreateBtn">✨ Create with AI</button>
         <button type="button" data-close-modal>Cancel</button>

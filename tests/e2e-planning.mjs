@@ -1496,26 +1496,20 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/project/${taPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await mbWait(1500);
       const flatState = await page.evaluate(() => {
-        const world = document.querySelector('#planStrategyCardsWorld');
-        // Column tops, not first-child tops: the baseline column
-        // holds the fixed card or (uncategorized) the note, whose
-        // own margins differ from a strategy card's — the alignment
-        // invariant is the columns starting at the same height.
+        // Item 10: the Under-scenario note element is gone entirely;
+        // the columns-starting-at-the-same-height invariant is what
+        // remains of the tier alignment.
         const bTop = document.querySelector('#planBaselineCards')?.getBoundingClientRect().top ?? null;
         const sTop = document.querySelector('#planStrategyCards')?.getBoundingClientRect().top ?? null;
         return {
-          parent: world?.parentElement?.id || '',
-          inStratCol: !!document.querySelector('#planStrategiesPanel #planStrategyCardsWorld'),
-          note: world?.textContent || '',
+          worldAbsent: !document.querySelector('#planStrategyCardsWorld'),
           bTop, sTop,
         };
       });
-      H.check('tieralign: world note is a single element above the row, not inside the Strategies column',
-        flatState.parent === 'planFlowMidTier' && !flatState.inStratCol, JSON.stringify(flatState));
+      H.check('tieralign: world note element absent (flat world)',
+        flatState.worldAbsent === true, JSON.stringify(flatState));
       H.check('tieralign: baseline and strategy columns share the same top offset (flat world)',
         flatState.bTop !== null && flatState.sTop !== null && Math.abs(flatState.bTop - flatState.sTop) <= 1, JSON.stringify(flatState));
-      H.check('tieralign: flat-world note text correct',
-        flatState.note.includes('Current rates (no scenario)'), JSON.stringify(flatState));
       r = await H.req('POST', `/api/planning/projects/${taPid}/scenarios`, { name: 'TA World' });
       H.check('tieralign: fixture scenario created',
         r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
@@ -1525,19 +1519,26 @@ export async function run(H, S) {
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await mbWait(1500);
       const pickedState = await page.evaluate(() => {
-        const world = document.querySelector('#planStrategyCardsWorld');
         const bTop = document.querySelector('#planBaselineCards')?.getBoundingClientRect().top ?? null;
         const sTop = document.querySelector('#planStrategyCards')?.getBoundingClientRect().top ?? null;
         return {
-          note: world?.textContent || '',
+          worldAbsent: !document.querySelector('#planStrategyCardsWorld'),
           bTop, sTop,
         };
       });
-      H.check('tieralign: note text correct for a picked scenario',
-        pickedState.note.includes('Under TA World'), JSON.stringify(pickedState));
+      H.check('tieralign: world note element absent (picked world)',
+        pickedState.worldAbsent === true, JSON.stringify(pickedState));
       H.check('tieralign: baseline and strategy columns share the same top offset (picked world)',
         pickedState.bTop !== null && pickedState.sTop !== null && Math.abs(pickedState.bTop - pickedState.sTop) <= 1, JSON.stringify(pickedState));
     } finally { await mbBrowser.close(); }
+  }
+  // Item 10 (c): no source element references the removed note id.
+  {
+    const appJs = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+    const indexHtml = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+    H.check('tieralign: no source references the removed world-note id',
+      !appJs.includes('planStrategyCardsWorld') && !indexHtml.includes('planStrategyCardsWorld'),
+      JSON.stringify({ appJs: appJs.includes('planStrategyCardsWorld'), indexHtml: indexHtml.includes('planStrategyCardsWorld') }));
   }
   // ---- Unified AI panel (browser) -------------------------------------
   // Panel toggle/targets, scattered entries gone, scenario + baseline
@@ -1617,29 +1618,85 @@ export async function run(H, S) {
       const targets = await page.evaluate(() => ({
         targets: [...document.querySelectorAll('[data-plan-ai-target]')].map((b) => b.dataset.planAiTarget),
         stratRowHidden: !!document.querySelector('#planAiPanelStrategyRow.hidden'),
-        scenNameShown: !document.querySelector('#planAiPanelScenarioNameRow.hidden'),
+        // Item 11 revised: NO Name field in the Design panel for
+        // either target — naming is automatic, from the design.
+        noNameRow: !document.querySelector('#planAiPanelScenarioNameRow') && !document.querySelector('#planAiPanelStrategyNameRow') && ![...document.querySelectorAll('#planAiPanel input')].some((i) => /name/i.test(i.placeholder || '') && i.id !== 'planAiPanelPreviewName'),
       }));
       H.check('modelmove: panel shows exactly two targets (no Strategy·model, no Baseline — baselines are fixed), scenario default, strategy row hidden',
-        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'ops']) && targets.stratRowHidden && targets.scenNameShown, JSON.stringify(targets));
+        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'ops']) && targets.stratRowHidden, JSON.stringify(targets));
+      H.check('aipanel11: Design panel has no Name field (scenario target)',
+        targets.noNameRow, JSON.stringify(targets));
       await page.evaluate(() => document.querySelector('[data-plan-ai-target="ops"]').click());
-      const opsRow = await page.evaluate(() => !document.querySelector('#planAiPanelStrategyRow.hidden'));
+      const opsRow = await page.evaluate(() => !document.querySelector('#planAiPanelStrategyRow.hidden')
+        && !document.querySelector('#planAiPanelStrategyNameRow'));
       H.check('aipanel browser: ops target shows the strategy picker', opsRow);
-      // Scenario through the panel: preset-only stub factors expand
+      H.check('aipanel11: Design panel has no Name field (ops target)', opsRow);
+      // Scenario through the panel, item 11 revised: Send works with
+      // description text only; the design carries the proposed name,
+      // shown editable in the preview; Apply creates it under the
+      // edited preview name. Preset-only stub factors expand
       // server-side; Apply navigates to the new scenario page.
       await page.evaluate(() => document.querySelector('[data-plan-ai-target="scenario"]').click());
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } }, name: 'Panel AI Name' }));
       await page.evaluate(() => {
-        document.querySelector('#planAiPanelScenarioName').value = 'Panel Scenario';
         document.querySelector('#planAiPanelText').value = 'prime rises';
       });
       await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
       await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
+      const previewName = await page.evaluate(() => document.querySelector('#planAiPanelPreviewName')?.value || '');
+      H.check('aipanel11: preview shows the AI-proposed name, editable',
+        previewName === 'Panel AI Name', JSON.stringify({ previewName }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelPreviewName').value = 'Panel AI Name Edited'; });
       await page.evaluate(() => document.querySelector('#planAiPanelApplyBtn').click());
       await page.waitForFunction(() => location.hash.startsWith('#planning/scenario/'), { timeout: 15000 });
       await page.goto(`http://ff.local/#planning/project/${panelProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await panelWait(1500);
-      const scenCard = await page.evaluate(() => (document.querySelector('#planScenarioCards')?.textContent || '').includes('Panel Scenario'));
+      const scenCard = await page.evaluate(() => (document.querySelector('#planScenarioCards')?.textContent || '').includes('Panel AI Name Edited'));
       H.check('aipanel browser: scenario designed in the panel joins the Scenarios list', scenCard);
+      H.check('aipanel11: Apply creates the scenario with the edited preview name', scenCard);
+      // AI-no-name fallback: a design without a name previews and
+      // applies under the plain default.
+      await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="scenario"]').click());
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'prime rises again'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
+      const fallbackName = await page.evaluate(() => document.querySelector('#planAiPanelPreviewName')?.value || '');
+      H.check('aipanel11: AI-no-name preview falls back to the plain default',
+        fallbackName === 'AI scenario', JSON.stringify({ fallbackName }));
+      await page.evaluate(() => document.querySelector('#planAiPanelApplyBtn').click());
+      await page.waitForFunction(() => location.hash.startsWith('#planning/scenario/'), { timeout: 15000 });
+      await page.goto(`http://ff.local/#planning/project/${panelProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await panelWait(1500);
+      const fallbackCard = await page.evaluate(() => (document.querySelector('#planScenarioCards')?.textContent || '').includes('AI scenario'));
+      H.check('aipanel11: Apply creates the fallback-named scenario', fallbackCard);
+      // Ops through the panel: new strategy is created at Send under
+      // the fallback, then renamed at Apply to the edited preview
+      // name, and the described ops land on it.
+      await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('[data-plan-ai-target="ops"]').click());
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ ops: [{ op_type: 'prepay', params: { date: '2027-01-01', amount: 10000, propertyRef: '77 Planning Test Lane, Victoria, BC' } }], name: 'Panel Ops Name' }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'prepay 10k'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
+      const opsPreview = await page.evaluate(() => document.querySelector('#planAiPanelPreviewName')?.value || '');
+      H.check('aipanel11: ops preview shows the AI-proposed strategy name',
+        opsPreview === 'Panel Ops Name', JSON.stringify({ opsPreview }));
+      await page.evaluate(() => { document.querySelector('#planAiPanelPreviewName').value = 'Panel Ops Name Edited'; });
+      await page.evaluate(() => document.querySelector('#planAiPanelApplyBtn').click());
+      await panelWait(2000);
+      r = await H.req('GET', `/api/planning/projects/${panelProjectId}`);
+      const opsStrat = (r.data.strategies || []).find((x) => x.name === 'Panel Ops Name Edited');
+      H.check('aipanel11: Apply renames the new strategy to the edited preview name',
+        !!opsStrat, JSON.stringify((r.data.strategies || []).map((x) => x.name)));
+      if (opsStrat) {
+        r = await H.req('GET', `/api/planning/strategies/${opsStrat.id}`);
+        H.check('aipanel11: Apply posts the described ops onto the renamed strategy',
+          (r.data.ops || []).some((o) => o.op_type === 'prepay' && Number(o.params && o.params.amount) === 10000), JSON.stringify(r.data.ops));
+      }
       // Baselines are FIXED: no baseline target in the panel, and the
       // tier offers no baseline buttons (this fixture project has no
       // category, so the tier shows the no-fixed-baseline note).
@@ -2384,6 +2441,40 @@ export async function run(H, S) {
         vizRemoved.total.includes('500.00') && !vizRemoved.viz.includes('External funding') && vizRemoved.viz.includes('POOL.B')
           && Array.isArray(vizRemoved.doughnut) && vizRemoved.doughnut.length === 1,
         JSON.stringify(vizRemoved));
+      // Item 4 (user 2026-11-04): funding block two columns — entries
+      // + Add button left, doughnut + breakdown + pool total right;
+      // narrow screens stack funding above the chart. Add/remove live
+      // updates are already covered by the vizBuilt/vizRemoved pins
+      // above, which run against the new layout.
+      await page.setViewport({ width: 1500, height: 900 });
+      await waitQ(300);
+      const poolLayoutWide = await page.evaluate(() => {
+        const l = document.querySelector('.plan-pool-left');
+        const r = document.querySelector('.plan-pool-right');
+        if (!l || !r) return { error: 'layout columns missing' };
+        const lb = l.getBoundingClientRect();
+        const rb = r.getBoundingClientRect();
+        return { l: { left: lb.left, right: lb.right, top: lb.top, bottom: lb.bottom }, r: { left: rb.left, right: rb.right, top: rb.top, bottom: rb.bottom } };
+      });
+      H.check('poolviz: desktop — funding entries left of the chart with vertical overlap',
+        poolLayoutWide.l && poolLayoutWide.l.right <= poolLayoutWide.r.left && poolLayoutWide.l.left < poolLayoutWide.r.left
+          && poolLayoutWide.l.top < poolLayoutWide.r.bottom && poolLayoutWide.r.top < poolLayoutWide.l.bottom,
+        JSON.stringify(poolLayoutWide));
+      await page.setViewport({ width: 600, height: 900 });
+      await waitQ(300);
+      const poolLayoutNarrow = await page.evaluate(() => {
+        const l = document.querySelector('.plan-pool-left');
+        const r = document.querySelector('.plan-pool-right');
+        if (!l || !r) return { error: 'layout columns missing' };
+        const lb = l.getBoundingClientRect();
+        const rb = r.getBoundingClientRect();
+        return { lBottom: lb.bottom, rTop: rb.top };
+      });
+      H.check('poolviz: narrow — funding stacks above the chart',
+        poolLayoutNarrow.lBottom !== undefined && poolLayoutNarrow.lBottom <= poolLayoutNarrow.rTop,
+        JSON.stringify(poolLayoutNarrow));
+      await page.setViewport({ width: 1500, height: 900 });
+      await waitQ(300);
       const vizErr = await page.evaluate(() => {
         const row = document.querySelector('[data-pool-entry]');
         row.querySelector('[data-pool-entry-mode]').value = 'percent';
@@ -2423,6 +2514,194 @@ export async function run(H, S) {
       const vizPreview = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
       H.check('poolviz: fixing to 30% of holding B continues to a preview carrying the 600.00 pool value',
         vizPreview.includes('600.00'), JSON.stringify(vizPreview.slice(0, 300)));
+      // Item 5 (user 2026-11-04): Back button on the Add project modal.
+      // State here: category modal open, investment picked, pool = 30%
+      // of holding B, subcategory cards rendered with a 600.00 pool.
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
+      const backVisible = await page.evaluate(() => ({
+        visible: !!document.querySelector('#planProjectBackBtn') && !document.querySelector('#planProjectBackBtn').classList.contains('hidden'),
+        note: document.querySelector('#planProjectCategoryNote')?.textContent || '',
+      }));
+      H.check('projectback: Back button visible on the recommendation step',
+        backVisible.visible, JSON.stringify(backVisible));
+      // Dispatched click, not page.click: the modal has just opened and
+      // Puppeteer's clickable-point check flakes on settling modals
+      // (documented click-miss family); the state check below is the
+      // real assertion.
+      try {
+        await page.waitForFunction(() => {
+          const b = document.querySelector('#planProjectBackBtn');
+          if (!b || b.classList.contains('hidden')) return false;
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        }, { timeout: 10000 });
+      } catch { /* dispatched click below still applies */ }
+      await page.evaluate(() => { document.querySelector('#planProjectBackBtn')?.click(); });
+      await waitQ(300);
+      const backState = await page.evaluate(() => ({
+        catVisible: !!document.querySelector('#planCategoryModal') && !document.querySelector('#planCategoryModal').classList.contains('hidden'),
+        projHidden: !!document.querySelector('#planProjectModal') && document.querySelector('#planProjectModal').classList.contains('hidden'),
+        catSelected: !!document.querySelector('#planCategoryCards [data-plan-cat="investment"]') && document.querySelector('#planCategoryCards [data-plan-cat="investment"]').classList.contains('plan-selected'),
+        entryVal: document.querySelector('[data-pool-entry-input]')?.value ?? null,
+        subSelected: !!document.querySelector('#planCategorySubs [data-plan-sub].plan-selected'),
+      }));
+      H.check('projectback: Back shows the pickers with the previous category/entity still selected',
+        backState.catVisible && backState.projHidden && backState.catSelected && backState.entryVal === '30' && backState.subSelected,
+        JSON.stringify(backState));
+      // Re-pick with a changed pool: 30% -> 50% of holding B, Continue,
+      // subcategory preview must carry the updated 1,000.00 pool value.
+      await page.evaluate(() => {
+        const inp = document.querySelector('[data-pool-entry-input]');
+        inp.value = '50';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planCatEntityGo').click();
+      });
+      try {
+        await page.waitForFunction(() => {
+          const s = document.querySelector('#planCategorySubs');
+          return s && s.textContent.includes('1,000.00');
+        }, { timeout: 10000 });
+      } catch { /* check below */ }
+      const backSubs = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
+      H.check('projectback: re-picking after a pool change shows an updated recommendation preview (1,000.00)',
+        backSubs.includes('1,000.00'), JSON.stringify(backSubs.slice(0, 300)));
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
+      const backModal2 = await page.evaluate(() => ({
+        visible: !!document.querySelector('#planProjectModal') && !document.querySelector('#planProjectModal').classList.contains('hidden'),
+        backVisible: !!document.querySelector('#planProjectBackBtn') && !document.querySelector('#planProjectBackBtn').classList.contains('hidden'),
+        note: document.querySelector('#planProjectCategoryNote')?.textContent || '',
+      }));
+      H.check('projectback: forward again returns to the recommendation screen with Back still available',
+        backModal2.visible && backModal2.backVisible && backModal2.note.includes('investment'), JSON.stringify(backModal2));
+      // Create with AI opens from the round-tripped modal (modal-open
+      // is the proxy: full AI creation needs LLM config and is covered
+      // elsewhere). Opening it closes the project modal by design, so
+      // the Create half below re-drives the flow.
+      await page.click('#planAiCreateBtn');
+      try { await page.waitForFunction(() => { const m = document.querySelector('#planAiCreateModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
+      const backAi = await page.evaluate(() => ({
+        open: !!document.querySelector('#planAiCreateModal') && !document.querySelector('#planAiCreateModal').classList.contains('hidden'),
+        ctx: document.querySelector('#planAiCreateCtx')?.textContent || '',
+      }));
+      H.check('projectback: Create with AI still opens after a Back-and-forward round trip',
+        backAi.open && backAi.ctx !== '', JSON.stringify(backAi));
+      await page.evaluate(() => { document.querySelector('#planAiCreateModal [data-close-modal]')?.click(); });
+      await waitQ(300);
+      // Second round trip, ending in Create: fresh flow, forward,
+      // Back (state preserved), forward again, Create.
+      await page.click('#planAddProjectBtn');
+      await waitQ(500);
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="investment"]')?.click(); });
+      try {
+        await page.waitForFunction(() => !!document.querySelector('[data-pool-entry]'), { timeout: 10000 });
+      } catch { /* check below */ }
+      await page.evaluate(() => {
+        const row = document.querySelector('[data-pool-entry]');
+        const sel = row.querySelector('[data-pool-entry-source]');
+        const holdOpt = [...sel.options].find((o) => o.value.startsWith('holding:'));
+        if (holdOpt) { sel.value = holdOpt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+        const inp = row.querySelector('[data-pool-entry-input]');
+        inp.value = '10';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planCatEntityGo').click();
+      });
+      try {
+        await page.waitForFunction(() => {
+          const s = document.querySelector('#planCategorySubs');
+          return s && s.textContent.trim() !== '';
+        }, { timeout: 10000 });
+      } catch { /* check below */ }
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
+      try {
+        await page.waitForFunction(() => {
+          const b = document.querySelector('#planProjectBackBtn');
+          if (!b || b.classList.contains('hidden')) return false;
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        }, { timeout: 10000 });
+      } catch { /* dispatched click below still applies */ }
+      await page.evaluate(() => { document.querySelector('#planProjectBackBtn')?.click(); });
+      await waitQ(300);
+      const backState2 = await page.evaluate(() => ({
+        catVisible: !!document.querySelector('#planCategoryModal') && !document.querySelector('#planCategoryModal').classList.contains('hidden'),
+        catSelected: !!document.querySelector('#planCategoryCards [data-plan-cat="investment"]') && document.querySelector('#planCategoryCards [data-plan-cat="investment"]').classList.contains('plan-selected'),
+        entryVal: document.querySelector('[data-pool-entry-input]')?.value ?? null,
+      }));
+      H.check('projectback: second Back preserves the fresh flow picks too',
+        backState2.catVisible && backState2.catSelected && backState2.entryVal === '10',
+        JSON.stringify(backState2));
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
+      await page.evaluate(() => {
+        const name = document.querySelector('#planProjectForm [name="name"]');
+        if (name) { name.value = 'BackForth Create'; name.dispatchEvent(new Event('input', { bubbles: true })); }
+      });
+      // Same click-miss flake class as the Back buttons: wait for the
+      // just-reopened modal's Save button to be visible + non-empty,
+      // then dispatch the click (a raw page.click flaked here).
+      try {
+        await page.waitForFunction(() => {
+          const b = document.querySelector('#planProjectSaveBtn');
+          if (!b || b.classList.contains('hidden')) return false;
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        }, { timeout: 10000 });
+      } catch { /* dispatched click below still applies */ }
+      await page.evaluate(() => { document.querySelector('#planProjectSaveBtn')?.click(); });
+      try { await page.waitForFunction(() => window.location.hash.includes('#planning/project/'), { timeout: 15000 }); } catch { /* check below */ }
+      const backCreated = await page.evaluate(() => ({ hash: window.location.hash }));
+      H.check('projectback: Create project still works after a Back-and-forward round trip',
+        backCreated.hash.includes('#planning/project/'), JSON.stringify(backCreated));
+      // Cancel discards: fresh flow to the modal, Cancel, both modals
+      // closed, reopening starts fresh with no stale selection.
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1200);
+      await page.click('#planAddProjectBtn');
+      await waitQ(500);
+      await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="investment"]')?.click(); });
+      try {
+        await page.waitForFunction(() => !!document.querySelector('[data-pool-entry]'), { timeout: 10000 });
+      } catch { /* check below */ }
+      await page.evaluate(() => {
+        const row = document.querySelector('[data-pool-entry]');
+        const sel = row.querySelector('[data-pool-entry-source]');
+        const holdOpt = [...sel.options].find((o) => o.value.startsWith('holding:'));
+        if (holdOpt) { sel.value = holdOpt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+        const inp = row.querySelector('[data-pool-entry-input]');
+        inp.value = '10';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planCatEntityGo').click();
+      });
+      try {
+        await page.waitForFunction(() => {
+          const s = document.querySelector('#planCategorySubs');
+          return s && s.textContent.trim() !== '';
+        }, { timeout: 10000 });
+      } catch { /* check below */ }
+      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
+      await page.evaluate(() => {
+        const btns = [...document.querySelectorAll('#planProjectModal [data-close-modal]')];
+        const cancel = btns.find((b) => b.textContent.trim() === 'Cancel');
+        if (cancel) cancel.click();
+      });
+      await waitQ(300);
+      const backCancelState = await page.evaluate(() => ({
+        projHidden: !!document.querySelector('#planProjectModal') && document.querySelector('#planProjectModal').classList.contains('hidden'),
+        catHidden: !!document.querySelector('#planCategoryModal') && document.querySelector('#planCategoryModal').classList.contains('hidden'),
+      }));
+      H.check('projectback: Cancel discards the flow (both modals closed)',
+        backCancelState.projHidden && backCancelState.catHidden, JSON.stringify(backCancelState));
+      await page.click('#planAddProjectBtn');
+      await waitQ(500);
+      const backFresh = await page.evaluate(() => ({
+        selected: document.querySelector('#planCategoryCards [data-plan-cat].plan-selected')?.dataset.planCat || null,
+      }));
+      H.check('projectback: reopening starts a fresh flow with no stale category selection',
+        backFresh.selected === null, JSON.stringify(backFresh));
       // Fresh builder: an entry with no source, then no entries at all.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1200);
@@ -2570,7 +2849,7 @@ export async function run(H, S) {
       const fresh = await page.evaluate(() => ({
         addSel: !!document.querySelector('#planFactorAddSel'),
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
-        stockVal: !!document.querySelector('#planFactorStockVal'),
+        stockVal: !!document.querySelector('#planStockGlobalVal'),
         growthInput: !!document.querySelector('[data-growth]'),
         sinkPanel: !!document.querySelector('#planSinkPanel'),
         scenTier: !!document.querySelector('#planStrategyScenarioTier'),
@@ -2587,10 +2866,10 @@ export async function run(H, S) {
         sel.value = 'stock';
         document.querySelector('#planFactorAddBtn').click();
         for (let i = 0; i < 12; i++) {
-          if (document.querySelector('#planFactorStockVal')) break;
+          if (document.querySelector('#planStockGlobalVal')) break;
           await sleep(500);
         }
-        const inp = document.querySelector('#planFactorStockVal');
+        const inp = document.querySelector('#planStockGlobalVal');
         if (!inp) return false;
         inp.value = '8';
         inp.dispatchEvent(new Event('input', { bubbles: true }));
@@ -2636,7 +2915,7 @@ export async function run(H, S) {
       await waitR(1500);
       const legacy = await page.evaluate(() => ({
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
-        stockVal: document.querySelector('#planFactorStockVal')?.value || '',
+        stockVal: document.querySelector('#planStockGlobalVal')?.value || '',
       }));
       H.check('strategy editor: migrated scenario still shows its factors (prime chart + stock 8)',
         legacy.primeChart && legacy.stockVal === '8', JSON.stringify(legacy));
@@ -3537,6 +3816,29 @@ export async function run(H, S) {
   c = await thCalc();
   H.check('takehome: cash take-home follows the new own total 340',
     c && c.perPeriod.cashNet === c.perPeriod.net - 340 && c.perPeriod.cashNet !== cashBefore, JSON.stringify(c?.perPeriod));
+  // (putlag): a take-home-basis edit solves with the POST-edit
+  // deduction — the entered paystub figure round-trips on the
+  // FIRST save, with no second edit needed. (Before the fix the
+  // solve priced the pre-edit deduction, storing a gross off by
+  // the percent of the gross delta.)
+  const thTarget = Math.round((c.perPeriod.cashNet + 100) * 100) / 100;
+  r = await H.req('PUT', `/api/earnings/jobs/${thJob}`, { employer: 'TakeHome Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: thTarget, pay_value_basis: 'takehome' });
+  H.check('takehome: take-home-basis edit accepted', r.status === 200, JSON.stringify(r.data));
+  c = await thCalc();
+  H.check('takehome: take-home edit round-trips to the cent on first save (no second edit)',
+    c && c.perPeriod.cashNet === thTarget, JSON.stringify(c?.perPeriod));
+  r = await H.req('GET', `/api/investments/accounts/${thAcct}`);
+  const pctAfterTh = (r.data.plans || []).find((p) => p.id === thPctPlan);
+  const fixAfterTh = (r.data.plans || []).find((p) => p.id === thFixedPlan);
+  const solvedGross = c && c.perPeriod ? c.perPeriod.gross : null;
+  H.check('takehome: percent plan derives from the solved gross, fixed plan unchanged',
+    solvedGross != null && pctAfterTh && pctAfterTh.derived_own_amount === Math.round(0.06 * solvedGross * 100) / 100 && fixAfterTh && fixAfterTh.own_amount === 100,
+    JSON.stringify({ solvedGross, pctAfterTh, fixAfterTh }));
+  r = await H.req('PUT', `/api/earnings/jobs/${thJob}`, { employer: 'TakeHome Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: thTarget, pay_value_basis: 'takehome' });
+  const cRepeat = await thCalc();
+  H.check('takehome: repeating the same take-home edit stores the same gross',
+    r.status === 200 && cRepeat && cRepeat.perPeriod.gross === solvedGross, JSON.stringify(cRepeat?.perPeriod));
+  c = cRepeat;
   // (c) browser: detail strip shows the cash take-home, chart carries an RRSP segment.
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('planning takehome browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -4014,6 +4316,41 @@ export async function run(H, S) {
       });
       H.check('propscope: strategy detail caption names the entity property, not summed across properties',
         cap.includes('777 PropScope Entity Lane') && !cap.includes('summed across properties'), JSON.stringify({ cap }));
+      // Item 6 revised (user 2026-11-04): a property strategy detail
+      // shows the entity's equity, remaining balance, and payment
+      // breakdown — AFTER Generate. The gate is open here via psRep,
+      // so the panels + the report-headline block render on load.
+      try {
+        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyEquityChart, { timeout: 15000 });
+      } catch { /* checks below */ }
+      const stratKindB = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
+        const vis = (sel) => {
+          const el = document.querySelector(sel);
+          return !!el && el.offsetParent !== null;
+        };
+        const chartLens = (id) => (typeof planCharts !== 'undefined' && planCharts[id]) ? planCharts[id].data.datasets.map((d) => d.data.filter((v) => v != null).length) : null;
+        return {
+          mortPanel: vis('#planStrategyMortChart'),
+          eqPanel: vis('#planStrategyEquityChart'),
+          eqData: chartLens('planStrategyEquityChart'),
+          mortData: chartLens('planStrategyMortChart'),
+          annualPanel: heads.includes('Annual interest'),
+          breakTitle: (() => { const t = document.querySelector('#planDiffBreakdownTitle'); return !!t && t.style.display !== 'none'; })(),
+          eqCap: document.querySelector('#planStrategyEquityChart')?.closest('.panel')?.querySelector('.note')?.textContent || '',
+          headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
+        };
+      });
+      H.check('stratpanels: property strategy detail shows Mortgage balance + Equity + Annual interest + payment breakdown, equity caption names the entity',
+        stratKindB.mortPanel && stratKindB.eqPanel && stratKindB.annualPanel && stratKindB.breakTitle
+          && Array.isArray(stratKindB.eqData) && stratKindB.eqData.length === 2 && stratKindB.eqData.every((n) => n > 0)
+          && Array.isArray(stratKindB.mortData) && stratKindB.mortData.length === 2
+          && stratKindB.eqCap.includes('777 PropScope Entity Lane') && !stratKindB.eqCap.includes('summed across properties'),
+        JSON.stringify(stratKindB));
+      H.check('stratpanels: property headline shows all 9 metric cards after Generate',
+        stratKindB.headline.length === 9
+          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Interest saved', 'Stock gain', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((k) => stratKindB.headline.includes(k)),
+        JSON.stringify({ headline: stratKindB.headline }));
       // Report HOW line (opened from the strategy tier LIST) names it too.
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
@@ -4024,6 +4361,31 @@ export async function run(H, S) {
       });
       H.check('propscope: report Mortgage balance how-line names the entity property, not summed across properties',
         how.includes('Mortgage balance = outstanding principal') && how.includes('777 PropScope Entity Lane') && !how.includes('summed across properties'), JSON.stringify({ how }));
+      // (opform): in a property project the op form's property
+      // picker offers ONLY the entity property, and a form-created
+      // op lands on it.
+      await page.evaluate(() => { document.querySelector('#planAddOpBtn').click(); });
+      await page.waitForFunction(() => !!document.querySelector('#planOpProperty'), { timeout: 15000 });
+      const propPicker = await page.evaluate(() => {
+        const sel = document.querySelector('#planOpProperty');
+        return sel ? [...sel.options].map((o) => ({ value: Number(o.value), text: o.textContent })) : null;
+      });
+      H.check('propscope: op form property picker lists exactly the entity property',
+        propPicker && propPicker.length === 1 && propPicker[0].value === psE && propPicker[0].text.includes('777 PropScope Entity Lane'), JSON.stringify({ propPicker, psE }));
+      await page.evaluate((d) => {
+        document.querySelector('#planOpAmount').value = '5000';
+        document.querySelector('#planOpDateVal').value = d;
+      }, psOpDate);
+      await page.evaluate(() => { document.querySelector('#planOpSaveBtn').click(); });
+      await page.waitForFunction(() => document.querySelector('#planOpModal')?.classList.contains('hidden'), { timeout: 15000 });
+      const formOpMsg = await page.evaluate(() => document.querySelector('#planOpModalMsg')?.textContent || '');
+      H.check('propscope: op created via the form lands on the entity property',
+        formOpMsg === '' && (await (async () => {
+          const rr = await H.req('GET', `/api/planning/strategies/${psStrat}`);
+          const ops = rr.data.ops || [];
+          const pre = ops.find((o) => o.op_type === 'prepay' && Number(o.params && o.params.amount) === 5000);
+          return !!pre && Number(pre.params.propertyId) === psE;
+        })()), JSON.stringify({ formOpMsg }));
     } finally { await browserP.close(); }
   }
   // --- strategy-page Reports tier (user 2026-11-04): the project
@@ -4388,6 +4750,57 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'InvComp report', definition: { strategies: [icStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value', 'total_value'] }] }, strategy_ids: [icStrat], scenario_ids: [] });
   H.check('invcomp: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const icRep = r.data.report.id;
+  // Item 6 fixtures: a MIXED strategy (mortgage + stock ops) in the
+  // investment project — prepay on the propscope property executes
+  // under the op-touched rule for non-property projects — and a
+  // report pinned to the pure-stock strategy that still carries a
+  // mortgage_balance chart (the filter must hide it).
+  r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Mixed prepay + sell' });
+  H.check('stratpanels: mixed strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const icMixStrat = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${icMixStrat}/ops`, { op_type: 'sell', params: { holdingId: icHold, date: psOpDate, units: 10, price: 100 } });
+  H.check('stratpanels: mixed sell op created', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/strategies/${icMixStrat}/ops`, { op_type: 'prepay', params: { propertyId: psE, date: psOpDate, amount: 5000 } });
+  H.check('stratpanels: mixed prepay op created', r.status === 201, JSON.stringify(r.data));
+  // Item 6 revised: the BASELINE wins over op nature — icMixStrat
+  // lives on the investment project (cash-pool baseline), so its
+  // Generate gate needs a report pinning it before its page can
+  // show any panel. The report below opens that gate.
+  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Mixed baseline report', definition: { strategies: [icMixStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value'] }] }, strategy_ids: [icMixStrat], scenario_ids: [] });
+  H.check('stratpanels: mixed strategy report created (opens its Generate gate)', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const icMixRep = r.data.report.id;
+  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Mortgage hidden report', definition: { strategies: [icStrat], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [icStrat], scenario_ids: [] });
+  H.check('stratpanels: mortgage-chart report on the stock strategy created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const icHideRep = r.data.report.id;
+  // (reporterr): a pot-funded buy with NO funding legs passes
+  // validation but is dropped at projection with the unfunded
+  // error; the report view must surface it prominently, and a
+  // clean report must show no notice.
+  r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Dropped buy' });
+  H.check('reporterr: dropped-buy strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const icDropStrat = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${icDropStrat}/ops`, { op_type: 'buy', params: { accountId: icAcct, symbol: 'INVCOMP.Z', date: icBuyYm, units: 10, price: 100, currency: 'CAD' } });
+  H.check('reporterr: leg-less buy op created (validation passes, projection drops it)', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${icDropStrat}`);
+  const dropErrs = (r.data.comparison && r.data.comparison.errors) || [];
+  H.check('reporterr: projection errors name the buy op + unfunded reason',
+    dropErrs.some((e) => /buy operation \d+: funding covers only part of the purchase — .* unfunded/.test(e)), JSON.stringify(dropErrs));
+  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Dropped buy report', definition: { strategies: [icDropStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [icDropStrat], scenario_ids: [] });
+  H.check('reporterr: dropped-buy report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const icDropRep = r.data.report.id;
+  // Item 6 revised (d): AI report on a cash-pool baseline — a
+  // mortgage-family chart in the AI definition is rejected by the
+  // server validation (same 502 style as the chart-spec check),
+  // while a pool chart passes. Unit tests cover the prompt text
+  // carrying the baseline kind + restriction.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
+  r = await H.req('POST', `/api/planning/projects/${icProj}/ai-report`, { text: 'Show mortgage balance' });
+  H.check('aireport: mortgage chart on a cash-pool baseline is rejected',
+    r.status === 502 && /cash pool|baseline/i.test(JSON.stringify(r.data)), JSON.stringify(r.data));
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'], method: 'Monthly pool balance from the engine projection.' }] }));
+  r = await H.req('POST', `/api/planning/projects/${icProj}/ai-report`, { text: 'Show pool trajectory' });
+  H.check('aireport: pool chart on a cash-pool baseline passes',
+    r.status === 200 && Array.isArray(r.data.definition && r.data.definition.charts) && r.data.definition.charts.length === 1, JSON.stringify(r.data));
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('invcomp browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
@@ -4446,6 +4859,37 @@ export async function run(H, S) {
         diffState.deltaLabels && !diffState.deltaLabels.some((l) => /Balance Δ/.test(l)) && diffState.deltaLabels.some((l) => /Value Δ/.test(l))
           && diffState.breakdownNull === true && diffState.breakdownTitleHidden === true && diffState.breakdownWrapHidden === true,
         JSON.stringify(diffState));
+      // Item 6 revised (a): a cash-pool-baseline strategy detail shows
+      // NO mortgage panels at all — no Mortgage balance, no Equity,
+      // no Annual interest — and the cash-pool trajectory instead.
+      // The gate is open here via icRep, so the panels render.
+      try {
+        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyPoolChart, { timeout: 15000 });
+      } catch { /* checks below */ }
+      const stratKindA = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
+        const pool = (typeof planCharts !== 'undefined' && planCharts.planStrategyPoolChart) ? planCharts.planStrategyPoolChart.data.datasets.map((d) => ({ label: d.label, n: d.data.filter((v) => v != null).length, max: Math.max(...d.data.filter((v) => v != null), -Infinity) })) : null;
+        return {
+          mortAbsent: !document.querySelector('#planStrategyMortChart'),
+          eqAbsent: !document.querySelector('#planStrategyEquityChart'),
+          annualAbsent: !heads.includes('Annual interest'),
+          stockPresent: !!document.querySelector('#planStrategyStockChart'),
+          pool,
+          poolCap: document.querySelector('#planStrategyPoolChart')?.closest('.panel')?.querySelector('.note')?.textContent || '',
+          headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
+        };
+      });
+      H.check('stratpanels: pure stock strategy detail hides all mortgage panels and shows the cash-pool trajectory',
+        stratKindA.mortAbsent && stratKindA.eqAbsent && stratKindA.annualAbsent && stratKindA.stockPresent
+          && Array.isArray(stratKindA.pool) && stratKindA.pool.length === 4
+          && stratKindA.pool.some((d) => /pool/.test(d.label) && d.max === 2400)
+          && stratKindA.poolCap.includes('property equity is not included'),
+        JSON.stringify(stratKindA));
+      H.check('stratpanels: cash-pool headline shows pool/stock metrics only, zero mortgage metric cards',
+        stratKindA.headline.length === 5
+          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => stratKindA.headline.includes(k))
+          && !stratKindA.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
+        JSON.stringify({ headline: stratKindA.headline }));
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Pool trajectory'), { timeout: 15000 });
@@ -4467,6 +4911,143 @@ export async function run(H, S) {
       H.check('invcomp: report trajectory table shows the pool at the sell month (Dec row: strategy pool 2,400, stock 7,600, total 10,000)',
         trajTable.includes('2,400.00') && trajTable.includes('7,600.00') && trajTable.includes('10,000.00'),
         JSON.stringify(trajTable.slice(0, 600)));
+      // Item 6 revised report tier: the same strategy's tier LIST
+      // carries the mortgage-chart report; opening it hides the
+      // mortgage block (with a plain baseline-phrased note) and
+      // keeps the pool block — the viewer rule is keyed on the
+      // cash-pool baseline, not on op nature.
+      await page.evaluate(() => { document.querySelector('#planReportBackBtn')?.click(); });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icHideRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icHideRep);
+      try {
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, icHideRep);
+      } catch {
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icHideRep);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icHideRep);
+      }
+      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      const hideState = await page.evaluate(() => ({
+        heads: [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent),
+        note: document.querySelector('#planReport')?.textContent.includes('Mortgage charts hidden') || false,
+      }));
+      H.check('stratpanels: report on a non-mortgage strategy hides its mortgage chart block, keeps the pool block, notes the hide',
+        !hideState.heads.includes('Mortgage balance') && hideState.heads.includes('Pool trajectory') && hideState.note,
+        JSON.stringify(hideState));
+      // Item 6 revised (c): BASELINE WINS over op nature — the mixed
+      // sell + prepay strategy lives on the investment project, so
+      // its baseline is a cash pool: pool + stock panels ONLY, no
+      // mortgage/equity/annual panels, breakdown hidden, Δ chart
+      // Value Δ only. (The old "both sets" reading is superseded.)
+      await page.goto(`http://ff.local/#planning/strategy/${icMixStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // The diff table exists on every strategy page, so it cannot
+      // prove the new page rendered — wait for this strategy's title
+      // or a stale-page read passes on the previous strategy's state.
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Mixed prepay + sell'), { timeout: 15000 });
+      try {
+        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyPoolChart, { timeout: 15000 });
+      } catch { /* checks below */ }
+      const stratKindC = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
+        return {
+          mort: !!document.querySelector('#planStrategyMortChart'),
+          eq: !!document.querySelector('#planStrategyEquityChart'),
+          annual: heads.includes('Annual interest'),
+          pool: !!document.querySelector('#planStrategyPoolChart'),
+          stock: !!document.querySelector('#planStrategyStockChart'),
+          breakTitle: (() => { const t = document.querySelector('#planDiffBreakdownTitle'); return !!t && t.style.display !== 'none'; })(),
+          deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planDiffChart) ? planCharts.planDiffChart.data.datasets.map((d) => d.label) : null,
+        };
+      });
+      H.check('stratpanels: mixed strategy on a cash-pool baseline shows pool/stock only, no mortgage panels, breakdown hidden, Value Δ only',
+        !stratKindC.mort && !stratKindC.eq && !stratKindC.annual && stratKindC.pool && stratKindC.stock && !stratKindC.breakTitle
+          && stratKindC.deltaLabels && stratKindC.deltaLabels.some((l) => /Value Δ/.test(l)) && !stratKindC.deltaLabels.some((l) => /Balance Δ/.test(l)),
+        JSON.stringify(stratKindC));
+      // Item 6 revised gating: a strategy with NO report shows no
+      // headline and no chart panels on load (Operations/Sink/
+      // Difference table still present); after UI Generate + reload
+      // the kind-appropriate panels + headline appear.
+      r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Gate pool' });
+      H.check('gating: no-report pool strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const gatePoolStrat = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/strategies/${gatePoolStrat}/ops`, { op_type: 'sell', params: { holdingId: icHold, date: psOpDate, units: 5, price: 100 } });
+      H.check('gating: pool strategy sell op created', r.status === 201, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${gatePoolStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Gate pool'), { timeout: 15000 });
+      const gatePoolClosed = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
+        return {
+          headline: !!document.querySelector('#planStrategyHeadline'),
+          mort: !!document.querySelector('#planStrategyMortChart'),
+          eq: !!document.querySelector('#planStrategyEquityChart'),
+          pool: !!document.querySelector('#planStrategyPoolChart'),
+          stock: !!document.querySelector('#planStrategyStockChart'),
+          ops: heads.includes('Operations'),
+          sink: heads.includes('Sink'),
+          diffTable: !!document.querySelector('#planDiffTable table'),
+        };
+      });
+      H.check('gating: no-report pool strategy page shows no headline and no chart panels, keeps Operations/Sink/Difference table',
+        !gatePoolClosed.headline && !gatePoolClosed.mort && !gatePoolClosed.eq && !gatePoolClosed.pool && !gatePoolClosed.stock
+          && gatePoolClosed.ops && gatePoolClosed.sink && gatePoolClosed.diffTable,
+        JSON.stringify(gatePoolClosed));
+      await page.waitForFunction(() => { const b = document.querySelector('#planStrategyGenerateBtn'); if (!b) return false; const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
+      await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
+      await page.goto(`http://ff.local/#planning/strategy/${gatePoolStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      try {
+        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyPoolChart, { timeout: 15000 });
+      } catch { /* checks below */ }
+      const gatePoolOpen = await page.evaluate(() => ({
+        headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
+        mort: !!document.querySelector('#planStrategyMortChart'),
+        eq: !!document.querySelector('#planStrategyEquityChart'),
+        pool: !!document.querySelector('#planStrategyPoolChart'),
+        stock: !!document.querySelector('#planStrategyStockChart'),
+      }));
+      H.check('gating: after Generate, pool strategy shows pool/stock panels + pool-only headline, no mortgage panels',
+        gatePoolOpen.pool && gatePoolOpen.stock && !gatePoolOpen.mort && !gatePoolOpen.eq
+          && gatePoolOpen.headline.length === 5 && !gatePoolOpen.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
+        JSON.stringify(gatePoolOpen));
+      r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Gate property' });
+      H.check('gating: no-report property strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const gatePropStrat = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/strategies/${gatePropStrat}/ops`, { op_type: 'prepay', params: { propertyId: psE, date: psOpDate, amount: 5000 } });
+      H.check('gating: property strategy prepay op created', r.status === 201, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/strategy/${gatePropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Gate property'), { timeout: 15000 });
+      const gatePropClosed = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
+        return {
+          headline: !!document.querySelector('#planStrategyHeadline'),
+          mort: !!document.querySelector('#planStrategyMortChart'),
+          eq: !!document.querySelector('#planStrategyEquityChart'),
+          pool: !!document.querySelector('#planStrategyPoolChart'),
+          ops: heads.includes('Operations'),
+          pen: heads.includes('Penalties'),
+          diffTable: !!document.querySelector('#planDiffTable table'),
+        };
+      });
+      H.check('gating: no-report property strategy page shows no headline and no chart panels, keeps Operations/Penalties/Difference table',
+        !gatePropClosed.headline && !gatePropClosed.mort && !gatePropClosed.eq && !gatePropClosed.pool
+          && gatePropClosed.ops && gatePropClosed.pen && gatePropClosed.diffTable,
+        JSON.stringify(gatePropClosed));
+      await page.waitForFunction(() => { const b = document.querySelector('#planStrategyGenerateBtn'); if (!b) return false; const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
+      await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
+      await page.goto(`http://ff.local/#planning/strategy/${gatePropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      try {
+        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyEquityChart, { timeout: 15000 });
+      } catch { /* checks below */ }
+      const gatePropOpen = await page.evaluate(() => ({
+        headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
+        mort: !!document.querySelector('#planStrategyMortChart'),
+        eq: !!document.querySelector('#planStrategyEquityChart'),
+        eqCap: document.querySelector('#planStrategyEquityChart')?.closest('.panel')?.querySelector('.note')?.textContent || '',
+      }));
+      H.check('gating: after Generate, property strategy shows mortgage/equity panels + all-9 headline, entity named',
+        gatePropOpen.mort && gatePropOpen.eq && gatePropOpen.headline.length === 9
+          && gatePropOpen.eqCap.includes('777 PropScope Entity Lane') && !gatePropOpen.eqCap.includes('summed across properties'),
+        JSON.stringify(gatePropOpen));
       // (d) Property strategy panels still render: open the payscope
       // report and confirm the breakdown block + Balance Δ line exist.
       await page.goto(`http://ff.local/#planning/project/${psProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -4495,6 +5076,531 @@ export async function run(H, S) {
         JSON.stringify(propState));
     } finally { await browserI.close(); }
   }
+  // (reporterr browser): the dropped-buy notice renders in the
+  // report view; the strategy detail still shows it; the clean
+  // report shows no notice.
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('reporterr browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardR = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (ch) => chunks.push(ch));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResR = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueR = loginResR.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserR = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserR.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardR({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
+      await page.goto(`http://ff.local/#planning/strategy/${icDropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      const detailErrs = await page.evaluate(() => [...document.querySelectorAll('.msg.err')].map((el) => el.textContent));
+      H.check('reporterr: strategy detail still shows the dropped-buy error',
+        detailErrs.some((t) => /unfunded/.test(t)), JSON.stringify(detailErrs));
+      // Item 6 refinement 2 (c): the dropped-buy headline zeros appear
+      // TOGETHER with the error notice (gate open via icDropRep), so
+      // the zeros are explained, not silent — pool-only headline.
+      const dropHead = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#planStrategyHeadline .summary-card, #planStrategyHeadline .breakdown-card')];
+        return cards.map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' }));
+      });
+      const dropVal = (k) => (dropHead.find((c) => c.k === k) || {}).v || '';
+      H.check('headline: dropped-buy headline shows pool-only zeros + non-zero Value at horizon alongside the error notice',
+        dropHead.length === 5 && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => dropHead.some((c) => c.k === k))
+          && ['Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((k) => /0\.00/.test(dropVal(k)) && !/[1-9]/.test(dropVal(k).replace(/0\.00/, '')))
+          && /\d/.test(dropVal('Value at horizon')) && !/^\$?0\.00$/.test(dropVal('Value at horizon').trim())
+          && detailErrs.some((t) => /unfunded/.test(t)),
+        JSON.stringify({ dropHead, detailErrs }));
+      await page.goto(`http://ff.local/#planning/project/${icProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icDropRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icDropRep);
+      try {
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, icDropRep);
+      } catch {
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icDropRep);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icDropRep);
+      }
+      await page.waitForFunction(() => !!document.querySelector('#planReport .msg.err'), { timeout: 15000 });
+      const repErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => el.textContent));
+      H.check('reporterr: report view shows a prominent notice naming the dropped buy + unfunded reason',
+        repErrs.some((t) => /Dropped buy/.test(t) && /buy operation \d+/.test(t) && /unfunded/.test(t)), JSON.stringify(repErrs));
+      await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
+      try {
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, icRep);
+      } catch {
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icRep);
+      }
+      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      const cleanErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => el.textContent));
+      H.check('reporterr: clean report shows no projection-error notice',
+        cleanErrs.length === 0, JSON.stringify(cleanErrs));
+    } finally { await browserR.close(); }
+  }
+  // ------------------------------------------- item 7 revised: scenario
+  // stock factors per holding (baseline card display-only)
+  // Fixture: own account + fund holding with manual NAV points
+  // (36mo @40, 12mo @50, 1mo @60 — the planHoldingId pattern), so
+  // the 1y history-derived suggestion exists; investment pool
+  // project holding 100% of it.
+  r = await H.req('POST', '/api/investments/accounts', { name: 'ScenFact RRSP', type: 'RRSP' });
+  H.check('scenfact: account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const sfAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${sfAcct}/holdings`, { label: 'ScenFact Fund', kind: 'fund', currency: 'CAD', events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 100 }] });
+  H.check('scenfact: holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const sfHold = r.data.id;
+  const sfVan = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+  const sfCy = Number(sfVan.slice(0, 4)); const sfCm = Number(sfVan.slice(5, 7));
+  const sfShift = (months) => {
+    const total = sfCy * 12 + (sfCm - 1) - months;
+    const y = Math.floor(total / 12); const m = (total % 12) + 1;
+    return `${y}-${String(m).padStart(2, '0')}-01`;
+  };
+  for (const [mo, price] of [[36, 40], [12, 50], [1, 60]]) {
+    r = await H.req('POST', `/api/investments/holdings/${sfHold}/nav`, { date: sfShift(mo), price });
+    H.check(`scenfact: NAV point -${mo}mo @${price}`, r.status === 201, JSON.stringify(r.data));
+  }
+  r = await H.req('GET', `/api/planning/return-suggestions?holdingId=${sfHold}`);
+  const sfSug1y = (r.data.suggestions || []).find((x) => x.label === '1y');
+  const sfHistPct = sfSug1y ? Math.round(sfSug1y.annualizedReturn * 10000) / 100 : null;
+  H.check('scenfact: 1y history-derived suggestion exists with basis + window',
+    !!sfSug1y && sfHistPct != null && !!sfSug1y.basis && !!sfSug1y.window, JSON.stringify(r.data.suggestions));
+  r = await H.req('POST', '/api/planning/projects', { name: 'ScenFact', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: sfHold, percent: 100 }] }, applyRecommendation: true });
+  H.check('scenfact: investment pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const sfcProj = r.data.project.id;
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('scenfact browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardF = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (ch) => chunks.push(ch));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResF = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueF = loginResF.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserF = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserF.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardF({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueF, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitF = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      // (c) flat world, no scenarios yet: baseline card shows the
+      // holding's own-history rate with basis + window, and has no
+      // edit control (display only).
+      await page.goto(`http://ff.local/#planning/project/${sfcProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const flatCard = await page.evaluate(() => {
+        const el = document.querySelector('#planBaselineCards');
+        const t = el ? el.textContent : '';
+        const m = t.match(/([0-9]+(?:\.[0-9]+)?)%\/yr expected/);
+        return { text: t, pct: m ? Number(m[1]) : null, inputs: el ? el.querySelectorAll('input').length : -1, buttons: el ? el.querySelectorAll('button').length : -1 };
+      });
+      H.check('scenfact: baseline card shows history-derived return with basis + window, no edit control (flat world)',
+        flatCard.pct != null && Math.abs(flatCard.pct - sfHistPct) < 0.01 && flatCard.text.includes('History') && flatCard.text.includes(sfSug1y.basis) && flatCard.text.includes(sfSug1y.window) && flatCard.inputs === 0 && flatCard.buttons === 0,
+        JSON.stringify({ flatCard, histPct: sfHistPct, basis: sfSug1y.basis, window: sfSug1y.window }));
+      // A factor-less scenario still falls back to history on the card.
+      r = await H.req('POST', `/api/planning/projects/${sfcProj}/scenarios`, { name: 'ScenFact World' });
+      H.check('scenfact: scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+      const sfScen = r.data.scenario.id;
+      await page.goto(`http://ff.local/#planning/project/${sfcProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const noFactorCard = await page.evaluate(() => document.querySelector('#planBaselineCards')?.textContent || '');
+      H.check('scenfact: factor-less scenario still shows the history rate on the baseline card',
+        noFactorCard.includes('History') && noFactorCard.includes(sfSug1y.basis), JSON.stringify(noFactorCard.slice(0, 300)));
+      // (a)+(b) scenario page: add the stock factor, the row shows
+      // the history-derived default labeled; edit per holding; save.
+      await page.goto(`http://ff.local/#planning/scenario/${sfScen}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      await page.evaluate(() => { document.querySelector('#planFactorAddSel').value = 'stock'; });
+      await page.evaluate(() => document.querySelector('#planFactorAddBtn').click());
+      await page.waitForFunction((hid) => !!document.querySelector(`input[data-plan-stock-holding="${hid}"]`), { timeout: 15000 }, sfHold);
+      await page.waitForFunction((hid) => (document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '').includes('History'), { timeout: 15000 }, sfHold);
+      const rowBefore = await page.evaluate((hid) => ({
+        eff: document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '',
+        val: document.querySelector(`input[data-plan-stock-holding="${hid}"]`)?.value || '',
+      }), sfHold);
+      H.check('scenfact: scenario stock row defaults to the history-derived value with basis + window label',
+        rowBefore.eff.includes('History') && rowBefore.eff.includes(sfSug1y.basis) && rowBefore.eff.includes(sfSug1y.window) && rowBefore.val === '',
+        JSON.stringify({ rowBefore, basis: sfSug1y.basis, window: sfSug1y.window }));
+      await page.evaluate((hid) => {
+        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
+        inp.value = '12.5';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+      }, sfHold);
+      await page.waitForFunction((hid) => (document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '').includes('Override'), { timeout: 10000 }, sfHold);
+      await page.evaluate(() => document.querySelector('#planFactorSaveBtn').click());
+      // The Save handler shows 'Factors saved' then immediately
+      // reloads the page, wiping the transient message — poll the
+      // saved API state instead of the message.
+      for (let i = 0; i < 20; i++) {
+        const chk = await H.req('GET', `/api/planning/scenarios/${sfScen}`);
+        const st2 = chk.data.scenario && chk.data.scenario.factors && chk.data.scenario.factors.stock;
+        if (st2 && st2.byHolding && Number((st2.byHolding[sfHold] || st2.byHolding[String(sfHold)] || {}).valuePct) === 12.5) break;
+        await waitF(500);
+      }
+      r = await H.req('GET', `/api/planning/scenarios/${sfScen}`);
+      const sfSaved = r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock;
+      H.check('scenfact: per-holding edit saves (byHolding 12.5)',
+        sfSaved && sfSaved.byHolding && Number((sfSaved.byHolding[sfHold] || sfSaved.byHolding[String(sfHold)] || {}).valuePct) === 12.5,
+        JSON.stringify(sfSaved));
+      // (c) the edited factor drives the baseline card with its source labeled.
+      await page.goto(`http://ff.local/#planning/project/${sfcProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const editedCard = await page.evaluate(() => {
+        const el = document.querySelector('#planBaselineCards');
+        return { text: el ? el.textContent : '', inputs: el ? el.querySelectorAll('input').length : -1, buttons: el ? el.querySelectorAll('button').length : -1 };
+      });
+      H.check('scenfact: baseline card shows the edited scenario return with its source, still no edit control',
+        editedCard.text.includes('12.5%/yr expected') && editedCard.text.includes('Scenario ScenFact World') && editedCard.inputs === 0 && editedCard.buttons === 0,
+        JSON.stringify(editedCard));
+      // (a) Revert restores the history-derived value + labels.
+      await page.goto(`http://ff.local/#planning/scenario/${sfScen}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      await page.waitForFunction((hid) => !!document.querySelector(`[data-plan-stock-revert="${hid}"]`), { timeout: 15000 }, sfHold);
+      await page.evaluate((hid) => document.querySelector(`[data-plan-stock-revert="${hid}"]`).click(), sfHold);
+      await page.waitForFunction((hid, pct) => {
+        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
+        return inp && Number(inp.value.replace(/,/g, '')) === pct;
+      }, { timeout: 15000 }, sfHold, sfHistPct);
+      const rowAfter = await page.evaluate((hid) => ({
+        eff: document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '',
+        val: document.querySelector(`input[data-plan-stock-holding="${hid}"]`)?.value || '',
+      }), sfHold);
+      H.check('scenfact: Revert restores the history-derived value with basis + window labels',
+        rowAfter.eff.includes(String(sfHistPct)) && rowAfter.eff.includes(sfSug1y.basis) && rowAfter.eff.includes(sfSug1y.window),
+        JSON.stringify({ rowAfter, histPct: sfHistPct }));
+      // (e) the baseline card itself still offers no Add/Edit/Refine/Delete.
+      await page.goto(`http://ff.local/#planning/project/${sfcProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const tierCtrls = await page.evaluate(() => {
+        const el = document.querySelector('#planBaselineCards');
+        return { inputs: el ? el.querySelectorAll('input').length : -1, buttons: el ? el.querySelectorAll('button').length : -1, text: el ? el.textContent : '' };
+      });
+      H.check('scenfact: baseline tier offers no Add/Edit/Refine/Delete for the baseline itself',
+        tierCtrls.inputs === 0 && tierCtrls.buttons === 0, JSON.stringify(tierCtrls));
+    } finally { await browserF.close(); }
+  }
+  // (d) an edited per-holding scenario factor feeds the baseline
+  // projection: single-holding pool at a 12.5% override grows as
+  // (1.125)^30 over the horizon.
+  r = await H.req('POST', `/api/planning/projects/${sfcProj}/scenarios`, { name: 'ScenFact Override' });
+  H.check('scenfact: override scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const sfScen2 = r.data.scenario.id;
+  r = await H.req('PUT', `/api/planning/scenarios/${sfScen2}`, { factors: { stock: { byHolding: { [sfHold]: { valuePct: 12.5 } } } } });
+  H.check('scenfact: per-holding override factor saves via API', r.status === 200, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/projects/${sfcProj}/comparison?scenarioIds=${sfScen2}`);
+  const sfcSeries = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
+  const sfRatio = sfcSeries && sfcSeries.length ? sfcSeries[sfcSeries.length - 1].value / sfcSeries[0].value : null;
+  H.check('scenfact: per-holding override feeds the baseline projection (ratio ≈ 1.125^30)',
+    sfRatio != null && Math.abs(sfRatio - Math.pow(1.125, 30)) / Math.pow(1.125, 30) < 0.005,
+    JSON.stringify({ first: sfcSeries && sfcSeries[0], last: sfcSeries && sfcSeries[sfcSeries.length - 1], ratio: sfRatio }));
+  // ------------------------------------------- items 8 + 9: scenario
+  // create modal with factors, ✨ name suggestion (scenario + strategy)
+  // Uncategorized: the modal's factor sections (prime + stock) do
+  // not need a category or an entity — holdings come from the app.
+  r = await H.req('POST', '/api/planning/projects', { name: 'ScenModal', question: 'q' });
+  H.check('scenmodal: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const smProj = r.data.project.id;
+  // Item 9 endpoint (stubbed LLM): a name only, from factors/ops context.
+  fs.writeFileSync(H.aiStubFile, 'Calm Growth');
+  r = await H.req('POST', '/api/planning/ai-suggest-name', { kind: 'scenario', context: { factors: { stock: { valuePct: 8 } }, category: 'investment' } });
+  H.check('ainame: scenario suggestion returns the stub name',
+    r.status === 200 && r.data.name === 'Calm Growth', JSON.stringify(r.data));
+  fs.writeFileSync(H.aiStubFile, 'Jan to Fix');
+  r = await H.req('POST', '/api/planning/ai-suggest-name', { kind: 'strategy', context: { ops: [{ op_type: 'rate_switch', params: { rateType: 'fixed', date: '2027-01-01' } }], category: 'property' } });
+  H.check('ainame: strategy suggestion returns the stub name from the op sequence',
+    r.status === 200 && r.data.name === 'Jan to Fix', JSON.stringify(r.data));
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('scenmodal browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardM = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (ch) => chunks.push(ch));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResM = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueM = loginResM.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserM = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserM.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardM({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueM, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitM = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      await page.goto(`http://ff.local/#planning/project/${smProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      await page.evaluate(() => document.querySelector('#planAddScenarioBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planScenarioModal').classList.contains('hidden'), { timeout: 10000 });
+      const modalState = await page.evaluate(() => ({
+        name: !!document.querySelector('#planScenarioName'),
+        star: !!document.querySelector('#planScenarioAiNameBtn'),
+        prime: !!document.querySelector('#planScenarioModalPrime') && document.querySelectorAll('#planScenarioModalPrime [data-modal-prime-preset]').length === 5,
+        stockRows: document.querySelectorAll('#planScenarioModalStock input[data-plan-stock-holding]').length,
+      }));
+      H.check('scenmodal: create modal shows name + prime presets + per-holding stock rows',
+        modalState.name && modalState.prime && modalState.stockRows > 0, JSON.stringify(modalState));
+      H.check('ainame: ✨ button present beside Name in the scenario create modal',
+        modalState.star, JSON.stringify(modalState));
+      // ✨ fills an editable draft; the user edits it; saving keeps
+      // the edited name AND the modal factors, atomically.
+      fs.writeFileSync(H.aiStubFile, 'Modal Suggested');
+      await page.evaluate(() => document.querySelector('#planScenarioAiNameBtn').click());
+      await page.waitForFunction(() => document.querySelector('#planScenarioName').value === 'Modal Suggested', { timeout: 10000 });
+      await page.evaluate(() => {
+        document.querySelector('#planScenarioName').value = 'Modal Suggested Edited';
+        const g = document.querySelector('#planStockGlobalVal');
+        g.value = '8';
+        g.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector('#planScenarioForm button[type=submit]').click());
+      await page.waitForFunction(() => location.hash.startsWith('#planning/scenario/'), { timeout: 15000 });
+      const modalScenId = Number((await page.evaluate(() => location.hash)).split('/').pop());
+      r = await H.req('GET', `/api/planning/scenarios/${modalScenId}`);
+      const modalScen = r.data.scenario;
+      H.check('scenmodal: creating with factors saves them atomically with the edited suggested name',
+        modalScen && modalScen.name === 'Modal Suggested Edited' && modalScen.factors && modalScen.factors.stock && modalScen.factors.stock.valuePct === 8,
+        JSON.stringify(modalScen));
+      // No factors still works (flat/default scenario).
+      await page.goto(`http://ff.local/#planning/project/${smProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      await page.evaluate(() => document.querySelector('#planAddScenarioBtn').click());
+      await page.waitForFunction(() => !document.querySelector('#planScenarioModal').classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#planScenarioName').value = 'Modal Flat'; });
+      await page.evaluate(() => document.querySelector('#planScenarioForm button[type=submit]').click());
+      await page.waitForFunction(() => location.hash.startsWith('#planning/scenario/'), { timeout: 15000 });
+      const flatScenId = Number((await page.evaluate(() => location.hash)).split('/').pop());
+      r = await H.req('GET', `/api/planning/scenarios/${flatScenId}`);
+      H.check('scenmodal: creating with no factors still works (flat scenario)',
+        r.data.scenario && r.data.scenario.name === 'Modal Flat' && !(r.data.scenario.factors && r.data.scenario.factors.stock),
+        JSON.stringify(r.data.scenario));
+      // Detail-page factor editing still works after modal creation.
+      await page.goto(`http://ff.local/#planning/scenario/${modalScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      await page.waitForFunction(() => !!document.querySelector('#planStockGlobalVal'), { timeout: 15000 });
+      await page.evaluate(() => {
+        const g = document.querySelector('#planStockGlobalVal');
+        g.value = '9';
+        g.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.evaluate(() => document.querySelector('#planFactorSaveBtn').click());
+      // Same transient-message hazard as the scenfact pin: the Save
+      // handler reloads the page right after showing the message, so
+      // poll the saved API state instead.
+      for (let i = 0; i < 20; i++) {
+        const chk = await H.req('GET', `/api/planning/scenarios/${modalScenId}`);
+        const st2 = chk.data.scenario && chk.data.scenario.factors && chk.data.scenario.factors.stock;
+        if (st2 && st2.valuePct === 9) break;
+        await waitM(500);
+      }
+      r = await H.req('GET', `/api/planning/scenarios/${modalScenId}`);
+      H.check('scenmodal: detail-page factor editing still works after modal creation',
+        r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock && r.data.scenario.factors.stock.valuePct === 9,
+        JSON.stringify(r.data.scenario.factors));
+      // Strategy rename ✨: fills from the op sequence, editable,
+      // saved under the edited name. (Item 10: no world note on the
+      // strategy page either.)
+      await page.goto(`http://ff.local/#planning/strategy/${icStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      const stratNoWorld = await page.evaluate(() => !document.querySelector('#planStrategyCardsWorld'));
+      H.check('tieralign: no world note element on the strategy page', stratNoWorld);
+      await page.evaluate(() => document.querySelector('#planStrategyRenameBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planStrategyNameInput'), { timeout: 10000 });
+      const renameStar = await page.evaluate(() => !!document.querySelector('#planStrategyHeaderTools button[title="Suggest a name with AI"]'));
+      H.check('ainame: ✨ button present in the strategy header rename', renameStar);
+      fs.writeFileSync(H.aiStubFile, 'Jan to Fix');
+      await page.evaluate(() => document.querySelector('#planStrategyHeaderTools button[title="Suggest a name with AI"]').click());
+      await page.waitForFunction(() => document.querySelector('#planStrategyNameInput').value === 'Jan to Fix', { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#planStrategyNameInput').value = 'Jan to Fix Edited'; });
+      await page.evaluate(() => document.querySelector('#planStrategyRenameSave').click());
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Jan to Fix Edited'), { timeout: 15000 });
+      r = await H.req('GET', `/api/planning/strategies/${icStrat}`);
+      H.check('ainame: user-edited suggested name is preserved on save (strategy rename)',
+        r.data.strategy && r.data.strategy.name === 'Jan to Fix Edited', JSON.stringify({ name: r.data.strategy && r.data.strategy.name }));
+      // Strategy create modal ✨ presence + fill (no save — the
+      // template form needs a preset choice to create).
+      await page.goto(`http://ff.local/#planning/project/${smProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitM(1500);
+      await page.evaluate(() => document.querySelector('#planAddStrategyBtn').click());
+      // The modal opens to a preset chooser; the Name field + ✨
+      // appear only after picking a preset — and the preset click
+      // is a no-op until the async op context loads, so poll-click.
+      await page.waitForFunction(async () => {
+        if (document.querySelector('#planStrategyAiNameBtn')) return true;
+        const card = document.querySelector('[data-plan-preset="buy"]');
+        if (card) card.click();
+        await new Promise((r) => setTimeout(r, 500));
+        return !!document.querySelector('#planStrategyAiNameBtn');
+      }, { timeout: 15000 });
+      fs.writeFileSync(H.aiStubFile, 'Strategy Suggested');
+      await page.evaluate(() => document.querySelector('#planStrategyAiNameBtn').click());
+      await page.waitForFunction(() => document.querySelector('#planStrategyName').value === 'Strategy Suggested', { timeout: 10000 });
+      H.check('ainame: ✨ button present + fills in the strategy create modal', true);
+    } finally { await browserM.close(); }
+  }
+  // Item 8 (e): Design with AI flow unchanged (stubbed ai-design).
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ factors: { prime: { preset: 'up' } } }));
+  r = await H.req('POST', `/api/planning/projects/${smProj}/scenarios/ai-design`, { text: 'prime rises', historyText: 'You: prime rises' });
+  H.check('scenmodal: AI design flow unchanged (ai-design still returns expanded factors)',
+    r.status === 200 && Array.isArray(r.data.factors?.prime?.points) && r.data.factors.prime.points.length > 0, JSON.stringify(r.data));
+  // ------------------------------------------- item 12: per-payday RRSP
+  // Fixture mirrors the take-home job (biweekly BC, 3000/period) on
+  // the 2026-10-23 grid, so from 2026-11-04 the next payday is
+  // 2026-11-06 (the user's case); the pins read the next payday
+  // from the job itself, so they hold on any run date.
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'Payday RRSP', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2026-10-23', recent_pay_date: '2026-10-23', recent_pay_value: 3000 });
+  H.check('payday: job created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const pdJob = r.data.id;
+  const pdCalc = async () => {
+    const rr = await H.req('GET', '/api/earnings');
+    return (rr.data.jobs || []).find((j) => j.id === pdJob);
+  };
+  let pd = await pdCalc();
+  const pdNext = pd?.next_pay_date;
+  const pdBase = pd?.calc?.perPeriod;
+  H.check('payday: next payday read from job', !!pdNext && !!pdBase, JSON.stringify({ next: pdNext, pp: pdBase }));
+  // Own fixture: the take-home section deletes its RRSP account at
+  // cleanup (and SQLite reuses the freed id for a later non-RRSP
+  // account), so thAcct/thFund must NOT be reused here.
+  r = await H.req('POST', '/api/investments/accounts', { name: 'Payday RRSP', type: 'RRSP' });
+  H.check('payday: RRSP account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const pdAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${pdAcct}/holdings`, { label: 'Payday Fund', kind: 'fund', currency: 'CAD' });
+  const pdFund = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${pdAcct}/plans`, { job_id: pdJob, target_holding_id: pdFund, start_date: pdNext, own_amount: 100, employer_amount: 50 });
+  H.check('payday: future plan starting at next payday created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  pd = await pdCalc();
+  const pp1 = pd?.calc?.perPeriod;
+  const ppSum1 = pp1 ? pp1.gross - pp1.totalTax - pp1.cpp - pp1.cpp2 - pp1.ei : null;
+  H.check('payday: next-pay cash reflects the next-payday-start plan (gross − tax − CPP/EI − own)',
+    pp1 && Math.abs(ppSum1 - pp1.net) <= 0.05 && pp1.cashNet === pp1.net - 100 && pp1.totalTax < pdBase.totalTax && pd.next_pay_date === pdNext,
+    JSON.stringify({ base: pdBase, pp1, next: pd.next_pay_date }));
+  H.check('payday: annual cash annualizes the next-pay deduction',
+    pd && Math.abs((pd.calc.netAnnual - pd.calc.cashNetAnnual) - 100 * 26) <= 0.02,
+    JSON.stringify({ netAnnual: pd.calc.netAnnual, cashNetAnnual: pd.calc.cashNetAnnual }));
+  r = await H.req('GET', `/api/earnings/jobs/${pdJob}/monthly-chart`);
+  const pdMonths = r.data.months || [];
+  const pdStartYm = pdNext.slice(0, 7);
+  const pdBeforeOk = pdMonths.filter((m) => m < pdStartYm).every((m) => r.data.rrsp[pdMonths.indexOf(m)] === 0);
+  const pdStartIdx = pdMonths.indexOf(pdStartYm);
+  const pdStartOk = pdStartIdx >= 0 ? r.data.rrsp[pdStartIdx] > 0 : null;
+  H.check('payday: monthly chart RRSP 0 before start month, positive in start month',
+    pdBeforeOk && pdStartOk !== false, JSON.stringify({ months: pdMonths, rrsp: r.data.rrsp, startYm: pdStartYm, startOk: pdStartOk }));
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'Payday Later', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2026-10-23', recent_pay_date: '2026-10-23', recent_pay_value: 3000 });
+  H.check('payday: later job created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const pdJob2 = r.data.id;
+  const pdCalc2 = async () => {
+    const rr = await H.req('GET', '/api/earnings');
+    return (rr.data.jobs || []).find((j) => j.id === pdJob2);
+  };
+  let pd2 = await pdCalc2();
+  const pdNext2 = pd2?.next_pay_date;
+  const pdBase2 = pd2?.calc?.perPeriod;
+  const pdLater = new Date(`${pdNext2}T00:00:00Z`); pdLater.setUTCDate(pdLater.getUTCDate() + 14);
+  const pdLaterStr = pdLater.toISOString().slice(0, 10);
+  r = await H.req('POST', `/api/investments/accounts/${pdAcct}/plans`, { job_id: pdJob2, target_holding_id: pdFund, start_date: pdLaterStr, own_amount: 100 });
+  H.check('payday: later-start plan created', r.status === 201, JSON.stringify(r.data));
+  pd2 = await pdCalc2();
+  H.check('payday: plan starting after next payday contributes $0 to next net pay',
+    pd2 && pd2.calc.perPeriod.cashNet === pdBase2.cashNet && pd2.calc.perPeriod.totalTax === pdBase2.totalTax,
+    JSON.stringify({ base2: pdBase2, after: pd2.calc.perPeriod, next2: pdNext2, laterStr: pdLaterStr }));
   // --- switch-to-fixed (user rule 2026-11-02): the payment
   // re-derives from the current outstanding balance over the
   // remaining amortization; a pure switch does not move the
@@ -5526,6 +6632,11 @@ export async function run(H, S) {
       const scStrategyId = r.data.strategy.id;
       r = await H.req('POST', `/api/planning/strategies/${scStrategyId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
       H.check('cleanup: stock-chart pin buy op posted', r.status === 201, JSON.stringify(r.data));
+      // Item 6 revised gating: the Stock value panel renders only
+      // after Generate, so this fixture needs a report pinning the
+      // strategy before its page is visited.
+      r = await H.req('POST', `/api/planning/projects/${scProjectId}/reports`, { name: 'Cleanup stock report', definition: { strategies: [scStrategyId], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [scStrategyId], scenario_ids: [] });
+      H.check('cleanup: stock-chart pin report created (opens its Generate gate)', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/strategy/${scStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const buyStock = await page.evaluate(() => ({
@@ -5586,6 +6697,11 @@ export async function run(H, S) {
       r = await H.req('POST', `/api/planning/projects/${afProjectId}/scenarios`, { name: 'Asm Plain World' });
       H.check('asmfollow: pin plain scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
       const afScenPlainId = r.data.scenario.id;
+      // Item 6 revised gating: the Stock value panel (which carries
+      // the return note these pins read) renders only after
+      // Generate, so open the gate with a pinning report first.
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/reports`, { name: 'Asm Gate', definition: { strategies: [afBuyId], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [afBuyId], scenario_ids: [afScenStockId] });
+      H.check('asmfollow: gate report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/strategy/${afBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       await page.click(`[data-plan-strategy-scenario-select="${afScenStockId}"]`);
@@ -5618,6 +6734,8 @@ export async function run(H, S) {
       H.check('asmfollow: pin mixed buy op posted', r.status === 201, JSON.stringify(r.data));
       r = await H.req('POST', `/api/planning/strategies/${afMixedId}/ops`, { op_type: 'prepay', params: { propertyId: afPropId, date: planOpDate, amount: 10000, openClosed: 'open' } });
       H.check('asmfollow: pin mixed prepay op posted', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/planning/projects/${afProjectId}/reports`, { name: 'Asm Mixed Gate', definition: { strategies: [afMixedId], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [afMixedId], scenario_ids: [afScenStockId] });
+      H.check('asmfollow: mixed gate report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/strategy/${afMixedId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmMixed = await page.evaluate(() => ({
@@ -5844,8 +6962,10 @@ export async function run(H, S) {
         selCard: !!document.querySelector(`[data-plan-scenario="${s2}"]`)?.classList.contains('plan-selected'),
         oldSel: !!document.querySelector(`[data-plan-scenario="${s1}"]`)?.classList.contains('plan-selected'),
       }), wScen1, wScen2);
-      H.check('wiring: wiring scenario pick switches the card world',
-        world2.note.includes('Wiring world 2') && world2.selCard && !world2.oldSel,
+      // Item 10: the world note element is gone — the pick switches
+      // selection (highlight only) and renders no note anywhere.
+      H.check('wiring: wiring scenario pick switches selection, no world note renders',
+        world2.note === '' && world2.selCard && !world2.oldSel,
         JSON.stringify(world2));
       // Baselines are FIXED: no baseline pick — the AI modal shows
       // the fixed baseline as display text (this uncategorized
@@ -6103,16 +7223,25 @@ export async function run(H, S) {
       // A reload resets wiring state (every strategy picked); the
       // baseline resolves to fixed automatically, so only re-pick
       // the engine selection (deselect the AI strategy).
+      await page.waitForFunction((s) => !!document.querySelector(s), { timeout: 15000 }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       // One-click Generate: creates + opens a report pinned to the
       // then-current wiring selection, with no modal. Inline: the
       // hash stays on the project page and the viewer shows the tab.
+      await page.waitForFunction(() => !!document.querySelector('#planFlowGenerateBtn'), { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planFlowGenerateBtn');
-      await waitF(1500);
+      // The tab renders asynchronously after the report POST (same
+      // race the deep-link pin below documents) — poll the API for
+      // the report, then wait for its tab, instead of a fixed sleep.
+      let genRep = null;
+      for (let i = 0; i < 20 && !genRep; i++) {
+        const rr = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+        genRep = (rr.data.reports || []).find((x) => x.name === `Report · Flow world · Do-nothing · ${fLetter}`);
+        if (!genRep) await waitF(500);
+      }
       const genHash = await page.evaluate(() => location.hash);
-      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
-      const genRep = (r.data.reports || []).find((x) => x.name === `Report · Flow world · Do-nothing · ${fLetter}`);
+      if (genRep) { try { await page.waitForSelector(`[data-plan-report-tab="${genRep.id}"]`, { timeout: 15000 }); } catch { /* the check below reports tab:false */ } }
       const genInline = await page.evaluate((rid) => ({
         inline: !!document.querySelector('#planProject #planReport'),
         tab: !!document.querySelector(`[data-plan-report-tab="${rid}"]`),

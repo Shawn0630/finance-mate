@@ -457,12 +457,15 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   // ---- stocks ----------------------------------------------------------
   const returnPct = num(assumptions.stockReturnPct);
   const rAnnual = returnPct == null ? 0 : returnPct / 100;
+  const byHolding = assumptions.stockReturnByHolding && typeof assumptions.stockReturnByHolding === 'object' ? assumptions.stockReturnByHolding : null;
   // Per-holding current rates (the baseline world): when the run sets
   // no global stock return, each holding grows at its own current
   // rate from its own history; holdings without a usable window stay
-  // flat. A global stockReturnPct (strategy factor or sink) wins over
-  // every per-holding rate.
+  // flat. Precedence: a per-holding scenario override wins over the
+  // global stockReturnPct (strategy factor or sink), which wins over
+  // every per-holding history rate.
   const growthFor = (holding) => {
+    if (byHolding && num(byHolding[holding.id]) != null) return num(byHolding[holding.id]) / 100;
     if (returnPct != null) return rAnnual;
     if (holdingGrowth && holdingGrowth[holding.id] != null) {
       const g = num(holdingGrowth[holding.id]);
@@ -1143,7 +1146,16 @@ export function validateAiReportChartSeries(charts) {
 // entity), so availability counts are snapshot-wide. A cash-pool
 // project's stock series covers only its pool — the render-time
 // no-data note is the backstop for that case.
-export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text }) {
+// Baseline kind (user 2026-11-04): report content follows the
+// baseline, not the ops — a cash-pool baseline allows pool/stock
+// charts only (mortgage charts are forbidden and rejected server-
+// side), a property baseline allows property charts.
+export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind }) {
+  const kindLine = baselineKind === 'pool'
+    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected.'
+    : baselineKind === 'property'
+      ? 'Baseline kind: property. This report covers one property: use property charts (mortgage_balance, total_value for equity, monthly_payment, payoff_month) and the pool/stock charts only where the strategies actually touch stocks.'
+      : null;
   return [
     'You compose a report definition as JSON only. No prose outside the JSON object.',
     'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
@@ -1152,10 +1164,85 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text 
     'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
     'Never invent a number: the app computes every series; you only order and title charts.',
     'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
+    ...(kindLine ? [kindLine] : []),
     `Charts render over the whole snapshot: ${mortgagedCount} ${mortgagedCount === 1 ? 'property carries' : 'properties carry'} a mortgage, ${holdingCount} stock ${holdingCount === 1 ? 'holding exists' : 'holdings exist'}. Do not use mortgage_balance when no property carries a mortgage, and do not use stock_value when no stock holding exists.`,
     `Strategies: ${JSON.stringify(strategies)}`,
     `User request: ${text}`,
   ].join('\n');
+}
+
+// Baseline-kind chart validation for AI reports ONLY (the preset
+// POST stays permissive — the viewer enforces at render, and legacy
+// saved definitions are never rewritten). On a cash-pool baseline
+// every mortgage-family chart is rejected: fan_band always; a
+// trajectory/stacked chart whose effective series is mortgage_balance
+// (an empty series defaults to it, matching the viewer); a doughnut
+// carrying mortgage_balance/total_value; metric cards carrying
+// monthly_payment/payoff_month. Other baseline kinds pass untouched.
+export function validateAiReportBaselineKind(charts, baselineKind) {
+  const errs = [];
+  if (baselineKind !== 'pool') return errs;
+  if (!Array.isArray(charts)) return errs;
+  for (const c of charts) {
+    if (!c || typeof c !== 'object') continue;
+    const title = c.title || c.template;
+    const series = Array.isArray(c.series) && c.series.length ? c.series : null;
+    if (c.template === 'fan_band') { errs.push(`chart "${title}" (fan_band) is a mortgage chart and is forbidden on a cash-pool baseline`); continue; }
+    if (c.template === 'time_line' || c.template === 'yearly_bars' || c.template === 'stacked_bar') {
+      const eff = series || ['mortgage_balance'];
+      if (eff.includes('mortgage_balance')) errs.push(`chart "${title}" (${c.template}) uses mortgage_balance, forbidden on a cash-pool baseline`);
+      continue;
+    }
+    if (c.template === 'share_doughnut') {
+      if (series && (series.includes('mortgage_balance') || series.includes('total_value'))) errs.push(`chart "${title}" (share_doughnut) uses a mortgage/equity series, forbidden on a cash-pool baseline`);
+      continue;
+    }
+    if (c.template === 'metric_cards') {
+      if (series && (series.includes('monthly_payment') || series.includes('payoff_month'))) errs.push(`chart "${title}" (metric_cards) uses a mortgage metric, forbidden on a cash-pool baseline`);
+    }
+  }
+  return errs;
+}
+
+// AI name suggestion (pure, so unit tests can pin it): a short name
+// only — never an explanation, never auto-saved (the client fills
+// the Name field as an editable draft). Strategy names come from the
+// OP SEQUENCE (op types + key params, e.g. "Jan to Fix", "pre pay
+// 50000"); the entity is context only, never the naming basis.
+// Scenario names come from the factors. With no factors/ops yet, the
+// prompt says so and the model names from category/entity context.
+export function aiSuggestNamePrompt(kind, context) {
+  const ctx = context && typeof context === 'object' && !Array.isArray(context) ? context : {};
+  if (kind === 'strategy') {
+    const ops = Array.isArray(ctx.ops) ? ctx.ops : [];
+    const opsLine = ops.length
+      ? `Operation sequence — name the strategy from these ops (op types + key params like dates, amounts, rate targets; e.g. a January switch to fixed is "Jan to Fix", a $50,000 prepay is "pre pay 50000"): ${JSON.stringify(ops)}`
+      : 'No operations entered yet — name it from the project context alone.';
+    const lines = ['You propose a short name for a financial planning strategy. Reply with the name ONLY — a few words, no explanation, no quotes, no JSON.', opsLine];
+    if (ctx.description) lines.push(`Description: ${ctx.description}`);
+    if (ctx.entityLabel) lines.push(`Project entity (context only, NOT the naming basis): ${ctx.entityLabel}`);
+    if (ctx.category) lines.push(`Project category: ${ctx.category}`);
+    return lines.join('\n');
+  }
+  const factors = ctx.factors && typeof ctx.factors === 'object' && !Array.isArray(ctx.factors) ? ctx.factors : {};
+  const lines = ['You propose a short name for a planning scenario (a future world). Reply with the name ONLY — a few words, no explanation, no quotes, no JSON.'];
+  lines.push(Object.keys(factors).length
+    ? `Scenario factors — name it from these: ${JSON.stringify(factors)}`
+    : 'No factors entered yet — name it from the project context alone.');
+  if (ctx.category) lines.push(`Project category: ${ctx.category}`);
+  if (ctx.entityLabel) lines.push(`Project entity (context): ${ctx.entityLabel}`);
+  return lines.join('\n');
+}
+// Clean a suggested name: a parsed {name} object, a bare string, or
+// raw model text (first line, quotes stripped, capped at 80 chars).
+// Empty in = empty out (the caller then reports "no name").
+export function cleanAiSuggestedName(raw) {
+  if (raw == null) return '';
+  let text = '';
+  if (typeof raw === 'object') text = typeof raw.name === 'string' ? raw.name : '';
+  else text = String(raw);
+  text = text.trim().split('\n')[0].trim().replace(/^["'“”]+|["'“”]+$/g, '').trim();
+  return text.slice(0, 80);
 }
 
 // Report definition edit (block delete / AI append): structural only,
@@ -1317,7 +1404,25 @@ export function validateStrategyFactors(factors, currentMonth = null) {
     const x = num(v.valuePct);
     if (x == null || x < min || x > max) errs.push(`${key} valuePct must be between ${min} and ${max}`);
   };
-  pctField('stock', -90, 500);
+  // A byHolding-only stock factor (per-holding overrides, no global
+  // default) is legal: the global range check applies only when a
+  // global valuePct is actually set. An empty stock object (neither)
+  // still fails, as before.
+  const stockByHoldingOnly = factors.stock && typeof factors.stock === 'object' && !Array.isArray(factors.stock)
+    && factors.stock.byHolding != null && num(factors.stock.valuePct) == null;
+  if (!stockByHoldingOnly) pctField('stock', -90, 500);
+  // Per-holding scenario overrides: {holdingId: {valuePct, basis?,
+  // window?}} — each valuePct in the same range as the global stock
+  // factor. A non-object entry or an out-of-range value is rejected.
+  if (factors.stock && typeof factors.stock === 'object' && !Array.isArray(factors.stock) && factors.stock.byHolding != null) {
+    const bh = factors.stock.byHolding;
+    if (typeof bh !== 'object' || Array.isArray(bh)) errs.push('stock byHolding must be an object');
+    else for (const [hid, v] of Object.entries(bh)) {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) { errs.push(`stock byHolding ${hid} must be an object`); continue; }
+      const x = num(v.valuePct);
+      if (x == null || x < -90 || x > 500) errs.push(`stock byHolding ${hid} valuePct must be between -90 and 500`);
+    }
+  }
   pctField('propertyGrowth', -90, 500);
   pctField('salaryGrowth', -90, 500);
   pctField('rentGrowth', -90, 500);
@@ -1395,6 +1500,14 @@ export function factorsToAssumptions(factors, confirmed = {}) {
   const f = factors || {};
   const a = { ...confirmed };
   if (f.stock && num(f.stock.valuePct) != null) a.stockReturnPct = num(f.stock.valuePct);
+  if (f.stock && f.stock.byHolding && typeof f.stock.byHolding === 'object' && !Array.isArray(f.stock.byHolding)) {
+    const m = {};
+    for (const [k, v] of Object.entries(f.stock.byHolding)) {
+      const x = v && typeof v === 'object' ? num(v.valuePct) : num(v);
+      if (x != null) m[k] = x;
+    }
+    if (Object.keys(m).length) a.stockReturnByHolding = m;
+  }
   if (f.propertyGrowth && num(f.propertyGrowth.valuePct) != null) a.propertyGrowthPct = num(f.propertyGrowth.valuePct);
   return a;
 }

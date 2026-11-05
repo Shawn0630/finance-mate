@@ -11116,6 +11116,9 @@ async function planCatPickCategory(key) {
   const cat = (planCatFlow.categories || []).find((c) => c.key === key);
   if (!cat) return;
   planCatFlow.category = cat;
+  // Selection mark, so Back from the project modal can show the
+  // pickers with the previous pick still visibly selected.
+  document.querySelectorAll('#planCategoryCards [data-plan-cat]').forEach((el) => el.classList.toggle('plan-selected', el.dataset.planCat === key));
   planCatFlow.entity = null;
   planCatFlow.subcategory = null;
   planCatFlow.recommendations = null;
@@ -11178,13 +11181,19 @@ async function planCatPickCategory(key) {
           <button type="button" class="small" data-pool-entry-remove title="Remove this funding">×</button>
         </div>`;
       host.innerHTML = `<div class="note">Build the cash pool one entry at a time — each entry is a stock inside an account, or external cash from outside the app. For a stock, give a percent of that stock or a CAD amount from it; external funding is a CAD amount. The pool total is the sum of the entries.</div>
-        <div id="planPoolEntries"></div>
-        <div class="toolbar"><button class="small" id="planPoolAddBtn">+ Add funding</button></div>
-        <div id="planPoolViz" style="margin-top:8px">
-          <div class="chart-wrap" style="height:220px"><canvas id="planPoolVizChart"></canvas></div>
-          <table class="tbl"><thead><tr><th>Source</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planPoolVizBody"></tbody></table>
+        <div class="plan-pool-layout">
+          <div class="plan-pool-left">
+            <div id="planPoolEntries"></div>
+            <div class="toolbar"><button class="small" id="planPoolAddBtn">+ Add funding</button></div>
+          </div>
+          <div class="plan-pool-right">
+            <div id="planPoolViz">
+              <div class="chart-wrap" style="height:220px"><canvas id="planPoolVizChart"></canvas></div>
+              <table class="tbl"><thead><tr><th>Source</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planPoolVizBody"></tbody></table>
+            </div>
+            <div class="note" id="planPoolTotal">Pool total: $0.00</div>
+          </div>
         </div>
-        <div class="note" id="planPoolTotal">Pool total: $0.00</div>
         <div class="toolbar"><button class="small primary" id="planCatEntityGo">Continue</button></div>`;
       const entryContribution = (row) => {
         const src = row.querySelector('[data-pool-entry-source]').value;
@@ -11314,6 +11323,7 @@ async function planCatPickEntity(entity) {
 }
 function planCatPickSubcategory(key) {
   planCatFlow.subcategory = key;
+  document.querySelectorAll('#planCategorySubs [data-plan-sub]').forEach((el) => el.classList.toggle('plan-selected', el.dataset.planSub === key));
   if (planCatFlow.mode === 'addBaseline') {
     // Append-only: the recommended baseline joins the project's list.
     const rec = (planCatFlow.recommendations || {})[key];
@@ -11337,6 +11347,11 @@ function openPlanProjectModal(existing, catCtx) {
   const aiBtn = $('#planAiCreateBtn');
   catRow.classList.add('hidden');
   aiBtn.classList.add('hidden');
+  // Back returns to the category/entity/scope pickers, which persist
+  // in the DOM exactly as left — but only when this modal was reached
+  // through the creation flow. Edit mode (and any direct open) has no
+  // previous step, so Back stays hidden and Cancel/Close are the exits.
+  $('#planProjectBackBtn').classList.add('hidden');
   form.dataset.projectId = existing ? existing.id : '';
   form.dataset.planCategory = '';
   form.dataset.planSubcategory = '';
@@ -11358,6 +11373,7 @@ function openPlanProjectModal(existing, catCtx) {
     catRow.classList.remove('hidden');
     $('#planProjectCategoryNote').textContent = `${catCtx.category} · ${catCtx.subcategory}${rec ? ` — Scenario: ${rec.scenario && rec.scenario.name ? rec.scenario.name : '—'} · Baseline: ${rec.baseline.name} · Strategy: ${rec.strategy.name}` : ''}`;
     aiBtn.classList.remove('hidden');
+    if (planCatFlow && planCatFlow.category) $('#planProjectBackBtn').classList.remove('hidden');
     // The creation button creates WITH the displayed recommendation
     // (the old Apply-recommendation behavior, now the only path);
     // a subcategory with no displayed recommendation has nothing to
@@ -11378,6 +11394,19 @@ $('#planProjectSaveBtn').addEventListener('click', () => {
   if (f.dataset.planCategory && f.dataset.planHasRec === '1') f.dataset.planApply = '1';
 });
 $('#planAiCreateBtn').addEventListener('click', openPlanAiCreateModal);
+// Back: close the project modal and re-open the category modal.
+// Nothing is reset — the pickers' DOM (category selection mark,
+// entity picker values, pool-builder entries, subcategory marks)
+// persists exactly as left, so the user re-picks and comes forward
+// again instead of Cancel-restarting the whole flow. A typed project
+// name or edited Question is NOT preserved: coming forward re-runs
+// openPlanProjectModal, which resets the form and refills Question
+// from the (possibly new) recommendation, as before.
+$('#planProjectBackBtn').addEventListener('click', () => {
+  if (!planCatFlow || !planCatFlow.category) return;
+  closeModalEl($('#planProjectModal'));
+  openModal('planCategoryModal');
+});
 $('#planProjectForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -11616,7 +11645,7 @@ async function loadPlanProject(id) {
 // do-nothing state, metadata only — no Add/Edit/Refine/Delete, no
 // Select. Shared by the project Baselines tier and the strategy
 // page's Baseline group. Null = legacy project without a category.
-function planFixedBaselineHtml(fb) {
+function planFixedBaselineHtml(fb, scen) {
   if (!fb) return '<div class="note">No fixed baseline — legacy project without a category.</div>';
   let parts = [];
   if (fb.kind === 'property') {
@@ -11633,7 +11662,26 @@ function planFixedBaselineHtml(fb) {
         else if (it.symbol) parts.push(`${esc(it.symbol)} ${money2(it.value ?? 0)}`);
       }
     } else if (figs.value != null) parts.push(`Current value ${money2(figs.value)}`);
-    for (const r of fb.returns || []) parts.push(`${esc(r.label)} ${r.pct}%/yr expected`);
+    // Effective expected return, display only (user 2026-11-04):
+    // the selected scenario's stock factor wins when set (a
+    // per-holding override, else the scenario default), else the
+    // holding's own-history rate — each labeled with its source.
+    // Editing lives on the scenario page; this card has no inputs.
+    const scenStock = scen && scen.stock ? scen.stock : null;
+    const shown = new Set();
+    for (const r of fb.returns || []) {
+      shown.add(Number(r.holdingId));
+      const ov = scenStock && scenStock.byHolding ? scenStock.byHolding[r.holdingId] || scenStock.byHolding[Number(r.holdingId)] : null;
+      if (ov && ov.valuePct != null) parts.push(`${esc(r.label)} ${ov.valuePct}%/yr expected · Scenario ${esc(scen.name)}`);
+      else if (scenStock && scenStock.valuePct != null) parts.push(`${esc(r.label)} ${scenStock.valuePct}%/yr expected · Scenario ${esc(scen.name)}`);
+      else parts.push(`${esc(r.label)} ${r.pct}%/yr expected · History (${esc(r.basis || 'Price CAGR')}${r.window ? ` · ${esc(r.window)}` : ''})`);
+    }
+    if (scenStock && scenStock.byHolding) {
+      for (const [hid, ov] of Object.entries(scenStock.byHolding)) {
+        if (shown.has(Number(hid)) || !ov || ov.valuePct == null) continue;
+        parts.push(`Holding ${hid} ${ov.valuePct}%/yr expected · Scenario ${esc(scen.name)}`);
+      }
+    }
     if (!parts.length && fb.description) parts.push(esc(fb.description));
   } else if (fb.kind === 'earning') {
     if (fb.employer) {
@@ -11716,7 +11764,6 @@ function planProjectHtml(d) {
       <div id="planScenarioCards"></div>
       </div>
       <div class="plan-flow-tier plan-flow-tier-mid" id="planFlowMidTier">
-      <div id="planStrategyCardsWorld"></div>
       <div class="plan-flow-group" id="planBaselineCardsPanel">
       <div class="section-head"><h3>Baselines</h3></div>
       <div id="planBaselineCards"></div>
@@ -11761,9 +11808,7 @@ function planProjectHtml(d) {
       </div>
       <div id="planAiPanelStrategyRow" class="hidden">
         <label>Strategy</label><select id="planAiPanelStrategy"></select>
-        <div id="planAiPanelStrategyNameRow" class="hidden"><label>New strategy name *</label><input id="planAiPanelStrategyName" placeholder="e.g. Pay down Christina, invest the rest"></div>
       </div>
-      <div id="planAiPanelScenarioNameRow" class="hidden"><label>Scenario name *</label><input id="planAiPanelScenarioName" placeholder="e.g. Prime rises"></div>
       <div><label>Describe what you want *</label><textarea id="planAiPanelText" rows="3" placeholder="e.g. Prime rises 1 point over the next year, then holds"></textarea></div>
       <div id="planAiPanelQueue"></div>
       <div class="toolbar"><input type="file" id="planAiPanelFiles" multiple accept="image/*,application/pdf,.csv,.txt"><select id="planAiPanelModel" title="Model" style="width:auto;flex:0 1 auto"></select><button class="small primary" id="planAiPanelGoBtn">Send</button></div>
@@ -11829,12 +11874,7 @@ function planProjectWire(d) {
   // Baselines tier: the FIXED baseline only, metadata, no buttons.
   // Legacy baseline records still load via the API and still label
   // old reports, but the UI never offers them as choices anymore.
-  const renderFixedBaseline = () => {
-    const host = $('#planBaselineCards');
-    if (!host) return;
-    host.innerHTML = planFixedBaselineHtml(p.fixedBaseline);
-  };
-  renderFixedBaseline();
+  planRenderFixedBaselineCard();
   // Compact metadata line: Edit swaps the line for the schema's field
   // editors (the same fields the old panel edited).
   const metaLineEdit = $('#planMetadataLineEdit');
@@ -11925,10 +11965,7 @@ function planScenarioSectionWire(d) {
     });
   });
   $('#planAddScenarioBtn').addEventListener('click', () => {
-    $('#planScenarioForm').dataset.projectId = p.id;
-    $('#planScenarioName').value = '';
-    showMsg($('#planScenarioModalMsg'), '', '');
-    openModal('planScenarioModal');
+    planScenarioModalOpen(p.id, p.category);
   });
 }
 // ---- Project flow wiring: one shared selection + connector lines ----
@@ -11947,6 +11984,19 @@ function planScenarioSectionWire(d) {
 let planWiringBaselineId = null;
 let planWiringStrategyIds = null; // null = every project strategy
 const planWiringScenarioId = () => (planCompareScenarioIds && planCompareScenarioIds.length ? planCompareScenarioIds[0] : null);
+// Baseline card (project page): re-rendered on every wiring refresh
+// so its effective expected returns track the selected scenario —
+// the scenario factor when set, else each holding's own history.
+// Display only: no edit control lives on the card.
+function planRenderFixedBaselineCard() {
+  const host = $('#planBaselineCards');
+  const d = planProjectData;
+  if (!host || !d || !d.project) return;
+  const scenId = planWiringScenarioId();
+  const scen = scenId != null ? (d.scenarios || []).find((x) => x.id === scenId) : null;
+  const scenStock = scen && scen.factors && scen.factors.stock ? { name: scen.name, stock: scen.factors.stock } : null;
+  host.innerHTML = planFixedBaselineHtml(d.project.fixedBaseline, scenStock);
+}
 const planWiringRepick = () => { const d = planProjectData; return !!(d && (d.scenarios || []).length && !(planCompareScenarioIds && planCompareScenarioIds.length)); };
 const planWiringStrategyPicked = (id) => (planWiringStrategyIds == null ? true : planWiringStrategyIds.includes(id));
 function planWiringRefresh() {
@@ -11965,6 +12015,7 @@ function planWiringRefresh() {
     b.disabled = repick;
     b.closest('.card')?.classList.toggle('plan-selected', on);
   });
+  planRenderFixedBaselineCard();
   planFlowGenerateRefresh();
 }
 // ---- one-click Generate report (flow panel) ----
@@ -12066,6 +12117,103 @@ function planWiringSelectStrategy(id) {
   planWiringStrategyIds = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
   planWiringRefresh();
 }
+// ---- scenario create modal with factors (user 2026-11-04) ----
+// The create modal carries Name + the factor sections, so a scenario
+// is created WITH its factors atomically — no name-only step +
+// detail-page round trip. The stock section reuses the shared
+// scenario stock editor (global default + per-holding rows); the
+// prime section carries the functional inputs (presets + date/rate
+// rows) but NOT the detail page's prime history chart, and its rows
+// use native month inputs instead of the shared month popup (the
+// popup is wired to the detail page's points container only).
+// Growth sections follow the project category (property → property
+// growth; earning → salary/rent growth). Detail-page editing stays
+// for later edits; the Design-with-AI flow is untouched.
+let planScenarioModalState = null;
+function planScenarioModalRenderPrime() {
+  const st = planScenarioModalState;
+  if (!st) return;
+  const host = $('#planScenarioModalPrime');
+  if (!host) return;
+  const curRate = st.primeInfo && st.primeInfo.current ? st.primeInfo.current.rate : null;
+  const presetBtns = [['optimistic', 'Optimistic (prime down)'], ['pessimistic', 'Pessimistic (prime up)'], ['up', 'Up'], ['down', 'Down'], ['flat', 'Flat']]
+    .map(([k, label]) => `<button type="button" class="small" data-modal-prime-preset="${k}">${label}</button>`).join(' ');
+  host.innerHTML = `<div class="section-head"><h3>Prime</h3></div>
+    <div class="note">Today's prime: ${curRate != null ? `${curRate}%` : '—'} · No points = prime stays at today's rate. Between points the rate holds until the next point.</div>
+    <div class="toolbar">${presetBtns}</div>
+    <div id="planScenarioModalPrimePoints">${st.prime.points.map((pt, i) => `
+      <div class="plan-row"><input type="month" data-modal-prime-month="${i}" value="${pt.month}">
+      <input type="number" step="0.01" data-modal-prime-rate="${i}" value="${pt.rate}" style="width:90px"> %
+      <button type="button" class="small danger" data-modal-prime-del="${i}">Remove</button></div>`).join('') || '<div class="note">No future points yet — pick a preset or add a point.</div>'}
+    </div>
+    <div class="toolbar"><button type="button" class="small" id="planScenarioModalPrimeAddBtn">+ Add point</button></div>`;
+  host.querySelectorAll('[data-modal-prime-preset]').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      const r = await api(`/api/planning/prime-presets?preset=${b.dataset.modalPrimePreset}`);
+      st.prime = { points: r.points || [], preset: r.preset };
+      planScenarioModalRenderPrime();
+    } catch (err) { showMsg($('#planScenarioModalMsg'), 'err', err.message); }
+  }));
+  host.querySelectorAll('[data-modal-prime-month]').forEach((inp) => inp.addEventListener('change', () => {
+    const i = Number(inp.dataset.modalPrimeMonth);
+    if (st.prime.points[i]) { st.prime.points[i].month = inp.value; st.prime.preset = null; }
+  }));
+  host.querySelectorAll('[data-modal-prime-rate]').forEach((inp) => inp.addEventListener('input', () => {
+    const i = Number(inp.dataset.modalPrimeRate);
+    if (st.prime.points[i]) { st.prime.points[i].rate = Number(inp.value); st.prime.preset = null; }
+  }));
+  host.querySelectorAll('[data-modal-prime-del]').forEach((b) => b.addEventListener('click', () => {
+    st.prime.points.splice(Number(b.dataset.modalPrimeDel), 1);
+    st.prime.preset = null;
+    planScenarioModalRenderPrime();
+  }));
+  const addBtn = $('#planScenarioModalPrimeAddBtn');
+  if (addBtn) addBtn.addEventListener('click', () => {
+    const pts = st.prime.points;
+    const last = pts.length ? pts[pts.length - 1] : null;
+    pts.push({ month: last ? nextYm(last.month) : nowYm(), rate: last ? last.rate : (curRate != null ? curRate : 0) });
+    st.prime.preset = null;
+    planScenarioModalRenderPrime();
+  });
+}
+async function planScenarioModalOpen(projectId, category) {
+  const form = $('#planScenarioForm');
+  form.dataset.projectId = projectId;
+  $('#planScenarioName').value = '';
+  showMsg($('#planScenarioModalMsg'), '', '');
+  planScenarioModalState = { prime: { points: [], preset: null }, stock: {}, primeInfo: null, holdings: [], category };
+  try { planScenarioModalState.primeInfo = await api('/api/prime'); } catch { planScenarioModalState.primeInfo = null; }
+  try {
+    const inv = await api('/api/investments');
+    planScenarioModalState.holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountName: (a.account || {}).name })));
+  } catch { planScenarioModalState.holdings = []; }
+  const host = $('#planScenarioModalFactors');
+  const growthRows = [];
+  if (category === 'property') growthRows.push(['propertyGrowth', 'Property value growth (% / year)']);
+  if (category === 'earning') { growthRows.push(['salaryGrowth', 'Salary growth (% / year)']); growthRows.push(['rentGrowth', 'Rent growth (% / year)']); }
+  host.innerHTML = `<div id="planScenarioModalPrime"></div>
+    <div id="planScenarioModalStock"></div>
+    ${growthRows.length ? `<div id="planScenarioModalGrowth"><div class="section-head"><h3>Growth</h3></div>${growthRows.map(([k, label]) => `
+      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-modal-growth="${k}"></div>`).join('')}${category === 'earning' ? '<div class="note">Salary and rent growth are stored and labeled only — the projection has no earnings leg yet, so they do not change numbers.</div>' : ''}</div>` : ''}`;
+  host.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  planScenarioModalRenderPrime();
+  planStockFactorRender($('#planScenarioModalStock'), planScenarioModalState.stock, planScenarioModalState.holdings, {});
+  openModal('planScenarioModal');
+}
+function planScenarioModalFactors() {
+  const st = planScenarioModalState;
+  const factors = {};
+  if (st) {
+    if (st.prime && (st.prime.points.length || st.prime.preset)) factors.prime = { points: st.prime.points, preset: st.prime.preset };
+    const sc = planStockFactorClean(st.stock);
+    if (sc) factors.stock = sc;
+    document.querySelectorAll('#planScenarioModalFactors [data-modal-growth]').forEach((inp) => {
+      const v = planParsePct(inp.value);
+      if (v != null) factors[inp.dataset.modalGrowth] = { valuePct: v };
+    });
+  }
+  return factors;
+}
 $('#planScenarioForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -12073,10 +12221,30 @@ $('#planScenarioForm').addEventListener('submit', async (e) => {
   try {
     const name = $('#planScenarioName').value.trim();
     if (!name) throw new Error('Scenario name is required');
-    const data = await api(`/api/planning/projects/${form.dataset.projectId}/scenarios`, { method: 'POST', body: { name } });
+    const body = { name };
+    const factors = planScenarioModalFactors();
+    if (Object.keys(factors).length) body.factors = factors;
+    const data = await api(`/api/planning/projects/${form.dataset.projectId}/scenarios`, { method: 'POST', body });
     closeModalEl($('#planScenarioModal'));
     location.hash = `#planning/scenario/${data.scenario.id}`;
   } catch (err) { showMsg(msg, 'err', err.message); }
+});
+// Shared ✨ name suggestion: fills the Name input as an editable
+// draft, never auto-saves. Errors (incl. the 503 no-LLM guidance)
+// surface in msgEl and leave the field untouched.
+async function planAiSuggestName(btn, inputEl, kind, context, msgEl) {
+  if (!btn || !inputEl) return;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await api('/api/planning/ai-suggest-name', { method: 'POST', body: { kind, context: context || {} } });
+    if (r && r.name) { inputEl.value = r.name; inputEl.focus(); inputEl.select(); }
+  } catch (err) { if (msgEl) showMsg(msgEl, 'err', err.message); }
+  finally { btn.disabled = false; btn.textContent = old; }
+}
+$('#planScenarioAiNameBtn').addEventListener('click', () => {
+  const st = planScenarioModalState;
+  planAiSuggestName($('#planScenarioAiNameBtn'), $('#planScenarioName'), 'scenario', { factors: planScenarioModalFactors(), category: st ? st.category : null }, $('#planScenarioModalMsg'));
 });
 // ---- Unified in-project AI panel ----
 // The ONE design entry on the project page: scenario, baseline,
@@ -12159,7 +12327,6 @@ function planAiPanelSetTarget(target) {
     b.classList.toggle('primary', on);
   });
   $('#planAiPanelStrategyRow').classList.toggle('hidden', target !== 'ops');
-  $('#planAiPanelScenarioNameRow').classList.toggle('hidden', target !== 'scenario');
   $('#planAiPanelAsk').innerHTML = '';
   $('#planAiPanelOut').innerHTML = '';
   showMsg($('#planAiPanelMsg'), '', '');
@@ -12171,7 +12338,6 @@ function planAiPanelRefreshStrategies(selectedId) {
   const strategies = (planProjectData && planProjectData.strategies) || [];
   const cur = selectedId != null ? String(selectedId) : sel.value;
   sel.innerHTML = `<option value="new">New strategy…</option>` + strategies.map((s) => `<option value="${s.id}"${String(s.id) === String(cur) ? ' selected' : ''}>${esc(s.name)}</option>`).join('');
-  $('#planAiPanelStrategyNameRow').classList.toggle('hidden', cur !== 'new' && cur !== '');
 }
 function planAiPanelWire(p) {
   planAiPanelCtx = { projectId: p.id, target: 'scenario', threads: { scenario: [], ops: [] }, pending: null };
@@ -12181,10 +12347,6 @@ function planAiPanelWire(p) {
   const close = $('#planAiPanelCloseBtn');
   if (close) close.addEventListener('click', () => panel.classList.add('hidden'));
   document.querySelectorAll('[data-plan-ai-target]').forEach((b) => b.addEventListener('click', () => planAiPanelSetTarget(b.dataset.planAiTarget)));
-  const sel = $('#planAiPanelStrategy');
-  if (sel) sel.addEventListener('change', () => {
-    $('#planAiPanelStrategyNameRow').classList.toggle('hidden', sel.value !== 'new');
-  });
   $('#planAiPanelGoBtn').addEventListener('click', () => planAiPanelPropose());
   const fileInput = $('#planAiPanelFiles');
   if (fileInput) fileInput.addEventListener('change', () => { planAiPanelQueueFiles(fileInput.files); fileInput.value = ''; });
@@ -12253,11 +12415,16 @@ async function planAiPanelProposeScenario(text, historyText, files, model) {
   const line = planScenarioSummaryLine(r.factors) || 'Flat world';
   ctx.threads.scenario.push({ role: 'ai', summary: line });
   planAiPanelRenderThread();
-  out.innerHTML = `<div class="n">${esc(line)}</div><div class="toolbar"><button class="small primary" id="planAiPanelApplyBtn">Create this scenario</button></div>`;
+  // Naming is automatic (user 2026-11-04): no name input in the
+  // panel — the design carries the proposed name, shown here as an
+  // editable draft; a missing name falls back to "AI scenario".
+  // Send is never blocked on a name.
+  const draftName = (r.name && String(r.name).trim()) || 'AI scenario';
+  out.innerHTML = `<div class="n">${esc(line)}</div><div><label>Name</label><input id="planAiPanelPreviewName" value="${esc(draftName)}"></div><div class="toolbar"><button class="small primary" id="planAiPanelApplyBtn">Create this scenario</button></div>`;
   $('#planAiPanelApplyBtn').addEventListener('click', async () => {
     try {
-      const name = $('#planAiPanelScenarioName').value.trim();
-      if (!name) throw new Error('Scenario name is required');
+      const nameEl = $('#planAiPanelPreviewName');
+      const name = (nameEl ? nameEl.value.trim() : '') || 'AI scenario';
       const data = await api(`/api/planning/projects/${ctx.projectId}/scenarios`, { method: 'POST', body: { name, factors: ctx.pending.factors, source: 'ai' } });
       location.hash = `#planning/scenario/${data.scenario.id}`;
     } catch (err) { showMsg(msg, 'err', err.message); }
@@ -12266,20 +12433,25 @@ async function planAiPanelProposeScenario(text, historyText, files, model) {
 async function planAiPanelEnsureStrategy() {
   const ctx = planAiPanelCtx;
   const sel = $('#planAiPanelStrategy');
-  if (sel && sel.value && sel.value !== 'new') return Number(sel.value);
-  const name = $('#planAiPanelStrategyName').value.trim();
-  if (!name) throw new Error('Strategy name is required');
-  const s = await api(`/api/planning/projects/${ctx.projectId}/strategies`, { method: 'POST', body: { name, source: 'ai' } });
+  if (sel && sel.value && sel.value !== 'new') return { id: Number(sel.value), isNew: false };
+  // No name input in the panel: a new strategy is created under the
+  // plain fallback and renamed at Apply to the AI-proposed (possibly
+  // edited) preview name. The per-strategy describe endpoint needs
+  // an id before it can propose ops, so creation cannot wait for the
+  // design the way the scenario flow can.
+  const s = await api(`/api/planning/projects/${ctx.projectId}/strategies`, { method: 'POST', body: { name: 'AI strategy', source: 'ai' } });
   // Keep the picker's source fresh: planProjectData is the page-load
   // snapshot, so the just-created strategy would otherwise vanish
   // from the picker and a follow-up would create a duplicate.
   if (planProjectData && Array.isArray(planProjectData.strategies)) planProjectData.strategies.push(s.strategy);
   planAiPanelRefreshStrategies(s.strategy.id);
-  return s.strategy.id;
+  return { id: s.strategy.id, isNew: true };
 }
 async function planAiPanelProposeOps(text, historyText, files, model) {
   const ctx = planAiPanelCtx; const msg = $('#planAiPanelMsg'); const out = $('#planAiPanelOut');
-  const sid = await planAiPanelEnsureStrategy();
+  const ensured = await planAiPanelEnsureStrategy();
+  const sid = ensured.id;
+  const isNew = ensured.isNew;
   const body = { text, historyText };
   if (files && files.length) body.files = files;
   if (model) body.model = model;
@@ -12291,11 +12463,19 @@ async function planAiPanelProposeOps(text, historyText, files, model) {
   if (r.unresolved && r.unresolved.length) html += `<div class="msg warn">Could not resolve: ${esc(r.unresolved.map((u) => u.reason).join('; '))}</div>`;
   if (r.warnings && r.warnings.length) html += `<div class="msg warn">${esc(r.warnings.join('; '))}</div>`;
   html += r.ops.map((o) => `<div class="plan-row"><span>${esc(o.op_type)} · ${esc(JSON.stringify(o.params))}</span></div>`).join('');
+  // Automatic naming: the design's proposed name as an editable
+  // draft (fallback "AI strategy"); Apply renames the strategy
+  // created at Send, then posts the ops.
+  const draftName = (r.name && String(r.name).trim()) || 'AI strategy';
+  html += `<div><label>Name</label><input id="planAiPanelPreviewName" value="${esc(draftName)}"></div>`;
   html += `<div class="toolbar"><button class="small primary" id="planAiPanelApplyBtn">Apply these operations</button></div>`;
   out.innerHTML = html || '<div class="note">No operations proposed.</div>';
   const applyBtn = $('#planAiPanelApplyBtn');
   if (applyBtn) applyBtn.addEventListener('click', async () => {
     try {
+      const nameEl = $('#planAiPanelPreviewName');
+      const name = (nameEl ? nameEl.value.trim() : '') || 'AI strategy';
+      if (isNew) await api(`/api/planning/strategies/${sid}`, { method: 'PUT', body: { name } });
       for (const o of ctx.pending.ops) await api(`/api/planning/strategies/${sid}/ops`, { method: 'POST', body: { op_type: o.op_type, params: o.params, legs: o.legs || [], source: 'ai' } });
       loadPlanProject(ctx.projectId);
     } catch (err) { showMsg(msg, 'err', err.message); }
@@ -12344,6 +12524,8 @@ function planScenarioSummaryLine(factors) {
   if (f.stock && f.stock.valuePct != null) {
     parts.push(`Stock ${f.stock.valuePct}%/yr${f.stock.basis ? ` (${f.stock.basis}${f.stock.window ? ` · ${f.stock.window}` : ''})` : ''}`);
   }
+  const bhCount = f.stock && f.stock.byHolding && typeof f.stock.byHolding === 'object' ? Object.keys(f.stock.byHolding).length : 0;
+  if (bhCount) parts.push(`Stock: ${bhCount} holding override${bhCount === 1 ? '' : 's'}`);
   if (f.propertyGrowth && f.propertyGrowth.valuePct != null) parts.push(`Property +${f.propertyGrowth.valuePct}%/yr`);
   if (f.salaryGrowth && f.salaryGrowth.valuePct != null) parts.push(`Salary +${f.salaryGrowth.valuePct}%/yr`);
   if (f.rentGrowth && f.rentGrowth.valuePct != null) parts.push(`Rent +${f.rentGrowth.valuePct}%/yr`);
@@ -12357,8 +12539,9 @@ function planSinkLine(sink, isInvestment) {
   return '';
 }
 function planStrategyCardsRender(rows, projectId) {
-  // Cards show figures under the FIRST selected scenario only (labeled
-  // in #planStrategyCardsWorld). Rows without a comparison (the re-pick
+  // Cards show figures under the FIRST selected scenario only (the
+  // picked world is shown by the Scenarios tier's Selected state).
+  // Rows without a comparison (the re-pick
   // state) render name-only — never figures from another world.
   $('#planStrategyCards').innerHTML = rows.map((r) => {
     let tp = {};
@@ -12393,13 +12576,13 @@ async function loadPlanStrategyCards(projectId) {
     const base = scenarios.find((x) => x.is_base) || scenarios[0];
     planCompareScenarioIds = base ? [base.id] : [];
   }
-  const worldEl = $('#planStrategyCardsWorld');
   // PINNED-INPUT RULE: scenarios exist but none picked = a re-pick
   // panel only. No card figures — nothing renders under a world the
   // user did not pick. (Unreachable via UI since wiring is
-  // single-select, but kept defensively.)
+  // single-select, but kept defensively.) The picked world is shown
+  // by the Scenarios tier's Selected state — no "Under …" note line
+  // in the mid-tier (user 2026-11-04: tiny and weird, removed).
   if (scenarios.length && !planCompareScenarioIds.length) {
-    if (worldEl) worldEl.innerHTML = '<div class="note">Pick a scenario to compare under.</div>';
     planStrategyCardsRender((planProjectData.strategies || []).map((st) => ({ strategy: st, comparison: null, sink: null })), projectId);
     planWiringRefresh();
     return;
@@ -12408,7 +12591,6 @@ async function loadPlanStrategyCards(projectId) {
   const data = await api(`/api/planning/projects/${projectId}/comparison${q}`);
   const blocks = data.scenarioBlocks && data.scenarioBlocks.length ? data.scenarioBlocks : [{ scenario: data.scenario, baseline: data.baseline, strategies: data.strategies, report: data.report }];
   const first = blocks[0];
-  if (worldEl) worldEl.innerHTML = first.scenario ? `<div class="note">Under ${esc(first.scenario.name)}</div>` : '<div class="note">Current rates (no scenario)</div>';
   // Strategy cards carry the per-strategy figures under the picked
   // world; the comparison itself (table/chart) lives in reports only.
   planStrategyCardsRender(first.strategies, projectId);
@@ -13058,6 +13240,28 @@ async function loadPlanReport(projectId, reportId) {
       comp.strategies = kept;
       if (comp.report) comp.report.trajectories = keptTrajs;
     }
+    // Mortgage-chart visibility follows the BASELINE kind, not the
+    // pins or the page (user 2026-11-04): on a cash-pool baseline
+    // (the report's investmentScope flag) mortgage-only chart blocks
+    // are hidden, even for a mortgage-op strategy. The rule is uniform
+    // — the same report renders identically on the project page and
+    // the strategy page — so the shared viewer is never forked by
+    // page and the stored definitions are never rewritten.
+    // metric_cards and the comparison panel stay: their mortgage
+    // figures already render '—' for non-mortgage strategies, and
+    // their cost/gain/net figures are real.
+    const cashPoolBaseline = !!(comp.report && comp.report.investmentScope);
+    let mortHidden = 0;
+    // Projection errors surface in the report view at the same
+    // standard as the strategy detail page: a dropped op (e.g. an
+    // empty-pot buy) must not read as identical series with no
+    // explanation. The view renders the first pinned world only,
+    // so the notice names that world's errors.
+    const projErrLines = [];
+    for (const row of comp.strategies) {
+      const errs = (row.comparison && row.comparison.errors) || [];
+      for (const e of errs) projErrLines.push(`${row.strategy.letter} · ${row.strategy.name}: ${e}`);
+    }
     let propNames = {};
     try {
       const pp = await api('/api/properties');
@@ -13066,7 +13270,7 @@ async function loadPlanReport(projectId, reportId) {
     } catch { /* labels fall back to ids */ }
     const charts = (report.definition && report.definition.charts) || [];
     const fanData = {};
-    if (charts.some((c) => c.template === 'fan_band')) {
+    if (!cashPoolBaseline && charts.some((c) => c.template === 'fan_band')) {
       for (const row of comp.strategies) {
         try { const sd = await api(`/api/planning/strategies/${row.strategy.id}`); fanData[row.strategy.id] = sd.scenarioTable || []; }
         catch { fanData[row.strategy.id] = []; }
@@ -13084,6 +13288,17 @@ async function loadPlanReport(projectId, reportId) {
     const draws = [];
     charts.forEach((c, i) => {
       const series = (c.series && c.series.length ? c.series : null);
+      // Mortgage-only blocks hide on a cash-pool baseline (see
+      // cashPoolBaseline above). A block with any non-mortgage series
+      // stays — e.g. a stacked_bar with stock_value.
+      if (cashPoolBaseline) {
+        const mortOnly = (sids) => sids.length > 0 && sids.every((sid) => sid === 'mortgage_balance');
+        if (c.template === 'fan_band') { mortHidden++; return; }
+        if (c.template === 'time_line' && mortOnly(series || ['mortgage_balance'])) { mortHidden++; return; }
+        if (c.template === 'yearly_bars' && ((series && series[0]) || 'mortgage_balance') === 'mortgage_balance') { mortHidden++; return; }
+        if (c.template === 'stacked_bar' && mortOnly(series || ['mortgage_balance'])) { mortHidden++; return; }
+        if (c.template === 'share_doughnut' && series && (series.includes('mortgage_balance') || series.includes('total_value'))) { mortHidden++; return; }
+      }
       // AI-supplied method wins; engine-path charts get the app's own
       // how-calculated line. Either way every chart states its method.
       const how = c.method ? c.method : planReportHowFor(series, comp.entityProperty && comp.entityProperty.address, comp.report && comp.report.investmentScope);
@@ -13237,6 +13452,8 @@ async function loadPlanReport(projectId, reportId) {
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
+        ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
+        ${mortHidden ? `<div class="note">Mortgage charts hidden — this report's baseline is a cash pool.</div>` : ''}
         <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
       </div>
       ${panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
@@ -13465,6 +13682,22 @@ function planStrategyHtml(d) {
       <div class="toolbar"><button class="small plan-flow-select" data-plan-strategy-scenario-select="${id}" aria-pressed="${stratScenSel(id) ? 'true' : 'false'}">${stratScenSel(id) ? '✓ Selected' : 'Select'}</button></div></div>`;
   const stratScenCards = stratScenCard(0, 'Current rates (no scenario)', false, 'Flat world — current rates', true)
     + (d.scenarios || []).map((sc) => stratScenCard(sc.id, sc.name, sc.is_base, planScenarioSummaryLine(sc.factors) || 'Flat world — current rates', false)).join('');
+  // Baseline card's effective returns run under the applied world.
+  const fbScen = d.appliedScenario ? (d.scenarios || []).find((x) => x.id === d.appliedScenario.id) : null;
+  const fbScenStock = fbScen && fbScen.factors && fbScen.factors.stock ? { name: fbScen.name, stock: fbScen.factors.stock } : null;
+  // Generate-gated chart panels (user 2026-11-04): no computed chart
+  // panel renders on page load — only after Generate report (preset
+  // or AI) in the Reports tier. Contents follow the BASELINE kind,
+  // which wins over op nature on any conflict: a cash-pool baseline
+  // shows the pool/stock panels only, a property baseline the
+  // mortgage/equity/annual panels only, any other baseline the old
+  // op-nature rules. (The Difference TABLE stays visible before
+  // Generate — it is the working comparison, not a report; its
+  // charts are kind-forced in planDiffRender.)
+  const stratKind = d.baselineKind || 'other';
+  const genOpen = !!d.hasGeneratedReport;
+  const showMortPanels = genOpen && (stratKind === 'property' || (stratKind === 'other' && asmHasMortgage));
+  const showPoolPanels = genOpen && (stratKind === 'pool' || (stratKind === 'other' && showStockChart));
   return `
     <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
     <div class="panel">
@@ -13479,6 +13712,30 @@ function planStrategyHtml(d) {
       </div>
       <div class="msg" id="planStrategyMsg"></div>
       ${c.errors && c.errors.length ? `<div class="msg err">${esc(c.errors.join('; '))}</div>` : ''}
+      ${(() => {
+        // Headline = the report's headline (user 2026-11-04): it is
+        // Generate-gated like the chart panels — nothing renders on
+        // page load; after Generate it renders as the report's
+        // headline block. The projection-error notice above stays
+        // visible before Generate (a functional warning, not a
+        // visualization) so headline zeros are explained, not silent.
+        // Contents follow the BASELINE kind: a cash-pool baseline
+        // shows pool/stock metrics only (Value at horizon = pool +
+        // stock, never property equity); a property baseline shows
+        // all 9 cards, entity-scoped.
+        if (!d.hasGeneratedReport) return '';
+        const poolVal = d.projection && d.projection.stocks ? d.projection.stocks.valueAtHorizon : null;
+        if (d.baselineKind === 'pool') return `<div id="planStrategyHeadline">
+        <div class="summary-strip">
+        <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
+        <div class="summary-card"><div class="k">Total cost</div><div class="v">${planMoney(c.cost)}</div></div>
+        <div class="summary-card"><div class="k">Total gain</div><div class="v">${planMoney(c.gain)}</div></div>
+        <div class="summary-card"><div class="k">Value at horizon</div><div class="v">${planMoney(poolVal)}</div></div>
+      </div>
+      <div class="cards">
+        <div class="card breakdown-card"><div class="k">Stock gain</div><div class="v">${planMoney(c.stockGain)}</div></div>
+      </div></div>`;
+        return `<div id="planStrategyHeadline">
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
         <div class="summary-card"><div class="k">Total cost</div><div class="v">${planMoney(c.cost)}</div></div>
@@ -13491,7 +13748,8 @@ function planStrategyHtml(d) {
         <div class="card breakdown-card"><div class="k">Payoff shift</div><div class="v">${c.payoffShiftMonths != null ? `${c.payoffShiftMonths} months` : '—'}</div></div>
         <div class="card breakdown-card"><div class="k">Monthly payment Δ</div><div class="v">${planSigned(c.paymentDelta)}</div></div>
         <div class="card breakdown-card"><div class="k">Penalty</div><div class="v">${planMoney(c.penaltyTotal)}</div><div class="n">Estimate — the bank quote governs</div></div>
-      </div>
+      </div></div>`;
+      })()}
     </div>
     <div class="panel" id="planStrategyFlowPanel">
       <div class="plan-flow-tier" id="planStrategyScenarioTier">
@@ -13501,7 +13759,7 @@ function planStrategyHtml(d) {
       <div class="plan-flow-tier plan-flow-tier-mid" id="planStrategyMidTier">
       <div class="plan-flow-group" id="planStrategyBaselineGroup">
       <div class="section-head"><h3>Baseline</h3></div>
-      <div id="planStrategyFixedBaseline">${planFixedBaselineHtml(d.fixedBaseline)}</div>
+      <div id="planStrategyFixedBaseline">${planFixedBaselineHtml(d.fixedBaseline, fbScenStock)}</div>
       </div>
       <div class="plan-flow-group" id="planStrategyOpsGroup">
       <div class="section-head"><h3>Operations</h3>
@@ -13512,12 +13770,22 @@ function planStrategyHtml(d) {
       </div>
       </div>
     </div>
-    <div class="panel">
+    ${showMortPanels ? `<div class="panel">
       <div class="section-head"><h3>Mortgage balance</h3></div>
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyMortChart"></canvas></div>
       <div class="note">X: month · Y: outstanding principal (CAD), baseline vs strategy, ${d.project.category === 'property' && d.entityProperty && d.entityProperty.address ? `for ${esc(d.entityProperty.address)}.` : 'summed across properties.'}</div>
     </div>
-    ${showStockChart ? `<div class="panel">
+    <div class="panel">
+      <div class="section-head"><h3>Equity</h3></div>
+      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyEquityChart"></canvas></div>
+      <div class="note">X: month · Y: equity (CAD), baseline vs strategy, ${d.project.category === 'property' && d.entityProperty && d.entityProperty.address ? `for ${esc(d.entityProperty.address)}.` : 'summed across properties.'} Equity = assessed value − outstanding principal.${d.equityGrowthPct != null ? ` Assessed grown at ${d.equityGrowthPct}%/yr under ${d.appliedScenario ? esc(d.appliedScenario.name) : 'the scenario'}.` : ' Assessed held flat at the current roll.'}</div>
+    </div>` : ''}
+    ${showPoolPanels ? `<div class="panel">
+      <div class="section-head"><h3>Cash pool</h3></div>
+      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyPoolChart"></canvas></div>
+      <div class="note">X: month · Y: CAD, baseline vs strategy. Cash pool + stock value; property equity is not included.</div>
+    </div>` : ''}
+    ${showPoolPanels ? `<div class="panel">
       <div class="section-head"><h3>Stock value</h3></div>
       ${asmStockBlock}
       <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
@@ -13528,10 +13796,10 @@ function planStrategyHtml(d) {
       <div id="planFactorSink"></div>
       <div class="msg" id="planSinkMsg"></div>
     </div>` : ''}
-    <div class="panel">
+    ${showMortPanels ? `<div class="panel">
       <div class="section-head"><h3>Annual interest</h3></div>
       <table class="tbl"><thead><tr><th>Year</th><th>Baseline interest</th><th>Strategy interest</th><th>Saved</th></tr></thead><tbody>${yearRows}</tbody></table>
-    </div>
+    </div>` : ''}
     <div class="panel" id="planDiffPanel">
       <div class="section-head"><h3>Difference vs baseline</h3>
         <div class="toolbar"><button class="small" data-plan-diff-gran="monthly">Monthly</button><button class="small" data-plan-diff-gran="annual">Annual</button></div>
@@ -13626,6 +13894,17 @@ function planStrategyWire(d) {
     cancel.textContent = 'Cancel';
     renameBtn.replaceWith(save);
     tools.appendChild(cancel);
+    // ✨ name from the strategy's op sequence (entity is context only).
+    const star = document.createElement('button');
+    star.className = 'small';
+    star.textContent = '✨';
+    star.title = 'Suggest a name with AI';
+    star.addEventListener('click', () => {
+      const ops = (d.ops || []).map((o) => ({ op_type: o.op_type, params: o.params || {}, ...(o.legs && o.legs.length ? { legs: o.legs.map((l) => ({ source_ref: l.source_ref, amount: l.amount })) } : {}) }));
+      const entLabel = (d.entityProperty && d.entityProperty.address) || (d.fixedBaseline && d.fixedBaseline.label) || null;
+      planAiSuggestName(star, input, 'strategy', { ops, category: d.project.category || null, entityLabel: entLabel }, $('#planStrategyMsg'));
+    });
+    tools.insertBefore(star, save);
     const input = $('#planStrategyNameInput');
     input.focus();
     input.select();
@@ -13765,6 +14044,32 @@ function planStrategyWire(d) {
   planLineChart('planStrategyMortChart', labels, [
     { label: 'Baseline', data: baseBal.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
     { label: s.name, data: labels.map((m) => stratMap.get(m) ?? null), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
+  ]);
+  // Equity lines: assessed − outstanding, baseline vs strategy, on
+  // the same months as the balance chart. Assessed follows the report
+  // rule: grown month by month under the applied scenario's
+  // property-growth factor, flat at the current roll without one.
+  // (planLineChart no-ops when the panel is gated out.)
+  const eqMonthIdx = (m) => { const [y, mo] = m.split('-').map(Number); return y * 12 + (mo - 1); };
+  const assessedAt = (m) => {
+    const total = d.equityAssessedTotal || 0;
+    if (d.equityGrowthPct == null || !d.equityCurrentMonth) return total;
+    return total * Math.pow(1 + d.equityGrowthPct / 100, (eqMonthIdx(m) - eqMonthIdx(d.equityCurrentMonth)) / 12);
+  };
+  planLineChart('planStrategyEquityChart', labels, [
+    { label: 'Baseline', data: baseBal.map(([m, v]) => assessedAt(m) - v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
+    { label: s.name, data: labels.map((m) => { const b = stratMap.get(m); return b == null ? null : assessedAt(m) - b; }), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
+  ]);
+  // Cash-pool trajectory: baseline pool vs strategy pool + stock
+  // value. Total = pool + stock; property equity is not included.
+  const poolBaseMap = new Map((d.baseline.stocks.potSeries || []).map((r) => [r.month, r.value]));
+  const poolStratMap = new Map((d.projection.stocks.potSeries || []).map((r) => [r.month, r.value]));
+  const poolMonths = d.baseline.stocks.series.map((r) => r.month);
+  planLineChart('planStrategyPoolChart', poolMonths, [
+    { label: 'Baseline pool', data: poolMonths.map((m) => poolBaseMap.get(m) ?? null), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0, spanGaps: true },
+    { label: `${s.name} pool`, data: poolMonths.map((m) => poolStratMap.get(m) ?? null), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
+    { label: 'Baseline stock', data: d.baseline.stocks.series.map((r) => r.value), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0, borderDash: [6, 4], spanGaps: true },
+    { label: `${s.name} stock`, data: d.projection.stocks.series.map((r) => r.value), borderColor: planColor(1), backgroundColor: planColor(1), fill: false, pointRadius: 0, borderDash: [6, 4], spanGaps: true },
   ]);
   planLineChart('planStrategyStockChart', d.baseline.stocks.series.map((r) => r.month), [
     { label: 'Baseline', data: d.baseline.stocks.series.map((r) => r.value), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
@@ -14049,7 +14354,17 @@ function planStrategyReportsWire(d) {
     try {
       const scenarioIds = pickedScenarios();
       if (scenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
-      const r = await api(`/api/planning/projects/${pid}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, baseline_id: pickedBaseline(), strategy_ids: [s.id], scenario_ids: scenarioIds } });
+      // Kind-aware preset definition (user 2026-11-04): a cash-pool
+      // baseline gets a pool trajectory chart, never the hardcoded
+      // Mortgage balance chart; property/other keep it. The preset
+      // POST stays permissive — the viewer enforces at render.
+      const presetCharts = d.baselineKind === 'pool'
+        ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
+        : [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }];
+      const r = await api(`/api/planning/projects/${pid}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: presetCharts }, baseline_id: pickedBaseline(), strategy_ids: [s.id], scenario_ids: scenarioIds } });
+      // AI-handler pattern: reload first so the Generate gate opens
+      // (headline + kind panels render), then open the new tab.
+      await loadPlanStrategy(s.id);
       planOpenReportTab(pid, r.report.id);
     } catch (err) { showMsg(msg, 'err', err.message); }
   });
@@ -14105,13 +14420,20 @@ function planDiffRender(d) {
   const hasStock = monthly.some((r) => r.valBase != null || r.valStrat != null);
   // Mortgage-touching (same definition as the server's comparison
   // touchesMortgage): a mortgage op, or a sell whose proceeds repay a
-  // mortgage. A pure stock strategy touches no mortgage — its Balance
-  // Δ would be a flat $0 line and its payment breakdown the untouched
-  // mainline mortgages, so both mortgage panels hide entirely. The
-  // table's mortgage columns keep the old hasMort rule (absolute
-  // balances are still informative context there).
+  // mortgage. It still drives the table's mortgage columns and the
+  // fallback rule below — but the Difference CHARTS follow the
+  // BASELINE kind, which wins over op nature (user 2026-11-04): a
+  // cash-pool baseline forces Balance Δ off + breakdown off; a
+  // property baseline forces Value Δ off (Balance Δ shows whenever
+  // balance data exists, even for a stock-only strategy on that
+  // property); any other baseline keeps the op-nature rule (a pure
+  // stock strategy's Balance Δ would be a flat $0 line, so it hides).
   const touchesMort = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
     || (d.ops || []).flatMap((o) => o.legs || []).some((l) => String(l.source_ref || '').startsWith('repay:'));
+  const diffKind = d.baselineKind || 'other';
+  const diffShowBalance = diffKind === 'pool' ? false : diffKind === 'property' ? hasMort : touchesMort;
+  const diffShowValue = diffKind === 'property' ? false : hasStock;
+  const diffShowBreakdown = diffKind === 'pool' ? false : diffKind === 'property' ? hasMort : touchesMort;
   planDiffSpan = monthly.length ? { start: monthly[0].month, end: monthly[monthly.length - 1].month } : null;
   const eff = planDiffEffectiveRange(monthly);
   const filtered = monthly.filter((r) => (!eff.from || r.month >= eff.from) && (!eff.to || r.month <= eff.to));
@@ -14143,11 +14465,12 @@ function planDiffRender(d) {
   const bTitle = $('#planDiffBreakdownTitle');
   const bWrap = document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap');
   // The payment-breakdown block (title + caption + chart) renders
-  // only for mortgage-touching strategies; otherwise it hides whole.
-  if (bWrap) bWrap.style.display = touchesMort ? '' : 'none';
-  if (bTitle) bTitle.style.display = touchesMort ? '' : 'none';
-  if (bCap) bCap.style.display = touchesMort ? '' : 'none';
-  if (!touchesMort) planDestroyChart('planDiffBreakdownChart');
+  // only when the baseline kind allows it (see diffShowBreakdown);
+  // otherwise it hides whole.
+  if (bWrap) bWrap.style.display = diffShowBreakdown ? '' : 'none';
+  if (bTitle) bTitle.style.display = diffShowBreakdown ? '' : 'none';
+  if (bCap) bCap.style.display = diffShowBreakdown ? '' : 'none';
+  if (!diffShowBreakdown) planDestroyChart('planDiffBreakdownChart');
   if (planDiffState.gran === 'annual') {
     const pgA = $('#planDiffYearPager'); if (pgA) pgA.innerHTML = '';
     if (cap) cap.textContent = 'X: year · Y: CAD — Equity Δ = the year\'s peak monthly balance advantage; Value Δ = year-end.';
@@ -14162,8 +14485,8 @@ function planDiffRender(d) {
   if (planDiffState.gran === 'annual') {
     const years = planDiffAnnual(filtered);
     const datasets = [];
-    if (touchesMort) datasets.push({ label: 'Equity Δ (peak)', data: years.map((a) => a.equityPeak), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
-    if (hasStock) datasets.push({ label: 'Value Δ (year-end)', data: years.map((a) => a.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
+    if (diffShowBalance) datasets.push({ label: 'Equity Δ (peak)', data: years.map((a) => a.equityPeak), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
+    if (diffShowValue) datasets.push({ label: 'Value Δ (year-end)', data: years.map((a) => a.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
     if (datasets.length) planLineChart('planDiffChart', years.map((a) => a.year), datasets); else planDestroyChart('planDiffChart');
     // Annual breakdown: per-year sums of scheduled interest/principal.
     const prinByYear = new Map();
@@ -14174,7 +14497,7 @@ function planDiffRender(d) {
       prinByYear.set(y, cur);
     }
     const bDatasetsA = [];
-    if (touchesMort) {
+    if (diffShowBreakdown) {
       bDatasetsA.push({ label: 'Baseline interest', data: years.map((a) => a.intBase), backgroundColor: '#888888', stack: 'base' });
       bDatasetsA.push({ label: 'Baseline principal', data: years.map((a) => (prinByYear.get(a.year) || {}).prinBase || 0), backgroundColor: planColorAlpha('#888888', 0.45), stack: 'base' });
       bDatasetsA.push({ label: 'Strategy interest', data: years.map((a) => a.intStrat), backgroundColor: planColor(0), stack: 'strat' });
@@ -14194,13 +14517,13 @@ function planDiffRender(d) {
     $('#planDiffTable').innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
   } else {
     const datasets = [];
-    if (touchesMort) datasets.push({ label: 'Balance Δ', data: filtered.map((r) => r.balDiff), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
-    if (hasStock) datasets.push({ label: 'Value Δ', data: filtered.map((r) => r.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
+    if (diffShowBalance) datasets.push({ label: 'Balance Δ', data: filtered.map((r) => r.balDiff), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
+    if (diffShowValue) datasets.push({ label: 'Value Δ', data: filtered.map((r) => r.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
     if (datasets.length) planLineChart('planDiffChart', filtered.map((r) => formatYM(r.month)), datasets); else planDestroyChart('planDiffChart');
     // Monthly breakdown: per-month scheduled interest (solid) +
     // principal (light), baseline vs strategy.
     const bDatasets = [];
-    if (touchesMort) {
+    if (diffShowBreakdown) {
       bDatasets.push({ label: 'Baseline interest', data: filtered.map((r) => r.intBase), backgroundColor: '#888888', stack: 'base' });
       bDatasets.push({ label: 'Baseline principal', data: filtered.map((r) => r.prinBase), backgroundColor: planColorAlpha('#888888', 0.45), stack: 'base' });
       bDatasets.push({ label: 'Strategy interest', data: filtered.map((r) => r.intStrat), backgroundColor: planColor(0), stack: 'strat' });
@@ -14579,6 +14902,113 @@ $('#planScenarioEditForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
+// ---- shared scenario stock-factor editor (detail page + create modal) ----
+// State shape (mutated live by the editor):
+//   { valuePct?, basis?, window?, byHolding?: { [holdingId]: { valuePct, basis?, window? } } }
+// A blank global input = no default; a blank row input = no override
+// (the holding then uses the default, else its own history). Manual
+// edits clear basis/window (the value is no longer history-derived);
+// Revert restores a holding's history-derived value with its basis +
+// window label. Callers save planStockFactorClean(st) (empty = null).
+const planStockHistCache = new Map();
+function planParsePct(v) {
+  if (v == null || v === '') return null;
+  const n = Number(String(v).replace(/,/g, '').trim());
+  return Number.isFinite(n) ? n : null;
+}
+function planStockFactorClean(st) {
+  if (!st || typeof st !== 'object') return null;
+  const out = {};
+  const g = planParsePct(st.valuePct);
+  if (g != null) { out.valuePct = g; if (st.basis) out.basis = st.basis; if (st.window) out.window = st.window; }
+  const bh = {};
+  for (const [k, v] of Object.entries(st.byHolding || {})) {
+    if (!v || typeof v !== 'object') continue;
+    const x = planParsePct(v.valuePct);
+    if (x == null) continue;
+    bh[k] = { valuePct: x, ...(v.basis ? { basis: v.basis } : {}), ...(v.window ? { window: v.window } : {}) };
+  }
+  if (Object.keys(bh).length) out.byHolding = bh;
+  return Object.keys(out).length ? out : null;
+}
+function planStockFactorRender(host, st, holdings, opts = {}) {
+  if (!host) return;
+  if (!st.byHolding || typeof st.byHolding !== 'object' || Array.isArray(st.byHolding)) st.byHolding = {};
+  const list = holdings || [];
+  const effHtml = (h) => {
+    const ov = st.byHolding[h.id];
+    if (ov && planParsePct(ov.valuePct) != null) return `${ov.valuePct}%/yr · Override${ov.basis ? ` (${esc(ov.basis)}${ov.window ? ` · ${esc(ov.window)}` : ''})` : ''}`;
+    if (planParsePct(st.valuePct) != null) return `${st.valuePct}%/yr · Scenario default`;
+    const cached = planStockHistCache.get(h.id);
+    if (cached === undefined) return 'history…';
+    if (!cached) return 'Flat — no usable history';
+    return `${cached.pct}%/yr · History (${esc(cached.basis)}${cached.window ? ` · ${esc(cached.window)}` : ''})`;
+  };
+  host.innerHTML = `<div class="section-head"><h3>Stock return</h3>${opts.showRemove ? '<div class="toolbar"><button class="small danger" data-factor-remove="stock">Remove</button></div>' : ''}</div>
+    <div><label>Default for all holdings (% / year)</label><input id="planStockGlobalVal" type="text" inputmode="decimal" data-money value="${st.valuePct != null ? st.valuePct : ''}"></div>
+    <div data-plan-stock-basis-note>${st.basis ? `<div class="note">Basis: ${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''}</div>` : ''}</div>
+    <div class="note">Per holding — blank means use the default above, or the holding's own history when no default is set.</div>
+    ${list.map((h) => {
+      const ov = st.byHolding[h.id];
+      return `<div class="plan-row"><span>${esc(h.accountName || '')} · ${esc(h.symbol || h.label || '')}</span>
+        <input type="text" inputmode="decimal" data-money data-plan-stock-holding="${h.id}" value="${ov && ov.valuePct != null ? ov.valuePct : ''}" placeholder="—" style="width:110px"> %/yr
+        <span data-plan-stock-eff="${h.id}">${effHtml(h)}</span>
+        <button class="small" data-plan-stock-revert="${h.id}">Revert to history</button></div>`;
+    }).join('') || '<div class="note">No holdings.</div>'}
+    <div class="note">Past returns do not predict future returns.</div>`;
+  host.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  const refreshEff = (hid) => {
+    const el = host.querySelector(`[data-plan-stock-eff="${hid}"]`);
+    const h = list.find((x) => Number(x.id) === Number(hid));
+    if (el && h) el.innerHTML = effHtml(h);
+  };
+  const globalInput = host.querySelector('#planStockGlobalVal');
+  if (globalInput) globalInput.addEventListener('input', () => {
+    const v = planParsePct(globalInput.value);
+    if (v == null) delete st.valuePct; else st.valuePct = v;
+    // A hand-typed default is not history-derived: drop its labels.
+    if (st.basis || st.window) { delete st.basis; delete st.window; const note = host.querySelector('[data-plan-stock-basis-note]'); if (note) note.innerHTML = ''; }
+    list.forEach((h) => refreshEff(h.id));
+  });
+  host.querySelectorAll('[data-plan-stock-holding]').forEach((inp) => {
+    inp.addEventListener('input', () => {
+      const hid = inp.dataset.planStockHolding;
+      const v = planParsePct(inp.value);
+      if (v == null) delete st.byHolding[hid];
+      else st.byHolding[hid] = { valuePct: v };
+      refreshEff(hid);
+    });
+  });
+  host.querySelectorAll('[data-plan-stock-revert]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const hid = btn.dataset.planStockRevert;
+      const out = host.querySelector(`[data-plan-stock-eff="${hid}"]`);
+      try {
+        const r = await api(`/api/planning/return-suggestions?holdingId=${hid}`);
+        const win = (r.suggestions || []).find((x) => x.annualizedReturn != null);
+        if (!win) { if (out) out.textContent = 'No history-derived return for this holding.'; return; }
+        const pct = Math.round(win.annualizedReturn * 10000) / 100;
+        st.byHolding[hid] = { valuePct: pct, basis: win.basis || null, window: win.window || null };
+        planStockHistCache.set(Number(hid), { pct, basis: win.basis || null, window: win.window || null });
+        const inp = host.querySelector(`[data-plan-stock-holding="${hid}"]`);
+        if (inp) inp.value = pct;
+        refreshEff(hid);
+      } catch (err) { if (out) out.innerHTML = `<span class="msg err">${esc(err.message)}</span>`; }
+    });
+  });
+  // History defaults fill in as suggestions arrive (cached across
+  // renders); rows with an override or a default never show history.
+  list.forEach(async (h) => {
+    if (planStockHistCache.has(h.id)) { refreshEff(h.id); return; }
+    try {
+      const r = await api(`/api/planning/return-suggestions?holdingId=${h.id}`);
+      const win = (r.suggestions || []).find((x) => x.annualizedReturn != null);
+      planStockHistCache.set(h.id, win ? { pct: Math.round(win.annualizedReturn * 10000) / 100, basis: win.basis || null, window: win.window || null } : null);
+    } catch { planStockHistCache.set(h.id, null); }
+    refreshEff(h.id);
+  });
+}
+
 function planScenarioFactorWire(d) {
   const sc = d.scenario;
   const isInvestment = d.project.category === 'investment';
@@ -14586,7 +15016,7 @@ function planScenarioFactorWire(d) {
   const cur = d.scenario.factors && typeof d.scenario.factors === 'object' ? d.scenario.factors : {};
   planFactorState = {
     prime: { points: (cur.prime && Array.isArray(cur.prime.points) ? cur.prime.points.map((pt) => ({ month: pt.month, rate: pt.rate })) : []), preset: (cur.prime && cur.prime.preset) || null },
-    stock: cur.stock ? { valuePct: cur.stock.valuePct, basis: cur.stock.basis || null, window: cur.stock.window || null } : null,
+    stock: cur.stock ? { valuePct: cur.stock.valuePct, basis: cur.stock.basis || null, window: cur.stock.window || null, byHolding: (cur.stock.byHolding && typeof cur.stock.byHolding === 'object' ? cur.stock.byHolding : {}) } : null,
     propertyGrowth: cur.propertyGrowth ? { valuePct: cur.propertyGrowth.valuePct } : null,
     salaryGrowth: cur.salaryGrowth ? { valuePct: cur.salaryGrowth.valuePct } : null,
     rentGrowth: cur.rentGrowth ? { valuePct: cur.rentGrowth.valuePct } : null,
@@ -14739,30 +15169,12 @@ function planScenarioFactorWire(d) {
   };
   const renderStock = () => {
     if (!stockHost) return;
-    const st = planFactorState.stock;
     if (!planFactorActive.has('stock')) { stockHost.innerHTML = ''; return; }
-    stockHost.innerHTML = `<div class="section-head"><h3>Stock return</h3><div class="toolbar"><button class="small danger" data-factor-remove="stock">Remove</button></div></div>
-      <div><label>Expected return (% / year)</label><input id="planFactorStockVal" type="text" inputmode="decimal" data-money value="${st && st.valuePct != null ? st.valuePct : ''}"></div>
-      ${st && st.basis ? `<div class="note">Basis: ${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''}</div>` : ''}
-      <div><label>Return suggestions (your own history)</label><div class="toolbar"><select id="planFactorSuggestHolding"></select><button class="small" id="planFactorSuggestBtn">Suggest</button></div><div id="planFactorSuggestOut"></div></div>
-      <div class="note">Past returns do not predict future returns.</div>`;
-    const sel = $('#planFactorSuggestHolding');
-    if (sel) {
-      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
-      $('#planFactorSuggestBtn').addEventListener('click', async () => {
-        const out = $('#planFactorSuggestOut');
-        try {
-          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
-          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available.')}</div>`; return; }
-          out.innerHTML = r.suggestions.map((x) => `
-            <button class="small" data-plan-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-suggest-basis="${esc(x.basis)}" data-plan-suggest-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ');
-          out.querySelectorAll('[data-plan-suggest]').forEach((b) => b.addEventListener('click', () => {
-            planFactorState.stock = { valuePct: Number(b.dataset.planSuggest), basis: b.dataset.planSuggestBasis || null, window: b.dataset.planSuggestWindow || null };
-            renderStock();
-          }));
-        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
-      });
-    }
+    if (!planFactorState.stock || typeof planFactorState.stock !== 'object') planFactorState.stock = {};
+    // Shared editor (also used by the create modal): a global default
+    // plus one editable row per holding with its history-derived
+    // default labeled (basis + window) and a Revert to history.
+    planStockFactorRender(stockHost, planFactorState.stock, holdings, { showRemove: true });
     wireFactorRemove(stockHost);
   };
   const renderGrowth = () => {
@@ -14795,11 +15207,11 @@ function planScenarioFactorWire(d) {
     try {
       syncPrimePointsFromDom();
       const st = planFactorState;
-      const stockVal = document.querySelector('#planFactorStockVal');
-      if (stockVal) {
-        const v = stockVal.value.replace(/,/g, '').trim();
-        st.stock = v === '' ? null : { ...(st.stock || {}), valuePct: Number(v) };
-      }
+      // Stock state is live-edited by the shared editor (global +
+      // per-holding rows); save its cleaned shape, or nothing when
+      // every field is blank (same as before: a blank factor is not
+      // saved).
+      if (st.stock) st.stock = planStockFactorClean(st.stock);
       const factors = {};
       if (planFactorActive.has('prime') && (st.prime.points.length || st.prime.preset)) factors.prime = { points: st.prime.points, preset: st.prime.preset };
       if (planFactorActive.has('stock') && st.stock) factors.stock = st.stock;
@@ -14892,7 +15304,17 @@ function planMonthBtnHtml(valueYm, inputId) {
 }
 function planOpFormHtml(type, params, ctx) {
   const p = params || {};
-  const propOpts = ctx.properties.map((x) => `<option value="${x.id}"${Number(p.propertyId) === x.id ? ' selected' : ''}>${esc(x.address)}</option>`).join('');
+  // Entity scope (user rule 2026-11-04): in a property project the
+  // picker offers ONLY the project entity property, so the UI path
+  // cannot produce a POST-then-excluded op. Server behavior is
+  // unchanged (integer propertyId still accepted for API compat).
+  // A non-property project, an unresolvable entity, or an entity
+  // property missing from the list falls back to all properties.
+  const entityPropId = ctx.project && ctx.project.category === 'property' && ctx.project.entity
+    ? Number(ctx.project.entity.propertyId) || null : null;
+  const scopedProps = entityPropId ? ctx.properties.filter((x) => Number(x.id) === entityPropId) : [];
+  const propList = scopedProps.length ? scopedProps : ctx.properties;
+  const propOpts = propList.map((x) => `<option value="${x.id}"${Number(p.propertyId) === x.id ? ' selected' : ''}>${esc(x.address)}</option>`).join('');
   const acctOpts = ctx.accounts.map((x) => `<option value="${x.id}"${Number(p.accountId) === x.id ? ' selected' : ''}>${esc(x.name)}</option>`).join('');
   const holdOpts = ctx.holdings.map((x) => `<option value="${x.id}"${Number(p.holdingId) === x.id ? ' selected' : ''}>${esc(x.symbol || x.label)}</option>`).join('');
   const dateRow = `<div><label>Date (month) *</label>${planMonthBtnHtml((p.date || '').slice(0, 7), 'planOpDateVal')}</div>`;
@@ -15486,7 +15908,7 @@ async function openPlanStrategyModal(projectId) {
     $('#planStrategyModalTitle').textContent = PRESET_LABELS[presetType] || 'Add strategy';
     $('#planStrategyModalBody').innerHTML = `
       <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
-      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Prepay then refinance"></div>
+      <div><label>Strategy name *</label><div style="display:flex;gap:8px"><input id="planStrategyName" placeholder="e.g. Prepay then refinance" style="flex:1"><button type="button" class="small" id="planStrategyAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
       <div><label>First operation (optional)</label></div>
       <div id="planStrategyOpFields">${planOpFormHtml(opType, ratePreset ? { rateType: ratePreset } : {}, ctx)}</div>
       <div class="toolbar"><button class="primary" id="planStrategyTemplateSave">Create strategy</button></div>`;
@@ -15554,6 +15976,18 @@ async function openPlanStrategyModal(projectId) {
         location.hash = `#planning/strategy/${s.strategy.id}`;
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
+    // ✨ name from the first op (op types + key params; a blank form
+    // falls back to category/entity context alone).
+    const aiNameBtn = $('#planStrategyAiNameBtn');
+    if (aiNameBtn) aiNameBtn.addEventListener('click', () => {
+      let ops = [];
+      try {
+        const { params, legs } = planReadOpForm(opType, $('#planStrategyModalBody').closest('.modal-card'));
+        if (Object.values(params || {}).some((v) => v !== '' && v != null)) ops = [{ op_type: opType, params, ...(legs && legs.length ? { legs } : {}) }];
+      } catch { ops = []; }
+      const proj = planProjectData && planProjectData.project ? planProjectData.project : {};
+      planAiSuggestName(aiNameBtn, $('#planStrategyName'), 'strategy', { ops, category: proj.category || null, entityLabel: (proj.categoryLabels && proj.categoryLabels.entity) || null }, $('#planStrategyModalMsg'));
+    });
   }
   // AI model design form: "Refine with AI" on a saved template opens
   // it prefilled with that template's summary, so template output is
@@ -15562,13 +15996,20 @@ async function openPlanStrategyModal(projectId) {
   function openPlanModelForm(prefillText) {
     $('#planStrategyModalBody').innerHTML = `
       <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
-      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
+      <div><label>Strategy name *</label><div style="display:flex;gap:8px"><input id="planStrategyName" placeholder="e.g. Refinance and invest" style="flex:1"><button type="button" class="small" id="planStrategyAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
       <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out">${esc(prefillText || '')}</textarea></div>
       <div class="toolbar"><button class="small" id="planStrategyModelThreadToggle">Show conversation thread</button></div>
       <div id="planStrategyModelThread" class="hidden"></div>
       <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
       <div id="planStrategyModelOut"></div>`;
     $('#planBackToPresets').addEventListener('click', renderChooser);
+    // ✨ name from the model description (no ops exist yet here).
+    const aiNameBtnM = $('#planStrategyAiNameBtn');
+    if (aiNameBtnM) aiNameBtnM.addEventListener('click', () => {
+      const proj = planProjectData && planProjectData.project ? planProjectData.project : {};
+      const desc = $('#planStrategyModelText') ? $('#planStrategyModelText').value.trim() : '';
+      planAiSuggestName(aiNameBtnM, $('#planStrategyName'), 'strategy', { ops: [], description: desc || null, category: proj.category || null, entityLabel: (proj.categoryLabels && proj.categoryLabels.entity) || null }, $('#planStrategyModalMsg'));
+    });
     // The thread stays collapsed until the user asks to see it —
     // design rounds accumulate turns behind this toggle, never in
     // the open by default.
@@ -15675,12 +16116,19 @@ async function openPlanStrategyModal(projectId) {
       const list = t.templates || [];
       $('#planStrategyModalBody').innerHTML = `
       <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
-      <div><label>Strategy name *</label><input id="planStrategyName" placeholder="e.g. Refinance and invest"></div>
+      <div><label>Strategy name *</label><div style="display:flex;gap:8px"><input id="planStrategyName" placeholder="e.g. Refinance and invest" style="flex:1"><button type="button" class="small" id="planStrategyAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
       ${list.length ? `<div><label>Saved template *</label><select id="planSavedTemplateSel">${list.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>
       <div id="planSavedTemplateQs"></div>
       <div class="toolbar"><button class="small primary" id="planSavedTemplateApply">Apply template</button><button class="small" id="planSavedTemplateRefine">Refine with AI</button></div>`
         : '<div class="note">No saved templates yet.</div>'}`;
       const sel = $('#planSavedTemplateSel');
+      // ✨ name from the picked saved template (no ops exist yet here).
+      const aiNameBtnS = $('#planStrategyAiNameBtn');
+      if (aiNameBtnS) aiNameBtnS.addEventListener('click', () => {
+        const proj = planProjectData && planProjectData.project ? planProjectData.project : {};
+        const cur = sel && sel.value ? list.find((x) => String(x.id) === String(sel.value)) : null;
+        planAiSuggestName(aiNameBtnS, $('#planStrategyName'), 'strategy', { ops: [], description: cur ? cur.name : null, category: proj.category || null, entityLabel: (proj.categoryLabels && proj.categoryLabels.entity) || null }, $('#planStrategyModalMsg'));
+      });
       const backBtn = $('#planBackToPresets');
       if (backBtn) backBtn.addEventListener('click', renderChooser);
       const renderQs = () => {

@@ -12,7 +12,8 @@ import {
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel,
   buildPlanAiSnapshot, normalizeAiAsk,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
-  validateAiReportChartSeries, aiReportPrompt,
+  validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind,
+  aiSuggestNamePrompt, cleanAiSuggestedName,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
@@ -876,4 +877,75 @@ test('validateAiCreateProposal rejects a non-object reply', () => {
   const { proposal, errors } = validateAiCreateProposal('nope');
   assert.equal(proposal, null);
   assert.deepEqual(errors, ['proposal must be an object']);
+});
+
+test('validateAiReportBaselineKind: pool baseline rejects every mortgage-family chart', () => {
+  const pool = (charts) => validateAiReportBaselineKind(charts, 'pool');
+  assert.equal(pool([{ template: 'fan_band', title: 'Fan', series: [] }]).length, 1);
+  assert.ok(pool([{ template: 'time_line', title: 'Mort', series: ['mortgage_balance'] }])[0].includes('mortgage_balance'));
+  assert.equal(pool([{ template: 'time_line', title: 'Default', series: [] }]).length, 1);
+  assert.equal(pool([{ template: 'yearly_bars', title: 'Y', series: ['mortgage_balance'] }]).length, 1);
+  assert.equal(pool([{ template: 'stacked_bar', title: 'S', series: ['mortgage_balance'] }]).length, 1);
+  assert.equal(pool([{ template: 'share_doughnut', title: 'D', series: ['mortgage_balance'] }]).length, 1);
+  assert.equal(pool([{ template: 'share_doughnut', title: 'D', series: ['total_value'] }]).length, 1);
+  assert.equal(pool([{ template: 'metric_cards', title: 'H', series: ['monthly_payment'] }]).length, 1);
+  assert.equal(pool([{ template: 'metric_cards', title: 'H', series: ['payoff_month'] }]).length, 1);
+  assert.deepEqual(pool([{ template: 'time_line', title: 'Pool', series: ['pool_balance', 'stock_value'] }]), []);
+  assert.deepEqual(pool([{ template: 'metric_cards', title: 'H', series: ['cost', 'gain', 'net', 'stock_gain'] }]), []);
+  assert.deepEqual(pool([{ template: 'share_doughnut', title: 'D', series: ['cost'] }]), []);
+  assert.deepEqual(validateAiReportBaselineKind([{ template: 'fan_band', title: 'Fan', series: [] }], 'property'), []);
+  assert.deepEqual(validateAiReportBaselineKind([{ template: 'time_line', title: 'Mort', series: ['mortgage_balance'] }], 'other'), []);
+});
+
+test('aiReportPrompt carries the baseline kind and its chart restriction', () => {
+  const pool = aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 1, text: 'x', baselineKind: 'pool' });
+  assert.match(pool, /Baseline kind: cash pool/);
+  assert.match(pool, /FORBIDDEN/);
+  assert.match(aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x', baselineKind: 'property' }), /Baseline kind: property/);
+  assert.doesNotMatch(aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 0, text: 'x' }), /Baseline kind/);
+});
+
+test('aiSuggestNamePrompt: strategy names come from ops, entity is context only', () => {
+  const p = aiSuggestNamePrompt('strategy', { ops: [{ op_type: 'rate_switch', params: { date: '2027-01-15', rateType: 'fixed', annualRate: 4.5 } }], entityLabel: '2985 Christina Place' });
+  assert.match(p, /Jan to Fix|rate_switch/);
+  assert.match(p, /NOT the naming basis/);
+  assert.match(p, /name ONLY/);
+  const empty = aiSuggestNamePrompt('strategy', { ops: [], category: 'property' });
+  assert.match(empty, /context alone/);
+  const scen = aiSuggestNamePrompt('scenario', { factors: { stock: { valuePct: 12 } }, category: 'investment' });
+  assert.match(scen, /12/);
+  assert.match(scen, /name ONLY/);
+});
+
+test('cleanAiSuggestedName strips objects, quotes and extra lines', () => {
+  assert.equal(cleanAiSuggestedName({ name: 'Jan to Fix' }), 'Jan to Fix');
+  assert.equal(cleanAiSuggestedName('"pre pay 50000"\nSome explanation'), 'pre pay 50000');
+  assert.equal(cleanAiSuggestedName('  Prime rises  '), 'Prime rises');
+  assert.equal(cleanAiSuggestedName(''), '');
+  assert.equal(cleanAiSuggestedName(null), '');
+});
+
+test('factorsToAssumptions maps per-holding stock overrides', () => {
+  assert.deepEqual(
+    factorsToAssumptions({ stock: { valuePct: 6, byHolding: { 7: { valuePct: 12, basis: 'Price CAGR', window: '2025-11 → 2026-10' } } } }, {}),
+    { stockReturnPct: 6, stockReturnByHolding: { 7: 12 } });
+  assert.deepEqual(factorsToAssumptions({ stock: { byHolding: { 7: { valuePct: 12 } } } }, {}), { stockReturnByHolding: { 7: 12 } });
+});
+
+test('validateScenarioFactors accepts and rejects per-holding stock overrides', () => {
+  assert.deepEqual(validateScenarioFactors({ stock: { byHolding: { 7: { valuePct: 12 } } } }), []);
+  assert.equal(validateScenarioFactors({ stock: { byHolding: { 7: { valuePct: 600 } } } }).length, 1);
+  assert.equal(validateScenarioFactors({ stock: { byHolding: { 7: 'nope' } } }).length, 1);
+  assert.equal(validateScenarioFactors({ stock: { byHolding: [] } }).length, 1);
+});
+
+test('computeProjection: per-holding scenario override wins over global and history rates', () => {
+  const holding = { id: 7, symbol: 'T', label: 'T', currency: 'CAD', events: [{ date: '2026-01-01', type: 'position', units: 100 }], pricePoints: [{ date: '2026-10-01', price: 10 }] };
+  const over = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [holding] }), holdingGrowth: { 7: 5 }, assumptions: { stockReturnByHolding: { 7: 20 } } }));
+  // 100 units × $10 grown one month at 20%/yr: 1000 × 1.20^(1/12) ≈ 1015.31.
+  assert.ok(Math.abs(over.stocks.series[0].value - 1015.31) < 0.5, `got ${over.stocks.series[0].value}`);
+  const global = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [holding] }), holdingGrowth: { 7: 5 }, assumptions: { stockReturnPct: 30, stockReturnByHolding: { 7: 20 } } }));
+  assert.ok(Math.abs(global.stocks.series[0].value - 1015.31) < 0.5, `got ${global.stocks.series[0].value}`);
+  const hist = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [holding] }), holdingGrowth: { 7: 5 }, assumptions: {} }));
+  assert.ok(Math.abs(hist.stocks.series[0].value - 1004.07) < 0.5, `got ${hist.stocks.series[0].value}`);
 });

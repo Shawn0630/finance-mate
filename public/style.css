@@ -610,6 +610,17 @@ table.seg-table td:last-child { text-align: right; }
 .plan-flow-tier .card { margin-bottom: 12px; }
 .plan-flow-card { padding: 12px 14px; }
 .plan-flow-card.plan-selected { border-color: #1668c4; background: #f0f6fc; }
+/* Category/subcategory cards are .card.breakdown-card, not
+   .plan-flow-card, so the Back-button selection mark needs the
+   general rule too (same blue border + tint). */
+.card.plan-selected { border-color: #1668c4; background: #f0f6fc; }
+/* Funding block two columns (user 2026-11-04): entries + Add button
+   left, doughnut + breakdown + pool total right. Below 760px the
+   modal itself starts shrinking (720px card), so the columns stack
+   with funding above and the chart below. */
+.plan-pool-layout { display: flex; gap: 16px; align-items: flex-start; }
+.plan-pool-left, .plan-pool-right { flex: 1 1 0; min-width: 0; }
+@media (max-width: 760px) { .plan-pool-layout { flex-direction: column; } }
 .plan-flow-card.plan-flow-flat { border-style: dashed; }
 .plan-flow-select[aria-pressed="true"] { background: #1668c4; color: #fff; border-color: #1668c4; }
 .plan-report-tabs { gap: 6px; flex-wrap: wrap; border-bottom: 1px solid #dde4ec; }
