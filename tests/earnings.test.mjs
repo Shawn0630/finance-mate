@@ -310,6 +310,15 @@ test('simplified job: pay-date cadences per frequency', () => {
   assert.deepEqual(payDatesInWindow('monthly', '2026-01-31', '2026-04-30', '2026-01-31'),
     ['2026-01-31', '2026-02-28', '2026-03-31', '2026-04-30']);
   assert.deepEqual(payDatesInWindow('biweekly', '2026-02-01', '2026-01-01', '2026-01-05'), []);
+  // The anchor may sit after the window start (a recent-date grid
+  // enumerating an earlier month): weekly / bi-weekly step BACKWARD
+  // from it to the first grid date on or after the window start.
+  assert.deepEqual(payDatesInWindow('biweekly', '2026-01-01', '2026-01-31', '2026-10-23'),
+    ['2026-01-02', '2026-01-16', '2026-01-30']);
+  assert.deepEqual(payDatesInWindow('biweekly', '2026-11-01', '2026-11-30', '2026-10-23'),
+    ['2026-11-06', '2026-11-20']);
+  assert.deepEqual(payDatesInWindow('weekly', '2026-01-01', '2026-01-31', '2026-10-23'),
+    ['2026-01-02', '2026-01-09', '2026-01-16', '2026-01-23', '2026-01-30']);
 });
 
 test('next pay date: recent-date anchor, holiday moves a day earlier, today counts, dateless is null', () => {
@@ -381,6 +390,8 @@ test('simplified job: YTD from elapsed periods, bi-weekly $3,000 Jan 5 -> Oct 23
     frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
     changes: [], recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
   });
+  // 21 paydays in [Jan 5, Oct 23] on the Friday grid: the window
+  // starts at the job start, so the Jan 2 payday predates the job.
   assert.equal(ytd.elapsed_periods, 21);
   assert.equal(ytd.ytd_cpp, 3416.9); // 21/26 of the $4,230.45 full-year CPP
   assert.equal(ytd.ytd_cpp2, 109.85); // 21/26 of $136.00
@@ -402,8 +413,11 @@ test('simplified job: a prior-year start still windows YTD at Jan 1', () => {
     frequency: 'biweekly', startDate: '2024-03-04', recentDate: '2026-10-23',
     changes: [], recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
   });
-  assert.equal(ytd.elapsed_periods, 21);
-  assert.equal(ytd.ytd_cpp, 3416.9);
+  // Friday grid (recent anchor): Jan 2 … Oct 23 is 22 paydays.
+  assert.equal(ytd.elapsed_periods, 22);
+  assert.equal(ytd.ytd_cpp, 3579.61); // 22/26 of the $4,230.45 full-year CPP
+  assert.equal(ytd.ytd_cpp2, 115.08); // 22/26 of $136.00
+  assert.equal(ytd.ytd_ei, 950.29); // 22/26 of the $1,123.07 EI cap
 });
 
 test('simplified job: a mid-year raise prices each segment, never the new rate over old pays', () => {
@@ -416,10 +430,11 @@ test('simplified job: a mid-year raise prices each segment, never the new rate o
     recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
   });
   assert.equal(ytd.elapsed_periods, 21);
-  // 11 pays at $2,500 + 10 at $3,000: CPP 1548.15 + 1627.10, EI 448.25 + 431.95.
-  assert.equal(ytd.ytd_cpp, 3175.24);
-  assert.equal(ytd.ytd_cpp2, 52.31);
-  assert.equal(ytd.ytd_ei, 880.2);
+  // Friday grid: 10 pays at $2,500 (Jan 16 … May 22) + 11 at $3,000
+  // (Jun 5 … Oct 23); CPP 1407.40 + 1789.81 = 3197.21.
+  assert.equal(ytd.ytd_cpp, 3197.21);
+  assert.equal(ytd.ytd_cpp2, 57.54);
+  assert.equal(ytd.ytd_ei, 882.65);
 });
 
 test('simplified job: bonus counts into the year\'s gross, never the per-period rate', () => {
@@ -616,12 +631,15 @@ test('monthly chart: months run start month through current month, stack sums to
   const s = jobMonthlySeries(monthlyBase);
   assert.deepEqual(s.months, ['2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10']);
   assert.equal(s.rrsp, null);
-  // Biweekly from Mon 2026-01-05: Jan has 2 paydays, Mar has 3.
-  assert.equal(s.gross[0], 6000);
-  assert.equal(s.gross[2], 9000);
-  assert.equal(s.tax[2], 2400);
-  assert.equal(s.cppEi[2], 600);
-  assert.equal(s.net[2], 6000);
+  // Biweekly from Fri 2026-10-23 (the recent-date grid): Jan has 3
+  // paydays, Mar has 2, Jul has 3, Aug has 2.
+  assert.equal(s.gross[0], 9000);
+  assert.equal(s.gross[2], 6000);
+  assert.equal(s.gross[6], 9000);
+  assert.equal(s.gross[7], 6000);
+  assert.equal(s.tax[2], 1600);
+  assert.equal(s.cppEi[2], 400);
+  assert.equal(s.net[2], 4000);
   for (let i = 0; i < s.months.length; i++) {
     assert.equal(Math.round((s.tax[i] + s.cppEi[i] + s.net[i]) * 100) / 100, s.gross[i], `month ${s.months[i]} stack must equal gross`);
   }
@@ -634,8 +652,10 @@ test('monthly chart: RRSP segment is own only — employer match never enters th
   });
   assert.ok(Array.isArray(s.rrsp));
   // Mar 2026 has 3 plan paydays: own 100 × 3 = 300, not (100 + 50) × 3.
+  // (Plan-anchored count; the job grid has 2 March paydays, so the
+  // March net is the 2-payday gross minus the 3-dues RRSP.)
   assert.equal(s.rrsp[2], 300);
-  assert.equal(s.net[2], 6000 - 300);
+  assert.equal(s.net[2], 3700);
   for (let i = 0; i < s.months.length; i++) {
     assert.equal(Math.round((s.tax[i] + s.cppEi[i] + s.rrsp[i] + s.net[i]) * 100) / 100, s.gross[i]);
   }
@@ -679,7 +699,7 @@ const monthEnd = (ym) => {
   const [y, m] = ym.split('-').map(Number);
   return `${ym}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`;
 };
-const nIn = (ym) => payDatesInWindow('biweekly', `${ym}-01`, monthEnd(ym), '2026-01-05').length;
+const nIn = (ym) => payDatesInWindow('biweekly', `${ym}-01`, monthEnd(ym), '2026-10-23').length;
 const pretaxJob = (over = {}) => ({
   frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period',
   tax_year: 2026, province: 'BC', ytd_cpp: 0, ytd_cpp2: 0, ytd_ei: 0,
@@ -748,7 +768,14 @@ test('monthly chart: pre-tax RRSP leaves pre-plan months at full-gross tax, cuts
     assert.equal(s.rrsp[i], 0, `${ym} must have no RRSP before the plan starts`);
     assert.equal(s.net[i], c2(full.net * nIn(ym)), `${ym} net must be full net`);
   }
-  for (let i = 6; i < 10; i++) {
+  // July straddles the plan start (Jul 6): the Jul 3 payday predates
+  // it on the Friday grid, so July mixes one full-tax payday with two
+  // reduced-tax paydays; Aug–Oct are fully reduced.
+  const jul = s.months.indexOf('2026-07');
+  assert.equal(s.tax[jul], c2(full.totalTax + 2 * reduced.totalTax), '2026-07 must mix one full-tax and two reduced-tax paydays');
+  assert.ok(s.rrsp[jul] > 0, '2026-07 must have an RRSP segment');
+  assert.equal(s.net[jul], c2(full.net + 2 * reduced.net) - s.rrsp[jul], '2026-07 net must mix full and reduced net minus RRSP');
+  for (let i = 7; i < 10; i++) {
     const ym = s.months[i];
     assert.equal(s.tax[i], c2(reduced.totalTax * nIn(ym)), `${ym} must use reduced tax`);
     assert.ok(s.rrsp[i] > 0, `${ym} must have an RRSP segment`);
@@ -768,11 +795,12 @@ test('monthly chart: mid-month plan start deducts only from paydays on/after the
     plans: [{ start_date: '2026-03-10', own_amount: 220.05 }],
     today: '2026-10-31', job: pretaxJob(), payroll,
   });
-  // March 2026 job paydays: Mar 2 (before the plan), Mar 16 + 30 (after it).
-  assert.equal(s.tax[2], c2(full.totalTax + 2 * reduced.totalTax));
+  // March 2026 job paydays: Mar 13 + 27 (both after the plan).
+  assert.equal(s.tax[2], c2(2 * reduced.totalTax));
   // Plan-anchored dues in March: Mar 10 + 24.
   assert.equal(s.rrsp[2], 440.10);
-  assert.equal(s.tax[0], c2(full.totalTax * 2));
+  // January has 3 Friday paydays.
+  assert.equal(s.tax[0], c2(full.totalTax * 3));
   assert.equal(s.rrsp[0], 0);
 });
 
@@ -786,7 +814,7 @@ test('monthly chart: employer-only plan changes nothing', () => {
   });
   assert.equal(s.rrsp, null);
   for (let i = 0; i < s.months.length; i++) {
-    assert.equal(s.tax[i], c2(full.totalTax * payDatesInWindow('biweekly', `${s.months[i]}-01`, monthEnd(s.months[i]), '2026-01-05').length));
+    assert.equal(s.tax[i], c2(full.totalTax * payDatesInWindow('biweekly', `${s.months[i]}-01`, monthEnd(s.months[i]), '2026-10-23').length));
   }
 });
 
@@ -816,14 +844,17 @@ test('monthly chart: taxBenefit per month is the tax saved by that month’s ded
   assert.ok(Array.isArray(s.taxBenefit));
   const perPayday = c2(full.totalTax - reduced.totalTax);
   for (let i = 0; i < 6; i++) assert.equal(s.taxBenefit[i], 0, `${s.months[i]} must have no benefit before the plan starts`);
-  for (let i = 6; i < 10; i++) {
+  // July straddles the plan start (Jul 6): only the Jul 17 + 31
+  // paydays save tax; Jul 3 predates the plan.
+  assert.equal(s.taxBenefit[6], c2(2 * perPayday), '2026-07 benefit must be two paydays × per-period tax saved');
+  for (let i = 7; i < 10; i++) {
     assert.equal(s.taxBenefit[i], c2(nIn(s.months[i]) * perPayday), `${s.months[i]} benefit must be paydays × per-period tax saved`);
   }
   assert.deepEqual(s.taxBenefitByYear, [{ year: 2026, annual: c2(s.taxBenefit.reduce((a, b) => a + b, 0)) }]);
-  // Per-pay table: one row per payday with a saving (9 paydays from
-  // the plan start through October), each the per-payday saving;
-  // the rows sum to the year's figure exactly.
-  assert.deepEqual(s.taxBenefitPays.map((p) => p.date), ['2026-07-06', '2026-07-20', '2026-08-03', '2026-08-17', '2026-08-31', '2026-09-14', '2026-09-28', '2026-10-12', '2026-10-26']);
+  // Per-pay table: one row per payday with a saving (8 Friday paydays
+  // from the first payday on/after the plan start through October),
+  // each the per-payday saving; the rows sum to the year's figure exactly.
+  assert.deepEqual(s.taxBenefitPays.map((p) => p.date), ['2026-07-17', '2026-07-31', '2026-08-14', '2026-08-28', '2026-09-11', '2026-09-25', '2026-10-09', '2026-10-23']);
   assert.ok(s.taxBenefitPays.every((p) => p.benefit === perPayday));
   assert.equal(c2(s.taxBenefitPays.reduce((a, p) => a + p.benefit, 0)), s.taxBenefitByYear[0].annual);
   // No plans → no benefit anywhere, no yearly rows.
@@ -839,6 +870,37 @@ test('monthly chart: taxBenefit per month is the tax saved by that month’s ded
   assert.equal(legacy.taxBenefit, null);
   assert.equal(legacy.taxBenefitByYear, null);
   assert.equal(legacy.taxBenefitPays, null);
+});
+
+test('payday grid: the monthly series and the per-pay table follow the recent-date grid, not the start-date grid', () => {
+  // The user's Meta job: start Monday 2022-06-06, recent Friday
+  // 2026-10-23, bi-weekly; plan starts 2026-11-06. The old
+  // start-anchored grid listed Nov 16 + 30 (Mondays); the real grid
+  // pays Nov 6 + 20 (Fridays, matching nextPayDate).
+  const full = calcSalary(pretaxJob(), payroll).perPeriod;
+  const reduced = calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll).perPeriod;
+  const s = jobMonthlySeries({
+    frequency: 'biweekly', startDate: '2022-06-06', recentDate: '2026-10-23',
+    calc: calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll),
+    plans: [{ start_date: '2026-11-06', own_amount: 220.05 }],
+    today: '2026-11-05', job: pretaxJob(), payroll,
+  });
+  assert.equal(nextPayDate({ frequency: 'biweekly', startDate: '2022-06-06', recentDate: '2026-10-23' }, '2026-11-01'), '2026-11-06');
+  assert.deepEqual(s.taxBenefitPays.map((p) => p.date), ['2026-11-06', '2026-11-20']);
+  assert.ok(!s.taxBenefitPays.some((p) => p.date === '2026-11-16' || p.date === '2026-11-30'));
+  assert.deepEqual(s.taxBenefitByYear, [{ year: 2026, annual: 124.12 }]);
+  // November has 2 paydays on the recent grid, so the month's benefit
+  // is 2 × the per-payday saving — the same count (and total) the old
+  // Monday grid gave, only the dates move.
+  assert.equal(s.taxBenefit[s.months.indexOf('2026-11')], 124.12);
+  assert.equal(c2(full.totalTax - reduced.totalTax), 62.06);
+  // YTD counts the same Friday grid over [Jan 1, Oct 23]: 22 paydays.
+  const ytd = deriveJobYtd({
+    frequency: 'biweekly', startDate: '2022-06-06', recentDate: '2026-10-23',
+    changes: [], recentValue: 3000, payroll, cppExempt: false, eiExempt: false,
+  });
+  assert.equal(ytd.elapsed_periods, 22);
+  assert.equal(ytd.ytd_cpp, 3579.61);
 });
 
 test('monthly chart: monthly plan paints no RRSP and no tax cut before its start month', () => {

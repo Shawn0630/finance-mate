@@ -134,9 +134,9 @@ export async function run(H, S) {
     JSON.stringify({ months: tbMonths, taxBenefit: tbBen, byYear: tbRead?.taxBenefit?.byYear }));
   // Per-pay table: the current tax year's paydays with a saving, from
   // the same per-payday values as the monthly series. Expected grid:
-  // biweekly anchored on the job start (2026-01-05), paydays on or
-  // after the plan start (2026-07-06) through the end of the current
-  // Vancouver month; each row is the per-payday saving (Jul 124.12
+  // biweekly anchored on the recent payment (2026-10-26, the same
+  // Monday grid as the start), paydays on or after the plan start
+  // (2026-07-06) through the end of the current Vancouver month; each row is the per-payday saving (Jul 124.12
   // over 2 paydays = 62.06); the rows sum to the total, and the total
   // is the by-year figure for the year.
   const tbPays = tbRead.taxBenefit.pays;
@@ -1384,6 +1384,12 @@ export async function run(H, S) {
           && tbView.paysRows[tbView.paysRows.length - 1][0].includes(`Total (${tbRead.taxBenefit.pays.year})`)
           && Math.abs(tbMoney(tbView.paysRows[tbView.paysRows.length - 1][1]) - tbRead.taxBenefit.pays.total) < 0.01,
         JSON.stringify({ paysRows: tbView.paysRows, pays: tbRead.taxBenefit.pays }));
+      // Layout: Pay changes + Bonuses above the Monthly pay chart,
+      // Tax benefit last (main panel first).
+      const tbOrder = await page.evaluate(() => [...document.querySelectorAll('#earnJobDetail > .panel')].map((p) => p.querySelector('.section-head h3')?.textContent?.trim()));
+      H.check('job detail: Pay changes + Bonuses above the Monthly pay chart, Tax benefit last',
+        JSON.stringify(tbOrder) === JSON.stringify(['TaxBenefit Corp', 'Pay changes', 'Bonuses', 'Monthly pay', 'Tax benefit']),
+        JSON.stringify(tbOrder));
       // List card: the same cash + benefit treatment as the detail page.
       await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
@@ -1435,6 +1441,126 @@ export async function run(H, S) {
       H.check('take-home solve cleanup: no-plan round-trip job deleted', r.status === 200, JSON.stringify(r.data));
       r = await H.req('DELETE', `/api/investments/accounts/${tbAcct}`);
       H.check('tax benefit cleanup: RRSP account deleted', r.status === 200, JSON.stringify(r.data));
+      // ---- Payday-grid unification + per-pay year pager ----
+      // Divergent-grid fixture (the user's Meta job shape): start
+      // Monday 2022-06-06, recent Friday 2026-10-23, bi-weekly, plan
+      // from 2026-11-06. The per-pay table must list the Friday
+      // paydays Nov 6 + 20 — never the old Monday-grid Nov 16/30 —
+      // and next pay must stay Nov 6.
+      r = await H.req('POST', '/api/investments/accounts', { name: 'Grid Pager RRSP', type: 'RRSP' });
+      H.check('payday grid: RRSP account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const gpAcct = r.data.id;
+      r = await H.req('POST', `/api/investments/accounts/${gpAcct}/holdings`, { label: 'GridPager Fund', kind: 'fund', currency: 'CAD' });
+      H.check('payday grid: holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const gpFund = r.data.id;
+      r = await H.req('POST', '/api/earnings/jobs', { employer: 'Grid Corp', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2022-06-06', recent_pay_date: '2026-10-23', recent_pay_value: 3000 });
+      H.check('payday grid: divergent job created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const gridJob = r.data.id;
+      r = await H.req('POST', `/api/investments/accounts/${gpAcct}/plans`, { job_id: gridJob, target_holding_id: gpFund, start_date: '2026-11-06', own_amount: 220.05, employer_amount: 0 });
+      H.check('payday grid: divergent plan created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const gridPlan = r.data.id;
+      // Multi-year fixture for the pager: start 2025-01-06, recent
+      // 2026-10-26 (same Monday grid), plan from 2025-07-07 — the
+      // per-pay table spans 2025 + 2026.
+      r = await H.req('POST', '/api/earnings/jobs', { employer: 'Pager Corp', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2025-01-06', recent_pay_date: '2026-10-26', recent_pay_value: 3000 });
+      H.check('tax benefit pager: multi-year job created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const pgJob = r.data.id;
+      r = await H.req('POST', `/api/investments/accounts/${gpAcct}/plans`, { job_id: pgJob, target_holding_id: gpFund, start_date: '2025-07-07', own_amount: 220.05, employer_amount: 0 });
+      H.check('tax benefit pager: multi-year plan created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const pgPlan = r.data.id;
+      r = await H.req('GET', '/api/earnings');
+      const gridRead = (r.data.jobs || []).find((j) => j.id === gridJob);
+      const pgRead = (r.data.jobs || []).find((j) => j.id === pgJob);
+      const gpToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+      const gpYear = Number(gpToday.slice(0, 4));
+      const gpMonthEnd = new Date(Date.UTC(gpYear, Number(gpToday.slice(5, 7)), 0)).toISOString().slice(0, 10);
+      // Expected divergent-grid paydays: step 14 days from the plan
+      // start (2026-11-06, a Friday on the recent grid) through the
+      // end of the current Vancouver month.
+      const gridExpected = [];
+      for (let d = new Date(Date.UTC(2026, 10, 6)); d.toISOString().slice(0, 10) <= gpMonthEnd; d = new Date(d.getTime() + 14 * 86400000)) gridExpected.push(d.toISOString().slice(0, 10));
+      // Expected next pay: the first Friday-grid payday on or after
+      // today (Nov 6 when run Nov 5–6; no holiday falls on the
+      // November grid dates, so no adjustment applies here).
+      let gridNext = '2026-11-06';
+      while (gridNext < gpToday) gridNext = new Date(new Date(`${gridNext}T00:00:00Z`).getTime() + 14 * 86400000).toISOString().slice(0, 10);
+      const gridPays = gridRead?.taxBenefit?.pays;
+      H.check('payday grid: per-pay table follows the recent-date grid (Nov 6 + 20, never Nov 16/30)',
+        gridRead?.next_pay_date === gridNext
+          && gridPays && JSON.stringify(gridPays.rows.map((x) => x.date)) === JSON.stringify(gridExpected)
+          && gridPays.rows.every((x) => x.benefit === 62.06)
+          && !gridPays.rows.some((x) => x.date === '2026-11-16' || x.date === '2026-11-30')
+          && Math.abs(gridPays.rows.reduce((a, x) => a + x.benefit, 0) - gridPays.total) < 0.001
+          && gridPays.total === (gridRead.taxBenefit.byYear || []).find((y) => y.year === gpYear)?.annual,
+        JSON.stringify({ next: gridRead?.next_pay_date, pays: gridPays, expected: gridExpected }));
+      // Multi-year grouping: 2025 is a complete year (13 Monday
+      // paydays from Jul 7), 2026 runs through the current month.
+      const pgExpected2025 = [];
+      for (let d = new Date(Date.UTC(2025, 6, 7)); d.toISOString().slice(0, 10) <= '2025-12-31'; d = new Date(d.getTime() + 14 * 86400000)) pgExpected2025.push(d.toISOString().slice(0, 10));
+      const pgExpected2026 = [];
+      for (let d = new Date(Date.UTC(2026, 0, 5)); d.toISOString().slice(0, 10) <= gpMonthEnd; d = new Date(d.getTime() + 14 * 86400000)) pgExpected2026.push(d.toISOString().slice(0, 10));
+      const pgGroups = pgRead?.taxBenefit?.paysByYear || [];
+      const pgG25 = pgGroups.find((g) => g.year === 2025);
+      const pgG26 = pgGroups.find((g) => g.year === gpYear);
+      const pgByYear = pgRead?.taxBenefit?.byYear || [];
+      H.check('tax benefit: per-pay table groups pays by year with each year totalled',
+        pgGroups.length >= 2 && pgGroups[0].year === 2025 && pgGroups[pgGroups.length - 1].year === gpYear
+          && pgG25 && JSON.stringify(pgG25.rows.map((x) => x.date)) === JSON.stringify(pgExpected2025)
+          && pgG25.rows.every((x) => x.benefit === 62.06) && pgG25.rows.length === 13
+          && Math.abs(pgG25.total - 806.78) < 0.01 && pgG25.total === pgByYear.find((y) => y.year === 2025)?.annual
+          && pgG26 && JSON.stringify(pgG26.rows.map((x) => x.date)) === JSON.stringify(pgExpected2026)
+          && pgG26.rows.every((x) => x.benefit === 62.06)
+          && Math.abs(pgG26.rows.reduce((a, x) => a + x.benefit, 0) - pgG26.total) < 0.001
+          && pgG26.total === pgByYear.find((y) => y.year === gpYear)?.annual,
+        JSON.stringify({ groups: pgGroups, byYear: pgByYear }));
+      // Browser: the pager defaults to the latest year; flipping to
+      // 2025 shows that year's rows + total, and the layout order
+      // holds on this page too.
+      await page.goto(`http://ff.local/#earnings/job/${pgJob}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // Same-URL goto is a no-op: pgJob reuses the deleted tbSolo job's
+      // id (SQLite reuses the freed id), so the browser may still sit on
+      // that stale page — reload to force the fresh render.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => document.querySelector('#earnJobTaxBenefitPaysTable'), { timeout: 15000 });
+      await waitE(500);
+      const pgView0 = await page.evaluate(() => {
+        const pager = [...document.querySelectorAll('#earnJobTaxBenefitPaysPager button')].map((b) => ({ year: b.dataset.earnTbYear, active: b.classList.contains('active') }));
+        const rows = [...document.querySelectorAll('#earnJobTaxBenefitPaysTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        const order = [...document.querySelectorAll('#earnJobDetail > .panel')].map((p) => p.querySelector('.section-head h3')?.textContent?.trim());
+        return { pager, rows, order };
+      });
+      H.check('tax benefit: year pager defaults to the latest year with matching rows + total',
+        pgView0.pager.length === 2 && pgView0.pager[0].year === '2025' && pgView0.pager[1].year === String(gpYear) && pgView0.pager[1].active === true
+          && pgView0.rows.length === pgG26.rows.length + 1
+          && pgView0.rows[pgView0.rows.length - 1][0].includes(`Total (${gpYear})`)
+          && Math.abs(tbMoney(pgView0.rows[pgView0.rows.length - 1][1]) - pgG26.total) < 0.01
+          && JSON.stringify(pgView0.order) === JSON.stringify(['Pager Corp', 'Pay changes', 'Bonuses', 'Monthly pay', 'Tax benefit']),
+        JSON.stringify(pgView0));
+      await page.click('[data-earn-tb-year="2025"]');
+      await waitE(500);
+      const pgView25 = await page.evaluate(() => {
+        const pager = [...document.querySelectorAll('#earnJobTaxBenefitPaysPager button')].map((b) => ({ year: b.dataset.earnTbYear, active: b.classList.contains('active') }));
+        const rows = [...document.querySelectorAll('#earnJobTaxBenefitPaysTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { pager, rows };
+      });
+      H.check('tax benefit: year pager flips to 2025 with that year\'s rows + total',
+        pgView25.pager.find((b) => b.year === '2025')?.active === true
+          && pgView25.rows.length === 14
+          && pgView25.rows[0][0] === 'Jul 7, 2025' && pgView25.rows[12][0] === 'Dec 22, 2025'
+          && pgView25.rows.slice(0, 13).every((row) => Math.abs(tbMoney(row[1]) - 62.06) < 0.01)
+          && pgView25.rows[13][0].includes('Total (2025)') && Math.abs(tbMoney(pgView25.rows[13][1]) - 806.78) < 0.01,
+        JSON.stringify(pgView25));
+      // Cleanup: plans first, then jobs, then the account.
+      r = await H.req('DELETE', `/api/investments/plans/${gridPlan}`);
+      H.check('payday grid cleanup: divergent plan deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/investments/plans/${pgPlan}`);
+      H.check('tax benefit pager cleanup: multi-year plan deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/earnings/jobs/${gridJob}`);
+      H.check('payday grid cleanup: divergent job deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/earnings/jobs/${pgJob}`);
+      H.check('tax benefit pager cleanup: multi-year job deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/investments/accounts/${gpAcct}`);
+      H.check('tax benefit pager cleanup: RRSP account deleted', r.status === 200, JSON.stringify(r.data));
       // Cleanup: remove the fixture rentals so later checks see the
       // pre-existing rentals only.
       r = await H.req('DELETE', `/api/earnings/rentals/${chartAId}`);

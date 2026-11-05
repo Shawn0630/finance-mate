@@ -3349,6 +3349,26 @@ const earnJobRow = (row) => {
       const paysRows = series && series.taxBenefitPays
         ? series.taxBenefitPays.filter((p) => Number(p.date.slice(0, 4)) === paysYear) : [];
       const paysByYear = series ? (series.taxBenefitByYear || []).find((y) => y.year === paysYear) : null;
+      // Per-pay table, grouped by year for the year pager: every year
+      // with a saving, each with its rows and its by-year total (the
+      // rows sum to it exactly). Only nonzero-benefit years get a page.
+      const paysByYearAll = (() => {
+        if (!series || !series.taxBenefitPays) return [];
+        const rowsByYear = new Map();
+        for (const p of series.taxBenefitPays) {
+          const y = Number(p.date.slice(0, 4));
+          if (!rowsByYear.has(y)) rowsByYear.set(y, []);
+          rowsByYear.get(y).push(p);
+        }
+        return [...rowsByYear.entries()].sort((a, b) => a[0] - b[0]).map(([year, rows]) => {
+          const byYear = (series.taxBenefitByYear || []).find((yy) => yy.year === year);
+          return {
+            year,
+            rows,
+            total: byYear ? byYear.annual : Math.round(rows.reduce((a, r) => a + r.benefit, 0) * 100) / 100,
+          };
+        });
+      })();
       taxBenefit = {
         perPeriod: Math.round((benefitAnnual / periods) * 100) / 100,
         annual: benefitAnnual,
@@ -3358,6 +3378,7 @@ const earnJobRow = (row) => {
           rows: paysRows,
           total: paysByYear ? paysByYear.annual : Math.round(paysRows.reduce((a, r) => a + r.benefit, 0) * 100) / 100,
         } : null,
+        paysByYear: paysByYearAll,
       };
     }
   }

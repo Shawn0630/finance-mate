@@ -204,6 +204,10 @@ export function payDatesInWindow(frequency, from, to, anchor) {
     const toN = jobDayNum(to);
     let n = jobDayNum(anchor);
     if (n < fromN) n += Math.ceil((fromN - n) / step) * step;
+    // The anchor may sit after the window start (a recent-date grid
+    // enumerating an earlier month): step back to the first grid date
+    // on or after the window start, so no payday is missed.
+    else while (n - step >= fromN) n -= step;
     const out = [];
     while (n <= toN) { out.push(jobDayStr(n)); n += step; }
     return out;
@@ -243,6 +247,18 @@ export function payDatesInWindow(frequency, from, to, anchor) {
   return [to]; // annual: one pay in the window, on the recent date
 }
 
+// The pay grid is FIXED: a holiday move is one-off and never drifts
+// it. If the entered recent payment is itself the moved one (its
+// next day is a holiday), the nominal anchor is that next day, not
+// the entered date. Applies to weekly, bi-weekly, monthly, and
+// annual alike; semi-monthly ignores the anchor either way. Every
+// payday enumeration (next pay, YTD, monthly series) shares this
+// nominal recent-date grid — one grid, never two.
+export function nominalRecentDate(recentDate) {
+  const recentN = jobDayNum(recentDate);
+  return isHoliday(jobDayStr(recentN + 1)) ? jobDayStr(recentN + 1) : recentDate;
+}
+
 // Next scheduled pay date on or after today. The cadence anchors on
 // the RECENT payment date (user rule 2026-11-01), not the start date:
 // weekly / bi-weekly step 7 / 14 days from it, monthly steps its
@@ -253,18 +269,10 @@ export function payDatesInWindow(frequency, from, to, anchor) {
 // or after today wins, so a payday falling today counts, while a
 // today that IS a holiday payday already paid yesterday and the next
 // one follows. Jobs without dates (legacy, no start or recent date)
-// get null — never a guessed date. YTD derivation and the monthly
-// chart keep the START-date anchor deliberately — this function
-// alone moved.
+// get null — never a guessed date.
 export function nextPayDate({ frequency, startDate, recentDate }, today) {
   if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today)) return null;
-  // A pay grid is FIXED: a holiday move is one-off and never drifts
-  // it. If the entered recent payment is itself the moved one (its
-  // next day is a holiday), the nominal anchor is that next day, not
-  // the entered date. Applies to weekly, bi-weekly, monthly, and
-  // annual alike; semi-monthly ignores the anchor either way.
-  const recentN = jobDayNum(recentDate);
-  const nominalRecent = isHoliday(jobDayStr(recentN + 1)) ? jobDayStr(recentN + 1) : recentDate;
+  const nominalRecent = nominalRecentDate(recentDate);
   if (frequency === 'annual') {
     const [, m, d] = nominalRecent.split('-').map(Number);
     const y = Number(today.slice(0, 4));
@@ -308,7 +316,10 @@ export function deriveJobYtd({ frequency, startDate, recentDate, changes, recent
   const taxYear = Number(recentDate.slice(0, 4));
   const yearStart = `${taxYear}-01-01`;
   const windowStart = startDate > yearStart ? startDate : yearStart;
-  const pays = payDatesInWindow(frequency, windowStart, recentDate, startDate);
+  // The pay grid anchors on the nominal recent date (same grid as
+  // nextPayDate and the monthly series); payDatesInWindow steps back
+  // from it to the window start for weekly / bi-weekly.
+  const pays = payDatesInWindow(frequency, windowStart, recentDate, nominalRecentDate(recentDate));
   const sorted = [...(changes || [])].sort((a, b) => (a.effective_date < b.effective_date ? -1 : 1));
   const last = sorted.length ? sorted[sorted.length - 1] : null;
   const valueAt = (d) => {
@@ -766,6 +777,11 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   let m = Number(startYm.slice(5, 7));
   const endY = Number(endYm.slice(0, 4));
   const endM = Number(endYm.slice(5, 7));
+  // The job pay grid anchors on the nominal recent date (same grid as
+  // nextPayDate and YTD). Annual is the exception: its anchor is only
+  // an existence gate (the anniversary comes from the recent date),
+  // so it keeps the start date there.
+  const gridAnchor = frequency === 'annual' ? startDate : nominalRecentDate(recentDate);
   while (y < endY || (y === endY && m <= endM)) {
     months.push(ymPad(y, m, 1).slice(0, 7));
     m += 1; if (m > 12) { m = 1; y += 1; }
@@ -817,7 +833,7 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   for (const ym of months) {
     const yy = Number(ym.slice(0, 4));
     const mm = Number(ym.slice(5, 7));
-    const n = countPaydaysInMonth(frequency, yy, mm, startDate, recentDate);
+    const n = countPaydaysInMonth(frequency, yy, mm, gridAnchor, recentDate);
     const r = rrspPresent
       ? round2(ownPlans.reduce((s, p) => s + (planDueInMonth(p, ym)
         ? Number(p.own_amount) * countPaydaysInMonth(frequency, yy, mm, p.start_date, p.start_date) : 0), 0))
@@ -836,7 +852,7 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
       let taxSum = 0;
       let netSum = 0;
       let benSum = 0;
-      for (const d of jobPaydaysInMonth(frequency, yy, mm, startDate, recentDate)) {
+      for (const d of jobPaydaysInMonth(frequency, yy, mm, gridAnchor, recentDate)) {
         const ded = ownPlans.reduce((s, p) => s + (p.start_date <= d ? Number(p.own_amount) : 0), 0);
         const pc = calcFor(ded);
         taxSum += pc.totalTax;

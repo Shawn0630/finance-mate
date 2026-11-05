@@ -9469,6 +9469,34 @@ function earnJobDateLabel(iso) {
   return `${MONTH_NAMES[m - 1]} ${d}, ${y}`;
 }
 
+// Per-pay tax benefit table with a year pager (same pattern as the
+// report table's year pager): one page per year with a saving,
+// defaulting to the latest year; no pager buttons for a single year.
+// The selected year lives in module state and resets when another
+// job's detail page loads.
+let earnJobTaxBenefitPaysYearSel = null;
+function earnJobTaxBenefitPaysHtml(tb) {
+  const groups = (tb && tb.paysByYear) || [];
+  if (!groups.length) return '';
+  const latest = groups[groups.length - 1].year;
+  const year = groups.some((g) => g.year === earnJobTaxBenefitPaysYearSel) ? earnJobTaxBenefitPaysYearSel : latest;
+  const g = groups.find((x) => x.year === year);
+  const pager = groups.length > 1
+    ? `<div id="earnJobTaxBenefitPaysPager">${groups.map((x) => `<button class="small${x.year === year ? ' active' : ''}" data-earn-tb-year="${x.year}" onclick="earnJobTaxBenefitPaysYear(${x.year})">${x.year}</button>`).join('')}</div>`
+    : '';
+  const rows = g.rows.map((r) => `<tr><td>${earnJobDateLabel(r.date)}</td><td>${money2(r.benefit)}</td></tr>`).join('');
+  return `${pager}<table id="earnJobTaxBenefitPaysTable"><thead><tr><th>Pay date</th><th>Tax benefit</th></tr></thead><tbody>
+        ${rows}
+        <tr><td>Total (${g.year})</td><td>${money2(g.total)}</td></tr>
+      </tbody></table>`;
+}
+window.earnJobTaxBenefitPaysYear = (year) => {
+  earnJobTaxBenefitPaysYearSel = Number(year);
+  const j = earnData.jobs.find((x) => x.id === currentEarnJobId);
+  const wrap = document.querySelector('#earnJobTaxBenefitPaysWrap');
+  if (j && j.taxBenefit && wrap) wrap.innerHTML = earnJobTaxBenefitPaysHtml(j.taxBenefit);
+};
+
 function earnJobDetailHtml(j) {
   const c = j.calc;
   const tb = j.taxBenefit || null; // null when no active RRSP deduction saves tax: no section, no marker.
@@ -9523,6 +9551,18 @@ function earnJobDetailHtml(j) {
       <div class="note">${esc(c.estimateNote)}</div>
       <div class="note">Job start ${esc(j.start_date || '—')} · Recent payment ${esc(j.recent_pay_date || '—')} · Current per-period value ${money2(earnJobPerPeriod(j))}</div>
     </div>
+    <div class="panel">
+      <div class="section-head"><h3>Pay changes</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddPayChange" onclick="earnJobDetailOpenRow('pay_change', null)">+ Pay change</button></div>
+      ${pcRows || '<div class="note">No pay changes yet.</div>'}
+    </div>
+    <div class="panel">
+      <div class="section-head"><h3>Bonuses</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddBonus" onclick="earnJobDetailOpenRow('bonus', null)">+ Bonus</button></div>
+      ${bonusRows || '<div class="note">No bonuses yet.</div>'}
+    </div>
+    ${j.start_date && j.recent_pay_date ? `<div class="panel" id="earnJobMonthlyPanel">
+      <div class="section-head"><h3>Monthly pay</h3></div>
+      <div><canvas id="earnJobMonthlyChart"></canvas></div>
+    </div>` : ''}
     ${tb ? `<div class="panel" id="earnJobTaxBenefitPanel">
       <div class="section-head"><h3>Tax benefit</h3></div>
       <table><tbody>
@@ -9531,24 +9571,9 @@ function earnJobDetailHtml(j) {
       ${tb.byYear && tb.byYear.length ? `<table><tbody>
         ${tb.byYear.map((y) => `<tr><td>${y.year}</td><td>${money2(y.annual)}</td></tr>`).join('')}
       </tbody></table>` : ''}
-      ${tb.pays ? `<table id="earnJobTaxBenefitPaysTable"><thead><tr><th>Pay date</th><th>Tax benefit</th></tr></thead><tbody>
-        ${tb.pays.rows.map((r) => `<tr><td>${earnJobDateLabel(r.date)}</td><td>${money2(r.benefit)}</td></tr>`).join('')}
-        <tr><td>Total (${tb.pays.year})</td><td>${money2(tb.pays.total)}</td></tr>
-      </tbody></table>` : ''}
-      <div class="note">Tax saved by the RRSP deduction — realized at the T1, at the current pay rate and plans; yearly rows cover months elapsed.${tb.pays ? ` The table lists each payday's saving in ${tb.pays.year} (only paydays with a saving are listed); its total is the year's figure.` : ''} Per-period = annual ÷ ${tbPeriods}, rounded.</div>
-    </div>` : ''}
-    ${j.start_date && j.recent_pay_date ? `<div class="panel" id="earnJobMonthlyPanel">
-      <div class="section-head"><h3>Monthly pay</h3></div>
-      <div><canvas id="earnJobMonthlyChart"></canvas></div>
-    </div>` : ''}
-    <div class="panel">
-      <div class="section-head"><h3>Pay changes</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddPayChange" onclick="earnJobDetailOpenRow('pay_change', null)">+ Pay change</button></div>
-      ${pcRows || '<div class="note">No pay changes yet.</div>'}
-    </div>
-    <div class="panel">
-      <div class="section-head"><h3>Bonuses</h3><div class="spacer"></div><button class="small" id="earnJobDetailAddBonus" onclick="earnJobDetailOpenRow('bonus', null)">+ Bonus</button></div>
-      ${bonusRows || '<div class="note">No bonuses yet.</div>'}
-    </div>`;
+      ${tb.paysByYear && tb.paysByYear.length ? `<div id="earnJobTaxBenefitPaysWrap">${earnJobTaxBenefitPaysHtml(tb)}</div>` : ''}
+      <div class="note">Tax saved by the RRSP deduction — realized at the T1, at the current pay rate and plans; yearly rows cover months elapsed.${tb.paysByYear && tb.paysByYear.length ? ` The table lists the selected year's paydays with a saving (only paydays with a saving are listed); its total is that year's figure.` : ''} Per-period = annual ÷ ${tbPeriods}, rounded.</div>
+    </div>` : ''}`;
 }
 
 let earnJobMonthlyChart = null;
@@ -9597,6 +9622,7 @@ async function loadEarnJobDetail(id) {
     const j = earnData.jobs.find((x) => x.id === id);
     if (!j) { location.hash = '#earnings/salary'; return; }
     currentEarnJobId = id;
+    earnJobTaxBenefitPaysYearSel = null;
     $('#earnJobDetail').innerHTML = earnJobDetailHtml(j);
     drawEarnJobMonthlyChart(id);
   } catch (e) {
