@@ -9494,6 +9494,7 @@ function earnJobDateLabel(iso) {
 
 function earnJobDetailHtml(j) {
   const c = j.calc;
+  const tb = j.taxBenefit || null; // null when no active RRSP deduction saves tax: no section, no marker.
   const freqLabel = (earnData.payFrequencies.find((f) => f.key === j.frequency) || {}).label || j.frequency;
   // History view: the opening position first, then every pay-change
   // entry in date order; the latest entry's result IS the current
@@ -9528,10 +9529,10 @@ function earnJobDetailHtml(j) {
       <div class="spacer"></div><button class="small" id="earnJobDetailEditBtn" onclick="earnEditJob(${j.id})">Edit</button><button class="small danger" id="earnJobDetailDeleteBtn" onclick="earnDeleteJob(${j.id})">Delete</button></div>
       <div class="summary-strip">
         <div class="summary-card"><div class="k">Annual gross</div><div class="v">${money2(c.annualGross)}</div></div>
-        <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(earnCashAnnual(c))}</div></div>
+        <div class="summary-card"><div class="k">Annual net</div><div class="v">${money2(earnCashAnnual(c))}</div>${tb ? `<div class="n">incl. tax benefit</div>` : ''}</div>
         ${j.next_pay_date
-          ? `<div class="summary-card"><div class="k">Next net pay date</div><div class="v">${esc(earnJobDateLabel(j.next_pay_date))}</div><div class="n">${money2(earnCashPerPeriod(c))}</div></div>`
-          : `<div class="summary-card"><div class="k">Net per pay period</div><div class="v">${money2(earnCashPerPeriod(c))}</div></div>`}
+          ? `<div class="summary-card"><div class="k">Next net pay date</div><div class="v">${esc(earnJobDateLabel(j.next_pay_date))}</div><div class="n">${money2(earnCashPerPeriod(c))}${tb ? ' · incl. tax benefit' : ''}</div></div>`
+          : `<div class="summary-card"><div class="k">Net per pay period</div><div class="v">${money2(earnCashPerPeriod(c))}</div>${tb ? '<div class="n">incl. tax benefit</div>' : ''}</div>`}
         <div class="summary-card"><div class="k">Total tax</div><div class="v">${money2(c.totalTax)}</div></div>
       </div>
       <table><tbody>
@@ -9544,6 +9545,16 @@ function earnJobDetailHtml(j) {
       <div class="note">${esc(c.estimateNote)}</div>
       <div class="note">Job start ${esc(j.start_date || '—')} · Recent payment ${esc(j.recent_pay_date || '—')} · Current per-period value ${money2(earnJobPerPeriod(j))}</div>
     </div>
+    ${tb ? `<div class="panel" id="earnJobTaxBenefitPanel">
+      <div class="section-head"><h3>Tax benefit</h3></div>
+      <table><tbody>
+        <tr><td>Per pay period</td><td>${money2(tb.perPeriod)}</td><td>Annual</td><td>${money2(tb.annual)}</td></tr>
+      </tbody></table>
+      ${tb.byYear && tb.byYear.length ? `<table><tbody>
+        ${tb.byYear.map((y) => `<tr><td>${y.year}</td><td>${money2(y.annual)}</td></tr>`).join('')}
+      </tbody></table>` : ''}
+      <div class="note">Tax saved by the RRSP deduction — realized at the T1, at the current pay rate and plans; yearly rows cover months elapsed. Per-period = annual ÷ 26, rounded.</div>
+    </div>` : ''}
     ${j.start_date && j.recent_pay_date ? `<div class="panel" id="earnJobMonthlyPanel">
       <div class="section-head"><h3>Monthly pay</h3></div>
       <div><canvas id="earnJobMonthlyChart"></canvas></div>

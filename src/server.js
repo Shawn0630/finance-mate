@@ -3312,16 +3312,48 @@ const earnJobRow = (row) => {
   const nextDate = nextPayDate(
     { frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date }, today);
   const linkedPlans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id);
-  const gross0 = calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction: 0 }, earnRegion().payroll).perPeriod.gross;
+  const calc0 = calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction: 0 }, earnRegion().payroll);
+  const gross0 = calc0.perPeriod.gross;
   const rrspDeduction = linkedPlans
     .reduce((s, p) => s + ((nextDate == null ? p.start_date <= today : p.start_date <= nextDate) ? planPeriodAmounts(p, gross0).own : 0), 0);
+  const calc = calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction }, earnRegion().payroll);
+  // RRSP tax benefit (engine, never hand-rolled brackets): total tax
+  // without the deduction minus total tax with it (federal +
+  // provincial). The annual figure is primary; per-period is the
+  // annual figure over the pay frequency. The by-year table accrues
+  // the same saving month by month from the monthly series (current
+  // pay rate and plans; yearly rows cover months elapsed, so the
+  // current year is partial). No active deduction, or a deduction
+  // that saves $0 tax, yields no benefit — no section, no marker.
+  let taxBenefit = null;
+  if (rrspDeduction > 0) {
+    const benefitAnnual = Math.round((calc0.totalTax - calc.totalTax) * 100) / 100;
+    if (benefitAnnual > 0) {
+      const periods = PAY_FREQUENCIES[row.frequency].periods;
+      const plans = linkedPlans.map((p) => ({
+        start_date: p.start_date,
+        own_amount: planPeriodAmounts(p, gross0).own,
+        employer_amount: planPeriodAmounts(p, gross0).employer,
+      }));
+      const series = (row.start_date && row.recent_pay_date) ? jobMonthlySeries({
+        frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
+        calc, plans, today, job: { ...row, bonus_total: bonusTotal }, payroll: earnRegion().payroll,
+      }) : null;
+      taxBenefit = {
+        perPeriod: Math.round((benefitAnnual / periods) * 100) / 100,
+        annual: benefitAnnual,
+        byYear: series ? (series.taxBenefitByYear || []) : [],
+      };
+    }
+  }
   return {
     ...row,
     owner: row.owner || null,
     cpp_exempt: row.cpp_exempt === 1, ei_exempt: row.ei_exempt === 1,
     pay_changes: payChanges, bonuses, bonus_total: bonusTotal,
     next_pay_date: nextDate,
-    calc: calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction }, earnRegion().payroll),
+    calc,
+    taxBenefit,
   };
 };
 const earnRentalYearRow = (rental, row) => {

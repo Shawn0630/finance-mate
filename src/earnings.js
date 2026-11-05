@@ -741,7 +741,7 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today) || !pp) return null;
   const startYm = startDate.slice(0, 7);
   const endYm = today.slice(0, 7);
-  if (startYm > endYm) return { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [] };
+  if (startYm > endYm) return { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [], taxBenefit: [], taxBenefitByYear: [] };
   const months = [];
   let y = Number(startYm.slice(0, 4));
   let m = Number(startYm.slice(5, 7));
@@ -785,6 +785,12 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   const cppEi = [];
   const rrsp = rrspPresent ? [] : null;
   const net = [];
+  // Tax benefit per month: the tax that month would have carried
+  // without the RRSP deduction minus the tax it actually carries —
+  // the same engine, payday by payday (calcFor(0) vs the payday's
+  // deduction). Null when the series cannot recompute (bare calls
+  // without job/payroll keep the legacy stored-calc behavior).
+  const taxBenefit = canRecompute ? [] : null;
   for (const ym of months) {
     const yy = Number(ym.slice(0, 4));
     const mm = Number(ym.slice(5, 7));
@@ -812,6 +818,7 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
       t = round2(taxSum);
       c = round2((zero.cpp + zero.cpp2 + zero.ei) * n);
       nt = round2(netSum) - r;
+      taxBenefit.push(round2(n * zero.totalTax - t));
     } else {
       t = round2(pp.totalTax * n);
       c = round2((pp.cpp + pp.cpp2 + pp.ei) * n);
@@ -823,7 +830,19 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
     net.push(nt);
     gross.push(round2(t + c + r + nt));
   }
-  return { months, gross, tax, cppEi, rrsp, net };
+  // Tax benefit by year: the same per-month saving grouped by tax
+  // year, nonzero years only. Months before any plan existed save
+  // $0 and leave no row; the current year covers months elapsed.
+  const taxBenefitByYear = taxBenefit == null ? null : (() => {
+    const byYear = new Map();
+    for (let i = 0; i < months.length; i++) {
+      if (!taxBenefit[i]) continue;
+      const y = Number(months[i].slice(0, 4));
+      byYear.set(y, round2((byYear.get(y) || 0) + taxBenefit[i]));
+    }
+    return [...byYear.entries()].sort((a, b) => a[0] - b[0]).map(([year, annual]) => ({ year, annual }));
+  })();
+  return { months, gross, tax, cppEi, rrsp, net, taxBenefit, taxBenefitByYear };
 }
 
 // ------------------------------------------------------------ rental --

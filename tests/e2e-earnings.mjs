@@ -93,6 +93,50 @@ export async function run(H, S) {
   H.check('earnings: entry edit reverts to the original derived gross',
     r.status === 200 && r.data.years.find((y) => y.tax_year === 2026).gross_rents === 24000,
     JSON.stringify(r.data.years.map((y) => ({ tax_year: y.tax_year, gross_rents: y.gross_rents }))));
+  // ---- RRSP tax benefit (job detail page) ----
+  // Fixture mirrors the unit-pinned pretax case: biweekly BC job,
+  // 3000/period, one fixed plan own 220.05 starting mid-year
+  // (2026-07-06). The benefit is the engine's tax difference:
+  // annual 1613.41, per-period 62.05. The by-year table covers
+  // months elapsed only, so it is checked against the monthly
+  // series (definition), never a literal — it grows with the
+  // current month.
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'TaxBenefit Corp', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: 3000 });
+  H.check('tax benefit: job created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const tbJob = r.data.id;
+  r = await H.req('POST', '/api/investments/accounts', { name: 'TaxBenefit RRSP', type: 'RRSP' });
+  H.check('tax benefit: RRSP account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const tbAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${tbAcct}/holdings`, { label: 'TaxBenefit Fund', kind: 'fund', currency: 'CAD' });
+  const tbFund = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${tbAcct}/plans`, { job_id: tbJob, target_holding_id: tbFund, start_date: '2026-07-06', own_amount: 220.05, employer_amount: 0 });
+  H.check('tax benefit: fixed plan created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const tbPlan = r.data.id;
+  r = await H.req('GET', '/api/earnings');
+  const tbRead = (r.data.jobs || []).find((j) => j.id === tbJob);
+  H.check('tax benefit: annual = tax(0) − tax(ded), per-period = annual / 26',
+    tbRead && tbRead.taxBenefit && tbRead.taxBenefit.annual === 1613.41 && tbRead.taxBenefit.perPeriod === 62.05,
+    JSON.stringify(tbRead?.taxBenefit));
+  // Monthly series: no benefit before the plan starts; Jul (2
+  // paydays) 124.12, Aug (3 paydays) 186.18; the by-year table is
+  // exactly the series summed for the year.
+  r = await H.req('GET', `/api/earnings/jobs/${tbJob}/monthly-chart`);
+  const tbMonths = r.data.months || [];
+  const tbBen = r.data.taxBenefit || [];
+  const tbJul = tbMonths.indexOf('2026-07');
+  const tbAug = tbMonths.indexOf('2026-08');
+  const tbByYearOk = tbRead && tbRead.taxBenefit && Array.isArray(tbRead.taxBenefit.byYear)
+    && tbRead.taxBenefit.byYear.length === 1 && tbRead.taxBenefit.byYear[0].year === 2026
+    && Math.abs(tbRead.taxBenefit.byYear[0].annual - tbBen.reduce((a, b) => a + b, 0)) < 0.011;
+  H.check('tax benefit: monthly benefit is 0 before the plan starts, paydays × 62.06 after; by-year table = series sum',
+    tbJul >= 0 && tbAug >= 0 && tbBen.slice(0, tbJul).every((v) => v === 0)
+      && tbBen[tbJul] === 124.12 && tbBen[tbAug] === 186.18 && tbByYearOk,
+    JSON.stringify({ months: tbMonths, taxBenefit: tbBen, byYear: tbRead?.taxBenefit?.byYear }));
+  // No-plan job: no benefit at all.
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'TaxBenefit Solo', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026 });
+  const tbSolo = r.data.id;
+  H.check('tax benefit: no-plan job carries no benefit', r.status === 201 && r.data.taxBenefit === null, JSON.stringify(r.data.taxBenefit));
+
   // ---- Earnings: browser pass over the new section ----
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('earnings browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -1231,6 +1275,46 @@ export async function run(H, S) {
         afterReload.cardGrey === false && afterReload.eyeClosed === false
           && afterReload.sliceVisible === true && afterReload.center === expectedCenter,
         JSON.stringify(afterReload));
+      // Tax benefit: the fixture job's detail page shows the section
+      // (per-period + annual + by-year table) and marks the take-home
+      // figures; the no-plan job shows neither.
+      await page.goto(`http://ff.local/#earnings/job/${tbJob}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => document.querySelector('#earnJobTaxBenefitPanel'), { timeout: 15000 });
+      await waitE(500);
+      const tbView = await page.evaluate(() => {
+        const panel = document.querySelector('#earnJobTaxBenefitPanel');
+        const cards = [...document.querySelectorAll('#earnJobDetail .summary-card')];
+        const annual = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Annual net'));
+        const next = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Next net pay date'));
+        return {
+          panelText: panel ? panel.textContent : null,
+          annualMarker: annual ? (annual.querySelector('.n')?.textContent || '') : null,
+          nextMarker: next ? (next.querySelector('.n')?.textContent || '') : null,
+        };
+      });
+      H.check('tax benefit: job detail shows the Tax benefit section with per-period + annual figures and the by-year table',
+        tbView.panelText && tbView.panelText.includes('Tax benefit') && tbView.panelText.includes('62.05')
+          && tbView.panelText.includes('1,613.41') && tbView.panelText.includes('2026'), JSON.stringify(tbView));
+      H.check('tax benefit: take-home figures are marked as including the tax benefit',
+        tbView.annualMarker === 'incl. tax benefit' && tbView.nextMarker && tbView.nextMarker.includes('incl. tax benefit'), JSON.stringify(tbView));
+      await page.goto(`http://ff.local/#earnings/job/${tbSolo}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const tbSoloView = await page.evaluate(() => ({
+        panel: !!document.querySelector('#earnJobTaxBenefitPanel'),
+        marker: document.querySelector('#earnJobDetail') ? document.querySelector('#earnJobDetail').textContent.includes('incl. tax benefit') : null,
+      }));
+      H.check('tax benefit: no-plan job shows no Tax benefit section and no marker',
+        tbSoloView.panel === false && tbSoloView.marker === false, JSON.stringify(tbSoloView));
+      // Cleanup: remove the tax-benefit fixture (plan first — a job
+      // with linked plans cannot be deleted).
+      r = await H.req('DELETE', `/api/investments/plans/${tbPlan}`);
+      H.check('tax benefit cleanup: plan deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/earnings/jobs/${tbJob}`);
+      H.check('tax benefit cleanup: job deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/earnings/jobs/${tbSolo}`);
+      H.check('tax benefit cleanup: solo job deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/investments/accounts/${tbAcct}`);
+      H.check('tax benefit cleanup: RRSP account deleted', r.status === 200, JSON.stringify(r.data));
       // Cleanup: remove the fixture rentals so later checks see the
       // pre-existing rentals only.
       r = await H.req('DELETE', `/api/earnings/rentals/${chartAId}`);

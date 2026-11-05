@@ -772,6 +772,49 @@ test('monthly chart: employer-only plan changes nothing', () => {
   }
 });
 
+test('rrsp tax benefit: benefit = tax without deduction − tax with deduction, per-period + annual', () => {
+  const noDed = calcSalary(pretaxJob(), payroll);
+  const withDed = calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll);
+  // Annual is primary (total tax difference, to the cent); per-period
+  // is the annual figure over the pay frequency.
+  const annual = c2(noDed.totalTax - withDed.totalTax);
+  assert.equal(annual, 1613.41);
+  assert.equal(c2(annual / 26), 62.05);
+  // The benefit is exactly the economic net gain from the deduction.
+  assert.equal(c2(withDed.netAnnual - noDed.netAnnual), 1613.41);
+  // No deduction → no benefit.
+  assert.equal(c2(noDed.totalTax - calcSalary(pretaxJob({ rrspDeduction: 0 }), payroll).totalTax), 0);
+});
+
+test('monthly chart: taxBenefit per month is the tax saved by that month’s deduction, grouped by year', () => {
+  const full = calcSalary(pretaxJob(), payroll).perPeriod;
+  const reduced = calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll).perPeriod;
+  const s = jobMonthlySeries({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    calc: calcSalary(pretaxJob({ rrspDeduction: 220.05 }), payroll),
+    plans: [{ start_date: '2026-07-06', own_amount: 220.05 }],
+    today: '2026-10-31', job: pretaxJob(), payroll,
+  });
+  assert.ok(Array.isArray(s.taxBenefit));
+  const perPayday = c2(full.totalTax - reduced.totalTax);
+  for (let i = 0; i < 6; i++) assert.equal(s.taxBenefit[i], 0, `${s.months[i]} must have no benefit before the plan starts`);
+  for (let i = 6; i < 10; i++) {
+    assert.equal(s.taxBenefit[i], c2(nIn(s.months[i]) * perPayday), `${s.months[i]} benefit must be paydays × per-period tax saved`);
+  }
+  assert.deepEqual(s.taxBenefitByYear, [{ year: 2026, annual: c2(s.taxBenefit.reduce((a, b) => a + b, 0)) }]);
+  // No plans → no benefit anywhere, no yearly rows.
+  const none = jobMonthlySeries({
+    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
+    calc: calcSalary(pretaxJob(), payroll), plans: [], today: '2026-10-31', job: pretaxJob(), payroll,
+  });
+  assert.ok(none.taxBenefit.every((v) => v === 0));
+  assert.deepEqual(none.taxBenefitByYear, []);
+  // Bare calls without job/payroll cannot recompute: benefit is null, never guessed.
+  const legacy = jobMonthlySeries(monthlyBase);
+  assert.equal(legacy.taxBenefit, null);
+  assert.equal(legacy.taxBenefitByYear, null);
+});
+
 test('monthly chart: monthly plan paints no RRSP and no tax cut before its start month', () => {
   const full = calcSalary(pretaxJob({ frequency: 'monthly' }), payroll).perPeriod;
   const s = jobMonthlySeries({
