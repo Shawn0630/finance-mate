@@ -2257,6 +2257,25 @@ export async function run(H, S) {
   H.check('planning sink: custom sink grows the pool at the user-filled 6% return',
     customRow && customRow.projection && customRow.projection.stocks && customRow.projection.stocks.valueAtHorizon > customRow.projection.stocks.buyCash * 5 && customRow.comparison && customRow.comparison.stockGain > 0,
     JSON.stringify({ value: customRow && customRow.projection.stocks.valueAtHorizon, buyCash: customRow && customRow.projection.stocks.buyCash, gain: customRow && customRow.comparison.stockGain }));
+  // ---- Op + Sink merge (user 2026-11-05): a cash-pool strategy's
+  // buy ops render in the merged Sink list. A stock-sink buy carries
+  // only a holdingId, so the server resolves its symbol for the row.
+  r = await H.req('GET', `/api/planning/strategies/${poolStrat.id}`);
+  const mergeSinkBuy = (r.data.ops || []).find((o) => o.op_type === 'buy');
+  H.check('opsink-merge: sink buy op carries the sink holding symbol for the list row',
+    r.status === 200 && !!mergeSinkBuy && mergeSinkBuy.holdingSymbol === 'POOL.A' && mergeSinkBuy.params && mergeSinkBuy.params.holdingId === poolHoldA,
+    JSON.stringify(mergeSinkBuy));
+  // A manual buy added to the strategy shows up alongside the sink
+  // buy — same list, no duplication, no loss.
+  r = await H.req('POST', `/api/planning/strategies/${poolStrat.id}/ops`, { op_type: 'buy', params: { accountId: poolAcctB, symbol: 'POOL.B', date: `${_poolVan.slice(0, 7)}-01`, amount: 500, price: 40 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('opsink-merge: manual buy op posted', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${poolStrat.id}`);
+  const mergeBuys = (r.data.ops || []).filter((o) => o.op_type === 'buy');
+  const mergeManual = mergeBuys.find((o) => o.params && o.params.symbol === 'POOL.B');
+  H.check('opsink-merge: strategy keeps both buys (sink + manual) and the manual buy keeps its implicit cash leg',
+    r.status === 200 && mergeBuys.length === 2 && (r.data.ops || []).filter((o) => o.op_type === 'sell').length === 2
+      && !!mergeManual && (mergeManual.legs || []).length === 1 && mergeManual.legs[0].source_ref === 'cash' && mergeManual.legs[0].amount === 'remainder',
+    JSON.stringify({ buys: mergeBuys, ops: (r.data.ops || []).map((o) => o.op_type) }));
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('planning pool/sink browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
@@ -2340,6 +2359,120 @@ export async function run(H, S) {
       H.check('planning pool: strategy detail has no Factors panel, keeps the Sink panel + Scenarios tier (picker gone), no fan chart',
         !stratPage.factorsPanel && stratPage.sinkPanel && stratPage.scenTier && stratPage.scenSelGone && !stratPage.scenarioPanelOld && !stratPage.fanChart,
         JSON.stringify(stratPage));
+      // Op + Sink merge: the pool strategy page has ONE Sink section
+      // and NO Operations section; the buy list shows the sink buy +
+      // the manual buy (buy rows only, no sell rows).
+      const merged = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('#planStrategy h3')].map((h) => h.textContent);
+        const cards = [...document.querySelectorAll('#planSinkBuyList [data-plan-op-card]')];
+        return {
+          heads,
+          sinkPanel: !!document.querySelector('#planSinkPanel'),
+          opsCard: !!document.querySelector('#planStrategyOpsCard'),
+          addBuy: !!document.querySelector('#planSinkAddBuyBtn'),
+          buyTitles: cards.map((c) => c.querySelector('.k')?.textContent || ''),
+          buyCount: cards.length,
+        };
+      });
+      H.check('opsink-merge: pool strategy page shows one Sink section, no Operations, buy list with both buys and no sell rows',
+        !merged.heads.includes('Operations') && merged.heads.filter((h) => h === 'Sink').length === 1
+          && merged.sinkPanel && !merged.opsCard && merged.addBuy && merged.buyCount === 2
+          && merged.buyTitles.every((t) => /\. buy — /.test(t))
+          && merged.buyTitles.some((t) => t.includes('POOL.A')) && merged.buyTitles.some((t) => t.includes('POOL.B')),
+        JSON.stringify(merged));
+      // + Add buy opens the buy-locked form: title 'Add buy', no
+      // operation-type select, Buy all / Half present.
+      await page.click('#planSinkAddBuyBtn');
+      await waitQ(500);
+      await page.waitForSelector('#planOpSymbol', { timeout: 15000 });
+      const addBuyForm = await page.evaluate(() => ({
+        title: document.querySelector('#planOpModalTitle')?.textContent || '',
+        typeSel: !!document.querySelector('#planOpTypeSel'),
+        symbol: !!document.querySelector('#planOpSymbol'),
+        buyAll: !!document.querySelector('#planOpBuyAllBtn'),
+        half: !!document.querySelector('#planOpBuyHalfBtn'),
+      }));
+      H.check('opsink-merge: + Add buy opens the buy-locked form (Add buy, no type select, Buy all / Half present)',
+        addBuyForm.title === 'Add buy' && !addBuyForm.typeSel && addBuyForm.symbol && addBuyForm.buyAll && addBuyForm.half,
+        JSON.stringify(addBuyForm));
+      // Price fill via the suggestion pick, compared against the
+      // price endpoint in the same run, never hardcoded.
+      await page.evaluate(() => {
+        const el = document.querySelector('#planOpSymbol');
+        el.value = 'ISHARES';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const l = document.querySelector('#planOpSymbolSuggest');
+        return l && !l.classList.contains('hidden') && [...l.querySelectorAll('li')].some((li) => li.textContent.includes('XQQ.TO'));
+      }, { timeout: 15000 });
+      await page.evaluate(() => {
+        [...document.querySelectorAll('#planOpSymbolSuggest li')].find((li) => li.textContent.includes('XQQ.TO'))
+          .dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const el = document.querySelector('#planOpPrice');
+        return el && el.value.trim() !== '';
+      }, { timeout: 15000 });
+      const mergeTier = await H.req('GET', '/api/invest/price?symbol=XQQ.TO');
+      const mergePrice = mergeTier.data && mergeTier.data.price != null ? Number(mergeTier.data.price) : null;
+      const mergeFilled = await page.evaluate(() => ({
+        price: document.querySelector('#planOpPrice').value,
+        symbol: document.querySelector('#planOpSymbol').value,
+      }));
+      H.check('opsink-merge: picking a suggestion in the merged Add-buy form fills Price from the price tiers',
+        mergeFilled.symbol === 'XQQ.TO' && mergePrice != null
+          && Number(String(mergeFilled.price).replace(/,/g, '')) === mergePrice,
+        JSON.stringify({ filled: mergeFilled, tier: mergeTier.data }));
+      // Buy all + Units linkage on the merged form (pool total 1100).
+      await page.waitForFunction(() => {
+        const row = document.querySelector('#planOpBuyActionsRow');
+        return row && !row.classList.contains('hidden');
+      }, { timeout: 15000 });
+      await page.click('#planOpBuyAllBtn');
+      await waitQ(300);
+      const mergeAll = await page.evaluate(() => ({
+        amount: document.querySelector('#planOpAmount')?.value || '',
+        units: document.querySelector('#planOpUnits')?.value || '',
+        poolText: document.querySelector('#planOpPoolTotal')?.textContent || '',
+      }));
+      H.check('opsink-merge: Buy all on the merged form sets Amount = pool total, Units = pool / price',
+        mergeAll.amount === '1,100.00' && mergeAll.poolText.includes('1,100.00')
+          && mergePrice != null && mergeAll.units === String(Math.round((1100 / mergePrice) * 10000) / 10000),
+        JSON.stringify({ ...mergeAll, price: mergePrice }));
+      // Over-pool save is blocked naming the pool total + excess.
+      await page.evaluate((ym) => {
+        const a = document.querySelector('#planOpAmount');
+        a.value = '2,000.00';
+        a.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planOpDateVal').value = `${ym}-01`;
+      }, _poolVan.slice(0, 7));
+      await page.click('#planOpSaveBtn');
+      await waitQ(800);
+      const mergeOverMsg = await page.evaluate(() => document.querySelector('#planOpModalMsg') ? document.querySelector('#planOpModalMsg').textContent : '');
+      H.check('opsink-merge: over-pool buy on the merged form is blocked naming the pool total + excess',
+        mergeOverMsg.includes('exceeds the cash pool total $1,100.00') && mergeOverMsg.includes('by $900.00'),
+        JSON.stringify(mergeOverMsg));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitQ(500);
+      // Reports tier on the merged page: Generate creates a report
+      // pinned to this strategy only.
+      await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
+      await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
+      r = await H.req('GET', `/api/planning/projects/${poolProjId}`);
+      const mergeReports = (r.data.reports || []).slice().sort((a, b) => b.id - a.id);
+      const mergeRep = mergeReports[0];
+      let mergeRepStrats = null;
+      try { mergeRepStrats = typeof mergeRep.strategy_ids === 'string' ? JSON.parse(mergeRep.strategy_ids) : mergeRep.strategy_ids; } catch { mergeRepStrats = null; }
+      let mergeRepScens = null;
+      try { mergeRepScens = typeof mergeRep.scenario_ids === 'string' ? JSON.parse(mergeRep.scenario_ids) : mergeRep.scenario_ids; } catch { mergeRepScens = null; }
+      H.check('opsink-merge: Generate on the merged page creates a report pinned to this strategy only',
+        !!mergeRep && Array.isArray(mergeRepStrats) && mergeRepStrats.length === 1 && mergeRepStrats[0] === poolStrat.id
+          // The page runs under the base scenario (Pool Prime), so the
+          // report pins that world — [] is rejected server-side ("pin
+          // at least one scenario") on any project that has scenarios.
+          && Array.isArray(mergeRepScens) && mergeRepScens.length === 1 && mergeRepScens[0] === poolScenId,
+        JSON.stringify({ report: mergeRep && { id: mergeRep.id, strategy_ids: mergeRep.strategy_ids, scenario_ids: mergeRep.scenario_ids } }));
       await page.goto(`http://ff.local/#planning/scenario/${poolScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
       // Prime is checkbox-gated now: check it, then the chart +
@@ -3559,6 +3692,18 @@ export async function run(H, S) {
       }, { timeout: 15000 }, needle);
       await page.goto(`http://ff.local/#planning/strategy/${baStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitBa(1500);
+      // Op + Sink merge gating: an investment strategy over a single
+      // account (no cash-pool baseline) keeps Operations — the merge
+      // applies to pool baselines only.
+      const baHeads = await page.evaluate(() => ({
+        heads: [...document.querySelectorAll('#planStrategy h3')].map((h) => h.textContent),
+        addOp: !!document.querySelector('#planAddOpBtn'),
+        addBuy: !!document.querySelector('#planSinkAddBuyBtn'),
+        sinkGroup: !!document.querySelector('#planStrategySinkGroup'),
+      }));
+      H.check('opsink-merge: account-entity investment strategy keeps Operations (no pool baseline), no merged Sink',
+        baHeads.heads.includes('Operations') && baHeads.addOp && !baHeads.addBuy && !baHeads.sinkGroup,
+        JSON.stringify(baHeads));
       await page.click('#planAddOpBtn');
       await waitBa(500);
       await page.select('#planOpTypeSel', 'buy');
@@ -3735,9 +3880,11 @@ export async function run(H, S) {
       }));
       await page.goto(`http://ff.local/#planning/strategy/${bfStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitBf(1500);
-      await page.click('#planAddOpBtn');
+      // Merged Sink (user 2026-11-05): this is a pool strategy, so
+      // the buy form opens from + Add buy, already locked to buy —
+      // no operation-type select to switch.
+      await page.click('#planSinkAddBuyBtn');
       await waitBf(500);
-      await page.select('#planOpTypeSel', 'buy');
       await page.waitForFunction(() => {
         const row = document.querySelector('#planOpBuyActionsRow');
         const tot = document.querySelector('#planOpPoolTotal');
@@ -3847,9 +3994,8 @@ export async function run(H, S) {
       await waitBf(500);
       await page.goto(`http://ff.local/#planning/strategy/${bfStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitBf(1500);
-      await page.click('#planAddOpBtn');
+      await page.click('#planSinkAddBuyBtn');
       await waitBf(500);
-      await page.select('#planOpTypeSel', 'buy');
       await page.waitForFunction(() => {
         const row = document.querySelector('#planOpBuyActionsRow');
         return row && !row.classList.contains('hidden');
@@ -5175,9 +5321,10 @@ export async function run(H, S) {
           && mixTable.cap.includes('Value Δ') && !mixTable.cap.includes('Balance Δ'),
         JSON.stringify(mixTable));
       // Item 6 revised gating: a strategy with NO report shows no
-      // headline and no chart panels on load (Operations/Sink/
-      // Difference table still present); after UI Generate + reload
-      // the kind-appropriate panels + headline appear.
+      // headline and no chart panels on load (the merged Sink /
+      // Difference table still present; a pool strategy has no
+      // Operations section); after UI Generate + reload the
+      // kind-appropriate panels + headline appear.
       r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Gate pool' });
       H.check('gating: no-report pool strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
       const gatePoolStrat = r.data.strategy.id;
@@ -5198,9 +5345,9 @@ export async function run(H, S) {
           diffTable: !!document.querySelector('#planDiffTable'),
         };
       });
-      H.check('gating: no-report pool strategy page shows no headline and no chart panels, keeps Operations/Sink, no Difference table',
+      H.check('gating: no-report pool strategy page shows no headline and no chart panels, keeps Sink (no Operations), no Difference table',
         !gatePoolClosed.headline && !gatePoolClosed.mort && !gatePoolClosed.eq && !gatePoolClosed.pool && !gatePoolClosed.stock
-          && gatePoolClosed.ops && gatePoolClosed.sink && !gatePoolClosed.diffTable,
+          && !gatePoolClosed.ops && gatePoolClosed.sink && !gatePoolClosed.diffTable,
         JSON.stringify(gatePoolClosed));
       await page.waitForFunction(() => { const b = document.querySelector('#planStrategyGenerateBtn'); if (!b) return false; const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, { timeout: 10000 });
       await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
@@ -9266,6 +9413,28 @@ export async function run(H, S) {
       }));
       H.check('engine: AI-designed scenario/strategy keep preset Generate enabled (routing cancelled), AI Generate stays available',
         routing.genDisabled === false && !routing.note.includes('AI-designed') && routing.aiEnabled, JSON.stringify(routing));
+      // Op + Sink merge: the GIC strategy page shows the merged Sink
+      // with the GIC buy in the list, no Operations section.
+      await page.goto(`http://ff.local/#planning/strategy/${gicSid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await aiWait(1500);
+      const gicPage = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('#planStrategy h3')].map((h) => h.textContent);
+        const cards = [...document.querySelectorAll('#planSinkBuyList [data-plan-op-card]')];
+        return {
+          heads,
+          sinkPanel: !!document.querySelector('#planSinkPanel'),
+          opsCard: !!document.querySelector('#planStrategyOpsCard'),
+          sinkLine: document.querySelector('#planFactorSink')?.textContent || '',
+          buyTitles: cards.map((c) => c.querySelector('.k')?.textContent || ''),
+          buyCount: cards.length,
+        };
+      });
+      H.check('opsink-merge: GIC strategy page shows the merged Sink with the GIC buy, no Operations',
+        !gicPage.heads.includes('Operations') && gicPage.heads.filter((h) => h === 'Sink').length === 1
+          && gicPage.sinkPanel && !gicPage.opsCard && gicPage.buyCount === 1
+          && gicPage.buyTitles.some((t) => t.includes('GIC 4.12% 180d'))
+          && gicPage.sinkLine.includes('GIC 4.12% 180d') && gicPage.sinkLine.includes('4.12%/yr'),
+        JSON.stringify(gicPage));
     } finally { await browserAi.close(); }
     }
   }

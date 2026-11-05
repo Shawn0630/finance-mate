@@ -14019,13 +14019,22 @@ function planLegLabel(l) {
 function planStrategyHtml(d) {
   const s = d.strategy;
   const c = d.comparison;
-  const ops = d.ops.map((o) => {
+  // Merged Sink (user 2026-11-05): a cash-pool investment strategy
+  // shows ONE Sink section instead of Operations — the buy list buys
+  // into the sink, buy-only, no sell rows. Gated on the fixed
+  // baseline BEING a cash pool (figures.poolValue), not on the
+  // project category: an investment strategy over a single account
+  // or holding has no pool and keeps Operations. (baselineKind
+  // alone cannot gate this — it is 'pool' for every investment
+  // project, pool entity or not.)
+  const isPool = !!(d.fixedBaseline && d.fixedBaseline.kind === 'investment' && d.fixedBaseline.figures && d.fixedBaseline.figures.poolValue != null);
+  const planOpCardHtml = (o) => {
     const p = o.params || {};
     const desc = o.op_type === 'prepay' ? `Prepay ${money2(p.amount)} on ${esc(p.date || '')}${p.recurringYears > 1 ? ` yearly × ${p.recurringYears}` : ''}`
       : o.op_type === 'rate_switch' ? `Switch rate on ${esc(p.date || '')} to ${p.rateType === 'fixed' ? `${p.annualRate}% fixed` : `Prime ${p.spread >= 0 ? '+' : ''}${p.spread}`}`
       : o.op_type === 'refinance' ? `Refinance on ${esc(p.date || '')} · ${p.termMonths} months · ${p.amortizationYears}y amortization`
       : o.op_type === 'payment_change' ? `Payment → ${money2(p.payment)} from ${esc(p.date || '')}`
-      : o.op_type === 'buy' ? `Buy ${p.symbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}`
+      : o.op_type === 'buy' ? `Buy ${p.symbol || o.holdingSymbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}`
       : o.op_type === 'sell' ? `Sell ${p.units} units on ${esc(p.date || '')}`
       : `Position ${p.units} units on ${esc(p.date || '')}`;
     const legRows = (o.op_type === 'buy' || o.op_type === 'sell') ? (o.legs || []).map((l) => `
@@ -14035,7 +14044,9 @@ function planStrategyHtml(d) {
       <div class="k">${o.seq}. ${esc(o.op_type)} — ${desc}</div>
       <div class="n">Source: ${esc(o.source || '')}</div>${legRows}
       <div class="toolbar"><button class="small" data-plan-op-edit="${o.id}">Edit</button><button class="small danger" data-plan-op-del="${o.id}">Delete</button></div></div>`;
-  }).join('');
+  };
+  const opsHtml = d.ops.map(planOpCardHtml).join('');
+  const buyOpsHtml = d.ops.filter((o) => o.op_type === 'buy').map(planOpCardHtml).join('');
   // Strategy page mirrors the project page's tiers (user 2026-11-04):
   // top Scenarios tier (single-select, same semantics as the old
   // picker — a click reloads the detail page under that world; the
@@ -14078,17 +14089,27 @@ function planStrategyHtml(d) {
       <div class="section-head"><h3>Baseline</h3></div>
       <div id="planStrategyFixedBaseline">${planFixedBaselineHtml(d.fixedBaseline, fbScenStock, { chartId: 'planStrategyBaselinePoolChart' })}</div>
       </div>
+      ${isPool ? `
+      <div class="plan-flow-group" id="planStrategySinkGroup">
+      <div class="section-head"><h3>Sink</h3></div>
+      <div class="card breakdown-card plan-flow-card" id="planSinkPanel">
+      <div id="planFactorSink"></div>
+      <div id="planSinkBuyList">${buyOpsHtml || '<div class="note">No buys yet.</div>'}</div>
+      <div class="toolbar"><button class="small" id="planSinkAddBuyBtn">+ Add buy</button></div>
+      <div class="msg" id="planOpsMsg"></div>
+      </div>
+      </div>` : `
       <div class="plan-flow-group" id="planStrategyOpsGroup">
       <div class="section-head"><h3>Operations</h3></div>
       <div class="card breakdown-card plan-flow-card" id="planStrategyOpsCard">
       <div class="toolbar" id="planStrategyOpsToolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
-      <div id="planStrategyOpCards">${ops || '<div class="note">No operations yet.</div>'}</div>
+      <div id="planStrategyOpCards">${opsHtml || '<div class="note">No operations yet.</div>'}</div>
       </div>
       <div class="msg" id="planOpsMsg"></div>
-      </div>
+      </div>`}
       </div>
     </div>
-    ${d.project.category === 'investment' ? `<div class="panel" id="planSinkPanel">
+    ${d.project.category === 'investment' && !isPool ? `<div class="panel" id="planSinkPanel">
       <div class="section-head"><h3>Sink</h3></div>
       <div id="planFactorSink"></div>
       <div class="msg" id="planSinkMsg"></div>
@@ -14201,12 +14222,18 @@ function planStrategyWire(d) {
       loadPlanStrategy(s.id);
     } catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
   }));
-  $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
+  const isPool = !!(d.fixedBaseline && d.fixedBaseline.kind === 'investment' && d.fixedBaseline.figures && d.fixedBaseline.figures.poolValue != null);
+  const addOpBtn = $('#planAddOpBtn');
+  if (addOpBtn) addOpBtn.addEventListener('click', () => openPlanOpModal(s.id, null));
   document.querySelectorAll('[data-plan-quick-op]').forEach((b) => b.addEventListener('click', () => openPlanOpModal(s.id, null, b.dataset.planQuickOp)));
+  // Merged Sink: the buy list's + Add buy opens the buy form locked
+  // to buy (no operation-type select — the section is buy-only).
+  const addBuyBtn = $('#planSinkAddBuyBtn');
+  if (addBuyBtn) addBuyBtn.addEventListener('click', () => openPlanOpModal(s.id, null, 'buy', { title: 'Add buy', lockType: true }));
   planStrategyReportsWire(d);
   document.querySelectorAll('[data-plan-op-edit]').forEach((b) => b.addEventListener('click', () => {
     const op = d.ops.find((o) => o.id === Number(b.dataset.planOpEdit));
-    openPlanOpModal(s.id, op);
+    openPlanOpModal(s.id, op, null, isPool && op && op.op_type === 'buy' ? { title: 'Edit buy' } : null);
   }));
   document.querySelectorAll('[data-plan-op-del]').forEach((b) => b.addEventListener('click', async () => {
     try { await api(`/api/planning/ops/${b.dataset.planOpDel}`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
@@ -14234,9 +14261,15 @@ function planStrategyReportsWire(d) {
   const panel = $('#planStrategyReportsPanel');
   if (!panel) return;
   const scenarios = d.scenarios || [];
-  // The page's current world (planStrategyScenarioId: undefined =
-  // server default, 0 = explicit flat, N = scenario N).
-  const currentScenarioIds = () => (planStrategyScenarioId !== undefined && planStrategyScenarioId !== 0) ? [planStrategyScenarioId] : [];
+  // The page's current world: the APPLIED scenario the numbers ran
+  // under (server default = base scenario when none is picked, N =
+  // scenario N, null = explicit flat). Pinning the applied scenario
+  // is pinning the world on screen, never a silent fallback — the
+  // old planStrategyScenarioId mapping sent [] for the base world,
+  // which the server rightly rejects ("pin at least one scenario")
+  // on any project that has scenarios (user 2026-11-05, found by
+  // the op+sink-merge Generate pin).
+  const currentScenarioIds = () => (d.appliedScenario ? [d.appliedScenario.id] : []);
   const pickedBaseline = () => (d.fixedBaseline ? d.fixedBaseline.recordId : null);
   $('#planStrategyGenerateBtn').addEventListener('click', async () => {
     const msg = $('#planStrategyReportMsg');
@@ -15653,14 +15686,17 @@ function planBuyPoolOverflow(root, amount) {
   if (amount > total) return `Buy amount ${money2(amount)} exceeds the cash pool total ${money2(total)} by ${money2(Math.round((amount - total) * 100) / 100)}`;
   return null;
 }
-async function openPlanOpModal(strategyId, existing, presetType) {
+async function openPlanOpModal(strategyId, existing, presetType, opts) {
   const strategy = planStrategyData ? planStrategyData.strategy : null;
   const projectId = planStrategyData ? planStrategyData.project.id : null;
   const ctx = await planLoadOpCtx(projectId, strategyId);
   planOpCtx = ctx;
   const type = existing ? existing.op_type : (presetType || 'prepay');
-  $('#planOpModalTitle').textContent = existing ? 'Edit operation' : 'Add operation';
-  const typeSel = existing ? '' : `<div><label>Operation type *</label><select id="planOpTypeSel">
+  $('#planOpModalTitle').textContent = (opts && opts.title) || (existing ? 'Edit operation' : 'Add operation');
+  // A locked form (the merged Sink's + Add buy) opens straight into
+  // the preset action with no operation-type select — the section is
+  // buy-only, so the user cannot switch it to a sell.
+  const typeSel = (existing || (opts && opts.lockType)) ? '' : `<div><label>Operation type *</label><select id="planOpTypeSel">
     <option value="prepay">Prepay mortgage</option><option value="rate_switch">Rate switch</option>
     <option value="refinance">Refinance</option><option value="payment_change">Payment change</option>
     <option value="buy">Buy</option><option value="sell">Sell</option><option value="position">Position (cost unknown)</option></select></div>`;
@@ -15742,7 +15778,7 @@ async function openPlanOpModal(strategyId, existing, presetType) {
   openModal('planOpModal');
   $('#planOpSaveBtn').addEventListener('click', async () => {
     const msg = $('#planOpModalMsg');
-    const curType = existing ? existing.op_type : $('#planOpTypeSel').value;
+    const curType = existing ? existing.op_type : (typeEl ? typeEl.value : type);
     try {
       const { params, legs } = planReadOpForm(curType, $('#planOpModalBody').closest('.modal-card'));
       if (!params.date) throw new Error('date is required');

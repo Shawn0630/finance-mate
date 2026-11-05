@@ -4564,6 +4564,15 @@ function planOpsOf(strategyId) {
   for (const o of ops) {
     o.legs = db.prepare('SELECT * FROM plan_legs WHERE op_id = ? ORDER BY id').all(o.id);
   }
+  // Buy/sell ops that target an existing holding carry only its id —
+  // the strategy page's buy list shows the holding's symbol, resolved
+  // here so the client never has to join holdings itself.
+  const holdingIds = [...new Set(ops.map((o) => (o.params && o.params.holdingId) || null).filter((x) => x != null))];
+  if (holdingIds.length) {
+    const rows = db.prepare(`SELECT id, symbol, label FROM invest_holdings WHERE id IN (${holdingIds.map(() => '?').join(',')})`).all(...holdingIds);
+    const byId = new Map(rows.map((r) => [r.id, r.symbol || r.label || '']));
+    for (const o of ops) if (o.params && o.params.holdingId && byId.has(Number(o.params.holdingId))) o.holdingSymbol = byId.get(Number(o.params.holdingId));
+  }
   return ops;
 }
 function planAssumptionsOf(strategyId) {
