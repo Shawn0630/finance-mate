@@ -16,7 +16,7 @@ import {
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
 import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured, callLlm, parseModelJson, validateChatFiles, fileContentParts } from './aiFill.js';
-import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts } from './costs.js';
+import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts, costAnnual } from './costs.js';
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   addNavPoint, updateNavPoint,
@@ -29,7 +29,7 @@ import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
-  deriveRentalYearFigures, entryCoveredYears, resolvePayChangeValues, positionValueFor,
+  deriveRentalYearFigures, entryCoveredYears, resolvePayChangeValues, positionValueFor, nextRentPayment,
 } from './earnings.js';
 import {
   validPlanInput, listPlans, getPlan, planView, generatePlan, generatePlansForAccount,
@@ -3393,7 +3393,39 @@ const earnJobRow = (row) => {
     taxBenefit,
   };
 };
-const earnRentalYearRow = (rental, row) => {
+// Property-derived deductible inputs for a rental: the linked
+// property's costs by year (annual totals by category, monthly
+// entries averaged x 12) plus that year's mortgage interest from the
+// engine's schedule. Only when the rental is linked to a property
+// AND a rental portion is set; otherwise null and expenses stay as
+// manually entered. Returns a Map taxYear -> { costs, interest }.
+const rentalDerivedInputs = (rental) => {
+  if (!rental || rental.property_id == null || rental.rental_portion_pct == null) return null;
+  const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(rental.property_id);
+  if (!prop) return null;
+  const costsByYear = new Map();
+  for (const c of db.prepare('SELECT * FROM property_costs WHERE property_id = ?').all(prop.id)) {
+    const annual = costAnnual(c);
+    if (!(annual > 0)) continue;
+    const list = costsByYear.get(c.year) || [];
+    list.push({ label: c.category, annual: Math.round(annual * 100) / 100 });
+    costsByYear.set(c.year, list);
+  }
+  const interestByYear = new Map();
+  const proj = projectionFor(prop);
+  if (proj) {
+    for (const row of proj.series || []) {
+      if (!(row.interest > 0)) continue;
+      const y = Number(String(row.month).slice(0, 4));
+      interestByYear.set(y, Math.round(((interestByYear.get(y) || 0) + row.interest) * 100) / 100);
+    }
+  }
+  const years = new Set([...costsByYear.keys(), ...interestByYear.keys()]);
+  const out = new Map();
+  for (const y of years) out.set(y, { costs: costsByYear.get(y) || [], interest: interestByYear.has(y) ? interestByYear.get(y) : null });
+  return out;
+};
+const earnRentalYearRow = (rental, row, derivedByYear) => {
   // Rent figures are derived from entries when any entry covers the
   // year; otherwise the row's stored figures stand (that is what
   // pre-entry records carry, and what a manual expenses-only year
@@ -3415,7 +3447,7 @@ const earnRentalYearRow = (rental, row) => {
     calc: calcRentalYear(rental, {
       ...year, expenses: year.expenses,
       claim_cca: year.claim_cca, cca_acknowledged: year.cca_acknowledged,
-    }, earnRegion().rental),
+    }, earnRegion().rental, derivedByYear ? (derivedByYear.get(row.tax_year) || null) : null),
   };
 };
 const earnRentalRow = (row) => {
@@ -3427,8 +3459,10 @@ const earnRentalRow = (row) => {
   };
   const entries = db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(row.id);
   rental.entries = entries;
+  rental.nextRentDue = nextRentPayment(entries, vancouverToday());
   const years = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC').all(row.id);
-  return { ...rental, years: years.map((y) => earnRentalYearRow(rental, y)) };
+  const derivedByYear = rentalDerivedInputs(rental);
+  return { ...rental, years: years.map((y) => earnRentalYearRow(rental, y, derivedByYear)) };
 };
 // Every tax year an entry covers gets a year record (bare defaults;
 // the rent figures come from the entries at read time). INSERT OR
@@ -3737,9 +3771,9 @@ app.post('/api/earnings/rentals', requireApiAuth, (req, res) => {
     const ts = nowIso();
     const info = db.prepare(
       `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level, ownership_pct,
-       is_principal_residence, was_principal_residence, structural_change, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
+       rental_portion_pct, is_principal_residence, was_principal_residence, structural_change, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct, v.rental_portion_pct,
       v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, ts, ts);
     return { value: earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(info.lastInsertRowid)), entityId: info.lastInsertRowid };
   });
@@ -3759,9 +3793,9 @@ app.put('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
   }, () => {
     db.prepare(
       `UPDATE earn_rentals SET property_id = ?, label = ?, address = ?, rental_type = ?, services_level = ?,
-       ownership_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
+       ownership_pct = ?, rental_portion_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
        updated_at = ? WHERE id = ?`).run(
-      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct,
+      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct, v.rental_portion_pct,
       v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, nowIso(), id);
     return { value: earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(id)), entityId: id };
   });
@@ -3802,7 +3836,7 @@ app.post('/api/earnings/rentals/:id/years', requireApiAuth, (req, res) => {
         v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
         v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
         v.str_compliant_days, v.str_non_compliant_days, ts, ts);
-      return { value: earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(info.lastInsertRowid)), entityId: rentalId };
+      return { value: earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(info.lastInsertRowid), rentalDerivedInputs(rental)), entityId: rentalId };
     });
   } catch {
     return res.status(400).json({ error: 'a year record already exists for this rental.' });
@@ -3831,7 +3865,7 @@ app.put('/api/earnings/rentals/:rentalId/years/:yearId', requireApiAuth, (req, r
       v.mortgage_interest, v.mortgage_principal, JSON.stringify(v.expenses),
       v.claim_cca ? 1 : 0, v.cca_acknowledged ? 1 : 0, v.ucc_class1, v.ucc_class8,
       v.str_compliant_days, v.str_non_compliant_days, nowIso(), yearId);
-    return { value: earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(yearId)), entityId: rental.id };
+    return { value: earnRentalYearRow(earnRentalRow(rental), db.prepare('SELECT * FROM earn_rental_years WHERE id = ?').get(yearId), rentalDerivedInputs(rental)), entityId: rental.id };
   });
   res.json(out);
 });

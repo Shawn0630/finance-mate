@@ -908,12 +908,19 @@ export function validRentalInput(body) {
   if (propertyId != null && (!Number.isInteger(propertyId) || propertyId <= 0)) {
     return { error: 'property_id must be an existing property id.' };
   }
+  // The rented share of the linked property (the tenant's share, NOT
+  // the ownership split): blank = not set, and derivation stays off.
+  const portion = b.rental_portion_pct == null || b.rental_portion_pct === '' ? null : Number(b.rental_portion_pct);
+  if (portion != null && (!Number.isFinite(portion) || portion <= 0 || portion > 100)) {
+    return { error: 'rental_portion_pct must be between 0 and 100.' };
+  }
   // Deliberately no tenant identifiers, mortgage account number, or
   // GST fields here: long-term rent is GST-exempt, and GST fields
   // only exist on the short-term/commercial path (year records).
   return {
     label, rental_type: rentalType, services_level: servicesLevel, ownership_pct: ownershipPct,
     property_id: propertyId, address: cleanStr(b.address, 240),
+    rental_portion_pct: portion,
     is_principal_residence: b.is_principal_residence === true || b.is_principal_residence === 1 || b.is_principal_residence === '1',
     was_principal_residence: b.was_principal_residence === true || b.was_principal_residence === 1 || b.was_principal_residence === '1',
     structural_change: b.structural_change === true || b.structural_change === 1 || b.structural_change === '1',
@@ -1014,6 +1021,37 @@ export function deriveRentalYearFigures(entries, taxYear, now = currentYm()) {
   return { gross_rents: gross, rental_days: days, covered: coveredMonths.size > 0 };
 }
 
+// The next rent payment on or after today ('YYYY-MM-DD'): each entry
+// pays on its pay day (clamped to the month's length) for every month
+// it covers; the earliest such date across entries wins, null when no
+// entry covers a future date. The amount is the entry's gross monthly
+// rent — the owner's share is applied downstream, not here.
+export function nextRentPayment(entries, todayStr) {
+  if (!todayStr) return null;
+  const [ty, tm] = todayStr.split('-').map(Number);
+  let best = null;
+  for (const e of entries || []) {
+    if (!e || !e.start_ym || e.monthly_rent == null) continue;
+    const [sy, sm] = String(e.start_ym).split('-').map(Number);
+    const end = e.end_ym ? String(e.end_ym).split('-').map(Number) : null;
+    const day = Math.max(1, Math.min(31, Number(e.pay_day) || 1));
+    let y = Math.max(ty, sy);
+    let m = y === ty ? Math.max(tm, sm) : (y === sy ? sm : 1);
+    for (let i = 0; i < 36; i++) {
+      if (end && (y > end[0] || (y === end[0] && m > end[1]))) break;
+      const d = Math.min(day, daysInMonth(y, m));
+      const iso = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      if (iso >= todayStr) {
+        if (!best || iso < best.date) best = { date: iso, amount: round2(Number(e.monthly_rent)) };
+        break;
+      }
+      m++;
+      if (m > 12) { m = 1; y++; }
+    }
+  }
+  return best;
+}
+
 export function validRentalYearInput(body, t776Lines) {
   const b = body || {};
   const taxYear = Number(b.tax_year);
@@ -1053,9 +1091,13 @@ export function validRentalYearInput(body, t776Lines) {
   };
 }
 
-export function calcRentalYear(rental, year, rentalRegion) {
+export function calcRentalYear(rental, year, rentalRegion, derived) {
   const warnings = [];
-  const factor = (year.area_share_pct / 100) * (year.rental_days / 365);
+  // The rented share governs the year: the rental's portion (the
+  // tenant's share of the linked property) when set, else the year
+  // record's own area share. A partial year prorates by rented days.
+  const areaShare = rental && rental.rental_portion_pct != null ? rental.rental_portion_pct : year.area_share_pct;
+  const factor = (areaShare / 100) * (year.rental_days / 365);
   const byLine = {};
   for (const l of rentalRegion.t776Lines) byLine[l.line] = 0;
   let directTotal = 0;
@@ -1068,9 +1110,35 @@ export function calcRentalYear(rental, year, rentalRegion) {
   // Mortgage interest flows to 8710 (it is an expense); principal
   // never flows anywhere in the expense set.
   byLine['8710'] = round2((byLine['8710'] || 0) + year.mortgage_interest);
+  // Property-derived costs: the linked property's books (annual cost
+  // totals by category) plus that year's mortgage interest — both
+  // scaled by the rented share. Manual T776 lines are ADDITIONAL
+  // costs not in the property's books, so nothing is counted twice:
+  // Sum = derived + manual = Deductible expenses. The derived
+  // interest is the T776 line 8710 interest for that year; it is
+  // listed in the expense table, not in the entered-lines breakdown.
+  const derivedCosts = (derived && derived.costs) || [];
+  const derivedItems = derivedCosts
+    .filter((c) => c && Number(c.annual) > 0)
+    .map((c) => ({ label: c.label, deductible: round2(Number(c.annual) * factor) }));
+  const derivedInterest = derived && derived.interest != null ? Number(derived.interest) : null;
+  if (derivedInterest != null && derivedInterest > 0) {
+    derivedItems.push({ label: 'Mortgage interest', deductible: round2(derivedInterest * factor) });
+  }
+  const derivedGross = derivedCosts.reduce((s, c) => s + (Number(c.annual) || 0), 0)
+    + (derivedInterest != null ? derivedInterest : 0);
+  const derivedTotal = derivedItems.reduce((s, i) => s + i.deductible, 0);
+  const t776ByLine = new Map((rentalRegion.t776Lines || []).map((l) => [l.line, l.label]));
+  const manualRows = (year.expenses || []).map((e) => ({
+    label: `${t776ByLine.get(e.line) || ('Line ' + e.line)} (manual)`,
+    deductible: e.direct ? round2(e.amount) : round2(e.amount * factor),
+  }));
+  if (Number(year.mortgage_interest) > 0) {
+    manualRows.push({ label: 'Mortgage interest (manual)', deductible: round2(Number(year.mortgage_interest)) });
+  }
   const deductibleShared = sharedTotal * factor;
-  const personalPortion = round2(sharedTotal * (1 - factor));
-  const deductibleExpenses = round2(directTotal + deductibleShared + year.mortgage_interest);
+  const personalPortion = round2(sharedTotal * (1 - factor) + derivedGross * (1 - factor));
+  const deductibleExpenses = round2(directTotal + deductibleShared + year.mortgage_interest + derivedTotal);
   const grossWhole = round2(year.gross_rents + year.other_income);
   let netBeforeCca = round2(grossWhole - deductibleExpenses);
   // s.67.7: short-term non-compliant days deny expenses pro-rata.
@@ -1117,6 +1185,7 @@ export function calcRentalYear(rental, year, rentalRegion) {
     grossWhole, otherIncome: round2(year.other_income),
     expensesByLine: byLine, totalExpensesEntered: round2(directTotal + sharedTotal),
     personalPortion9949: personalPortion, deductibleExpenses,
+    expenseTable: { rows: [...derivedItems, ...manualRows], sum: deductibleExpenses, hasDerived: derivedItems.length > 0 },
     mortgageInterest: round2(year.mortgage_interest), mortgagePrincipal: round2(year.mortgage_principal),
     deniedExpenses, netBeforeCca9369: netBeforeCca, ccaClaim9936: ccaClaim,
     netWhole9946: netWhole, ownerShareNet: ownerShare, ownershipPct: rental.ownership_pct,

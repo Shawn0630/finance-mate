@@ -261,10 +261,34 @@ export async function run(H, S) {
         salaryText.slice(0, 300));
       await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
-      const rentalText = await page.evaluate(() => document.querySelector('#earn-rentals').textContent);
-      H.check('earnings UI: rentals section lists the rental with its T776 year summary',
-        rentalText.includes('Basement suite') && rentalText.includes('Owner share'),
-        rentalText.slice(0, 300));
+      // Rentals: the list card is slim — title + a Next rent due
+      // headline (the API's next payment date + gross rent); the
+      // T776 year summary and the entries live on the detail page.
+      const rentalUi = await page.evaluate(async () => {
+        const d = await (await fetch('/api/earnings')).json();
+        const r = d.rentals.find((x) => x.label === 'Basement suite');
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Basement suite'));
+        const head = card ? card.querySelector('.summary-card .v')?.textContent.trim() : null;
+        const sub = card ? card.querySelector('.summary-card .n')?.textContent.trim() : null;
+        const text = document.querySelector('#earn-rentals').textContent;
+        return {
+          hasBasement: text.includes('Basement suite'),
+          head, sub,
+          wantDate: r && r.nextRentDue ? window.earnJobDateLabel(r.nextRentDue.date) : null,
+          hasNeutral: text.includes('No upcoming payment'),
+          hasOwnerShare: text.includes('Owner share'),
+          hasDerived: text.includes('from rent entries'),
+          hasTenant: text.includes('Test Tenant'),
+        };
+      });
+      const rentalHeadOk = rentalUi.wantDate
+        ? (rentalUi.head === rentalUi.wantDate && rentalUi.sub && rentalUi.sub.includes('2,000.00'))
+        : rentalUi.hasNeutral;
+      H.check('earnings UI: rental card shows the Next rent due headline, no T776 detail',
+        rentalUi.hasBasement && rentalHeadOk
+          && !rentalUi.hasOwnerShare && !rentalUi.hasDerived && !rentalUi.hasTenant,
+        JSON.stringify(rentalUi));
       // Earnings charts: overview composition, rental net — plus
       // the standard legend left-click toggle. The Salary view
       // carries no chart any more (it moved to the job detail
@@ -386,6 +410,12 @@ export async function run(H, S) {
         !earnPopRect.hidden && Math.abs(earnPopRect.pTop - (earnPopRect.fBottom + 6)) <= 2
         && Math.abs(earnPopRect.pLeft - Math.max(4, Math.min(earnPopRect.fLeft, earnPopRect.vw - earnPopRect.pWidth - 4))) <= 2,
         JSON.stringify(earnPopRect));
+      // The From button names the effective range's first month
+      // (2024), so the picker opens at 2024: step to 2026 first.
+      await page.click('#monthPopNext');
+      await waitE(200);
+      await page.click('#monthPopNext');
+      await waitE(200);
       await page.click('#monthPop button[data-ym="2026-06"]');
       await waitE(600);
       const earnPick = await page.evaluate(() => {
@@ -438,13 +468,13 @@ export async function run(H, S) {
         rentIncomeInfo && rentIncomeInfo.keys.includes('gross') && rentIncomeInfo.keys.includes('expenses') && rentIncomeLineOk,
         JSON.stringify(rentIncomeInfo));
 
-      // Rent entries UI: the rental card lists the entry (tenant as a
-      // plain string) and the year block marks its days as derived;
-      // the monthly-rent money input groups while typing.
+      // Rent entries UI: the entry (tenant as a plain string) and the
+      // year block's derived-days marker live on the DETAIL page now
+      // (the list card is slim); the monthly-rent money input groups
+      // while typing.
       await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
       const entryUi = await page.evaluate(async () => {
-        const text = document.querySelector('#earn-rentals').textContent;
         const d = await (await fetch('/api/earnings')).json();
         const rental = d.rentals.find((x) => x.label === 'Basement suite');
         window.earnAddEntry(rental.id);
@@ -453,20 +483,28 @@ export async function run(H, S) {
         input.dispatchEvent(new Event('input', { bubbles: true }));
         const grouped = input.value;
         document.querySelector('#earnRentalEntryCancelBtn').click();
-        return { textHasTenant: text.includes('Test Tenant'), textHasDerived: text.includes('from rent entries'), grouped };
+        return { rentalId: rental.id, grouped };
       });
-      H.check('earnings UI: rental card lists the rent entry and marks derived days',
-        entryUi.textHasTenant && entryUi.textHasDerived, JSON.stringify(entryUi));
       H.check('earnings UI: monthly-rent input groups thousands while typing',
         entryUi.grouped === '1,234', JSON.stringify(entryUi));
+      await page.goto(`http://ff.local/#earnings/rental/${entryUi.rentalId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => !!document.querySelector('#earnRentalBackLink'), { timeout: 10000 });
+      const detailEntryUi = await page.evaluate(() => {
+        const text = document.querySelector('#earnRentalDetail').textContent;
+        return { textHasTenant: text.includes('Test Tenant'), textHasDerived: text.includes('from rent entries') };
+      });
+      H.check('earnings UI: rental detail lists the rent entry and marks derived days',
+        detailEntryUi.textHasTenant && detailEntryUi.textHasDerived, JSON.stringify(detailEntryUi));
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
 
       // Rental modals: the rent entry modal (not an inline
-      // panel); saving from the modal creates the entry and the
-      // card refreshes with derived years; + Year record is gone;
-      // year edit opens a modal too. The card no longer carries
-      // + Rent entry — the detail panel does — so the modal here
-      // opens through the same handler the button calls, and the
-      // detail button itself is pinned in the detail section below.
+      // panel); saving from the modal creates the entry with derived
+      // years; + Year record is gone; year edit opens a modal too.
+      // The card no longer carries + Rent entry — the detail panel
+      // does — so the modal here opens through the same handler the
+      // button calls, and the detail button itself is pinned in the
+      // detail section below.
       r = await H.req('POST', '/api/earnings/rentals', {
         label: 'Modal rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
       });
@@ -579,7 +617,9 @@ export async function run(H, S) {
       await page.type('#earnRentalEntryForm [name="tenant_name"]', 'Modal Tenant');
       await page.evaluate(() => { document.querySelector('#earnRentalEntryForm').pay_day.value = '1'; });
       await page.click('#earnRentalEntryForm button[type="submit"]');
-      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Modal Tenant'), { timeout: 10000 });
+      // The list card no longer shows entries (the detail page does),
+      // so the save's completion signal is the modal closing.
+      await page.waitForFunction(() => document.querySelector('#earnRentalEntryModal').classList.contains('hidden'), { timeout: 10000 });
       r = await H.req('GET', '/api/earnings');
       const modalRental = (r.data.rentals || []).find((x) => x.id === modalRentalId);
       const modalYear = modalRental && modalRental.years.find((y) => y.tax_year === 2026);
@@ -600,7 +640,8 @@ export async function run(H, S) {
       H.check('rental modals: year modal Cancel closes it', yearModalClosed === true, JSON.stringify(yearModalClosed));
 
       // Blank To still means ongoing: pick only a start month and
-      // save; the entry stores a null end and the card shows it.
+      // save; the entry stores a null end (its range label lives on
+      // the detail page now — the list card shows the headline only).
       await page.evaluate((rid) => window.earnAddEntry(rid), modalRentalId);
       await waitE(300);
       await pickEntryMonth('#earnEntryStartBtn', '2025-06');
@@ -614,7 +655,7 @@ export async function run(H, S) {
       await page.type('#earnRentalEntryForm [name="monthly_rent"]', '2000');
       await page.evaluate(() => { document.querySelector('#earnRentalEntryForm').pay_day.value = '5'; });
       await page.click('#earnRentalEntryForm button[type="submit"]');
-      await page.waitForFunction(() => document.querySelector('#earnRentalList').textContent.includes('Jun 2025 – Ongoing'), { timeout: 10000 });
+      await page.waitForFunction(() => document.querySelector('#earnRentalEntryModal').classList.contains('hidden'), { timeout: 10000 });
       r = await H.req('GET', '/api/earnings');
       const ongoingRental = (r.data.rentals || []).find((x) => x.id === modalRentalId);
       const ongoingEntry = ongoingRental && ongoingRental.entries.find((e) => e.start_ym === '2025-06');
@@ -1567,6 +1608,228 @@ export async function run(H, S) {
       H.check('rental income panel cleanup: Chart A deleted', r.status === 200, JSON.stringify(r.data));
       r = await H.req('DELETE', `/api/earnings/rentals/${chartBId}`);
       H.check('rental income panel cleanup: Chart B deleted', r.status === 200, JSON.stringify(r.data));
+
+      // ---- Earnings rental round (2026-11-05): Item A headline card,
+      // Item B overview default All + From/To, Item C derived expenses.
+      // Item A: a fixture rental with only ended entries shows the
+      // neutral line on its card.
+      r = await H.req('POST', '/api/earnings/rentals', {
+        label: 'Ended rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+      });
+      H.check('rental headline setup: ended rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const endedRentalId = r.data.id;
+      r = await H.req('POST', `/api/earnings/rentals/${endedRentalId}/entries`, {
+        start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 1500, pay_day: 1,
+      });
+      H.check('rental headline setup: ended entry created', r.status === 201, JSON.stringify(r.data));
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const endedCard = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Ended rental'));
+        return card ? { hasHeadline: card.textContent.includes('Next rent due'), hasNeutral: card.textContent.includes('No upcoming payment') } : null;
+      });
+      H.check('rental headline: ended-only rental shows the neutral line, no headline',
+        endedCard && !endedCard.hasHeadline && endedCard.hasNeutral, JSON.stringify(endedCard));
+
+      // Item B: the overview defaults to All on load (fresh state
+      // after a reload) and From/To name the data's actual years.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await page.goto('http://ff.local/#earnings/overview', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const ovDefault = await page.evaluate(() => {
+        const chart = window.__fmCharts.earnOverview;
+        const from = document.querySelector('[data-earn-range="overview"] [data-earn-month="from"]');
+        const to = document.querySelector('[data-earn-range="overview"] [data-earn-month="to"]');
+        const allBtn = document.querySelector('[data-earn-range="overview"] [data-years="0"]');
+        return {
+          labels: chart ? chart.data.labels : null,
+          fromText: from ? from.textContent.trim() : null, fromVal: from ? from.dataset.value : null,
+          toText: to ? to.textContent.trim() : null, toVal: to ? to.dataset.value : null,
+          allActive: allBtn ? allBtn.classList.contains('active') : null,
+        };
+      });
+      const ovChartYears = (await H.req('GET', '/api/earnings/charts')).data.years;
+      H.check('overview default: All active on load, chart shows every data year, From/To name the range',
+        ovDefault.allActive === true
+          && ovDefault.labels && JSON.stringify(ovDefault.labels) === JSON.stringify(ovChartYears.map(String))
+          && ovDefault.fromVal === `${ovChartYears[0]}-01` && ovDefault.toVal === `${ovChartYears[ovChartYears.length - 1]}-12`
+          && ovDefault.fromText !== '—' && ovDefault.toText !== '—',
+        JSON.stringify({ ...ovDefault, chartYears: ovChartYears }));
+      await page.click('[data-earn-range="overview"] [data-preset="ytd"]');
+      await waitE(500);
+      const ovYtd2 = await page.evaluate(() => {
+        const chart = window.__fmCharts.earnOverview;
+        const from = document.querySelector('[data-earn-range="overview"] [data-earn-month="from"]');
+        const to = document.querySelector('[data-earn-range="overview"] [data-earn-month="to"]');
+        return {
+          labels: chart ? chart.data.labels : null,
+          fromVal: from ? from.dataset.value : null, toVal: to ? to.dataset.value : null,
+        };
+      });
+      const curYear = new Date().getFullYear();
+      const curYm = `${curYear}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+      H.check('overview This year (round): From Jan, To current month, chart narrows to the year',
+        ovYtd2.labels && ovYtd2.labels.join(',') === String(curYear)
+          && ovYtd2.fromVal === `${curYear}-01` && ovYtd2.toVal === curYm,
+        JSON.stringify(ovYtd2));
+      await page.click('[data-earn-range="overview"] [data-years="0"]');
+      await waitE(500);
+      await page.click('[data-earn-range="overview"] [data-earn-month="from"]');
+      await waitE(300);
+      // The From button names the effective range's first month, so
+      // the picker opens there: step to 2026 before picking June.
+      await page.evaluate(() => {
+        const yearEl = document.querySelector('#monthPopYear');
+        let guard = 0;
+        while (Number(yearEl.textContent) !== 2026 && guard++ < 120) {
+          document.querySelector('#monthPopNext').click();
+        }
+      });
+      await waitE(300);
+      await page.click('#monthPop button[data-ym="2026-06"]');
+      await waitE(600);
+      const ovManual2 = await page.evaluate(() => {
+        const chart = window.__fmCharts.earnOverview;
+        const from = document.querySelector('[data-earn-range="overview"] [data-earn-month="from"]');
+        const to = document.querySelector('[data-earn-range="overview"] [data-earn-month="to"]');
+        return {
+          labels: chart ? chart.data.labels : null,
+          fromText: from ? from.textContent.trim() : null, fromVal: from ? from.dataset.value : null,
+          toText: to ? to.textContent.trim() : null, toVal: to ? to.dataset.value : null,
+        };
+      });
+      H.check('overview manual pick (round): From Jun 2026 narrows the chart to 2026+, To names the range end',
+        ovManual2.labels && ovManual2.labels.join(',') === '2026'
+          && ovManual2.fromVal === '2026-06' && ovManual2.fromText === 'Jun 2026'
+          && ovManual2.toVal === '2026-12',
+        JSON.stringify(ovManual2));
+
+      // Item C: a property with known 2025/2026 costs + a fixed 5%
+      // mortgage, a rental linked to it with portion 33% — the
+      // derived 2026 deductible = 33% x (costs + interest) to the cent.
+      r = await H.req('POST', '/api/properties', {
+        address: '1 Derived Way, Coquitlam, BC', region: 'CA', purchase_date: '2024-12-01',
+        mortgage_balance: 120000, mortgage_balance_date: '2025-01-01', amortization_years: 25,
+      });
+      H.check('derived setup: property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const derPropId = r.data.id;
+      r = await H.req('POST', `/api/properties/${derPropId}/rates`, {
+        start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5,
+      });
+      H.check('derived setup: fixed 5% segment created', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/properties/${derPropId}/costs`, { year: 2025, category: 'Property tax', amount: 5000 });
+      H.check('derived setup: 2025 Property tax cost created', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/properties/${derPropId}/costs`, { year: 2026, category: 'Property tax', amount: 6000 });
+      H.check('derived setup: 2026 Property tax cost created', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/properties/${derPropId}/costs`, { year: 2026, category: 'Gas', amount: 100, basis: 'monthly' });
+      H.check('derived setup: 2026 Gas monthly cost created', r.status === 201, JSON.stringify(r.data));
+      const amort = await H.req('GET', `/api/properties/${derPropId}/amortization`);
+      const interestByYear = {};
+      for (const row of (amort.data.series || [])) {
+        const y = Number(String(row.month).slice(0, 4));
+        interestByYear[y] = Math.round(((interestByYear[y] || 0) + (row.interest || 0)) * 100) / 100;
+      }
+      H.check('derived setup: amortization series read', amort.status === 200 && interestByYear[2025] > 0 && interestByYear[2026] > 0, JSON.stringify({ i25: interestByYear[2025], i26: interestByYear[2026] }));
+      r = await H.req('POST', '/api/earnings/rentals', {
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        property_id: derPropId, rental_portion_pct: 33,
+      });
+      H.check('derived setup: linked rental created with portion 33', r.status === 201 && r.data.rental_portion_pct === 33, JSON.stringify(r.data));
+      const derRentalId = r.data.id;
+      r = await H.req('POST', `/api/earnings/rentals/${derRentalId}/entries`, {
+        start_ym: '2025-01', end_ym: '2026-12', monthly_rent: 2000, pay_day: 15,
+      });
+      H.check('derived setup: entry covering 2025–2026 created', r.status === 201, JSON.stringify(r.data));
+      const derEarn = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === derRentalId);
+      const derY26 = derEarn.years.find((y) => y.tax_year === 2026);
+      const derY25 = derEarn.years.find((y) => y.tax_year === 2025);
+      const want26 = Math.round((0.33 * (7200 + interestByYear[2026])) * 100) / 100;
+      const want25 = Math.round((0.33 * (5000 + interestByYear[2025])) * 100) / 100;
+      H.check('derived expenses: 2026 deductible = 33% x (costs + interest) to the cent',
+        derY26 && Math.abs(derY26.calc.deductibleExpenses - want26) < 0.01
+          && Math.abs(derY26.calc.personalPortion9949 - Math.round(0.67 * (7200 + interestByYear[2026]) * 100) / 100) < 0.02,
+        JSON.stringify({ got: derY26 && derY26.calc.deductibleExpenses, want: want26, personal: derY26 && derY26.calc.personalPortion9949 }));
+      H.check('derived expenses: 2025 deductible = 33% x (costs + interest) to the cent',
+        derY25 && Math.abs(derY25.calc.deductibleExpenses - want25) < 0.01,
+        JSON.stringify({ got: derY25 && derY25.calc.deductibleExpenses, want: want25 }));
+      H.check('derived expenses: expense table rows + sum match the year calc',
+        derY26 && derY26.calc.expenseTable.hasDerived === true
+          && Math.abs(derY26.calc.expenseTable.sum - derY26.calc.deductibleExpenses) < 0.01
+          && derY26.calc.expenseTable.rows.some((row) => row.label === 'Property tax' && Math.abs(row.deductible - 1980) < 0.01)
+          && derY26.calc.expenseTable.rows.some((row) => row.label === 'Gas' && Math.abs(row.deductible - 396) < 0.01)
+          && derY26.calc.expenseTable.rows.some((row) => row.label === 'Mortgage interest' && Math.abs(row.deductible - Math.round(interestByYear[2026] * 0.33 * 100) / 100) < 0.01),
+        JSON.stringify(derY26 && derY26.calc.expenseTable));
+      // A rental with no linked property shows no derived table.
+      const baseEarn = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.label === 'Basement suite');
+      const baseY26 = baseEarn.years.find((y) => y.tax_year === 2026);
+      H.check('derived expenses: unlinked rental has no derived table, manual calc unchanged',
+        baseY26 && baseY26.calc.expenseTable.hasDerived === false && baseY26.calc.deductibleExpenses === 12500,
+        JSON.stringify(baseY26 && baseY26.calc));
+      // Editing the portion re-derives on save (the save rule).
+      r = await H.req('PUT', `/api/earnings/rentals/${derRentalId}`, {
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        property_id: derPropId, rental_portion_pct: 50,
+      });
+      const derEarn50 = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === derRentalId);
+      const derY26b = derEarn50.years.find((y) => y.tax_year === 2026);
+      const want50 = Math.round((0.5 * (7200 + interestByYear[2026])) * 100) / 100;
+      H.check('derived expenses: editing the portion to 50% re-derives the deductible',
+        r.status === 200 && derY26b && Math.abs(derY26b.calc.deductibleExpenses - want50) < 0.01,
+        JSON.stringify({ got: derY26b && derY26b.calc.deductibleExpenses, want: want50 }));
+      // Validation: portion outside 1–100 is rejected.
+      r = await H.req('PUT', `/api/earnings/rentals/${derRentalId}`, {
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        property_id: derPropId, rental_portion_pct: 0,
+      });
+      H.check('derived expenses: portion 0 is rejected', r.status === 400, JSON.stringify(r.data));
+      // Restore the portion, then check the detail page: the
+      // year-paged table lists each item + the sum, the summary-strip
+      // Deductible expenses card matches, and the pager flips years.
+      r = await H.req('PUT', `/api/earnings/rentals/${derRentalId}`, {
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        property_id: derPropId, rental_portion_pct: 33,
+      });
+      H.check('derived expenses: portion restored to 33', r.status === 200, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#earnings/rental/${derRentalId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => !!document.querySelector('#earnRentalBackLink'), { timeout: 10000 });
+      const derDetail = await page.evaluate(() => {
+        const d = document.querySelector('#earnRentalDetail');
+        const strip = [...d.querySelectorAll('.summary-card')].map((c) => [c.querySelector('.k')?.textContent.trim(), c.querySelector('.v')?.textContent.trim()]);
+        const pager = [...document.querySelectorAll('#earnRentalExpensePager button')].map((b) => ({ year: b.dataset.earnExpYear, active: b.classList.contains('active') }));
+        const rows = [...document.querySelectorAll('#earnRentalExpenseTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { strip, pager, rows, hasTable: !!document.querySelector('#earnRentalExpenseTable') };
+      });
+      const want26Str = want26.toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      H.check('derived expenses: detail shows the year-paged table (2026 default) + summary card matches',
+        derDetail.hasTable
+          && derDetail.pager.length === 2 && derDetail.pager.find((b) => b.year === '2026')?.active === true
+          && derDetail.rows.some((row) => row[0] === 'Property tax' && row[1] === '$1,980.00')
+          && derDetail.rows.some((row) => row[0] === 'Gas' && row[1] === '$396.00')
+          && derDetail.rows.some((row) => row[0] === 'Mortgage interest')
+          && derDetail.rows[derDetail.rows.length - 1][0] === 'Sum'
+          && derDetail.rows[derDetail.rows.length - 1][1] === want26Str
+          && derDetail.strip.find((c) => c[0] === 'Deductible expenses')?.[1] === want26Str,
+        JSON.stringify({ ...derDetail, want26Str }));
+      await page.click('[data-earn-exp-year="2025"]');
+      await waitE(500);
+      const derDetail25 = await page.evaluate(() => {
+        const pager = [...document.querySelectorAll('#earnRentalExpensePager button')].map((b) => ({ year: b.dataset.earnExpYear, active: b.classList.contains('active') }));
+        const rows = [...document.querySelectorAll('#earnRentalExpenseTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { pager, rows };
+      });
+      H.check('derived expenses: pager flips to 2025 with that year\'s rows + sum',
+        derDetail25.pager.find((b) => b.year === '2025')?.active === true
+          && derDetail25.rows.some((row) => row[0] === 'Property tax' && row[1] === '$1,650.00')
+          && derDetail25.rows[derDetail25.rows.length - 1][0] === 'Sum',
+        JSON.stringify(derDetail25));
+      // Cleanup: the derived rental + its property, and the ended rental.
+      r = await H.req('DELETE', `/api/earnings/rentals/${derRentalId}`);
+      H.check('derived cleanup: rental deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/properties/${derPropId}`);
+      H.check('derived cleanup: property deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/earnings/rentals/${endedRentalId}`);
+      H.check('rental headline cleanup: ended rental deleted', r.status === 200, JSON.stringify(r.data));
     } finally {
       await browserE.close();
     }

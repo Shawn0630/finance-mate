@@ -7,7 +7,7 @@ import { payroll, rental } from '../src/regions/ca.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
-  deriveRentalYearFigures, entryCoveredYears,
+  deriveRentalYearFigures, entryCoveredYears, nextRentPayment,
   payDatesInWindow, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
   validPayChanges, resolvePayChangeValues, positionValueFor,
 } from '../src/earnings.js';
@@ -177,6 +177,64 @@ test('rental validation: rejects bad ownership and bad rental type', () => {
   assert.ok(validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 150 }).error);
   assert.ok(validRentalInput({ label: 'X', rental_type: 'weekly', ownership_pct: 50 }).error);
   assert.ok(!validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 50 }).error);
+});
+
+test('rental validation: rental portion is optional, must be 1–100 when set', () => {
+  const base = { label: 'X', rental_type: 'long_term', ownership_pct: 50 };
+  assert.equal(validRentalInput(base).rental_portion_pct, null);
+  assert.equal(validRentalInput({ ...base, rental_portion_pct: '' }).rental_portion_pct, null);
+  assert.equal(validRentalInput({ ...base, rental_portion_pct: 33 }).rental_portion_pct, 33);
+  assert.ok(validRentalInput({ ...base, rental_portion_pct: 0 }).error);
+  assert.ok(validRentalInput({ ...base, rental_portion_pct: 101 }).error);
+  assert.ok(validRentalInput({ ...base, rental_portion_pct: 'abc' }).error);
+});
+
+test('next rent payment: ongoing entry pays on its pay day, on/after today', () => {
+  const e = { start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1800, pay_day: 15 };
+  assert.deepEqual(nextRentPayment([e], '2026-11-05'), { date: '2026-11-15', amount: 1800 });
+  assert.deepEqual(nextRentPayment([e], '2026-11-15'), { date: '2026-11-15', amount: 1800 });
+  assert.deepEqual(nextRentPayment([e], '2026-11-16'), { date: '2026-12-15', amount: 1800 });
+  // Pay day 31 clamps to the month's length.
+  const e31 = { start_ym: '2026-01', end_ym: null, monthly_rent: 1000, pay_day: 31 };
+  assert.deepEqual(nextRentPayment([e31], '2026-02-10'), { date: '2026-02-28', amount: 1000 });
+  // A future entry's first pay day; an ended entry has no next payment.
+  assert.deepEqual(nextRentPayment([{ start_ym: '2027-01', end_ym: null, monthly_rent: 2000, pay_day: 1 }], '2026-11-05'), { date: '2027-01-01', amount: 2000 });
+  assert.equal(nextRentPayment([{ start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 2000, pay_day: 15 }], '2026-11-05'), null);
+  assert.equal(nextRentPayment([], '2026-11-05'), null);
+  assert.equal(nextRentPayment(null, '2026-11-05'), null);
+});
+
+test('rental: property-derived costs scale by the rental portion, manual lines stay additional', () => {
+  const derived = { costs: [{ label: 'Property tax', annual: 6000 }, { label: 'Gas', annual: 1200 }], interest: 5000 };
+  const c = calcRentalYear(rentalBase({ rental_portion_pct: 33 }), yearBase({
+    area_share_pct: 100, rental_days: 365, mortgage_interest: 0,
+    expenses: [{ line: '9180', amount: 1000, direct: false }],
+  }), rental, derived);
+  // 33% x (7200 costs + 5000 interest) = 4026 derived; manual 1000 x 33% = 330.
+  assert.equal(c.deductibleExpenses, 4356);
+  assert.equal(c.personalPortion9949, 8844); // 67% x (7200 + 5000 + 1000 manual)
+  assert.equal(c.expenseTable.hasDerived, true);
+  assert.equal(c.expenseTable.sum, 4356);
+  assert.deepEqual(c.expenseTable.rows.slice(0, 3).map((r) => [r.label, r.deductible]), [
+    ['Property tax', 1980], ['Gas', 396], ['Mortgage interest', 1650],
+  ]);
+  assert.equal(c.expenseTable.rows[3].deductible, 330);
+  assert.ok(c.expenseTable.rows[3].label.includes('(manual)'));
+  // Partial year prorates by rented days on top of the portion.
+  const part = calcRentalYear(rentalBase({ rental_portion_pct: 33 }), yearBase({
+    area_share_pct: 100, rental_days: 212, mortgage_interest: 0,
+    expenses: [{ line: '9180', amount: 1000, direct: false }],
+  }), rental, derived);
+  const f = 0.33 * 212 / 365;
+  assert.ok(Math.abs(part.deductibleExpenses - (1000 * f + 7200 * f + 5000 * f)) < 0.02);
+  assert.ok(Math.abs(part.personalPortion9949 - 13200 * (1 - f)) < 0.02);
+  // No derived input: the calc is unchanged (manual only, no table).
+  const plain = calcRentalYear(rentalBase(), yearBase({
+    mortgage_interest: 0, expenses: [{ line: '9180', amount: 1000, direct: false }],
+  }), rental);
+  assert.equal(plain.deductibleExpenses, 1000);
+  assert.equal(plain.expenseTable.hasDerived, false);
+  assert.equal(plain.expenseTable.sum, 1000);
 });
 
 test('job owner: single earner kept, empty/omitted means unassigned', () => {

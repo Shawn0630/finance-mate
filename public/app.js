@@ -8862,11 +8862,15 @@ function earnEntryBlock(r, e) {
 
 function earnRentalCard(r) {
   const hidden = rentHiddenRentals.has(r.id);
+  const nxt = r.nextRentDue;
+  // The list card stays slim: title + the next payment headline
+  // only. Entries and year records live on the detail page.
   return `<div class="panel rent-card earn-rental-card" data-rental-id="${r.id}" style="cursor:pointer">
     <button type="button" class="rent-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-rental-id="${r.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}" onclick="toggleRentRental(${r.id})">${RENT_EYE_SVG}</button>
     <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span></div>
-    ${(r.entries || []).length ? `<div><div class="note">Rent entries</div>${r.entries.map((e) => earnEntryBlock(r, e)).join('')}</div>` : ''}
-    ${r.years.length ? r.years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
+    ${nxt
+    ? `<div class="summary-strip"><div class="summary-card"><div class="k">Next rent due</div><div class="v">${esc(earnJobDateLabel(nxt.date))}</div><div class="n">${money2(nxt.amount)}</div></div></div>`
+    : `<div class="note">No upcoming payment</div>`}
   </div>`;
 }
 
@@ -8921,11 +8925,10 @@ let earnRentalsView = 'net';
 const earnChartRanges = {
   // Overview only now: the rentals summary is driven by the shared
   // invest-range picker (level 'rentIncome'), not by this state.
-  // Default is a one-year window (the annual chart's '1 year':
-  // the latest tax year); presets are 3 months (salary pages
-  // only — on annual data it resolves to the current tax year),
-  // this year, 2 years, All.
-  overview: { years: 1, from: null, to: null, fromYm: null, toYm: null, preset: null },
+  // Default is All (the whole data range); presets are 3 months
+  // (salary pages only — on annual data it resolves to the current
+  // tax year), this year, 2 years, All.
+  overview: { years: 0, from: null, to: null, fromYm: null, toYm: null, preset: null },
 };
 
 function earnRangeControlsHtml(key) {
@@ -9132,6 +9135,31 @@ function earnRentalsLegendClick(e, item, legend) {
   chart.update();
 }
 
+// From/To always name the range actually in force: a preset that
+// carries no explicit months (All, or a years-count preset) leaves
+// st.fromYm/st.toYm unset, so the buttons show the effective range's
+// first/last month instead of '—'. A preset or manual pick that set
+// its own months keeps them — only the unset side is filled, and the
+// state itself is never rewritten (the buttons are a display of the
+// effective range, not a new selection).
+function earnSyncRangeDisplay(key) {
+  const st = earnChartRanges[key];
+  const wrap = document.querySelector(`[data-earn-range="${key}"]`);
+  if (!wrap) return;
+  const years = earnEffectiveYears(key);
+  if (!years.length) return;
+  const from = wrap.querySelector('[data-earn-month="from"]');
+  const to = wrap.querySelector('[data-earn-month="to"]');
+  if (from && (st.fromYm == null || st.fromYm === '')) {
+    const ym = `${years[0]}-01`;
+    from.dataset.value = ym; from.textContent = formatYM(ym);
+  }
+  if (to && (st.toYm == null || st.toYm === '')) {
+    const ym = `${years[years.length - 1]}-12`;
+    to.dataset.value = ym; to.textContent = formatYM(ym);
+  }
+}
+
 function drawEarnVisibleChart() {
   // The Salary view carries no chart: its annual chart moved to the
   // job detail page as a monthly stacked chart, so the salary
@@ -9141,6 +9169,7 @@ function drawEarnVisibleChart() {
     $('#earnOverviewRange').innerHTML = earnRangeControlsHtml('overview');
     earnWireRange('overview');
     drawEarnOverviewChart();
+    earnSyncRangeDisplay('overview');
   } else if (sub === 'rentals') {
     // The Rentals summary is ONE combined panel: the rentIncome
     // picker drives both the share and the annual chart, so there
@@ -9779,6 +9808,7 @@ window.earnEditRental = (id) => {
   const f = $('#earnRentalForm');
   f.label.value = r.label; f.property_id.value = r.property_id ?? ''; f.address.value = r.address || '';
   f.rental_type.value = r.rental_type; f.services_level.value = r.services_level; f.ownership_pct.value = r.ownership_pct;
+  f.rental_portion_pct.value = r.rental_portion_pct ?? '';
   f.is_principal_residence.checked = r.is_principal_residence; f.was_principal_residence.checked = r.was_principal_residence;
   f.structural_change.checked = r.structural_change;
   syncEarnRentalAddressState();
@@ -9848,6 +9878,37 @@ function earnRentalDetailSummaryHtml(r) {
   </div>`;
 }
 
+// Deductible expenses, item by item (same year-pager pattern as the
+// per-pay tax benefit table): the property-derived costs — each
+// category plus that year's mortgage interest, scaled by the rented
+// share — plus any manual T776 lines, with a Sum row equal to the
+// year record's Deductible expenses. One page per year with derived
+// items, defaulting to the latest; no pager for a single year.
+let earnRentalExpenseYearSel = null;
+function earnRentalExpenseTableHtml(r) {
+  const years = [...(r.years || [])]
+    .filter((y) => y.calc && y.calc.expenseTable && y.calc.expenseTable.hasDerived)
+    .sort((a, b) => a.tax_year - b.tax_year);
+  if (!years.length) return '';
+  const latest = years[years.length - 1].tax_year;
+  const year = years.some((y) => y.tax_year === earnRentalExpenseYearSel) ? earnRentalExpenseYearSel : latest;
+  const y = years.find((v) => v.tax_year === year);
+  const pager = years.length > 1
+    ? `<div id="earnRentalExpensePager">${years.map((v) => `<button class="small${v.tax_year === year ? ' active' : ''}" data-earn-exp-year="${v.tax_year}" onclick="earnRentalExpenseYear(${v.tax_year})">${v.tax_year}</button>`).join('')}</div>`
+    : '';
+  const rows = y.calc.expenseTable.rows.map((row) => `<tr><td>${esc(row.label)}</td><td>${money2(row.deductible)}</td></tr>`).join('');
+  return `<div class="panel"><div class="section-head"><h3>Deductible expenses</h3></div>${pager}<table id="earnRentalExpenseTable"><thead><tr><th>Item</th><th>Amount</th></tr></thead><tbody>
+        ${rows}
+        <tr><td>Sum</td><td>${money2(y.calc.expenseTable.sum)}</td></tr>
+      </tbody></table></div>`;
+}
+window.earnRentalExpenseYear = (year) => {
+  earnRentalExpenseYearSel = Number(year);
+  const r = earnData.rentals.find((x) => x.id === currentEarnRentalId);
+  const wrap = document.querySelector('#earnRentalExpenseWrap');
+  if (r && wrap) wrap.innerHTML = earnRentalExpenseTableHtml(r);
+};
+
 function earnRentalDetailHtml(r) {
   const years = [...(r.years || [])].sort((a, b) => a.tax_year - b.tax_year);
   return `<div class="toolbar"><a id="earnRentalBackLink" href="#earnings/rentals">← Back to Rentals</a><div class="spacer"></div></div>
@@ -9868,7 +9929,8 @@ function earnRentalDetailHtml(r) {
     <div class="panel">
       <div class="section-head"><h3>Rent entries</h3><div class="spacer"></div><button class="small" id="earnRentalDetailAddEntry" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
       ${(r.entries || []).length ? r.entries.map((e) => earnEntryBlock(r, e)).join('') : '<div class="note">No rent entries yet.</div>'}
-    </div>`;
+    </div>
+    <div id="earnRentalExpenseWrap">${earnRentalExpenseTableHtml(r)}</div>`;
 }
 
 function drawEarnRentalDetailChart(r) {
@@ -9943,8 +10005,18 @@ window.earnEditYear = (rentalId, yearId) => {
   $('#earnRentalYearFormTitle').textContent = 'Edit year record';
   const f = $('#earnRentalYearForm');
   f.tax_year.value = y.tax_year; f.other_income.value = y.other_income;
-  f.area_share_pct.value = y.area_share_pct;
-  $('#earnYearDerived').innerHTML = `Gross rents ${money2(y.gross_rents)} · Rented days ${y.rental_days}${y.rent_derived ? ' (from rent entries)' : ''}`;
+  // When the rental carries a portion, it governs the year: the
+  // share field shows the portion and is read-only (not disabled —
+  // a disabled control is omitted from FormData and the server would
+  // fall back to 100). No portion: the field stays editable as today.
+  if (r.rental_portion_pct != null) {
+    f.area_share_pct.value = r.rental_portion_pct;
+    f.area_share_pct.readOnly = true;
+  } else {
+    f.area_share_pct.readOnly = false;
+    f.area_share_pct.value = y.area_share_pct;
+  }
+  $('#earnYearDerived').innerHTML = `Gross rents ${money2(y.gross_rents)} · Rented days ${y.rental_days}${y.rent_derived ? ' (from rent entries)' : ''}${r.rental_portion_pct != null ? ` · Rental portion ${r.rental_portion_pct}%` : ''}`;
   $('#earnYearDerived').classList.remove('hidden');
   f.mortgage_interest.value = y.mortgage_interest; f.mortgage_principal.value = y.mortgage_principal;
   f.claim_cca.checked = y.claim_cca; f.cca_acknowledged.checked = y.cca_acknowledged;

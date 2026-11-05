@@ -286,6 +286,7 @@ CREATE TABLE IF NOT EXISTS earn_rentals (
   rental_type TEXT NOT NULL,                    -- long_term | short_term | commercial
   services_level TEXT NOT NULL DEFAULT 'basic', -- basic (T776) | hotel_like (T2125)
   ownership_pct REAL NOT NULL DEFAULT 100,      -- owner's share of net (T1 line 12600)
+  rental_portion_pct REAL,                     -- share of the linked property that is rented (the tenant's share); null = not set
   is_principal_residence INTEGER NOT NULL DEFAULT 0,
   was_principal_residence INTEGER NOT NULL DEFAULT 0,
   structural_change INTEGER NOT NULL DEFAULT 0,
@@ -573,6 +574,16 @@ if (!propCols.includes('hs_id_address')) {
   // skip the address locate step.
   db.exec('ALTER TABLE properties ADD COLUMN hs_id_address TEXT');
   db.exec('ALTER TABLE properties ADD COLUMN hs_id_listing TEXT');
+}
+const rentCols = db.prepare('PRAGMA table_info(earn_rentals)').all().map((c) => c.name);
+if (!rentCols.includes('rental_portion_pct')) {
+  // The share of the linked property that is rented (the tenant's
+  // share), driving the property-derived deductible expenses. One-time
+  // prefill for the user's 2985 Basement rental: his own estimate is
+  // 33% — that is the rented share, NOT the 66.67% ownership split;
+  // it runs once here and never resets an edited value.
+  db.exec('ALTER TABLE earn_rentals ADD COLUMN rental_portion_pct REAL');
+  db.prepare("UPDATE earn_rentals SET rental_portion_pct = 33 WHERE label = '2985 Basement' AND rental_portion_pct IS NULL").run();
 }
 // value_history: the land / building split columns (see the table
 // comment). Existing points predate the split and stay NULL — no
