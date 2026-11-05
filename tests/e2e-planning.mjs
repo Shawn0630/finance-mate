@@ -5172,6 +5172,200 @@ export async function run(H, S) {
         cleanErrs.length === 0, JSON.stringify(cleanErrs));
     } finally { await browserR.close(); }
   }
+  // ------------------------------------------- difftable: pool-baseline
+  // Difference table must not show mortgage columns or mortgage
+  // months (user bug 2026-11-04: summed Christina+Nash balances on
+  // the "Buy SPY" pool strategy page). Fixture: a holding bought
+  // 2026-03 — before the current month, so units are held at the
+  // series start — while the propscope mortgage series starts
+  // 2026-01; a 0-op strategy on the pool project. The stock series
+  // starts at the current month (computeProjection builds it from
+  // currentMonth), so the summed mortgage series has leading months
+  // with no stock values.
+  r = await H.req('POST', '/api/investments/accounts', { name: 'DiffTable Acct', type: 'NonRegistered' });
+  H.check('difftable: account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const dtAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${dtAcct}/holdings`, { label: 'DiffTable H', kind: 'exchange', symbol: 'DIFF.H', currency: 'CAD', events: [{ date: '2026-03-15', type: 'buy', units: 100, price: 100 }] });
+  H.check('difftable: holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const dtHold = r.data.id;
+  r = await H.req('POST', `/api/investments/holdings/${dtHold}/nav`, { date: '2026-03-15', price: 100 });
+  H.check('difftable: NAV point 2026-03 @100', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/projects', { name: 'DiffTable Pool', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: dtHold, percent: 100 }] } });
+  H.check('difftable: pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const dtProj = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${dtProj}/strategies`, { name: 'Zero ops' });
+  H.check('difftable: 0-op strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const dtStrat = r.data.strategy.id;
+  // The payload still carries the summed mortgage series (the leak
+  // source); the stock series starts at the current month, flat $10,000.
+  const dtNowYm = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+  const dtMonName = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const dtFirstLabel = `${dtMonName[Number(dtNowYm.slice(5, 7)) - 1]} ${dtNowYm.slice(0, 4)}`;
+  r = await H.req('GET', `/api/planning/strategies/${dtStrat}`);
+  const dtBase = r.data.baseline || {};
+  const dtMortKeys = Object.keys((dtBase.mortgage && dtBase.mortgage.perProperty) || {});
+  const dtStockSeries = ((dtBase.stocks || {}).series || []);
+  H.check('difftable: payload carries the summed mortgage series (E + O) while the stock series starts at the current month',
+    dtMortKeys.includes(String(psE)) && dtMortKeys.includes(String(psO)) && dtStockSeries.length > 0 && dtStockSeries[0].month === dtNowYm && dtStockSeries.every((pt) => Math.abs((pt.value || 0) - 10000) < 0.01),
+    JSON.stringify({ mortKeys: dtMortKeys, firstStock: dtStockSeries[0], n: dtStockSeries.length, nowYm: dtNowYm }));
+  r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'DiffTable report', definition: { strategies: [dtStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value'] }] }, strategy_ids: [dtStrat], scenario_ids: [] });
+  H.check('difftable: pool report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const dtRep = r.data.report.id;
+  // Entity series for the property regression pin (Fix E strategy).
+  r = await H.req('GET', `/api/planning/strategies/${psStrat}`);
+  const psEBaseSeries = (((r.data.baseline || {}).mortgage || {}).perProperty || {})[psE]?.baseline?.series || [];
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('difftable browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardD = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (ch) => chunks.push(ch));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResD = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueD = loginResD.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserD = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserD.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardD({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueD, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitD = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      const ymOfLabel = (label) => { const [mon, y] = (label || '').split(' '); return `${y}-${String(dtMonName.indexOf(mon) + 1).padStart(2, '0')}`; };
+      // (a/b) Pool 0-op strategy page: no mortgage columns, caption
+      // Value Δ only, table starts at the stock series with Value Δ 0.
+      await page.goto(`http://ff.local/#planning/strategy/${dtStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Zero ops'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      const dtTable = await page.evaluate(() => {
+        const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+        const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+        const col = (name) => headCells.indexOf(name);
+        const rows = [...document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return {
+          head: headCells,
+          cap: document.querySelector('#planDiffCaption')?.textContent || '',
+          firstMonth: rows[0] ? rows[0][0] : null,
+          firstBaseVal: rows[0] ? parse(rows[0][col('Baseline value')]) : null,
+          firstStratVal: rows[0] ? parse(rows[0][col('Strategy value')]) : null,
+          firstValDiff: rows[0] ? parse(rows[0][col('Value Δ')]) : null,
+          allValDiffZero: rows.length > 0 && rows.every((m) => parse(m[col('Value Δ')]) === 0),
+          rows: rows.length,
+        };
+      });
+      const dtFirstYearRows = dtStockSeries.filter((pt) => pt.month.slice(0, 4) === dtNowYm.slice(0, 4)).length;
+      H.check('difftable: pool strategy table has no mortgage columns and its caption names Value Δ only',
+        !dtTable.head.some((h) => ['Baseline balance', 'Strategy balance', 'Balance Δ', 'Baseline interest', 'Strategy interest', 'Interest saved'].includes(h))
+          && ['Baseline value', 'Strategy value', 'Value Δ'].every((h) => dtTable.head.includes(h))
+          && !dtTable.cap.includes('Balance Δ') && dtTable.cap.includes('Value Δ'),
+        JSON.stringify(dtTable));
+      H.check('difftable: pool table starts at the stock series, no leading "—" months, Value Δ is 0 for a 0-op strategy',
+        dtTable.firstMonth === dtFirstLabel && dtTable.firstBaseVal === 10000 && dtTable.firstStratVal === 10000 && dtTable.firstValDiff === 0 && dtTable.allValDiffZero && dtTable.rows === dtFirstYearRows,
+        JSON.stringify({ ...dtTable, expectedFirst: dtFirstLabel, expectedRows: dtFirstYearRows }));
+      // (c) Pool annual view: Value Δ only, no mortgage columns.
+      await page.click('[data-plan-diff-gran="annual"]');
+      await waitD(800);
+      const dtAnnual = await page.evaluate(() => ({
+        head: [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim()),
+        cap: document.querySelector('#planDiffCaption')?.textContent || '',
+      }));
+      H.check('difftable: pool annual table has Value Δ only, no mortgage columns',
+        dtAnnual.head.includes('Value Δ') && !dtAnnual.head.some((h) => ['Baseline balance', 'Strategy balance', 'Equity Δ (peak)', 'Baseline interest', 'Strategy interest', 'Interest saved'].includes(h))
+          && !dtAnnual.cap.includes('Equity Δ') && dtAnnual.cap.includes('Value Δ'),
+        JSON.stringify(dtAnnual));
+      // (d) Property regression: mortgage columns stay, and the
+      // balance series is the entity property's own (777 PropScope
+      // Entity Lane) — no summed jump at the other property's
+      // funding month.
+      await page.goto(`http://ff.local/#planning/strategy/${psStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Fix E'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      const psTable = await page.evaluate(() => {
+        const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+        const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+        const col = (name) => headCells.indexOf(name);
+        const rows = [...document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { head: headCells, months: rows.map((m) => m[0]), bals: rows.map((m) => parse(m[col('Baseline balance')])) };
+      });
+      const psApiByMonth = new Map(psEBaseSeries.map((pt) => [pt.month, pt.balance]));
+      const psFirstYear = psEBaseSeries[0]?.month?.slice(0, 4);
+      const psExpectedRows = psEBaseSeries.filter((pt) => pt.month.slice(0, 4) === psFirstYear).length;
+      const psFirstLabel = psEBaseSeries[0] ? `${dtMonName[Number(psEBaseSeries[0].month.slice(5, 7)) - 1]} ${psEBaseSeries[0].month.slice(0, 4)}` : null;
+      let psMaxJump = 0;
+      for (let i = 1; i < psTable.bals.length; i++) psMaxJump = Math.max(psMaxJump, (psTable.bals[i] || 0) - (psTable.bals[i - 1] || 0));
+      const psJunBal = psTable.bals[psTable.months.indexOf('Jun 2026')];
+      H.check('difftable: property strategy table keeps mortgage columns and its balance series is entity-only (no cross-property jump)',
+        ['Baseline balance', 'Strategy balance', 'Balance Δ', 'Baseline interest', 'Strategy interest', 'Interest saved'].every((h) => psTable.head.includes(h))
+          && psTable.bals.length === psExpectedRows && psTable.months[0] === psFirstLabel && psMaxJump < 5000 && (psJunBal || 0) < 450000
+          && psTable.bals.every((v, i) => v != null && Math.abs(v - (psApiByMonth.get(ymOfLabel(psTable.months[i])) || 0)) < 0.01),
+        JSON.stringify({ head: psTable.head, bals: psTable.bals, months: psTable.months, maxJump: psMaxJump, junBal: psJunBal, expectedRows: psExpectedRows, expectedFirst: psFirstLabel }));
+      // (e/f/g) Report-view merged table: pool + no mortgage-touching
+      // strategy hides the mortgage rows; a picked mortgage-touching
+      // strategy (mixed) and a property report keep them.
+      const openMerged = async (projId, repId) => {
+        // The cross-project open can miss while the freshly loaded
+        // LIST is still settling (same flake the gating pins retry
+        // around): re-goto + retry the open once before giving up.
+        const openOnce = async () => {
+          await page.goto(`http://ff.local/#planning/project/${projId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+          await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, repId);
+          await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, repId);
+        };
+        try { await openOnce(); } catch { await openOnce(); }
+        try {
+          await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, repId);
+        } catch {
+          await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, repId);
+          await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, repId);
+        }
+        await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+        return page.evaluate(() => [...document.querySelectorAll('#planReportMergedTable tbody tr td:first-child')].map((td) => td.textContent.trim()));
+      };
+      const dtMerged = await openMerged(dtProj, dtRep);
+      H.check('difftable: pool report merged table has no mortgage rows',
+        !dtMerged.some((l) => l.startsWith('Monthly payment') || l === 'Total interest' || l === 'Payoff')
+          && ['Value at horizon', 'Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((l) => dtMerged.includes(l)),
+        JSON.stringify(dtMerged));
+      const mixMerged = await openMerged(icProj, icMixRep);
+      H.check('difftable: pool report with a mortgage-touching strategy keeps the mortgage rows',
+        mixMerged.some((l) => l.startsWith('Monthly payment')) && mixMerged.includes('Total interest') && mixMerged.includes('Payoff'),
+        JSON.stringify(mixMerged));
+      const propMerged = await openMerged(psProj, psRep);
+      H.check('difftable: property report merged table keeps the mortgage rows',
+        propMerged.some((l) => l.startsWith('Monthly payment')) && propMerged.includes('Total interest') && propMerged.includes('Payoff'),
+        JSON.stringify(propMerged));
+    } finally { await browserD.close(); }
+  }
   // ------------------------------------------- item 7 revised: scenario
   // stock factors per holding (baseline card display-only)
   // Fixture: own account + fund holding with manual NAV points

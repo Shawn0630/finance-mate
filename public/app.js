@@ -14420,23 +14420,29 @@ function planDiffRender(d) {
   const hasStock = monthly.some((r) => r.valBase != null || r.valStrat != null);
   // Mortgage-touching (same definition as the server's comparison
   // touchesMortgage): a mortgage op, or a sell whose proceeds repay a
-  // mortgage. It still drives the table's mortgage columns and the
-  // fallback rule below — but the Difference CHARTS follow the
-  // BASELINE kind, which wins over op nature (user 2026-11-04): a
-  // cash-pool baseline forces Balance Δ off + breakdown off; a
-  // property baseline forces Value Δ off (Balance Δ shows whenever
-  // balance data exists, even for a stock-only strategy on that
-  // property); any other baseline keeps the op-nature rule (a pure
-  // stock strategy's Balance Δ would be a flat $0 line, so it hides).
+  // mortgage. The Difference TABLE follows the same BASELINE-kind
+  // rule as the charts (user 2026-11-04): a cash-pool baseline shows
+  // NO mortgage columns, ever; a property baseline shows them
+  // whenever balance data exists, even for a stock-only strategy on
+  // that property; any other baseline keeps the op-nature rule (a
+  // pure stock strategy's Balance Δ would be a flat $0 line, so it
+  // hides). The old table rule (columns whenever balance data
+  // exists) leaked the summed all-properties mortgage series onto
+  // pool-baseline pages.
   const touchesMort = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
     || (d.ops || []).flatMap((o) => o.legs || []).some((l) => String(l.source_ref || '').startsWith('repay:'));
   const diffKind = d.baselineKind || 'other';
   const diffShowBalance = diffKind === 'pool' ? false : diffKind === 'property' ? hasMort : touchesMort;
   const diffShowValue = diffKind === 'property' ? false : hasStock;
   const diffShowBreakdown = diffKind === 'pool' ? false : diffKind === 'property' ? hasMort : touchesMort;
-  planDiffSpan = monthly.length ? { start: monthly[0].month, end: monthly[monthly.length - 1].month } : null;
-  const eff = planDiffEffectiveRange(monthly);
-  const filtered = monthly.filter((r) => (!eff.from || r.month >= eff.from) && (!eff.to || r.month <= eff.to));
+  // Pool baseline: the table (and its range/pager) covers the
+  // pool/stock series only. The summed mortgage series must not
+  // contribute months — its leading months carry no stock values, so
+  // their value cells render "—".
+  const diffRows = diffKind === 'pool' ? monthly.filter((r) => r.valBase != null || r.valStrat != null) : monthly;
+  planDiffSpan = diffRows.length ? { start: diffRows[0].month, end: diffRows[diffRows.length - 1].month } : null;
+  const eff = planDiffEffectiveRange(diffRows);
+  const filtered = diffRows.filter((r) => (!eff.from || r.month >= eff.from) && (!eff.to || r.month <= eff.to));
   host.querySelectorAll('[data-plan-diff-gran]').forEach((b) => b.classList.toggle('active', b.dataset.planDiffGran === planDiffState.gran));
   host.querySelectorAll('[data-plan-diff-preset]').forEach((b) => b.classList.toggle('active', b.dataset.planDiffPreset === planDiffState.preset));
   const fromBtn = host.querySelector('[data-plan-diff-month="from"]');
@@ -14473,11 +14479,11 @@ function planDiffRender(d) {
   if (!diffShowBreakdown) planDestroyChart('planDiffBreakdownChart');
   if (planDiffState.gran === 'annual') {
     const pgA = $('#planDiffYearPager'); if (pgA) pgA.innerHTML = '';
-    if (cap) cap.textContent = 'X: year · Y: CAD — Equity Δ = the year\'s peak monthly balance advantage; Value Δ = year-end.';
+    if (cap) cap.textContent = diffKind === 'pool' ? 'X: year · Y: CAD — Value Δ = year-end.' : 'X: year · Y: CAD — Equity Δ = the year\'s peak monthly balance advantage; Value Δ = year-end.';
     if (bTitle) bTitle.textContent = 'Annual payment breakdown';
     if (bCap) bCap.textContent = 'X: year · Y: CAD per year — scheduled payment split into interest (solid) + principal (light), baseline vs strategy, summed over the year\'s months.';
   } else {
-    if (cap) cap.textContent = 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
+    if (cap) cap.textContent = diffKind === 'pool' ? 'X: month · Y: CAD — Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
     if (bTitle) bTitle.textContent = 'Monthly payment breakdown';
     if (bCap) bCap.textContent = 'X: month · Y: CAD per month — scheduled payment split into interest (solid) + principal (light), baseline vs strategy.';
   }
@@ -14505,12 +14511,12 @@ function planDiffRender(d) {
     }
     if (bDatasetsA.length) planBarChart('planDiffBreakdownChart', years.map((a) => a.year), bDatasetsA); else planDestroyChart('planDiffBreakdownChart');
     let head = '<tr><th>Year</th>';
-    if (hasMort) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Equity Δ (peak)</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
+    if (diffShowBalance) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Equity Δ (peak)</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
     if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
     head += '</tr>';
     const rows = years.map((a) => {
       let r = `<tr><td>${a.year}</td>`;
-      if (hasMort) r += `<td>${planMoney(a.balBase)}</td><td>${planMoney(a.balStrat)}</td><td${diffCls(a.equityPeak)}>${planSigned(a.equityPeak)}</td><td>${planMoney(a.intBase)}</td><td>${planMoney(a.intStrat)}</td><td${diffCls(a.intSaved)}>${planSigned(a.intSaved)}</td>`;
+      if (diffShowBalance) r += `<td>${planMoney(a.balBase)}</td><td>${planMoney(a.balStrat)}</td><td${diffCls(a.equityPeak)}>${planSigned(a.equityPeak)}</td><td>${planMoney(a.intBase)}</td><td>${planMoney(a.intStrat)}</td><td${diffCls(a.intSaved)}>${planSigned(a.intSaved)}</td>`;
       if (hasStock) r += `<td>${planMoney(a.valBase)}</td><td>${planMoney(a.valStrat)}</td><td${diffCls(a.valDiff)}>${planSigned(a.valDiff)}</td>`;
       return r + '</tr>';
     }).join('');
@@ -14531,7 +14537,7 @@ function planDiffRender(d) {
     }
     if (bDatasets.length) planBarChart('planDiffBreakdownChart', filtered.map((r) => formatYM(r.month)), bDatasets); else planDestroyChart('planDiffBreakdownChart');
     let head = '<tr><th>Month</th>';
-    if (hasMort) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Balance Δ</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
+    if (diffShowBalance) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Balance Δ</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
     if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
     head += '</tr>';
     // Year pager, table only (charts keep the full filtered range):
@@ -14549,7 +14555,7 @@ function planDiffRender(d) {
     // Monthly rows group BY YEAR: a year header, the year's months,
     // then an annual-sum row — flows summed over the year's months,
     // balances/value at year-end.
-    const cols = 1 + (hasMort ? 6 : 0) + (hasStock ? 3 : 0);
+    const cols = 1 + (diffShowBalance ? 6 : 0) + (hasStock ? 3 : 0);
     let rows = '';
     let curYear = null; let yearRows = [];
     const flushYear = () => {
@@ -14557,7 +14563,7 @@ function planDiffRender(d) {
       const last = yearRows[yearRows.length - 1];
       const sum = (f) => yearRows.reduce((a, r) => a + (r[f] || 0), 0);
       rows += `<tr class="plan-year-total"><td>${curYear} total</td>`;
-      if (hasMort) rows += `<td>${planMoney(last.balBase)}</td><td>${planMoney(last.balStrat)}</td><td${diffCls(last.balDiff)}>${planSigned(last.balDiff)}</td><td>${planMoney(sum('intBase'))}</td><td>${planMoney(sum('intStrat'))}</td><td${diffCls(sum('intSaved'))}>${planSigned(sum('intSaved'))}</td>`;
+      if (diffShowBalance) rows += `<td>${planMoney(last.balBase)}</td><td>${planMoney(last.balStrat)}</td><td${diffCls(last.balDiff)}>${planSigned(last.balDiff)}</td><td>${planMoney(sum('intBase'))}</td><td>${planMoney(sum('intStrat'))}</td><td${diffCls(sum('intSaved'))}>${planSigned(sum('intSaved'))}</td>`;
       if (hasStock) rows += `<td>${planMoney(last.valBase)}</td><td>${planMoney(last.valStrat)}</td><td${diffCls(last.valDiff)}>${planSigned(last.valDiff)}</td>`;
       rows += '</tr>';
     };
@@ -14566,7 +14572,7 @@ function planDiffRender(d) {
       if (y !== curYear) { flushYear(); curYear = y; yearRows = []; rows += `<tr class="plan-year-head"><td colspan="${cols}">${y}</td></tr>`; }
       yearRows.push(r);
       let x = `<tr><td>${formatYM(r.month)}</td>`;
-      if (hasMort) x += `<td>${planMoney(r.balBase)}</td><td>${planMoney(r.balStrat)}</td><td${diffCls(r.balDiff)}>${planSigned(r.balDiff)}</td><td>${planMoney(r.intBase)}</td><td>${planMoney(r.intStrat)}</td><td${diffCls(r.intSaved)}>${planSigned(r.intSaved)}</td>`;
+      if (diffShowBalance) x += `<td>${planMoney(r.balBase)}</td><td>${planMoney(r.balStrat)}</td><td${diffCls(r.balDiff)}>${planSigned(r.balDiff)}</td><td>${planMoney(r.intBase)}</td><td>${planMoney(r.intStrat)}</td><td${diffCls(r.intSaved)}>${planSigned(r.intSaved)}</td>`;
       if (hasStock) x += `<td>${planMoney(r.valBase)}</td><td>${planMoney(r.valStrat)}</td><td${diffCls(r.valDiff)}>${planSigned(r.valDiff)}</td>`;
       rows += x + '</tr>';
     }
@@ -14782,23 +14788,30 @@ function planMergedRender(t) {
   if (!block) return;
   const appleIds = t.getAppleIds();
   const picked = block.strategies.filter((r) => appleIds && appleIds.includes(r.strategy.id));
+  // Pool baseline with no mortgage-touching strategy picked: the
+  // mortgage rows would show the summed all-properties mainline
+  // figures (the payload carries every property's mortgage series),
+  // which say nothing about a cash-pool comparison — hide them, the
+  // same way the breakdown block hides. A picked mortgage-touching
+  // strategy keeps them (scoped figures, real effects).
+  const poolNoMort = !!(block.report && block.report.investmentScope) && !picked.some((r) => r.touchesMortgage);
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const payMeta = planPaymentScopeMeta(block);
   const baseValue = planBaselineValue(block);
   const months = (v) => (v == null ? '—' : ((v >= 0 ? '+' : '') + v + ' months'));
   const rows = [
-    { label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => {
+    { mort: true, label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => {
       const abs = r.paymentScope ? planMoney(r.paymentScope.strategy) : planMoney(planMortAbs(r.projection, 'strategy').payment);
       const dv = r.paymentScope ? r.paymentScope.delta : r.comparison.paymentDelta;
       const delta = planSigned(dv);
       if (abs === '—' && delta === '—') return { single: '—' };
       return { abs, delta, bold: dv != null && dv !== 0 };
     } },
-    { label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => {
+    { mort: true, label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => {
       const dv = r.comparison.interestSaved == null ? null : -r.comparison.interestSaved;
       return { abs: planMoney(planMortAbs(r.projection, 'strategy').interest), delta: planSigned(dv), bold: dv != null && dv !== 0 };
     } },
-    { label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => {
+    { mort: true, label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => {
       const shift = r.comparison.payoffShiftMonths;
       const stratPayoff = planMortAbs(r.projection, 'strategy').payoff || '—';
       const ymIdx = (s) => (s && /^\d{4}-\d{2}$/.test(s) ? Number(s.slice(0, 4)) * 12 + Number(s.slice(5, 7)) : null);
@@ -14818,11 +14831,12 @@ function planMergedRender(t) {
     { label: 'Equity Δ', base: '—', strat: (r) => ({ single: r.equityDelta != null ? planSigned(r.equityDelta) : '—', bold: r.equityDelta != null && r.equityDelta !== 0 }) },
     { label: 'Principal Δ', base: '—', strat: (r) => ({ single: r.principalDelta != null ? planSigned(r.principalDelta) : '—', bold: r.principalDelta != null && r.principalDelta !== 0 }) },
   ];
+  const shownRows = poolNoMort ? rows.filter((row) => !row.mort) : rows;
   const cell = (c) => (c.single != null
     ? `<td${c.bold ? ' class="plan-diff"' : ''}>${c.single}</td>`
     : `<td><div>${c.abs}</div><div class="plan-cell-delta${c.bold ? ' plan-diff' : ''}">${c.delta}</div></td>`);
   const head = '<tr><th></th><th>Baseline</th>' + picked.map((r) => `<th>${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</th>`).join('') + '</tr>';
-  const body = rows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + picked.map((r) => cell(row.strat(r))).join('') + '</tr>').join('');
+  const body = shownRows.map((row) => `<tr><td>${row.label}</td><td>${row.base}</td>` + picked.map((r) => cell(row.strat(r))).join('') + '</tr>').join('');
   const host = $(t.merged);
   if (!host) return;
   host.innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table>`
