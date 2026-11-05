@@ -5376,7 +5376,9 @@ export async function run(H, S) {
           tableCap: document.querySelector('#planReportTableCaption')?.textContent || '',
           deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
           breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
-          breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
+          // The pool template has no breakdown section at all — the
+          // wrap is absent, not merely hidden (templates, not gates).
+          breakdownAbsent: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap') == null,
         };
       });
       H.check('stratpanels: report shows the cash-pool trajectory (6 datasets, pool max 2,400) with the equity-excluded caption',
@@ -5389,9 +5391,9 @@ export async function run(H, S) {
           && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => repPool.headline.includes(k))
           && !repPool.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
         JSON.stringify({ headline: repPool.headline }));
-      H.check('invcomp: report comparison has Value Δ only, no Balance Δ line, breakdown block hidden',
+      H.check('invcomp: report comparison has Value Δ only, no Balance Δ line, no breakdown section',
         repPool.deltaLabels && !repPool.deltaLabels.some((l) => /Balance Δ/.test(l)) && repPool.deltaLabels.some((l) => /Value Δ/.test(l))
-          && repPool.breakdownNull === true && repPool.breakdownWrapHidden === true,
+          && repPool.breakdownNull === true && repPool.breakdownAbsent === true,
         JSON.stringify(repPool));
       H.check('invcomp: report table has Value Δ only, no mortgage columns',
         repPool.tableHead.includes('Value Δ') && !repPool.tableHead.includes('Balance Δ') && !repPool.tableHead.includes('Baseline balance')
@@ -5402,9 +5404,11 @@ export async function run(H, S) {
         JSON.stringify(repPool.trajTable.slice(0, 600)));
       // Item 6 revised report tier: the same strategy's tier LIST
       // carries the mortgage-chart report; opening it hides the
-      // mortgage block (with a plain baseline-phrased note) and
-      // keeps the pool block — the viewer rule is keyed on the
-      // cash-pool baseline, not on op nature.
+      // mortgage block (the pool template has no mortgage charts)
+      // and keeps the pool block — the viewer rule is keyed on the
+      // cash-pool baseline, not on op nature. The old "Mortgage
+      // charts hidden" note is gone with the template split: a pool
+      // template has no mortgage charts to explain away.
       await page.evaluate(() => { document.querySelector('#planReportBackBtn')?.click(); });
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icHideRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icHideRep);
@@ -5419,8 +5423,8 @@ export async function run(H, S) {
         heads: [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent),
         note: document.querySelector('#planReport')?.textContent.includes('Mortgage charts hidden') || false,
       }));
-      H.check('stratpanels: report on a non-mortgage strategy hides its mortgage chart block, keeps the pool block, notes the hide',
-        !hideState.heads.includes('Mortgage balance') && hideState.heads.includes('Pool trajectory') && hideState.note,
+      H.check('stratpanels: pool template hides the mortgage chart block, keeps the pool block, no hide note',
+        !hideState.heads.includes('Mortgage balance') && hideState.heads.includes('Pool trajectory') && !hideState.note,
         JSON.stringify(hideState));
       // Item 6 revised (c): BASELINE WINS over op nature — the mixed
       // sell + prepay strategy lives on the investment project, so
@@ -5742,6 +5746,12 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'DiffTable multi report', definition: { charts: [] }, strategy_ids: [dtStrat, dtStrat2], scenario_ids: [] });
   const dtRepMulti = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
   H.check('difftable: multi-strategy pool report created', r.status === 201 && dtRepMulti > 0, JSON.stringify(r.data));
+  // (reptpl) An AI report on the pool project: definition.engine is
+  // an object, so the viewer treats it as an AI report — it must
+  // still render the POOL template (no mortgage sections).
+  r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'DiffTable AI pool report', definition: { engine: {}, charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'], method: 'Cash pool balance by month from the engine projection.' }] }, strategy_ids: [dtStrat, dtStrat2], scenario_ids: [] });
+  const dtRepAi = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+  H.check('reptpl: AI pool report created', r.status === 201 && dtRepAi > 0, JSON.stringify(r.data));
   r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Mixed multi report', definition: { charts: [] }, strategy_ids: [icMixStrat, icStrat], scenario_ids: [] });
   const icMixRepMulti = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
   H.check('difftable: multi-strategy mixed report created', r.status === 201 && icMixRepMulti > 0, JSON.stringify(r.data));
@@ -5843,6 +5853,24 @@ export async function run(H, S) {
       H.check('difftable: pool report table starts at the stock series, no leading "—" months, Value Δ is 0 for a 0-op strategy',
         dtTable.firstMonth === dtFirstLabel && dtTable.firstBaseVal === 10000 && dtTable.firstStratVal === 10000 && dtTable.firstValDiff === 0 && dtTable.allValDiffZero && dtTable.rows === dtFirstYearRows,
         JSON.stringify({ ...dtTable, expectedFirst: dtFirstLabel, expectedRows: dtFirstYearRows }));
+      // (reptpl) Pool template: no Monthly payment breakdown anywhere
+      // (no h3, no note text, no canvas), no "Mortgage charts hidden"
+      // note, and the headline carries only the applicable cards.
+      // dtRep is still open from the table checks above.
+      const dtTpl = await page.evaluate(() => ({
+        hasBreakdownH3: [...document.querySelectorAll('#planReport h3')].some((h) => h.textContent.includes('Monthly payment breakdown')),
+        hasBreakdownCanvas: !!document.querySelector('#planReportTrajectoryBreakdownChart'),
+        mentionsBreakdown: (document.querySelector('#planReport')?.textContent || '').includes('Monthly payment breakdown'),
+        hasHideNote: (document.querySelector('#planReport')?.textContent || '').includes('Mortgage charts hidden'),
+        headlineCards: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((el) => el.textContent.trim()),
+      }));
+      H.check('reptpl: pool report has no Monthly payment breakdown section and no hide note',
+        !dtTpl.hasBreakdownH3 && !dtTpl.hasBreakdownCanvas && !dtTpl.mentionsBreakdown && !dtTpl.hasHideNote,
+        JSON.stringify(dtTpl));
+      H.check('reptpl: pool report headline carries only the applicable cards (no mortgage cards)',
+        ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((l) => dtTpl.headlineCards.includes(l))
+          && !dtTpl.headlineCards.some((l) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(l)),
+        JSON.stringify(dtTpl.headlineCards));
       // (c) is gone: the report table is monthly only (no annual
       // toggle — the merged comparison carries annual summaries).
       // (d) Property regression: mortgage columns stay, and the
@@ -5869,6 +5897,19 @@ export async function run(H, S) {
           && psTable.bals.length === psExpectedRows && psTable.months[0] === psFirstLabel && psMaxJump < 5000 && (psJunBal || 0) < 450000
           && psTable.bals.every((v, i) => v != null && Math.abs(v - (psApiByMonth.get(ymOfLabel(psTable.months[i])) || 0)) < 0.01),
         JSON.stringify({ head: psTable.head, bals: psTable.bals, months: psTable.months, maxJump: psMaxJump, junBal: psJunBal, expectedRows: psExpectedRows, expectedFirst: psFirstLabel }));
+      // (reptpl) Property template: the Monthly payment breakdown
+      // section is present (h3 + canvas) and the headline carries
+      // the mortgage cards. psRep is still open from the table
+      // checks above.
+      const psTpl = await page.evaluate(() => ({
+        hasBreakdownH3: [...document.querySelectorAll('#planReport h3')].some((h) => h.textContent.includes('Monthly payment breakdown')),
+        hasBreakdownCanvas: !!document.querySelector('#planReportTrajectoryBreakdownChart'),
+        headlineCards: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((el) => el.textContent.trim()),
+      }));
+      H.check('reptpl: property report keeps the Monthly payment breakdown section and the mortgage headline cards',
+        psTpl.hasBreakdownH3 && psTpl.hasBreakdownCanvas
+          && ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((l) => psTpl.headlineCards.includes(l)),
+        JSON.stringify(psTpl));
       // (e/f/g) Report-view merged table: pool + no mortgage-touching
       // strategy hides the mortgage rows; a picked mortgage-touching
       // strategy (mixed) and a property report keep them.
@@ -5897,13 +5938,29 @@ export async function run(H, S) {
           && ['Value at horizon', 'Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((l) => dtMerged.includes(l)),
         JSON.stringify(dtMerged));
       const mixMerged = await openMerged(icProj, icMixRepMulti);
-      H.check('difftable: pool report with a mortgage-touching strategy keeps the mortgage rows',
-        mixMerged.some((l) => l.startsWith('Monthly payment')) && mixMerged.includes('Total interest') && mixMerged.includes('Payoff'),
+      H.check('difftable: pool report merged table has no mortgage rows even with a mortgage-touching strategy (baseline wins)',
+        !mixMerged.some((l) => l.startsWith('Monthly payment') || l === 'Total interest' || l === 'Payoff')
+          && ['Value at horizon', 'Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((l) => mixMerged.includes(l)),
         JSON.stringify(mixMerged));
       const propMerged = await openMerged(psProj, psRepMulti);
       H.check('difftable: property report merged table keeps the mortgage rows',
         propMerged.some((l) => l.startsWith('Monthly payment')) && propMerged.includes('Total interest') && propMerged.includes('Payoff'),
         JSON.stringify(propMerged));
+      // (reptpl) AI report on the pool project: same pool template —
+      // no breakdown, no mortgage headline cards — and the Refine
+      // block proves it rendered as an AI report.
+      await openReport(dtProj, dtRepAi);
+      const dtAiTpl = await page.evaluate(() => ({
+        hasBreakdownH3: [...document.querySelectorAll('#planReport h3')].some((h) => h.textContent.includes('Monthly payment breakdown')),
+        hasBreakdownCanvas: !!document.querySelector('#planReportTrajectoryBreakdownChart'),
+        hasHideNote: (document.querySelector('#planReport')?.textContent || '').includes('Mortgage charts hidden'),
+        headlineCards: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((el) => el.textContent.trim()),
+        hasRefine: !!document.querySelector('[data-plan-report-block="refine"]'),
+      }));
+      H.check('reptpl: AI pool report renders the pool template (no mortgage sections) and keeps its Refine block',
+        !dtAiTpl.hasBreakdownH3 && !dtAiTpl.hasBreakdownCanvas && !dtAiTpl.hasHideNote && dtAiTpl.hasRefine
+          && !dtAiTpl.headlineCards.some((l) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(l)),
+        JSON.stringify(dtAiTpl));
     } finally { await browserD.close(); }
   }
   // ------------------------------------------- engine: penalty variables + report sections + flat horizon

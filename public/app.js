@@ -13254,6 +13254,39 @@ function planReportApplyOverlay(comp, report) {
   }
 }
 
+// Per-baseline-kind report templates (user 2026-11-05): a report
+// renders the template of its BASELINE kind — property and cash-pool
+// reports no longer share one merged template with piecemeal
+// kind-gates inside it (that merge is what let the "Monthly payment
+// breakdown" heading leak into an investment report while its chart
+// correctly hid). Each template declares its sections, in order,
+// plus which mortgage pieces it carries. A new baseline kind
+// (saving) registers its own template here; the shared viewer never
+// forks by kind again. The default is the property template.
+const PLAN_REPORT_TEMPLATES = {
+  property: {
+    key: 'property',
+    sections: ['variables', 'headline', 'charts', 'table', 'comparison', 'engine'],
+    mortgageCharts: true,        // mortgage-only chart blocks render
+    mortgageHeadlineCards: true, // Interest saved / Payoff shift / Monthly payment Δ / Penalty
+    breakdown: true,             // Monthly payment breakdown inside the comparison panel
+    mergedMortgageRows: true,    // mortgage rows in the merged table
+  },
+  pool: {
+    key: 'pool',
+    sections: ['variables', 'headline', 'charts', 'table', 'comparison', 'engine'],
+    mortgageCharts: false,
+    mortgageHeadlineCards: false,
+    breakdown: false,
+    mergedMortgageRows: false,
+  },
+};
+// Baseline kind → template, defaulting to property. The report's
+// baseline kind is its investmentScope flag (cash-pool baseline).
+function planReportTemplateFor(kind) {
+  return PLAN_REPORT_TEMPLATES[kind] || PLAN_REPORT_TEMPLATES.property;
+}
+
 // Headline cards for the selected strategy (items 6 + 9): the nine
 // metric cards that used to live on the strategy page. Pool
 // baselines show five (no mortgage figures). Values come from the
@@ -13263,7 +13296,11 @@ function planReportHeadlineCardsHtml(view) {
   const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
   if (!row) return '<div class="note">No strategies yet.</div>';
   const c = planReportEffectiveComparison(row, view.vars);
-  const pool = !!(view.comp.report && view.comp.report.investmentScope);
+  // Which mortgage cards show follows the report TEMPLATE, not a
+  // local investmentScope check. Stock gain stays for pool reports:
+  // it is a stock figure, not a mortgage figure.
+  const template = view.template || planReportTemplateFor('property');
+  const showMortCards = template.mortgageHeadlineCards;
   const card = (k, v) => `<div class="card breakdown-card plan-metric-card"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`;
   const cards = [
     card('Net benefit', planMoney(c.net)),
@@ -13271,9 +13308,9 @@ function planReportHeadlineCardsHtml(view) {
     card('Total gain', planMoney(c.gain)),
     card('Value at horizon', planMoney(c.valueAtHorizon)),
   ];
-  if (!pool) cards.push(card('Interest saved', planSigned(c.interestSaved)));
+  if (showMortCards) cards.push(card('Interest saved', planSigned(c.interestSaved)));
   cards.push(card('Stock gain', planSigned(c.stockGain)));
-  if (!pool) {
+  if (showMortCards) {
     cards.push(card('Payoff shift', c.payoffShiftMonths == null ? '—' : `${c.payoffShiftMonths >= 0 ? '+' : ''}${c.payoffShiftMonths} months`));
     cards.push(card('Monthly payment Δ', planSigned(c.paymentDelta)));
     cards.push(card('Penalty', planMoney(c.penalty)));
@@ -13321,7 +13358,7 @@ function planReportTableRender(view) {
   const pager = $('#planReportTablePager');
   if (!host) return;
   const rows = planReportTableRows(view);
-  const kind = (view.comp.report && view.comp.report.investmentScope) ? 'pool' : (view.projectCategory === 'property' ? 'property' : 'other');
+  const kind = view.templateKey === 'pool' ? 'pool' : (view.projectCategory === 'property' ? 'property' : 'other');
   const hasMort = rows.some((r) => r.balBase != null || r.balStrat != null);
   const hasStock = rows.some((r) => r.valBase != null || r.valStrat != null);
   const selRow = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId);
@@ -13620,6 +13657,14 @@ async function loadPlanReport(projectId, reportId) {
     // variables replace the engine penalty in cost. Applied once
     // here so every section renders executed figures.
     planReportApplyOverlay(comp, report);
+    // The report's TEMPLATE follows its BASELINE kind (cash-pool
+    // baseline → pool template, everything else → property template
+    // for now). The template — not scattered investmentScope checks —
+    // decides which mortgage pieces render, and the rule is uniform:
+    // the same report renders identically on the project page and
+    // the strategy page, so the shared viewer is never forked by
+    // page and the stored definitions are never rewritten.
+    const template = planReportTemplateFor((comp.report && comp.report.investmentScope) ? 'pool' : 'property');
     // Report-view state: the chip-selected strategy drives the
     // headline, the table and the engine note; it survives reloads
     // within the tab while the report stays open.
@@ -13630,6 +13675,7 @@ async function loadPlanReport(projectId, reportId) {
     planReportView = {
       projectId, reportId, comp, report, scenarioIds, pickedIds,
       selectedStrategyId,
+      template, templateKey: template.key,
       vars: JSON.parse(JSON.stringify((report.definition && report.definition.variables) || {})),
       tableYear: prevView ? prevView.tableYear : null,
       projectCategory: proj.project ? proj.project.category : null,
@@ -13637,18 +13683,6 @@ async function loadPlanReport(projectId, reportId) {
       costDoughnut: null,
       refineDefinition: null,
     };
-    // Mortgage-chart visibility follows the BASELINE kind, not the
-    // pins or the page (user 2026-11-04): on a cash-pool baseline
-    // (the report's investmentScope flag) mortgage-only chart blocks
-    // are hidden, even for a mortgage-op strategy. The rule is uniform
-    // — the same report renders identically on the project page and
-    // the strategy page — so the shared viewer is never forked by
-    // page and the stored definitions are never rewritten.
-    // metric_cards and the comparison panel stay: their mortgage
-    // figures already render '—' for non-mortgage strategies, and
-    // their cost/gain/net figures are real.
-    const cashPoolBaseline = !!(comp.report && comp.report.investmentScope);
-    let mortHidden = 0;
     // Projection errors surface in the report view at the same
     // standard as the strategy detail page: a dropped op (e.g. an
     // empty-pot buy) must not read as identical series with no
@@ -13670,7 +13704,7 @@ async function loadPlanReport(projectId, reportId) {
     } catch { /* labels fall back to ids */ }
     const charts = (report.definition && report.definition.charts) || [];
     const fanData = {};
-    if (!cashPoolBaseline && charts.some((c) => c.template === 'fan_band')) {
+    if (template.mortgageCharts && charts.some((c) => c.template === 'fan_band')) {
       for (const row of comp.strategies) {
         try { const sd = await api(`/api/planning/strategies/${row.strategy.id}`); fanData[row.strategy.id] = sd.scenarioTable || []; }
         catch { fanData[row.strategy.id] = []; }
@@ -13693,20 +13727,20 @@ async function loadPlanReport(projectId, reportId) {
       // renders twice.
       if (c.template === 'metric_cards') return;
       const series = (c.series && c.series.length ? c.series : null);
-      // Mortgage-only blocks hide on a cash-pool baseline (see
-      // cashPoolBaseline above). A block with any non-mortgage series
+      // Mortgage-only blocks hide under a template without mortgage
+      // charts (the pool template). A block with any non-mortgage series
       // stays — e.g. a stacked_bar with stock_value.
-      if (cashPoolBaseline) {
+      if (!template.mortgageCharts) {
         const mortOnly = (sids) => sids.length > 0 && sids.every((sid) => sid === 'mortgage_balance');
-        if (c.template === 'fan_band') { mortHidden++; return; }
-        if (c.template === 'time_line' && mortOnly(series || ['mortgage_balance'])) { mortHidden++; return; }
-        if (c.template === 'yearly_bars' && ((series && series[0]) || 'mortgage_balance') === 'mortgage_balance') { mortHidden++; return; }
-        if (c.template === 'stacked_bar' && mortOnly(series || ['mortgage_balance'])) { mortHidden++; return; }
-        if (c.template === 'share_doughnut' && series && (series.includes('mortgage_balance') || series.includes('total_value'))) { mortHidden++; return; }
+        if (c.template === 'fan_band') return;
+        if (c.template === 'time_line' && mortOnly(series || ['mortgage_balance'])) return;
+        if (c.template === 'yearly_bars' && ((series && series[0]) || 'mortgage_balance') === 'mortgage_balance') return;
+        if (c.template === 'stacked_bar' && mortOnly(series || ['mortgage_balance'])) return;
+        if (c.template === 'share_doughnut' && series && (series.includes('mortgage_balance') || series.includes('total_value'))) return;
       }
       // AI-supplied method wins; engine-path charts get the app's own
       // how-calculated line. Either way every chart states its method.
-      const how = c.method ? c.method : planReportHowFor(series, comp.entityProperty && comp.entityProperty.address, comp.report && comp.report.investmentScope);
+      const how = c.method ? c.method : planReportHowFor(series, comp.entityProperty && comp.entityProperty.address, template.key === 'pool');
       const cid = `planReportChart${i}`;
       if (c.template === 'time_line') {
         const sids = series || ['mortgage_balance'];
@@ -13860,40 +13894,33 @@ async function loadPlanReport(projectId, reportId) {
       : 'Current rates (no scenario)';
     planReportTabsOpen(projectId, reportId, report.name);
     const renderedStrategyIds = comp.strategies.map((r) => r.strategy.id);
-    // Report sections (item 9), in order: headline → chart → table →
-    // strategy对比 (the merged cross-strategy table, multi-strategy
-    // reports only — the Δ chart + breakdown in the comparison
-    // panel stay for every report) → engine explanation (always
-    // last). Variables sit above the headline; Refine with AI
-    // follows the engine note, AI reports only. Each section is a
-    // data-plan-report-block so the floating outline nav lists it;
-    // the comparison panel keeps its own id (the outline adds it
-    // once, by id).
+    // Report sections, in the TEMPLATE's order: headline → chart →
+    // table → strategy对比 (the merged cross-strategy table,
+    // multi-strategy reports only — the Δ chart + breakdown in the
+    // comparison panel stay for every report of a template that has
+    // them) → engine explanation (always last). Variables sit above
+    // the headline; Refine with AI follows the engine note, AI
+    // reports only. Each section is a data-plan-report-block so the
+    // floating outline nav lists it; the comparison panel keeps its
+    // own id (the outline adds it once, by id). The header panel
+    // (title / world / definitions) is common to every template.
     const isAiReport = !!(report.definition && report.definition.engine && typeof report.definition.engine === 'object');
     const headlineChips = comp.strategies.map((r) => `<button class="small${r.strategy.id === planReportView.selectedStrategyId ? ' active' : ''}" data-plan-report-headline-strategy="${r.strategy.id}">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</button>`).join(' ');
-    $('#planReport').innerHTML = `
-      <div class="panel">
-        <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
-        <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
-        ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
-        ${projWarnLines.map((l) => `<div class="msg warn">${esc(l)}</div>`).join('')}
-        ${mortHidden ? `<div class="note">Mortgage charts hidden — this report's baseline is a cash pool.</div>` : ''}
-        <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
-      </div>
-      <div data-plan-report-block="variables">${planReportVariablesHtml(planReportView)}</div>
-      <div data-plan-report-block="headline"><div class="panel">
+    const sections = {
+      variables: `<div data-plan-report-block="variables">${planReportVariablesHtml(planReportView)}</div>`,
+      headline: `<div data-plan-report-block="headline"><div class="panel">
         <div class="section-head"><h3>Headline</h3></div>
         <div class="toolbar">${headlineChips}</div>
         <div id="planReportHeadlineCards">${planReportHeadlineCardsHtml(planReportView)}</div>
-      </div></div>
-      ${panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
-      <div data-plan-report-block="table"><div class="panel">
+      </div></div>`,
+      charts: panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>',
+      table: `<div data-plan-report-block="table"><div class="panel">
         <div class="section-head"><h3>Difference vs baseline</h3></div>
         <div class="note" id="planReportTableCaption"></div>
         <div class="toolbar" id="planReportTablePager"></div>
         <div id="planReportTableBody"></div>
-      </div></div>
-      <div class="panel" id="planReportComparePanel">
+      </div></div>`,
+      comparison: `<div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
         <div id="planReportComparePicker" class="toolbar"></div>
@@ -13902,14 +13929,24 @@ async function loadPlanReport(projectId, reportId) {
         <div id="planReportTrajRange"></div>
         <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
-        <div class="section-head"><h3>Monthly payment breakdown</h3></div>
+        ${template.breakdown ? `<div class="section-head"><h3>Monthly payment breakdown</h3></div>
         <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
         <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planReportTrajectoryBreakdownChart"></canvas></div>
-        <div id="planReportTrajectoryBreakdownEmpty"></div>
+        <div id="planReportTrajectoryBreakdownEmpty"></div>` : ''}
         <div id="planReportMergedTable"></div>
-        <div class="note">${(comp.report && comp.report.investmentScope) ? 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Trajectory total value = cash pool balance + stock value (investment scope — property equity excluded); Value at horizon = property equity + stock value + cash pot.' : 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Total value = property equity + stock value; equity = assessed value − outstanding principal.'}</div>
+        <div class="note">${template.key === 'pool' ? 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Trajectory total value = cash pool balance + stock value (investment scope — property equity excluded); Value at horizon = property equity + stock value + cash pot.' : 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Total value = property equity + stock value; equity = assessed value − outstanding principal.'}</div>
+      </div>`,
+      engine: `<div data-plan-report-block="engine"><div id="planReportEngineBody">${planReportEngineHtml(planReportView)}</div></div>`,
+    };
+    $('#planReport').innerHTML = `
+      <div class="panel">
+        <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
+        <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
+        ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
+        ${projWarnLines.map((l) => `<div class="msg warn">${esc(l)}</div>`).join('')}
+        <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
       </div>
-      <div data-plan-report-block="engine"><div id="planReportEngineBody">${planReportEngineHtml(planReportView)}</div></div>
+      ${template.sections.map((s) => sections[s] || '').join('')}
       ${isAiReport ? `<div data-plan-report-block="refine">${planReportRefineHtml()}</div>` : ''}`;
     draws.forEach((d) => { try { d(); } catch { /* a failed chart never blocks the tables */ } });
     // Table section renders from the already-fetched trajectories.
@@ -13920,6 +13957,7 @@ async function loadPlanReport(projectId, reportId) {
     // planCompareNewRender).
     try {
       planCompareNewRender({ scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report }, {
+        template,
         note: '#planReportTrajectoryNote', chart: 'planReportTrajectoryChart', empty: '#planReportTrajectoryEmpty',
         wrapSel: '#planReportComparePanel .plan-traj-wrap',
         range: '#planReportTrajRange', breakdown: 'planReportTrajectoryBreakdownChart', breakdownEmpty: '#planReportTrajectoryBreakdownEmpty',
@@ -14796,27 +14834,35 @@ function planCompareNewRender(block, ids) {
       planDestroyChart(t.chart);
       if (empty) empty.innerHTML = '<div class="note">Pick a strategy to compare.</div>';
     }
-    // Payment breakdown: baseline + mortgage-touching picked
+    // Payment breakdown (property template only — the pool template
+    // has no breakdown section at all, so there is nothing to draw
+    // or hide here): baseline + mortgage-touching picked
     // trajectories only. A strategy with no mortgage ops must not
     // render mortgage bars at all — its interest/principal series are
     // the untouched mainline mortgages, not the strategy's effect.
-    // With no mortgage-touching strategy picked, the whole block hides.
-    const mortPickedIds = picked.filter((r) => r.touchesMortgage).map((r) => r.strategy.id);
-    if (!mortPickedIds.length) {
-      if (bWrap) bWrap.style.display = 'none';
+    // With no mortgage-touching strategy picked, the whole block hides
+    // (this hide stays inside the property template).
+    const hasBreakdown = !t.template || t.template.breakdown !== false;
+    if (!hasBreakdown) {
       planDestroyChart(t.breakdown);
-      if (bEmpty) bEmpty.innerHTML = '';
     } else {
-      if (bWrap) bWrap.style.display = '';
-      if (bEmpty) bEmpty.innerHTML = '';
-      const shownTrajs = trajs.filter((tr) => tr.key === 'baseline' || mortPickedIds.includes(Number(tr.key)));
-      const bDatasets = [];
-      shownTrajs.forEach((tr, i) => {
-        const get = byMonth(tr);
-        bDatasets.push({ label: `${tr.label} interest`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.interest || 0); }), backgroundColor: planColor(i), stack: tr.label });
-        bDatasets.push({ label: `${tr.label} principal`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.principal || 0); }), backgroundColor: planColorAlpha(planColor(i), 0.45), stack: tr.label });
-      });
-      planBarChart(t.breakdown, effMonths.map(formatYM), bDatasets);
+      const mortPickedIds = picked.filter((r) => r.touchesMortgage).map((r) => r.strategy.id);
+      if (!mortPickedIds.length) {
+        if (bWrap) bWrap.style.display = 'none';
+        planDestroyChart(t.breakdown);
+        if (bEmpty) bEmpty.innerHTML = '';
+      } else {
+        if (bWrap) bWrap.style.display = '';
+        if (bEmpty) bEmpty.innerHTML = '';
+        const shownTrajs = trajs.filter((tr) => tr.key === 'baseline' || mortPickedIds.includes(Number(tr.key)));
+        const bDatasets = [];
+        shownTrajs.forEach((tr, i) => {
+          const get = byMonth(tr);
+          bDatasets.push({ label: `${tr.label} interest`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.interest || 0); }), backgroundColor: planColor(i), stack: tr.label });
+          bDatasets.push({ label: `${tr.label} principal`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.principal || 0); }), backgroundColor: planColorAlpha(planColor(i), 0.45), stack: tr.label });
+        });
+        planBarChart(t.breakdown, effMonths.map(formatYM), bDatasets);
+      }
     }
   } else {
     planDestroyChart(t.chart);
@@ -14881,13 +14927,13 @@ function planMergedRender(t) {
   if (!block) return;
   const appleIds = t.getAppleIds();
   const picked = block.strategies.filter((r) => appleIds && appleIds.includes(r.strategy.id));
-  // Pool baseline with no mortgage-touching strategy picked: the
-  // mortgage rows would show the summed all-properties mainline
-  // figures (the payload carries every property's mortgage series),
-  // which say nothing about a cash-pool comparison — hide them, the
-  // same way the breakdown block hides. A picked mortgage-touching
-  // strategy keeps them (scoped figures, real effects).
-  const poolNoMort = !!(block.report && block.report.investmentScope) && !picked.some((r) => r.touchesMortgage);
+  // The merged table's mortgage rows follow the report TEMPLATE
+  // (baseline kind), not the picked strategies' op nature: a pool
+  // report has no mortgage rows even when a picked strategy touches
+  // a mortgage — the baseline wins over op nature, the same rule
+  // the Difference table already applies. The property template
+  // keeps them.
+  const showMortRows = !t.template || t.template.mergedMortgageRows !== false;
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const payMeta = planPaymentScopeMeta(block);
   const baseValue = planBaselineValue(block);
@@ -14924,7 +14970,7 @@ function planMergedRender(t) {
     { label: 'Equity Δ', base: '—', strat: (r) => ({ single: r.equityDelta != null ? planSigned(r.equityDelta) : '—', bold: r.equityDelta != null && r.equityDelta !== 0 }) },
     { label: 'Principal Δ', base: '—', strat: (r) => ({ single: r.principalDelta != null ? planSigned(r.principalDelta) : '—', bold: r.principalDelta != null && r.principalDelta !== 0 }) },
   ];
-  const shownRows = poolNoMort ? rows.filter((row) => !row.mort) : rows;
+  const shownRows = showMortRows ? rows : rows.filter((row) => !row.mort);
   const cell = (c) => (c.single != null
     ? `<td${c.bold ? ' class="plan-diff"' : ''}>${c.single}</td>`
     : `<td><div>${c.abs}</div><div class="plan-cell-delta${c.bold ? ' plan-diff' : ''}">${c.delta}</div></td>`);
