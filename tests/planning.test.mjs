@@ -93,6 +93,16 @@ test('validateStrategyFactors: shape errors for points, percents and sinks', () 
   assert.equal(primeFactorToScenario({}), null);
   assert.deepEqual(factorsToAssumptions({ stock: { valuePct: 6 } }, { stockReturnPct: 3, comparableRate: 4 }), { stockReturnPct: 6, comparableRate: 4 });
   assert.deepEqual(factorsToAssumptions({}, { stockReturnPct: 3 }), { stockReturnPct: 3 });
+  // Disabled factors (enabled === false — unchecked in the editor,
+  // values kept in data) contribute nothing: the dimension follows
+  // the default world exactly as if the factor were absent. Missing
+  // `enabled` still means enabled (migration: stored factors start
+  // checked).
+  assert.equal(primeFactorToScenario({ prime: { points: [{ month: '2027-06', rate: 5.5 }], enabled: false } }), null);
+  assert.deepEqual(primeFactorToScenario({ prime: { points: [{ month: '2027-06', rate: 5.5 }], enabled: true } }), { name: 'Strategy prime', steps: [{ date: '2027-06-01', rate: 5.5 }] });
+  assert.deepEqual(factorsToAssumptions({ stock: { valuePct: 6, byHolding: { 7: { valuePct: 9 } }, enabled: false }, propertyGrowth: { valuePct: 2, enabled: false } }, { stockReturnPct: 3 }), { stockReturnPct: 3 });
+  assert.deepEqual(factorsToAssumptions({ stock: { valuePct: 6, byHolding: { 7: { valuePct: 9 } }, enabled: true }, propertyGrowth: { valuePct: 2 } }, { stockReturnPct: 3 }), { stockReturnPct: 6, stockReturnByHolding: { 7: 9 }, propertyGrowthPct: 2 });
+  assert.deepEqual(validateScenarioFactors({ prime: { points: [{ month: '2027-06', rate: 5.5 }], enabled: false } }), []);
 });
 
 // ------------------------------------------------------------- validation
@@ -877,6 +887,25 @@ test('validateAiCreateProposal rejects a non-object reply', () => {
   const { proposal, errors } = validateAiCreateProposal('nope');
   assert.equal(proposal, null);
   assert.deepEqual(errors, ['proposal must be an object']);
+});
+
+test('validateAiCreateProposal preserves a valid custom sink (GIC shape) and flags a bad one', () => {
+  const gic = {
+    project: { name: 'GIC Investment' },
+    scenario: { name: 'Base Scenario', factors: {} },
+    baseline: { name: 'Do Nothing', description: 'Hold the pool as-is' },
+    strategy: { name: 'GIC Purchase Strategy', sink: { kind: 'custom', name: 'GIC 4.12% 180d', expectedReturnPct: 4.12 }, ops: [{ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12% 180d', currency: 'CAD', date: '2027-01-01', amount: 10000, price: 100 } }] },
+  };
+  const { proposal, errors } = validateAiCreateProposal(gic);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(proposal.strategy.sink, { kind: 'custom', name: 'GIC 4.12% 180d', expectedReturnPct: 4.12 });
+  const bad = validateAiCreateProposal({ ...gic, strategy: { ...gic.strategy, sink: { kind: 'custom', name: 'GIC' } } });
+  assert.ok(bad.errors.some((e) => /expectedReturnPct/.test(e)));
+  const nonObj = validateAiCreateProposal({ ...gic, strategy: { ...gic.strategy, sink: 'GIC' } });
+  assert.ok(nonObj.errors.includes('strategy sink must be an object'));
+  const noSink = validateAiCreateProposal({ ...gic, strategy: { name: 'GIC Purchase Strategy', ops: [] } });
+  assert.deepEqual(noSink.errors, []);
+  assert.equal(noSink.proposal.strategy.sink, undefined);
 });
 
 test('validateAiReportBaselineKind: pool baseline rejects every mortgage-family chart', () => {

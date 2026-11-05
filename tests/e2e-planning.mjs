@@ -2299,15 +2299,13 @@ export async function run(H, S) {
         JSON.stringify(stratPage));
       await page.goto(`http://ff.local/#planning/scenario/${poolScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
-      // Prime is opt-in now: add the factor first, then the chart + presets render.
+      // Prime is checkbox-gated now: check it, then the chart +
+      // presets render. (The Add-factor select is gone.)
       const primeAdded = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         for (let i = 0; i < 12; i++) {
-          const sel = document.querySelector('#planFactorAddSel');
-          if (sel) {
-            sel.value = 'prime';
-            document.querySelector('#planFactorAddBtn').click();
-          }
+          const cb = document.querySelector('[data-factor-check="prime"]');
+          if (cb && !cb.checked) cb.click();
           await sleep(500);
           if (document.querySelector('#planFactorPrimeChart')) return true;
         }
@@ -2319,13 +2317,13 @@ export async function run(H, S) {
         presetBtns: document.querySelectorAll('[data-plan-prime-preset]').length,
         scenarioPanelOld: !!document.querySelector('#planScenarioPanel'),
         fanChart: !!document.querySelector('#planStrategyFanChart'),
-        addOpts: [...document.querySelectorAll('#planFactorAddSel option')].map((o) => o.value),
+        checkOpts: [...document.querySelectorAll('#planFactorChecks [data-factor-check]')].map((c) => c.dataset.factorCheck),
       }));
-      H.check('planning pool: scenario detail shows the Factors panel with prime chart + view presets after Add factor, no fan chart',
+      H.check('planning pool: scenario detail shows the Factors panel with prime chart + view presets after checking Prime, no fan chart',
         primeAdded && scenPage.factorsPanel && scenPage.primeChart && scenPage.presetBtns === 5 && !scenPage.scenarioPanelOld && !scenPage.fanChart,
         JSON.stringify(scenPage));
-      H.check('scenario restructure: the scenario Add-factor select never offers Sink (sink lives on the strategy)',
-        !scenPage.addOpts.includes('sink'), JSON.stringify(scenPage.addOpts));
+      H.check('scenario restructure: the factor checkboxes never offer Sink (sink lives on the strategy)',
+        !scenPage.checkOpts.includes('sink'), JSON.stringify(scenPage.checkOpts));
       // Ops + sink still work with no factors: under the factor-less
       // Pool Prime world the strategy card keeps its figures + sink line.
       await page.goto(`http://ff.local/#planning/project/${poolProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -2823,15 +2821,26 @@ export async function run(H, S) {
       await waitR(1500);
       const added = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        const sel = document.querySelector('#planFactorAddSel');
-        if (!sel) return false;
-        sel.value = 'stock';
-        document.querySelector('#planFactorAddBtn').click();
+        // The checkboxes render when the page's factor wire finishes
+        // its async loads (prime + investments) — poll for the box
+        // instead of bailing when it is not there yet.
+        let cb = null;
         for (let i = 0; i < 12; i++) {
-          if (document.querySelector('#planStockGlobalVal')) break;
+          cb = document.querySelector('[data-factor-check="stock"]');
+          if (cb) break;
           await sleep(500);
         }
-        const inp = document.querySelector('#planStockGlobalVal');
+        if (!cb) return false;
+        if (!cb.checked) cb.click();
+        for (let i = 0; i < 12; i++) {
+          if (document.querySelector('[data-plan-stock-override]')) break;
+          await sleep(500);
+        }
+        const btn = document.querySelector('[data-plan-stock-override]');
+        if (!btn) return false;
+        btn.click();
+        await sleep(500);
+        const inp = document.querySelector('input[data-plan-stock-holding]');
         if (!inp) return false;
         inp.value = '8';
         inp.dispatchEvent(new Event('input', { bubbles: true }));
@@ -2841,7 +2850,9 @@ export async function run(H, S) {
       });
       H.check('strategy editor: stock factor added through the scenario UI', added);
       r = await H.req('GET', `/api/planning/scenarios/${edScenId}`);
-      H.check('strategy editor: scenario stock factor saved', r.status === 200 && r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock && r.data.scenario.factors.stock.valuePct === 8, JSON.stringify(r.data));
+      const edStock = r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock;
+      H.check('strategy editor: scenario stock factor saved',
+        r.status === 200 && edStock && edStock.byHolding && Object.values(edStock.byHolding).some((v) => Number(v.valuePct) === 8), JSON.stringify(r.data));
       r = await H.req('GET', `/api/planning/strategies/${edStratId}?scenarioId=${edScenId}`);
       const edAfter = r.data.comparison || {};
       // A stock factor is a global return override: with valued holdings
@@ -2877,24 +2888,29 @@ export async function run(H, S) {
       await waitR(1500);
       const legacy = await page.evaluate(() => ({
         primeChart: !!document.querySelector('#planFactorPrimeChart'),
-        stockVal: document.querySelector('#planStockGlobalVal')?.value || '',
+        stockChecked: !!document.querySelector('[data-factor-check="stock"]')?.checked,
+        stockDefault: [...document.querySelectorAll('[data-plan-stock-eff]')].map((el) => el.textContent).join(' | '),
       }));
-      H.check('strategy editor: migrated scenario still shows its factors (prime chart + stock 8)',
-        legacy.primeChart && legacy.stockVal === '8', JSON.stringify(legacy));
-      // Growth editor on a property project: Add factor reveals it.
+      H.check('strategy editor: migrated scenario still shows its factors (prime chart + stock 8 as scenario default)',
+        legacy.primeChart && legacy.stockChecked && legacy.stockDefault.includes('8%/yr · Scenario default'), JSON.stringify(legacy));
+      // Growth editor on a property project: checking Property growth reveals it.
       const growthAdded = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        const sel = document.querySelector('#planFactorAddSel');
-        if (!sel) return false;
-        sel.value = 'propertyGrowth';
-        document.querySelector('#planFactorAddBtn').click();
+        let cb = null;
+        for (let i = 0; i < 12; i++) {
+          cb = document.querySelector('[data-factor-check="propertyGrowth"]');
+          if (cb) break;
+          await sleep(500);
+        }
+        if (!cb) return false;
+        if (!cb.checked) cb.click();
         for (let i = 0; i < 12; i++) {
           if (document.querySelector('[data-growth="propertyGrowth"]')) return true;
           await sleep(500);
         }
         return false;
       });
-      H.check('scenario restructure: Add factor reveals the property-growth editor on a property project', growthAdded);
+      H.check('scenario restructure: checking Property growth reveals its editor on a property project', growthAdded);
       await page.goto(`http://ff.local/#planning/project/${edProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
       // Scenario cards: create / rename / delete through the UI.
@@ -5747,21 +5763,39 @@ export async function run(H, S) {
       const noFactorCard = await page.evaluate(() => document.querySelector('#planBaselineCards')?.textContent || '');
       H.check('scenfact: factor-less scenario still shows the history rate on the baseline card',
         noFactorCard.includes('History') && noFactorCard.includes(sfSug1y.basis), JSON.stringify(noFactorCard.slice(0, 300)));
-      // (a)+(b) scenario page: add the stock factor, the row shows
-      // the history-derived default labeled; edit per holding; save.
+      // (a)+(b) scenario page: factor checkboxes — stock starts
+      // unchecked, its component hidden; checking it shows the
+      // read-only history-derived value with basis + window label
+      // and NO editable input until "+ Override".
       await page.goto(`http://ff.local/#planning/scenario/${sfScen}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitF(1500);
-      await page.evaluate(() => { document.querySelector('#planFactorAddSel').value = 'stock'; });
-      await page.evaluate(() => document.querySelector('#planFactorAddBtn').click());
-      await page.waitForFunction((hid) => !!document.querySelector(`input[data-plan-stock-holding="${hid}"]`), { timeout: 15000 }, sfHold);
+      // The checkboxes render when the factor wire finishes its async
+      // loads — wait for the box before asserting its initial state.
+      await page.waitForFunction(() => !!document.querySelector('[data-factor-check="stock"]'), { timeout: 15000 });
+      const checksBefore = await page.evaluate(() => ({
+        stockChecked: !!document.querySelector('[data-factor-check="stock"]')?.checked,
+        stockHidden: !document.querySelector('#planFactorStock')?.textContent.trim(),
+        addBtn: !!document.querySelector('#planFactorAddBtn'),
+      }));
+      H.check('scenfact: factor checkboxes replace Add factor; stock starts unchecked and hidden',
+        checksBefore.stockChecked === false && checksBefore.stockHidden && !checksBefore.addBtn, JSON.stringify(checksBefore));
+      await page.evaluate(() => document.querySelector('[data-factor-check="stock"]').click());
       await page.waitForFunction((hid) => (document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '').includes('History'), { timeout: 15000 }, sfHold);
       const rowBefore = await page.evaluate((hid) => ({
         eff: document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '',
-        val: document.querySelector(`input[data-plan-stock-holding="${hid}"]`)?.value || '',
+        inputs: document.querySelectorAll('#planFactorStock input[data-plan-stock-holding]').length,
+        overrideBtn: !!document.querySelector(`[data-plan-stock-override="${hid}"]`),
       }), sfHold);
-      H.check('scenfact: scenario stock row defaults to the history-derived value with basis + window label',
-        rowBefore.eff.includes('History') && rowBefore.eff.includes(sfSug1y.basis) && rowBefore.eff.includes(sfSug1y.window) && rowBefore.val === '',
+      H.check('scenfact: scenario stock row is read-only history value with basis + window label, + Override offered',
+        rowBefore.eff.includes('History') && rowBefore.eff.includes(sfSug1y.basis) && rowBefore.eff.includes(sfSug1y.window) && rowBefore.inputs === 0 && rowBefore.overrideBtn,
         JSON.stringify({ rowBefore, basis: sfSug1y.basis, window: sfSug1y.window }));
+      // "+ Override" opens an input prefilled with the history value;
+      // typing 12.5 marks the row Override; Save persists it.
+      await page.evaluate((hid) => document.querySelector(`[data-plan-stock-override="${hid}"]`).click(), sfHold);
+      await page.waitForFunction((hid, pct) => {
+        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
+        return inp && Number(inp.value.replace(/,/g, '')) === pct;
+      }, { timeout: 10000 }, sfHold, sfHistPct);
       await page.evaluate((hid) => {
         const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
         inp.value = '12.5';
@@ -5793,22 +5827,45 @@ export async function run(H, S) {
       H.check('scenfact: baseline card shows the edited scenario return with its source, still no edit control',
         editedCard.text.includes('12.5%/yr expected') && editedCard.text.includes('Scenario ScenFact World') && editedCard.inputs === 0 && editedCard.buttons === 0,
         JSON.stringify(editedCard));
-      // (a) Revert restores the history-derived value + labels.
+      // Unchecking the stock factor hides its component; Save keeps
+      // the values in data (enabled: false) and the baseline card
+      // falls back to the history rate (the factor is not computed).
       await page.goto(`http://ff.local/#planning/scenario/${sfScen}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitF(1500);
-      await page.waitForFunction((hid) => !!document.querySelector(`[data-plan-stock-revert="${hid}"]`), { timeout: 15000 }, sfHold);
-      await page.evaluate((hid) => document.querySelector(`[data-plan-stock-revert="${hid}"]`).click(), sfHold);
-      await page.waitForFunction((hid, pct) => {
-        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
-        return inp && Number(inp.value.replace(/,/g, '')) === pct;
-      }, { timeout: 15000 }, sfHold, sfHistPct);
-      const rowAfter = await page.evaluate((hid) => ({
+      await page.waitForFunction((hid) => (document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '').includes('Override'), { timeout: 15000 }, sfHold);
+      await page.evaluate(() => document.querySelector('[data-factor-check="stock"]').click());
+      await page.waitForFunction(() => !document.querySelector('#planFactorStock')?.textContent.trim(), { timeout: 10000 });
+      await page.evaluate(() => document.querySelector('#planFactorSaveBtn').click());
+      for (let i = 0; i < 20; i++) {
+        const chk = await H.req('GET', `/api/planning/scenarios/${sfScen}`);
+        const st2 = chk.data.scenario && chk.data.scenario.factors && chk.data.scenario.factors.stock;
+        if (st2 && st2.enabled === false) break;
+        await waitF(500);
+      }
+      r = await H.req('GET', `/api/planning/scenarios/${sfScen}`);
+      const sfDisabled = r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock;
+      H.check('scenfact: unchecking keeps the values in data (enabled false, byHolding 12.5 retained)',
+        sfDisabled && sfDisabled.enabled === false && sfDisabled.byHolding && Number((sfDisabled.byHolding[sfHold] || sfDisabled.byHolding[String(sfHold)] || {}).valuePct) === 12.5,
+        JSON.stringify(sfDisabled));
+      // Baseline card falls back to history while the factor is off.
+      await page.goto(`http://ff.local/#planning/project/${sfcProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const disabledCard = await page.evaluate(() => document.querySelector('#planBaselineCards')?.textContent || '');
+      H.check('scenfact: disabled stock factor does not drive the baseline card (history rate returns)',
+        disabledCard.includes('History') && !disabledCard.includes('12.5%/yr expected'), JSON.stringify(disabledCard.slice(0, 300)));
+      // Re-checking restores the 12.5 override (values were kept).
+      await page.goto(`http://ff.local/#planning/scenario/${sfScen}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      await page.waitForFunction(() => !!document.querySelector('[data-factor-check="stock"]'), { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('[data-factor-check="stock"]').click());
+      await page.waitForFunction((hid) => (document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '').includes('Override'), { timeout: 15000 }, sfHold);
+      const rowRestored = await page.evaluate((hid) => ({
         eff: document.querySelector(`[data-plan-stock-eff="${hid}"]`)?.textContent || '',
         val: document.querySelector(`input[data-plan-stock-holding="${hid}"]`)?.value || '',
       }), sfHold);
-      H.check('scenfact: Revert restores the history-derived value with basis + window labels',
-        rowAfter.eff.includes(String(sfHistPct)) && rowAfter.eff.includes(sfSug1y.basis) && rowAfter.eff.includes(sfSug1y.window),
-        JSON.stringify({ rowAfter, histPct: sfHistPct }));
+      H.check('scenfact: re-checking restores the 12.5 override',
+        rowRestored.eff.includes('12.5') && rowRestored.eff.includes('Override') && Number(rowRestored.val.replace(/,/g, '')) === 12.5,
+        JSON.stringify(rowRestored));
       // (e) the baseline card itself still offers no Add/Edit/Refine/Delete.
       await page.goto(`http://ff.local/#planning/project/${sfcProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitF(1500);
@@ -5818,6 +5875,30 @@ export async function run(H, S) {
       });
       H.check('scenfact: baseline tier offers no Add/Edit/Refine/Delete for the baseline itself',
         tierCtrls.inputs === 0 && tierCtrls.buttons === 0, JSON.stringify(tierCtrls));
+      // Item 2: pool baseline doughnut on the project-page card
+      // (single-source pool = one full-circle slice, 100%).
+      const poolDoughnut = await page.evaluate(() => {
+        const canvas = document.querySelector('#planBaselinePoolChart');
+        const rows = [...document.querySelectorAll('#planBaselineCards table.tbl tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent));
+        return { canvas: !!canvas, width: canvas ? canvas.width : 0, rows };
+      });
+      H.check('pooldoughnut: project-page baseline card shows the pool doughnut (canvas + source table, single slice 100%)',
+        poolDoughnut.canvas && poolDoughnut.width > 0 && poolDoughnut.rows.length === 1 && poolDoughnut.rows[0][2] === '100.0%' && poolDoughnut.rows[0][1].includes('6,000.00'),
+        JSON.stringify(poolDoughnut));
+      // Same doughnut on the strategy-page baseline card.
+      r = await H.req('POST', `/api/planning/projects/${sfcProj}/strategies`, { name: 'Doughnut Strat', source: 'template' });
+      H.check('pooldoughnut: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const pdSid = r.data.strategy.id;
+      await page.goto(`http://ff.local/#planning/strategy/${pdSid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      const stratDoughnut = await page.evaluate(() => {
+        const canvas = document.querySelector('#planStrategyBaselinePoolChart');
+        const rows = [...document.querySelectorAll('#planStrategyFixedBaseline table.tbl tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent));
+        return { canvas: !!canvas, width: canvas ? canvas.width : 0, rows };
+      });
+      H.check('pooldoughnut: strategy-page baseline card shows the same pool doughnut',
+        stratDoughnut.canvas && stratDoughnut.width > 0 && stratDoughnut.rows.length === 1 && stratDoughnut.rows[0][2] === '100.0%' && stratDoughnut.rows[0][1].includes('6,000.00'),
+        JSON.stringify(stratDoughnut));
     } finally { await browserF.close(); }
   }
   // (d) an edited per-holding scenario factor feeds the baseline
@@ -5905,31 +5986,52 @@ export async function run(H, S) {
       const modalState = await page.evaluate(() => ({
         name: !!document.querySelector('#planScenarioName'),
         star: !!document.querySelector('#planScenarioAiNameBtn'),
-        prime: !!document.querySelector('#planScenarioModalPrime') && document.querySelectorAll('#planScenarioModalPrime [data-modal-prime-preset]').length === 5,
-        stockRows: document.querySelectorAll('#planScenarioModalStock input[data-plan-stock-holding]').length,
+        checks: document.querySelectorAll('#planScenarioModalChecks [data-modal-factor-check]').length,
+        primeHidden: !!document.querySelector('#planScenarioModalPrime')?.classList.contains('hidden'),
+        stockHidden: !!document.querySelector('#planScenarioModalStock')?.classList.contains('hidden'),
       }));
-      H.check('scenmodal: create modal shows name + prime presets + per-holding stock rows',
-        modalState.name && modalState.prime && modalState.stockRows > 0, JSON.stringify(modalState));
+      H.check('scenmodal: create modal shows name + factor checkboxes, all unchecked and hidden at open',
+        modalState.name && modalState.checks >= 2 && modalState.primeHidden && modalState.stockHidden, JSON.stringify(modalState));
       H.check('ainame: ✨ button present beside Name in the scenario create modal',
         modalState.star, JSON.stringify(modalState));
+      // Checking Prime + Stock reveals their components: prime
+      // presets, and read-only stock rows with + Override (no
+      // inputs until an override opens).
+      await page.evaluate(() => {
+        document.querySelector('[data-modal-factor-check="prime"]').click();
+        document.querySelector('[data-modal-factor-check="stock"]').click();
+      });
+      await page.waitForFunction(() => document.querySelectorAll('#planScenarioModalPrime [data-modal-prime-preset]').length === 5, { timeout: 10000 });
+      const modalStock = await page.evaluate(() => ({
+        effs: document.querySelectorAll('#planScenarioModalStock [data-plan-stock-eff]').length,
+        inputs: document.querySelectorAll('#planScenarioModalStock input[data-plan-stock-holding]').length,
+        overrides: document.querySelectorAll('#planScenarioModalStock [data-plan-stock-override]').length,
+      }));
+      H.check('scenmodal: checked factors render (prime presets + read-only stock rows with + Override)',
+        modalStock.effs > 0 && modalStock.inputs === 0 && modalStock.overrides > 0, JSON.stringify(modalStock));
       // ✨ fills an editable draft; the user edits it; saving keeps
       // the edited name AND the modal factors, atomically.
       fs.writeFileSync(H.aiStubFile, 'Modal Suggested');
       await page.evaluate(() => document.querySelector('#planScenarioAiNameBtn').click());
       await page.waitForFunction(() => document.querySelector('#planScenarioName').value === 'Modal Suggested', { timeout: 10000 });
-      await page.evaluate(() => {
+      await page.evaluate((hid) => {
         document.querySelector('#planScenarioName').value = 'Modal Suggested Edited';
-        const g = document.querySelector('#planStockGlobalVal');
-        g.value = '8';
-        g.dispatchEvent(new Event('input', { bubbles: true }));
-      });
+        document.querySelector(`[data-plan-stock-override="${hid}"]`).click();
+      }, sfHold);
+      await page.waitForFunction((hid) => !!document.querySelector(`input[data-plan-stock-holding="${hid}"]`), { timeout: 10000 }, sfHold);
+      await page.evaluate((hid) => {
+        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
+        inp.value = '8';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+      }, sfHold);
       await page.evaluate(() => document.querySelector('#planScenarioForm button[type=submit]').click());
       await page.waitForFunction(() => location.hash.startsWith('#planning/scenario/'), { timeout: 15000 });
       const modalScenId = Number((await page.evaluate(() => location.hash)).split('/').pop());
       r = await H.req('GET', `/api/planning/scenarios/${modalScenId}`);
       const modalScen = r.data.scenario;
       H.check('scenmodal: creating with factors saves them atomically with the edited suggested name',
-        modalScen && modalScen.name === 'Modal Suggested Edited' && modalScen.factors && modalScen.factors.stock && modalScen.factors.stock.valuePct === 8,
+        modalScen && modalScen.name === 'Modal Suggested Edited' && modalScen.factors && modalScen.factors.stock && modalScen.factors.stock.enabled === true
+        && modalScen.factors.stock.byHolding && Number((modalScen.factors.stock.byHolding[sfHold] || modalScen.factors.stock.byHolding[String(sfHold)] || {}).valuePct) === 8,
         JSON.stringify(modalScen));
       // No factors still works (flat/default scenario).
       await page.goto(`http://ff.local/#planning/project/${smProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -5947,12 +6049,18 @@ export async function run(H, S) {
       // Detail-page factor editing still works after modal creation.
       await page.goto(`http://ff.local/#planning/scenario/${modalScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitM(1500);
-      await page.waitForFunction(() => !!document.querySelector('#planStockGlobalVal'), { timeout: 15000 });
-      await page.evaluate(() => {
-        const g = document.querySelector('#planStockGlobalVal');
-        g.value = '9';
-        g.dispatchEvent(new Event('input', { bubbles: true }));
-      });
+      // The modal-saved override renders as its editor directly
+      // (the stock factor starts checked — stored values restore).
+      await page.waitForFunction((hid) => {
+        const cb = document.querySelector('[data-factor-check="stock"]');
+        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
+        return cb && cb.checked && !!inp;
+      }, { timeout: 15000 }, sfHold);
+      await page.evaluate((hid) => {
+        const inp = document.querySelector(`input[data-plan-stock-holding="${hid}"]`);
+        inp.value = '9';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+      }, sfHold);
       await page.evaluate(() => document.querySelector('#planFactorSaveBtn').click());
       // Same transient-message hazard as the scenfact pin: the Save
       // handler reloads the page right after showing the message, so
@@ -5960,12 +6068,12 @@ export async function run(H, S) {
       for (let i = 0; i < 20; i++) {
         const chk = await H.req('GET', `/api/planning/scenarios/${modalScenId}`);
         const st2 = chk.data.scenario && chk.data.scenario.factors && chk.data.scenario.factors.stock;
-        if (st2 && st2.valuePct === 9) break;
+        if (st2 && st2.byHolding && Number((st2.byHolding[sfHold] || st2.byHolding[String(sfHold)] || {}).valuePct) === 9) break;
         await waitM(500);
       }
       r = await H.req('GET', `/api/planning/scenarios/${modalScenId}`);
       H.check('scenmodal: detail-page factor editing still works after modal creation',
-        r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock && r.data.scenario.factors.stock.valuePct === 9,
+        r.data.scenario && r.data.scenario.factors && r.data.scenario.factors.stock && r.data.scenario.factors.stock.byHolding && Number((r.data.scenario.factors.stock.byHolding[sfHold] || r.data.scenario.factors.stock.byHolding[String(sfHold)] || {}).valuePct) === 9,
         JSON.stringify(r.data.scenario.factors));
       // Strategy rename ✨: fills from the op sequence, editable,
       // saved under the edited name. (Item 10: no world note on the
@@ -8831,6 +8939,42 @@ export async function run(H, S) {
     r = await H.req('GET', `/api/planning/strategies/${r.data.strategy.id}`);
     H.check('aicreate: edited proposal reflected in the created strategy',
       r.status === 200 && (r.data.ops || []).length === 1, JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
+    // ---- Item 3: AI-create GIC pattern (deterministic template) ----
+    const gicEntity = { type: 'pool', items: [{ holdingId: sfHold, percent: 100 }] };
+    const gicPool = await H.req('GET', `/api/planning/projects/${sfcProj}`);
+    const gicPoolValue = gicPool.data.project && gicPool.data.project.fixedBaseline && gicPool.data.project.fixedBaseline.figures ? gicPool.data.project.fixedBaseline.figures.poolValue : null;
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy GIC 4.12% from 2027-01-01, 180 days', category: 'investment', subcategory: 'gic', entity: gicEntity });
+    const gicOp = r.data.proposal && r.data.proposal.strategy && r.data.proposal.strategy.ops && r.data.proposal.strategy.ops[0];
+    H.check('aicreate-gic: propose with the GIC text returns the GIC shape (custom sink + one sink buy, no position op)',
+      r.status === 200 && r.data.proposal && r.data.proposal.strategy.sink && r.data.proposal.strategy.sink.kind === 'custom'
+      && r.data.proposal.strategy.sink.expectedReturnPct === 4.12 && r.data.proposal.strategy.sink.name === 'GIC 4.12% 180d'
+      && (r.data.proposal.strategy.ops || []).length === 1 && gicOp && gicOp.op_type === 'buy' && gicOp.params.accountId === null
+      && gicOp.params.symbol === 'GIC 4.12% 180d' && gicOp.params.date === '2027-01-01' && gicOp.params.price === 100
+      && gicOp.params.amount === gicPoolValue && (r.data.unresolved || []).length === 0 && (r.data.warnings.ops || []).length === 0,
+      JSON.stringify({ proposal: r.data.proposal, poolValue: gicPoolValue, unresolved: r.data.unresolved, warnings: r.data.warnings }));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy GIC from 2027-01-01, 180 days', category: 'investment', subcategory: 'gic', entity: gicEntity });
+    H.check('aicreate-gic: missing rate asks instead of inventing',
+      r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.some((q) => q.field === 'gic_rate') && !r.data.proposal, JSON.stringify(r.data));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy GIC 4.12%, 180 days', category: 'investment', subcategory: 'gic', entity: gicEntity });
+    H.check('aicreate-gic: missing date asks instead of inventing',
+      r.status === 200 && Array.isArray(r.data.ask) && r.data.ask.some((q) => q.field === 'gic_start') && !r.data.proposal, JSON.stringify(r.data));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy GIC from 2027-01-01, 180 days', category: 'investment', subcategory: 'gic', entity: gicEntity, answers: { gic_rate: '4.12' } });
+    H.check('aicreate-gic: answering the rate question completes the proposal',
+      r.status === 200 && r.data.proposal && r.data.proposal.strategy.sink && r.data.proposal.strategy.sink.expectedReturnPct === 4.12
+      && r.data.proposal.strategy.ops && r.data.proposal.strategy.ops[0] && r.data.proposal.strategy.ops[0].params.date === '2027-01-01', JSON.stringify(r.data));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy GIC 4.12% from 2027-01-01, 180 days', category: 'investment', subcategory: 'gic', entity: gicEntity });
+    const gicProposal = r.data.proposal;
+    r = await H.req('POST', '/api/planning/ai-create/apply', { proposal: gicProposal, category: 'investment', subcategory: 'gic', entity: gicEntity });
+    H.check('aicreate-gic: Apply creates the GIC project (AI-designed)',
+      r.status === 201 && r.data.project && r.data.project.id > 0 && r.data.strategy && r.data.strategy.source === 'ai', JSON.stringify(r.data));
+    const gicSid = r.data.strategy && r.data.strategy.id;
+    r = await H.req('GET', `/api/planning/strategies/${gicSid}`);
+    const gicOps = r.data.ops || [];
+    H.check('aicreate-gic: created strategy stores the custom sink + the sink buy op',
+      r.status === 200 && r.data.strategy && r.data.strategy.sink && r.data.strategy.sink.kind === 'custom' && r.data.strategy.sink.expectedReturnPct === 4.12
+      && gicOps.length === 1 && gicOps[0].op_type === 'buy' && gicOps[0].params && gicOps[0].params.accountId === null
+      && gicOps[0].params.symbol === 'GIC 4.12% 180d' && gicOps[0].params.price === 100,
+      JSON.stringify({ sink: r.data.strategy && r.data.strategy.sink, ops: gicOps }));
     // Browser: entry visible in the creation flow; preview Remove +
     // Apply end to end; routing disables preset Generate.
     if (!H.puppeteer || !H.chromeAvailable) {

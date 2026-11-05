@@ -11455,6 +11455,14 @@ async function planAiCreateSerializeQueue() {
     reader.readAsDataURL(f);
   })));
 }
+// Sink line for the AI-create preview (the GIC shape carries a
+// custom sink; a stock sink names its holding + trend).
+function planAiCreateSinkLabel(sink) {
+  if (!sink || typeof sink !== 'object') return '';
+  if (sink.kind === 'custom') return `Custom — ${sink.name || ''}${sink.expectedReturnPct != null ? ` · ${sink.expectedReturnPct}%/yr` : ''}`;
+  if (sink.kind === 'stock') return `Stock holding ${sink.holdingId ?? ''}${sink.trendPct != null ? ` · ${sink.trendPct}%/yr` : ''}`;
+  return JSON.stringify(sink);
+}
 function planAiCreateRenderPreview() {
   const r = planAiCreateProposal;
   const host = $('#planAiCreatePreview');
@@ -11472,6 +11480,7 @@ function planAiCreateRenderPreview() {
     <div><label>Baseline name *</label><input id="planAiCreateBaselineName" value="${esc(p.baseline.name || '')}"></div>
     <div><label>Baseline description</label><input id="planAiCreateBaselineDesc" value="${esc(p.baseline.description || '')}"></div>
     <div><label>Strategy name *</label><input id="planAiCreateStrategyName" value="${esc(p.strategy.name || '')}"></div>
+    ${p.strategy.sink ? `<div class="n">Sink: ${esc(planAiCreateSinkLabel(p.strategy.sink))}</div>` : ''}
     <div><label>Operations</label>${ops.length ? ops.map((o, i) => `<div class="plan-row" data-plan-ai-create-op="${i}"><span>${esc(o.op_type)}</span><textarea data-plan-ai-create-op-params rows="2" style="flex:1">${esc(JSON.stringify(o.params || {}))}</textarea><button type="button" class="small" data-plan-ai-create-op-remove="${i}">Remove</button></div>`).join('') : '<div class="note">No operations proposed.</div>'}</div>
     ${(r.unresolved && r.unresolved.length) ? `<div><label>Not included (unresolved)</label>${r.unresolved.map((u) => `<div class="plan-row"><span>${esc(u.op ? u.op.op_type : '')} · ${esc(u.reason)}</span></div>`).join('')}</div>` : ''}`;
   host.querySelectorAll('[data-plan-ai-create-op-remove]').forEach((btn) => {
@@ -11538,7 +11547,7 @@ async function planAiCreateApply() {
     project: { name: $('#planAiCreateProjectName').value.trim(), question: p.project.question || null },
     scenario: { name: $('#planAiCreateScenarioName').value.trim(), factors: p.scenario.factors || {} },
     baseline: { name: $('#planAiCreateBaselineName').value.trim(), description: $('#planAiCreateBaselineDesc').value.trim(), assumptions: p.baseline.assumptions },
-    strategy: { name: $('#planAiCreateStrategyName').value.trim(), ops },
+    strategy: { name: $('#planAiCreateStrategyName').value.trim(), ops, ...(p.strategy.sink ? { sink: p.strategy.sink } : {}) },
   };
   try {
     const data = await api('/api/planning/ai-create/apply', { method: 'POST', body: { proposal, category: planAiCreateCtx.category, subcategory: planAiCreateCtx.subcategory, entity: planAiCreateCtx.entity } });
@@ -11627,7 +11636,18 @@ async function loadPlanProject(id) {
 // do-nothing state, metadata only — no Add/Edit/Refine/Delete, no
 // Select. Shared by the project Baselines tier and the strategy
 // page's Baseline group. Null = legacy project without a category.
-function planFixedBaselineHtml(fb, scen) {
+// Draw a pool baseline's doughnut (shared by the project-page
+// Baselines tier and the strategy-page Baseline card). Pool baselines
+// only — account/holding baselines have no per-source items and get
+// no chart. A single-source pool renders as one full-circle slice.
+function planBaselinePoolDoughnutDraw(fb, chartId) {
+  if (!fb || fb.kind !== 'investment' || !fb.figures || fb.figures.poolValue == null) return;
+  const items = Array.isArray(fb.figures.items) ? fb.figures.items : [];
+  if (!items.length) return;
+  if (!document.getElementById(chartId)) return;
+  planDoughnutChart(chartId, items.map((it) => it.account || it.symbol || 'External funding'), items.map((it) => Number(it.value ?? it.amount ?? 0) || 0), 'Pool total', fb.figures.poolValue);
+}
+function planFixedBaselineHtml(fb, scen, opts = {}) {
   if (!fb) return '<div class="note">No fixed baseline — legacy project without a category.</div>';
   let parts = [];
   if (fb.kind === 'property') {
@@ -11681,10 +11701,26 @@ function planFixedBaselineHtml(fb, scen) {
   } else if (fb.kind === 'tax_saving') {
     parts.push(`${fb.jobs ?? 0} salary jobs · ${fb.rentals ?? 0} rentals`);
   }
+  // Pool baseline doughnut (pool baselines only): one slice per pool
+  // source with amount + share, pool total in the center — the same
+  // style as the funding visualization.
+  let poolViz = '';
+  if (fb.kind === 'investment' && fb.figures && fb.figures.poolValue != null && Array.isArray(fb.figures.items) && fb.figures.items.length) {
+    const items = fb.figures.items;
+    const total = fb.figures.poolValue;
+    const chartId = opts.chartId || 'planBaselinePoolChart';
+    poolViz = `<div class="chart-wrap" style="height:200px"><canvas id="${chartId}"></canvas></div>
+      <table class="tbl"><thead><tr><th>Source</th><th>Amount</th><th>Share</th></tr></thead><tbody>${items.map((it) => {
+        const label = it.account || it.symbol || 'External funding';
+        const v = Number(it.value ?? it.amount ?? 0) || 0;
+        return `<tr><td>${esc(label)}</td><td>${money2(v)}</td><td>${total ? `${((v / total) * 100).toFixed(1)}%` : '—'}</td></tr>`;
+      }).join('')}</tbody></table>`;
+  }
   return `<div class="card breakdown-card plan-flow-card" id="planFixedBaselineCard">
     <div class="k">${esc(fb.name)}</div>
     <div class="n">Fixed baseline — do nothing${parts.length ? ` · ${parts.join(' · ')}` : ''}</div>
-    ${fb.description && fb.description !== fb.name ? `<div class="n">${esc(fb.description)}</div>` : ''}</div>`;
+    ${fb.description && fb.description !== fb.name ? `<div class="n">${esc(fb.description)}</div>` : ''}
+    ${poolViz}</div>`;
 }
 function planProjectHtml(d) {
   const p = d.project;
@@ -11976,8 +12012,11 @@ function planRenderFixedBaselineCard() {
   if (!host || !d || !d.project) return;
   const scenId = planWiringScenarioId();
   const scen = scenId != null ? (d.scenarios || []).find((x) => x.id === scenId) : null;
-  const scenStock = scen && scen.factors && scen.factors.stock ? { name: scen.name, stock: scen.factors.stock } : null;
-  host.innerHTML = planFixedBaselineHtml(d.project.fixedBaseline, scenStock);
+  // A disabled stock factor follows the default world: the card falls
+  // back to each holding's own-history rate.
+  const scenStock = scen && scen.factors && scen.factors.stock && scen.factors.stock.enabled !== false ? { name: scen.name, stock: scen.factors.stock } : null;
+  host.innerHTML = planFixedBaselineHtml(d.project.fixedBaseline, scenStock, { chartId: 'planBaselinePoolChart' });
+  planBaselinePoolDoughnutDraw(d.project.fixedBaseline, 'planBaselinePoolChart');
 }
 const planWiringRepick = () => { const d = planProjectData; return !!(d && (d.scenarios || []).length && !(planCompareScenarioIds && planCompareScenarioIds.length)); };
 const planWiringStrategyPicked = (id) => (planWiringStrategyIds == null ? true : planWiringStrategyIds.includes(id));
@@ -12139,7 +12178,9 @@ async function planScenarioModalOpen(projectId, category) {
   form.dataset.projectId = projectId;
   $('#planScenarioName').value = '';
   showMsg($('#planScenarioModalMsg'), '', '');
-  planScenarioModalState = { prime: { points: [], preset: null }, stock: {}, primeInfo: null, holdings: [], category };
+  // Factors start unchecked in a fresh modal (same checkbox model as
+  // the detail page); checking a box reveals its component.
+  planScenarioModalState = { prime: { points: [], preset: null }, stock: {}, primeInfo: null, holdings: [], category, active: new Set() };
   try { planScenarioModalState.primeInfo = await api('/api/prime'); } catch { planScenarioModalState.primeInfo = null; }
   try {
     const inv = await api('/api/investments');
@@ -12149,25 +12190,69 @@ async function planScenarioModalOpen(projectId, category) {
   const growthRows = [];
   if (category === 'property') growthRows.push(['propertyGrowth', 'Property value growth (% / year)']);
   if (category === 'earning') { growthRows.push(['salaryGrowth', 'Salary growth (% / year)']); growthRows.push(['rentGrowth', 'Rent growth (% / year)']); }
-  host.innerHTML = `<div id="planScenarioModalPrime"></div>
+  host.innerHTML = `<div class="toolbar" id="planScenarioModalChecks"></div>
+    <div id="planScenarioModalPrime"></div>
     <div id="planScenarioModalStock"></div>
     ${growthRows.length ? `<div id="planScenarioModalGrowth"><div class="section-head"><h3>Growth</h3></div>${growthRows.map(([k, label]) => `
-      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-modal-growth="${k}"></div>`).join('')}${category === 'earning' ? '<div class="note">Salary and rent growth are stored and labeled only — the projection has no earnings leg yet, so they do not change numbers.</div>' : ''}</div>` : ''}`;
+      <div data-modal-growth-row="${k}"><label>${label}</label><input type="text" inputmode="decimal" data-money data-modal-growth="${k}"></div>`).join('')}${category === 'earning' ? '<div class="note">Salary and rent growth are stored and labeled only — the projection has no earnings leg yet, so they do not change numbers.</div>' : ''}</div>` : ''}`;
   host.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   planScenarioModalRenderPrime();
   planStockFactorRender($('#planScenarioModalStock'), planScenarioModalState.stock, planScenarioModalState.holdings, {});
+  planScenarioModalRenderChecks();
+  planScenarioModalToggleFactors();
   openModal('planScenarioModal');
+}
+const PLAN_SCENARIO_MODAL_FACTOR_LABELS = { prime: 'Prime', stock: 'Stock return', propertyGrowth: 'Property growth', salaryGrowth: 'Salary growth', rentGrowth: 'Rent growth' };
+function planScenarioModalRenderChecks() {
+  const st = planScenarioModalState;
+  if (!st) return;
+  const host = $('#planScenarioModalChecks');
+  if (!host) return;
+  const avail = ['prime', 'stock'];
+  if (st.category === 'property') avail.push('propertyGrowth');
+  if (st.category === 'earning') avail.push('salaryGrowth', 'rentGrowth');
+  host.innerHTML = avail.map((k) => `<label class="check"><input type="checkbox" data-modal-factor-check="${k}" ${st.active.has(k) ? 'checked' : ''}> ${PLAN_SCENARIO_MODAL_FACTOR_LABELS[k]}</label>`).join('');
+  host.querySelectorAll('[data-modal-factor-check]').forEach((cb) => cb.addEventListener('change', () => {
+    const k = cb.dataset.modalFactorCheck;
+    if (cb.checked) st.active.add(k); else st.active.delete(k);
+    planScenarioModalToggleFactors();
+  }));
+}
+// Show/hide factor components from the checkbox set (hosts stay
+// mounted, so in-progress edits survive a toggle).
+function planScenarioModalToggleFactors() {
+  const st = planScenarioModalState;
+  if (!st) return;
+  const prime = $('#planScenarioModalPrime');
+  const stock = $('#planScenarioModalStock');
+  const growth = $('#planScenarioModalGrowth');
+  if (prime) prime.classList.toggle('hidden', !st.active.has('prime'));
+  if (stock) stock.classList.toggle('hidden', !st.active.has('stock'));
+  if (growth) {
+    let any = false;
+    growth.querySelectorAll('[data-modal-growth-row]').forEach((row) => {
+      const on = st.active.has(row.dataset.modalGrowthRow);
+      row.classList.toggle('hidden', !on);
+      if (on) any = true;
+    });
+    growth.classList.toggle('hidden', !any);
+  }
 }
 function planScenarioModalFactors() {
   const st = planScenarioModalState;
   const factors = {};
   if (st) {
-    if (st.prime && (st.prime.points.length || st.prime.preset)) factors.prime = { points: st.prime.points, preset: st.prime.preset };
-    const sc = planStockFactorClean(st.stock);
-    if (sc) factors.stock = sc;
+    // Only checked factors are collected (a fresh modal has no stored
+    // values to keep); each saved factor carries enabled: true.
+    if (st.active.has('prime') && st.prime && (st.prime.points.length || st.prime.preset)) factors.prime = { points: st.prime.points, preset: st.prime.preset, enabled: true };
+    if (st.active.has('stock')) {
+      const sc = planStockFactorClean(st.stock);
+      if (sc) factors.stock = { ...sc, enabled: true };
+    }
     document.querySelectorAll('#planScenarioModalFactors [data-modal-growth]').forEach((inp) => {
+      if (!st.active.has(inp.dataset.modalGrowth)) return;
       const v = planParsePct(inp.value);
-      if (v != null) factors[inp.dataset.modalGrowth] = { valuePct: v };
+      if (v != null) factors[inp.dataset.modalGrowth] = { valuePct: v, enabled: true };
     });
   }
   return factors;
@@ -12472,21 +12557,24 @@ $('#planBaselineEditForm').addEventListener('submit', async (e) => {
 // it lives on the strategy, not the world.
 function planScenarioSummaryLine(factors) {
   const f = factors && typeof factors === 'object' ? factors : {};
+  // A disabled factor (enabled === false — unchecked in the editor,
+  // values kept) follows the default world and says nothing here.
+  const on = (k) => !(f[k] && f[k].enabled === false);
   const parts = [];
-  if (f.prime && Array.isArray(f.prime.points) && f.prime.points.length) {
+  if (on('prime') && f.prime && Array.isArray(f.prime.points) && f.prime.points.length) {
     const last = f.prime.points[f.prime.points.length - 1];
     parts.push(`Prime → ${last.rate}% by ${last.month}`);
-  } else if (f.prime && f.prime.preset === 'flat') {
+  } else if (on('prime') && f.prime && f.prime.preset === 'flat') {
     parts.push('Prime: flat at current');
   }
-  if (f.stock && f.stock.valuePct != null) {
+  if (on('stock') && f.stock && f.stock.valuePct != null) {
     parts.push(`Stock ${f.stock.valuePct}%/yr${f.stock.basis ? ` (${f.stock.basis}${f.stock.window ? ` · ${f.stock.window}` : ''})` : ''}`);
   }
-  const bhCount = f.stock && f.stock.byHolding && typeof f.stock.byHolding === 'object' ? Object.keys(f.stock.byHolding).length : 0;
+  const bhCount = on('stock') && f.stock && f.stock.byHolding && typeof f.stock.byHolding === 'object' ? Object.keys(f.stock.byHolding).length : 0;
   if (bhCount) parts.push(`Stock: ${bhCount} holding override${bhCount === 1 ? '' : 's'}`);
-  if (f.propertyGrowth && f.propertyGrowth.valuePct != null) parts.push(`Property +${f.propertyGrowth.valuePct}%/yr`);
-  if (f.salaryGrowth && f.salaryGrowth.valuePct != null) parts.push(`Salary +${f.salaryGrowth.valuePct}%/yr`);
-  if (f.rentGrowth && f.rentGrowth.valuePct != null) parts.push(`Rent +${f.rentGrowth.valuePct}%/yr`);
+  if (on('propertyGrowth') && f.propertyGrowth && f.propertyGrowth.valuePct != null) parts.push(`Property +${f.propertyGrowth.valuePct}%/yr`);
+  if (on('salaryGrowth') && f.salaryGrowth && f.salaryGrowth.valuePct != null) parts.push(`Salary +${f.salaryGrowth.valuePct}%/yr`);
+  if (on('rentGrowth') && f.rentGrowth && f.rentGrowth.valuePct != null) parts.push(`Rent +${f.rentGrowth.valuePct}%/yr`);
   return parts.join(' · ');
 }
 // One-line sink summary for a strategy card. Investment strategies
@@ -13797,6 +13885,7 @@ async function loadPlanStrategy(id, scenarioId) {
     $('#planScenario').classList.add('hidden');
     $('#planStrategy').innerHTML = planStrategyHtml(data);
     planStrategyWire(data);
+    planBaselinePoolDoughnutDraw(data.fixedBaseline, 'planStrategyBaselinePoolChart');
   });
 }
 function planLegLabel(l) {
@@ -13840,8 +13929,9 @@ function planStrategyHtml(d) {
   const stratScenCards = stratScenCard(0, 'Current rates (no scenario)', false, 'Flat world — current rates', true)
     + (d.scenarios || []).map((sc) => stratScenCard(sc.id, sc.name, sc.is_base, planScenarioSummaryLine(sc.factors) || 'Flat world — current rates', false)).join('');
   // Baseline card's effective returns run under the applied world.
+  // A disabled stock factor follows the default world (history rates).
   const fbScen = d.appliedScenario ? (d.scenarios || []).find((x) => x.id === d.appliedScenario.id) : null;
-  const fbScenStock = fbScen && fbScen.factors && fbScen.factors.stock ? { name: fbScen.name, stock: fbScen.factors.stock } : null;
+  const fbScenStock = fbScen && fbScen.factors && fbScen.factors.stock && fbScen.factors.stock.enabled !== false ? { name: fbScen.name, stock: fbScen.factors.stock } : null;
   return `
     <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
     <div class="panel">
@@ -13865,7 +13955,7 @@ function planStrategyHtml(d) {
       <div class="plan-flow-tier plan-flow-tier-mid" id="planStrategyMidTier">
       <div class="plan-flow-group" id="planStrategyBaselineGroup">
       <div class="section-head"><h3>Baseline</h3></div>
-      <div id="planStrategyFixedBaseline">${planFixedBaselineHtml(d.fixedBaseline, fbScenStock)}</div>
+      <div id="planStrategyFixedBaseline">${planFixedBaselineHtml(d.fixedBaseline, fbScenStock, { chartId: 'planStrategyBaselinePoolChart' })}</div>
       </div>
       <div class="plan-flow-group" id="planStrategyOpsGroup">
       <div class="section-head"><h3>Operations</h3>
@@ -14515,7 +14605,7 @@ function planScenarioHtml(d) {
     </div>
     <div class="panel" id="planFactorsPanel">
       <div class="section-head"><h3>Factors</h3></div>
-      <div class="toolbar" id="planFactorAddRow"><select id="planFactorAddSel"></select><button class="small" id="planFactorAddBtn">Add factor</button></div>
+      <div class="toolbar" id="planFactorChecks"></div>
       <div id="planFactorPrime"></div>
       <div id="planFactorStock"></div>
       <div id="planFactorGrowth"></div>
@@ -14573,11 +14663,15 @@ $('#planScenarioEditForm').addEventListener('submit', async (e) => {
 // ---- shared scenario stock-factor editor (detail page + create modal) ----
 // State shape (mutated live by the editor):
 //   { valuePct?, basis?, window?, byHolding?: { [holdingId]: { valuePct, basis?, window? } } }
-// A blank global input = no default; a blank row input = no override
-// (the holding then uses the default, else its own history). Manual
-// edits clear basis/window (the value is no longer history-derived);
-// Revert restores a holding's history-derived value with its basis +
-// window label. Callers save planStockFactorClean(st) (empty = null).
+// Read-only by default: each holding shows its EFFECTIVE value — the
+// per-holding override when set, else a stored scenario default, else
+// the holding's own history (never invented; no history = 0%/yr).
+// "+ Override" opens an editable input prefilled with the current
+// effective value; Remove clears the override (back to history /
+// default). There is no global-default input and no Revert button:
+// a stored global default survives only as legacy data (labeled
+// "Scenario default"), and removing an override returns the row to
+// history. Callers save planStockFactorClean(st) (empty = null).
 const planStockHistCache = new Map();
 function planParsePct(v) {
   if (v == null || v === '') return null;
@@ -14603,69 +14697,68 @@ function planStockFactorRender(host, st, holdings, opts = {}) {
   if (!host) return;
   if (!st.byHolding || typeof st.byHolding !== 'object' || Array.isArray(st.byHolding)) st.byHolding = {};
   const list = holdings || [];
-  const effHtml = (h) => {
+  // Rows with an open override input (created by "+ Override" or by a
+  // stored override, which renders as its editor directly).
+  const editing = new Set();
+  // Effective value for a holding, in priority order: per-holding
+  // override → a stored scenario default (legacy data only; the input
+  // is gone) → the holding's own history → nothing (0%/yr, no history).
+  // The override label never changes without an edit; the history
+  // label fills in when the suggestion arrives.
+  const effOf = (h) => {
     const ov = st.byHolding[h.id];
-    if (ov && planParsePct(ov.valuePct) != null) return `${ov.valuePct}%/yr · Override${ov.basis ? ` (${esc(ov.basis)}${ov.window ? ` · ${esc(ov.window)}` : ''})` : ''}`;
-    if (planParsePct(st.valuePct) != null) return `${st.valuePct}%/yr · Scenario default`;
+    if (ov && planParsePct(ov.valuePct) != null) return { pct: Number(ov.valuePct), label: `${ov.valuePct}%/yr · Override` };
+    if (planParsePct(st.valuePct) != null) return { pct: Number(st.valuePct), label: `${st.valuePct}%/yr · Scenario default` };
     const cached = planStockHistCache.get(h.id);
-    if (cached === undefined) return 'history…';
-    if (!cached) return 'Flat — no usable history';
-    return `${cached.pct}%/yr · History (${esc(cached.basis)}${cached.window ? ` · ${esc(cached.window)}` : ''})`;
+    if (cached === undefined) return { pct: null, label: 'history…' };
+    if (!cached) return { pct: null, label: '0%/yr · No history' };
+    return { pct: cached.pct, label: `${cached.pct}%/yr · History (${esc(cached.basis)}${cached.window ? ` · ${esc(cached.window)}` : ''})` };
   };
-  host.innerHTML = `<div class="section-head"><h3>Stock return</h3>${opts.showRemove ? '<div class="toolbar"><button class="small danger" data-factor-remove="stock">Remove</button></div>' : ''}</div>
-    <div><label>Default for all holdings (% / year)</label><input id="planStockGlobalVal" type="text" inputmode="decimal" data-money value="${st.valuePct != null ? st.valuePct : ''}"></div>
-    <div data-plan-stock-basis-note>${st.basis ? `<div class="note">Basis: ${esc(st.basis)}${st.window ? ` · ${esc(st.window)}` : ''}</div>` : ''}</div>
-    <div class="note">Per holding — blank means use the default above, or the holding's own history when no default is set.</div>
-    ${list.map((h) => {
-      const ov = st.byHolding[h.id];
-      return `<div class="plan-row"><span>${esc(h.accountName || '')} · ${esc(h.symbol || h.label || '')}</span>
-        <input type="text" inputmode="decimal" data-money data-plan-stock-holding="${h.id}" value="${ov && ov.valuePct != null ? ov.valuePct : ''}" placeholder="—" style="width:110px"> %/yr
-        <span data-plan-stock-eff="${h.id}">${effHtml(h)}</span>
-        <button class="small" data-plan-stock-revert="${h.id}">Revert to history</button></div>`;
-    }).join('') || '<div class="note">No holdings.</div>'}
-    <div class="note">Past returns do not predict future returns.</div>`;
-  host.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+  const rowHtml = (h) => {
+    const eff = effOf(h);
+    const hasOv = !!(st.byHolding[h.id] && planParsePct(st.byHolding[h.id].valuePct) != null);
+    const open = editing.has(String(h.id)) || hasOv;
+    return `<div class="plan-row"><span>${esc(h.accountName || '')} · ${esc(h.symbol || h.label || '')}</span><span data-plan-stock-eff="${h.id}">${eff.label}</span>${open
+      ? `<span><input type="text" inputmode="decimal" data-money data-plan-stock-holding="${h.id}" value="${hasOv ? st.byHolding[h.id].valuePct : (eff.pct != null ? eff.pct : 0)}" style="width:110px"> %/yr <button class="small" data-plan-stock-unoverride="${h.id}">Remove</button></span>`
+      : `<span><button class="small" data-plan-stock-override="${h.id}">+ Override</button></span>`}</div>`;
+  };
   const refreshEff = (hid) => {
     const el = host.querySelector(`[data-plan-stock-eff="${hid}"]`);
     const h = list.find((x) => Number(x.id) === Number(hid));
-    if (el && h) el.innerHTML = effHtml(h);
+    if (el && h) el.innerHTML = effOf(h).label;
   };
-  const globalInput = host.querySelector('#planStockGlobalVal');
-  if (globalInput) globalInput.addEventListener('input', () => {
-    const v = planParsePct(globalInput.value);
-    if (v == null) delete st.valuePct; else st.valuePct = v;
-    // A hand-typed default is not history-derived: drop its labels.
-    if (st.basis || st.window) { delete st.basis; delete st.window; const note = host.querySelector('[data-plan-stock-basis-note]'); if (note) note.innerHTML = ''; }
-    list.forEach((h) => refreshEff(h.id));
-  });
-  host.querySelectorAll('[data-plan-stock-holding]').forEach((inp) => {
-    inp.addEventListener('input', () => {
+  const renderRows = () => {
+    const box = host.querySelector('[data-plan-stock-rows]');
+    if (!box) return;
+    box.innerHTML = list.map(rowHtml).join('') || '<div class="note">No holdings.</div>';
+    box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    box.querySelectorAll('[data-plan-stock-override]').forEach((btn) => btn.addEventListener('click', () => {
+      editing.add(btn.dataset.planStockOverride);
+      renderRows();
+      const inp = box.querySelector(`[data-plan-stock-holding="${btn.dataset.planStockOverride}"]`);
+      if (inp) { inp.focus(); inp.select(); }
+    }));
+    box.querySelectorAll('[data-plan-stock-holding]').forEach((inp) => inp.addEventListener('input', () => {
       const hid = inp.dataset.planStockHolding;
+      const raw = inp.value.replace(/,/g, '').trim();
+      if (raw === '') { delete st.byHolding[hid]; editing.delete(hid); renderRows(); return; }
       const v = planParsePct(inp.value);
-      if (v == null) delete st.byHolding[hid];
-      else st.byHolding[hid] = { valuePct: v };
+      if (v == null) return; // mid-typing; keep the previous value
+      st.byHolding[hid] = { valuePct: v };
       refreshEff(hid);
-    });
-  });
-  host.querySelectorAll('[data-plan-stock-revert]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const hid = btn.dataset.planStockRevert;
-      const out = host.querySelector(`[data-plan-stock-eff="${hid}"]`);
-      try {
-        const r = await api(`/api/planning/return-suggestions?holdingId=${hid}`);
-        const win = (r.suggestions || []).find((x) => x.annualizedReturn != null);
-        if (!win) { if (out) out.textContent = 'No history-derived return for this holding.'; return; }
-        const pct = Math.round(win.annualizedReturn * 10000) / 100;
-        st.byHolding[hid] = { valuePct: pct, basis: win.basis || null, window: win.window || null };
-        planStockHistCache.set(Number(hid), { pct, basis: win.basis || null, window: win.window || null });
-        const inp = host.querySelector(`[data-plan-stock-holding="${hid}"]`);
-        if (inp) inp.value = pct;
-        refreshEff(hid);
-      } catch (err) { if (out) out.innerHTML = `<span class="msg err">${esc(err.message)}</span>`; }
-    });
-  });
-  // History defaults fill in as suggestions arrive (cached across
-  // renders); rows with an override or a default never show history.
+    }));
+    box.querySelectorAll('[data-plan-stock-unoverride]').forEach((btn) => btn.addEventListener('click', () => {
+      const hid = btn.dataset.planStockUnoverride;
+      delete st.byHolding[hid];
+      editing.delete(hid);
+      renderRows();
+    }));
+  };
+  host.innerHTML = `<div class="section-head"><h3>Stock return</h3></div><div data-plan-stock-rows></div><div class="note">Past returns do not predict future returns.</div>`;
+  renderRows();
+  // History values fill in as suggestions arrive (cached across
+  // renders); rows with an override or a scenario default never show
+  // history.
   list.forEach(async (h) => {
     if (planStockHistCache.has(h.id)) { refreshEff(h.id); return; }
     try {
@@ -14679,32 +14772,32 @@ function planStockFactorRender(host, st, holdings, opts = {}) {
 
 function planScenarioFactorWire(d) {
   const sc = d.scenario;
-  const isInvestment = d.project.category === 'investment';
   const hasMortgageOps = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type));
   const cur = d.scenario.factors && typeof d.scenario.factors === 'object' ? d.scenario.factors : {};
   planFactorState = {
-    prime: { points: (cur.prime && Array.isArray(cur.prime.points) ? cur.prime.points.map((pt) => ({ month: pt.month, rate: pt.rate })) : []), preset: (cur.prime && cur.prime.preset) || null },
-    stock: cur.stock ? { valuePct: cur.stock.valuePct, basis: cur.stock.basis || null, window: cur.stock.window || null, byHolding: (cur.stock.byHolding && typeof cur.stock.byHolding === 'object' ? cur.stock.byHolding : {}) } : null,
-    propertyGrowth: cur.propertyGrowth ? { valuePct: cur.propertyGrowth.valuePct } : null,
-    salaryGrowth: cur.salaryGrowth ? { valuePct: cur.salaryGrowth.valuePct } : null,
-    rentGrowth: cur.rentGrowth ? { valuePct: cur.rentGrowth.valuePct } : null,
+    prime: { points: (cur.prime && Array.isArray(cur.prime.points) ? cur.prime.points.map((pt) => ({ month: pt.month, rate: pt.rate })) : []), preset: (cur.prime && cur.prime.preset) || null, enabled: !(cur.prime && cur.prime.enabled === false) },
+    stock: cur.stock ? { valuePct: cur.stock.valuePct, basis: cur.stock.basis || null, window: cur.stock.window || null, byHolding: (cur.stock.byHolding && typeof cur.stock.byHolding === 'object' ? cur.stock.byHolding : {}), enabled: cur.stock.enabled !== false } : null,
+    propertyGrowth: cur.propertyGrowth ? { valuePct: cur.propertyGrowth.valuePct, enabled: cur.propertyGrowth.enabled !== false } : null,
+    salaryGrowth: cur.salaryGrowth ? { valuePct: cur.salaryGrowth.valuePct, enabled: cur.salaryGrowth.enabled !== false } : null,
+    rentGrowth: cur.rentGrowth ? { valuePct: cur.rentGrowth.valuePct, enabled: cur.rentGrowth.enabled !== false } : null,
   };
-  // Opt-in factors: a factor renders only once added. An already-set
-  // factor counts as added, so legacy strategies render exactly as
-  // before; a never-added factor is hidden and never saved.
+  // Checkbox factors: every applicable factor has a checkbox; its
+  // component renders only when checked. Unchecked = that dimension
+  // follows the default world, but the VALUES STAY in the saved data
+  // (carried as enabled: false) and come back when re-checked. A
+  // factor with stored values starts checked; a never-set factor
+  // starts unchecked and is not saved until it has a value.
   planFactorActive = new Set();
-  if (planFactorState.prime.points.length || planFactorState.prime.preset) planFactorActive.add('prime');
-  if (planFactorState.stock) planFactorActive.add('stock');
-  if (planFactorState.propertyGrowth) planFactorActive.add('propertyGrowth');
-  if (planFactorState.salaryGrowth) planFactorActive.add('salaryGrowth');
-  if (planFactorState.rentGrowth) planFactorActive.add('rentGrowth');
+  if (planFactorState.prime.enabled && (planFactorState.prime.points.length || planFactorState.prime.preset)) planFactorActive.add('prime');
+  if (planFactorState.stock && planFactorState.stock.enabled !== false) planFactorActive.add('stock');
+  if (planFactorState.propertyGrowth && planFactorState.propertyGrowth.enabled !== false) planFactorActive.add('propertyGrowth');
+  if (planFactorState.salaryGrowth && planFactorState.salaryGrowth.enabled !== false) planFactorActive.add('salaryGrowth');
+  if (planFactorState.rentGrowth && planFactorState.rentGrowth.enabled !== false) planFactorActive.add('rentGrowth');
   let primeInfo = null;
   let holdings = [];
-  let sinkDraft = null;
   const primeHost = $('#planFactorPrime');
   const stockHost = $('#planFactorStock');
   const growthHost = $('#planFactorGrowth');
-  const sinkHost = $('#planFactorSink');
   const nextYm = (ym) => { const [y, m] = ym.split('-').map(Number); const dt = new Date(Date.UTC(y, m - 1, 1)); dt.setUTCMonth(dt.getUTCMonth() + 1); return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}`; };
   const nowYm = () => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}`; };
   // The shared month picker writes the picked month onto the button
@@ -14758,35 +14851,24 @@ function planScenarioFactorWire(d) {
       },
     });
   };
-  const FACTOR_LABELS = { prime: 'Prime', stock: 'Stock return', propertyGrowth: 'Property growth', salaryGrowth: 'Salary growth', rentGrowth: 'Rent growth', sink: 'Sink' };
-  const renderFactorAdd = () => {
-    const row = $('#planFactorAddRow');
-    const sel = $('#planFactorAddSel');
-    if (!row || !sel) return;
-    const avail = [];
-    if (!planFactorActive.has('prime')) avail.push('prime');
-    if (!planFactorActive.has('stock') && !(isInvestment && planFactorState.sink)) avail.push('stock');
-    if ((d.project.category === 'property' || hasMortgageOps) && !planFactorActive.has('propertyGrowth')) avail.push('propertyGrowth');
-    if (d.project.category === 'earning') {
-      if (!planFactorActive.has('salaryGrowth')) avail.push('salaryGrowth');
-      if (!planFactorActive.has('rentGrowth')) avail.push('rentGrowth');
-    }
-    if (!avail.length) { row.classList.add('hidden'); return; }
-    row.classList.remove('hidden');
-    sel.innerHTML = avail.map((k) => `<option value="${k}">${FACTOR_LABELS[k]}</option>`).join('');
+  const FACTOR_LABELS = { prime: 'Prime', stock: 'Stock return', propertyGrowth: 'Property growth', salaryGrowth: 'Salary growth', rentGrowth: 'Rent growth' };
+  // One checkbox per applicable factor, always visible. Unchecking
+  // hides the component but keeps its values (saved with
+  // enabled: false); re-checking restores them.
+  const renderFactorChecks = () => {
+    const row = $('#planFactorChecks');
+    if (!row) return;
+    const avail = ['prime', 'stock'];
+    if (d.project.category === 'property' || hasMortgageOps) avail.push('propertyGrowth');
+    if (d.project.category === 'earning') avail.push('salaryGrowth', 'rentGrowth');
+    row.innerHTML = avail.map((k) => `<label class="check"><input type="checkbox" data-factor-check="${k}" ${planFactorActive.has(k) ? 'checked' : ''}> ${FACTOR_LABELS[k]}</label>`).join('');
+    row.querySelectorAll('[data-factor-check]').forEach((cb) => cb.addEventListener('change', () => {
+      const k = cb.dataset.factorCheck;
+      if (cb.checked) planFactorActive.add(k); else planFactorActive.delete(k);
+      renderAllFactors();
+    }));
   };
-  const renderAllFactors = () => { renderPrime(); renderStock(); renderGrowth(); renderFactorAdd(); };
-  const removeFactor = (key) => {
-    planFactorActive.delete(key);
-    if (key === 'prime') planFactorState.prime = { points: [], preset: null };
-    else planFactorState[key] = null;
-    if (key === 'sink') sinkDraft = null;
-    renderAllFactors();
-  };
-  const wireFactorRemove = (host) => {
-    if (!host) return;
-    host.querySelectorAll('[data-factor-remove]').forEach((b) => b.addEventListener('click', () => removeFactor(b.dataset.factorRemove)));
-  };
+  const renderAllFactors = () => { renderPrime(); renderStock(); renderGrowth(); renderFactorChecks(); };
   const renderPrime = () => {
     if (!primeHost) return;
     if (!planFactorActive.has('prime')) { primeHost.innerHTML = ''; return; }
@@ -14795,7 +14877,7 @@ function planScenarioFactorWire(d) {
     const presetBtns = [['optimistic', 'Optimistic (prime down)'], ['pessimistic', 'Pessimistic (prime up)'], ['up', 'Up'], ['down', 'Down'], ['flat', 'Flat']]
       .map(([k, label]) => `<button class="small" data-plan-prime-preset="${k}">${label}</button>`).join(' ');
     primeHost.innerHTML = `
-      <div class="section-head"><h3>Prime</h3><div class="toolbar"><button class="small danger" data-factor-remove="prime">Remove</button></div></div>
+      <div class="section-head"><h3>Prime</h3></div>
       <div class="note">Today's prime: ${curRate != null ? `${curRate}%` : '—'} · No points = prime stays at today's rate. Between points the rate holds until the next point.</div>
       <div class="chart-wrap" style="height:220px"><canvas id="planFactorPrimeChart"></canvas></div>
       <div class="toolbar">${presetBtns}</div>
@@ -14833,17 +14915,14 @@ function planScenarioFactorWire(d) {
       planFactorState.prime.preset = null;
       renderPrime();
     });
-    wireFactorRemove(primeHost);
   };
   const renderStock = () => {
     if (!stockHost) return;
     if (!planFactorActive.has('stock')) { stockHost.innerHTML = ''; return; }
     if (!planFactorState.stock || typeof planFactorState.stock !== 'object') planFactorState.stock = {};
-    // Shared editor (also used by the create modal): a global default
-    // plus one editable row per holding with its history-derived
-    // default labeled (basis + window) and a Revert to history.
-    planStockFactorRender(stockHost, planFactorState.stock, holdings, { showRemove: true });
-    wireFactorRemove(stockHost);
+    // Shared editor (also used by the create modal): read-only
+    // effective values with an on-demand "+ Override" per holding.
+    planStockFactorRender(stockHost, planFactorState.stock, holdings, {});
   };
   const renderGrowth = () => {
     if (!growthHost) return;
@@ -14855,37 +14934,32 @@ function planScenarioFactorWire(d) {
     }
     if (!rows.length) { growthHost.innerHTML = ''; return; }
     growthHost.innerHTML = `<div class="section-head"><h3>Growth</h3></div>` + rows.map(([k, label, v]) => `
-      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-growth="${k}" value="${v && v.valuePct != null ? v.valuePct : ''}"><button class="small danger" data-factor-remove="${k}">Remove</button></div>`).join('')
+      <div><label>${label}</label><input type="text" inputmode="decimal" data-money data-growth="${k}" value="${v && v.valuePct != null ? v.valuePct : ''}"></div>`).join('')
       + (d.project.category === 'earning' ? `<div class="note">Salary and rent growth are stored and labeled only — the projection has no earnings leg yet, so they do not change numbers.</div>` : '');
     growthHost.querySelectorAll('[data-growth]').forEach((inp) => inp.addEventListener('input', () => {
       const k = inp.dataset.growth;
       const v = inp.value.replace(/,/g, '').trim();
       planFactorState[k] = v === '' ? null : { valuePct: Number(v) };
     }));
-    wireFactorRemove(growthHost);
   };
-  $('#planFactorAddBtn').addEventListener('click', () => {
-    const k = $('#planFactorAddSel').value;
-    if (!k) return;
-    planFactorActive.add(k);
-    renderAllFactors();
-  });
   $('#planFactorSaveBtn').addEventListener('click', async () => {
     const msg = $('#planFactorMsg');
     try {
       syncPrimePointsFromDom();
       const st = planFactorState;
-      // Stock state is live-edited by the shared editor (global +
-      // per-holding rows); save its cleaned shape, or nothing when
-      // every field is blank (same as before: a blank factor is not
-      // saved).
+      // Stock state is live-edited by the shared editor (read-only
+      // rows + on-demand overrides); save its cleaned shape, or
+      // nothing when every field is blank (same as before: a blank
+      // factor is not saved). Every saved factor carries its enabled
+      // flag: unchecked factors keep their values in data (enabled:
+      // false) and are not computed; re-checking restores them.
       if (st.stock) st.stock = planStockFactorClean(st.stock);
       const factors = {};
-      if (planFactorActive.has('prime') && (st.prime.points.length || st.prime.preset)) factors.prime = { points: st.prime.points, preset: st.prime.preset };
-      if (planFactorActive.has('stock') && st.stock) factors.stock = st.stock;
-      if (planFactorActive.has('propertyGrowth') && st.propertyGrowth) factors.propertyGrowth = st.propertyGrowth;
-      if (planFactorActive.has('salaryGrowth') && st.salaryGrowth) factors.salaryGrowth = st.salaryGrowth;
-      if (planFactorActive.has('rentGrowth') && st.rentGrowth) factors.rentGrowth = st.rentGrowth;
+      if (st.prime.points.length || st.prime.preset) factors.prime = { points: st.prime.points, preset: st.prime.preset, enabled: planFactorActive.has('prime') };
+      if (st.stock) factors.stock = { ...st.stock, enabled: planFactorActive.has('stock') };
+      if (st.propertyGrowth) factors.propertyGrowth = { ...st.propertyGrowth, enabled: planFactorActive.has('propertyGrowth') };
+      if (st.salaryGrowth) factors.salaryGrowth = { ...st.salaryGrowth, enabled: planFactorActive.has('salaryGrowth') };
+      if (st.rentGrowth) factors.rentGrowth = { ...st.rentGrowth, enabled: planFactorActive.has('rentGrowth') };
       await api(`/api/planning/scenarios/${sc.id}`, { method: 'PUT', body: { factors } });
       showMsg(msg, 'ok', 'Factors saved');
       loadPlanScenario(sc.id);
@@ -14920,7 +14994,7 @@ function planScenarioFactorWire(d) {
     renderPrime();
     renderStock();
     renderGrowth();
-    renderFactorAdd();
+    renderFactorChecks();
   })();
 }
 

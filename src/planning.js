@@ -1364,6 +1364,13 @@ export function validateAiCreateProposal(parsed) {
   if (baseline.assumptions !== undefined && baseline.assumptions !== null && !Array.isArray(baseline.assumptions)) errs.push('baseline assumptions must be an array');
   if (!strategy.name || !String(strategy.name).trim()) errs.push('strategy name is required');
   if (strategy.ops !== undefined && !Array.isArray(strategy.ops)) errs.push('strategy ops must be an array');
+  // A strategy sink rides along when present (the GIC shape: a custom
+  // product sink + one sink buy). It is validated like any sink and
+  // preserved verbatim; a missing sink is simply no sink.
+  if (strategy.sink !== undefined && strategy.sink !== null) {
+    if (typeof strategy.sink !== 'object' || Array.isArray(strategy.sink)) errs.push('strategy sink must be an object');
+    else errs.push(...validateStrategyFactors({ sink: strategy.sink }));
+  }
   const ops = Array.isArray(strategy.ops) ? strategy.ops : [];
   for (const [i, o] of ops.entries()) {
     if (!o || typeof o !== 'object' || Array.isArray(o)) { errs.push(`operation ${i + 1} must be an object`); continue; }
@@ -1374,7 +1381,7 @@ export function validateAiCreateProposal(parsed) {
     project: { name: project.name ? String(project.name).trim() : '', question: project.question ? String(project.question) : null },
     scenario: { name: scenario.name ? String(scenario.name).trim() : '', factors: scenario.factors && typeof scenario.factors === 'object' && !Array.isArray(scenario.factors) ? scenario.factors : {} },
     baseline: { name: baseline.name ? String(baseline.name).trim() : (baseline.description ? String(baseline.description).trim() : ''), description: baseline.description ? String(baseline.description) : '', assumptions: baseline.assumptions },
-    strategy: { name: strategy.name ? String(strategy.name).trim() : '', ops },
+    strategy: { name: strategy.name ? String(strategy.name).trim() : '', ops, ...(strategy.sink && typeof strategy.sink === 'object' && !Array.isArray(strategy.sink) ? { sink: strategy.sink } : {}) },
   };
   return { proposal, errors: errs };
 }
@@ -1893,18 +1900,25 @@ export function groupStrategyFactorsForMigration(strategies) {
 // A prime factor's points as a projection scenario (steps the engine
 // merges onto the actual prime history). Empty points = no scenario:
 // the future holds at the last actual prime (do-nothing behavior).
+// A disabled factor (enabled === false — unchecked in the editor,
+// values kept in data) contributes nothing, same as absent.
 export function primeFactorToScenario(factors) {
+  if (factors && factors.prime && factors.prime.enabled === false) return null;
   const pts = factors && factors.prime && Array.isArray(factors.prime.points) ? factors.prime.points : [];
   if (!pts.length) return null;
   return { name: 'Strategy prime', steps: pts.map((p) => ({ date: `${p.month}-01`, rate: num(p.rate) })) };
 }
 // Factors overlay the confirmed assumptions: a set factor wins, an
-// unset one falls back to the confirmed value (or nothing).
+// unset one falls back to the confirmed value (or nothing). A disabled
+// factor (enabled === false — unchecked in the editor, values kept in
+// data) never overlays anything: the dimension follows the default
+// world exactly as if the factor were absent.
 export function factorsToAssumptions(factors, confirmed = {}) {
   const f = factors || {};
   const a = { ...confirmed };
-  if (f.stock && num(f.stock.valuePct) != null) a.stockReturnPct = num(f.stock.valuePct);
-  if (f.stock && f.stock.byHolding && typeof f.stock.byHolding === 'object' && !Array.isArray(f.stock.byHolding)) {
+  const on = (k) => !(f[k] && f[k].enabled === false);
+  if (on('stock') && f.stock && num(f.stock.valuePct) != null) a.stockReturnPct = num(f.stock.valuePct);
+  if (on('stock') && f.stock && f.stock.byHolding && typeof f.stock.byHolding === 'object' && !Array.isArray(f.stock.byHolding)) {
     const m = {};
     for (const [k, v] of Object.entries(f.stock.byHolding)) {
       const x = v && typeof v === 'object' ? num(v.valuePct) : num(v);
@@ -1912,7 +1926,7 @@ export function factorsToAssumptions(factors, confirmed = {}) {
     }
     if (Object.keys(m).length) a.stockReturnByHolding = m;
   }
-  if (f.propertyGrowth && num(f.propertyGrowth.valuePct) != null) a.propertyGrowthPct = num(f.propertyGrowth.valuePct);
+  if (on('propertyGrowth') && f.propertyGrowth && num(f.propertyGrowth.valuePct) != null) a.propertyGrowthPct = num(f.propertyGrowth.valuePct);
   return a;
 }
 // View-grouped prime presets: complete paths from the current prime,
@@ -1950,6 +1964,7 @@ export function expandScenarioPrimePreset(factors, currentPrime, currentMonth) {
   if (!factors || typeof factors !== 'object' || Array.isArray(factors)) return factors;
   const p = factors.prime;
   if (!p || typeof p !== 'object' || Array.isArray(p)) return factors;
+  if (p.enabled === false) return factors;
   if (p.preset == null || !PLAN_PRIME_PRESETS.includes(p.preset)) return factors;
   if (Array.isArray(p.points) && p.points.length) return factors;
   return { ...factors, prime: { ...p, points: primeFactorPresetPoints(p.preset, currentPrime, currentMonth) } };

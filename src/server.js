@@ -6983,10 +6983,18 @@ function planResolveNameRefs(ops, projectId) {
       else p.propertyId = m.id;
     }
     if (['buy', 'position'].includes(op.op_type)) {
-      const m = matchAccount(p.accountRef ?? p.accountId);
-      if (!m) bad = `account "${p.accountRef ?? p.accountId}" not found`;
-      else if (m.ambiguous) bad = `account "${p.accountRef}" is ambiguous: ${m.ambiguous.join(', ')}`;
-      else p.accountId = m.id;
+      // A custom-product buy (the manual GIC shape): an EXPLICIT null
+      // accountId + a symbol, no holding ref. It buys a product with
+      // no account, so there is nothing to resolve — the engine
+      // creates the holding from the buy price. A missing accountId
+      // (undefined) still fails, as before.
+      const isCustomBuy = op.op_type === 'buy' && 'accountId' in p && p.accountId === null && typeof p.symbol === 'string' && p.symbol.trim() && !p.holdingRef && !p.holdingId;
+      if (!isCustomBuy) {
+        const m = matchAccount(p.accountRef ?? p.accountId);
+        if (!m) bad = `account "${p.accountRef ?? p.accountId}" not found`;
+        else if (m.ambiguous) bad = `account "${p.accountRef}" is ambiguous: ${m.ambiguous.join(', ')}`;
+        else p.accountId = m.id;
+      }
       if (p.holdingRef && !p.holdingId) {
         const h = matchHolding(p.holdingRef, p.accountId);
         if (!h) bad = `holding "${p.holdingRef}" not found`;
@@ -7444,6 +7452,83 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
   res.json(out);
 });
 
+// Deterministic GIC template for ai-create propose (user 2026-11-04):
+// the manual GIC path models a GIC as a custom sink (kind 'custom',
+// name, expectedReturnPct) plus ONE sink-generated buy op
+// {accountId: null, symbol: <GIC name>, currency CAD, date, amount:
+// pool proceeds, price: 100} with no legs (the pool funds it); the
+// engine grows the new holding from its buy price at the sink's
+// expected return. A position op on a fund is never the shape.
+// Returns {ask} (missing rate/date/amount — never invented),
+// {error} (bad entity), or {response} (the propose payload, same
+// shape as the LLM path: proposal + unresolved + warnings).
+function planGicTemplateProposal(text, answers, category, subcategory, entity) {
+  const ans = answers || {};
+  // Rate: a previous answer wins, else parse "<n>%" / "<n> percent"
+  // from the text.
+  let rate = null;
+  if (ans.gic_rate != null && String(ans.gic_rate).trim() !== '') rate = Number(String(ans.gic_rate).replace(/,/g, '').trim());
+  if (rate == null || Number.isNaN(rate)) {
+    // NOTE: no \b after the unit — % is a non-word char, so a word
+    // boundary can never follow it ("4.12% " has no boundary after
+    // %). (?![a-z]) still keeps "percentage" from matching.
+    const m = /(\d+(?:\.\d+)?)\s*(?:%|percent|pct)(?![a-z])/i.exec(text);
+    if (m) rate = Number(m[1]);
+  }
+  // Start date: a previous answer wins, else the first YYYY-MM-DD
+  // (or YYYY-MM, read as the 1st) in the text.
+  let date = null;
+  if (ans.gic_start != null && String(ans.gic_start).trim() !== '') date = String(ans.gic_start).trim();
+  if (!date) {
+    const m = /(\d{4}-\d{2}-\d{2})/.exec(text) || /(\d{4}-\d{2})\b/.exec(text);
+    if (m) date = m[1].length === 7 ? `${m[1]}-01` : m[1];
+  }
+  // Term (label only): "180 days" / "180-day" / "180d".
+  let termDays = null;
+  const tm = /(\d+)\s*(?:days?|day)\b/i.exec(text) || /(\d+)[- ]day\b/i.exec(text);
+  if (tm) termDays = Number(tm[1]);
+  const ask = [];
+  if (rate == null || Number.isNaN(rate) || rate < -90 || rate > 500) ask.push({ field: 'gic_rate', label: 'GIC annual rate (%)', type: 'number' });
+  const curMonth = currentMonthKey();
+  const realDate = (d) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d || '')) return false;
+    const dt = new Date(`${d}T00:00:00Z`);
+    return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === d;
+  };
+  if (!date || !realDate(date) || date < `${curMonth}-01`) ask.push({ field: 'gic_start', label: 'GIC start date (must be this month or later)', type: 'date' });
+  if (ask.length) return { ask };
+  // Funding total: the entity's value (pool total for a pool,
+  // current value for an account/holding). Unknown or empty → ask.
+  let amount = null;
+  if (ans.gic_amount != null && String(ans.gic_amount).trim() !== '') amount = Number(String(ans.gic_amount).replace(/,/g, '').trim());
+  if (amount == null || Number.isNaN(amount)) {
+    const rec = planRecommendationFor(category, subcategory, entity);
+    if (rec.error) return { error: rec.error };
+    const figs = (rec.baseline && rec.baseline.figures) || {};
+    const total = figs.poolValue != null ? figs.poolValue : (figs.value != null ? figs.value : null);
+    if (total != null && total > 0) amount = Math.round(total * 100) / 100;
+  }
+  if (amount == null || Number.isNaN(amount) || amount <= 0) return { ask: [{ field: 'gic_amount', label: 'GIC amount (CAD)', type: 'number' }] };
+  const name = `GIC ${rate}%${termDays ? ` ${termDays}d` : ''}`;
+  const proposal = {
+    project: { name: 'GIC Investment', question: text },
+    scenario: { name: 'Base Scenario', factors: {} },
+    baseline: { name: 'Do Nothing', description: 'Hold the pool as-is', assumptions: [] },
+    strategy: {
+      name: 'GIC Purchase Strategy',
+      sink: { kind: 'custom', name, expectedReturnPct: rate },
+      ops: [{ op_type: 'buy', params: { accountId: null, symbol: name, currency: 'CAD', date, amount, price: 100 } }],
+    },
+  };
+  const { proposal: norm, errors: shapeErrors } = validateAiCreateProposal(proposal);
+  const { resolved, unresolved } = planResolveNameRefs(norm.strategy.ops, null);
+  const seqOps = resolved.map((o, i) => ({ ...o, seq: i + 1 }));
+  const legs = [];
+  for (const o of seqOps) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+  const opErrs = planValidateStrategyOps(null, seqOps, legs);
+  return { response: { proposal: { ...norm, strategy: { ...norm.strategy, ops: seqOps } }, unresolved, warnings: { shape: shapeErrors, scenario: [], baseline: [], ops: opErrs }, configured: true } };
+}
+
 // Pure-AI project creation: a NEW project designed from one stated
 // need. The entry lives in the creation flow AFTER the category /
 // entity / scope pickers, so the trio below is already scoped to a
@@ -7458,7 +7543,6 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
 // the preview is the correction surface, and a repair loop over a
 // four-part object would hide which part failed.
 app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => {
-  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const b = req.body || {};
   const text = String(b.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
@@ -7469,12 +7553,25 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
   if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
   const entErr = planValidateOptEntity(category, entity);
   if (entErr) return res.status(400).json({ error: entErr });
+  const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
+  // Deterministic GIC template (user 2026-11-04): a GIC request under
+  // the gic subcategory never goes to the model — the shape is fixed
+  // (custom sink + one sink buy, mirroring the manual GIC path), so
+  // the model cannot draft it into a fund position op again. It needs
+  // no LLM, so it also runs when the LLM is unconfigured. Missing
+  // rate/date/amount are asked for, never invented.
+  if (subcategory === 'gic') {
+    const gic = planGicTemplateProposal(text, answers, category, subcategory, entity);
+    if (gic.ask) return res.json({ ask: normalizeAiAsk(gic.ask) || gic.ask, configured: true });
+    if (gic.error) return res.status(400).json({ error: gic.error });
+    return res.json(gic.response);
+  }
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const fileCheck = validateChatFiles(b.files);
   if (fileCheck.error) return res.status(fileCheck.status).json({ error: fileCheck.error });
   const modelCheck = planAiPanelModel(b);
   if (modelCheck.error) return res.status(modelCheck.status).json({ error: modelCheck.error });
   const historyText = String(b.historyText || '').trim().slice(0, 4000);
-  const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
   const snapshot = await planAiSnapshotForProject();
   const prompt = [
     'You design ONE coherent planning project as JSON only. No prose outside the JSON object.',
@@ -7482,6 +7579,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
     'The scenario holds ONLY world factors: prime (a rate path), stock (an expected annual return %), propertyGrowth, salaryGrowth, rentGrowth. It NEVER holds a sink, an operation, or a price. prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30. stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one. Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
     'The baseline changes nothing: a pure do-nothing reference (name + one-line description + assumptions only). It carries NO prime path and NO stock reference.',
     'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position. A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price. Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas). Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids. For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
+    'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as strategy.sink {"kind": "custom", "name": "GIC <rate>%", "expectedReturnPct": <rate>} plus ONE buy op {"accountId": null, "symbol": "<same name>", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing.',
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. This is a NEW project: it has no existing scenarios, baselines, or strategies yet.',
     `Optimization: category ${category}, subcategory ${subcategory}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
     `App data snapshot: ${JSON.stringify(snapshot)}`,
@@ -7570,8 +7668,8 @@ app.post('/api/planning/ai-create/apply', requireApiAuth, async (req, res) => {
     const def = { ...baselineDef, stockReference: 'current-plan' };
     const bl = db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(pid, norm.baseline.name, 'ai', category, subcategory, JSON.stringify(entity), JSON.stringify(def), now, now);
-    const st = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(pid, norm.strategy.name, planNextLetter(pid), 'ai', null, null, now, now);
+    const st = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, sink, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(pid, norm.strategy.name, planNextLetter(pid), 'ai', null, null, norm.strategy.sink ? JSON.stringify(norm.strategy.sink) : null, now, now);
     for (const o of seqOps) {
       const oi = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(st.lastInsertRowid, o.seq, o.op_type, JSON.stringify(o.params), 'ai', now, now);
