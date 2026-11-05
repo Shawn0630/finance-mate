@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS earn_rentals (
   address TEXT,
   rental_type TEXT NOT NULL,                    -- long_term | short_term | commercial
   services_level TEXT NOT NULL DEFAULT 'basic', -- basic (T776) | hotel_like (T2125)
-  ownership_pct REAL NOT NULL DEFAULT 100,      -- owner's share of net (T1 line 12600)
+  ownership_pct REAL NOT NULL DEFAULT 100,      -- DORMANT: the owner share is derived on read (100% / number of owners of the linked property), never entered or written; kept only so old rows keep their history
   rental_portion_pct REAL,                     -- share of the linked property that is rented (the tenant's share); null = not set
   is_principal_residence INTEGER NOT NULL DEFAULT 0,
   was_principal_residence INTEGER NOT NULL DEFAULT 0,

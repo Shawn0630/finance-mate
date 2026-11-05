@@ -900,10 +900,12 @@ export function validRentalInput(body) {
   if (!RENTAL_TYPES.includes(rentalType)) return { error: 'rental_type must be long_term, short_term or commercial.' };
   const servicesLevel = String(b.services_level || 'basic');
   if (!SERVICE_LEVELS.includes(servicesLevel)) return { error: 'services_level must be basic or hotel_like.' };
-  const ownershipPct = Number(b.ownership_pct);
-  if (!Number.isFinite(ownershipPct) || ownershipPct <= 0 || ownershipPct > 100) {
-    return { error: 'ownership_pct must be between 0 and 100.' };
-  }
+  // The owner share is derived, never entered: 100% / (number of
+  // owners of the linked property) — two owners is 50/50. The calc
+  // reads rental.ownership_pct, which the server's read path always
+  // sets to the derived value; a value in an old request body is
+  // ignored rather than stored, and the stored ownership_pct column
+  // is dormant.
   const propertyId = b.property_id == null || b.property_id === '' ? null : Number(b.property_id);
   if (propertyId != null && (!Number.isInteger(propertyId) || propertyId <= 0)) {
     return { error: 'property_id must be an existing property id.' };
@@ -918,7 +920,7 @@ export function validRentalInput(body) {
   // GST fields here: long-term rent is GST-exempt, and GST fields
   // only exist on the short-term/commercial path (year records).
   return {
-    label, rental_type: rentalType, services_level: servicesLevel, ownership_pct: ownershipPct,
+    label, rental_type: rentalType, services_level: servicesLevel,
     property_id: propertyId, address: cleanStr(b.address, 240),
     rental_portion_pct: portion,
     is_principal_residence: b.is_principal_residence === true || b.is_principal_residence === 1 || b.is_principal_residence === '1',
@@ -1117,28 +1119,44 @@ export function calcRentalYear(rental, year, rentalRegion, derived) {
   // Sum = derived + manual = Deductible expenses. The derived
   // interest is the T776 line 8710 interest for that year; it is
   // listed in the expense table, not in the entered-lines breakdown.
+  // Each expense-table row carries its Total (the item's amount for
+  // the rented period: the full-year cost, prorated by rented days
+  // for a partial year), the Tenant % (the rental portion), and the
+  // Deductible = Total x portion, to the cent. The deductible is
+  // computed FROM the rounded Total, so the row identity holds
+  // exactly; the year total is the sum of the row deductibles, so
+  // the table's Sum row IS the year record's Deductible expenses.
+  // Rows the portion does not scale (a direct manual line, a
+  // manually entered mortgage interest) carry pct null, shown as
+  // '—', with Total == Deductible.
+  const daysFactor = year.rental_days / 365;
   const derivedCosts = (derived && derived.costs) || [];
   const derivedItems = derivedCosts
     .filter((c) => c && Number(c.annual) > 0)
-    .map((c) => ({ label: c.label, deductible: round2(Number(c.annual) * factor) }));
+    .map((c) => {
+      const total = round2(Number(c.annual) * daysFactor);
+      return { label: c.label, total, pct: areaShare, deductible: round2(total * areaShare / 100) };
+    });
   const derivedInterest = derived && derived.interest != null ? Number(derived.interest) : null;
   if (derivedInterest != null && derivedInterest > 0) {
-    derivedItems.push({ label: 'Mortgage interest', deductible: round2(derivedInterest * factor) });
+    const total = round2(derivedInterest * daysFactor);
+    derivedItems.push({ label: 'Mortgage interest', total, pct: areaShare, deductible: round2(total * areaShare / 100) });
   }
   const derivedGross = derivedCosts.reduce((s, c) => s + (Number(c.annual) || 0), 0)
     + (derivedInterest != null ? derivedInterest : 0);
   const derivedTotal = derivedItems.reduce((s, i) => s + i.deductible, 0);
   const t776ByLine = new Map((rentalRegion.t776Lines || []).map((l) => [l.line, l.label]));
-  const manualRows = (year.expenses || []).map((e) => ({
-    label: `${t776ByLine.get(e.line) || ('Line ' + e.line)} (manual)`,
-    deductible: e.direct ? round2(e.amount) : round2(e.amount * factor),
-  }));
+  const manualRows = (year.expenses || []).map((e) => {
+    const label = `${t776ByLine.get(e.line) || ('Line ' + e.line)} (manual)`;
+    if (e.direct) return { label, total: round2(e.amount), pct: null, deductible: round2(e.amount) };
+    const total = round2(e.amount * daysFactor);
+    return { label, total, pct: areaShare, deductible: round2(total * areaShare / 100) };
+  });
   if (Number(year.mortgage_interest) > 0) {
-    manualRows.push({ label: 'Mortgage interest (manual)', deductible: round2(Number(year.mortgage_interest)) });
+    manualRows.push({ label: 'Mortgage interest (manual)', total: round2(Number(year.mortgage_interest)), pct: null, deductible: round2(Number(year.mortgage_interest)) });
   }
-  const deductibleShared = sharedTotal * factor;
   const personalPortion = round2(sharedTotal * (1 - factor) + derivedGross * (1 - factor));
-  const deductibleExpenses = round2(directTotal + deductibleShared + year.mortgage_interest + derivedTotal);
+  const deductibleExpenses = round2(derivedTotal + manualRows.reduce((s, r) => s + r.deductible, 0));
   const grossWhole = round2(year.gross_rents + year.other_income);
   let netBeforeCca = round2(grossWhole - deductibleExpenses);
   // s.67.7: short-term non-compliant days deny expenses pro-rata.
@@ -1185,7 +1203,7 @@ export function calcRentalYear(rental, year, rentalRegion, derived) {
     grossWhole, otherIncome: round2(year.other_income),
     expensesByLine: byLine, totalExpensesEntered: round2(directTotal + sharedTotal),
     personalPortion9949: personalPortion, deductibleExpenses,
-    expenseTable: { rows: [...derivedItems, ...manualRows], sum: deductibleExpenses, hasDerived: derivedItems.length > 0 },
+    expenseTable: { rows: [...derivedItems, ...manualRows], sum: deductibleExpenses, totalSum: round2([...derivedItems, ...manualRows].reduce((s, r) => s + r.total, 0)), hasDerived: derivedItems.length > 0 },
     mortgageInterest: round2(year.mortgage_interest), mortgagePrincipal: round2(year.mortgage_principal),
     deniedExpenses, netBeforeCca9369: netBeforeCca, ccaClaim9936: ccaClaim,
     netWhole9946: netWhole, ownerShareNet: ownerShare, ownershipPct: rental.ownership_pct,

@@ -24,7 +24,7 @@ export async function run(H, S) {
     r.status === 201 && r.data.calc.provincialTax === null && r.data.calc.provinceVerified === false,
     JSON.stringify(r.data.calc));
   r = await H.req('POST', '/api/earnings/rentals', {
-    label: 'Basement suite', rental_type: 'long_term', services_level: 'basic', ownership_pct: 50,
+    label: 'Basement suite', rental_type: 'long_term', services_level: 'basic',
   });
   H.check('earnings: rental created', r.status === 201 && r.data.label === 'Basement suite', JSON.stringify(r.data));
   const earnRentalId = r.data.id;
@@ -54,7 +54,7 @@ export async function run(H, S) {
   H.check('earnings: entry auto-creates covered years and derives gross + days (no typing)',
     r.status === 200 && r.data.rentals[0].years.length === 2
     && earnYear2026.gross_rents === 24000 && earnYear2026.rental_days === 365 && earnYear2026.rent_derived === true
-    && earnYear2026.calc.personalPortion9949 === 6000 && earnYear2026.calc.ownerShareNet === 5750
+    && earnYear2026.calc.personalPortion9949 === 6000 && earnYear2026.calc.ownerShareNet === 11500
     && earnYear2026.calc.netWhole9946 === 11500 && earnYear2026.calc.gst.status === 'exempt'
     && earnYear2025.gross_rents === 24000 && earnYear2025.rental_days === 365,
     JSON.stringify(r.data.rentals[0].years.map((y) => ({ tax_year: y.tax_year, gross_rents: y.gross_rents, rental_days: y.rental_days, rent_derived: y.rent_derived, calc: y.calc }))));
@@ -506,7 +506,7 @@ export async function run(H, S) {
       // button calls, and the detail button itself is pinned in the
       // detail section below.
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Modal rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Modal rental', rental_type: 'long_term', services_level: 'basic',
       });
       H.check('rental modals setup: rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
       const modalRentalId = r.data.id;
@@ -668,7 +668,7 @@ export async function run(H, S) {
       // Edit/Delete or + Rent entry; Total income stays.
       page.on('dialog', (d) => d.accept());
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Detail rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 66.67,
+        label: 'Detail rental', rental_type: 'long_term', services_level: 'basic',
       });
       H.check('rental detail setup: rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
       const detailRentalId = r.data.id;
@@ -687,7 +687,7 @@ export async function run(H, S) {
       });
       H.check('rental detail setup: 2025 entry created', r.status === 201, JSON.stringify(r.data));
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Empty rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Empty rental', rental_type: 'long_term', services_level: 'basic',
       });
       H.check('rental detail setup: empty rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
       const emptyRentalId = r.data.id;
@@ -797,7 +797,7 @@ export async function run(H, S) {
         JSON.stringify(detailInfo));
       H.check('rental detail header shows label + type and ownership',
         detailInfo.header && detailInfo.header.includes('Detail rental') && detailInfo.header.includes('long_term')
-          && detailInfo.header.includes('basic') && detailInfo.header.includes('66.67% owned'),
+          && detailInfo.header.includes('basic') && detailInfo.header.includes('100% owned'),
         JSON.stringify(detailInfo.header));
       const wantDetailCards = [
         ['Gross rents', cad(latestDetailYear.calc.grossWhole)],
@@ -994,7 +994,7 @@ export async function run(H, S) {
       // Rentals income panel: share-left / history-right above the
       // cards, range share from entries only, per-rental eye hide.
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Chart A', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Chart A', rental_type: 'long_term', services_level: 'basic',
       });
       H.check('rental income panel setup: Chart A created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
       const chartAId = r.data.id;
@@ -1010,7 +1010,7 @@ export async function run(H, S) {
       });
       H.check('rental income panel setup: Chart A entry', r.status === 201, JSON.stringify(r.data));
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Chart B', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Chart B', rental_type: 'long_term', services_level: 'basic',
       });
       H.check('rental income panel setup: Chart B created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
       const chartBId = r.data.id;
@@ -1614,7 +1614,7 @@ export async function run(H, S) {
       // Item A: a fixture rental with only ended entries shows the
       // neutral line on its card.
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Ended rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Ended rental', rental_type: 'long_term', services_level: 'basic',
       });
       H.check('rental headline setup: ended rental created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
       const endedRentalId = r.data.id;
@@ -1732,7 +1732,7 @@ export async function run(H, S) {
       }
       H.check('derived setup: amortization series read', amort.status === 200 && interestByYear[2025] > 0 && interestByYear[2026] > 0, JSON.stringify({ i25: interestByYear[2025], i26: interestByYear[2026] }));
       r = await H.req('POST', '/api/earnings/rentals', {
-        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic',
         property_id: derPropId, rental_portion_pct: 33,
       });
       H.check('derived setup: linked rental created with portion 33', r.status === 201 && r.data.rental_portion_pct === 33, JSON.stringify(r.data));
@@ -1760,6 +1760,16 @@ export async function run(H, S) {
           && derY26.calc.expenseTable.rows.some((row) => row.label === 'Gas' && Math.abs(row.deductible - 396) < 0.01)
           && derY26.calc.expenseTable.rows.some((row) => row.label === 'Mortgage interest' && Math.abs(row.deductible - Math.round(interestByYear[2026] * 0.33 * 100) / 100) < 0.01),
         JSON.stringify(derY26 && derY26.calc.expenseTable));
+      H.check('derived expenses: rows carry Total + Tenant % with Deductible == Total x portion, Sum == year deductible',
+        derY26 && derY26.calc.expenseTable.rows.every((row) => row.pct == null
+            ? Math.abs(row.total - row.deductible) < 0.01
+            : Math.abs(row.deductible - Math.round(row.total * row.pct / 100 * 100) / 100) < 0.01)
+          && Math.abs(derY26.calc.expenseTable.totalSum - (7200 + interestByYear[2026])) < 0.01
+          && Math.abs(derY26.calc.expenseTable.rows.reduce((s, r) => s + r.deductible, 0) - derY26.calc.deductibleExpenses) < 0.01
+          && derY26.calc.expenseTable.rows.some((row) => row.label === 'Property tax' && Math.abs(row.total - 6000) < 0.01 && row.pct === 33)
+          && derY26.calc.expenseTable.rows.some((row) => row.label === 'Gas' && Math.abs(row.total - 1200) < 0.01 && row.pct === 33)
+          && derY26.calc.expenseTable.rows.some((row) => row.label === 'Mortgage interest' && Math.abs(row.total - interestByYear[2026]) < 0.01 && row.pct === 33),
+        JSON.stringify(derY26 && derY26.calc.expenseTable));
       // A rental with no linked property shows no derived table.
       const baseEarn = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.label === 'Basement suite');
       const baseY26 = baseEarn.years.find((y) => y.tax_year === 2026);
@@ -1768,7 +1778,7 @@ export async function run(H, S) {
         JSON.stringify(baseY26 && baseY26.calc));
       // Editing the portion re-derives on save (the save rule).
       r = await H.req('PUT', `/api/earnings/rentals/${derRentalId}`, {
-        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic',
         property_id: derPropId, rental_portion_pct: 50,
       });
       const derEarn50 = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === derRentalId);
@@ -1779,7 +1789,7 @@ export async function run(H, S) {
         JSON.stringify({ got: derY26b && derY26b.calc.deductibleExpenses, want: want50 }));
       // Validation: portion outside 1–100 is rejected.
       r = await H.req('PUT', `/api/earnings/rentals/${derRentalId}`, {
-        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic',
         property_id: derPropId, rental_portion_pct: 0,
       });
       H.check('derived expenses: portion 0 is rejected', r.status === 400, JSON.stringify(r.data));
@@ -1787,7 +1797,7 @@ export async function run(H, S) {
       // year-paged table lists each item + the sum, the summary-strip
       // Deductible expenses card matches, and the pager flips years.
       r = await H.req('PUT', `/api/earnings/rentals/${derRentalId}`, {
-        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic', ownership_pct: 100,
+        label: 'Derived rental', rental_type: 'long_term', services_level: 'basic',
         property_id: derPropId, rental_portion_pct: 33,
       });
       H.check('derived expenses: portion restored to 33', r.status === 200, JSON.stringify(r.data));
@@ -1796,33 +1806,122 @@ export async function run(H, S) {
       const derDetail = await page.evaluate(() => {
         const d = document.querySelector('#earnRentalDetail');
         const strip = [...d.querySelectorAll('.summary-card')].map((c) => [c.querySelector('.k')?.textContent.trim(), c.querySelector('.v')?.textContent.trim()]);
-        const pager = [...document.querySelectorAll('#earnRentalExpensePager button')].map((b) => ({ year: b.dataset.earnExpYear, active: b.classList.contains('active') }));
+        const yearLabel = document.querySelector('#earnRentalSummaryYear')?.textContent.trim() || null;
+        const sel = document.querySelector('#earnRentalExpenseYearSel');
+        const head = document.querySelector('#earnRentalDetail .cost-year-head')?.textContent.trim() || null;
         const rows = [...document.querySelectorAll('#earnRentalExpenseTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
-        return { strip, pager, rows, hasTable: !!document.querySelector('#earnRentalExpenseTable') };
+        const sumRow = [...document.querySelectorAll('#earnRentalExpenseTable tfoot tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { strip, yearLabel, selValue: sel ? sel.value : null, selOptions: sel ? [...sel.options].map((o) => o.value) : null, head, rows, sumRow, hasTable: !!document.querySelector('#earnRentalExpenseTable') };
       });
       const want26Str = want26.toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      H.check('derived expenses: detail shows the year-paged table (2026 default) + summary card matches',
+      const want26TotalFmt = (Math.round((7200 + interestByYear[2026]) * 100) / 100).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const int26Fmt = (Math.round(interestByYear[2026] * 100) / 100).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const int26DedFmt = (Math.round(interestByYear[2026] * 0.33 * 100) / 100).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      H.check('derived expenses: detail shows the restyled table (2026 default, 4 columns) + strip year label + summary card matches',
         derDetail.hasTable
-          && derDetail.pager.length === 2 && derDetail.pager.find((b) => b.year === '2026')?.active === true
-          && derDetail.rows.some((row) => row[0] === 'Property tax' && row[1] === '$1,980.00')
-          && derDetail.rows.some((row) => row[0] === 'Gas' && row[1] === '$396.00')
-          && derDetail.rows.some((row) => row[0] === 'Mortgage interest')
-          && derDetail.rows[derDetail.rows.length - 1][0] === 'Sum'
-          && derDetail.rows[derDetail.rows.length - 1][1] === want26Str
+          && derDetail.yearLabel === 'Tax year 2026'
+          && derDetail.selValue === '2026' && JSON.stringify(derDetail.selOptions) === JSON.stringify(['2025', '2026'])
+          && derDetail.head === '2026'
+          && derDetail.rows.some((row) => row[0] === 'Property tax' && row[1] === '$6,000.00' && row[2] === '33%' && row[3] === '$1,980.00')
+          && derDetail.rows.some((row) => row[0] === 'Gas' && row[1] === '$1,200.00' && row[2] === '33%' && row[3] === '$396.00')
+          && derDetail.rows.some((row) => row[0] === 'Mortgage interest' && row[1] === int26Fmt && row[2] === '33%' && row[3] === int26DedFmt)
+          && derDetail.sumRow.length === 1 && derDetail.sumRow[0][0] === 'Sum'
+          && derDetail.sumRow[0][1] === want26TotalFmt && derDetail.sumRow[0][3] === want26Str
           && derDetail.strip.find((c) => c[0] === 'Deductible expenses')?.[1] === want26Str,
-        JSON.stringify({ ...derDetail, want26Str }));
-      await page.click('[data-earn-exp-year="2025"]');
+        JSON.stringify({ ...derDetail, want26Str, want26TotalFmt, int26Fmt, int26DedFmt }));
+      await page.select('#earnRentalExpenseYearSel', '2025');
       await waitE(500);
       const derDetail25 = await page.evaluate(() => {
-        const pager = [...document.querySelectorAll('#earnRentalExpensePager button')].map((b) => ({ year: b.dataset.earnExpYear, active: b.classList.contains('active') }));
+        const sel = document.querySelector('#earnRentalExpenseYearSel');
+        const head = document.querySelector('#earnRentalDetail .cost-year-head')?.textContent.trim() || null;
         const rows = [...document.querySelectorAll('#earnRentalExpenseTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
-        return { pager, rows };
+        const sumRow = [...document.querySelectorAll('#earnRentalExpenseTable tfoot tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { selValue: sel ? sel.value : null, head, rows, sumRow };
       });
-      H.check('derived expenses: pager flips to 2025 with that year\'s rows + sum',
-        derDetail25.pager.find((b) => b.year === '2025')?.active === true
-          && derDetail25.rows.some((row) => row[0] === 'Property tax' && row[1] === '$1,650.00')
-          && derDetail25.rows[derDetail25.rows.length - 1][0] === 'Sum',
+      H.check('derived expenses: year select flips to 2025 with that year\'s rows + sum',
+        derDetail25.selValue === '2025' && derDetail25.head === '2025'
+          && derDetail25.rows.some((row) => row[0] === 'Property tax' && row[1] === '$5,000.00' && row[2] === '33%' && row[3] === '$1,650.00')
+          && derDetail25.sumRow.length === 1 && derDetail25.sumRow[0][0] === 'Sum',
         JSON.stringify(derDetail25));
+      // Live derivation: adding a property cost updates the table on
+      // the next read — no re-entry on the rental side.
+      r = await H.req('POST', `/api/properties/${derPropId}/costs`, { year: 2026, category: 'Electricity', amount: 1200 });
+      H.check('derived expenses: live-add setup — 2026 Electricity cost created', r.status === 201, JSON.stringify(r.data));
+      const liveCostId = r.data.entries
+        ? (r.data.entries.find((e) => e.category === 'Electricity' && e.year === 2026) || {}).id : null;
+      const derEarnLive = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === derRentalId);
+      const derY26Live = derEarnLive.years.find((y) => y.tax_year === 2026);
+      H.check('derived expenses: a property cost added later appears in the table with Total x portion == deductible',
+        liveCostId != null && derY26Live && derY26Live.calc.expenseTable.rows.some((row) => row.label === 'Electricity' && Math.abs(row.total - 1200) < 0.01 && row.pct === 33 && Math.abs(row.deductible - 396) < 0.01)
+          && Math.abs(derY26Live.calc.deductibleExpenses - Math.round((want26 + 396) * 100) / 100) < 0.01,
+        JSON.stringify({ liveCostId, table: derY26Live && derY26Live.calc.expenseTable }));
+      r = await H.req('DELETE', `/api/properties/${derPropId}/costs/${liveCostId}`);
+      H.check('derived expenses: live-add cleanup — cost deleted', r.status === 200, JSON.stringify(r.data));
+      const derEarnBack = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === derRentalId);
+      const derY26Back = derEarnBack.years.find((y) => y.tax_year === 2026);
+      H.check('derived expenses: deleting the cost removes its row again',
+        derY26Back && !derY26Back.calc.expenseTable.rows.some((row) => row.label === 'Electricity')
+          && Math.abs(derY26Back.calc.deductibleExpenses - want26) < 0.01,
+        JSON.stringify(derY26Back && derY26Back.calc.expenseTable));
+
+      // Item 2: the owner share is derived — two owners is 50/50,
+      // and the rental saves with no ownership value at all.
+      r = await H.req('POST', '/api/properties', {
+        address: '2 Owners Way, Coquitlam, BC', region: 'CA', purchase_date: '2024-12-01',
+        owners: ['Shawn', 'Jiaying'],
+      });
+      H.check('derived ownership: two-owner property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const twoPropId = r.data.id;
+      r = await H.req('POST', '/api/earnings/rentals', {
+        label: 'Two-owner rental', rental_type: 'long_term', services_level: 'basic',
+        property_id: twoPropId,
+      });
+      H.check('derived ownership: rental linked to the two-owner property, saved with no ownership value',
+        r.status === 201 && r.data.ownership_pct === 50, JSON.stringify(r.data));
+      const twoRentalId = r.data.id;
+      r = await H.req('POST', `/api/earnings/rentals/${twoRentalId}/years`, {
+        tax_year: 2026, other_income: 0, area_share_pct: 100,
+        mortgage_interest: 0, mortgage_principal: 0,
+        expenses: [{ line: '9180', amount: 4000, direct: false }],
+      });
+      H.check('derived ownership: year created', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/earnings/rentals/${twoRentalId}/entries`, {
+        start_ym: '2026-01', end_ym: '2026-12', monthly_rent: 2000, pay_day: 1,
+      });
+      H.check('derived ownership: entry created', r.status === 201, JSON.stringify(r.data));
+      const twoEarn = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === twoRentalId);
+      const twoY26 = twoEarn.years.find((y) => y.tax_year === 2026);
+      // Gross 24,000 − deductible 4,000 = net 20,000; owner share 50% = 10,000.
+      H.check('derived ownership: two owners -> Owner share = net x 50%',
+        twoEarn && twoEarn.ownership_pct === 50 && twoY26 && twoY26.calc.netWhole9946 === 20000 && twoY26.calc.ownerShareNet === 10000,
+        JSON.stringify({ pct: twoEarn && twoEarn.ownership_pct, calc: twoY26 && twoY26.calc }));
+      await page.goto(`http://ff.local/#earnings/rental/${twoRentalId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // Same-hash detail navigation does not reload the panel: the
+      // previous rental's detail stays rendered until the new load
+      // finishes, so wait for this rental's heading, not just the
+      // back link (which already exists from the stale render).
+      await page.waitForFunction(() => document.querySelector('#earnRentalDetail .panel .section-head h3')?.textContent.includes('Two-owner rental'), { timeout: 10000 });
+      const twoHeader = await page.evaluate(() => document.querySelector('#earnRentalDetail .panel .section-head')?.textContent || null);
+      H.check('derived ownership: detail header shows 50% owned',
+        twoHeader && twoHeader.includes('50% owned'), JSON.stringify(twoHeader));
+      // The rental form carries no ownership % field — the only
+      // percentage on the form is the Rental portion.
+      await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(500);
+      await page.evaluate(() => document.querySelector('#addEarnRentalBtn').click());
+      await waitE(300);
+      const formFields = await page.evaluate(() => ({
+        hasOwnership: !!document.querySelector('#earnRentalForm [name="ownership_pct"]'),
+        hasPortion: !!document.querySelector('#earnRentalForm [name="rental_portion_pct"]'),
+      }));
+      H.check('derived ownership: the rental form has no ownership % field, only Rental portion',
+        formFields.hasOwnership === false && formFields.hasPortion === true, JSON.stringify(formFields));
+      await page.click('#earnRentalCancelBtn');
+      await waitE(200);
+      r = await H.req('DELETE', `/api/earnings/rentals/${twoRentalId}`);
+      H.check('derived ownership cleanup: rental deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/properties/${twoPropId}`);
+      H.check('derived ownership cleanup: property deleted', r.status === 200, JSON.stringify(r.data));
       // Cleanup: the derived rental + its property, and the ended rental.
       r = await H.req('DELETE', `/api/earnings/rentals/${derRentalId}`);
       H.check('derived cleanup: rental deleted', r.status === 200, JSON.stringify(r.data));

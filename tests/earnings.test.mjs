@@ -173,14 +173,16 @@ test('rental: co-owner share applies to net only', () => {
   assert.equal(c.grossWhole, 24000); // whole-property gross, not halved
 });
 
-test('rental validation: rejects bad ownership and bad rental type', () => {
-  assert.ok(validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 150 }).error);
-  assert.ok(validRentalInput({ label: 'X', rental_type: 'weekly', ownership_pct: 50 }).error);
+test('rental validation: ownership is derived, never entered — a sent value is ignored', () => {
+  assert.ok(!validRentalInput({ label: 'X', rental_type: 'long_term' }).error);
+  assert.ok(!validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 150 }).error);
   assert.ok(!validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 50 }).error);
+  assert.equal(validRentalInput({ label: 'X', rental_type: 'long_term', ownership_pct: 50 }).ownership_pct, undefined);
+  assert.ok(validRentalInput({ label: 'X', rental_type: 'weekly' }).error);
 });
 
 test('rental validation: rental portion is optional, must be 1–100 when set', () => {
-  const base = { label: 'X', rental_type: 'long_term', ownership_pct: 50 };
+  const base = { label: 'X', rental_type: 'long_term' };
   assert.equal(validRentalInput(base).rental_portion_pct, null);
   assert.equal(validRentalInput({ ...base, rental_portion_pct: '' }).rental_portion_pct, null);
   assert.equal(validRentalInput({ ...base, rental_portion_pct: 33 }).rental_portion_pct, 33);
@@ -215,10 +217,19 @@ test('rental: property-derived costs scale by the rental portion, manual lines s
   assert.equal(c.personalPortion9949, 8844); // 67% x (7200 + 5000 + 1000 manual)
   assert.equal(c.expenseTable.hasDerived, true);
   assert.equal(c.expenseTable.sum, 4356);
-  assert.deepEqual(c.expenseTable.rows.slice(0, 3).map((r) => [r.label, r.deductible]), [
-    ['Property tax', 1980], ['Gas', 396], ['Mortgage interest', 1650],
+  assert.equal(c.expenseTable.totalSum, 13200);
+  assert.deepEqual(c.expenseTable.rows.slice(0, 3).map((r) => [r.label, r.total, r.pct, r.deductible]), [
+    ['Property tax', 6000, 33, 1980], ['Gas', 1200, 33, 396], ['Mortgage interest', 5000, 33, 1650],
   ]);
+  // Row identity: every row the portion scales satisfies
+  // Deductible == Total x portion, to the cent.
+  for (const r of c.expenseTable.rows) {
+    if (r.pct == null) continue;
+    assert.equal(r.deductible, Math.round(r.total * r.pct / 100 * 100) / 100);
+  }
   assert.equal(c.expenseTable.rows[3].deductible, 330);
+  assert.equal(c.expenseTable.rows[3].total, 1000);
+  assert.equal(c.expenseTable.rows[3].pct, 33);
   assert.ok(c.expenseTable.rows[3].label.includes('(manual)'));
   // Partial year prorates by rented days on top of the portion.
   const part = calcRentalYear(rentalBase({ rental_portion_pct: 33 }), yearBase({
@@ -235,6 +246,23 @@ test('rental: property-derived costs scale by the rental portion, manual lines s
   assert.equal(plain.deductibleExpenses, 1000);
   assert.equal(plain.expenseTable.hasDerived, false);
   assert.equal(plain.expenseTable.sum, 1000);
+});
+
+test('rental: expense table rows the portion does not scale carry pct null, Total == Deductible', () => {
+  const c = calcRentalYear(rentalBase({ rental_portion_pct: 33 }), yearBase({
+    area_share_pct: 100, rental_days: 365, mortgage_interest: 6000,
+    expenses: [{ line: '8521', amount: 500, direct: true }],
+  }), rental);
+  const rows = c.expenseTable.rows;
+  const direct = rows.find((r) => r.label.includes('(manual)') && r.total === 500);
+  assert.ok(direct && direct.pct === null && direct.deductible === 500);
+  const mi = rows.find((r) => r.label === 'Mortgage interest (manual)');
+  assert.ok(mi && mi.pct === null && mi.total === 6000 && mi.deductible === 6000);
+  // The displayed rows sum to the Sum row, which is the year
+  // record's Deductible expenses.
+  assert.equal(c.expenseTable.sum, c.deductibleExpenses);
+  assert.equal(c.expenseTable.sum, rows.reduce((s, r) => s + r.deductible, 0));
+  assert.equal(c.expenseTable.totalSum, 6500);
 });
 
 test('job owner: single earner kept, empty/omitted means unassigned', () => {

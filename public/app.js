@@ -9807,7 +9807,7 @@ window.earnEditRental = (id) => {
   $('#earnRentalFormTitle').textContent = 'Edit rental';
   const f = $('#earnRentalForm');
   f.label.value = r.label; f.property_id.value = r.property_id ?? ''; f.address.value = r.address || '';
-  f.rental_type.value = r.rental_type; f.services_level.value = r.services_level; f.ownership_pct.value = r.ownership_pct;
+  f.rental_type.value = r.rental_type; f.services_level.value = r.services_level;
   f.rental_portion_pct.value = r.rental_portion_pct ?? '';
   f.is_principal_residence.checked = r.is_principal_residence; f.was_principal_residence.checked = r.was_principal_residence;
   f.structural_change.checked = r.structural_change;
@@ -9858,7 +9858,8 @@ function earnRentalDetailSummaryHtml(r) {
   const y = earnRentalLatestYear(r);
   if (y && y.calc) {
     const c = y.calc;
-    return `<div class="summary-strip">
+    return `<div class="note" id="earnRentalSummaryYear">Tax year ${y.tax_year}</div>
+    <div class="summary-strip">
       <div class="summary-card"><div class="k">Gross rents</div><div class="v">${money2(c.grossWhole)}</div></div>
       <div class="summary-card"><div class="k">Deductible expenses</div><div class="v">${money2(c.deductibleExpenses)}</div></div>
       <div class="summary-card"><div class="k">Net, whole property (9946)</div><div class="v">${money2(c.netWhole9946)}</div></div>
@@ -9879,11 +9880,17 @@ function earnRentalDetailSummaryHtml(r) {
 }
 
 // Deductible expenses, item by item (same year-pager pattern as the
-// per-pay tax benefit table): the property-derived costs — each
-// category plus that year's mortgage interest, scaled by the rented
-// share — plus any manual T776 lines, with a Sum row equal to the
-// year record's Deductible expenses. One page per year with derived
-// items, defaulting to the latest; no pager for a single year.
+// per-pay tax benefit table, styled like the Property costs panel:
+// a year select in the panel header, a bold year heading, the
+// costs-table with a shaded tfoot Sum row): the property-derived
+// costs — each category plus that year's mortgage interest, scaled
+// by the rented share — plus any manual T776 lines, with a Sum row
+// equal to the year record's Deductible expenses. One page per year
+// with derived items, defaulting to the latest; no select for a
+// single year. Each row shows the Total (the item's amount for the
+// rented period), the Tenant % (the rental portion), and the
+// Deductible = Total x portion; rows the portion does not scale
+// show '—' for the %.
 let earnRentalExpenseYearSel = null;
 function earnRentalExpenseTableHtml(r) {
   const years = [...(r.years || [])]
@@ -9893,14 +9900,15 @@ function earnRentalExpenseTableHtml(r) {
   const latest = years[years.length - 1].tax_year;
   const year = years.some((y) => y.tax_year === earnRentalExpenseYearSel) ? earnRentalExpenseYearSel : latest;
   const y = years.find((v) => v.tax_year === year);
-  const pager = years.length > 1
-    ? `<div id="earnRentalExpensePager">${years.map((v) => `<button class="small${v.tax_year === year ? ' active' : ''}" data-earn-exp-year="${v.tax_year}" onclick="earnRentalExpenseYear(${v.tax_year})">${v.tax_year}</button>`).join('')}</div>`
+  const sel = years.length > 1
+    ? `<div class="spacer"></div><select id="earnRentalExpenseYearSel" aria-label="Year" onchange="earnRentalExpenseYear(Number(this.value))">${years.map((v) => `<option value="${v.tax_year}"${v.tax_year === year ? ' selected' : ''}>${v.tax_year}</option>`).join('')}</select>`
     : '';
-  const rows = y.calc.expenseTable.rows.map((row) => `<tr><td>${esc(row.label)}</td><td>${money2(row.deductible)}</td></tr>`).join('');
-  return `<div class="panel"><div class="section-head"><h3>Deductible expenses</h3></div>${pager}<table id="earnRentalExpenseTable"><thead><tr><th>Item</th><th>Amount</th></tr></thead><tbody>
+  const rows = y.calc.expenseTable.rows.map((row) => `<tr><td>${esc(row.label)}</td><td class="num">${money2(row.total)}</td><td class="num">${row.pct == null ? '—' : `${row.pct}%`}</td><td class="num">${money2(row.deductible)}</td></tr>`).join('');
+  return `<div class="panel"><div class="section-head"><h3>Deductible expenses</h3>${sel}</div>
+    <div class="cost-year-head"><span>${year}</span></div>
+    <table class="costs-table" id="earnRentalExpenseTable"><thead><tr><th>Item</th><th class="num">Total</th><th class="num">Tenant %</th><th class="num">Deductible</th></tr></thead><tbody>
         ${rows}
-        <tr><td>Sum</td><td>${money2(y.calc.expenseTable.sum)}</td></tr>
-      </tbody></table></div>`;
+      </tbody><tfoot><tr class="cost-year-total"><td>Sum</td><td class="num">${money2(y.calc.expenseTable.totalSum)}</td><td class="num"></td><td class="num">${money2(y.calc.expenseTable.sum)}</td></tr></tfoot></table></div>`;
 }
 window.earnRentalExpenseYear = (year) => {
   earnRentalExpenseYearSel = Number(year);

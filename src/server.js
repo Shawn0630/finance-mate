@@ -3393,6 +3393,20 @@ const earnJobRow = (row) => {
     taxBenefit,
   };
 };
+// The owner share is derived on read, never entered: 100% / (number
+// of owners of the linked property) — two owners is 50/50. A
+// standalone rental, or a linked property with no owners listed, is
+// a single owner (100%). The stored ownership_pct column is dormant:
+// it is never read on the read path and never written; it is kept
+// only so old rows keep their history. Changing a property's owner
+// list flows through on the next read.
+const derivedOwnershipPct = (rental) => {
+  if (!rental || rental.property_id == null) return 100;
+  const prop = db.prepare('SELECT owners FROM properties WHERE id = ?').get(rental.property_id);
+  const owners = prop ? parseOwners(prop.owners) : [];
+  if (!owners.length) return 100;
+  return Math.round((100 / owners.length) * 100) / 100;
+};
 // Property-derived deductible inputs for a rental: the linked
 // property's costs by year (annual totals by category, monthly
 // entries averaged x 12) plus that year's mortgage interest from the
@@ -3457,6 +3471,10 @@ const earnRentalRow = (row) => {
     was_principal_residence: row.was_principal_residence === 1,
     structural_change: row.structural_change === 1,
   };
+  // The stored ownership_pct is dormant — the read path always
+  // carries the derived share, so every surface (list card, detail
+  // header, Owned card, year Owner share) shows the same figure.
+  rental.ownership_pct = derivedOwnershipPct(rental);
   const entries = db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(row.id);
   rental.entries = entries;
   rental.nextRentDue = nextRentPayment(entries, vancouverToday());
@@ -3770,10 +3788,10 @@ app.post('/api/earnings/rentals', requireApiAuth, (req, res) => {
   }, () => {
     const ts = nowIso();
     const info = db.prepare(
-      `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level, ownership_pct,
+      `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level,
        rental_portion_pct, is_principal_residence, was_principal_residence, structural_change, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct, v.rental_portion_pct,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.rental_portion_pct,
       v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, ts, ts);
     return { value: earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(info.lastInsertRowid)), entityId: info.lastInsertRowid };
   });
@@ -3793,9 +3811,9 @@ app.put('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
   }, () => {
     db.prepare(
       `UPDATE earn_rentals SET property_id = ?, label = ?, address = ?, rental_type = ?, services_level = ?,
-       ownership_pct = ?, rental_portion_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
+       rental_portion_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
        updated_at = ? WHERE id = ?`).run(
-      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.ownership_pct, v.rental_portion_pct,
+      v.property_id, v.label, v.address, v.rental_type, v.services_level, v.rental_portion_pct,
       v.is_principal_residence ? 1 : 0, v.was_principal_residence ? 1 : 0, v.structural_change ? 1 : 0, nowIso(), id);
     return { value: earnRentalRow(db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(id)), entityId: id };
   });
@@ -5707,7 +5725,7 @@ async function planAiSnapshotForProject() {
     accounts: db.prepare('SELECT * FROM invest_accounts ORDER BY id').all(),
     holdings: db.prepare('SELECT * FROM invest_holdings ORDER BY id').all(),
     jobs: db.prepare('SELECT * FROM earn_jobs ORDER BY id').all(),
-    rentals: db.prepare('SELECT * FROM earn_rentals ORDER BY id').all(),
+    rentals: db.prepare('SELECT * FROM earn_rentals ORDER BY id').all().map(earnRentalRow),
     prime: curPrime ? curPrime.rate : null,
     primeHistory: getPrimeHistory(),
   });
