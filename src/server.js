@@ -3341,10 +3341,23 @@ const earnJobRow = (row) => {
         frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
         calc, plans, today, job: { ...row, bonus_total: bonusTotal }, payroll: earnRegion().payroll,
       }) : null;
+      // Per-pay table: the current tax year's paydays with a saving,
+      // from the same per-payday values the monthly series is built
+      // from. The total is the by-year figure for that year (the rows
+      // sum to it exactly); no current-year rows → no table.
+      const paysYear = Number(today.slice(0, 4));
+      const paysRows = series && series.taxBenefitPays
+        ? series.taxBenefitPays.filter((p) => Number(p.date.slice(0, 4)) === paysYear) : [];
+      const paysByYear = series ? (series.taxBenefitByYear || []).find((y) => y.year === paysYear) : null;
       taxBenefit = {
         perPeriod: Math.round((benefitAnnual / periods) * 100) / 100,
         annual: benefitAnnual,
         byYear: series ? (series.taxBenefitByYear || []) : [],
+        pays: paysRows.length ? {
+          year: paysYear,
+          rows: paysRows,
+          total: paysByYear ? paysByYear.annual : Math.round(paysRows.reduce((a, r) => a + r.benefit, 0) * 100) / 100,
+        } : null,
       };
     }
   }

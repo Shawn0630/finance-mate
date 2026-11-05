@@ -132,10 +132,75 @@ export async function run(H, S) {
     tbJul >= 0 && tbAug >= 0 && tbBen.slice(0, tbJul).every((v) => v === 0)
       && tbBen[tbJul] === 124.12 && tbBen[tbAug] === 186.18 && tbByYearOk,
     JSON.stringify({ months: tbMonths, taxBenefit: tbBen, byYear: tbRead?.taxBenefit?.byYear }));
+  // Per-pay table: the current tax year's paydays with a saving, from
+  // the same per-payday values as the monthly series. Expected grid:
+  // biweekly anchored on the job start (2026-01-05), paydays on or
+  // after the plan start (2026-07-06) through the end of the current
+  // Vancouver month; each row is the per-payday saving (Jul 124.12
+  // over 2 paydays = 62.06); the rows sum to the total, and the total
+  // is the by-year figure for the year.
+  const tbPays = tbRead.taxBenefit.pays;
+  const tbToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const tbYear = Number(tbToday.slice(0, 4));
+  const tbMonthEnd = new Date(Date.UTC(tbYear, Number(tbToday.slice(5, 7)), 0)).toISOString().slice(0, 10);
+  const tbExpectedDates = [];
+  for (let d = new Date(Date.UTC(2026, 0, 5)); d.toISOString().slice(0, 10) <= tbMonthEnd; d = new Date(d.getTime() + 14 * 86400000)) {
+    const iso = d.toISOString().slice(0, 10);
+    if (iso >= '2026-07-06') tbExpectedDates.push(iso);
+  }
+  const tbByYearNow = (tbRead.taxBenefit.byYear || []).find((y) => y.year === tbYear);
+  const tbPaysOk = tbPays && tbPays.year === tbYear
+    && JSON.stringify(tbPays.rows.map((r) => r.date)) === JSON.stringify(tbExpectedDates)
+    && tbPays.rows.every((r) => r.benefit === 62.06)
+    && Math.abs(tbPays.rows.reduce((a, r) => a + r.benefit, 0) - tbPays.total) < 0.001
+    && tbByYearNow && tbPays.total === tbByYearNow.annual;
+  H.check('tax benefit: per-pay table lists each current-year payday with its saving and sums to the by-year figure',
+    tbPaysOk, JSON.stringify({ pays: tbPays, byYear: tbRead?.taxBenefit?.byYear, expectedDates: tbExpectedDates }));
   // No-plan job: no benefit at all.
   r = await H.req('POST', '/api/earnings/jobs', { employer: 'TaxBenefit Solo', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026 });
   const tbSolo = r.data.id;
   H.check('tax benefit: no-plan job carries no benefit', r.status === 201 && r.data.taxBenefit === null, JSON.stringify(r.data.taxBenefit));
+  // Take-home back-solve prices the DISPLAYED cash (cashNet minus the
+  // per-period benefit): feeding a job's displayed per-period cash as
+  // the take-home target must solve back to the job's own gross, and
+  // the re-read displayed cash must equal the target to the cent.
+  // The target is rounded to cents first — it is the displayed
+  // figure, which the user reads as a 2-decimal string and re-types
+  // (the raw cashNet − benefit subtraction can sit 1 ulp below the
+  // cent double, which no gross could ever match).
+  const rtCash = Math.round((tbRead.calc.perPeriod.cashNet - tbRead.taxBenefit.perPeriod) * 100) / 100;
+  r = await H.req('PUT', `/api/earnings/jobs/${tbJob}`, { employer: 'TaxBenefit Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: rtCash, pay_value_basis: 'takehome' });
+  H.check('take-home solve: PUT with the displayed cash as target succeeds', r.status === 200, JSON.stringify({ status: r.status, data: r.data }));
+  r = await H.req('GET', '/api/earnings');
+  const rtJob = (r.data.jobs || []).find((j) => j.id === tbJob);
+  H.check('take-home solve: displayed cash round-trips to the job gross with an RRSP plan',
+    rtJob && rtJob.calc.perPeriod.gross === 3000
+      && Math.abs((rtJob.calc.perPeriod.cashNet - rtJob.taxBenefit.perPeriod) - rtCash) < 0.001,
+    JSON.stringify({ gross: rtJob?.calc?.perPeriod?.gross, cashNet: rtJob?.calc?.perPeriod?.cashNet, benefit: rtJob?.taxBenefit?.perPeriod, target: rtCash }));
+  // No-plan job (benefit 0): the same round-trip through the PUT path,
+  // with dates so the take-home toggle applies. The gross is asserted
+  // within one cent, not exactly: the solver returns the SMALLEST
+  // gross whose computed net equals the target, and the per-period net
+  // is flat over a 1-cent gross step here (2477.82 at both 2999.99 and
+  // 3000) — the displayed cash is what must match exactly, and it does.
+  // This is the pre-existing minimal-gross contract, untouched by the
+  // benefit change (no-plan netAt is byte-identical to before). The
+  // comparison is in integer cents: |2999.99 − 3000| computes as
+  // 0.010000000000218279 in floating point, above a 0.01 tolerance.
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'TakeHome Solo', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: 3000 });
+  const rtSolo = r.data.id;
+  H.check('take-home solve: no-plan job created', r.status === 201 && rtSolo > 0, JSON.stringify(r.data));
+  r = await H.req('GET', '/api/earnings');
+  const rtSoloRead = (r.data.jobs || []).find((j) => j.id === rtSolo);
+  const rtSoloCash = rtSoloRead ? Math.round(rtSoloRead.calc.perPeriod.cashNet * 100) / 100 : null;
+  r = await H.req('PUT', `/api/earnings/jobs/${rtSolo}`, { employer: 'TakeHome Solo', province: 'BC', frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: rtSoloCash, pay_value_basis: 'takehome' });
+  H.check('take-home solve: no-plan PUT with the displayed cash as target succeeds', r.status === 200, JSON.stringify({ status: r.status, data: r.data }));
+  r = await H.req('GET', '/api/earnings');
+  const rtSoloAfter = (r.data.jobs || []).find((j) => j.id === rtSolo);
+  H.check('take-home solve: no-plan job round-trips the displayed cash to its gross',
+    rtSoloAfter && Math.abs(Math.round(rtSoloAfter.calc.perPeriod.gross * 100) - 300000) <= 1 && rtSoloAfter.taxBenefit === null
+      && Math.abs(rtSoloAfter.calc.perPeriod.cashNet - rtSoloCash) < 0.001,
+    JSON.stringify({ gross: rtSoloAfter?.calc?.perPeriod?.gross, cashNet: rtSoloAfter?.calc?.perPeriod?.cashNet, target: rtSoloCash }));
 
   // ---- Earnings: browser pass over the new section ----
   if (!H.puppeteer || !H.chromeAvailable) {
@@ -1286,25 +1351,78 @@ export async function run(H, S) {
         const cards = [...document.querySelectorAll('#earnJobDetail .summary-card')];
         const annual = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Annual net'));
         const next = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Next net pay date'));
+        const paysRows = [...document.querySelectorAll('#earnJobTaxBenefitPaysTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
         return {
           panelText: panel ? panel.textContent : null,
-          annualMarker: annual ? (annual.querySelector('.n')?.textContent || '') : null,
-          nextMarker: next ? (next.querySelector('.n')?.textContent || '') : null,
+          paysRows,
+          annualMain: annual ? (annual.querySelector('.v')?.textContent || '') : null,
+          annualSub: annual ? (annual.querySelector('.n')?.textContent || '') : null,
+          nextSub: next ? (next.querySelector('.n')?.textContent || '') : null,
+          hasInclMarker: document.querySelector('#earnJobDetail') ? document.querySelector('#earnJobDetail').textContent.includes('incl. tax benefit') : null,
         };
       });
+      const tbMoney = (t) => Number(String(t || '').replace(/[^0-9.]/g, ''));
+      // Cash take-home: the old combined figure minus the benefit
+      // (cash + benefit = the figure the old display showed).
+      const tbCashAnnual = tbRead.calc.cashNetAnnual - tbRead.taxBenefit.annual;
+      const tbCashPeriod = tbRead.calc.perPeriod.cashNet - tbRead.taxBenefit.perPeriod;
       H.check('tax benefit: job detail shows the Tax benefit section with per-period + annual figures and the by-year table',
         tbView.panelText && tbView.panelText.includes('Tax benefit') && tbView.panelText.includes('62.05')
           && tbView.panelText.includes('1,613.41') && tbView.panelText.includes('2026'), JSON.stringify(tbView));
-      H.check('tax benefit: take-home figures are marked as including the tax benefit',
-        tbView.annualMarker === 'incl. tax benefit' && tbView.nextMarker && tbView.nextMarker.includes('incl. tax benefit'), JSON.stringify(tbView));
+      H.check('tax benefit: take-home cards show cash with the benefit on its own sub-line, no incl-benefit marker',
+        Math.abs(tbMoney(tbView.annualMain) - tbCashAnnual) < 0.01
+          && tbView.annualSub && tbView.annualSub.includes('+ $1,613.41 tax benefit')
+          && tbView.nextSub && Math.abs(tbMoney(tbView.nextSub.split('+')[0]) - tbCashPeriod) < 0.01
+          && tbView.nextSub.includes('+ $62.05 tax benefit')
+          && tbView.hasInclMarker === false, JSON.stringify({ ...tbView, tbCashAnnual, tbCashPeriod }));
+      const tbMon = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const tbDateLabel = (iso) => { const [y, m, d] = iso.split('-').map(Number); return `${tbMon[m - 1]} ${d}, ${y}`; };
+      H.check('tax benefit: per-pay table lists the API paydays and totals to the by-year figure',
+        tbView.paysRows.length === tbRead.taxBenefit.pays.rows.length + 1
+          && tbView.paysRows.slice(0, -1).every((row, i) => row[0] === tbDateLabel(tbRead.taxBenefit.pays.rows[i].date)
+            && Math.abs(tbMoney(row[1]) - tbRead.taxBenefit.pays.rows[i].benefit) < 0.01)
+          && tbView.paysRows[tbView.paysRows.length - 1][0].includes(`Total (${tbRead.taxBenefit.pays.year})`)
+          && Math.abs(tbMoney(tbView.paysRows[tbView.paysRows.length - 1][1]) - tbRead.taxBenefit.pays.total) < 0.01,
+        JSON.stringify({ paysRows: tbView.paysRows, pays: tbRead.taxBenefit.pays }));
+      // List card: the same cash + benefit treatment as the detail page.
+      await page.goto('http://ff.local/#earnings/salary', { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const tbCard = await page.evaluate((id) => {
+        const card = document.querySelector(`.earn-job-card[data-job-id="${id}"]`);
+        if (!card) return null;
+        const cards = [...card.querySelectorAll('.summary-card')];
+        const annual = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Annual net'));
+        const period = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Net per pay period'));
+        const next = card.querySelector('.earn-next-pay');
+        return {
+          annualMain: annual ? (annual.querySelector('.v')?.textContent || '') : null,
+          annualSub: annual ? (annual.querySelector('.n')?.textContent || '') : null,
+          periodMain: period ? (period.querySelector('.v')?.textContent || '') : null,
+          periodSub: period ? (period.querySelector('.n')?.textContent || '') : null,
+          nextLine: next ? next.textContent : null,
+          text: card.textContent,
+        };
+      }, tbJob);
+      H.check('tax benefit: job list card shows cash take-home with the benefit sub-line',
+        tbCard && Math.abs(tbMoney(tbCard.annualMain) - tbCashAnnual) < 0.01
+          && tbCard.annualSub && tbCard.annualSub.includes('+ $1,613.41 tax benefit')
+          && Math.abs(tbMoney(tbCard.periodMain) - tbCashPeriod) < 0.01
+          && tbCard.periodSub && tbCard.periodSub.includes('+ $62.05 tax benefit')
+          && tbCard.nextLine && tbCard.nextLine.includes('Take-home') && Math.abs(tbMoney(tbCard.nextLine.split('Take-home')[1].split('+')[0]) - tbCashPeriod) < 0.01
+          && tbCard.nextLine.includes('+ $62.05 tax benefit')
+          && !tbCard.text.includes('incl. tax benefit'), JSON.stringify(tbCard));
       await page.goto(`http://ff.local/#earnings/job/${tbSolo}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitE(800);
-      const tbSoloView = await page.evaluate(() => ({
-        panel: !!document.querySelector('#earnJobTaxBenefitPanel'),
-        marker: document.querySelector('#earnJobDetail') ? document.querySelector('#earnJobDetail').textContent.includes('incl. tax benefit') : null,
-      }));
-      H.check('tax benefit: no-plan job shows no Tax benefit section and no marker',
-        tbSoloView.panel === false && tbSoloView.marker === false, JSON.stringify(tbSoloView));
+      const tbSoloView = await page.evaluate(() => {
+        const el = document.querySelector('#earnJobDetail');
+        return {
+          panel: !!document.querySelector('#earnJobTaxBenefitPanel'),
+          paysTable: !!document.querySelector('#earnJobTaxBenefitPaysTable'),
+          anyBenefitText: el ? el.textContent.includes('tax benefit') : null,
+        };
+      });
+      H.check('tax benefit: no-plan job shows no Tax benefit section, no per-pay table and no benefit sub-line',
+        tbSoloView.panel === false && tbSoloView.paysTable === false && tbSoloView.anyBenefitText === false, JSON.stringify(tbSoloView));
       // Cleanup: remove the tax-benefit fixture (plan first — a job
       // with linked plans cannot be deleted).
       r = await H.req('DELETE', `/api/investments/plans/${tbPlan}`);
@@ -1313,6 +1431,8 @@ export async function run(H, S) {
       H.check('tax benefit cleanup: job deleted', r.status === 200, JSON.stringify(r.data));
       r = await H.req('DELETE', `/api/earnings/jobs/${tbSolo}`);
       H.check('tax benefit cleanup: solo job deleted', r.status === 200, JSON.stringify(r.data));
+      r = await H.req('DELETE', `/api/earnings/jobs/${rtSolo}`);
+      H.check('take-home solve cleanup: no-plan round-trip job deleted', r.status === 200, JSON.stringify(r.data));
       r = await H.req('DELETE', `/api/investments/accounts/${tbAcct}`);
       H.check('tax benefit cleanup: RRSP account deleted', r.status === 200, JSON.stringify(r.data));
       // Cleanup: remove the fixture rentals so later checks see the

@@ -484,6 +484,32 @@ const solveTakeHome = (targetNet, over = {}) => solveGrossForTakeHome({
   changes: [], bonuses: [], payroll, td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false,
   ...over,
 });
+// Displayed take-home at a gross: cashNet minus the per-period tax
+// benefit, computed exactly as earnJobRow computes it (annual-first:
+// tax with no deduction minus tax with it, annual ÷ 26, rounded).
+// With no deduction this is exactly cashNet.
+const displayedCashAt = (gross, rrspDeduction = 0, over = {}) => {
+  const { frequency = 'biweekly', province = 'BC', startDate = '2026-01-05', recentDate = '2026-10-23',
+    changes = [], bonuses = [], cppExempt = false, eiExempt = false,
+    td1Federal = null, td1Provincial = null } = over;
+  const ytd = deriveJobYtd({
+    frequency, startDate, recentDate, changes, recentValue: gross, payroll, cppExempt, eiExempt,
+  });
+  const args = {
+    frequency, gross_amount: gross, gross_basis: 'period', province,
+    bonus_total: bonuses.reduce((a, b) => a + b.amount, 0),
+    ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
+    td1_federal: td1Federal, td1_provincial: td1Provincial, cpp_exempt: cppExempt, ei_exempt: eiExempt,
+  };
+  const calc = calcSalary({ ...args, rrspDeduction }, payroll);
+  let benefit = 0;
+  if (rrspDeduction > 0) {
+    const calc0 = calcSalary({ ...args, rrspDeduction: 0 }, payroll);
+    const annual = c2(calc0.totalTax - calc.totalTax);
+    if (annual > 0) benefit = c2(annual / 26);
+  }
+  return c2(calc.perPeriod.cashNet - benefit);
+};
 
 test('take-home: BC biweekly $3,000 gross round-trips exactly, and the solve is minimal', () => {
   const target = takeHomeNetAt(3000);
@@ -694,25 +720,17 @@ test('salary: zero RRSP deduction is identical to no deduction, and the deductio
   assert.equal(floored.ei, a.ei);
 });
 
-test('salary: take-home solve with a pre-tax deduction reproduces the CASH target net under the pre-tax calc', () => {
-  const target = 2141.17; // economic net 2361.22 minus the own 220.05 deduction: the displayed take-home is cash
-  const solved = solveGrossForTakeHome({
-    targetNet: target, frequency: 'biweekly', province: 'BC',
-    startDate: '2026-01-05', recentDate: '2026-10-23', changes: [], bonuses: [], payroll,
-    td1Federal: null, td1Provincial: null, cppExempt: false, eiExempt: false, rrspDeduction: 220.05,
-  });
+test('salary: take-home solve with a pre-tax deduction round-trips the DISPLAYED cash (cashNet minus per-period benefit)', () => {
+  // The displayed figure at 3000/period (derived YTD): cashNet
+  // 2311.71 minus the 62.05 per-period benefit — NOT the 2311.71
+  // cashNet the old solver priced.
+  const target = displayedCashAt(3000, 220.05);
+  assert.equal(target, 2249.66);
+  const solved = solveTakeHome(target, { rrspDeduction: 220.05 });
   assert.ok(!solved.error, JSON.stringify(solved));
-  // The solve prices the net with the job's YTD offsets (start +
-  // recent dates), so the verification must derive the same YTD —
-  // ytd 0 would price a different, lower net.
-  const ytd = deriveJobYtd({
-    frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
-    changes: [], recentValue: solved.gross, payroll, cppExempt: false, eiExempt: false,
-  });
-  assert.equal(calcSalary(pretaxJob({
-    gross_amount: solved.gross, ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
-    rrspDeduction: 220.05,
-  }), payroll).perPeriod.cashNet, target);
+  assert.equal(solved.gross, 3000);
+  assert.equal(displayedCashAt(solved.gross, 220.05), target);
+  assert.ok(displayedCashAt(2999.99, 220.05) < target, 'one cent less gross must display below the target');
 });
 
 test('monthly chart: pre-tax RRSP leaves pre-plan months at full-gross tax, cuts post-plan months', () => {
@@ -802,6 +820,12 @@ test('monthly chart: taxBenefit per month is the tax saved by that month’s ded
     assert.equal(s.taxBenefit[i], c2(nIn(s.months[i]) * perPayday), `${s.months[i]} benefit must be paydays × per-period tax saved`);
   }
   assert.deepEqual(s.taxBenefitByYear, [{ year: 2026, annual: c2(s.taxBenefit.reduce((a, b) => a + b, 0)) }]);
+  // Per-pay table: one row per payday with a saving (9 paydays from
+  // the plan start through October), each the per-payday saving;
+  // the rows sum to the year's figure exactly.
+  assert.deepEqual(s.taxBenefitPays.map((p) => p.date), ['2026-07-06', '2026-07-20', '2026-08-03', '2026-08-17', '2026-08-31', '2026-09-14', '2026-09-28', '2026-10-12', '2026-10-26']);
+  assert.ok(s.taxBenefitPays.every((p) => p.benefit === perPayday));
+  assert.equal(c2(s.taxBenefitPays.reduce((a, p) => a + p.benefit, 0)), s.taxBenefitByYear[0].annual);
   // No plans → no benefit anywhere, no yearly rows.
   const none = jobMonthlySeries({
     frequency: 'biweekly', startDate: '2026-01-05', recentDate: '2026-10-23',
@@ -809,10 +833,12 @@ test('monthly chart: taxBenefit per month is the tax saved by that month’s ded
   });
   assert.ok(none.taxBenefit.every((v) => v === 0));
   assert.deepEqual(none.taxBenefitByYear, []);
+  assert.deepEqual(none.taxBenefitPays, []);
   // Bare calls without job/payroll cannot recompute: benefit is null, never guessed.
   const legacy = jobMonthlySeries(monthlyBase);
   assert.equal(legacy.taxBenefit, null);
   assert.equal(legacy.taxBenefitByYear, null);
+  assert.equal(legacy.taxBenefitPays, null);
 });
 
 test('monthly chart: monthly plan paints no RRSP and no tax cut before its start month', () => {

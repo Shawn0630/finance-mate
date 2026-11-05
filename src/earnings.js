@@ -353,19 +353,35 @@ export function solveGrossForTakeHome({ targetNet, frequency, province, startDat
   if (!Number.isFinite(target) || target < 0) return { error: 'take-home pay must be a number ≥ 0.' };
   if (!PAY_FREQUENCIES[frequency] || !payroll) return { error: 'take-home pay needs a valid pay frequency.' };
   const bonusTotal = (bonuses || []).reduce((a, b) => a + (Number(b.amount) || 0), 0);
-  // The solve prices the DISPLAYED net definition: cash take-home
-  // (economic net minus the own RRSP deduction), so entering a
-  // paystub figure round-trips to the gross that displays it.
+  // The solve prices the DISPLAYED net definition: the paycheque
+  // cash (economic net minus the own RRSP deduction, minus the
+  // per-period tax benefit that deduction saves — the benefit is
+  // realized at the T1, so it is not on the paycheque). Entering a
+  // displayed figure round-trips to the gross that displays it.
   const netAt = (gross) => {
     const ytd = deriveJobYtd({
       frequency, startDate, recentDate, changes, recentValue: gross, payroll, cppExempt, eiExempt,
     });
-    return calcSalary({
+    const calcArgs = {
       frequency, gross_amount: gross, gross_basis: 'period', province, bonus_total: bonusTotal,
       ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
       td1_federal: td1Federal ?? null, td1_provincial: td1Provincial ?? null,
-      cpp_exempt: !!cppExempt, ei_exempt: !!eiExempt, rrspDeduction: rrspDeduction || 0,
-    }, payroll).perPeriod.cashNet;
+      cpp_exempt: !!cppExempt, ei_exempt: !!eiExempt,
+    };
+    const calc = calcSalary({ ...calcArgs, rrspDeduction: rrspDeduction || 0 }, payroll);
+    // The benefit is computed exactly as the display computes it
+    // (earnJobRow): annual-first — total tax with no deduction minus
+    // total tax with it, rounded to cents; per-period is the annual
+    // figure over the pay frequency, rounded. No deduction, or a
+    // deduction that saves no tax, means no benefit and this is
+    // exactly cashNet, so no-plan jobs are unchanged.
+    let benefitPerPeriod = 0;
+    if ((rrspDeduction || 0) > 0) {
+      const calc0 = calcSalary({ ...calcArgs, rrspDeduction: 0 }, payroll);
+      const benefitAnnual = Math.round((calc0.totalTax - calc.totalTax) * 100) / 100;
+      if (benefitAnnual > 0) benefitPerPeriod = Math.round((benefitAnnual / PAY_FREQUENCIES[frequency].periods) * 100) / 100;
+    }
+    return round2(calc.perPeriod.cashNet - benefitPerPeriod);
   };
   const unreachable = 'no per-period gross produces that take-home pay.';
   if (netAt(0) > target) return { error: unreachable };
@@ -594,13 +610,16 @@ export function calcSalary(job, payroll) {
   const netAnnual = annualGross - cppAnnual - cpp2Annual - eiAnnual - totalTax;
   const div = (n) => round2(n / periods);
   const ppNet = div(netAnnual);
-  // Cash take-home: the displayed net is what actually lands on the
-  // paycheque — the economic net above minus the employee's own
+  // Cash take-home: the economic net above minus the employee's own
   // RRSP payroll deduction for the period. The tax-reduction effect
   // stays inside totalTax (taxable income already excludes the
   // deduction); only the net presentation subtracts the cash out.
-  // With no deduction the cash figure equals the economic figure
-  // exactly, so no-plan jobs are unchanged.
+  // Note the deferred tax benefit is still inside these cashNet
+  // fields (tax is withheld on the full gross, so the benefit only
+  // arrives at the T1) — the take-home display subtracts the
+  // period's benefit to show the paycheque figure. With no
+  // deduction the cash figure equals the economic figure exactly,
+  // so no-plan jobs are unchanged.
   const ded = Math.max(0, Number(job.rrspDeduction) || 0);
   return {
     annualGross: round2(annualGross), perPeriodGross: round2(perPeriodGross),
@@ -741,7 +760,7 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   if (!PAY_FREQUENCIES[frequency] || !normJobDate(startDate) || !normJobDate(recentDate) || !normJobDate(today) || !pp) return null;
   const startYm = startDate.slice(0, 7);
   const endYm = today.slice(0, 7);
-  if (startYm > endYm) return { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [], taxBenefit: [], taxBenefitByYear: [] };
+  if (startYm > endYm) return { months: [], gross: [], tax: [], cppEi: [], rrsp: null, net: [], taxBenefit: [], taxBenefitPays: [], taxBenefitByYear: [] };
   const months = [];
   let y = Number(startYm.slice(0, 4));
   let m = Number(startYm.slice(5, 7));
@@ -790,7 +809,11 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
   // the same engine, payday by payday (calcFor(0) vs the payday's
   // deduction). Null when the series cannot recompute (bare calls
   // without job/payroll keep the legacy stored-calc behavior).
+  // taxBenefitPays lists each payday's own saving: per-period taxes
+  // are already rounded to cents, so a payday's saving is exact to
+  // the cent and a month's rows sum to the monthly value exactly.
   const taxBenefit = canRecompute ? [] : null;
+  const taxBenefitPays = canRecompute ? [] : null;
   for (const ym of months) {
     const yy = Number(ym.slice(0, 4));
     const mm = Number(ym.slice(5, 7));
@@ -805,20 +828,27 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
     if (canRecompute) {
       // Group this month's job paydays by the deduction in force on
       // each payday; CPP/EI never depend on the deduction, so they
-      // come from the zero-deduction calc exactly as stored.
+      // come from the zero-deduction calc exactly as stored. The
+      // month's benefit is the sum of its paydays' rounded savings
+      // (identical to n × zero-tax − summed tax: every per-period
+      // tax is already rounded to cents).
+      const zero = calcFor(0);
       let taxSum = 0;
       let netSum = 0;
+      let benSum = 0;
       for (const d of jobPaydaysInMonth(frequency, yy, mm, startDate, recentDate)) {
         const ded = ownPlans.reduce((s, p) => s + (p.start_date <= d ? Number(p.own_amount) : 0), 0);
         const pc = calcFor(ded);
         taxSum += pc.totalTax;
         netSum += pc.net;
+        const pb = round2(zero.totalTax - pc.totalTax);
+        if (pb !== 0) taxBenefitPays.push({ date: d, benefit: pb });
+        benSum = round2(benSum + pb);
       }
-      const zero = calcFor(0);
       t = round2(taxSum);
       c = round2((zero.cpp + zero.cpp2 + zero.ei) * n);
       nt = round2(netSum) - r;
-      taxBenefit.push(round2(n * zero.totalTax - t));
+      taxBenefit.push(benSum);
     } else {
       t = round2(pp.totalTax * n);
       c = round2((pp.cpp + pp.cpp2 + pp.ei) * n);
@@ -842,7 +872,7 @@ export function jobMonthlySeries({ frequency, startDate, recentDate, calc, plans
     }
     return [...byYear.entries()].sort((a, b) => a[0] - b[0]).map(([year, annual]) => ({ year, annual }));
   })();
-  return { months, gross, tax, cppEi, rrsp, net, taxBenefit, taxBenefitByYear };
+  return { months, gross, tax, cppEi, rrsp, net, taxBenefit, taxBenefitPays, taxBenefitByYear };
 }
 
 // ------------------------------------------------------------ rental --
