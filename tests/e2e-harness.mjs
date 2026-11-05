@@ -280,6 +280,14 @@ const stooqCsvBySymbol = {
     '2026-02-27,209,211,208,210,1000',
     '2026-03-02,219,221,218,220,1000',
   ].join('\n'),
+  // New-symbol sink pin: AMZN has no holding in the fixture, so its
+  // current price comes from the tiers — the stub makes it 266.03.
+  'amzn.us': [
+    'Date,Open,High,Low,Close,Volume',
+    '2026-01-02,197,199,196,198,1000',
+    '2026-01-30,199,201,198,200,1000',
+    '2026-10-30,264,267,263,266.03,1000',
+  ].join('\n'),
 };
 const stooqStub = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');

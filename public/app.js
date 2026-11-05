@@ -11577,7 +11577,7 @@ async function planAiCreateSerializeQueue() {
 function planAiCreateSinkLabel(sink) {
   if (!sink || typeof sink !== 'object') return '';
   if (sink.kind === 'custom') return `Custom — ${sink.name || ''}${sink.expectedReturnPct != null ? ` · ${sink.expectedReturnPct}%/yr` : ''}`;
-  if (sink.kind === 'stock') return `Stock holding ${sink.holdingId ?? ''}${sink.trendPct != null ? ` · ${sink.trendPct}%/yr` : ''}`;
+  if (sink.kind === 'stock') return sink.symbol ? `Stock ${sink.symbol}${sink.trendPct != null ? ` · ${sink.trendPct}%/yr` : ''}` : `Stock holding ${sink.holdingId ?? ''}${sink.trendPct != null ? ` · ${sink.trendPct}%/yr` : ''}`;
   return JSON.stringify(sink);
 }
 function planAiCreateRenderPreview() {
@@ -12697,7 +12697,7 @@ function planScenarioSummaryLine(factors) {
 // One-line sink summary for a strategy card. Investment strategies
 // without a sink get a prompt instead.
 function planSinkLine(sink, isInvestment) {
-  if (sink) return sink.kind === 'custom' ? `Sink: ${sink.name}` : 'Sink: existing stock';
+  if (sink) return sink.kind === 'custom' ? `Sink: ${sink.name}` : `Sink: ${sink.symbol || 'existing stock'}`;
   if (isInvestment) return 'Sink: not picked yet';
   return '';
 }
@@ -14338,20 +14338,34 @@ let planFactorMonthPopWired = false;
 // here always — no Add-factor gate. Saving rebuilds the strategy's ops
 // into sell-pool + buy-sink ops, as before. Sink Delete (clear to a
 // re-pick state) belongs to the strategy-page redesign round.
+// The pick is ONE entry, modelled on the pool funding picker ("+ Add
+// funding"): pick a stock (an existing holding, or a new symbol via
+// autocomplete) or a custom product — WITH its expected return
+// attached as part of the pick. A stock with price history offers
+// trend suggestions that fill the return; a new symbol has no
+// history, so the return is typed inline. Nothing blocks Save with
+// a trend gate anymore: the return is a visible field, and Save
+// only requires it to be filled in.
 function planSinkWire(d) {
   const s = d.strategy;
   const sinkHost = $('#planFactorSink');
   if (!sinkHost || d.project.category !== 'investment') return;
   let holdings = [];
-  let sinkDraft = null;
+  let accounts = [];
+  const poolAccounts = Array.isArray(d.poolAccounts) ? d.poolAccounts : [];
+  let sinkTrend = null;
+  let sinkPrice = null;
   const sink = d.sink || null;
   let tp = {};
   try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
   let sinkEditing = false;
   const render = () => {
-    const defaultKind = tp.sinkKind === 'custom' ? 'custom' : 'stock';
+    const defaultKind = sink && sinkEditing ? (sink.kind === 'custom' ? 'custom' : 'stock') : (tp.sinkKind === 'custom' ? 'custom' : 'stock');
+    const sinkSymbol = sink && sink.kind === 'stock'
+      ? (sink.symbol || (holdings.find((h) => Number(h.id) === Number(sink.holdingId)) || {}).symbol || (holdings.find((h) => Number(h.id) === Number(sink.holdingId)) || {}).label || 'existing stock')
+      : null;
     const curLine = sink
-      ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: existing stock · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
+      ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: ${sinkSymbol} · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
       : 'No sink picked yet — the strategy holds the pool until you pick one.';
     // A picked sink shows as a line with Edit + Delete; Delete clears
     // it back to the pick form below. No sink = the pick form itself.
@@ -14367,39 +14381,178 @@ function planSinkWire(d) {
       });
       return;
     }
+    // The account picker for a new-symbol buy: the pool's accounts
+    // when it spans more than one (default the largest share); all
+    // accounts when the pool holds none; no picker for a
+    // single-account pool — that account is used.
+    const acctOptions = poolAccounts.length === 1 ? null
+      : poolAccounts.length > 1 ? poolAccounts
+      : accounts.map((a) => ({ accountId: a.id, name: a.name, value: null }));
     sinkHost.innerHTML = `<div class="note">${esc(curLine)}</div>
-      <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Existing stock</label>
+      <div class="note">Pick what the pool goes into — a stock or a custom product — and its expected return. Saving rebuilds the strategy's operations into sell-pool + buy-sink operations.</div>
+      <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Stock</label>
       <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
       <div id="planSinkStockBox"${defaultKind === 'custom' ? ' class="hidden"' : ''}>
         <div><label>Stock</label><select id="planSinkHolding"></select></div>
+        <div id="planSinkNewBox" class="hidden">
+          <div><label>Symbol</label><div class="suggest-wrap"><input id="planSinkSymbol" placeholder="Symbol for a new stock" autocomplete="off"><ul class="suggest-list hidden" id="planSinkSymbolSuggest"></ul></div></div>
+          <div id="planSinkPriceNote" class="n hidden"></div>
+          <div id="planSinkAccountBox"${acctOptions ? '' : ' class="hidden"'}><label>Account</label><select id="planSinkAccount">${(acctOptions || []).map((a) => `<option value="${a.accountId}">${esc(a.name)}${a.value != null ? ` · ${money2(a.value)}` : ''}</option>`).join('')}</select></div>
+        </div>
+        <div><label>Expected return (% / year) *</label><input id="planSinkReturn" type="text" inputmode="decimal" data-money></div>
         <div class="toolbar"><button class="small" id="planSinkSuggestBtn">Suggest trend</button></div><div id="planSinkSuggestOut"></div>
       </div>
       <div id="planSinkCustomBox"${defaultKind === 'stock' ? ' class="hidden"' : ''}>
         <div><label>Product name *</label><input id="planSinkName"></div>
-        <div><label>Expected return (% / year) *</label><input id="planSinkReturn" type="text" inputmode="decimal" data-money></div>
+        <div><label>Expected return (% / year) *</label><input id="planSinkCustomReturn" type="text" inputmode="decimal" data-money></div>
       </div>
       <div class="toolbar"><button class="small primary" id="planSinkSaveBtn">Save sink (rebuilds operations)</button></div>
       <div class="msg" id="planSinkMsg"></div>`;
+    sinkHost.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
     const sel = $('#planSinkHolding');
-    if (sel) {
-      sel.innerHTML = holdings.map((h) => `<option value="${h.id}">${esc(h.accountName)} · ${esc(h.symbol || h.label)}</option>`).join('');
-      if (tp.sink && tp.sink.holdingId && [...sel.options].some((o) => Number(o.value) === Number(tp.sink.holdingId))) sel.value = String(tp.sink.holdingId);
-      else if (sink && sink.kind === 'stock' && [...sel.options].some((o) => Number(o.value) === Number(sink.holdingId))) sel.value = String(sink.holdingId);
-      $('#planSinkSuggestBtn').addEventListener('click', async () => {
-        const out = $('#planSinkSuggestOut');
-        try {
-          const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
-          if (!r.suggestions.length) { out.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available — pick a custom product instead.')}</div>`; return; }
-          out.innerHTML = r.suggestions.map((x) => `
-            <button class="small" data-plan-sink-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-sink-basis="${esc(x.basis)}" data-plan-sink-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
-            + `<div class="note">Past returns do not predict future returns.</div>`;
-          out.querySelectorAll('[data-plan-sink-suggest]').forEach((b) => b.addEventListener('click', () => {
-            sinkDraft = { kind: 'stock', holdingId: Number(sel.value), trendPct: Number(b.dataset.planSinkSuggest), basis: b.dataset.planSinkBasis || null, window: b.dataset.planSinkWindow || null };
-            out.innerHTML = `<div class="note">Picked: trend ${sinkDraft.trendPct}%/yr (${esc(sinkDraft.basis || '')}${sinkDraft.window ? ` · ${sinkDraft.window}` : ''})</div>`;
-          }));
-        } catch (err) { out.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+    const retEl = $('#planSinkReturn');
+    const newBox = $('#planSinkNewBox');
+    const symInput = $('#planSinkSymbol');
+    const symList = $('#planSinkSymbolSuggest');
+    const priceNote = $('#planSinkPriceNote');
+    const acctBox = $('#planSinkAccountBox');
+    const suggestBtn = $('#planSinkSuggestBtn');
+    const suggestOut = $('#planSinkSuggestOut');
+    // The stock select groups holdings by account, pool-picker style,
+    // with a "New stock…" entry for a symbol the user does not hold.
+    const grouped = accounts.map((a) => ({ name: a.name, holdings: holdings.filter((h) => Number(h.accountId) === Number(a.id)) }));
+    sel.innerHTML = grouped.filter((g) => g.holdings.length).map((g) =>
+      `<optgroup label="${esc(g.name)}">${g.holdings.map((h) => `<option value="${h.id}">${esc(h.symbol || h.label)} · ${money2(h.value || 0)}</option>`).join('')}</optgroup>`).join('')
+      + '<option value="new">New stock…</option>';
+    // The return is a visible field, not a hidden draft: picking a
+    // trend fills it, typing edits it. Changing the stock clears it
+    // (a trend belongs to one holding) so a stale pick never rides
+    // along to a different stock.
+    const clearReturn = () => { sinkTrend = null; retEl.value = ''; suggestOut.innerHTML = ''; };
+    const showPick = (isNew) => {
+      newBox.classList.toggle('hidden', !isNew);
+      suggestBtn.classList.toggle('hidden', isNew);
+      if (!isNew) { priceNote.classList.add('hidden'); sinkPrice = null; }
+    };
+    let priceSeq = 0;
+    const fillSinkPrice = async (symbol) => {
+      const my = ++priceSeq;
+      try {
+        const data = await api('/api/invest/price?symbol=' + encodeURIComponent(symbol));
+        if (my !== priceSeq) return;
+        if (data && data.price != null) {
+          sinkPrice = { price: data.price, date: data.date || null, source: data.source || null };
+          priceNote.textContent = `Current price ${money2(data.price)}${data.date ? ` · ${data.date}` : ''}${data.source ? ` · ${data.source}` : ''}`;
+          priceNote.className = 'n';
+          priceNote.classList.remove('hidden');
+        } else {
+          sinkPrice = null;
+          priceNote.textContent = `No price data for ${symbol} — saving this sink will fail.`;
+          priceNote.className = 'msg err';
+          priceNote.classList.remove('hidden');
+        }
+      } catch { /* best-effort: the save re-fetches and reports */ }
+    };
+    sel.addEventListener('change', () => {
+      showPick(sel.value === 'new');
+      clearReturn();
+      if (sel.value === 'new') symInput.focus();
+    });
+    // Symbol autocomplete for a new stock: the buy form's pattern
+    // (holdings by ticker/name, then /api/invest/search, then the
+    // typed ticker itself). A suggestion that IS a holding switches
+    // the select to that holding; anything else stays a new symbol
+    // and its current price fills the note below it.
+    const acctName = (id) => (accounts.find((a) => a.id === id) || {}).name || '';
+    let symItems = [];
+    let symActive = -1;
+    let symTimer = null;
+    let symSeq = 0;
+    let lastPriced = '';
+    const symClose = () => { symList.classList.add('hidden'); symList.innerHTML = ''; symItems = []; symActive = -1; };
+    const symPick = (i) => {
+      const c = symItems[i];
+      if (!c) return;
+      symClose();
+      if (c.holdingId) {
+        sel.value = String(c.holdingId);
+        showPick(false);
+        clearReturn();
+      } else {
+        symInput.value = c.symbol;
+        symInput.focus();
+        lastPriced = '';
+        fillSinkPrice(c.symbol);
+      }
+    };
+    const symRender = () => {
+      if (!symItems.length) { symClose(); return; }
+      symList.innerHTML = '';
+      symItems.forEach((c, i) => {
+        const li = document.createElement('li');
+        const sym = document.createElement('span');
+        sym.className = 'sg-sym';
+        sym.textContent = c.symbol;
+        li.appendChild(sym);
+        if (c.label) li.appendChild(document.createTextNode(' ' + c.label));
+        const meta = [c.exchange, c.currency, c.account].filter(Boolean).join(' · ');
+        if (meta) { const m = document.createElement('span'); m.className = 'sg-meta'; m.textContent = meta; li.appendChild(m); }
+        if (i === symActive) li.classList.add('active');
+        li.addEventListener('mousedown', (e) => { e.preventDefault(); symPick(i); });
+        symList.appendChild(li);
       });
-    }
+      symList.classList.remove('hidden');
+    };
+    symInput.addEventListener('input', () => {
+      clearTimeout(symTimer);
+      const q = symInput.value.trim();
+      if (q.length < 2) { symClose(); return; }
+      symTimer = setTimeout(async () => {
+        const my = ++symSeq;
+        const needle = q.toLowerCase();
+        const held = holdings.filter((h) => (h.symbol || '').toLowerCase().includes(needle) || (h.label || '').toLowerCase().includes(needle))
+          .map((h) => ({ symbol: (h.symbol || '').toUpperCase(), label: h.label || '', account: acctName(h.accountId), holdingId: h.id }));
+        let remote = [];
+        try { const data = await api('/api/invest/search?q=' + encodeURIComponent(q)); remote = data.results || []; } catch { remote = []; }
+        if (my !== symSeq) return;
+        const seen = new Set(held.map((h) => h.symbol));
+        const merged = held.slice();
+        for (const r of remote) {
+          if (!r.symbol || seen.has(r.symbol)) continue;
+          seen.add(r.symbol);
+          merged.push({ symbol: r.symbol, label: r.label || '', exchange: r.exchange || '', currency: r.currency || '' });
+        }
+        if (/^[A-Za-z][A-Za-z0-9.]{1,11}$/.test(q) && !seen.has(q.toUpperCase())) merged.push({ symbol: q.toUpperCase(), label: '' });
+        symItems = merged;
+        symActive = symItems.length ? 0 : -1;
+        symRender();
+        // Typing a ticker fills the price note too (not only a
+        // suggestion pick): the note shows what the rebuild will pay.
+        if (/^[A-Za-z][A-Za-z0-9.]{1,11}$/.test(q) && q.toUpperCase() !== lastPriced) { lastPriced = q.toUpperCase(); fillSinkPrice(q); }
+      }, 250);
+    });
+    symInput.addEventListener('keydown', (e) => {
+      if (symList.classList.contains('hidden')) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); symActive = Math.min(symActive + 1, symItems.length - 1); symRender(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); symActive = Math.max(symActive - 1, 0); symRender(); }
+      else if (e.key === 'Enter' && symActive >= 0) { e.preventDefault(); symPick(symActive); }
+      else if (e.key === 'Escape') { symClose(); }
+    });
+    document.addEventListener('mousedown', (e) => { if (!symList.contains(e.target) && e.target !== symInput) symClose(); });
+    suggestBtn.addEventListener('click', async () => {
+      try {
+        const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
+        if (!r.suggestions.length) { suggestOut.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available — pick a custom product instead.')}</div>`; return; }
+        suggestOut.innerHTML = r.suggestions.map((x) => `
+          <button class="small" data-plan-sink-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-sink-basis="${esc(x.basis)}" data-plan-sink-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
+          + `<div class="note">Past returns do not predict future returns.</div>`;
+        suggestOut.querySelectorAll('[data-plan-sink-suggest]').forEach((b) => b.addEventListener('click', () => {
+          sinkTrend = { holdingId: Number(sel.value), trendPct: Number(b.dataset.planSinkSuggest), basis: b.dataset.planSinkBasis || null, window: b.dataset.planSinkWindow || null };
+          retEl.value = formatMoneyInput(String(sinkTrend.trendPct));
+          suggestOut.innerHTML = `<div class="note">Picked: trend ${sinkTrend.trendPct}%/yr (${esc(sinkTrend.basis || '')}${sinkTrend.window ? ` · ${sinkTrend.window}` : ''})</div>`;
+        }));
+      } catch (err) { suggestOut.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+    });
     sinkHost.querySelectorAll('input[name="planSinkKind"]').forEach((r) => r.addEventListener('change', () => {
       const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
       $('#planSinkStockBox').classList.toggle('hidden', kind !== 'stock');
@@ -14411,11 +14564,29 @@ function planSinkWire(d) {
         const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
         let sinkBody;
         if (kind === 'stock') {
-          if (!sinkDraft || sinkDraft.holdingId !== Number(sel.value)) throw new Error('Pick a trend suggestion for the chosen stock first');
-          sinkBody = sinkDraft;
+          const retRaw = retEl.value.replace(/,/g, '').trim();
+          const ret = retRaw === '' ? null : Number(retRaw);
+          if (ret == null || !isFinite(ret)) throw new Error('Expected return is required');
+          if (sel.value === 'new') {
+            const symbol = (symInput.value || '').trim().toUpperCase();
+            if (!symbol) throw new Error('Enter a symbol for the new stock');
+            // A typed symbol matching a holding is that holding, not
+            // a new stock.
+            const held = holdings.find((h) => (h.symbol || '').toUpperCase() === symbol);
+            if (held) {
+              sinkBody = { kind: 'stock', holdingId: held.id, trendPct: ret, basis: sinkTrend && sinkTrend.holdingId === held.id ? sinkTrend.basis : 'Your expected return', window: sinkTrend && sinkTrend.holdingId === held.id ? sinkTrend.window : 'Annual' };
+            } else {
+              const acctSel = $('#planSinkAccount');
+              const accountId = acctSel && !acctBox.classList.contains('hidden') ? Number(acctSel.value) : (poolAccounts.length === 1 ? poolAccounts[0].accountId : null);
+              sinkBody = { kind: 'stock', symbol, ...(accountId != null ? { accountId } : {}), trendPct: ret, basis: 'Your expected return', window: 'Annual' };
+            }
+          } else {
+            const holdingId = Number(sel.value);
+            sinkBody = { kind: 'stock', holdingId, trendPct: ret, basis: sinkTrend && sinkTrend.holdingId === holdingId ? sinkTrend.basis : 'Your expected return', window: sinkTrend && sinkTrend.holdingId === holdingId ? sinkTrend.window : 'Annual' };
+          }
         } else {
           const name = $('#planSinkName').value.trim();
-          const ret = $('#planSinkReturn').value.replace(/,/g, '').trim();
+          const ret = $('#planSinkCustomReturn').value.replace(/,/g, '').trim();
           if (!name) throw new Error('Product name is required');
           if (ret === '' || !isFinite(Number(ret))) throw new Error('Expected return is required');
           sinkBody = { kind: 'custom', name, expectedReturnPct: Number(ret) };
@@ -14426,12 +14597,35 @@ function planSinkWire(d) {
         loadPlanStrategy(s.id);
       } catch (err) { showMsg(msg, 'err', err.message); }
     });
+    // Prefill when editing a picked sink: the holding (or the new
+    // symbol) + the return it was saved with.
+    if (sink && sinkEditing) {
+      if (sink.kind === 'custom') {
+        $('#planSinkName').value = sink.name || '';
+        $('#planSinkCustomReturn').value = sink.expectedReturnPct != null ? formatMoneyInput(String(sink.expectedReturnPct)) : '';
+      } else if (sink.kind === 'stock') {
+        if (sink.symbol) {
+          sel.value = 'new';
+          showPick(true);
+          symInput.value = sink.symbol;
+          retEl.value = sink.trendPct != null ? formatMoneyInput(String(sink.trendPct)) : '';
+          const acctSel = $('#planSinkAccount');
+          if (acctSel && sink.accountId != null && [...acctSel.options].some((o) => Number(o.value) === Number(sink.accountId))) acctSel.value = String(sink.accountId);
+          fillSinkPrice(sink.symbol);
+        } else if (sink.holdingId != null && [...sel.options].some((o) => Number(o.value) === Number(sink.holdingId))) {
+          sel.value = String(sink.holdingId);
+          retEl.value = sink.trendPct != null ? formatMoneyInput(String(sink.trendPct)) : '';
+          if (sink.basis) suggestOut.innerHTML = `<div class="note">Picked: trend ${sink.trendPct}%/yr (${esc(sink.basis || '')}${sink.window ? ` · ${sink.window}` : ''})</div>`;
+        }
+      }
+    }
   };
   (async () => {
     try {
       const inv = await api('/api/investments');
-      holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountName: (a.account || {}).name })));
-    } catch { holdings = []; }
+      holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountId: (a.account || {}).id, accountName: (a.account || {}).name, value: (h.summary || {}).value || 0 })));
+      accounts = (inv.accounts || []).map((a) => ({ id: (a.account || {}).id, name: (a.account || {}).name || '' }));
+    } catch { holdings = []; accounts = []; }
     render();
   })();
 }

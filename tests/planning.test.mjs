@@ -116,7 +116,16 @@ test('validateStrategyFactors: shape errors for points, percents and sinks', () 
   assert.ok(validateStrategyFactors({ nope: 1 }).some((e) => /unknown factor/.test(e)));
   assert.ok(validateStrategyFactors({ stock: { valuePct: 'x' } }).length > 0);
   assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1 } }).some((e) => /trendPct/.test(e)));
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1, trendPct: 10 } }).length === 0);
   assert.ok(validateStrategyFactors({ sink: { kind: 'custom', name: 'GIC', expectedReturnPct: 4 } }).length === 0);
+  // A new-symbol stock sink (a stock the user does not hold yet) is
+  // valid with a symbol + trendPct, no holdingId; neither target, or
+  // both, is rejected, as is a missing return.
+  assert.deepEqual(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN', trendPct: 12 } }), []);
+  assert.deepEqual(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN', accountId: 1, trendPct: 12 } }), []);
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN' } }).some((e) => /trendPct/.test(e)));
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock' } }).some((e) => /holdingId or a symbol/.test(e)));
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1, symbol: 'AMZN', trendPct: 12 } }).some((e) => /not both/.test(e)));
   assert.deepEqual(primeFactorToScenario({ prime: { points: [{ month: '2027-06', rate: 5.5 }] } }), { name: 'Strategy prime', steps: [{ date: '2027-06-01', rate: 5.5 }] });
   assert.equal(primeFactorToScenario({}), null);
   assert.deepEqual(factorsToAssumptions({ stock: { valuePct: 6 } }, { stockReturnPct: 3, comparableRate: 4 }), { stockReturnPct: 6, comparableRate: 4 });

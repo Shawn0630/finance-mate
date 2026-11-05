@@ -4791,8 +4791,10 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput, ov
   // A stock sink outside the pool is injected into the strategy run's
   // mainline with empty events + actual price points: its pre-existing
   // position outside the pool is NOT counted, only the sink buy is.
+  // A symbol-only sink (a new stock the user does not hold yet) has
+  // no holding to inject — the buy op creates it in the engine.
   let strategyMainline = mainline;
-  if (sink && sink.kind === 'stock') {
+  if (sink && sink.kind === 'stock' && sink.holdingId != null) {
     const sinkId = Number(sink.holdingId);
     if (!mainline.holdings.some((h) => Number(h.id) === sinkId)) {
       const real = baseMainline.holdings.find((h) => Number(h.id) === sinkId);
@@ -5311,6 +5313,31 @@ function planRecommendationFor(category, subcategory, entity) {
 // uses. recordId points at the project's recommendation-source
 // baseline record when one exists (report pins keep working);
 // legacy AI/manual records are never the fixed baseline.
+// Pool accounts for the sink picker: the accounts the pool draws
+// on, with each account's pool contribution, largest first. The
+// client shows an account picker for a new-symbol sink only when
+// the pool spans more than one account (a single-account pool uses
+// that account; an all-external pool has none and the client falls
+// back to all accounts).
+function planPoolAccounts(figures) {
+  const byId = new Map();
+  for (const it of (figures && figures.items) || []) {
+    let aid = it.accountId != null ? Number(it.accountId) : null;
+    if (aid == null && it.holdingId != null) {
+      const h = db.prepare('SELECT account_id FROM invest_holdings WHERE id = ?').get(Number(it.holdingId));
+      if (h) aid = Number(h.account_id);
+    }
+    if (aid == null) continue;
+    byId.set(aid, (byId.get(aid) || 0) + (Number(it.value) || 0));
+  }
+  const out = [];
+  for (const [aid, value] of byId) {
+    const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(aid);
+    out.push({ accountId: aid, name: acc ? acc.name : '', value: Math.round(value * 100) / 100 });
+  }
+  out.sort((a, b) => b.value - a.value);
+  return out;
+}
 function planFixedBaseline(view) {
   const category = view.category;
   const subcategory = view.subcategory;
@@ -5986,7 +6013,8 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
       if (Array.isArray(ids) && ids.includes(s.id)) { hasGeneratedReport = true; break; }
     }
   } catch { /* no reports table rows = gate closed */ }
-  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: entityProp, equityAssessedTotal, equityGrowthPct, equityCurrentMonth: currentMonthKey(), baselineKind, hasGeneratedReport, fixedBaseline: planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity: planProjectEntityOf(p) }) });
+  const fb = planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity: planProjectEntityOf(p) });
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: entityProp, equityAssessedTotal, equityGrowthPct, equityCurrentMonth: currentMonthKey(), baselineKind, hasGeneratedReport, fixedBaseline: fb, poolAccounts: planPoolAccounts(fb && fb.figures) });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -6392,7 +6420,7 @@ app.put('/api/planning/strategies/:id/factors', requireApiAuth, (req, res) => {
 // the sink. A stock sink uses the user-picked historical trend as its
 // return assumption; a custom product uses the user-filled expected
 // annualized return. Investment-pool projects only.
-app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
+app.put('/api/planning/strategies/:id/sink', requireApiAuth, async (req, res) => {
   const s = planStrategyById(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
@@ -6428,7 +6456,7 @@ app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
   }
   sells.sort((a, b) => a.holding.id - b.holding.id);
   let buyParams; let stockFactor;
-  if (sink.kind === 'stock') {
+  if (sink.kind === 'stock' && sink.holdingId != null) {
     const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(Number(sink.holdingId));
     if (!h) return res.status(400).json({ error: 'sink holding not found' });
     const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
@@ -6437,6 +6465,28 @@ app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
     const amountNative = h.currency === 'USD' ? proceedsCad / fx : proceedsCad;
     buyParams = { accountId: h.account_id, holdingId: h.id, date: `${currentMonth}-01`, amount: amountNative, price };
     stockFactor = { valuePct: Number(sink.trendPct), basis: sink.basis || null, window: sink.window || null };
+  } else if (sink.kind === 'stock') {
+    // A new symbol the user does not hold yet: the buy lands in the
+    // account the form picked (or the pool's only account), priced at
+    // the current price from the same tiers behind GET /api/invest/
+    // price — never guessed, never 100. No currency is set, so the
+    // engine treats the holding as CAD, exactly like a manual buy.
+    const symbol = String(sink.symbol || '').trim().toUpperCase();
+    let accountId = null;
+    if (sink.accountId != null) {
+      const acc = db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(Number(sink.accountId));
+      if (!acc) return res.status(400).json({ error: 'sink account not found' });
+      accountId = acc.id;
+    } else {
+      const poolAccounts = [...new Set(poolMainline.holdings.map((h) => h.accountId))].filter((x) => x != null);
+      if (poolAccounts.length === 1) accountId = poolAccounts[0];
+      else if (!poolAccounts.length) return res.status(400).json({ error: `pick an account for ${symbol}: the pool holds no account` });
+      else return res.status(400).json({ error: `pick an account for ${symbol}: the pool spans ${poolAccounts.length} accounts` });
+    }
+    const px = await latestPrice(symbol);
+    if (!px || px.price == null) return res.status(400).json({ error: `no current price for ${symbol}` });
+    buyParams = { accountId, symbol, date: `${currentMonth}-01`, amount: proceedsCad, price: px.price };
+    stockFactor = { valuePct: Number(sink.trendPct), basis: sink.basis || 'Your expected return', window: sink.window || 'Annual' };
   } else {
     buyParams = { accountId: null, symbol: String(sink.name).trim(), currency: 'CAD', date: `${currentMonth}-01`, amount: proceedsCad, price: 100 };
     stockFactor = { valuePct: Number(sink.expectedReturnPct), basis: 'Your expected return', window: 'Annual' };

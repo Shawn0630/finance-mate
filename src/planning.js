@@ -1807,7 +1807,12 @@ export const PLAN_STRATEGY_TEMPLATE_LABELS = {
 //     propertyGrowth: { valuePct }, salaryGrowth: { valuePct },
 //     rentGrowth: { valuePct },
 //     sink: { kind: 'stock', holdingId, trendPct, basis?, window? }
+//           | { kind: 'stock', symbol, accountId?, trendPct, basis?, window? }
 //           | { kind: 'custom', name, expectedReturnPct } }
+// A stock sink targets an existing holding (holdingId) or a new
+// symbol the user does not hold yet (symbol, with the account the
+// buy lands in when the pool spans more than one) — never both,
+// never neither. Either way the return rides on trendPct.
 // Salary and rent growth are stored and labeled only — the engine has
 // no earnings leg, so they do not change numbers yet.
 export const PLAN_FACTOR_KEYS = ['prime', 'stock', 'propertyGrowth', 'salaryGrowth', 'rentGrowth', 'sink'];
@@ -1870,7 +1875,10 @@ export function validateStrategyFactors(factors, currentMonth = null) {
     const s = factors.sink;
     if (typeof s !== 'object' || Array.isArray(s)) errs.push('sink must be an object');
     else if (s.kind === 'stock') {
-      if (!Number.isInteger(s.holdingId)) errs.push('stock sink needs a holdingId');
+      const hasHolding = Number.isInteger(s.holdingId);
+      const hasSymbol = typeof s.symbol === 'string' && s.symbol.trim().length > 0;
+      if (hasHolding && hasSymbol) errs.push('stock sink needs either a holdingId or a symbol, not both');
+      else if (!hasHolding && !hasSymbol) errs.push('stock sink needs a holdingId or a symbol');
       const t = num(s.trendPct);
       if (t == null || t < -90 || t > 500) errs.push('stock sink needs a trendPct between -90 and 500');
     } else if (s.kind === 'custom') {

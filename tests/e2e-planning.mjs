@@ -2257,6 +2257,65 @@ export async function run(H, S) {
   H.check('planning sink: custom sink grows the pool at the user-filled 6% return',
     customRow && customRow.projection && customRow.projection.stocks && customRow.projection.stocks.valueAtHorizon > customRow.projection.stocks.buyCash * 5 && customRow.comparison && customRow.comparison.stockGain > 0,
     JSON.stringify({ value: customRow && customRow.projection.stocks.valueAtHorizon, buyCash: customRow && customRow.projection.stocks.buyCash, gain: customRow && customRow.comparison.stockGain }));
+  // ---- New-symbol sink (user 2026-11-05): the sink picker accepts
+  // a stock the user does not hold yet (AMZN) through the same
+  // unified pick — a new symbol + a typed expected return, priced
+  // at the current price from the tiers (never 100, never guessed).
+  // A fresh strategy gets a manual buy first, so the rebuild
+  // semantics (the manual buy is replaced) are pinned too.
+  r = await H.req('POST', `/api/planning/projects/${poolProjId}/strategies`, { name: 'New Stock Sink', source: 'manual' });
+  H.check('sink-new-stock: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const newSinkStratId = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${newSinkStratId}/ops`, { op_type: 'buy', params: { accountId: poolAcctB, symbol: 'POOL.B', date: `${_poolVan.slice(0, 7)}-01`, amount: 500, price: 40 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('sink-new-stock: manual buy op posted', r.status === 201, JSON.stringify(r.data));
+  // No return → the save fails (the return is part of the pick, and
+  // the old trend-gate error is gone — the message is the plain
+  // field validation, not "Pick a trend suggestion…").
+  r = await H.req('PUT', `/api/planning/strategies/${newSinkStratId}/sink`, { sink: { kind: 'stock', symbol: 'AMZN', accountId: poolAcctA } });
+  H.check('sink-new-stock: new-symbol sink without a return is rejected',
+    r.status === 400 && /trendPct/.test(r.data.error || '') && !/Pick a trend suggestion/.test(r.data.error || ''), JSON.stringify(r.data));
+  // No account on a multi-account pool → the save fails naming the
+  // account choice (the form shows the picker in this case).
+  r = await H.req('PUT', `/api/planning/strategies/${newSinkStratId}/sink`, { sink: { kind: 'stock', symbol: 'AMZN', trendPct: 12 } });
+  H.check('sink-new-stock: new-symbol sink without an account is rejected on a multi-account pool',
+    r.status === 400 && /account/.test(r.data.error || ''), JSON.stringify(r.data));
+  // No price data for the symbol → 400 naming the symbol, never a
+  // guessed price.
+  r = await H.req('PUT', `/api/planning/strategies/${newSinkStratId}/sink`, { sink: { kind: 'stock', symbol: 'ZZZZ', accountId: poolAcctA, trendPct: 12 } });
+  H.check('sink-new-stock: new-symbol sink with no price data fails naming the symbol',
+    r.status === 400 && /ZZZZ/.test(r.data.error || '') && /no current price/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await H.req('PUT', `/api/planning/strategies/${newSinkStratId}/sink`, { sink: { kind: 'stock', symbol: 'AMZN', accountId: poolAcctA, trendPct: 12, basis: 'Your expected return', window: 'Annual' } });
+  H.check('sink-new-stock: new-symbol sink saves with the entered return',
+    r.status === 200 && r.data.sink && r.data.sink.kind === 'stock' && r.data.sink.symbol === 'AMZN' && r.data.sink.trendPct === 12, JSON.stringify(r.data.sink));
+  r = await H.req('GET', `/api/planning/strategies/${newSinkStratId}`);
+  const newSinkOps = r.data.ops || [];
+  const newSinkBuy = newSinkOps.find((o) => o.op_type === 'buy');
+  H.check('sink-new-stock: rebuild replaces the manual buy — two sells + one AMZN buy at the stubbed price, not 100',
+    r.status === 200 && newSinkOps.length === 3 && newSinkOps.filter((o) => o.op_type === 'sell').length === 2
+      && !!newSinkBuy && newSinkBuy.params && newSinkBuy.params.symbol === 'AMZN' && newSinkBuy.params.price === 266.03
+      && newSinkBuy.params.amount === 1100 && newSinkBuy.params.accountId === poolAcctA
+      && !newSinkOps.some((o) => o.params && o.params.symbol === 'POOL.B'),
+    JSON.stringify(newSinkOps));
+  // The projection applies the new-symbol sink's return: the stock
+  // series grows at 12%/yr over the 30y horizon, exactly like the
+  // baseline-growth pin's (1+X)^30 ratio.
+  r = await H.req('GET', `/api/planning/projects/${poolProjId}/comparison`);
+  const newSinkRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === newSinkStratId);
+  const newSinkSeries = newSinkRow && newSinkRow.projection && newSinkRow.projection.stocks && newSinkRow.projection.stocks.series;
+  const newSinkRatio = newSinkSeries && newSinkSeries.length ? newSinkSeries[newSinkSeries.length - 1].value / newSinkSeries[0].value : null;
+  const newSinkExpected = Math.pow(1.12, 30);
+  H.check('sink-new-stock: projection grows the AMZN buy at the typed 12% return',
+    newSinkSeries && newSinkSeries.length > 0 && newSinkRatio != null && Math.abs(newSinkRatio - newSinkExpected) / newSinkExpected < 0.005
+      && newSinkRow.projection.stocks.valueAtHorizon > newSinkRow.projection.stocks.buyCash * 10,
+    JSON.stringify({ first: newSinkSeries && newSinkSeries[0], last: newSinkSeries && newSinkSeries[newSinkSeries.length - 1], ratio: newSinkRatio, expected: newSinkExpected }));
+  // The strategy GET carries the pool accounts for the picker's
+  // account picker: this pool spans A ($600) + B ($500), largest first.
+  r = await H.req('GET', `/api/planning/strategies/${newSinkStratId}`);
+  H.check('sink-new-stock: strategy GET carries poolAccounts, largest share first',
+    r.status === 200 && Array.isArray(r.data.poolAccounts) && r.data.poolAccounts.length === 2
+      && r.data.poolAccounts[0].accountId === poolAcctA && r.data.poolAccounts[0].value === 600
+      && r.data.poolAccounts[1].accountId === poolAcctB && r.data.poolAccounts[1].value === 500,
+    JSON.stringify(r.data.poolAccounts));
   // ---- Op + Sink merge (user 2026-11-05): a cash-pool strategy's
   // buy ops render in the merged Sink list. A stock-sink buy carries
   // only a holdingId, so the server resolves its symbol for the row.
@@ -2473,6 +2532,85 @@ export async function run(H, S) {
           // at least one scenario") on any project that has scenarios.
           && Array.isArray(mergeRepScens) && mergeRepScens.length === 1 && mergeRepScens[0] === poolScenId,
         JSON.stringify({ report: mergeRep && { id: mergeRep.id, strategy_ids: mergeRep.strategy_ids, scenario_ids: mergeRep.scenario_ids } }));
+      // ---- Unified sink picker (user 2026-11-05): the new-symbol
+      // strategy's page shows the picked AMZN sink; Edit opens the
+      // unified pick (stock select with a "New stock…" entry + a
+      // visible return field, no trend gate).
+      page.on('dialog', (d) => d.accept());
+      await page.goto(`http://ff.local/#planning/strategy/${newSinkStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitQ(1500);
+      const newSinkView = await page.evaluate(() => ({
+        line: document.querySelector('#planFactorSink')?.textContent || '',
+        edit: !!document.querySelector('#planSinkEditBtn'),
+      }));
+      H.check('sink-new-stock: picked AMZN sink shows as a line with Edit',
+        newSinkView.line.includes('Current sink: AMZN') && newSinkView.line.includes('trend 12%/yr') && newSinkView.edit,
+        JSON.stringify(newSinkView));
+      await page.click('#planSinkEditBtn');
+      await waitQ(800);
+      const newSinkPicker = await page.evaluate(() => {
+        const sel = document.querySelector('#planSinkHolding');
+        return {
+          save: !!document.querySelector('#planSinkSaveBtn'),
+          ret: !!document.querySelector('#planSinkReturn'),
+          retVal: document.querySelector('#planSinkReturn')?.value || '',
+          symVal: document.querySelector('#planSinkSymbol')?.value || '',
+          newOpt: sel ? [...sel.options].some((o) => o.value === 'new') : false,
+          newBoxHidden: !!document.querySelector('#planSinkNewBox')?.classList.contains('hidden'),
+          acctVal: document.querySelector('#planSinkAccount')?.value || '',
+          gateText: (document.querySelector('#planFactorSink')?.textContent || '').includes('Pick a trend suggestion'),
+        };
+      });
+      H.check('sink-new-stock: Edit opens the unified picker prefilled with the AMZN symbol + 12% return, account picker on the largest share',
+        newSinkPicker.save && newSinkPicker.ret && newSinkPicker.retVal === '12' && newSinkPicker.symVal === 'AMZN'
+          && newSinkPicker.newOpt && !newSinkPicker.newBoxHidden && newSinkPicker.acctVal === String(poolAcctA) && !newSinkPicker.gateText,
+        JSON.stringify(newSinkPicker));
+      // The old gate is gone: pick an existing holding, type a return
+      // WITHOUT touching Suggest trend, and Save succeeds.
+      await page.evaluate((holdA) => {
+        const sel = document.querySelector('#planSinkHolding');
+        sel.value = String(holdA);
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        const ret = document.querySelector('#planSinkReturn');
+        ret.value = '10';
+        ret.dispatchEvent(new Event('input', { bubbles: true }));
+      }, poolHoldA);
+      await page.click('#planSinkSaveBtn');
+      await waitQ(1500);
+      const gateGone = await page.evaluate(() => ({
+        line: document.querySelector('#planFactorSink')?.textContent || '',
+        err: document.querySelector('#planSinkMsg')?.textContent || '',
+      }));
+      H.check('sink-new-stock: existing-holding sink saves with a typed return and no trend pick (old gate gone)',
+        gateGone.line.includes('Current sink: POOL.A') && gateGone.line.includes('trend 10%/yr') && !gateGone.err.includes('Pick a trend suggestion'),
+        JSON.stringify(gateGone));
+      // Back to a new symbol through the picker: "New stock…" shows
+      // the symbol input, typing AMZN fills the stubbed price note.
+      await page.click('#planSinkEditBtn');
+      await waitQ(800);
+      await page.evaluate(() => {
+        const sel = document.querySelector('#planSinkHolding');
+        sel.value = 'new';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        const sym = document.querySelector('#planSinkSymbol');
+        sym.value = 'AMZN';
+        sym.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const n = document.querySelector('#planSinkPriceNote');
+        return n && !n.classList.contains('hidden') && n.textContent.includes('266.03');
+      }, { timeout: 15000 });
+      await page.evaluate(() => {
+        const ret = document.querySelector('#planSinkReturn');
+        ret.value = '12';
+        ret.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.click('#planSinkSaveBtn');
+      await waitQ(1500);
+      const amznBack = await page.evaluate(() => document.querySelector('#planFactorSink')?.textContent || '');
+      H.check('sink-new-stock: new-symbol pick fills the stubbed price and saves AMZN back',
+        amznBack.includes('Current sink: AMZN') && amznBack.includes('trend 12%/yr'),
+        JSON.stringify(amznBack));
       await page.goto(`http://ff.local/#planning/scenario/${poolScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
       // Prime is checkbox-gated now: check it, then the chart +
