@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import {
   payDatesFrom, frequencyLabel, validPlanInput,
   listPlans, getPlan, planView, generatePlan, recordPlanEventDeletion,
+  planPeriodAmounts, planJobPerPeriodGross,
 } from '../src/plans.js';
 
 function setup() {
@@ -57,6 +58,37 @@ test('payDatesFrom: annual steps yearly, Feb 29 clamps to Feb 28', () => {
 });
 
 // --------------------------------------------------------- validation
+test('validPlanInput: percent mode derives from pct, employer pct RRSP-only, own pct > 0 required', () => {
+  const base = { job_id: 1, target_holding_id: 10, start_date: '2026-01-05' };
+  const ok = validPlanInput({ ...base, amount_mode: 'percent', own_pct: 6, employer_pct: 3 }, { accountType: 'RRSP' });
+  assert.equal(ok.error, undefined);
+  assert.equal(ok.mode, 'percent');
+  assert.equal(ok.ownPct, 6);
+  assert.equal(ok.employerPct, 3);
+  assert.equal(ok.ownAmount, null);
+  assert.match(validPlanInput({ ...base, amount_mode: 'percent', own_pct: 0 }, { accountType: 'RRSP' }).error, /own percent/);
+  assert.match(validPlanInput({ ...base, amount_mode: 'percent', own_pct: 101 }, { accountType: 'RRSP' }).error, /own percent/);
+  assert.match(validPlanInput({ ...base, amount_mode: 'percent', own_pct: 6, employer_pct: 3 }, { accountType: 'TFSA' }).error, /RRSP/);
+  assert.equal(validPlanInput({ ...base, amount_mode: 'percent', own_pct: 6, employer_pct: 0 }, { accountType: 'TFSA' }).employerPct, null);
+  // Fixed mode unchanged, pcts null.
+  const fx = validPlanInput({ ...base, own_amount: 100 }, { accountType: 'RRSP' });
+  assert.equal(fx.mode, 'fixed');
+  assert.equal(fx.ownPct, null);
+  assert.equal(fx.ownAmount, 100);
+});
+test('planPeriodAmounts: percent derives pct x current gross to the cent; fixed returns stored', () => {
+  assert.deepEqual(planPeriodAmounts({ own_pct: 6, employer_pct: 3 }, 3000), { own: 180, employer: 90 });
+  assert.deepEqual(planPeriodAmounts({ own_pct: 6.5 }, 3000), { own: 195, employer: null });
+  assert.deepEqual(planPeriodAmounts({ own_pct: 6 }, 3333.33), { own: 200, employer: null });
+  assert.deepEqual(planPeriodAmounts({ own_amount: 100, employer_amount: 50 }, 3000), { own: 100, employer: 50 });
+  assert.deepEqual(planPeriodAmounts({ own_pct: 6 }, null), { own: 0, employer: null });
+});
+test('planJobPerPeriodGross: period basis is per-period; annual spreads over periods', () => {
+  assert.equal(planJobPerPeriodGross({ frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period' }), 3000);
+  assert.equal(planJobPerPeriodGross({ frequency: 'biweekly', gross_amount: 78000, gross_basis: 'annual' }), 3000);
+  assert.equal(planJobPerPeriodGross({ frequency: 'monthly', gross_amount: 90000, gross_basis: 'annual' }), 7500);
+  assert.equal(planJobPerPeriodGross({ frequency: 'biweekly', gross_amount: null, gross_basis: 'period' }), null);
+});
 test('validPlanInput: employer amount is RRSP-only, own amount must be > 0', () => {
   assert.equal(validPlanInput({ job_id: 1, target_holding_id: 10, start_date: '2026-01-05', own_amount: 100, employer_amount: 50 }, { accountType: 'RRSP' }).error, undefined);
   assert.match(validPlanInput({ job_id: 1, target_holding_id: 10, start_date: '2026-01-05', own_amount: 100, employer_amount: 50 }, { accountType: 'TFSA' }).error, /RRSP/);

@@ -353,6 +353,9 @@ export function solveGrossForTakeHome({ targetNet, frequency, province, startDat
   if (!Number.isFinite(target) || target < 0) return { error: 'take-home pay must be a number ≥ 0.' };
   if (!PAY_FREQUENCIES[frequency] || !payroll) return { error: 'take-home pay needs a valid pay frequency.' };
   const bonusTotal = (bonuses || []).reduce((a, b) => a + (Number(b.amount) || 0), 0);
+  // The solve prices the DISPLAYED net definition: cash take-home
+  // (economic net minus the own RRSP deduction), so entering a
+  // paystub figure round-trips to the gross that displays it.
   const netAt = (gross) => {
     const ytd = deriveJobYtd({
       frequency, startDate, recentDate, changes, recentValue: gross, payroll, cppExempt, eiExempt,
@@ -362,7 +365,7 @@ export function solveGrossForTakeHome({ targetNet, frequency, province, startDat
       ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
       td1_federal: td1Federal ?? null, td1_provincial: td1Provincial ?? null,
       cpp_exempt: !!cppExempt, ei_exempt: !!eiExempt, rrspDeduction: rrspDeduction || 0,
-    }, payroll).perPeriod.net;
+    }, payroll).perPeriod.cashNet;
   };
   const unreachable = 'no per-period gross produces that take-home pay.';
   if (netAt(0) > target) return { error: unreachable };
@@ -590,6 +593,15 @@ export function calcSalary(job, payroll) {
   const totalTax = federalTax + (provincialTax || 0);
   const netAnnual = annualGross - cppAnnual - cpp2Annual - eiAnnual - totalTax;
   const div = (n) => round2(n / periods);
+  const ppNet = div(netAnnual);
+  // Cash take-home: the displayed net is what actually lands on the
+  // paycheque — the economic net above minus the employee's own
+  // RRSP payroll deduction for the period. The tax-reduction effect
+  // stays inside totalTax (taxable income already excludes the
+  // deduction); only the net presentation subtracts the cash out.
+  // With no deduction the cash figure equals the economic figure
+  // exactly, so no-plan jobs are unchanged.
+  const ded = Math.max(0, Number(job.rrspDeduction) || 0);
   return {
     annualGross: round2(annualGross), perPeriodGross: round2(perPeriodGross),
     cpp: round2(cppAnnual), cpp2: round2(cpp2Annual), ei: round2(eiAnnual),
@@ -597,10 +609,11 @@ export function calcSalary(job, payroll) {
     taxableIncome: round2(taxable), rrspAnnual: round2(rrspAnnual), td1Federal: round2(td1Federal),
     federalTax: round2(federalTax), provincialTax: provincialTax == null ? null : round2(provincialTax),
     healthPremium: round2(healthPremium), totalTax: round2(totalTax), netAnnual: round2(netAnnual),
+    cashNetAnnual: round2(netAnnual - rrspAnnual),
     perPeriod: {
       gross: round2(perPeriodGross), cpp: div(cppAnnual), cpp2: div(cpp2Annual), ei: div(eiAnnual),
       federalTax: div(federalTax), provincialTax: provincialTax == null ? null : div(provincialTax),
-      totalTax: div(totalTax), net: div(netAnnual),
+      totalTax: div(totalTax), net: ppNet, cashNet: round2(ppNet - ded),
     },
     provinceVerified: !!(prov && prov.verified),
     provinceLabel: prov ? prov.label : job.province,

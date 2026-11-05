@@ -239,7 +239,7 @@ export function validateLegs(ops, legs) {
 // scenario: prime-path scenario object (or null = actual history only)
 // Returns {mortgage: {perProperty, totals}, stocks: {...}, fees, penalties,
 // cost, gain, net, valueAtHorizon, errors[], warnings[]}.
-export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null }) {
+export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null, potInitial = 0 }) {
   const errors = [];
   const warnings = [];
   const primeHist = scenarioPrimeHistory(primeHistory, scenario);
@@ -508,7 +508,10 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
 
   // Op outputs (for leg resolution) + pot simulation, in sequence order.
   const opOutput = new Map(); // seq -> {amount (CAD, native? keep native+CAD), note}
-  let pot = 0; // CAD
+  // The pot starts at the pool's external cash (0 for pools without
+  // any) — external funding is spendable from the first month.
+  const potBase = num(potInitial) || 0;
+  let pot = potBase; // CAD
   const potEvents = [];
   let buyCash = 0;
   let buyCashFromSells = 0; // CAD — buy amount funded by sell earmarks
@@ -544,6 +547,10 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
         opDate: p.date, holdingCurrency: holding.currency, fxRate, buySeq: op.seq,
       });
       if (resolved.error) { errors.push(`buy operation ${op.seq}: ${resolved.error}`); continue; }
+      // A pot-funded buy draws the pot down — record it as a pot event
+      // so the monthly pot series (below) moves on the buy month, not
+      // just on sells. Without this the pot series would miss draws.
+      if (resolved.pot !== pot) potEvents.push({ month: monthKey, delta: round2(resolved.pot - pot) });
       pot = resolved.pot;
       buyCash += toCad(holding, amount);
       // Sell-earmarked funding is a swap, not new cash: it must not
@@ -640,7 +647,9 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   }
   const interestSaved = round2(baselineInterest - strategyInterest);
 
-  // Monthly stock value series (holdings + pot).
+  // Monthly stock value series (holdings only — the cash pot is NOT
+  // folded in month by month; it has its own series below. The horizon
+  // value adds the pot, so a pot deployment never reads as a loss.)
   const months = [];
   for (let i = monthIdxOf(currentMonth); i <= monthIdxOf(horizonMonth); i++) months.push(ymOfIdx(i));
   let valueAtHorizon = 0;
@@ -657,6 +666,15 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     valueAtHorizon = v;
     return { month: m, value: round2(v) };
   });
+  // Cash-pool balance by month: the pot starts at the pool's external
+  // cash and moves only on op dates — sell proceeds parked in the pot
+  // raise it, pot-funded buys draw it down. Carried forward between
+  // op months, so a pot-funded buy reads as pool down + stock up by
+  // the same amount.
+  const potSeries = months.map((m) => ({
+    month: m,
+    value: round2(potBase + potEvents.filter((e) => e.month <= m).reduce((s, e) => s + e.delta, 0)),
+  }));
   // Pot at horizon: final pot value (pot moves only on op dates).
   valueAtHorizon = round2((stockSeries.length ? stockSeries[stockSeries.length - 1].value : 0) + pot);
   // Stock gain vs the STARTING value is informational only. The
@@ -685,7 +703,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
 
   return {
     mortgage: { perProperty: mortgagePerProperty, baselineInterest: round2(baselineInterest), strategyInterest: round2(strategyInterest), interestSaved },
-    stocks: { series: stockSeries, startingValue: round2(startingValue), valueAtHorizon, buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
+    stocks: { series: stockSeries, potSeries, startingValue: round2(startingValue), valueAtHorizon, buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
     fees: round2(fees), penalties, penaltyTotal,
     cost, valueAtHorizon: projectedTotalAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
@@ -717,17 +735,35 @@ function paymentDeltaOf(perProperty) {
   return out;
 }
 
-// Monthly-payment scope (user rule 2026-11-02): the payment figure
-// covers ONLY the properties a strategy's mortgage ops touch —
-// rate_switch, refinance, prepay, payment_change, by params.propertyId.
-// Stock ops and funding legs never count. No mortgage ops → all null
-// (the client renders '—', never the project total).
-export function paymentScopeFor(baselineProj, strategyProj, ops) {
+// Property-project entity scope (user rule 2026-11-04): a property
+// project's projection world contains ONLY its entity property — the
+// creation flow asks which property the project is about, so no other
+// property's mortgage may leak into project figures. Pure: filters the
+// properties list, leaves holdings/assessed/declared assets untouched.
+// A null/invalid id returns the mainline unchanged (legacy and
+// non-property projects stay unscoped).
+export function scopeMainlineToProperty(mainline, propertyId) {
+  if (!mainline || propertyId == null || !Number.isInteger(Number(propertyId))) return mainline;
+  const id = Number(propertyId);
+  return { ...mainline, properties: (mainline.properties || []).filter((p) => Number(p.id) === id) };
+}
+
+// Monthly-payment scope: the payment figure covers ONLY the scoped
+// properties — never the project total. Default (no override) is the
+// 2026-11-02 op-touched rule: rate_switch, refinance, prepay,
+// payment_change, by params.propertyId. Stock ops and funding legs
+// never count. No mortgage ops → all null (the client renders '—',
+// never the project total). For property projects the 2026-11-04
+// entity rule SUBSUMES op-touched: callers pass scopePropertyIds =
+// [entityId] and the payment follows the entity property instead.
+export function paymentScopeFor(baselineProj, strategyProj, ops, scopePropertyIds = null) {
   const MORTGAGE_PAYMENT_OPS = ['prepay', 'rate_switch', 'refinance', 'payment_change'];
-  const propertyIds = [...new Set((ops || [])
-    .filter((o) => MORTGAGE_PAYMENT_OPS.includes(o.op_type))
-    .map((o) => Number(o.params && o.params.propertyId))
-    .filter(Number.isInteger))];
+  const propertyIds = Array.isArray(scopePropertyIds)
+    ? [...new Set(scopePropertyIds.map(Number).filter(Number.isInteger))]
+    : [...new Set((ops || [])
+      .filter((o) => MORTGAGE_PAYMENT_OPS.includes(o.op_type))
+      .map((o) => Number(o.params && o.params.propertyId))
+      .filter(Number.isInteger))];
   const sumSide = (proj, side) => {
     if (!propertyIds.length) return null;
     let sum = null;
@@ -987,7 +1023,7 @@ export function validateAiCreateProposal(parsed) {
 // the same convention valueAtHorizon uses). Interest and scheduled
 // principal are summed too so yearly bars and the payment breakdown
 // can aggregate without re-walking the engine series.
-export function reportMonthlySeries(perProperty, side, stockSeries, assessedTotal, growthPct = null, currentMonth = null) {
+export function reportMonthlySeries(perProperty, side, stockSeries, assessedTotal, growthPct = null, currentMonth = null, opts = {}) {
   const byMonth = new Map();
   for (const per of Object.values(perProperty || {})) {
     const s = per[side] && per[side].series ? per[side].series : [];
@@ -1001,6 +1037,7 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
   }
   const stockByMonth = new Map((stockSeries || []).map((r) => [r.month, r.value || 0]));
   for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
+  const poolByMonth = new Map(((opts.poolSeries) || []).map((r) => [r.month, r.value || 0]));
   const g = num(growthPct);
   return [...byMonth.keys()].sort().map((m) => {
     const b = byMonth.get(m);
@@ -1010,11 +1047,16 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
     // assessed value is held flat, exactly as before.
     const assessedAt = (g == null || !currentMonth) ? (assessedTotal || 0)
       : (assessedTotal || 0) * Math.pow(1 + g / 100, (monthIdxOf(m) - monthIdxOf(currentMonth)) / 12);
+    const pool = poolByMonth.get(m) || 0;
     return {
       month: m,
       mortgage_balance: round2(b.balance),
       stock_value: round2(sv),
-      total_value: round2(assessedAt - b.balance + sv),
+      pool_balance: round2(pool),
+      // Investment scope: the trajectory total is the investment
+      // portfolio only (cash pool + stocks) — property equity must
+      // not swamp it. Every other scope keeps the old definition.
+      total_value: opts.investmentScope ? round2(pool + sv) : round2(assessedAt - b.balance + sv),
       interest: round2(b.interest),
       // Scheduled principal (the payment split) — lump sums deduct
       // balance directly and never flow into this field, so the
@@ -1076,8 +1118,8 @@ export function validateAiChartMethods(charts) {
 // series is NOT an error: the renderer falls back to its default
 // series for that template.
 export const PLAN_REPORT_SERIES_BY_TEMPLATE = {
-  time_line: ['mortgage_balance', 'stock_value', 'total_value'],
-  yearly_bars: ['mortgage_balance', 'stock_value', 'total_value'],
+  time_line: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance'],
+  yearly_bars: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance'],
   stacked_bar: ['mortgage_balance', 'stock_value'],
   metric_cards: ['cost', 'gain', 'net', 'stock_gain', 'payoff_month', 'monthly_payment'],
   share_doughnut: ['cost', 'mortgage_balance', 'total_value'],
@@ -1106,8 +1148,8 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text 
     'You compose a report definition as JSON only. No prose outside the JSON object.',
     'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
     'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
-    'Series ids are: mortgage_balance, stock_value, total_value, cost, gain, net, payoff_month, monthly_payment.',
-    'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
+    'Series ids are: mortgage_balance, stock_value, total_value, pool_balance, cost, gain, net, payoff_month, monthly_payment.',
+    'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
     'Never invent a number: the app computes every series; you only order and title charts.',
     'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
     `Charts render over the whole snapshot: ${mortgagedCount} ${mortgagedCount === 1 ? 'property carries' : 'properties carry'} a mortgage, ${holdingCount} stock ${holdingCount === 1 ? 'holding exists' : 'holdings exist'}. Do not use mortgage_balance when no property carries a mortgage, and do not use stock_value when no stock holding exists.`,
@@ -1741,6 +1783,15 @@ export function validatePoolItemShapes(items) {
   const seenHoldings = new Set();
   for (const it of items) {
     if (!it || typeof it !== 'object') return 'pool items need a source';
+    // External funding: new cash from outside the app — a sourceless
+    // leg, amount only (a percent of nothing is meaningless).
+    if (it.source === 'external') {
+      if ((it.accountId != null && it.accountId !== '') || (it.holdingId != null && it.holdingId !== '')) return 'an external pool item has no account or holding';
+      if (it.percent != null && it.percent !== '') return 'external pool funding is an amount, not a percent';
+      const amt = Number(it.amount);
+      if (!isFinite(amt) || amt <= 0) return 'pool amounts must be above 0';
+      continue;
+    }
     const hasAccount = it.accountId != null && it.accountId !== '';
     const hasHolding = it.holdingId != null && it.holdingId !== '';
     if (hasAccount === hasHolding) return 'pool items need exactly one source (an account or a holding)';
@@ -1765,6 +1816,18 @@ export function validatePoolItemShapes(items) {
     }
   }
   return null;
+}
+
+// External cash in a pool entity: the sum of its sourceless legs.
+// Pure — the server seeds the projection pot with this (both runs),
+// so external funding is spendable cash, not a display-only number.
+export function poolExternalCash(entity) {
+  if (!entity || entity.type !== 'pool' || !Array.isArray(entity.items)) return 0;
+  let total = 0;
+  for (const it of entity.items) {
+    if (it && it.source === 'external') total += Number(it.amount) || 0;
+  }
+  return round2(total);
 }
 
 

@@ -225,8 +225,10 @@ CREATE TABLE IF NOT EXISTS invest_plans (
   job_id INTEGER NOT NULL REFERENCES earn_jobs(id),
   target_holding_id INTEGER REFERENCES invest_holdings(id) ON DELETE SET NULL,
   start_date TEXT NOT NULL,                   -- 'YYYY-MM-DD', first due period
-  own_amount REAL NOT NULL,                   -- payroll deduction per period, holding currency
-  employer_amount REAL,                       -- employer match per period; RRSP only, NULL = none
+  own_amount REAL,                            -- fixed mode: payroll deduction per period, holding currency (NULL in percent mode)
+  employer_amount REAL,                       -- fixed mode: employer match per period; RRSP only, NULL = none (NULL in percent mode)
+  own_pct REAL,                               -- percent mode: percent of the linked job's current per-period gross (NULL = fixed mode)
+  employer_pct REAL,                          -- percent mode: employer match percent, RRSP only (NULL = none)
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -340,6 +342,49 @@ CREATE TABLE IF NOT EXISTS property_photos (
 );
 CREATE INDEX IF NOT EXISTS idx_property_photos ON property_photos(property_id, sort_order, id);
 `);
+
+// Percent-mode columns on pre-existing databases: fixed plans keep
+// their stored dollars with both pct columns NULL — no migration of
+// stored amounts, ever.
+{
+  const planCols = db.prepare('PRAGMA table_info(invest_plans)').all().map((c) => c.name);
+  if (planCols.length && !planCols.includes('own_pct')) {
+    db.exec('ALTER TABLE invest_plans ADD COLUMN own_pct REAL');
+  }
+  if (planCols.length && !planCols.includes('employer_pct')) {
+    db.exec('ALTER TABLE invest_plans ADD COLUMN employer_pct REAL');
+  }
+  if (planCols.length) {
+    // own_amount was NOT NULL before percent mode; relax it so a
+    // percent plan can store NULL dollars. SQLite cannot drop a NOT
+    // NULL constraint in place — rebuild only when the old shape is
+    // detected (existing rows are unaffected: their amounts stay).
+    const ownCol = db.prepare('PRAGMA table_info(invest_plans)').all().find((c) => c.name === 'own_amount');
+    if (ownCol && ownCol.notnull === 1) {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE invest_plans_new (
+            id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES invest_accounts(id) ON DELETE CASCADE,
+            job_id INTEGER NOT NULL REFERENCES earn_jobs(id),
+            target_holding_id INTEGER REFERENCES invest_holdings(id) ON DELETE SET NULL,
+            start_date TEXT NOT NULL,
+            own_amount REAL,
+            employer_amount REAL,
+            own_pct REAL,
+            employer_pct REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO invest_plans_new (id, account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, own_pct, employer_pct, created_at, updated_at)
+            SELECT id, account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, own_pct, employer_pct, created_at, updated_at FROM invest_plans;
+          DROP TABLE invest_plans;
+          ALTER TABLE invest_plans_new RENAME TO invest_plans;
+        `);
+      })();
+    }
+  }
+}
 
 // Jobs predate the single-earner field; existing rows default to
 // unassigned (NULL). New databases get the column from the CREATE

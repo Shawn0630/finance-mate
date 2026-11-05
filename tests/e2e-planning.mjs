@@ -318,6 +318,57 @@ export async function run(H, S) {
         return v && !v.classList.contains('hidden') && list && list.textContent.includes('Hist TFSA');
       });
       H.check('history: History tab renders the commit list', tabOk === true);
+      // Inline accordion (user bug 2026-11-04): the detail expands
+      // directly under the clicked row — never at the page bottom.
+      const histIds = await page.evaluate(() => [...document.querySelectorAll('#histList tbody tr[data-hist-id]')].map((r) => Number(r.dataset.histId)));
+      H.check('histacc: at least three rows to test middle expansion', histIds.length >= 3, JSON.stringify({ count: histIds.length }));
+      if (histIds.length >= 3) {
+        // (a) Middle row expands immediately below itself.
+        const midId = histIds[1];
+        await page.evaluate((id) => { document.querySelector(`#histList tr[data-hist-id="${id}"]`).click(); }, midId);
+        await page.waitForFunction((id) => { const b = document.querySelector('#histList .hist-detail-body'); return b && b.textContent.includes(`Commit #${id}`); }, { timeout: 15000 }, midId);
+        const geo = await page.evaluate((id) => {
+          const rows = [...document.querySelectorAll('#histList tbody tr')];
+          const ci = rows.findIndex((r) => Number(r.dataset.histId) === id);
+          const detail = rows[ci + 1];
+          const next = rows[ci + 2];
+          return {
+            detailIsNext: !!detail && detail.classList.contains('hist-detail-row'),
+            detailTop: detail ? detail.getBoundingClientRect().top : null,
+            clickedBottom: ci >= 0 ? rows[ci].getBoundingClientRect().bottom : null,
+            nextTop: next ? next.getBoundingClientRect().top : null,
+            hasBottomPanel: !!document.querySelector('#histDetail'),
+          };
+        }, midId);
+        H.check('histacc: middle row expands directly below it (not at page bottom)',
+          geo.detailIsNext && geo.detailTop >= geo.clickedBottom - 2 && geo.detailTop < geo.nextTop && !geo.hasBottomPanel, JSON.stringify(geo));
+        // (b) Another row moves the detail under it; single-open.
+        const otherId = histIds[2];
+        await page.evaluate((id) => { document.querySelector(`#histList tr[data-hist-id="${id}"]`).click(); }, otherId);
+        await page.waitForFunction((id) => { const b = document.querySelector('#histList .hist-detail-body'); return b && b.textContent.includes(`Commit #${id}`); }, { timeout: 15000 }, otherId);
+        const moved = await page.evaluate((oid, mid) => {
+          const rows = [...document.querySelectorAll('#histList tbody tr')];
+          const oi = rows.findIndex((r) => Number(r.dataset.histId) === oid);
+          const detail = rows[oi + 1];
+          return {
+            count: document.querySelectorAll('#histList .hist-detail-row').length,
+            underNew: !!detail && detail.classList.contains('hist-detail-row'),
+            showsOther: detail ? detail.textContent.includes(`Commit #${oid}`) : false,
+            showsOld: [...document.querySelectorAll('#histList .hist-detail-body')].some((x) => x.textContent.includes(`Commit #${mid}`)),
+          };
+        }, otherId, midId);
+        H.check('histacc: clicking another row moves the detail under it, first row collapses',
+          moved.count === 1 && moved.underNew && moved.showsOther && !moved.showsOld, JSON.stringify(moved));
+        // (c) Clicking the open row collapses it; (d) no bottom container.
+        await page.evaluate((id) => { document.querySelector(`#histList tr[data-hist-id="${id}"]`).click(); }, otherId);
+        await waitH(500);
+        const collapsed = await page.evaluate(() => ({
+          details: document.querySelectorAll('#histList .hist-detail-row').length,
+          bottom: !!document.querySelector('#histDetail'),
+        }));
+        H.check('histacc: clicking the open row collapses it, no bottom detail container',
+          collapsed.details === 0 && !collapsed.bottom, JSON.stringify(collapsed));
+      }
     } finally {
       await browserH.close();
     }
@@ -415,31 +466,42 @@ export async function run(H, S) {
         JSON.stringify(subs));
       await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="refinance"]').click(); });
       await waitT(800);
-      const intake = await page.evaluate(() => ({
-        modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
-        catNote: document.querySelector('#planProjectCategoryNote') ? document.querySelector('#planProjectCategoryNote').textContent : '',
-        catBtnsVisible: !document.querySelector('#planProjectCategoryBtns').classList.contains('hidden'),
-        saveLabel: document.querySelector('#planProjectSaveBtn').textContent,
-        question: document.querySelector('#planProjectForm [name=question]').value,
-      }));
-      H.check('planning category intake shows the recommendation, Apply + AI + Create-without',
-        intake.modalOpen && intake.catBtnsVisible && intake.saveLabel === 'Create without'
+      const intake = await page.evaluate(() => {
+        const saveBtn = document.querySelector('#planProjectSaveBtn');
+        const aiBtn = document.querySelector('#planAiCreateBtn');
+        const cs = (el) => el ? getComputedStyle(el) : null;
+        const s = cs(saveBtn); const a = cs(aiBtn);
+        return {
+          modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+          catNote: document.querySelector('#planProjectCategoryNote') ? document.querySelector('#planProjectCategoryNote').textContent : '',
+          saveLabel: saveBtn ? saveBtn.textContent : '',
+          aiVisible: aiBtn ? !aiBtn.classList.contains('hidden') : false,
+          aiLabel: aiBtn ? aiBtn.textContent : '',
+          noApplyBtn: !document.querySelector('#planProjectApplyRecBtn'),
+          cancelVisible: !!document.querySelector('#planProjectModal [data-close-modal]'),
+          sameStyle: !!(s && a && s.height === a.height && s.paddingTop === a.paddingTop && s.paddingBottom === a.paddingBottom && s.fontWeight === a.fontWeight),
+          question: document.querySelector('#planProjectForm [name=question]').value,
+        };
+      });
+      H.check('planning category intake shows exactly two creation buttons + Cancel, AI button in primary style',
+        intake.modalOpen && intake.saveLabel === 'Create project' && intake.aiVisible && intake.aiLabel.includes('Create with AI')
+          && intake.noApplyBtn && intake.cancelVisible && intake.sameStyle
           && intake.catNote.includes('property') && intake.catNote.includes('refinance')
           && intake.catNote.includes('Baseline:') && intake.catNote.includes('Strategy:')
           && intake.question.length > 0,
         JSON.stringify(intake));
       await page.type('#planProjectForm [name=name]', 'Category Flow Test');
-      await page.click('#planProjectApplyRecBtn');
+      await page.click('#planProjectSaveBtn');
       try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
       await waitT(1500);
       const landed = await page.evaluate(() => {
         const panelTitles = [...document.querySelectorAll('.panel .section-head h3')].map((el) => el.textContent);
-        const baseCards = [...document.querySelectorAll('#planBaselineCards [data-plan-baseline]')].map((el) => ({
-          name: el.textContent,
-          edit: !!el.querySelector('[data-plan-baseline-edit]'),
-          ai: !!el.querySelector('[data-plan-baseline-ai]'),
-          del: !!el.querySelector('[data-plan-baseline-del]'),
-        }));
+        const fixedCard = document.querySelector('#planFixedBaselineCard');
+        const fixedBase = {
+          present: !!fixedCard,
+          text: fixedCard ? fixedCard.textContent : '',
+          buttons: [...document.querySelectorAll('#planBaselineCards button')].length,
+        };
         const stratCards = [...document.querySelectorAll('#planStrategyCards [data-plan-strategy]')].map((el) => ({
           text: el.textContent,
           edit: !!el.querySelector('[data-plan-strategy-edit]'),
@@ -450,7 +512,7 @@ export async function run(H, S) {
           headerTitle: document.querySelector('#planProjectHeader h3') ? document.querySelector('#planProjectHeader h3').textContent : '',
           panelTitles,
           catLine: document.querySelector('#planProjectCategoryLine') ? document.querySelector('#planProjectCategoryLine').textContent : '',
-          baseCards, stratCards,
+          fixedBase, stratCards,
         };
       });
       H.check('planning detail title is an inline header row, not a standalone card',
@@ -467,10 +529,10 @@ export async function run(H, S) {
       H.check('beautify: project title row carries category/subcategory/entity as tags (no separate note line)',
         titleTags.tags.length === 3 && titleTags.tags[0] === 'Property' && titleTags.tags[1] === 'Refinance' && titleTags.tags[2].includes('77 Planning Test Lane') && !titleTags.noteLine,
         JSON.stringify(titleTags));
-      H.check('planning applied recommendation renders baseline cards with Edit/Delete and strategy cards as click-to-navigate only (no card toolbar)',
-        landed.baseCards.length === 1 && landed.baseCards[0].edit && !landed.baseCards[0].ai && landed.baseCards[0].del
+      H.check('planning applied recommendation renders the fixed baseline as metadata only (no Edit/Delete/Select) + strategy cards as click-to-navigate only (no card toolbar)',
+        landed.fixedBase.present && landed.fixedBase.text.includes('Fixed baseline') && landed.fixedBase.text.includes('77 Planning Test Lane') && landed.fixedBase.buttons === 0
           && landed.stratCards.length === 1 && !landed.stratCards[0].edit && !landed.stratCards[0].del,
-        JSON.stringify({ baseCards: landed.baseCards, stratCards: landed.stratCards }));
+        JSON.stringify({ fixedBase: landed.fixedBase, stratCards: landed.stratCards }));
       const catProjectId = landed.hash.split('/').pop();
       // Edit modal carries no category control, and PUT rejects a change.
       await page.evaluate(() => { document.querySelector('#planProjectEditBtn').click(); });
@@ -478,18 +540,19 @@ export async function run(H, S) {
       const editModal = await page.evaluate(() => ({
         open: !document.querySelector('#planProjectModal').classList.contains('hidden'),
         catRowHidden: document.querySelector('#planProjectCategoryRow').classList.contains('hidden'),
-        catBtnsHidden: document.querySelector('#planProjectCategoryBtns').classList.contains('hidden'),
+        aiBtnHidden: document.querySelector('#planAiCreateBtn').classList.contains('hidden'),
         saveLabel: document.querySelector('#planProjectSaveBtn').textContent,
       }));
       H.check('planning edit modal has no category control',
-        editModal.open && editModal.catRowHidden && editModal.catBtnsHidden && editModal.saveLabel === 'Save',
+        editModal.open && editModal.catRowHidden && editModal.aiBtnHidden && editModal.saveLabel === 'Save',
         JSON.stringify(editModal));
       await page.evaluate(() => { document.querySelector('#planProjectModal [data-close-modal]').click(); });
       await waitT(300);
       r = await H.req('PUT', `/api/planning/projects/${catProjectId}`, { name: 'Category Flow Test', category: 'investment' });
       H.check('planning PUT changing the category returns 400',
         r.status === 400 && String(r.data.error || '').includes('cannot be changed'), JSON.stringify(r.data));
-      // Create-without: same flow, no recommendation applied.
+      // Create project (interest_rate): the same flow now applies the
+      // recommendation — the old create-without path is gone by design.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitT(1000);
       await page.click('#planAddProjectBtn');
@@ -509,13 +572,13 @@ export async function run(H, S) {
       try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
       await waitT(1500);
       const bareLanded = await page.evaluate(() => ({ hash: location.hash }));
-      H.check('planning create-without lands on a project page',
+      H.check('planning create-project lands on a project page',
         bareLanded.hash.startsWith('#planning/project/') && bareLanded.hash !== landed.hash,
         JSON.stringify(bareLanded));
       const bareProjectId = bareLanded.hash.split('/').pop();
       r = await H.req('GET', `/api/planning/projects/${bareProjectId}`);
-      H.check('planning create-without starts with no baseline and no strategy',
-        (r.data.project.baselines || []).length === 0 && (r.data.strategies || []).length === 0,
+      H.check('planning create-project applies the recommendation (baseline + strategy present)',
+        (r.data.project.baselines || []).length === 1 && (r.data.strategies || []).length === 1,
         JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length }));
       // Scope categories (saving / tax_saving): no property dropdown
       // may appear, survive a switch, or arrive late — and creation
@@ -1434,19 +1497,22 @@ export async function run(H, S) {
       await mbWait(1500);
       const flatState = await page.evaluate(() => {
         const world = document.querySelector('#planStrategyCardsWorld');
-        const bCard = document.querySelector('#planBaselineCards [data-plan-baseline]');
-        const sCard = document.querySelector('#planStrategyCards [data-plan-strategy]');
+        // Column tops, not first-child tops: the baseline column
+        // holds the fixed card or (uncategorized) the note, whose
+        // own margins differ from a strategy card's — the alignment
+        // invariant is the columns starting at the same height.
+        const bTop = document.querySelector('#planBaselineCards')?.getBoundingClientRect().top ?? null;
+        const sTop = document.querySelector('#planStrategyCards')?.getBoundingClientRect().top ?? null;
         return {
           parent: world?.parentElement?.id || '',
           inStratCol: !!document.querySelector('#planStrategiesPanel #planStrategyCardsWorld'),
           note: world?.textContent || '',
-          bTop: bCard ? bCard.getBoundingClientRect().top : null,
-          sTop: sCard ? sCard.getBoundingClientRect().top : null,
+          bTop, sTop,
         };
       });
       H.check('tieralign: world note is a single element above the row, not inside the Strategies column',
         flatState.parent === 'planFlowMidTier' && !flatState.inStratCol, JSON.stringify(flatState));
-      H.check('tieralign: baseline and strategy cards share the same top offset (flat world)',
+      H.check('tieralign: baseline and strategy columns share the same top offset (flat world)',
         flatState.bTop !== null && flatState.sTop !== null && Math.abs(flatState.bTop - flatState.sTop) <= 1, JSON.stringify(flatState));
       H.check('tieralign: flat-world note text correct',
         flatState.note.includes('Current rates (no scenario)'), JSON.stringify(flatState));
@@ -1460,17 +1526,16 @@ export async function run(H, S) {
       await mbWait(1500);
       const pickedState = await page.evaluate(() => {
         const world = document.querySelector('#planStrategyCardsWorld');
-        const bCard = document.querySelector('#planBaselineCards [data-plan-baseline]');
-        const sCard = document.querySelector('#planStrategyCards [data-plan-strategy]');
+        const bTop = document.querySelector('#planBaselineCards')?.getBoundingClientRect().top ?? null;
+        const sTop = document.querySelector('#planStrategyCards')?.getBoundingClientRect().top ?? null;
         return {
           note: world?.textContent || '',
-          bTop: bCard ? bCard.getBoundingClientRect().top : null,
-          sTop: sCard ? sCard.getBoundingClientRect().top : null,
+          bTop, sTop,
         };
       });
       H.check('tieralign: note text correct for a picked scenario',
         pickedState.note.includes('Under TA World'), JSON.stringify(pickedState));
-      H.check('tieralign: baseline and strategy cards share the same top offset (picked world)',
+      H.check('tieralign: baseline and strategy columns share the same top offset (picked world)',
         pickedState.bTop !== null && pickedState.sTop !== null && Math.abs(pickedState.bTop - pickedState.sTop) <= 1, JSON.stringify(pickedState));
     } finally { await mbBrowser.close(); }
   }
@@ -1554,8 +1619,8 @@ export async function run(H, S) {
         stratRowHidden: !!document.querySelector('#planAiPanelStrategyRow.hidden'),
         scenNameShown: !document.querySelector('#planAiPanelScenarioNameRow.hidden'),
       }));
-      H.check('modelmove: panel shows exactly three targets (no Strategy·model), scenario default, strategy row hidden',
-        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'baseline', 'ops']) && targets.stratRowHidden && targets.scenNameShown, JSON.stringify(targets));
+      H.check('modelmove: panel shows exactly two targets (no Strategy·model, no Baseline — baselines are fixed), scenario default, strategy row hidden',
+        JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'ops']) && targets.stratRowHidden && targets.scenNameShown, JSON.stringify(targets));
       await page.evaluate(() => document.querySelector('[data-plan-ai-target="ops"]').click());
       const opsRow = await page.evaluate(() => !document.querySelector('#planAiPanelStrategyRow.hidden'));
       H.check('aipanel browser: ops target shows the strategy picker', opsRow);
@@ -1575,22 +1640,18 @@ export async function run(H, S) {
       await panelWait(1500);
       const scenCard = await page.evaluate(() => (document.querySelector('#planScenarioCards')?.textContent || '').includes('Panel Scenario'));
       H.check('aipanel browser: scenario designed in the panel joins the Scenarios list', scenCard);
-      // Baseline through the panel: ask → answer → Apply.
+      // Baselines are FIXED: no baseline target in the panel, and the
+      // tier offers no baseline buttons (this fixture project has no
+      // category, so the tier shows the no-fixed-baseline note).
       await page.evaluate(() => document.querySelector('#planAiPanelToggleBtn').click());
       await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
-      await page.evaluate(() => document.querySelector('[data-plan-ai-target="baseline"]').click());
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ ask: [{ field: 'prime_direction', label: 'Prime direction?', type: 'text' }] }));
-      await page.evaluate(() => { document.querySelector('#planAiPanelText').value = 'Prime rises'; });
-      await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planAiPanelAsk_prime_direction'), { timeout: 15000 });
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ baseline: { description: 'Panel baseline desc', assumptions: [] } }));
-      await page.evaluate(() => { document.querySelector('#planAiPanelAsk_prime_direction').value = 'up'; });
-      await page.evaluate(() => document.querySelector('#planAiPanelContinueBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planAiPanelApplyBtn'), { timeout: 15000 });
-      await page.evaluate(() => document.querySelector('#planAiPanelApplyBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('Panel baseline desc'), { timeout: 15000 });
-      const baseListed = await page.evaluate(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('Panel baseline desc'));
-      H.check('aipanel browser: baseline designed in the panel joins the Baselines list', baseListed);
+      const noBaseTarget = await page.evaluate(() => ({
+        targetGone: !document.querySelector('[data-plan-ai-target="baseline"]'),
+        tierText: document.querySelector('#planBaselineCards')?.textContent || '',
+        noBaseButtons: [...document.querySelectorAll('#planBaselineCards button')].length === 0,
+      }));
+      H.check('fixedbase: panel has no baseline target and the tier offers no baseline buttons',
+        noBaseTarget.targetGone && noBaseTarget.tierText.includes('No fixed baseline') && noBaseTarget.noBaseButtons, JSON.stringify(noBaseTarget));
       // Strategy page: the Describe panel is gone (absorbed).
       await page.goto(`http://ff.local/#planning/strategy/${planStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await panelWait(1500);
@@ -1776,7 +1837,14 @@ export async function run(H, S) {
   H.check('planning: test property cleanup', r.status === 200, JSON.stringify(r.data));
 
   // ---- Optimization categories: multi-baseline, cards, AI follow-up, grounding ----
-  r = await H.req('POST', '/api/properties', { address: '9 Category Lane', purchase_date: '2024-01-15', mortgage_balance: 800000, amortization_years: 25 });
+  // Assessed value set on purpose: under entity scoping (user rule
+  // 2026-11-04) this project's valueAtHorizon comes ONLY from this
+  // property, so a property-growth check needs a nonzero assessed
+  // base to grow — with assessed null (= 0) growth adds nothing and
+  // the 9% prime factor alone would push the scenario horizon BELOW
+  // the flat world, which is correct arithmetic but not what this
+  // pin is testing.
+  r = await H.req('POST', '/api/properties', { address: '9 Category Lane', purchase_date: '2024-01-15', mortgage_balance: 800000, amortization_years: 25, assessed_value: 1000000, assessed_year: 2026 });
   H.check('planning category: fixture property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
   const catPid = r.data.id;
   r = await H.req('POST', `/api/properties/${catPid}/rates`, { start_date: '2024-01-15', rate_type: 'variable', rate_mode: 'prime_spread', spread: -1 });
@@ -1793,8 +1861,8 @@ export async function run(H, S) {
   H.check('planning category: baseline B created', r.status === 201 && r.data.baseline && r.data.baseline.id > 0, JSON.stringify(r.data));
   const baseB = r.data.baseline.id;
   r = await H.req('GET', `/api/planning/projects/${catMultiId}`);
-  H.check('planning category: two baselines coexist in one project',
-    (r.data.project.baselines || []).length === 2, JSON.stringify((r.data.project.baselines || []).map((b) => b.name)));
+  H.check('planning category: two baselines coexist in one project (plus the auto fixed record)',
+    (r.data.project.baselines || []).length === 3, JSON.stringify((r.data.project.baselines || []).map((b) => b.name)));
   const mkStrat = async (name, amount) => {
     const s2 = await H.req('POST', `/api/planning/projects/${catMultiId}/strategies`, { name, source: 'template' });
     const sid = s2.data.strategy.id;
@@ -1810,7 +1878,7 @@ export async function run(H, S) {
   H.check('planning category: recommendation appends a third baseline', r.status === 201, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/projects/${catMultiId}`);
   H.check('planning category: append keeps the old baselines',
-    (r.data.project.baselines || []).length === 3
+    (r.data.project.baselines || []).length === 4
       && (r.data.project.baselines || []).some((b) => b.id === baseA)
       && (r.data.project.baselines || []).some((b) => b.id === baseB),
     JSON.stringify((r.data.project.baselines || []).map((b) => b.name)));
@@ -2181,15 +2249,15 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/project/${poolProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
       const poolPage = await page.evaluate(() => {
-        const baseCards = [...document.querySelectorAll('#planBaselineCards [data-plan-baseline]')];
+        const fixedCard = document.querySelector('#planFixedBaselineCard');
         const stratCards = [...document.querySelectorAll('#planStrategiesPanel [data-plan-strategy]')];
         return {
-          baseText: baseCards.map((c) => c.textContent).join(' | '),
+          baseText: fixedCard ? fixedCard.textContent : '',
           stratText: stratCards.map((c) => c.textContent).join(' | '),
         };
       });
-      H.check('planning pool: baseline cards carry no factor UI, strategy card shows the sink line',
-        !poolPage.baseText.includes('Prime →') && !poolPage.baseText.includes('Sink:')
+      H.check('planning pool: fixed baseline display carries no factor UI, strategy card shows the sink line',
+        poolPage.baseText.includes('Fixed baseline') && !poolPage.baseText.includes('Prime →') && !poolPage.baseText.includes('Sink:')
           && poolPage.stratText.includes('Sink: existing stock'),
         JSON.stringify(poolPage));
       // Factors live on scenarios now: the strategy detail carries no
@@ -2202,12 +2270,13 @@ export async function run(H, S) {
       const stratPage = await page.evaluate(() => ({
         factorsPanel: !!document.querySelector('#planFactorsPanel'),
         sinkPanel: !!document.querySelector('#planSinkPanel'),
-        scenSel: !!document.querySelector('#planStrategyScenarioSel'),
+        scenTier: !!document.querySelector('#planStrategyScenarioTier'),
+        scenSelGone: !document.querySelector('#planStrategyScenarioSel'),
         scenarioPanelOld: !!document.querySelector('#planScenarioPanel'),
         fanChart: !!document.querySelector('#planStrategyFanChart'),
       }));
-      H.check('planning pool: strategy detail has no Factors panel, keeps the Sink panel + scenario picker, no fan chart',
-        !stratPage.factorsPanel && stratPage.sinkPanel && stratPage.scenSel && !stratPage.scenarioPanelOld && !stratPage.fanChart,
+      H.check('planning pool: strategy detail has no Factors panel, keeps the Sink panel + Scenarios tier (picker gone), no fan chart',
+        !stratPage.factorsPanel && stratPage.sinkPanel && stratPage.scenTier && stratPage.scenSelGone && !stratPage.scenarioPanelOld && !stratPage.fanChart,
         JSON.stringify(stratPage));
       await page.goto(`http://ff.local/#planning/scenario/${poolScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1500);
@@ -2248,15 +2317,28 @@ export async function run(H, S) {
       });
       H.check('scenario restructure: strategy ops + sink still render figures under a factor-less scenario',
         poolAfter.hasValue && poolAfter.text.includes('Sink: existing stock'), JSON.stringify(poolAfter));
-      // Pool builder: account percent + holding amount compose the same
-      // 1100 total live, and the preview card carries it.
+      // Pool builder, visualized flow: "+ Add funding" adds one entry
+      // at a time; each entry picks a stock inside an account or
+      // external cash. The total + doughnut + breakdown update live;
+      // removing a leg updates both; validation errors still fire.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1200);
       await page.click('#planAddProjectBtn');
       await waitQ(300);
       await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="investment"]').click(); });
       await waitQ(1200);
-      const built = await page.evaluate((ids) => {
+      const vizOpts = await page.evaluate(() => {
+        const btn = document.querySelector('#planPoolAddBtn');
+        if (!btn) return { error: 'no Add funding button' };
+        btn.click();
+        const sel = document.querySelector('[data-pool-entry-source]');
+        if (!sel) return { error: 'no source picker after Add funding' };
+        return { options: [...sel.options].map((o) => ({ v: o.value, t: o.text })) };
+      });
+      H.check('poolviz: + Add funding opens a source picker offering account holdings AND an external option',
+        vizOpts.options && vizOpts.options.some((o) => o.v === `holding:${poolHoldB}`) && vizOpts.options.some((o) => o.v === 'external' && /External/.test(o.t)),
+        JSON.stringify(vizOpts));
+      const vizBuilt = await page.evaluate((ids) => {
         const setVal = (sel, val, ev) => {
           const el = document.querySelector(sel);
           if (!el) return false;
@@ -2264,69 +2346,141 @@ export async function run(H, S) {
           el.dispatchEvent(new Event(ev, { bubbles: true }));
           return true;
         };
-        const acctCb = document.querySelector(`[data-pool-account="${ids.acctA}"]`);
-        if (!acctCb) return { error: 'no account row' };
-        acctCb.click();
-        setVal(`[data-pool-input="${ids.acctA}"]`, '30', 'input');
-        const holdCb = document.querySelector(`[data-pool-holding="${ids.holdB}"]`);
-        if (!holdCb) return { error: 'no holding row' };
-        holdCb.click();
-        setVal(`[data-pool-mode-h="${ids.holdB}"]`, 'amount', 'change');
-        setVal(`[data-pool-input-h="${ids.holdB}"]`, '500', 'input');
-        return { total: document.querySelector('#planPoolTotal')?.textContent || '' };
-      }, { acctA: poolAcctA, holdB: poolHoldB });
-      H.check('planning pool: builder composes 30% of account A + $500 of holding B into a 1,100.00 live total',
-        built.total && built.total.includes('1,100.00'), JSON.stringify(built));
-      await page.click('#planCatEntityGo');
-      await waitQ(1200);
-      const preview = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
-      H.check('planning pool: builder preview card carries the 1,100.00 pool value over 2 stocks',
-        preview.includes('1,100.00') && preview.includes('2 stocks'), JSON.stringify(preview.slice(0, 300)));
-      // Beautify: pool builder groups holdings collapsibly with $0
-      // holdings tucked behind a show control (presentation only —
-      // the total/validation pins above already cover the model).
-      r = await H.req('POST', `/api/investments/accounts/${poolAcctB}/holdings`, { label: 'Pool Zero', kind: 'exchange', symbol: 'POOL.Z', currency: 'CAD', events: [] });
-      H.check('beautify: zero-value fixture holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+        const rows = [...document.querySelectorAll('[data-pool-entry]')];
+        const row0 = rows[0];
+        row0.querySelector('[data-pool-entry-source]').value = `holding:${ids.holdB}`;
+        row0.querySelector('[data-pool-entry-source]').dispatchEvent(new Event('change', { bubbles: true }));
+        row0.querySelector('[data-pool-entry-mode]').value = 'amount';
+        row0.querySelector('[data-pool-entry-mode]').dispatchEvent(new Event('change', { bubbles: true }));
+        setVal('[data-pool-entry-input]', '500', 'input');
+        document.querySelector('#planPoolAddBtn').click();
+        const row1 = [...document.querySelectorAll('[data-pool-entry]')][1];
+        row1.querySelector('[data-pool-entry-source]').value = 'external';
+        row1.querySelector('[data-pool-entry-source]').dispatchEvent(new Event('change', { bubbles: true }));
+        const inp1 = row1.querySelector('[data-pool-entry-input]');
+        inp1.value = '700';
+        inp1.dispatchEvent(new Event('input', { bubbles: true }));
+        return {
+          total: document.querySelector('#planPoolTotal')?.textContent || '',
+          viz: document.querySelector('#planPoolVizBody')?.textContent || '',
+          doughnut: (typeof planCharts !== 'undefined' && planCharts.planPoolVizChart) ? planCharts.planPoolVizChart.data.datasets[0].data : null,
+        };
+      }, { holdB: poolHoldB });
+      H.check('poolviz: holding leg ($500) + external leg ($700) compose a 1,200.00 live total with both parts in the visualization',
+        vizBuilt.total.includes('1,200.00') && vizBuilt.viz.includes('500.00') && vizBuilt.viz.includes('700.00')
+          && vizBuilt.viz.includes('External funding') && vizBuilt.viz.includes('POOL.B')
+          && Array.isArray(vizBuilt.doughnut) && vizBuilt.doughnut.length === 2,
+        JSON.stringify(vizBuilt));
+      const vizRemoved = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-pool-entry]')];
+        rows[1].querySelector('[data-pool-entry-remove]').click();
+        return {
+          total: document.querySelector('#planPoolTotal')?.textContent || '',
+          viz: document.querySelector('#planPoolVizBody')?.textContent || '',
+          doughnut: (typeof planCharts !== 'undefined' && planCharts.planPoolVizChart) ? planCharts.planPoolVizChart.data.datasets[0].data : null,
+        };
+      });
+      H.check('poolviz: removing the external leg drops the total to 500.00 and the visualization to one part',
+        vizRemoved.total.includes('500.00') && !vizRemoved.viz.includes('External funding') && vizRemoved.viz.includes('POOL.B')
+          && Array.isArray(vizRemoved.doughnut) && vizRemoved.doughnut.length === 1,
+        JSON.stringify(vizRemoved));
+      const vizErr = await page.evaluate(() => {
+        const row = document.querySelector('[data-pool-entry]');
+        row.querySelector('[data-pool-entry-mode]').value = 'percent';
+        row.querySelector('[data-pool-entry-mode]').dispatchEvent(new Event('change', { bubbles: true }));
+        const inp = row.querySelector('[data-pool-entry-input]');
+        inp.value = '101';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planCatEntityGo').click();
+        return { msg: document.querySelector('#planCategoryMsg')?.textContent || '' };
+      });
+      H.check('poolviz: percent above 100 still errors at Continue',
+        vizErr.msg.includes('100'), JSON.stringify(vizErr));
+      const vizFixed = await page.evaluate(() => {
+        // Drop the leftover empty entry vizBuilt's extra Add left
+        // behind: Continue correctly rejects entries with no source,
+        // so the empty row would block the fix-to-30% Continue.
+        [...document.querySelectorAll('[data-pool-entry]')].forEach((r) => {
+          if (!r.querySelector('[data-pool-entry-source]').value) r.querySelector('[data-pool-entry-remove]').click();
+        });
+        const row = document.querySelector('[data-pool-entry]');
+        const inp = row.querySelector('[data-pool-entry-input]');
+        inp.value = '30';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planCatEntityGo').click();
+        return { subs: document.querySelector('#planCategorySubs')?.textContent || '' };
+      });
+      await waitQ(300);
+      // Wait for the subcategory preview to render (recommendations
+      // round-trip) instead of a fixed sleep: under load the render
+      // can land after 1200ms, which used to read an empty container.
+      try {
+        await page.waitForFunction(() => {
+          const s = document.querySelector('#planCategorySubs');
+          return s && s.textContent.trim() !== '';
+        }, { timeout: 10000 });
+      } catch { /* falls through to the check below with what rendered */ }
+      const vizPreview = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
+      H.check('poolviz: fixing to 30% of holding B continues to a preview carrying the 600.00 pool value',
+        vizPreview.includes('600.00'), JSON.stringify(vizPreview.slice(0, 300)));
+      // Fresh builder: an entry with no source, then no entries at all.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitQ(1200);
       await page.click('#planAddProjectBtn');
       await waitQ(300);
       await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="investment"]').click(); });
       await waitQ(1200);
-      const poolUi = await page.evaluate((acctB) => {
-        const group = document.querySelector(`[data-pool-group="${acctB}"]`);
-        if (!group) return { error: 'no group' };
-        const toggle = group.querySelector('[data-pool-toggle]');
-        const box = group.querySelector('[data-pool-holdings]');
-        const zeroBox = group.querySelector('[data-pool-zero]');
-        const zeroBtn = group.querySelector('[data-pool-zero-btn]');
-        const out = {
-          toggle: !!toggle, boxHidden: box ? box.hidden : null,
-          zeroHidden: zeroBox ? zeroBox.hidden : null, zeroBtn: !!zeroBtn,
-          zeroBtnText: zeroBtn ? zeroBtn.textContent : '',
-        };
-        if (toggle) toggle.click();
-        out.afterExpandHidden = box ? box.hidden : null;
-        out.zeroStillHidden = zeroBox ? zeroBox.hidden : null;
-        if (zeroBtn) zeroBtn.click();
-        out.zeroAfterShow = zeroBox ? zeroBox.hidden : null;
-        const firstNz = [...group.querySelectorAll('[data-pool-holding]')].find((cb) => {
-          const row = cb.closest('.plan-row');
-          return row && !row.closest('[data-pool-zero]');
-        });
-        if (firstNz) firstNz.click();
-        out.toggleLabel = toggle ? toggle.textContent : '';
-        if (toggle) toggle.click();
-        out.afterCollapseHidden = box ? box.hidden : null;
-        return out;
-      }, poolAcctB);
-      H.check('beautify: pool builder groups holdings collapsibly with $0 holdings tucked (expand → show → picked → collapse)',
-        poolUi.toggle && poolUi.boxHidden === true && poolUi.zeroHidden === true && poolUi.zeroBtn && poolUi.zeroBtnText.includes('$0')
-          && poolUi.afterExpandHidden === false && poolUi.zeroStillHidden === true && poolUi.zeroAfterShow === false
-          && poolUi.toggleLabel.includes('picked') && poolUi.afterCollapseHidden === true,
-        JSON.stringify(poolUi));
+      const vizEmpty = await page.evaluate(() => {
+        document.querySelector('#planCatEntityGo').click();
+        const noSource = document.querySelector('#planCategoryMsg')?.textContent || '';
+        document.querySelector('[data-pool-entry-remove]').click();
+        document.querySelector('#planCatEntityGo').click();
+        const noEntries = document.querySelector('#planCategoryMsg')?.textContent || '';
+        return { noSource, noEntries };
+      });
+      H.check('poolviz: Continue with an unsourced entry, then with no entries, both error',
+        vizEmpty.noSource.includes('source') && vizEmpty.noEntries.includes('at least one'),
+        JSON.stringify(vizEmpty));
     } finally { await browserQ.close(); }
   }
+  // External pool funding (API): a sourceless leg is accepted, its
+  // amount joins the pool total, and it seeds the projection pot so
+  // a pot-funded buy computes against it (no regression in op-form
+  // funding). Shape errors still fire for percent-on-external and
+  // zero external amounts.
+  r = await H.req('POST', '/api/planning/projects', { name: 'PoolViz Ext', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: poolHoldA, percent: 100 }, { source: 'external', amount: 5000 }] } });
+  H.check('poolviz: project with a holding + external leg creates', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const pvProj = r.data.project.id;
+  r = await H.req('POST', '/api/planning/recommendations', { category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: poolHoldA, percent: 100 }, { source: 'external', amount: 5000 }] } });
+  const pvFigs = r.data.recommendations && r.data.recommendations.stock && r.data.recommendations.stock.baseline && r.data.recommendations.stock.baseline.figures;
+  H.check('poolviz: recommendation pool value includes the external 5000 (2000 holding + 5000 external)',
+    r.status === 200 && pvFigs && pvFigs.poolValue === 7000 && (pvFigs.items || []).some((it) => it.source === 'external' && it.value === 5000),
+    JSON.stringify(pvFigs));
+  r = await H.req('POST', '/api/planning/projects', { name: 'PoolViz Bad', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ source: 'external', percent: 50 }] } });
+  H.check('poolviz: percent on an external leg is rejected', r.status === 400 && /not a percent/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/projects', { name: 'PoolViz Bad2', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ source: 'external', amount: 0 }] } });
+  H.check('poolviz: zero external amount is rejected', r.status === 400 && /above 0/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${pvProj}/strategies`, { name: 'Buy from external' });
+  H.check('poolviz: external-pool strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const pvStrat = r.data.strategy.id;
+  // Local buy date (next month 1st) + pre-buy month: the payscope
+  // block's psOpDate is declared later in this file, so this section
+  // must not reference it (TDZ aborts the whole module).
+  const _pvNow = new Date();
+  const _pvNext = new Date(Date.UTC(_pvNow.getUTCFullYear(), _pvNow.getUTCMonth() + 1, 1));
+  const pvOpDate = _pvNext.toISOString().slice(0, 10);
+  const pvPreMonth = `${_pvNow.getUTCFullYear()}-${String(_pvNow.getUTCMonth() + 1).padStart(2, '0')}`;
+  r = await H.req('POST', `/api/planning/strategies/${pvStrat}/ops`, { op_type: 'buy', params: { accountId: poolAcctA, symbol: 'POOL.EXT', date: pvOpDate, units: 12, price: 100, currency: 'CAD' }, legs: [{ source_ref: 'pot', amount: 'all' }] });
+  H.check('poolviz: pot-funded buy against external cash creates', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${pvStrat}`);
+  const pvErrs = (r.data.comparison && r.data.comparison.errors) || [];
+  const pvPot = (r.data.projection && r.data.projection.stocks && r.data.projection.stocks.potSeries) || [];
+  const pvPotAt = (m) => (pvPot.find((x) => x.month === m) || {}).value;
+  H.check('poolviz: buy from external-seeded pot computes — strategy pot 5000 before the buy, 3800 at the buy month',
+    pvErrs.length === 0 && pvPotAt(pvPreMonth) === 5000 && pvPotAt(pvOpDate.slice(0, 7)) === 3800,
+    JSON.stringify({ errors: pvErrs, pre: pvPotAt(pvPreMonth), buy: pvPotAt(pvOpDate.slice(0, 7)) }));
+  r = await H.req('DELETE', `/api/planning/projects/${pvProj}`);
+  H.check('poolviz: external-pool project cleanup', r.status === 200);
   r = await H.req('DELETE', `/api/planning/projects/${poolProjId}`);
   H.check('planning pool: project cleanup', r.status === 200);
   r = await H.req('DELETE', `/api/planning/projects/${poolGrowthId}`);
@@ -2419,10 +2573,11 @@ export async function run(H, S) {
         stockVal: !!document.querySelector('#planFactorStockVal'),
         growthInput: !!document.querySelector('[data-growth]'),
         sinkPanel: !!document.querySelector('#planSinkPanel'),
-        scenSel: !!document.querySelector('#planStrategyScenarioSel'),
+        scenTier: !!document.querySelector('#planStrategyScenarioTier'),
+        scenSelGone: !document.querySelector('#planStrategyScenarioSel'),
       }));
-      H.check('strategy editor: property strategy detail carries no factor UI; scenario picker present',
-        !fresh.addSel && !fresh.primeChart && !fresh.stockVal && !fresh.growthInput && !fresh.sinkPanel && fresh.scenSel, JSON.stringify(fresh));
+      H.check('strategy editor: property strategy detail carries no factor UI; Scenarios tier present, picker gone',
+        !fresh.addSel && !fresh.primeChart && !fresh.stockVal && !fresh.growthInput && !fresh.sinkPanel && fresh.scenTier && fresh.scenSelGone, JSON.stringify(fresh));
       await page.goto(`http://ff.local/#planning/scenario/${edScenId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
       const added = await page.evaluate(async () => {
@@ -3123,6 +3278,346 @@ export async function run(H, S) {
   r = await H.req('DELETE', `/api/planning/projects/${baProj}`);
   H.check('buyautocomplete: project cleanup', r.status === 200);
 
+  // ------------------------------------------- buy-form fixes
+  // Buy op form (op modal + template form share the wiring): typed
+  // symbols fill Price, Units ⟷ Amount link both ways, buys bigger
+  // than the cash pool are blocked naming pool + excess, and Buy
+  // all / Half set from the pool total. Pool fixture: an external
+  // cash leg of $1,200 — deterministic regardless of market prices
+  // (an amount-based holding leg would need a holding worth at
+  // least the amount, which is fixture noise, not what is pinned).
+  // Price-fill values are compared against the price endpoint in
+  // the same run, never hardcoded (same pattern as the
+  // buyautocomplete pins above).
+  r = await H.req('POST', '/api/investments/accounts', { name: 'Buy Form Acct', type: 'NonRegistered' });
+  H.check('buyform: account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const bfAcct = r.data.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'Buy Form Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ source: 'external', amount: 1200 }] } });
+  H.check('buyform: pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const bfProj = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${bfProj}/strategies`, { name: 'Buy Form Strat', source: 'template' });
+  H.check('buyform: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const bfStrat = r.data.strategy.id;
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('planning buyform browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardBf = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResBf = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueBf = loginResBf.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserBf = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserBf.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardBf({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueBf, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitBf = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      const formVals = () => page.evaluate(() => ({
+        units: document.querySelector('#planOpUnits') ? document.querySelector('#planOpUnits').value : null,
+        amount: document.querySelector('#planOpAmount') ? document.querySelector('#planOpAmount').value : null,
+        price: document.querySelector('#planOpPrice') ? document.querySelector('#planOpPrice').value : null,
+        poolRowHidden: document.querySelector('#planOpBuyActionsRow') ? document.querySelector('#planOpBuyActionsRow').classList.contains('hidden') : null,
+        poolText: document.querySelector('#planOpPoolTotal') ? document.querySelector('#planOpPoolTotal').textContent : '',
+        noteHidden: document.querySelector('#planOpPriceNote') ? document.querySelector('#planOpPriceNote').classList.contains('hidden') : null,
+        note: document.querySelector('#planOpPriceNote') ? document.querySelector('#planOpPriceNote').textContent : '',
+      }));
+      await page.goto(`http://ff.local/#planning/strategy/${bfStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitBf(1500);
+      await page.click('#planAddOpBtn');
+      await waitBf(500);
+      await page.select('#planOpTypeSel', 'buy');
+      await page.waitForFunction(() => {
+        const row = document.querySelector('#planOpBuyActionsRow');
+        const tot = document.querySelector('#planOpPoolTotal');
+        return row && !row.classList.contains('hidden') && tot && tot.textContent.includes('1,200');
+      }, { timeout: 15000 });
+      let v = await formVals();
+      H.check('buyform: pool project shows Buy all / Half + pool total',
+        v.poolRowHidden === false && v.poolText.includes('1,200'), JSON.stringify(v));
+      // (a) Typed symbol fills Price from the price endpoint.
+      await page.evaluate(() => {
+        const el = document.querySelector('#planOpSymbol');
+        el.value = 'XQQ.TO';
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const el = document.querySelector('#planOpPrice');
+        return el && el.value.trim() !== '';
+      }, { timeout: 15000 });
+      v = await formVals();
+      const tierBf = await H.req('GET', '/api/invest/price?symbol=XQQ.TO');
+      H.check('buyform: typed symbol fills Price from the price endpoint',
+        tierBf.data && tierBf.data.price != null
+          && Number(String(v.price).replace(/,/g, '')) === Number(tierBf.data.price),
+        JSON.stringify({ price: v.price, tier: tierBf.data }));
+      // (b) Units → Amount to the cent.
+      await page.evaluate(() => {
+        document.querySelector('#planOpPrice').value = '100';
+        const u = document.querySelector('#planOpUnits');
+        u.value = '12';
+        u.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      v = await formVals();
+      H.check('buyform: Units computes Amount = units x price to the cent',
+        v.amount === '1,200.00', JSON.stringify(v));
+      // (c) Amount → Units at 4-decimal precision.
+      await page.evaluate(() => {
+        const a = document.querySelector('#planOpAmount');
+        a.value = '500';
+        a.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      v = await formVals();
+      H.check('buyform: Amount back-computes Units = amount / price',
+        v.units === '5', JSON.stringify(v));
+      // (d) Amount over the pool blocks save naming pool + excess.
+      await page.evaluate(() => {
+        const a = document.querySelector('#planOpAmount');
+        a.value = '1,500';
+        a.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planOpDateVal').value = '2027-01-01';
+      });
+      await page.click('#planOpSaveBtn');
+      await waitBf(800);
+      const overMsg = await page.evaluate(() => document.querySelector('#planOpModalMsg') ? document.querySelector('#planOpModalMsg').textContent : '');
+      H.check('buyform: Amount over pool blocks save naming pool total + excess',
+        overMsg.includes('exceeds') && overMsg.includes('1,200.00') && overMsg.includes('300.00'),
+        JSON.stringify(overMsg));
+      r = await H.req('GET', `/api/planning/strategies/${bfStrat}`);
+      H.check('buyform: blocked buy was not saved',
+        !(r.data.ops || []).some((o) => o.op_type === 'buy'), JSON.stringify(r.data.ops));
+      // (e) Buy all + Half share the same path.
+      await page.click('#planOpBuyAllBtn');
+      await waitBf(300);
+      v = await formVals();
+      H.check('buyform: Buy all sets Amount = pool total, Units = pool / price',
+        v.amount === '1,200.00' && v.units === '12', JSON.stringify(v));
+      await page.click('#planOpBuyHalfBtn');
+      await waitBf(300);
+      v = await formVals();
+      H.check('buyform: Half sets Amount = pool / 2, Units accordingly',
+        v.amount === '600.00' && v.units === '6', JSON.stringify(v));
+      // (f) No-price symbol: editable Price + plain note, never a guess.
+      await page.evaluate(() => {
+        document.querySelector('#planOpPrice').value = '';
+        const el = document.querySelector('#planOpSymbol');
+        el.value = 'ZZZZZZQQ';
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const n = document.querySelector('#planOpPriceNote');
+        return n && !n.classList.contains('hidden') && n.textContent.includes('No price data');
+      }, { timeout: 30000 });
+      v = await formVals();
+      const priceEditable = await page.evaluate(() => {
+        const el = document.querySelector('#planOpPrice');
+        return el && !el.disabled && el.value === '';
+      });
+      H.check('buyform: no-price symbol leaves Price editable with a plain note',
+        v.noteHidden === false && v.note.includes('No price data') && priceEditable, JSON.stringify(v));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitBf(500);
+      // Template form shares the wiring: Buy preset on the project page.
+      await page.goto(`http://ff.local/#planning/project/${bfProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitBf(1500);
+      await page.click('#planAddStrategyBtn');
+      await waitBf(500);
+      await page.evaluate(() => { document.querySelector('#planStrategyModalBody [data-plan-preset="buy"]')?.click(); });
+      await page.waitForFunction(() => {
+        const row = document.querySelector('#planOpBuyActionsRow');
+        return row && !row.classList.contains('hidden');
+      }, { timeout: 15000 });
+      await page.evaluate(() => {
+        document.querySelector('#planOpPrice').value = '100';
+      });
+      await page.click('#planOpBuyAllBtn');
+      await waitBf(300);
+      v = await formVals();
+      H.check('buyform: template Buy form shares Buy all wiring',
+        v.amount === '1,200.00' && v.units === '12', JSON.stringify(v));
+      await page.evaluate(() => { document.querySelector('#planStrategyModal [data-close-modal]')?.click(); });
+      await waitBf(500);
+    } finally { await browserBf.close(); }
+  }
+  r = await H.req('DELETE', `/api/planning/projects/${bfProj}`);
+  H.check('buyform: project cleanup', r.status === 200);
+
+  // ------------------------------------------- take-home cash + percent plans
+  // Displayed take-home is CASH: gross − tax − CPP/EI − own RRSP
+  // total, matching the Monthly pay chart's Net segment; the
+  // economic net stays for the engine. Percent plans derive from
+  // the job's current per-period gross and re-derive on pay change.
+  // Fixture: biweekly BC job, 3000/period, start 2026-01-05, recent
+  // payday 2026-10-26 (on the 14-day grid). Fixed plan own 100 +
+  // employer 50; percent plan own 6% (= 180.00) + employer 3%
+  // (= 90.00) on RRSP. Own total 280.00/period.
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'TakeHome Corp', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026, start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: 3000 });
+  H.check('takehome: job created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const thJob = r.data.id;
+  r = await H.req('POST', '/api/investments/accounts', { name: 'TakeHome RRSP', type: 'RRSP' });
+  H.check('takehome: RRSP account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const thAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${thAcct}/holdings`, { label: 'TakeHome Fund', kind: 'fund', currency: 'CAD' });
+  const thFund = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${thAcct}/plans`, { job_id: thJob, target_holding_id: thFund, start_date: '2026-01-05', own_amount: 100, employer_amount: 50 });
+  H.check('takehome: fixed plan created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const thFixedPlan = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${thAcct}/plans`, { job_id: thJob, target_holding_id: thFund, start_date: '2026-01-05', amount_mode: 'percent', own_pct: 6, employer_pct: 3 });
+  H.check('takehome: percent plan created with derived amounts', r.status === 201 && r.data.derived_own_amount === 180 && r.data.derived_employer_amount === 90, JSON.stringify(r.data));
+  const thPctPlan = r.data.id;
+  const thCalc = async () => {
+    const rr = await H.req('GET', '/api/earnings');
+    return (rr.data.jobs || []).find((j) => j.id === thJob)?.calc;
+  };
+  let c = await thCalc();
+  // (a) per-period take-home = economic net − own total, to the cent.
+  H.check('takehome: per-period cash = economic net − own total',
+    c && c.perPeriod.cashNet === c.perPeriod.net - 280 && Math.abs((c.netAnnual - c.cashNetAnnual) - 280 * 26) <= 0.02, JSON.stringify(c?.perPeriod));
+  // (b) monthly chart: segments sum to gross, RRSP slice = own total x paydays.
+  r = await H.req('GET', `/api/earnings/jobs/${thJob}/monthly-chart`);
+  const oct = (r.data.months || []).indexOf('2026-10');
+  const octOk = oct >= 0 && r.data.gross[oct] === 6000 && r.data.rrsp[oct] === 560
+    && Math.abs(r.data.tax[oct] + r.data.cppEi[oct] + r.data.rrsp[oct] + r.data.net[oct] - r.data.gross[oct]) <= 0.02;
+  H.check('takehome: October chart segments sum to gross with RRSP 560 (2 paydays x 280)', octOk, JSON.stringify({ months: r.data.months, gross: r.data.gross, rrsp: r.data.rrsp }));
+  // (d) no-plan job unchanged: cash equals economic.
+  r = await H.req('POST', '/api/earnings/jobs', { employer: 'TakeHome Solo', province: 'BC', frequency: 'biweekly', gross_amount: 3000, gross_basis: 'period', tax_year: 2026 });
+  const thSolo = r.data.id;
+  H.check('takehome: no-plan job cash equals economic', r.status === 201 && r.data.calc.perPeriod.cashNet === r.data.calc.perPeriod.net && r.data.calc.cashNetAnnual === r.data.calc.netAnnual, JSON.stringify(r.data.calc?.perPeriod));
+  // % pins: (d) employer % on non-RRSP rejected; (e) own_pct 0 rejected.
+  r = await H.req('POST', '/api/investments/accounts', { name: 'TakeHome TFSA', type: 'TFSA' });
+  const thTfsa = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${thTfsa}/holdings`, { label: 'TakeHome TFSA Fund', kind: 'fund', currency: 'CAD' });
+  const thTfsaFund = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${thTfsa}/plans`, { job_id: thJob, target_holding_id: thTfsaFund, start_date: '2026-01-05', amount_mode: 'percent', own_pct: 6, employer_pct: 3 });
+  H.check('takehome: employer percent on TFSA rejected', r.status === 400 && /RRSP/.test(r.data.error || ''), JSON.stringify(r.data));
+  r = await H.req('POST', `/api/investments/accounts/${thAcct}/plans`, { job_id: thJob, target_holding_id: thFund, start_date: '2026-01-05', amount_mode: 'percent', own_pct: 0 });
+  H.check('takehome: percent plan with own_pct 0 rejected', r.status === 400 && /own percent/.test(r.data.error || ''), JSON.stringify(r.data));
+  // % pin (b): pay change re-derives the percent plan + cash take-home; fixed unchanged.
+  const cashBefore = c && c.perPeriod ? c.perPeriod.cashNet : null;
+  r = await H.req('PUT', `/api/earnings/jobs/${thJob}`, { employer: 'TakeHome Corp', province: 'BC', frequency: 'biweekly', gross_amount: 4000, gross_basis: 'period', tax_year: 2026, start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: 4000 });
+  H.check('takehome: pay change accepted', r.status === 200, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/investments/accounts/${thAcct}`);
+  const pctAfter = (r.data.plans || []).find((p) => p.id === thPctPlan);
+  const fixAfter = (r.data.plans || []).find((p) => p.id === thFixedPlan);
+  H.check('takehome: percent plan re-derived to 240 on 4000 gross, fixed plan unchanged',
+    pctAfter && pctAfter.derived_own_amount === 240 && pctAfter.derived_employer_amount === 120 && fixAfter && fixAfter.own_amount === 100, JSON.stringify({ pctAfter, fixAfter }));
+  c = await thCalc();
+  H.check('takehome: cash take-home follows the new own total 340',
+    c && c.perPeriod.cashNet === c.perPeriod.net - 340 && c.perPeriod.cashNet !== cashBefore, JSON.stringify(c?.perPeriod));
+  // (c) browser: detail strip shows the cash take-home, chart carries an RRSP segment.
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('planning takehome browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardTh = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (ch) => chunks.push(ch));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResTh = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueTh = loginResTh.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserTh = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserTh.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardTh({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueTh, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitTh = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#earnings/job/${thJob}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => window.__fmCharts && window.__fmCharts.earnJobMonthly, { timeout: 15000 });
+      await waitTh(500);
+      const strip = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#earnJobDetail .summary-card')];
+        const next = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Next net pay date'));
+        const annual = cards.find((el) => (el.querySelector('.k')?.textContent || '').includes('Annual net'));
+        const chart = window.__fmCharts && window.__fmCharts.earnJobMonthly;
+        const rrspDs = chart ? chart.data.datasets.find((d) => d.label === 'RRSP contribution') : null;
+        return {
+          nextNet: next ? next.querySelector('.n')?.textContent : null,
+          annualNet: annual ? annual.querySelector('.v')?.textContent : null,
+          rrspHasData: !!(rrspDs && rrspDs.data.some((v) => Number(v) > 0)),
+        };
+      });
+      const num = (s) => (s == null ? null : parseFloat(String(s).replace(/[^0-9.-]/g, '')));
+      H.check('takehome: detail strip shows the cash take-home + chart carries an RRSP segment',
+        c && Math.abs(num(strip.nextNet) - c.perPeriod.cashNet) < 0.01 && Math.abs(num(strip.annualNet) - c.cashNetAnnual) < 0.01 && strip.rrspHasData === true, JSON.stringify({ strip, cash: c.perPeriod, cashAnnual: c.cashNetAnnual }));
+    } finally {
+      await browserTh.close();
+    }
+  }
+  await H.req('DELETE', `/api/investments/plans/${thPctPlan}`);
+  await H.req('DELETE', `/api/investments/plans/${thFixedPlan}`);
+  r = await H.req('DELETE', `/api/earnings/jobs/${thJob}`);
+  H.check('takehome: job cleanup', r.status === 200, JSON.stringify(r.data));
+  r = await H.req('DELETE', `/api/earnings/jobs/${thSolo}`);
+  H.check('takehome: solo job cleanup', r.status === 200, JSON.stringify(r.data));
+  r = await H.req('DELETE', `/api/investments/accounts/${thAcct}`);
+  H.check('takehome: RRSP cleanup', r.status === 200, JSON.stringify(r.data));
+  r = await H.req('DELETE', `/api/investments/accounts/${thTfsa}`);
+  H.check('takehome: TFSA cleanup', r.status === 200, JSON.stringify(r.data));
+
   // ------------------------------------------- comparison views
   // Strategy detail diff section (baseline/strategy/diff columns,
   // monthly/annual toggle, All-default range with presets) + project
@@ -3379,6 +3874,627 @@ export async function run(H, S) {
   H.check('payscope: legacy stock-only delta is summed 0 but scoped null',
     ps2StkRow.comparison && ps2StkRow.comparison.paymentDelta === 0 && ps2StkScope.delta == null,
     JSON.stringify({ summed: ps2StkRow.comparison && ps2StkRow.comparison.paymentDelta, scoped: ps2StkScope.delta }));
+  // --- entity scope (user rule 2026-11-04): a property project's
+  // figures cover ONLY its entity property — never the summed total
+  // across mainline properties. Fixture: two mortgaged properties,
+  // E (series from 2026-01) and O (series from 2026-06, a $520,000
+  // funding step), project entity = E.
+  const psMkPropDated = async (address, balance, balDate) => {
+    let rr = await H.req('POST', '/api/properties', { address, mortgage_balance: balance, mortgage_balance_date: balDate, amortization_years: 25, purchase_date: '2020-03-15' });
+    H.check(`propscope: property ${address} created`, rr.status === 201 && rr.data.id > 0, JSON.stringify(rr.data));
+    const pid = rr.data.id;
+    rr = await H.req('POST', `/api/properties/${pid}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+    H.check(`propscope: fixed 5% segment on ${address}`, rr.status === 201, JSON.stringify(rr.data));
+    return pid;
+  };
+  const psE = await psMkPropDated('777 PropScope Entity Lane, Victoria, BC', 400000, '2026-01-15');
+  const psO = await psMkPropDated('888 PropScope Other Lane, Victoria, BC', 520000, '2026-06-15');
+  r = await H.req('POST', '/api/planning/projects', { name: 'PropScope', question: 'Entity only', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: psE } });
+  H.check('propscope: property project created with entity E', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const psProj = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Fix E', source: 'template' });
+  H.check('propscope: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const psStrat = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${psStrat}/ops`, { op_type: 'rate_switch', params: { propertyId: psE, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  H.check('propscope: rate_switch op on E created', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/projects/${psProj}/comparison`);
+  H.check('propscope: comparison loads', r.status === 200 && !!r.data.report, JSON.stringify({ status: r.status }));
+  const psRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === psStrat);
+  const psBase = r.data.baseline;
+  const psEnt = r.data.entityProperty;
+  H.check('propscope: comparison names the entity property', psEnt && psEnt.id === psE && (psEnt.address || '').includes('777 PropScope Entity Lane'), JSON.stringify(psEnt));
+  const psBaseKeys = Object.keys((psBase.mortgage && psBase.mortgage.perProperty) || {});
+  const psStratKeys = Object.keys((psRow.projection.mortgage && psRow.projection.mortgage.perProperty) || {});
+  H.check('propscope: perProperty keys are entity-only on both sides',
+    JSON.stringify(psBaseKeys) === JSON.stringify([String(psE)]) && JSON.stringify(psStratKeys) === JSON.stringify([String(psE)]),
+    JSON.stringify({ base: psBaseKeys, strat: psStratKeys }));
+  const psEBase = psBase.mortgage.perProperty[psE].baseline;
+  const psEStrat = psRow.projection.mortgage.perProperty[psE].strategy;
+  const psBaseMonthly = (r.data.report.trajectories[0] || {}).monthly || [];
+  const psFind = (rows, m) => rows.find((x) => x.month === m) || {};
+  const psJun = psFind(psBaseMonthly, '2026-06');
+  const psMay = psFind(psBaseMonthly, '2026-05');
+  const psJunPt = psFind(psEBase.series, '2026-06');
+  H.check('propscope: report Mortgage balance equals the entity trajectory at 2026-06',
+    Math.abs((psJun.mortgage_balance || 0) - (psJunPt.balance || 0)) < 0.01, JSON.stringify({ report: psJun.mortgage_balance, entity: psJunPt.balance }));
+  H.check('propscope: no $520k funding jump at the other property\'s start month',
+    (psJun.mortgage_balance || 0) < 450000 && Math.abs((psJun.mortgage_balance || 0) - (psMay.mortgage_balance || 0)) < 5000,
+    JSON.stringify({ may: psMay.mortgage_balance, jun: psJun.mortgage_balance }));
+  const psIntSum = (psEBase.series || []).reduce((s, x) => s + (x.interest || 0), 0);
+  H.check('propscope: annual-interest total is entity-only (no other-property interest)',
+    Math.abs((psBase.mortgage.baselineInterest || 0) - psIntSum) < 5 && (psBase.mortgage.baselineInterest || 0) < 500000,
+    JSON.stringify({ total: psBase.mortgage.baselineInterest, entitySum: psIntSum }));
+  const psIdx = (ym) => Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7));
+  const psShift = psIdx(psEBase.payoffMonth) - psIdx(psEStrat.payoffMonth);
+  H.check('propscope: payoff shift derives from the entity property only',
+    psRow.comparison.payoffShiftMonths === psShift && !!psEBase.payoffMonth && !!psEStrat.payoffMonth,
+    JSON.stringify({ shift: psRow.comparison.payoffShiftMonths, expected: psShift, base: psEBase.payoffMonth, strat: psEStrat.payoffMonth }));
+  const psScope = psRow.paymentScope || {};
+  H.check('propscope: monthly payment scope is the entity property',
+    JSON.stringify(psScope.propertyIds) === JSON.stringify([psE]) && psClose(psScope.baseline, psEBase.paymentAtEffect) && psClose(psScope.strategy, psEStrat.paymentAtEffect) && (psScope.label || '').includes('777 PropScope Entity Lane'),
+    JSON.stringify(psScope));
+  let psPeak = 0;
+  for (const pt of psEBase.series || []) {
+    const sp = psFind(psEStrat.series, pt.month);
+    const diff = (pt.balance || 0) - (sp.balance != null ? sp.balance : 0);
+    if (diff > psPeak) psPeak = diff;
+  }
+  H.check('propscope: Equity Δ equals the entity series peak advantage',
+    Math.abs((psRow.equityDelta || 0) - psPeak) < 1.00, JSON.stringify({ equityDelta: psRow.equityDelta, peak: psPeak }));
+  // Edge: an op naming the OTHER property is excluded, not computed.
+  r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Fix O', source: 'template' });
+  H.check('propscope: edge strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const psEdge = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${psEdge}/ops`, { op_type: 'rate_switch', params: { propertyId: psO, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  H.check('propscope: op on the other property is accepted by validation (201)', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${psEdge}`);
+  const psEdgeErrs = ((r.data.comparison && r.data.comparison.errors) || []).join('; ');
+  const psEdgeKeys = Object.keys((r.data.projection.mortgage && r.data.projection.mortgage.perProperty) || {});
+  H.check('propscope: op on the other property errors as unknown and is excluded (cost 0, keys entity-only)',
+    /unknown property/.test(psEdgeErrs) && psEdgeErrs.includes(String(psO)) && JSON.stringify(psEdgeKeys) === JSON.stringify([String(psE)]) && r.data.comparison.cost === 0,
+    JSON.stringify({ errors: psEdgeErrs, keys: psEdgeKeys, cost: r.data.comparison.cost }));
+  // Report for the caption pins (pinned to the Fix E strategy).
+  r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope report', definition: { strategies: [psStrat], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }] }, strategy_ids: [psStrat], scenario_ids: [] });
+  H.check('propscope: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const psRep = r.data.report.id;
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('propscope browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardP = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResP = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueP = loginResP.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserP = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserP.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardP({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueP, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      // Detail caption names the entity property, never "summed".
+      await page.goto(`http://ff.local/#planning/strategy/${psStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitP(1500);
+      const cap = await page.evaluate(() => {
+        const panel = document.querySelector('#planStrategyMortChart')?.closest('.panel');
+        return panel ? (panel.querySelector('.note')?.textContent || '') : '';
+      });
+      H.check('propscope: strategy detail caption names the entity property, not summed across properties',
+        cap.includes('777 PropScope Entity Lane') && !cap.includes('summed across properties'), JSON.stringify({ cap }));
+      // Report HOW line (opened from the strategy tier LIST) names it too.
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+      const how = await page.evaluate(() => {
+        const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Mortgage balance');
+        return block ? [...block.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '';
+      });
+      H.check('propscope: report Mortgage balance how-line names the entity property, not summed across properties',
+        how.includes('Mortgage balance = outstanding principal') && how.includes('777 PropScope Entity Lane') && !how.includes('summed across properties'), JSON.stringify({ how }));
+    } finally { await browserP.close(); }
+  }
+  // --- strategy-page Reports tier (user 2026-11-04): the project
+  // Reports tier, scoped to THIS strategy. Fixture: one project,
+  // two engine strategies, three reports (A-only, B-only, A+B).
+  r = await H.req('POST', '/api/planning/projects', { name: 'StratReport', question: 'Tier scope' });
+  H.check('stratreport: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const srProj = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${srProj}/strategies`, { name: 'Strat A', source: 'template' });
+  H.check('stratreport: strategy A created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const srA = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${srProj}/strategies`, { name: 'Strat B', source: 'template' });
+  H.check('stratreport: strategy B created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const srB = r.data.strategy.id;
+  const srDef = { strategies: [], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }] };
+  const srMkRep = async (name, sids) => {
+    const rr = await H.req('POST', `/api/planning/projects/${srProj}/reports`, { name, definition: { ...srDef, strategies: sids }, strategy_ids: sids, scenario_ids: [] });
+    H.check(`stratreport: report ${name} created`, rr.status === 201 && rr.data.report && rr.data.report.id > 0, JSON.stringify(rr.data));
+    return rr.data.report.id;
+  };
+  const srR1 = await srMkRep('SR A only', [srA]);
+  const srR2 = await srMkRep('SR B only', [srB]);
+  const srR3 = await srMkRep('SR AB', [srA, srB]);
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('stratreport browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardS = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResS = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueS = loginResS.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserS = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserS.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardS({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueS, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitS = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      page.on('dialog', (d) => d.accept());
+      // (a) LIST on strategy A shows A-only + AB, never B-only.
+      await page.goto(`http://ff.local/#planning/strategy/${srA}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, srR1);
+      const listA = await page.evaluate(() => document.querySelector('#planReportList')?.textContent || '');
+      H.check('stratreport: strategy A LIST shows A-only + AB, hides B-only',
+        listA.includes('SR A only') && listA.includes('SR AB') && !listA.includes('SR B only'), JSON.stringify({ listA }));
+      // (b) Preset Generate from strategy A pins ONLY A, opens its tab in place.
+      r = await H.req('GET', `/api/planning/projects/${srProj}`);
+      const beforeIds = new Set((r.data.reports || []).map((x) => x.id));
+      await page.click('#planStrategyGenerateBtn');
+      await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
+      const genHash = await page.evaluate(() => location.hash);
+      r = await H.req('GET', `/api/planning/projects/${srProj}`);
+      const fresh = (r.data.reports || []).find((x) => !beforeIds.has(x.id));
+      let freshSids = null;
+      try { freshSids = fresh ? JSON.parse(fresh.strategy_ids) : null; } catch { freshSids = null; }
+      H.check('stratreport: preset Generate from strategy A pins only A and stays on the strategy page',
+        genHash === `#planning/strategy/${srA}` && fresh && JSON.stringify(freshSids) === JSON.stringify([srA]), JSON.stringify({ hash: genHash, fresh: fresh && fresh.id, sids: freshSids }));
+      // Back to LIST (close the generated tab), then (d) OPEN viewer from the LIST.
+      await page.evaluate(() => { document.querySelector('.plan-report-tab-close')?.click(); });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, srR1);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, srR1);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+      const open = await page.evaluate(() => ({
+        tabBar: !!document.querySelector('#planReportTabsBar'),
+        sticky: !!document.querySelector('#planReportStickyBar'),
+        stickyPos: getComputedStyle(document.querySelector('#planReportTabsHost')).position,
+        compare: !!document.querySelector('#planReportComparePanel'),
+        outline: document.querySelectorAll('#planReportOutlineList li').length,
+        listHidden: !!document.querySelector('#planReportList')?.classList.contains('hidden'),
+      }));
+      H.check('stratreport: OPEN viewer on the strategy page works (tab bar, sticky host, comparison, outline)',
+        open.tabBar && open.sticky && open.stickyPos === 'sticky' && open.compare && open.outline > 0 && open.listHidden, JSON.stringify(open));
+      await page.evaluate(() => { document.querySelector('.plan-report-tab-close')?.click(); });
+      await waitS(800);
+      const backList = await page.evaluate(() => ({
+        listVisible: !(document.querySelector('#planReportList')?.classList.contains('hidden')),
+        hasR1: (document.querySelector('#planReportList')?.textContent || '').includes('SR A only'),
+      }));
+      H.check('stratreport: closing the tab returns to the strategy LIST', backList.listVisible && backList.hasR1, JSON.stringify(backList));
+      // (c) AI modal locks strategies to this one.
+      await page.click('#planStrategyAiReportBtn');
+      await page.waitForFunction(() => document.querySelectorAll('#planReportAiStrategies input').length > 0, { timeout: 15000 });
+      const lock = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input')].map((el) => ({ v: Number(el.value), checked: el.checked, disabled: el.disabled })));
+      H.check('stratreport: AI modal strategy picker is locked to this strategy',
+        lock.length === 1 && lock[0].v === srA && lock[0].checked && lock[0].disabled, JSON.stringify(lock));
+      await page.click('#planReportAiModal [data-close-modal]');
+      await waitS(500);
+      // (e) Project page tier still lists all reports unfiltered.
+      await page.goto(`http://ff.local/#planning/project/${srProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, srR2);
+      const listP = await page.evaluate(() => document.querySelector('#planReportList')?.textContent || '');
+      H.check('stratreport: project page tier still lists all reports unfiltered',
+        listP.includes('SR A only') && listP.includes('SR B only') && listP.includes('SR AB'), JSON.stringify({ listP }));
+    } finally { await browserS.close(); }
+  }
+  // --- fixed baselines + strategy-page mirror (user 2026-11-04
+  // 16:26/16:27 + 17:15 confirmation): creation auto-sets a fixed
+  // baseline, the tier is metadata only, report modals show the
+  // fixed display, legacy extra baselines stay loadable but are
+  // never offered, and the strategy page mirrors the project tiers
+  // (Scenarios / Baseline+Operations / Reports) with op cards.
+  r = await H.req('POST', '/api/properties', {
+    address: '777 FixedBase Lane, Victoria, BC',
+    mortgage_balance: 400000, mortgage_balance_date: '2026-01-15', amortization_years: 25,
+    purchase_date: '2020-03-15',
+  });
+  H.check('fixedbase: property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const fbProp = r.data.id;
+  r = await H.req('POST', `/api/properties/${fbProp}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+  H.check('fixedbase: rate segment added', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/projects', { name: 'FixedBase', question: 'q', category: 'property', subcategory: 'refinance', entity: { type: 'property', propertyId: fbProp }, applyRecommendation: true });
+  H.check('fixedbase: project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const fbProj = r.data.project.id;
+  const fbFixed = r.data.project.fixedBaseline;
+  // The live fixed display takes its name from the recommendation's
+  // do-nothing baseline, and recordId is the recommendation record
+  // (null when no recommendation exists — the wiring/flow pins
+  // already cover that null path on uncategorized fixtures).
+  const fbFixedRec = (r.data.project.baselines || []).find((b) => b.source === 'recommendation');
+  H.check('fixedbase: creation auto-sets the baseline with no add step',
+    !!fbFixed && fbFixed.name === 'Current path · 777 FixedBase Lane, Victoria, BC' && !!fbFixedRec && fbFixed.recordId === fbFixedRec.id,
+    JSON.stringify({ fixed: fbFixed, baselines: r.data.project.baselines }));
+  r = await H.req('POST', `/api/planning/projects/${fbProj}/strategies`, { name: 'FB strategy 1', source: 'template' });
+  H.check('fixedbase: strategy 1 created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const fbS1 = r.data.strategy.id;
+  const _fbNow = new Date();
+  const _fbNext = new Date(Date.UTC(_fbNow.getUTCFullYear(), _fbNow.getUTCMonth() + 1, 1));
+  r = await H.req('POST', `/api/planning/strategies/${fbS1}/ops`, {
+    op_type: 'prepay',
+    params: { propertyId: fbProp, date: _fbNext.toISOString().slice(0, 10), amount: 10000, openClosed: 'open' },
+  });
+  H.check('fixedbase: prepay op added to strategy 1', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${fbProj}/strategies`, { name: 'FB strategy 2', source: 'template' });
+  H.check('fixedbase: strategy 2 created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const fbS2 = r.data.strategy.id;
+  // Legacy extra baselines: loadable via API, never offered in UI.
+  for (const nm of ['FB legacy 1', 'FB legacy 2']) {
+    r = await H.req('POST', `/api/planning/projects/${fbProj}/baselines`, { name: nm, source: 'manual', definition: { description: 'legacy' } });
+    H.check(`fixedbase: legacy baseline ${nm} created`, r.status === 201, JSON.stringify(r.data));
+  }
+  r = await H.req('GET', `/api/planning/projects/${fbProj}`);
+  const fbStillFixed = r.data.project.fixedBaseline;
+  H.check('fixedbase: legacy multi-baseline project still resolves to the fixed baseline',
+    !!fbStillFixed && fbStillFixed.recordId === fbFixedRec.id && (r.data.project.baselines || []).length === 3,
+    JSON.stringify({ fixed: fbStillFixed, count: (r.data.project.baselines || []).length }));
+  r = await H.req('POST', `/api/planning/projects/${fbProj}/reports`, { name: 'FB S2 only', definition: { strategies: [fbS2], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }] }, strategy_ids: [fbS2], scenario_ids: [] });
+  H.check('fixedbase: S2-only report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  let fbGenName = '';
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('fixedbase/stratmirror browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardFb = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResFb = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueFb = loginResFb.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserFb = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserFb.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardFb({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueFb, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitFb = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${fbProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitFb(1500);
+      const tier = await page.evaluate(() => ({
+        fixedCard: !!document.querySelector('#planFixedBaselineCard'),
+        fixedText: document.querySelector('#planFixedBaselineCard')?.textContent || '',
+        tierButtons: [...document.querySelectorAll('#planBaselineCards button')].length,
+        addGone: !document.querySelector('#planAddBaselineBtn'),
+      }));
+      H.check('fixedbase: tier shows metadata only — fixed card, no Add/Edit/Refine/Delete controls',
+        tier.fixedCard && tier.fixedText.includes('Fixed baseline') && tier.fixedText.includes('Current path · 777 FixedBase Lane, Victoria, BC')
+          && tier.fixedText.includes('777 FixedBase Lane') && tier.tierButtons === 0 && tier.addGone,
+        JSON.stringify(tier));
+      // Report modal: fixed display text, no dropdown choice.
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiReportBtn');
+      await waitFb(1000);
+      const modalFb = await page.evaluate(() => ({
+        fixedText: document.querySelector('#planReportAiFixedBaseline')?.textContent || '',
+        selectGone: !document.querySelector('#planReportAiBaseline'),
+        open: !document.querySelector('#planReportAiModal').classList.contains('hidden'),
+      }));
+      H.check('fixedbase: AI report modal shows the fixed baseline as display text, no dropdown',
+        modalFb.open && modalFb.fixedText === 'Current path · 777 FixedBase Lane, Victoria, BC' && modalFb.selectGone, JSON.stringify(modalFb));
+      await page.evaluate(() => { document.querySelector('#planReportAiModal [data-close-modal]').click(); });
+      await waitFb(500);
+      // Preset Generate pins the fixed baseline record.
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planFlowGenerateBtn');
+      await page.waitForSelector('[data-plan-report-tab]', { timeout: 15000 });
+      r = await H.req('GET', `/api/planning/projects/${fbProj}`);
+      const fbGen = (r.data.reports || []).reduce((a, x) => (!a || x.id > a.id ? x : a), null);
+      fbGenName = fbGen ? fbGen.name : '';
+      H.check('fixedbase: preset Generate pins the fixed baseline record',
+        !!fbGen && fbGen.baseline_id === fbFixedRec.id, JSON.stringify(fbGen));
+      // Strategy page mirror.
+      await page.goto(`http://ff.local/#planning/strategy/${fbS1}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('#planStrategyScenarioTier', { timeout: 15000 });
+      await page.waitForSelector('#planStrategyMidTier', { timeout: 15000 });
+      await page.waitForSelector('#planStrategyReportsPanel', { timeout: 15000 });
+      await page.waitForSelector('[data-plan-op-card]', { timeout: 15000 });
+      const mirror = await page.evaluate(() => {
+        const top = (id) => document.querySelector(id)?.getBoundingClientRect().top ?? -1;
+        return {
+          tops: [top('#planStrategyScenarioTier'), top('#planStrategyMidTier'), top('#planStrategyReportsPanel')],
+          opCards: document.querySelectorAll('[data-plan-op-card]').length,
+          opEdit: !!document.querySelector('[data-plan-op-edit]'),
+          opDel: !!document.querySelector('[data-plan-op-del]'),
+          baseGroupFixed: !!document.querySelector('#planStrategyBaselineGroup #planFixedBaselineCard'),
+          baseGroupText: document.querySelector('#planStrategyBaselineGroup')?.textContent || '',
+          // The tier reuses the global #planReportList (filtered to
+          // this strategy); it renders even when a tab restores open.
+          listText: document.querySelector('#planReportList')?.textContent || '',
+        };
+      });
+      H.check('stratmirror: strategy page orders Scenarios tier, then Baseline+Operations row, then Reports tier',
+        mirror.tops[0] >= 0 && mirror.tops[0] < mirror.tops[1] && mirror.tops[1] < mirror.tops[2], JSON.stringify(mirror.tops));
+      H.check('stratmirror: operations render as cards with inline Edit/Delete',
+        mirror.opCards >= 1 && mirror.opEdit && mirror.opDel, JSON.stringify(mirror));
+      H.check('stratmirror: baseline left tier shows the fixed metadata display',
+        mirror.baseGroupFixed && mirror.baseGroupText.includes('Fixed baseline'), JSON.stringify(mirror.baseGroupText.slice(0, 200)));
+      H.check('stratmirror: Reports tier is strategy-scoped (own reports listed, S2-only hidden)',
+        !!fbGenName && mirror.listText.includes(fbGenName) && !mirror.listText.includes('FB S2 only'),
+        JSON.stringify({ gen: fbGenName, listHasGen: mirror.listText.includes(fbGenName), listHasS2: mirror.listText.includes('FB S2 only') }));
+      const hashBefore = await page.evaluate(() => location.hash);
+      await page.evaluate(() => { document.querySelector('[data-plan-op-card]').click(); });
+      await waitFb(500);
+      const hashAfter = await page.evaluate(() => location.hash);
+      H.check('stratmirror: clicking an op card body does not navigate',
+        hashBefore === hashAfter && hashAfter === `#planning/strategy/${fbS1}`, JSON.stringify({ hashBefore, hashAfter }));
+    } finally { await browserFb.close(); }
+  }
+  // --- investment comparison (user bug 2026-11-04 16:38/16:39):
+  // a buy-stock strategy must not render mortgage panels (no Monthly
+  // payment breakdown chart, no Balance Δ line), and its trajectory
+  // must focus on the cash pool: baseline pool vs strategy pool plus
+  // stock value, with the total scoped to pool + stocks (never
+  // property equity). Fixture: a pool project holding 100 units of H
+  // at a flat $100 (baseline $10,000); the strategy sells 24 units
+  // ($2,400 into the pot) then buys 12 units of new holding G from
+  // the pot ($1,200) — sell = 2x buy, so the post-buy pool ($1,200)
+  // equals the buy amount and the baseline-vs-strategy pool gap from
+  // the buy month on is exactly the buy amount.
+  const icBuyYm = (() => { const d = new Date(Date.UTC(Number(psOpDate.slice(0, 4)), Number(psOpDate.slice(5, 7)), 1)); return d.toISOString().slice(0, 10); })();
+  r = await H.req('POST', '/api/investments/accounts', { name: 'InvComp Acct', type: 'NonRegistered' });
+  H.check('invcomp: account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const icAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${icAcct}/holdings`, { label: 'InvComp H', kind: 'exchange', symbol: 'INVCOMP.H', currency: 'CAD', events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 100 }] });
+  H.check('invcomp: holding H created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const icHold = r.data.id;
+  r = await H.req('POST', `/api/investments/holdings/${icHold}/nav`, { date: '2025-01-15', price: 100 });
+  H.check('invcomp: single flat NAV point on H (no growth window)', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/projects', { name: 'InvComp', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: icHold, percent: 100 }] } });
+  H.check('invcomp: investment pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const icProj = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Sell then buy' });
+  H.check('invcomp: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const icStrat = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${icStrat}/ops`, { op_type: 'sell', params: { holdingId: icHold, date: psOpDate, units: 24, price: 100 } });
+  H.check('invcomp: sell op created (proceeds park in the pot)', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/strategies/${icStrat}/ops`, { op_type: 'buy', params: { accountId: icAcct, symbol: 'INVCOMP.G', date: icBuyYm, units: 12, price: 100, currency: 'CAD' }, legs: [{ source_ref: 'pot', amount: 'all' }] });
+  H.check('invcomp: pot-funded buy op created', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${icStrat}`);
+  H.check('invcomp: buy executed, not dropped (no projection errors)',
+    r.status === 200 && ((r.data.comparison && r.data.comparison.errors) || []).length === 0, JSON.stringify(r.data.comparison && r.data.comparison.errors));
+  r = await H.req('GET', `/api/planning/projects/${icProj}/comparison`);
+  H.check('invcomp: comparison loads', r.status === 200 && !!r.data.report, JSON.stringify({ status: r.status }));
+  const icRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === icStrat);
+  H.check('invcomp: touchesMortgage false, touchesStocks true, investmentScope true',
+    icRow && icRow.touchesMortgage === false && icRow.touchesStocks === true && r.data.report.investmentScope === true,
+    JSON.stringify({ touchesMortgage: icRow && icRow.touchesMortgage, touchesStocks: icRow && icRow.touchesStocks, investmentScope: r.data.report.investmentScope }));
+  const icBaseTraj = (r.data.report.trajectories || []).find((t) => t.key === 'baseline') || {};
+  const icStratTraj = (r.data.report.trajectories || []).find((t) => t.key === String(icStrat)) || {};
+  const icFind = (rows, m) => (rows || []).find((x) => x.month === m) || {};
+  const icSellYm = psOpDate.slice(0, 7);
+  const icBuyMo = icBuyYm.slice(0, 7);
+  const icPre = icFind(icStratTraj.monthly, icSellYm);
+  const icPost = icFind(icStratTraj.monthly, icBuyMo);
+  const icBaseBuy = icFind(icBaseTraj.monthly, icBuyMo);
+  H.check('invcomp: baseline pool is 0 flat; strategy pool 2400 at sell month, 1200 from buy month on',
+    (icFind(icBaseTraj.monthly, icSellYm).pool_balance || 0) === 0 && (icBaseBuy.pool_balance || 0) === 0
+      && icPre.pool_balance === 2400 && icPost.pool_balance === 1200,
+    JSON.stringify({ baseSell: icFind(icBaseTraj.monthly, icSellYm).pool_balance, baseBuy: icBaseBuy.pool_balance, stratSell: icPre.pool_balance, stratBuy: icPost.pool_balance }));
+  H.check('invcomp: pool drops by the buy amount at the buy month, stock rises by the buy amount',
+    psClose(icPre.pool_balance - icPost.pool_balance, 1200) && psClose(icPost.stock_value - icPre.stock_value, 1200),
+    JSON.stringify({ poolDrop: icPre.pool_balance - icPost.pool_balance, stockRise: icPost.stock_value - icPre.stock_value }));
+  H.check('invcomp: baseline-vs-strategy pool gap from the buy month on equals the buy amount',
+    psClose((icPost.pool_balance || 0) - (icBaseBuy.pool_balance || 0), 1200),
+    JSON.stringify({ gap: (icPost.pool_balance || 0) - (icBaseBuy.pool_balance || 0) }));
+  H.check('invcomp: scoped total is pool + stock, not property-swamped (strategy total = baseline total = 10000 at buy month)',
+    psClose(icPost.total_value, 10000) && psClose(icBaseBuy.total_value, 10000) && psClose(icPost.stock_value, 8800),
+    JSON.stringify({ stratTotal: icPost.total_value, baseTotal: icBaseBuy.total_value, stratStock: icPost.stock_value }));
+  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'InvComp report', definition: { strategies: [icStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value', 'total_value'] }] }, strategy_ids: [icStrat], scenario_ids: [] });
+  H.check('invcomp: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const icRep = r.data.report.id;
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('invcomp browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardI = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResI = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueI = loginResI.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserI = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserI.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardI({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueI, domain: 'ff.local', path: '/', httpOnly: true });
+      await page.goto(`http://ff.local/#planning/strategy/${icStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      const diffState = await page.evaluate(() => ({
+        deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planDiffChart) ? planCharts.planDiffChart.data.datasets.map((d) => d.label) : null,
+        breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planDiffBreakdownChart == null : null,
+        breakdownTitleHidden: document.querySelector('#planDiffBreakdownTitle')?.style.display === 'none',
+        breakdownWrapHidden: document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap')?.style.display === 'none',
+      }));
+      H.check('invcomp: detail diff has Value Δ only, no Balance Δ line, breakdown block hidden',
+        diffState.deltaLabels && !diffState.deltaLabels.some((l) => /Balance Δ/.test(l)) && diffState.deltaLabels.some((l) => /Value Δ/.test(l))
+          && diffState.breakdownNull === true && diffState.breakdownTitleHidden === true && diffState.breakdownWrapHidden === true,
+        JSON.stringify(diffState));
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Pool trajectory'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      const repState = await page.evaluate(() => ({
+        deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
+        breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
+        breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
+      }));
+      H.check('invcomp: report comparison has Value Δ only, no Balance Δ line, breakdown block hidden',
+        repState.deltaLabels && !repState.deltaLabels.some((l) => /Balance Δ/.test(l)) && repState.deltaLabels.some((l) => /Value Δ/.test(l))
+          && repState.breakdownNull === true && repState.breakdownWrapHidden === true,
+        JSON.stringify(repState));
+      const trajTable = await page.evaluate(() => {
+        const panels = [...document.querySelectorAll('[data-plan-report-block]')];
+        const p = panels.find((el) => el.querySelector('h3')?.textContent === 'Pool trajectory');
+        return p ? p.querySelector('table')?.textContent || '' : '';
+      });
+      H.check('invcomp: report trajectory table shows the pool at the sell month (Dec row: strategy pool 2,400, stock 7,600, total 10,000)',
+        trajTable.includes('2,400.00') && trajTable.includes('7,600.00') && trajTable.includes('10,000.00'),
+        JSON.stringify(trajTable.slice(0, 600)));
+      // (d) Property strategy panels still render: open the payscope
+      // report and confirm the breakdown block + Balance Δ line exist.
+      await page.goto(`http://ff.local/#planning/project/${psProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
+      // The cross-project open can silently miss while the freshly
+      // loaded LIST is still settling (run 4 read the previous
+      // report's chart instead of the payscope one): wait for this
+      // report's tab, retrying the click once, before reading any
+      // chart state.
+      try {
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, psRep);
+      } catch {
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, psRep);
+      }
+      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      const propState = await page.evaluate(() => ({
+        deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
+        breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
+        breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
+      }));
+      H.check('invcomp: property strategy comparison still renders breakdown + Balance Δ',
+        propState.deltaLabels && propState.deltaLabels.some((l) => /Balance Δ/.test(l))
+          && propState.breakdownNull === false && propState.breakdownWrapHidden === false,
+        JSON.stringify(propState));
+    } finally { await browserI.close(); }
+  }
   // --- switch-to-fixed (user rule 2026-11-02): the payment
   // re-derives from the current outstanding balance over the
   // remaining amortization; a pure switch does not move the
@@ -3847,25 +4963,26 @@ export async function run(H, S) {
       });
       H.check('report: re-pinned view renders under the new scenario',
         repinned.world2 && repinned.traj, JSON.stringify(repinned));
-      // Strategy detail report panel: current strategy × pinned scenarios.
+      // Strategy detail Reports tier: current strategy × pinned scenarios.
       await page.goto(`http://ff.local/#planning/strategy/${repStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1500);
       const detailPanel = await page.evaluate(() => ({
-        panel: !!document.querySelector('#planStrategyReportPanel'),
+        panel: !!document.querySelector('#planStrategyReportsPanel'),
         scen: (document.querySelector('#planStrategyReportScenarios')?.textContent || '').includes('Report world 2'),
       }));
-      H.check('report: strategy detail has a Report panel with the pinned scenarios', detailPanel.panel && detailPanel.scen, JSON.stringify(detailPanel));
-      await page.click('#planStrategyReportBtn');
+      H.check('report: strategy detail has a Reports tier with the pinned scenarios', detailPanel.panel && detailPanel.scen, JSON.stringify(detailPanel));
+      await page.click('#planStrategyGenerateBtn');
       await waitP(2500);
       const detailReport = await page.evaluate(() => ({
         hash: location.hash,
         strat: (document.querySelector('#planReport')?.textContent || '').includes('Prepay 10k'),
+        tab: !!document.querySelector('#planReportTabsBar'),
       }));
-      H.check('report: strategy detail Generate opens a report scoped to the current strategy',
-        detailReport.hash.startsWith('#planning/project/') && detailReport.strat, JSON.stringify(detailReport));
-      // Baselines AI entry (now in the project-page AI panel):
-      // propose → preview → Apply appends a baseline.
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ description: 'AI baseline test', assumptions: [{ key: 'note', value: 'test' }] }));
+      H.check('report: strategy detail Generate opens its tab in place, scoped to the current strategy',
+        detailReport.hash.startsWith('#planning/strategy/') && detailReport.strat && detailReport.tab, JSON.stringify(detailReport));
+      // Baselines are FIXED: the panel has no baseline target, and
+      // the tier offers no baseline buttons — the AI-designed
+      // baseline flow is gone (the endpoint stays for API compat).
       await page.goto(`http://ff.local/#planning/project/${repProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1200);
       await page.click('#planAiPanelToggleBtn');
@@ -3881,21 +4998,13 @@ export async function run(H, S) {
         await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiPanelToggleBtn');
         await page.waitForFunction(() => !document.querySelector('#planAiPanel').classList.contains('hidden'), { timeout: 10000 });
       }
-      await page.evaluate(() => document.querySelector('[data-plan-ai-target="baseline"]').click());
-      await waitP(400);
-      await page.type('#planAiPanelText', 'A plain do-nothing baseline');
-      await page.click('#planAiPanelGoBtn');
-      await waitP(1500);
-      const basePreview = await page.evaluate(() => ({
-        text: document.querySelector('#planAiPanelOut') ? document.querySelector('#planAiPanelOut').textContent : '',
-        apply: !!document.querySelector('#planAiPanelApplyBtn'),
+      const noBaseEntry = await page.evaluate(() => ({
+        targetGone: !document.querySelector('[data-plan-ai-target="baseline"]'),
+        noBaseButtons: [...document.querySelectorAll('#planBaselineCards button')].length === 0,
+        tierText: document.querySelector('#planBaselineCards')?.textContent || '',
       }));
-      H.check('report: baseline AI preview shows the proposed baseline before Apply',
-        basePreview.apply && basePreview.text.includes('AI baseline test'), JSON.stringify(basePreview));
-      await page.click('#planAiPanelApplyBtn');
-      await waitP(1200);
-      const baseListed = await page.evaluate(() => (document.querySelector('#planBaselineCards')?.textContent || '').includes('AI baseline test'));
-      H.check('report: applied AI baseline joins the Baselines list', baseListed);
+      H.check('report: no AI baseline entry in the panel; tier shows fixed display only',
+        noBaseEntry.targetGone && noBaseEntry.noBaseButtons && (noBaseEntry.tierText.includes('Fixed baseline') || noBaseEntry.tierText.includes('No fixed baseline')), JSON.stringify(noBaseEntry));
     } finally { await browserP2.close(); }
   }
   // ------------------------------------------- strategy page redesign
@@ -4043,23 +5152,24 @@ export async function run(H, S) {
       await waitR(1200);
       r = await H.req('GET', `/api/planning/strategies/${rdStrategyId}`);
       H.check('redesign: op Delete removes the operation', !(r.data.ops || []).some((o) => o.id === rdPrepayOpId), JSON.stringify((r.data.ops || []).map((o) => o.id)));
-      // Leg sub-rows: Edit swaps the row for the leg editor.
-      const legRows = await page.evaluate(() => [...document.querySelectorAll('.plan-leg-subrow')].map((tr) => tr.textContent));
-      H.check('redesign: buy op renders funding-leg sub-rows', legRows.length === 2 && legRows.some((t) => t.includes('Declared cash')) && legRows.some((t) => t.includes('Cash pot')), JSON.stringify(legRows));
+      // Leg lines: Edit swaps the card line for the leg editor.
+      const legRows = await page.evaluate(() => [...document.querySelectorAll('[data-plan-leg-id]')].map((tr) => tr.textContent));
+      H.check('redesign: buy op renders funding-leg lines', legRows.length === 2 && legRows.some((t) => t.includes('Declared cash')) && legRows.some((t) => t.includes('Cash pot')), JSON.stringify(legRows));
       r = await H.req('GET', `/api/planning/strategies/${rdStrategyId}`);
       const buyOp = (r.data.ops || []).find((o) => o.id === rdBuyOpId);
       const legCash = (buyOp.legs || []).find((l) => l.source_ref === 'cash');
       const legPot = (buyOp.legs || []).find((l) => l.source_ref === 'pot');
       await page.evaluate((lid) => { document.querySelector(`[data-plan-leg-edit$=":${lid}"]`).click(); }, legCash.id);
       await waitR(1200);
-      const legEditor = await page.evaluate((lid) => {
-        const tr = document.querySelector(`tr[data-plan-leg-id="${lid}"]`);
-        return { editor: !!tr?.querySelector('.plan-leg-src'), save: !!tr?.querySelector('#planLegSaveBtn') };
-      }, legCash.id);
+      const legEditor = await page.evaluate(() => ({
+        // The editor fills the card leg line itself (no table row).
+        editor: !!document.querySelector('.plan-leg-src'),
+        save: !!document.querySelector('#planLegSaveBtn'),
+      }));
       H.check('redesign: leg Edit opens the inline leg editor', legEditor.editor && legEditor.save, JSON.stringify(legEditor));
-      await page.select(`tr[data-plan-leg-id="${legCash.id}"] .plan-leg-mode`, 'fixed');
+      await page.select('.plan-leg-mode', 'fixed');
       await waitR(200);
-      await page.type(`tr[data-plan-leg-id="${legCash.id}"] .plan-leg-amount`, '500');
+      await page.type('.plan-leg-amount', '500');
       await page.click('#planLegSaveBtn');
       await waitR(1200);
       r = await H.req('GET', `/api/planning/strategies/${rdStrategyId}`);
@@ -4076,7 +5186,7 @@ export async function run(H, S) {
       // The newer panels survive the redesign, in place.
       const panels = await page.evaluate(() => ({
         diff: !!document.querySelector('#planDiffPanel'),
-        report: !!document.querySelector('#planStrategyReportPanel'),
+        report: !!document.querySelector('#planStrategyReportsPanel'),
         opsFirst: (() => { const heads = [...document.querySelectorAll('#planStrategy .panel .section-head h3')].map((h) => h.textContent.trim()); return heads.indexOf('Operations') < heads.indexOf('Difference vs baseline'); })(),
       }));
       H.check('redesign: diff + report panels still render, Operations sits before the diff section',
@@ -4203,10 +5313,10 @@ export async function run(H, S) {
   // ------------------------------------------- strategy-detail clarity
   // Titles + axis captions on report charts (template + AI paths),
   // interest/principal stacked bars + range picker on time charts,
-  // year-grouped diff table with annual-sum rows, Assumptions as top
-  // metadata with Delete, Report + Penalties above Model. (The old
-  // Describe panel is gone — ops drafting lives in the project-page
-  // AI panel now.)
+  // year-grouped diff table with annual-sum rows, Operations first
+  // with the assumption inputs folded into Penalties / Stock value,
+  // Report + Penalties above Model. (The old Describe panel is gone
+  // — ops drafting lives in the project-page AI panel now.)
   r = await H.req('POST', '/api/planning/projects', { name: 'DC Clarity', question: 'q' });
   H.check('detail-clarity: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const dcProjectId = r.data.project.id;
@@ -4323,9 +5433,14 @@ export async function run(H, S) {
         const chartLabels = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
         return {
           heads,
-          asmTop: idx('Assumptions') === 1,
-          reportAfterDiff: idx('Report') === idx('Difference vs baseline') + 2,
-          penAfterReport: idx('Penalties') === idx('Report') + 1,
+          // Item B tier structure: Scenarios tier, then the
+          // Baseline+Operations row, then the analysis panels.
+          // 'Assumptions' may appear ONLY inside the Model panel
+          // (its spec sections) — never as a standalone panel.
+          tiersFirst: idx('Scenarios') === 1 && idx('Baseline') === 2 && idx('Operations') === 3,
+          asmTop: idx('Assumptions') === -1 || idx('Assumptions') > idx('Model'),
+          reportAfterDiff: idx('Reports') === idx('Difference vs baseline') + 2,
+          penAfterReport: idx('Penalties') === idx('Reports') + 1,
           modelLast: idx('Model') === heads.length - 1 || idx('Model') > idx('Penalties'),
           mortCap: !!document.querySelector('#planStrategyMortChart')?.closest('.panel')?.textContent.includes('X: month'),
           stockCap: !!document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent.includes('X: month'),
@@ -4339,8 +5454,8 @@ export async function run(H, S) {
           privChecked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
         };
       });
-      H.check('detail-clarity: panel order — Assumptions top, Report + Penalties above Model, no Describe panel',
-        order.asmTop && order.reportAfterDiff && order.penAfterReport && order.modelLast && !order.heads.includes('Describe in words'), JSON.stringify(order.heads));
+      H.check('detail-clarity: panel order — Scenarios tier, Baseline+Operations row, no standalone Assumptions, Reports + Penalties above Model, no Describe panel',
+        order.tiersFirst && order.asmTop && order.reportAfterDiff && order.penAfterReport && order.modelLast && !order.heads.includes('Describe in words'), JSON.stringify(order.heads));
       H.check('detail-clarity: detail charts + diff carry axis captions and a breakdown chart',
         order.mortCap && order.diffCap && order.diffBreak && order.diffBreakLabels > 12 && order.diffBreakCap, JSON.stringify(order));
       // DC strat is mortgage-only (prepay + rate switch, no stock
@@ -4354,7 +5469,7 @@ export async function run(H, S) {
       const afterDel = await page.evaluate(() => ({
         val: document.querySelector('#planAsmPrivilege')?.value || '',
         checked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
-        note: document.querySelector('#planStrategyAsmPanel')?.textContent.includes('Blank privilege % = penalty on the full amount (upper bound)') || false,
+        note: document.querySelector('#planStrategyPenPanel')?.textContent.includes('Blank privilege % = penalty on the full amount (upper bound)') || false,
       }));
       H.check('detail-clarity: assumption Delete resets to unset, upper-bound note still true',
         afterDel.val === '' && !afterDel.checked && afterDel.note, JSON.stringify(afterDel));
@@ -4420,15 +5535,16 @@ export async function run(H, S) {
       H.check('cleanup: stock-op strategy shows the Stock value chart',
         buyStock.panel && buyStock.cap, JSON.stringify(buyStock));
       // Assumptions follow THAT strategy: stock strategies show the
-      // picked scenario's stock return (read-only) and hide the
-      // mortgage pair; mortgage strategies keep the pair and hide
-      // the return; mixed shows both; empty shows a neutral note.
+      // picked scenario's stock return (read-only, in the Stock value
+      // panel) and hide the mortgage pair; mortgage strategies keep
+      // the pair (in the Penalties panel) and hide the return; mixed
+      // shows both; empty shows neither (no section, no note).
       // (a) Stock-only, flat world (Cleanup Buy Strat's project has
       // no scenarios): no mortgage inputs, no Save, historical note.
       await page.goto(`http://ff.local/#planning/strategy/${scStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmStock = await page.evaluate(() => {
-        const t = document.querySelector('#planStrategyAsmPanel')?.textContent || '';
+        const t = document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '';
         return {
           comparable: !!document.querySelector('#planAsmComparable'),
           privilege: !!document.querySelector('#planAsmPrivilege'),
@@ -4443,7 +5559,7 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmMort = await page.evaluate(() => {
-        const t = document.querySelector('#planStrategyAsmPanel')?.textContent || '';
+        const t = document.querySelector('#planStrategyPenPanel')?.textContent || '';
         return {
           comparable: !!document.querySelector('#planAsmComparable'),
           privilege: !!document.querySelector('#planAsmPrivilege'),
@@ -4472,17 +5588,17 @@ export async function run(H, S) {
       const afScenPlainId = r.data.scenario.id;
       await page.goto(`http://ff.local/#planning/strategy/${afBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
-      await page.select('#planStrategyScenarioSel', String(afScenStockId));
+      await page.click(`[data-plan-strategy-scenario-select="${afScenStockId}"]`);
       await waitD(1500);
       const asmPicked = await page.evaluate(() => ({
-        text: document.querySelector('#planStrategyAsmPanel')?.textContent || '',
+        text: document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '',
         comparable: !!document.querySelector('#planAsmComparable'),
       }));
       H.check('asmfollow: picked scenario stock factor shows with source',
         asmPicked.text.includes('7%/yr') && asmPicked.text.includes('From scenario Asm Stock World') && asmPicked.text.includes('Price CAGR') && !asmPicked.comparable, JSON.stringify(asmPicked));
-      await page.select('#planStrategyScenarioSel', String(afScenPlainId));
+      await page.click(`[data-plan-strategy-scenario-select="${afScenPlainId}"]`);
       await waitD(1500);
-      const asmPlain = await page.evaluate(() => document.querySelector('#planStrategyAsmPanel')?.textContent || '');
+      const asmPlain = await page.evaluate(() => document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '');
       H.check('asmfollow: switching to a scenario without a stock factor shows the historical-rates note',
         asmPlain.includes('sets no stock return') && asmPlain.includes('own historical rates') && !asmPlain.includes('From scenario'), JSON.stringify(asmPlain));
       // (d) Mixed (buy + prepay) shows both sections.
@@ -4505,28 +5621,55 @@ export async function run(H, S) {
       await page.goto(`http://ff.local/#planning/strategy/${afMixedId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmMixed = await page.evaluate(() => ({
-        text: document.querySelector('#planStrategyAsmPanel')?.textContent || '',
+        text: document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '',
         comparable: !!document.querySelector('#planAsmComparable'),
         save: !!document.querySelector('#planAsmSaveBtn'),
       }));
       H.check('asmfollow: mixed strategy shows both sections',
         asmMixed.comparable && asmMixed.save && asmMixed.text.includes('Stock return'), JSON.stringify(asmMixed));
-      // (e) Empty strategy (no ops) shows a neutral note, no sections.
+      // (e) Empty strategy (no ops) shows no assumptions UI at all:
+      // no inputs, no Save, no Penalties panel, no Stock panel, and
+      // no standalone Assumptions section (the old neutral note is
+      // gone with the section).
       r = await H.req('POST', `/api/planning/projects/${afProjectId}/strategies`, { name: 'Asm Empty Strat', source: 'template' });
       H.check('asmfollow: pin empty strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
       const afEmptyId = r.data.strategy.id;
       await page.goto(`http://ff.local/#planning/strategy/${afEmptyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
-      const asmEmpty = await page.evaluate(() => ({
-        text: document.querySelector('#planStrategyAsmPanel')?.textContent || '',
-        comparable: !!document.querySelector('#planAsmComparable'),
-        save: !!document.querySelector('#planAsmSaveBtn'),
-      }));
-      H.check('asmfollow: empty strategy shows a neutral note, no sections',
-        !asmEmpty.comparable && !asmEmpty.save && asmEmpty.text.includes('No operations yet'), JSON.stringify(asmEmpty));
+      const asmEmpty = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('#planStrategy .panel h3')].map((h) => h.textContent.trim());
+        return {
+          comparable: !!document.querySelector('#planAsmComparable'),
+          save: !!document.querySelector('#planAsmSaveBtn'),
+          penPanel: !!document.querySelector('#planStrategyPenPanel'),
+          stockPanel: !!document.querySelector('#planStrategyStockChart'),
+          asmHead: heads.includes('Assumptions'),
+          stockReturn: document.querySelector('#planStrategy')?.textContent.includes('Stock return') || false,
+        };
+      });
+      H.check('asmfollow: empty strategy shows no assumptions UI at all',
+        !asmEmpty.comparable && !asmEmpty.save && !asmEmpty.penPanel && !asmEmpty.stockPanel && !asmEmpty.asmHead && !asmEmpty.stockReturn, JSON.stringify(asmEmpty));
+      // Saving from the new location (Penalties panel) still writes:
+      // set a comparable rate + Confirmed on the DC mortgage strategy
+      // and read it back from the strategy GET.
+      await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitD(1500);
+      const saveHere = await page.evaluate(() => !!document.querySelector('#planStrategyPenPanel #planAsmSaveBtn'));
+      H.check('asmfold: Save assumptions button renders inside the Penalties panel', saveHere, JSON.stringify({ saveHere }));
+      await page.evaluate(() => {
+        const inp = document.querySelector('#planAsmComparable');
+        inp.focus(); inp.select(); document.execCommand('insertText', false, '4.2');
+        document.querySelector('#planAsmComparableOk').click();
+      });
+      await page.click('#planAsmSaveBtn');
+      await waitD(1500);
+      r = await H.req('GET', `/api/planning/strategies/${dcStrategyId}`);
+      const savedAsm = (r.data.assumptions || []).find((a) => a.key === 'comparableRate') || {};
+      H.check('asmfold: saving from the Penalties panel writes a confirmed comparable rate',
+        Number(savedAsm.value) === 4.2 && Number(savedAsm.confirmed) === 1, JSON.stringify(savedAsm));
       // Leave the picker on flat world so no cross-project scenario id
       // leaks into later strategy visits in this browser session.
-      await page.select('#planStrategyScenarioSel', '0');
+      await page.click('[data-plan-strategy-scenario-select="0"]');
       await waitD(1000);
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
@@ -4704,25 +5847,24 @@ export async function run(H, S) {
       H.check('wiring: wiring scenario pick switches the card world',
         world2.note.includes('Wiring world 2') && world2.selCard && !world2.oldSel,
         JSON.stringify(world2));
-      await page.click(`[data-plan-baseline-select="${wBaseId}"]`);
-      await waitW(500);
-      // The Save modal is gone (user 13:51); the AI modal carries the
-      // same wiring-default pins, so the defaults check moves there.
+      // Baselines are FIXED: no baseline pick — the AI modal shows
+      // the fixed baseline as display text (this uncategorized
+      // fixture project resolves to the do-nothing label).
       await page.click('#planAiReportBtn');
       await waitW(1000);
-      const modal = await page.evaluate((b, s) => ({
-        baseVal: document.querySelector('#planReportAiBaseline')?.value || '',
+      const modal = await page.evaluate((s) => ({
+        baseText: document.querySelector('#planReportAiFixedBaseline')?.textContent || '',
         scenChecked: [...document.querySelectorAll('#planReportAiScenarios input:checked')].map((el) => Number(el.value)),
         open: !document.querySelector('#planReportAiModal').classList.contains('hidden'),
-      }), wBaseId, wScen2);
-      H.check('wiring: AI report modal defaults to the wiring baseline + wiring scenario',
-        modal.open && modal.baseVal === String(wBaseId) && JSON.stringify(modal.scenChecked) === JSON.stringify([wScen2]),
+      }), wScen2);
+      H.check('wiring: AI report modal shows the fixed baseline + defaults to the wiring scenario',
+        modal.open && modal.baseText === 'Do-nothing baseline' && JSON.stringify(modal.scenChecked) === JSON.stringify([wScen2]),
         JSON.stringify(modal));
       await page.evaluate(() => { document.querySelector('#planReportAiModal [data-close-modal]').click(); });
       await waitW(500);
-      // No modal save reloads the project anymore, so the wiring
-      // baseline picked above stays picked; the Generate guard below
-      // reflects ONLY the strategy toggle, not a missing baseline.
+      // No modal save reloads the project anymore, and the baseline
+      // is fixed (never missing), so the Generate guard below
+      // reflects ONLY the strategy toggle.
       const selBefore = await page.evaluate((sid) => {
         const b = document.querySelector(`[data-plan-strategy-select="${sid}"]`);
         return { pressed: b?.getAttribute('aria-pressed'), selected: !!b?.closest('.card')?.classList.contains('plan-selected') };
@@ -4913,25 +6055,17 @@ export async function run(H, S) {
           && tiers.tops[0] < tiers.tops[1] && tiers.tops[1] < tiers.tops[2], JSON.stringify(tiers));
       H.check('flow: no connector lines in the flow panel',
         !tiers.svg && tiers.paths === 0, JSON.stringify(tiers));
-      // Guard: baseline is not picked yet (only the base scenario is).
-      // Deselect the AI strategy first, or the routing rule (not the
-      // guard) would own the button state from here on.
+      // Guard: the baseline is FIXED — no baseline pick is ever
+      // missing. Deselect the AI strategy first, or the routing rule
+      // (not the guard) would own the button state from here on.
       await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const guard0 = await page.evaluate(() => ({
         disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
       }));
-      H.check('flow: missing-pick guard names the missing baseline',
-        guard0.disabled && guard0.note.includes('a baseline'), JSON.stringify(guard0));
-      await page.click(`[data-plan-baseline-select="${fBaseId}"]`);
-      await waitF(800);
-      const guard1 = await page.evaluate(() => ({
-        disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
-        note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
-      }));
-      H.check('flow: guard clears once scenario + baseline + strategy are picked',
-        !guard1.disabled && guard1.note === '', JSON.stringify(guard1));
+      H.check('flow: no baseline pick needed — Generate enabled with scenario + strategies picked (baseline fixed)',
+        !guard0.disabled && guard0.note === '', JSON.stringify(guard0));
       // Selection alone creates no report.
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const repCount0 = (r.data.reports || []).length;
@@ -4966,10 +6100,9 @@ export async function run(H, S) {
         navHash === `#planning/strategy/${fStratId}`, navHash);
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitF(1500);
-      // A reload resets wiring state (baseline unpicked, every
-      // strategy picked), so re-pick the engine selection first.
-      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fBaseId}"]`);
-      await waitF(500);
+      // A reload resets wiring state (every strategy picked); the
+      // baseline resolves to fixed automatically, so only re-pick
+      // the engine selection (deselect the AI strategy).
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       // One-click Generate: creates + opens a report pinned to the
@@ -4979,7 +6112,7 @@ export async function run(H, S) {
       await waitF(1500);
       const genHash = await page.evaluate(() => location.hash);
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
-      const genRep = (r.data.reports || []).find((x) => x.name === `Report · Flow world · Flow baseline · ${fLetter}`);
+      const genRep = (r.data.reports || []).find((x) => x.name === `Report · Flow world · Do-nothing · ${fLetter}`);
       const genInline = await page.evaluate((rid) => ({
         inline: !!document.querySelector('#planProject #planReport'),
         tab: !!document.querySelector(`[data-plan-report-tab="${rid}"]`),
@@ -4987,7 +6120,7 @@ export async function run(H, S) {
       const modalGone = await page.evaluate(() => !document.querySelector('#planReportSaveModal'));
       H.check('flow: one-click Generate creates and opens a pinned preset report, no modal',
         !!genRep && genHash === `#planning/project/${fProjectId}` && genInline.inline && genInline.tab
-          && JSON.stringify(genRep.scenarioIds) === JSON.stringify([fScenId]) && genRep.baseline_id === fBaseId
+          && JSON.stringify(genRep.scenarioIds) === JSON.stringify([fScenId]) && genRep.baseline_id == null
           && JSON.stringify(JSON.parse(genRep.strategy_ids || 'null')) === JSON.stringify([fStratId])
           && JSON.stringify(genRep.definition.charts) === JSON.stringify([
             { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] },
@@ -5200,11 +6333,8 @@ export async function run(H, S) {
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
         aiEnabled: !document.querySelector('#planAiReportBtn')?.disabled,
       }));
-      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fAiBaseId}"]`);
-      await waitF(800);
-      const routeBase = await routingState();
-      await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-baseline-select="${fBaseId}"]`);
-      await waitF(800);
+      // Baselines are FIXED, so there is no AI-baseline routing case
+      // anymore — an AI baseline record can never be picked.
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fAiScenId}"]`);
       // Wait for the scenario-click render itself, not a fixed sleep:
       // a fixed 1200ms read the pre-click routing (disabled false, note
@@ -5222,11 +6352,10 @@ export async function run(H, S) {
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const routeStrat = await routingState();
-      H.check('flow: AI-designed baseline/scenario/strategy each disable preset Generate with reason, AI Generate stays available',
-        routeBase.disabled && routeBase.note.includes('AI-designed') && routeBase.note.includes('baseline') && routeBase.aiEnabled
-          && routeScen.disabled && routeScen.note.includes('AI-designed') && routeScen.note.includes('scenario') && routeScen.aiEnabled
+      H.check('flow: AI-designed scenario/strategy each disable preset Generate with reason, AI Generate stays available',
+        routeScen.disabled && routeScen.note.includes('AI-designed') && routeScen.note.includes('scenario') && routeScen.aiEnabled
           && routeStrat.disabled && routeStrat.note.includes('AI-designed') && routeStrat.note.includes('strategy') && routeStrat.aiEnabled,
-        JSON.stringify({ routeBase, routeScen, routeStrat }));
+        JSON.stringify({ routeScen, routeStrat }));
       // AI title vs preset title: the AI modal prefills its name
       // from the AI title; without one it falls back to the
       // auto-name pattern. The preset report from Generate keeps
@@ -5316,7 +6445,7 @@ export async function run(H, S) {
       // project page.
       const tierEngine = await readTier(fScenId, fBaseId, fStratId);
       H.check('reporttab: engine tab highlights its own pins on the tiers above; scenario card shows one combined frame; viewer inline',
-        JSON.stringify(tierEngine.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierEngine.basePins) === JSON.stringify([fBaseId]) && tierEngine.stratPins.includes(fStratId)
+        JSON.stringify(tierEngine.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierEngine.basePins) === JSON.stringify([]) && tierEngine.base === null && tierEngine.stratPins.includes(fStratId)
           && tierEngine.scen && tierEngine.scen.pin && tierEngine.scen.sel
           && tierEngine.scen.border === 'rgb(22, 104, 196)' && tierEngine.scen.bg === 'rgb(240, 246, 252)'
           && tierEngine.scen.outlineStyle === 'none' && tierEngine.scen.shadow.includes('183, 121, 31') && tierEngine.scen.shadow.includes('inset')
@@ -5374,7 +6503,7 @@ export async function run(H, S) {
       H.check('reporttab: AI-pinned tab disables preset Generate with reason, AI stays enabled', tabRoute.genDisabled && tabRoute.note.includes('AI-designed') && tabRoute.aiEnabled, JSON.stringify(tabRoute));
       const tierAi = await readTier(fAiScenId, fAiBaseId, fAiStratId);
       H.check('reporttab: AI tab highlights its own pins above, not the engine pins',
-        JSON.stringify(tierAi.scenPins) === JSON.stringify([fAiScenId]) && JSON.stringify(tierAi.basePins) === JSON.stringify([fAiBaseId]) && JSON.stringify(tierAi.stratPins) === JSON.stringify([fAiStratId]), JSON.stringify(tierAi));
+        JSON.stringify(tierAi.scenPins) === JSON.stringify([fAiScenId]) && JSON.stringify(tierAi.basePins) === JSON.stringify([]) && JSON.stringify(tierAi.stratPins) === JSON.stringify([fAiStratId]), JSON.stringify(tierAi));
       // Round-trip: back to the engine tab, its highlight returns.
       await page.waitForSelector(`[data-plan-report-tab="${genRep.id}"]`, { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab="${genRep.id}"]`);
@@ -5382,7 +6511,7 @@ export async function run(H, S) {
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
       const tierBack = await readTier(fScenId, fBaseId, fStratId);
       H.check('reporttab: highlight follows the tab back to the engine pins',
-        JSON.stringify(tierBack.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierBack.basePins) === JSON.stringify([fBaseId]) && tierBack.stratPins.includes(fStratId), JSON.stringify(tierBack));
+        JSON.stringify(tierBack.scenPins) === JSON.stringify([fScenId]) && JSON.stringify(tierBack.basePins) === JSON.stringify([]) && tierBack.stratPins.includes(fStratId), JSON.stringify(tierBack));
       // AI append on the AI tab: new charts join, old ones stay, and
       // the append persists across a close + reopen.
       await page.waitForSelector(`[data-plan-report-tab="${rtAiId}"]`, { timeout: 15000 });
@@ -5395,7 +6524,7 @@ export async function run(H, S) {
         modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
         // Pickers hide by their .plan-ai-modal-card (modalbeautify
         // restructure): the picker's closest div is now .plan-ai-picks.
-        pickersHidden: ['planReportAiBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.contains('hidden')),
+        pickersHidden: ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.contains('hidden')),
         modelHidden: !!document.querySelector('#planReportAiModelSection.hidden'),
         note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
       }));
@@ -5934,6 +7063,15 @@ export async function run(H, S) {
         await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
         await page.waitForFunction(() => (document.querySelector('#planAiPanelThread')?.textContent || '').includes('prime rises third'), { timeout: 15000 });
       }
+      // Await 'third' COMPLETION (its AI turn), not just its user
+      // turn (pushed pre-API): an in-flight send's success-clear
+      // wipes step (4)'s queue after the zip failure (run 7: msg
+      // ok, kept false).
+      await page.waitForFunction(() => {
+        const t = document.querySelector('#planAiPanelThread')?.textContent || '';
+        const i = t.indexOf('prime rises third');
+        return i >= 0 && t.indexOf('AI:', i) >= 0;
+      }, { timeout: 15000 });
       // (4) An invalid attachment type surfaces the server validation
       // message, and the failed send keeps the queue for retry.
       await page.evaluate(() => {
@@ -5945,26 +7083,27 @@ export async function run(H, S) {
         document.querySelector('#planAiPanelText').value = 'with a zip';
       });
       await page.evaluate(() => document.querySelector('#planAiPanelGoBtn').click());
-      await page.waitForFunction(() => (document.querySelector('#planAiPanelMsg')?.textContent || '').includes('Attachments must be an image'), { timeout: 15000 });
+      // Timeout-safe: a slow send under full-run load must fail this
+      // one check, never abort the module (run 6 lost the whole
+      // aicreate tail to this wait).
+      await page.waitForFunction(() => (document.querySelector('#planAiPanelMsg')?.textContent || '').includes('Attachments must be an image'), { timeout: 15000 }).catch(() => {});
       const zipState = await page.evaluate(() => ({
         msg: document.querySelector('#planAiPanelMsg')?.textContent || '',
         kept: (document.querySelector('#planAiPanelQueue')?.textContent || '').includes('a.zip'),
       }));
       H.check('panelparity: invalid attachment type surfaces the server validation message and keeps the queue',
         zipState.msg.includes('Attachments must be an image') && zipState.kept, JSON.stringify(zipState));
-      // (5) Other targets' threads are untouched; the scenario thread
+      // (5) The other target's thread is untouched; the scenario thread
       // keeps its filename turn across switches.
       const iso = await page.evaluate(() => {
         document.querySelector('[data-plan-ai-target="ops"]').click();
         const opsThread = document.querySelector('#planAiPanelThread')?.textContent || '';
-        document.querySelector('[data-plan-ai-target="baseline"]').click();
-        const baseThread = document.querySelector('#planAiPanelThread')?.textContent || '';
         document.querySelector('[data-plan-ai-target="scenario"]').click();
         const scenThread = document.querySelector('#planAiPanelThread')?.textContent || '';
-        return { opsEmpty: opsThread === '', baseEmpty: baseThread === '', scenHasFile: scenThread.includes('rates.csv') };
+        return { opsEmpty: opsThread === '', scenHasFile: scenThread.includes('rates.csv') };
       });
-      H.check('panelparity: other targets threads untouched, scenario thread keeps its filename turn',
-        iso.opsEmpty && iso.baseEmpty && iso.scenHasFile, JSON.stringify(iso));
+      H.check('panelparity: other target thread untouched, scenario thread keeps its filename turn',
+        iso.opsEmpty && iso.scenHasFile, JSON.stringify(iso));
     } finally { await browserPp.close(); }
   }
 
@@ -6125,7 +7264,6 @@ export async function run(H, S) {
       await page.evaluate(() => document.querySelector('#planAiCreateApplyBtn').click());
       await page.waitForFunction(() => (location.hash || '').includes('#planning/project/'), { timeout: 20000 });
       await page.waitForSelector('[data-plan-scenario-select]', { timeout: 15000 });
-      await page.waitForSelector('[data-plan-baseline-select]', { timeout: 15000 });
       await page.waitForSelector('[data-plan-strategy-select]', { timeout: 15000 });
       const browserHash = await page.evaluate(() => location.hash);
       const browserPid = Number((browserHash.match(/project\/(\d+)/) || [])[1]);
@@ -6140,10 +7278,11 @@ export async function run(H, S) {
         r.status === 200 && (r.data.ops || []).length === 1, JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
       // Strategy stays picked via the null=all wiring default: clicking
       // its Select would toggle the only strategy OFF and trip the
-      // pick-a-strategy guard instead of the AI-routing note.
+      // pick-a-strategy guard instead of the AI-routing note. The
+      // scenario click picks the AI scenario; the baseline is fixed
+      // and never picked, so the old baseline leg is gone.
       await page.evaluate(() => {
         document.querySelector('[data-plan-scenario-select]').click();
-        document.querySelector('[data-plan-baseline-select]').click();
       });
       await aiWait(800);
       const routing = await page.evaluate(() => ({
@@ -6151,7 +7290,7 @@ export async function run(H, S) {
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
         aiEnabled: document.querySelector('#planAiReportBtn')?.disabled === false,
       }));
-      H.check('aicreate: AI-designed trio disables preset Generate, AI Generate stays available',
+      H.check('aicreate: AI-designed scenario/strategy disable preset Generate, AI Generate stays available',
         routing.genDisabled && routing.note.includes('AI-designed') && routing.aiEnabled, JSON.stringify(routing));
     } finally { await browserAi.close(); }
     }

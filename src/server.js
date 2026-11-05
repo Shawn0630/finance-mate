@@ -33,7 +33,7 @@ import {
 } from './earnings.js';
 import {
   validPlanInput, listPlans, getPlan, planView, generatePlan, generatePlansForAccount,
-  recordPlanEventDeletion,
+  recordPlanEventDeletion, planPeriodAmounts, planJobPerPeriodGross,
 } from './plans.js';
 import { analyzeCsv, activityValuesFor, applyMappedCsv, proposeCsvMapping, reviseCsvMapping, translatePreview } from './csvMapImport.js';
 import {
@@ -54,12 +54,13 @@ import {
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
+  scopeMainlineToProperty,
   PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
   validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
   primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
-  currentReturnRateFromPoints, validatePoolItemShapes,
+  currentReturnRateFromPoints, validatePoolItemShapes, poolExternalCash,
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
   validateAiReportChartSeries, aiReportPrompt,
 } from './planning.js';
@@ -2943,8 +2944,8 @@ app.post('/api/investments/accounts/:id/plans', requireApiAuth, (req, res) => {
   }, () => {
     const ts = nowIso();
     const info = db.prepare(
-      'INSERT INTO invest_plans (account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(account.id, v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, ts, ts);
+      'INSERT INTO invest_plans (account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, own_pct, employer_pct, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(account.id, v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, v.ownPct, v.employerPct, ts, ts);
     const plan = getPlan(db, info.lastInsertRowid);
     const gen = generatePlan(db, plan, { today: vancouverToday(), ts });
     return { value: { ...planView(db, plan, vancouverToday()), generation: gen }, entityId: account.id };
@@ -2966,8 +2967,8 @@ app.put('/api/investments/plans/:id', requireApiAuth, (req, res) => {
     module: 'stocks', entityType: 'account', entityId: account.id,
     entityLabel: account.name, summary: `Updated contribution plan · ${account.name}`,
   }, () => {
-    db.prepare('UPDATE invest_plans SET job_id = ?, target_holding_id = ?, start_date = ?, own_amount = ?, employer_amount = ?, updated_at = ? WHERE id = ?')
-      .run(v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, nowIso(), plan.id);
+    db.prepare('UPDATE invest_plans SET job_id = ?, target_holding_id = ?, start_date = ?, own_amount = ?, employer_amount = ?, own_pct = ?, employer_pct = ?, updated_at = ? WHERE id = ?')
+      .run(v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, v.ownPct, v.employerPct, nowIso(), plan.id);
     const updated = getPlan(db, plan.id);
     const gen = generatePlan(db, updated, { today: vancouverToday(), ts: nowIso() });
     return { value: { ...planView(db, updated, vancouverToday()), generation: gen }, entityId: account.id };
@@ -3290,13 +3291,19 @@ const earnJobRow = (row) => {
     .reduce((s, b) => s + b.amount, 0);
   // Pre-tax RRSP: linked plans' OWN per-period amount active today
   // reduces taxable income in the calc (federal and provincial);
-  // the employer match never enters. The calc runs on read, so a
-  // plan create/edit/delete flows into every surface — list cards,
-  // detail summary, breakdown table, charts — with no stored
-  // figure to refresh and no history row touched.
+  // the employer match never enters. Percent plans derive from the
+  // job's CURRENT per-period gross, so a pay change flows into the
+  // deduction (and the cash take-home) with no stored figure to
+  // refresh. The calc runs on read, so a plan create/edit/delete
+  // flows into every surface — list cards, detail summary,
+  // breakdown table, charts — with no history row touched. The
+  // gross is deduction-independent, so a zero-deduction calc gives
+  // the exact gross the percent derivation prices from.
   const today = vancouverToday();
-  const rrspDeduction = db.prepare('SELECT start_date, own_amount FROM invest_plans WHERE job_id = ?').all(row.id)
-    .reduce((s, p) => s + (Number(p.own_amount) > 0 && p.start_date <= today ? Number(p.own_amount) : 0), 0);
+  const linkedPlans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id);
+  const gross0 = calcSalary({ ...row, bonus_total: bonusTotal, rrspDeduction: 0 }, earnRegion().payroll).perPeriod.gross;
+  const rrspDeduction = linkedPlans
+    .reduce((s, p) => s + (p.start_date <= today ? planPeriodAmounts(p, gross0).own : 0), 0);
   return {
     ...row,
     owner: row.owner || null,
@@ -3517,7 +3524,14 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
   // job with linked plans solves with the same pre-tax deduction
   // the read-time calc applies (current-rate convention: plans
   // active today; a new job has no plans, so POST keeps the 0).
-  const rrspDed = db.prepare('SELECT COALESCE(SUM(own_amount), 0) AS s FROM invest_plans WHERE job_id = ? AND own_amount > 0 AND start_date <= ?').get(id, vancouverToday()).s;
+  // Percent plans derive from the job's PRE-EDIT gross here — the
+  // read path re-derives from the new gross on every read, so the
+  // display is always exact; only a take-home-basis edit combined
+  // with a simultaneous pay change can drift by the percent of
+  // the gross delta until the next read, which recomputes exactly.
+  const preGross = earnJobRow(existing).calc.perPeriod.gross;
+  const rrspDed = db.prepare('SELECT * FROM invest_plans WHERE job_id = ? AND start_date <= ?').all(id, vancouverToday())
+    .reduce((s, p) => s + planPeriodAmounts(p, preGross).own, 0);
   const pcErr = derivePayChangeValues(v, existing, rrspDed);
   if (pcErr) return res.status(400).json({ error: pcErr });
   const takeErr = resolveTakeHome(req.body || {}, v, existing, rrspDed);
@@ -3598,7 +3612,12 @@ app.get('/api/earnings/jobs/:id/monthly-chart', requireApiAuth, (req, res) => {
   const row = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'job not found' });
   const job = earnJobRow(row);
-  const plans = db.prepare('SELECT start_date, own_amount, employer_amount FROM invest_plans WHERE job_id = ?').all(row.id);
+  // Percent plans price from the job's current gross (the chart's
+  // current-rate convention), so the RRSP slices and the per-payday
+  // tax recompute both see derived amounts, never stored NULLs.
+  const gross = job.calc.perPeriod.gross;
+  const plans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id)
+    .map((p) => ({ start_date: p.start_date, own_amount: planPeriodAmounts(p, gross).own, employer_amount: planPeriodAmounts(p, gross).employer }));
   const series = jobMonthlySeries({
     frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
     calc: job.calc, plans, today: vancouverToday(),
@@ -4379,6 +4398,16 @@ function planProjectEntityOf(project) {
   if (!project) return null;
   try { return project.entity ? JSON.parse(project.entity) : null; } catch { return null; }
 }
+// Property-project entity property (user rule 2026-11-04): the single
+// property the project is about, with its address for captions. Null
+// for legacy projects (no category/entity) and non-property projects.
+function planEntityProperty(project) {
+  if (!project || project.category !== 'property') return null;
+  const entity = planProjectEntityOf(project);
+  if (!entity || entity.type !== 'property' || !Number.isInteger(Number(entity.propertyId))) return null;
+  const row = db.prepare('SELECT id, address FROM properties WHERE id = ?').get(Number(entity.propertyId));
+  return row ? { id: row.id, address: row.address } : null;
+}
 function planOpsOf(strategyId) {
   const ops = db.prepare('SELECT * FROM plan_ops WHERE strategy_id = ? ORDER BY seq, id').all(strategyId)
     .map((o) => ({ ...o, params: JSON.parse(o.params || '{}') }));
@@ -4555,7 +4584,13 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
   await ensureFreshPrime();
   const baseMainline = planAssembleMainline(project.id);
   const currentMonth = currentMonthKey();
-  const mainline = planPoolMainline(project, baseMainline, currentMonth);
+  let mainline = planPoolMainline(project, baseMainline, currentMonth);
+  // Entity scope (user rule 2026-11-04): a property project's
+  // projection world holds ONLY its entity property — every figure
+  // below (balance, interest, payment, payoff, cost/gain/net, deltas)
+  // is then entity-only by construction. Holdings are untouched.
+  const entityProp = planEntityProperty(project);
+  if (entityProp) mainline = scopeMainlineToProperty(mainline, entityProp.id);
   const ops = planOpsOf(strategy.id);
   const legs = [];
   for (const o of ops) for (const l of o.legs) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
@@ -4581,7 +4616,10 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
   const primeHistory = getPrimeHistory();
   const cur = getCurrentPrime();
   const currentPrime = cur ? cur.rate : null;
-  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth };
+  // External pool cash seeds the pot in both runs (0 when the pool
+  // has none) — it is spendable from the first month.
+  const potInitial = poolExternalCash(planProjectEntityOf(project));
+  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth, potInitial };
   const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
   const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
   baseline.currentRates = currentRates;
@@ -4787,6 +4825,7 @@ function planProjectViewRow(p) {
     metadataLabels: planProjectMetadataLabels(metadata),
     categoryLabels: planOptCategoryLabels(p.category, p.subcategory, entity),
     baselines: planBaselinesOf(p.id),
+    fixedBaseline: planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity }),
   };
 }
 function planBaselineRow(b) {
@@ -4899,6 +4938,9 @@ function planValidateOptEntity(category, entity) {
       }
       let total = 0;
       for (const it of items) {
+        // External funding adds its amount straight to the pool —
+        // no holding or account value to check against.
+        if (it.source === 'external') { total += Number(it.amount); continue; }
         if (it.accountId != null) {
           const hs = db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId));
           let accountValue = 0;
@@ -4995,7 +5037,11 @@ function planRecommendationFor(category, subcategory, entity) {
       return { h, account: acc ? acc.name : '', units, price, valueCad: h.currency === 'USD' ? valueNative * fx : valueNative };
     };
     for (const it of entity.items) {
-      if (it.accountId != null) {
+      if (it.source === 'external') {
+        const contribution = Number(it.amount);
+        poolTotal += contribution;
+        items.push({ source: 'external', amount: contribution, value: contribution });
+      } else if (it.accountId != null) {
         const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(Number(it.accountId));
         const hs = db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId));
         const details = hs.map((row) => holdingDetail(row.id)).filter((d) => d.units > 0);
@@ -5090,6 +5136,110 @@ function planRecommendationFor(category, subcategory, entity) {
   return { error: 'unknown category' };
 }
 
+// The FIXED baseline (user 2026-11-04): the current do-nothing
+// state, never user-added. The engine already treats every baseline
+// as the do-nothing reference (comparison endpoint: a chosen
+// baselineId is numerically inert, only a label), so the fixed
+// baseline is a live computation from current stored data, not a
+// record: name + description from the recommendation's do-nothing
+// baseline, facts per category from the same sources the engine
+// uses. recordId points at the project's recommendation-source
+// baseline record when one exists (report pins keep working);
+// legacy AI/manual records are never the fixed baseline.
+function planFixedBaseline(view) {
+  const category = view.category;
+  const subcategory = view.subcategory;
+  const entity = view.entity;
+  if (!category || !entity) return null;
+  const rec = planRecommendationFor(category, subcategory, entity);
+  if (!rec || rec.error) return null;
+  const label = planOptEntityLabel(entity);
+  let recordId = null;
+  if (view.id) {
+    const rows = db.prepare('SELECT id, source FROM plan_baselines WHERE project_id = ? ORDER BY id').all(view.id);
+    const fixed = rows.find((r) => r.source === 'recommendation');
+    recordId = fixed ? fixed.id : null;
+  }
+  const base = { name: rec.baseline.name, description: rec.baseline.description, recordId, kind: category };
+  const figs = rec.baseline.figures || {};
+  if (category === 'property') {
+    const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(Number(entity.propertyId));
+    if (!prop) return null;
+    const seg = db.prepare('SELECT * FROM rate_segments WHERE property_id = ? ORDER BY start_date DESC, id DESC LIMIT 1').get(Number(entity.propertyId));
+    let rateLabel = '—';
+    if (seg) {
+      if (seg.rate_type === 'fixed') rateLabel = `${seg.annual_rate}% fixed`;
+      else if (seg.rate_mode === 'prime_spread') rateLabel = `Prime ${Number(seg.spread) >= 0 ? '+' : ''}${seg.spread}`;
+      else if (seg.annual_rate != null) rateLabel = `${seg.annual_rate}% variable`;
+    }
+    // Monthly payment + remaining balance: the same schedule the
+    // property page projects (paymentUsed, balance at current month).
+    let payment = null; let outstanding = prop.mortgage_balance ?? null;
+    const balance = prop.mortgage_balance > 0 ? prop.mortgage_balance : 0;
+    const segments = segmentsOf(prop.id);
+    if (balance > 0 && segments.length) {
+      const prime = getCurrentPrime();
+      const primeRate = prime ? prime.rate : null;
+      const primeBlocked = primeRate === null && segments.some((s) => s.rate_type === 'variable' && s.rate_mode === 'prime_spread');
+      if (!primeBlocked) {
+        const { frequency, paymentDay } = termScheduleOf(prop);
+        const r = buildSchedule({
+          balance, balanceDate: prop.mortgage_balance_date || vancouverToday(),
+          terms: termsOf(prop.id), segments, lumpSums: lumpSumsOf(prop.id),
+          paymentDay, frequency, primeRate, primeHistory: getPrimeHistory(), region: prop.region || 'CA',
+        });
+        if (r.state === 'projected') {
+          payment = r.paymentUsed;
+          outstanding = remainingBalanceAt(r.series, currentMonthKey(), balance, r.payoffMonth).balance;
+        }
+      }
+    }
+    return { ...base, address: label, rateType: seg ? seg.rate_type : null, rateLabel, balance: figs.balance ?? null, payment, outstanding };
+  }
+  if (category === 'investment') {
+    // Expected return per holding: the baseline's own rule — first
+    // available annualized window, 1y → 3y → 5y price CAGR, never
+    // invented (a holding with < 2 points carries no return).
+    const holdingIds = new Set();
+    if (entity.type === 'pool') {
+      for (const it of entity.items || []) {
+        if (it.holdingId != null) holdingIds.add(Number(it.holdingId));
+        else if (it.accountId != null) {
+          for (const h of db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(it.accountId))) holdingIds.add(h.id);
+        }
+      }
+    } else if (entity.holdingId) holdingIds.add(Number(entity.holdingId));
+    else if (entity.accountId) {
+      for (const h of db.prepare('SELECT id FROM invest_holdings WHERE account_id = ?').all(Number(entity.accountId))) holdingIds.add(h.id);
+    }
+    const returns = [];
+    for (const hid of holdingIds) {
+      const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(hid);
+      if (!h) continue;
+      const units = unitsOn(listEvents(db, hid), currentMonthKey());
+      if (!(units > 0)) continue;
+      const pts = listPricePoints(db, hid).filter((pt) => String(pt.date) <= vancouverToday());
+      const sug = returnSuggestionsFromPoints(pts, currentMonthKey());
+      const win = sug.find((s) => s.annualizedReturn != null);
+      if (win) returns.push({ holdingId: hid, label: h.symbol || h.label || '', pct: Math.round(win.annualizedReturn * 10000) / 100, window: win.window });
+    }
+    return { ...base, label, figures: figs, returns };
+  }
+  if (category === 'earning') {
+    if (entity.type === 'job') {
+      const job = db.prepare('SELECT * FROM earn_jobs WHERE id = ?').get(Number(entity.jobId));
+      if (!job) return null;
+      return { ...base, label, employer: job.employer, annualGross: figs.annualGross ?? null, frequency: job.frequency };
+    }
+    const rental = db.prepare('SELECT * FROM earn_rentals WHERE id = ?').get(Number(entity.rentalId));
+    if (!rental) return null;
+    return { ...base, label: rental.label || label, taxYear: figs.taxYear ?? null, gross: figs.gross ?? null, net: figs.net ?? null };
+  }
+  if (category === 'saving') return { ...base, spent12m: figs.spent12m ?? null };
+  if (category === 'tax_saving') return { ...base, jobs: figs.jobs ?? null, rentals: figs.rentals ?? null };
+  return base;
+}
+
 app.post('/api/planning/projects', requireApiAuth, (req, res) => {
   const b = req.body || {};
   if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'project name is required' });
@@ -5130,6 +5280,11 @@ app.post('/api/planning/projects', requireApiAuth, (req, res) => {
         .run(pid, rec.baseline.name, 'recommendation', category, subcategory, JSON.stringify(entity), JSON.stringify(rec.baseline), now, now);
       db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
         .run(pid, rec.strategy.name, 'A', 'template', 'recommendation', JSON.stringify(rec.strategy.template_params), now, now);
+    } else if (category) {
+      // Fixed baseline auto-set even without a recommendation: the
+      // do-nothing current state, no figures invented.
+      db.prepare('INSERT INTO plan_baselines (project_id, name, source, category, subcategory, entity, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(pid, 'Current state', 'fixed', category, subcategory, JSON.stringify(entity), JSON.stringify({ name: 'Current state', description: 'Do nothing — current state', figures: {} }), now, now);
     }
     return pid;
   });
@@ -5625,7 +5780,7 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
   // The strategy carries no factors anymore: the world lives on the
   // scenario (appliedScenario labels which one these numbers ran under).
   const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [], factors: null, sink: planStrategySink(s) };
-  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model });
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: planEntityProperty(p), fixedBaseline: planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity: planProjectEntityOf(p) }) });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -5683,6 +5838,9 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     selected = base ? [base] : [null];
   }
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  // Entity property for the 2026-11-04 scope rule (null unless this
+  // is a property project with a resolvable entity property).
+  const entityProp = planEntityProperty(p);
   const buildBlock = async (scenarioRow) => {
     const factors = planScenarioFactorsOfRow(scenarioRow);
     const rows = [];
@@ -5704,9 +5862,11 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
       await ensureFreshPrime();
       const cur = getCurrentPrime();
       const currentMonth = currentMonthKey();
-      const mainline = planPoolMainline(p, baseMainline, currentMonth);
+      let mainline = planPoolMainline(p, baseMainline, currentMonth);
+      const fallbackEntity = planEntityProperty(p);
+      if (fallbackEntity) mainline = scopeMainlineToProperty(mainline, fallbackEntity.id);
       const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
-      baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: factorsToAssumptions(factors, {}), primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: primeFactorToScenario(factors), holdingGrowth });
+      baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: factorsToAssumptions(factors, {}), primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: primeFactorToScenario(factors), holdingGrowth, potInitial: poolExternalCash(planProjectEntityOf(p)) });
       baseline.currentRates = currentRates;
     }
     // Strategy-centric deltas: per strategy, Equity Δ (peak balance
@@ -5724,12 +5884,14 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
       const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
       r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
       r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
-      // Monthly-payment scope (user rule 2026-11-02): the payment
-      // figures cover ONLY the properties this strategy's mortgage
-      // ops touch — never the project total. Stock-only / no-op
-      // strategies carry nulls and render '—'. The single-property
-      // label names the property so the figure is self-evident.
-      const scope = paymentScopeFor(baseline, r.projection, sops);
+      // Monthly-payment scope: for property projects the 2026-11-04
+      // entity rule SUBSUMES the 2026-11-02 op-touched rule — the
+      // payment follows the entity property, not the touched set.
+      // Legacy and non-property projects keep op-touched scope.
+      // Stock-only / no-op strategies carry nulls and render '—'.
+      // The single-property label names the property so the figure is
+      // self-evident.
+      const scope = paymentScopeFor(baseline, r.projection, sops, entityProp ? [entityProp.id] : null);
       let scopeLabel = 'Monthly payment';
       if (scope.propertyIds.length === 1) {
         const addr = db.prepare('SELECT address FROM properties WHERE id = ?').get(scope.propertyIds[0]);
@@ -5751,16 +5913,24 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     // and the strategy trajectories: one world, one assessed path.
     const mainlineForReport = planAssembleMainline(p.id);
     const assessedByProperty = mainlineForReport.assessed || {};
-    const assessedTotal = Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
+    // Entity scope: a property project's total value grows ONLY its
+    // entity property's assessed value — never the all-properties sum.
+    const assessedTotal = entityProp
+      ? (Number(assessedByProperty[entityProp.id]) || 0)
+      : Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
     const growth = factors && factors.propertyGrowth ? factors.propertyGrowth.valuePct : null;
-    const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey()) }];
+    // Investment scope: report trajectories carry the cash-pool series
+    // and their total is pool + stocks only (never property equity).
+    const investmentScope = p.category === 'investment';
+    const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: baseline.stocks.potSeries, investmentScope }) }];
     for (const r of rows) {
-      reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey()) });
+      reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope }) });
     }
     const report = {
       assessedTotal, assessedByProperty,
       trajectories: reportTrajectories,
       costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
+      investmentScope,
     };
     return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
   };
@@ -5778,7 +5948,7 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     project: p, scenarios: allScenarios, selectedScenarioIds: selected.filter(Boolean).map((x) => x.id),
     scenarioBlocks, scenario: first ? first.scenario : null,
     baseline: first ? first.baseline : null, strategies: first ? first.strategies : [],
-    report: first ? first.report : null, chosenBaseline,
+    report: first ? first.report : null, chosenBaseline, entityProperty: entityProp,
   });
 });
 

@@ -116,6 +116,30 @@ export function validPlanInput(b, { accountType } = {}) {
   const holdingId = Number(b.target_holding_id ?? b.targetHoldingId ?? b.holding_id);
   if (!Number.isInteger(holdingId) || holdingId <= 0) return { error: 'a target holding is required' };
   if (!isDateStr(b.start_date)) return { error: 'start date must be YYYY-MM-DD' };
+  // Percentage mode: the contribution tracks the linked job's pay —
+  // own_pct / employer_pct are percent of the job's CURRENT
+  // per-period gross, derived at read/generation time, never stored
+  // as dollars. Fixed-dollar mode is unchanged and stays the
+  // default; a plan is one mode or the other, never a mix.
+  const modeRaw = b.amount_mode ?? b.amountMode;
+  const mode = modeRaw === 'percent' || modeRaw === 'fixed'
+    ? modeRaw
+    : (b.own_pct ?? b.ownPct) != null ? 'percent' : 'fixed';
+  if (mode === 'percent') {
+    const ownPct = cleanNum(b.own_pct ?? b.ownPct);
+    if (ownPct == null || ownPct <= 0 || ownPct > 100) return { error: 'own percent must be a number > 0 and at most 100' };
+    const employerPctRaw = cleanNum(b.employer_pct ?? b.employerPct);
+    if (employerPctRaw != null && employerPctRaw < 0) return { error: 'employer percent must be a number ≥ 0' };
+    if (employerPctRaw != null && employerPctRaw > 100) return { error: 'employer percent must be at most 100' };
+    if (accountType !== 'RRSP' && employerPctRaw != null && employerPctRaw > 0) {
+      return { error: 'employer contributions apply to RRSP accounts only' };
+    }
+    return {
+      jobId, holdingId, startDate: b.start_date, mode,
+      ownAmount: null, employerAmount: null,
+      ownPct, employerPct: accountType === 'RRSP' && employerPctRaw ? employerPctRaw : null,
+    };
+  }
   const ownAmount = cleanNum(b.own_amount ?? b.ownAmount);
   if (ownAmount == null || ownAmount <= 0) return { error: 'own amount must be a number > 0' };
   const employerRaw = cleanNum(b.employer_amount ?? b.employerAmount);
@@ -124,9 +148,37 @@ export function validPlanInput(b, { accountType } = {}) {
     return { error: 'employer contributions apply to RRSP accounts only' };
   }
   return {
-    jobId, holdingId, startDate: b.start_date,
+    jobId, holdingId, startDate: b.start_date, mode,
     ownAmount, employerAmount: accountType === 'RRSP' && employerRaw ? employerRaw : null,
+    ownPct: null, employerPct: null,
   };
+}
+
+// The linked job's CURRENT per-period gross, on the same basis the
+// salary calc uses (a period-basis job's gross IS per-period; an
+// annual-basis job's gross is spread over the year's periods).
+// Rounded to cents like the calc's displayed per-period gross, so a
+// derived percent amount always matches the displayed gross.
+export function planJobPerPeriodGross(job) {
+  if (!job || job.gross_amount == null) return null;
+  const freq = PAY_FREQUENCIES[job.frequency];
+  if (!freq) return null;
+  const gross = job.gross_basis === 'period' ? Number(job.gross_amount) : Number(job.gross_amount) / freq.periods;
+  return Number.isFinite(gross) ? round2(gross) : null;
+}
+
+// One plan's CURRENT per-period amounts: fixed plans return their
+// stored dollars; percent plans derive pct × current gross, rounded
+// to cents. A percent plan with no derivable gross yields 0 —
+// generation skips that period rather than guessing an amount.
+export function planPeriodAmounts(plan, perPeriodGross) {
+  if (plan && plan.own_pct != null) {
+    if (perPeriodGross == null) return { own: 0, employer: null };
+    const own = round2(Number(plan.own_pct) / 100 * perPeriodGross);
+    const employer = plan.employer_pct != null ? round2(Number(plan.employer_pct) / 100 * perPeriodGross) : null;
+    return { own, employer };
+  }
+  return { own: Number(plan.own_amount) || 0, employer: plan.employer_amount != null ? Number(plan.employer_amount) : null };
 }
 
 // ------------------------------------------------------------- reads
@@ -175,6 +227,7 @@ export function planView(db, plan, today) {
   const events = listPlanEvents(db, plan.id);
   const ownTotal = round2(events.reduce((s, e) => s + (Number(e.own_amount) || 0), 0));
   const employerTotal = round2(events.reduce((s, e) => s + (Number(e.employer_amount) || 0), 0));
+  const derived = planPeriodAmounts(plan, planJobPerPeriodGross(job));
   return {
     ...plan,
     frequency, frequency_label: frequencyLabel(frequency),
@@ -182,6 +235,7 @@ export function planView(db, plan, today) {
     target_holding_label: holding ? holding.label : null,
     generated_count: events.length,
     own_total: ownTotal, employer_total: employerTotal,
+    derived_own_amount: derived.own, derived_employer_amount: derived.employer,
     skipped,
   };
 }
@@ -211,11 +265,15 @@ export function generatePlan(db, plan, { today, ts }) {
         if (st.state === 'skipped') skipped.push({ due_date: due, reason: st.reason });
         continue;
       }
-      const total = Number(plan.own_amount) + (Number(plan.employer_amount) || 0);
+      // Percent plans derive from the job's CURRENT gross, so a pay
+      // change flows into the next generated buy automatically;
+      // already-generated events keep their generation-time amounts.
+      const amounts = planPeriodAmounts(plan, planJobPerPeriodGross(job));
+      const total = amounts.own + (amounts.employer || 0);
       const units = round4(total / st.price);
-      if (!(units > 0)) { skipped.push({ due_date: due, reason: 'no price on or before this date' }); continue; }
+      if (!(units > 0)) { skipped.push({ due_date: due, reason: 'no contribution amount for this period' }); continue; }
       ins.run(plan.target_holding_id, due, units, st.price,
-        plan.id, Number(plan.own_amount), Number(plan.employer_amount) || null, ts, ts);
+        plan.id, amounts.own, amounts.employer || null, ts, ts);
       created.push({ date: due, units, price: st.price });
     }
   })();

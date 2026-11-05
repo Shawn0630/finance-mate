@@ -595,6 +595,18 @@ table.seg-table td:last-child { text-align: right; }
 @media (max-width: 1100px) { .plan-flow-tier-mid { grid-template-columns: 1fr; } }
 .plan-flow-group { min-width: 0; }
 .plan-flow-group .card { margin-bottom: 12px; }
+/* Mid-tier group heads share one height: a toolbar's own vertical
+   margins would otherwise stretch the Strategies/Operations head
+   taller than the button-less Baselines/Baseline head, so the two
+   columns' content starts at different heights (tieralign pin:
+   removing the Baselines + Add button in the fixed-baseline round
+   exposed exactly this 12px step). */
+.plan-flow-tier-mid .plan-flow-group .section-head .toolbar { margin: 0; }
+/* A fixed-baseline empty-state note occupies a card slot: cards
+   carry no top margin, so the note's 6px top margin would
+   otherwise collapse out of its container and step the Baseline
+   column 6px below the Strategies/Operations column (tieralign). */
+#planBaselineCards .note, #planStrategyFixedBaseline .note { margin-top: 0; }
 .plan-flow-tier .card { margin-bottom: 12px; }
 .plan-flow-card { padding: 12px 14px; }
 .plan-flow-card.plan-selected { border-color: #1668c4; background: #f0f6fc; }

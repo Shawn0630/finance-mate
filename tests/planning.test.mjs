@@ -16,6 +16,7 @@ import {
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
+  scopeMainlineToProperty, validatePoolItemShapes, poolExternalCash,
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
   validateScenarioFactors,
   factorsToAssumptions,
@@ -386,6 +387,99 @@ test('reportMonthlySeries: scheduled principal sums across properties, 0 on stoc
   assert.equal(rows[2].principal, 0);
 });
 
+test('computeProjection: pot series tracks sells in and pot-funded buys out', () => {
+  const holding = {
+    id: 1, accountId: 1, symbol: 'XQQ.TO', label: 'XQQ', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100 }],
+    pricePoints: [{ date: '2025-01-01', price: 100 }],
+  };
+  const mainline = { properties: [], holdings: [holding], assessed: {}, declaredAssets: [], fxRateLatest: 1 };
+  const run = (ops, legs) => computeProjection({
+    mainline: JSON.parse(JSON.stringify(mainline)), ops, legs,
+    assumptions: {}, scenario: null, primeHistory: [], currentPrime: null,
+    currentMonth: '2026-11', horizonMonths: 12, holdingGrowth: null,
+  });
+  const strat = run(
+    [{ id: 1, seq: 1, op_type: 'sell', params: { holdingId: 1, date: '2026-12-15', units: 24, price: 100 } },
+     { id: 2, seq: 2, op_type: 'buy', params: { accountId: 1, symbol: 'NEW.TO', date: '2027-01-15', units: 12, price: 100, currency: 'CAD' } }],
+    [{ op_seq: 2, source_ref: 'pot', amount: 'all' }]);
+  assert.deepEqual(strat.errors, []);
+  const potAt = (m) => (strat.stocks.potSeries.find((r) => r.month === m) || {}).value;
+  const valAt = (m) => (strat.stocks.series.find((r) => r.month === m) || {}).value;
+  assert.equal(potAt('2026-11'), 0);
+  assert.equal(potAt('2026-12'), 2400);
+  assert.equal(potAt('2027-01'), 1200);
+  assert.equal(strat.stocks.potAtHorizon, 1200);
+  assert.equal(valAt('2026-12'), 7600);
+  assert.equal(valAt('2027-01'), 8800);
+  // An empty-pot pot-funded buy is dropped with an error and the
+  // series stays identical to baseline — the mechanism behind the
+  // user's identical-series report (not conservation: conservation
+  // moves pool down and stock up by the buy amount, as above).
+  const dropped = run(
+    [{ id: 1, seq: 1, op_type: 'buy', params: { holdingId: 1, date: '2027-01-15', units: 10, price: 100 } }],
+    [{ op_seq: 1, source_ref: 'pot', amount: 'all' }]);
+  assert.equal(dropped.errors.length, 1);
+  assert.match(dropped.errors[0], /unfunded/);
+  assert.equal(dropped.stocks.buyCash, 0);
+  assert.equal((dropped.stocks.series.find((r) => r.month === '2027-01') || {}).value, 10000);
+});
+
+test('reportMonthlySeries: pool balance series and investment-scope total (pool + stocks only)', () => {
+  const perProperty = { 1: { baseline: { series: [{ month: '2026-11', balance: 100000, interest: 400 }] } } };
+  const stock = [{ month: '2026-11', value: 10000 }];
+  const pool = [{ month: '2026-11', value: 1200 }];
+  const scoped = reportMonthlySeries(perProperty, 'baseline', stock, 500000, null, null, { poolSeries: pool, investmentScope: true });
+  assert.equal(scoped[0].pool_balance, 1200);
+  assert.equal(scoped[0].total_value, 11200);
+  const plain = reportMonthlySeries(perProperty, 'baseline', stock, 500000, null, null, { poolSeries: pool });
+  assert.equal(plain[0].pool_balance, 1200);
+  assert.equal(plain[0].total_value, 410000);
+});
+
+test('validateAiReportChartSeries: pool_balance allowed on trajectory templates only', () => {
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'time_line', title: 'Pool', series: ['pool_balance'] }]), []);
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'yearly_bars', title: 'Pool', series: ['pool_balance'] }]), []);
+  const errs = validateAiReportChartSeries([{ template: 'stacked_bar', title: 'Pool', series: ['pool_balance'] }]);
+  assert.equal(errs.length, 1);
+});
+
+test('validatePoolItemShapes: external funding is amount-only and sourceless', () => {
+  assert.equal(validatePoolItemShapes([{ source: 'external', amount: 5000 }]), null);
+  assert.match(validatePoolItemShapes([{ source: 'external', percent: 50 }]), /not a percent/);
+  assert.match(validatePoolItemShapes([{ source: 'external', amount: 0 }]), /above 0/);
+  assert.match(validatePoolItemShapes([{ source: 'external', holdingId: 1, amount: 500 }]), /no account or holding/);
+  assert.equal(validatePoolItemShapes([{ source: 'external', amount: 500 }, { source: 'external', amount: 700 }]), null);
+});
+
+test('poolExternalCash: sums external legs only', () => {
+  assert.equal(poolExternalCash({ type: 'pool', items: [{ holdingId: 1, percent: 50 }, { source: 'external', amount: 5000 }, { source: 'external', amount: 700 }] }), 5700);
+  assert.equal(poolExternalCash({ type: 'pool', items: [{ holdingId: 1, percent: 50 }] }), 0);
+  assert.equal(poolExternalCash(null), 0);
+});
+
+test('computeProjection: potInitial seeds the pot series for both runs', () => {
+  const holding = {
+    id: 1, accountId: 1, symbol: 'XQQ.TO', label: 'XQQ', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100 }],
+    pricePoints: [{ date: '2025-01-01', price: 100 }],
+  };
+  const mainline = { properties: [], holdings: [holding], assessed: {}, declaredAssets: [], fxRateLatest: 1 };
+  const run = (ops, legs, potInitial) => computeProjection({
+    mainline: JSON.parse(JSON.stringify(mainline)), ops, legs,
+    assumptions: {}, scenario: null, primeHistory: [], currentPrime: null,
+    currentMonth: '2026-11', horizonMonths: 12, holdingGrowth: null, potInitial,
+  });
+  const base = run([], [], 5000);
+  assert.equal(base.stocks.potSeries[0].value, 5000);
+  assert.equal(base.stocks.potAtHorizon, 5000);
+  const strat = run(
+    [{ id: 1, seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'NEW.TO', date: '2027-01-15', units: 12, price: 100, currency: 'CAD' } }],
+    [{ op_seq: 1, source_ref: 'pot', amount: 'all' }], 5000);
+  assert.deepEqual(strat.errors, []);
+  assert.equal((strat.stocks.potSeries.find((r) => r.month === '2027-01') || {}).value, 3800);
+});
+
 test('reportCostBreakdown: cash out is the remainder after fees and penalty', () => {
   const bd = reportCostBreakdown({ cost: 12000, fees: 500, penaltyTotal: 1500 });
   assert.deepEqual(bd, { fees: 500, penalty: 1500, cashOut: 10000, total: 12000 });
@@ -658,6 +752,36 @@ test('paymentScopeFor: payment covers only mortgage-op properties, never the pro
     { propertyIds: [], baseline: null, strategy: null, delta: null });
   assert.deepEqual(paymentScopeFor(base, strat, []),
     { propertyIds: [], baseline: null, strategy: null, delta: null });
+});
+
+// Entity scope (user rule 2026-11-04): for property projects the
+// payment follows the entity property, subsuming op-touched scope.
+test('paymentScopeFor: entity override beats op-touched scope', () => {
+  const base = { mortgage: { perProperty: {
+    1: { baseline: { paymentAtEffect: 1000 }, strategy: { paymentAtEffect: 1200 } },
+    2: { baseline: { paymentAtEffect: 500 }, strategy: { paymentAtEffect: 900 } },
+  } } };
+  // Ops touch property 2, but the entity is property 1: scope is [1].
+  assert.deepEqual(paymentScopeFor(base, base,
+    [{ op_type: 'rate_switch', params: { propertyId: 2 } }], [1]),
+    { propertyIds: [1], baseline: 1000, strategy: 1200, delta: 200 });
+  // An entity with no perProperty entry contributes nothing (nulls),
+  // never the op-touched property's figures.
+  assert.deepEqual(paymentScopeFor(base, base,
+    [{ op_type: 'rate_switch', params: { propertyId: 2 } }], [9]),
+    { propertyIds: [9], baseline: null, strategy: null, delta: null });
+});
+
+test('scopeMainlineToProperty: keeps only the entity property', () => {
+  const ml = MAINLINE({ properties: [PROP(), { ...PROP(), id: 2 }, { ...PROP(), id: 3 }], holdings: [{ id: 7 }] });
+  const scoped = scopeMainlineToProperty(ml, 2);
+  assert.deepEqual(scoped.properties.map((p) => p.id), [2]);
+  assert.deepEqual(scoped.holdings, [{ id: 7 }]);
+  assert.equal(scoped.assessed[1], 1000000);
+  // Null/invalid ids leave the mainline unchanged (legacy + non-property).
+  assert.equal(scopeMainlineToProperty(ml, null), ml);
+  assert.equal(scopeMainlineToProperty(ml, 'x'), ml);
+  assert.equal(scopeMainlineToProperty(ml, 9).properties.length, 0);
 });
 
 // AI-report empty chart (user bug 2026-11-03): a series its template

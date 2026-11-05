@@ -676,6 +676,11 @@ test('salary: pre-tax RRSP reduces taxable income and both taxes, CPP/EI unchang
   assert.equal(c2(newC.netAnnual - oldC.netAnnual), c2(oldC.totalTax - newC.totalTax));
   assert.equal(c2(newC.netAnnual - oldC.netAnnual), 1613.41);
   assert.equal(newC.perPeriod.net, 2361.22);
+  // Cash definition: displayed take-home is the economic net minus
+  // the own deduction; with no deduction cash equals economic.
+  assert.equal(newC.perPeriod.cashNet, 2141.17);
+  assert.equal(oldC.perPeriod.cashNet, oldC.perPeriod.net);
+  assert.equal(oldC.cashNetAnnual, oldC.netAnnual);
 });
 
 test('salary: zero RRSP deduction is identical to no deduction, and the deduction floor holds at zero taxable', () => {
@@ -689,8 +694,8 @@ test('salary: zero RRSP deduction is identical to no deduction, and the deductio
   assert.equal(floored.ei, a.ei);
 });
 
-test('salary: take-home solve with a pre-tax deduction reproduces the target net under the pre-tax calc', () => {
-  const target = 2361.22;
+test('salary: take-home solve with a pre-tax deduction reproduces the CASH target net under the pre-tax calc', () => {
+  const target = 2141.17; // economic net 2361.22 minus the own 220.05 deduction: the displayed take-home is cash
   const solved = solveGrossForTakeHome({
     targetNet: target, frequency: 'biweekly', province: 'BC',
     startDate: '2026-01-05', recentDate: '2026-10-23', changes: [], bonuses: [], payroll,
@@ -707,7 +712,7 @@ test('salary: take-home solve with a pre-tax deduction reproduces the target net
   assert.equal(calcSalary(pretaxJob({
     gross_amount: solved.gross, ytd_cpp: ytd.ytd_cpp, ytd_cpp2: ytd.ytd_cpp2, ytd_ei: ytd.ytd_ei,
     rrspDeduction: 220.05,
-  }), payroll).perPeriod.net, target);
+  }), payroll).perPeriod.cashNet, target);
 });
 
 test('monthly chart: pre-tax RRSP leaves pre-plan months at full-gross tax, cuts post-plan months', () => {
