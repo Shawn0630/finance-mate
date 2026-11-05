@@ -14071,10 +14071,11 @@ function planStrategyHtml(d) {
       <div id="planStrategyFixedBaseline">${planFixedBaselineHtml(d.fixedBaseline, fbScenStock, { chartId: 'planStrategyBaselinePoolChart' })}</div>
       </div>
       <div class="plan-flow-group" id="planStrategyOpsGroup">
-      <div class="section-head"><h3>Operations</h3>
-        <div class="toolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
-      </div>
+      <div class="section-head"><h3>Operations</h3></div>
+      <div class="card breakdown-card plan-flow-card" id="planStrategyOpsCard">
+      <div class="toolbar" id="planStrategyOpsToolbar">${d.project.category === 'property' ? `<button class="small" data-plan-quick-op="prepay">Prepay</button><button class="small" data-plan-quick-op="refinance">Refinance</button><button class="small" data-plan-quick-op="rate_switch">Rate switch</button><button class="small" data-plan-quick-op="payment_change">Payment change</button>` : ''}<button class="small" id="planAddOpBtn">+ Add operation</button></div>
       <div id="planStrategyOpCards">${ops || '<div class="note">No operations yet.</div>'}</div>
+      </div>
       <div class="msg" id="planOpsMsg"></div>
       </div>
       </div>

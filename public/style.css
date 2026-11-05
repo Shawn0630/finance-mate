@@ -607,6 +607,13 @@ table.seg-table td:last-child { text-align: right; }
    otherwise collapse out of its container and step the Baseline
    column 6px below the Strategies/Operations column (tieralign). */
 #planBaselineCards .note, #planStrategyFixedBaseline .note { margin-top: 0; }
+/* Strategy-page Operations card: the quick-action toolbar lives
+   inside this card (below the single-line Operations heading, above
+   the op list) so the Baseline and Operations cards start at the
+   same height — the two-row toolbar used to push the op list ~29px
+   below the Baseline card (strategy-align). */
+#planStrategyOpsCard > .toolbar { margin-top: 0; }
+#planStrategyOpsCard > #planStrategyOpCards > .card:last-child { margin-bottom: 0; }
 .plan-flow-tier .card { margin-bottom: 12px; }
 .plan-flow-card { padding: 12px 14px; }
 .plan-flow-card.plan-selected { border-color: #1668c4; background: #f0f6fc; }

@@ -1346,6 +1346,10 @@ export async function run(H, S) {
       await mbWait(1500);
       await page.evaluate(() => document.querySelector('#planAiReportBtn').click());
       await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      // The pick chips render asynchronously after the modal opens;
+      // wait for them before measuring (reading them too early sees
+      // no label at all and fails on an empty radius).
+      await page.waitForFunction(() => document.querySelector('#planReportAiModal .plan-ai-picks label'), { timeout: 10000 });
       const styleState = await page.evaluate(() => {
         const cards = [...document.querySelectorAll('#planReportAiModal .plan-ai-modal-card')];
         const card = cards[0];
@@ -3022,6 +3026,61 @@ export async function run(H, S) {
       }));
       H.check('strategy editor: Payment change quick action opens the op editor with payment_change preselected',
         quickClicked && quickFormState.title === 'Add operation' && quickFormState.type === 'payment_change', JSON.stringify(quickFormState));
+      // ---- Strategy-page Baseline/Operations alignment ----
+      // The four quick actions + Add operation used to sit in the
+      // Operations section-head and wrap to two rows, pushing the op
+      // list ~29px below the Baseline card (user 2026-11-05). The
+      // toolbar now lives inside the Operations card (below the
+      // single-line heading, above the op list), so the two cards
+      // start at the same height.
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitR(500);
+      // This browser runs at the default 800px viewport, where the
+      // mid-tier stacks to one column and the cards cannot share a
+      // top edge — measure at 1500px, the two-column layout the user
+      // sees (main is capped at 1180px, so any wider viewport lays
+      // out identically).
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.goto(`http://ff.local/#planning/strategy/${edStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitR(1200);
+      const alignState = await page.evaluate(() => {
+        const q = (s) => document.querySelector(s);
+        const top = (el) => el ? el.getBoundingClientRect().top : null;
+        const vis = (el) => !!el && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+        const tb = q('#planStrategyOpsToolbar');
+        const op = q('[data-plan-op-card]');
+        return {
+          baseTop: top(q('#planFixedBaselineCard')),
+          opsTop: top(q('#planStrategyOpsCard')),
+          toolbarInCard: !!tb?.closest('#planStrategyOpsCard'),
+          opBelowToolbar: tb && op ? op.getBoundingClientRect().top > tb.getBoundingClientRect().bottom : false,
+          opPresent: !!op,
+          quickVisible: [...document.querySelectorAll('[data-plan-quick-op]')].map((b) => b.dataset.planQuickOp).join(',')
+            + '|' + [...document.querySelectorAll('[data-plan-quick-op]')].every(vis),
+          addOpVisible: vis(q('#planAddOpBtn')),
+        };
+      });
+      H.check('strategy align: Baseline card and Operations card share the same top edge (within 4px)',
+        alignState.baseTop !== null && alignState.opsTop !== null && Math.abs(alignState.baseTop - alignState.opsTop) <= 4, JSON.stringify(alignState));
+      H.check('strategy align: quick-action toolbar lives inside the Operations card, op list renders below it',
+        alignState.toolbarInCard && alignState.opPresent && alignState.opBelowToolbar, JSON.stringify(alignState));
+      H.check('strategy align: all four quick actions + Add operation are visible',
+        alignState.quickVisible === 'prepay,refinance,rate_switch,payment_change|true' && alignState.addOpVisible, JSON.stringify(alignState));
+      const alignClicked = await page.evaluate(() => {
+        const b = document.querySelector('[data-plan-quick-op="prepay"]');
+        if (b) b.click();
+        return !!b;
+      });
+      await waitR(800);
+      const alignFormState = await page.evaluate(() => ({
+        title: document.querySelector('#planOpModalTitle')?.textContent || '',
+        type: document.querySelector('#planOpTypeSel')?.value || '',
+      }));
+      H.check('strategy align: Prepay quick action still opens the op editor with prepay preselected',
+        alignClicked && alignFormState.title === 'Add operation' && alignFormState.type === 'prepay', JSON.stringify(alignFormState));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitR(500);
       // ---- Optional first operation + action-form pins ----
       await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
       await waitR(500);
@@ -6983,6 +7042,13 @@ export async function run(H, S) {
       const rdDelId = r.data.strategy.id;
       await page.goto(`http://ff.local/#planning/strategy/${rdDelId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1200);
+      // Hash navigation preserves the previous page's scroll: the
+      // preserved scroll can land the header Delete button in the
+      // top strip under the sticky 52px topbar, where a click hits
+      // the topbar instead of the button. Scroll it into view first
+      // (what a user does) so the click lands on the button.
+      await page.evaluate(() => document.querySelector('#planStrategyDeleteBtn').scrollIntoView({ block: 'center' }));
+      await waitR(300);
       await page.click('#planStrategyDeleteBtn');
       await waitR(1200);
       const delLanded = await page.evaluate(() => location.hash);
