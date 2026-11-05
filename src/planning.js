@@ -488,6 +488,22 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     const months = monthIdxOf(monthKey) - monthIdxOf(last.date.slice(0, 7));
     return last.price * Math.pow(1 + growthFor(holding), months / 12);
   };
+  // Flat price: last stored point ≤ month, NOT grown — the price as
+  // actually known today. Used only for the comparison headline
+  // value at horizon, so 30 years of compounded growth never reads
+  // as a present-day balance (user 2026-11-04: $94.6M on a $1.93M
+  // property). The grown priceAt above stays the projection's series
+  // (growth-scenario pins assert on it); only the headline is flat.
+  const priceAtFlat = (holding, monthKey) => {
+    const pts = (holding.pricePoints || []).map((p) => ({ date: String(p.date).slice(0, 10), price: Number(p.price) }))
+      .filter((p) => isFinite(p.price)).sort((a, b) => (a.date < b.date ? -1 : 1));
+    if (!pts.length) return null;
+    const cutoff = monthEndOf(monthKey);
+    let last = null;
+    for (const pt of pts) if (pt.date <= cutoff) last = pt; else break;
+    if (!last) return null;
+    return last.price;
+  };
   const fxRate = num(mainline.fxRateLatest) || 1;
   const toCad = (holding, v) => (holding.currency === 'USD' ? v * fxRate : v);
   // Baseline units per holding per month (events only, split-restated
@@ -703,12 +719,23 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     equityAtHorizon += assessedGrown - (bal || 0);
   }
   const projectedTotalAtHorizon = round2(equityAtHorizon + valueAtHorizon);
+  // Flat-price value at horizon (comparison headline ONLY): equity
+  // at horizon + units at the horizon month × today's known prices
+  // + pot. The delta vs the baseline's flat value is purely the
+  // strategy's doing — no common-mode 30-year compounding in it.
+  let flatStockAtHorizon = 0;
+  for (const h of mainline.holdings || []) {
+    const u = baselineUnitsAt(h, horizonMonth) + (opUnitsDelta.get(h.id) || []).filter((d) => d.month <= horizonMonth).reduce((s, d) => s + d.delta, 0);
+    const pr = priceAtFlat(h, horizonMonth);
+    if (pr != null && u !== 0) flatStockAtHorizon += toCad(h, u * pr);
+  }
+  const flatValueAtHorizon = round2(equityAtHorizon + flatStockAtHorizon + pot);
 
   return {
     mortgage: { perProperty: mortgagePerProperty, baselineInterest: round2(baselineInterest), strategyInterest: round2(strategyInterest), interestSaved },
-    stocks: { series: stockSeries, potSeries, startingValue: round2(startingValue), valueAtHorizon, buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
+    stocks: { series: stockSeries, potSeries, startingValue: round2(startingValue), valueAtHorizon, flatValueAtHorizon: round2(flatStockAtHorizon + pot), buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
     fees: round2(fees), penalties, penaltyTotal,
-    cost, valueAtHorizon: projectedTotalAtHorizon,
+    cost, valueAtHorizon: projectedTotalAtHorizon, flatValueAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
     paymentDelta: paymentDeltaOf(mortgagePerProperty),
     errors, warnings,
@@ -915,6 +942,23 @@ export function compareProjections(baseline, strategy, opts = {}) {
   const cost = strategy.cost;
   const gain = opts.excludeStockGain ? round2(interestSaved) : round2(interestSaved + stockGain);
   const net = round2(gain - cost);
+  // Value at horizon is the FLAT-price figure (equity at horizon +
+  // units at horizon × today's known prices + pot) — the grown
+  // 30-year projection value stays on the projection itself
+  // (projection.valueAtHorizon) and never surfaces as a headline
+  // balance. The flat fallback keeps hand-built projections (unit
+  // fixtures without flatValueAtHorizon) behaving as before.
+  // Investment scope: the flat value is the portfolio only (flat
+  // stock + pot) — property equity from the mainline's summed
+  // equityAtHorizon must not leak into a pool project's headline.
+  const flatStrat = opts.investmentScope
+    ? ((strategy.stocks && strategy.stocks.flatValueAtHorizon != null) ? strategy.stocks.flatValueAtHorizon : strategy.flatValueAtHorizon)
+    : strategy.flatValueAtHorizon;
+  const flatBase = opts.investmentScope
+    ? ((baseline.stocks && baseline.stocks.flatValueAtHorizon != null) ? baseline.stocks.flatValueAtHorizon : baseline.flatValueAtHorizon)
+    : baseline.flatValueAtHorizon;
+  const valueStrat = flatStrat != null ? flatStrat : strategy.valueAtHorizon;
+  const valueBase = flatBase != null ? flatBase : baseline.valueAtHorizon;
   return {
     cost, gain, net,
     interestSaved, stockGain,
@@ -922,12 +966,330 @@ export function compareProjections(baseline, strategy, opts = {}) {
     fees: strategy.fees, penaltyTotal: strategy.penaltyTotal,
     payoffShiftMonths: strategy.payoffShiftMonths,
     paymentDelta: strategy.paymentDelta,
-    valueAtHorizon: strategy.valueAtHorizon,
-    baselineValueAtHorizon: baseline.valueAtHorizon,
+    valueAtHorizon: valueStrat,
+    baselineValueAtHorizon: valueBase,
     errors: strategy.errors, warnings: strategy.warnings,
   };
 }
 export const summarizeComparison = compareProjections;
+
+// ------------------------------------------- report variables -------
+// A report variable is an adjustable control bound to an engine
+// input, saved WITH the report (never on the strategy — the same
+// strategy can be read under different what-ifs in different
+// reports). Shape: { penalty: { [strategyId]: amount } } — penalty
+// is the only variable so far; other variables arrive by name and
+// add their own key, never by inventing one here. Amounts are ≥ 0;
+// the penalty variable REPLACES the engine's penalty estimate in
+// cost (default $0: cost excludes penalty unless typed).
+// What-if never writes: the client holds edits in memory and only
+// PUTs the report on Apply.
+export function validateReportVariables(vars) {
+  const errs = [];
+  if (vars == null) return errs;
+  if (typeof vars !== 'object' || Array.isArray(vars)) return ['variables must be an object'];
+  if (vars.penalty !== undefined && vars.penalty !== null) {
+    if (typeof vars.penalty !== 'object' || Array.isArray(vars.penalty)) errs.push('penalty variables must be an object keyed by strategy id');
+    else for (const [sid, v] of Object.entries(vars.penalty)) {
+      if (v == null) continue;
+      if (!isFinite(Number(v)) || Number(v) < 0) errs.push(`penalty for strategy ${sid} must be a number ≥ 0`);
+    }
+  }
+  return errs;
+}
+export function reportPenaltyFor(vars, strategyId) {
+  if (!vars || !vars.penalty) return 0;
+  const v = vars.penalty[String(strategyId)];
+  if (v == null || !isFinite(Number(v)) || Number(v) < 0) return 0;
+  return round2(Number(v));
+}
+// Overlay the report's variables on one strategy's comparison:
+// cost = engine cost − engine penalty estimate + penalty variable;
+// net = gain − cost (the net = gain − cost invariant holds after
+// the overlay). Gain is untouched — penalty never moves a
+// trajectory, only cost. Pure — the client applies it on every
+// render (live what-if + saved variables alike); the engine's own
+// cost semantics never change.
+export function applyReportVariables(comparison, vars, strategyId) {
+  if (!comparison) return null;
+  const penalty = reportPenaltyFor(vars, strategyId);
+  const enginePenalty = round2(comparison.penaltyTotal || 0);
+  const cost = round2((comparison.cost || 0) - enginePenalty + penalty);
+  const gain = round2(comparison.gain || 0);
+  return { ...comparison, penalty, cost, net: round2(gain - cost) };
+}
+
+// ------------------------------------------- AI engine ------------
+// The AI engine is a calculation DEFINITION the app executes —
+// never a model, never evaluated by the model. Shape:
+//   { inputs: [{key, label, default}], series: {<id>: expr}, scalars: {<id>: expr} }
+// Delta contract: anything the definition does NOT override is the
+// preset engine's figure. Series overrides are monthly formulas
+// over the base series; scalar overrides are headline formulas over
+// the base scalars. Expressions are numbers, identifiers, + - * /
+// ( ), unary minus, min(a, b), max(a, b) — parsed by the tiny
+// recursive-descent parser below; there is no eval/Function
+// anywhere in this path, so a hostile or malformed definition can
+// only produce a validation error, never code execution.
+// Base series ids are the reportMonthlySeries row keys; base scalar
+// ids are the comparison fields. A series formula may use series +
+// scalar ids (scalars broadcast across months); a scalar formula
+// may use scalar ids + inputs only (a monthly series has no single
+// value to reduce to).
+export const AI_ENGINE_SERIES = ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance', 'interest', 'principal'];
+export const AI_ENGINE_SCALARS = ['cost', 'gain', 'net', 'interestSaved', 'stockGain', 'valueAtHorizon', 'payoffShiftMonths', 'paymentDelta', 'fees', 'penaltyTotal'];
+function aiExprTokens(src) {
+  const toks = [];
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (/[0-9.]/.test(ch)) {
+      let j = i;
+      while (j < src.length && /[0-9.]/.test(src[j])) j++;
+      const n = Number(src.slice(i, j));
+      if (!isFinite(n)) throw new Error(`bad number '${src.slice(i, j)}'`);
+      toks.push({ t: 'num', v: n }); i = j; continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < src.length && /[A-Za-z0-9_]/.test(src[j])) j++;
+      toks.push({ t: 'id', v: src.slice(i, j) }); i = j; continue;
+    }
+    if ('+-*/(),'.includes(ch)) { toks.push({ t: ch }); i++; continue; }
+    throw new Error(`unexpected character '${ch}'`);
+  }
+  return toks;
+}
+function aiExprParse(src) {
+  const toks = aiExprTokens(String(src || ''));
+  let p = 0;
+  const peek = () => toks[p];
+  const next = () => toks[p++];
+  function parseExpr() {
+    let node = parseTerm();
+    while (peek() && (peek().t === '+' || peek().t === '-')) {
+      const op = next().t;
+      node = { k: 'bin', op, l: node, r: parseTerm() };
+    }
+    return node;
+  }
+  function parseTerm() {
+    let node = parseFactor();
+    while (peek() && (peek().t === '*' || peek().t === '/')) {
+      const op = next().t;
+      node = { k: 'bin', op, l: node, r: parseFactor() };
+    }
+    return node;
+  }
+  function parseFactor() {
+    const tk = peek();
+    if (!tk) throw new Error('unexpected end of expression');
+    if (tk.t === '-') { next(); return { k: 'neg', x: parseFactor() }; }
+    if (tk.t === 'num') { next(); return { k: 'num', v: tk.v }; }
+    if (tk.t === '(') {
+      next();
+      const node = parseExpr();
+      if (!peek() || peek().t !== ')') throw new Error('missing closing parenthesis');
+      next();
+      return node;
+    }
+    if (tk.t === 'id') {
+      next();
+      if (peek() && peek().t === '(') {
+        if (tk.v !== 'min' && tk.v !== 'max') throw new Error(`unknown function '${tk.v}' — only min/max are allowed`);
+        next();
+        const a = parseExpr();
+        if (!peek() || peek().t !== ',') throw new Error(`'${tk.v}' needs two arguments`);
+        next();
+        const b = parseExpr();
+        if (!peek() || peek().t !== ')') throw new Error(`missing closing parenthesis after '${tk.v}' arguments`);
+        next();
+        return { k: 'fn', fn: tk.v, a, b };
+      }
+      return { k: 'id', v: tk.v };
+    }
+    throw new Error(`unexpected token '${tk.t}'`);
+  }
+  const ast = parseExpr();
+  if (p < toks.length) throw new Error(`trailing input '${toks.slice(p).map((t) => t.v || t.t).join(' ')}'`);
+  return ast;
+}
+function aiExprIds(ast, out = new Set()) {
+  if (ast.k === 'id') out.add(ast.v);
+  else if (ast.k === 'bin') { aiExprIds(ast.l, out); aiExprIds(ast.r, out); }
+  else if (ast.k === 'neg') aiExprIds(ast.x, out);
+  else if (ast.k === 'fn') { aiExprIds(ast.a, out); aiExprIds(ast.b, out); }
+  return out;
+}
+function aiExprEval(ast, ctx) {
+  // ctx: identifier -> number | number[] (monthly). Arrays evaluate
+  // element-wise; scalars broadcast. Division by zero and
+  // non-finite results are errors, never silent infinities.
+  if (ast.k === 'num') return ast.v;
+  if (ast.k === 'id') {
+    if (!(ast.v in ctx)) throw new Error(`unknown identifier '${ast.v}'`);
+    return ctx[ast.v];
+  }
+  if (ast.k === 'neg') {
+    const v = aiExprEval(ast.x, ctx);
+    return Array.isArray(v) ? v.map((x) => -x) : -v;
+  }
+  if (ast.k === 'fn') {
+    const a = aiExprEval(ast.a, ctx);
+    const b = aiExprEval(ast.b, ctx);
+    const f = ast.fn === 'min' ? Math.min : Math.max;
+    if (Array.isArray(a) || Array.isArray(b)) {
+      const arr = Array.isArray(a) ? a : b;
+      return arr.map((_, i) => f(Array.isArray(a) ? a[i] : a, Array.isArray(b) ? b[i] : b));
+    }
+    return f(a, b);
+  }
+  const l = aiExprEval(ast.l, ctx);
+  const r = aiExprEval(ast.r, ctx);
+  const op = (a, b) => {
+    let v;
+    if (ast.op === '+') v = a + b;
+    else if (ast.op === '-') v = a - b;
+    else if (ast.op === '*') v = a * b;
+    else if (ast.op === '/') {
+      if (b === 0) throw new Error('division by zero');
+      v = a / b;
+    }
+    if (!isFinite(v)) throw new Error('non-finite result');
+    return v;
+  };
+  if (Array.isArray(l) || Array.isArray(r)) {
+    const arr = Array.isArray(l) ? l : r;
+    return arr.map((_, i) => op(Array.isArray(l) ? l[i] : l, Array.isArray(r) ? r[i] : r));
+  }
+  return op(l, r);
+}
+function aiExprCheckFinite(v, what) {
+  const bad = Array.isArray(v) ? v.some((x) => x == null || !isFinite(x)) : (v == null || !isFinite(v));
+  if (bad) throw new Error(`${what} evaluated to a non-finite value`);
+}
+export function validateAiEngine(engine) {
+  const errs = [];
+  if (engine == null) return errs; // no engine = preset figures throughout
+  if (typeof engine !== 'object' || Array.isArray(engine)) return ['engine must be an object'];
+  const inputs = engine.inputs == null ? [] : engine.inputs;
+  if (!Array.isArray(inputs)) errs.push('engine.inputs must be an array');
+  const inputKeys = new Set();
+  if (Array.isArray(inputs)) {
+    for (const inp of inputs) {
+      if (!inp || typeof inp !== 'object') { errs.push('engine input must be an object {key, label, default}'); continue; }
+      if (!inp.key || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(inp.key))) errs.push('engine input key must be a valid identifier');
+      else if (inputKeys.has(inp.key)) errs.push(`duplicate engine input '${inp.key}'`);
+      else inputKeys.add(inp.key);
+      if (inp.default != null && !isFinite(Number(inp.default))) errs.push(`engine input '${inp.key}' default must be a number`);
+    }
+  }
+  const allowedSeries = new Set([...AI_ENGINE_SERIES, ...AI_ENGINE_SCALARS, ...inputKeys]);
+  const allowedScalar = new Set([...AI_ENGINE_SCALARS, ...inputKeys]);
+  for (const [where, map, allowed, kinds] of [
+    ['series', engine.series, allowedSeries, AI_ENGINE_SERIES],
+    ['scalars', engine.scalars, allowedScalar, AI_ENGINE_SCALARS],
+  ]) {
+    if (map == null) continue;
+    if (typeof map !== 'object' || Array.isArray(map)) { errs.push(`engine.${where} must be an object`); continue; }
+    for (const [id, expr] of Object.entries(map)) {
+      if (!kinds.includes(id)) { errs.push(`engine.${where} '${id}' is not a known ${where === 'series' ? 'series' : 'scalar'} id`); continue; }
+      if (typeof expr !== 'string' || !expr.trim()) { errs.push(`engine.${where} '${id}' needs a formula`); continue; }
+      try {
+        const ast = aiExprParse(expr);
+        for (const name of aiExprIds(ast)) {
+          if (!allowed.has(name)) errs.push(`engine.${where} '${id}' uses unknown identifier '${name}'`);
+        }
+        if (where === 'series') {
+          // A series formula referencing only scalars is a flat line —
+          // allowed (it is still a monthly series), so no extra rule.
+        }
+      } catch (e) { errs.push(`engine.${where} '${id}': ${e.message}`); }
+    }
+  }
+  return errs;
+}
+// Old → new diff for an AI-refined report definition (follow-up
+// preview): chart titles added/removed/changed + engine keys
+// added/removed/changed per map. Pure — the refine endpoint returns
+// it alongside the complete revised definition; Apply writes via
+// the report PUT, never from the refine call itself.
+export function aiReportDefinitionDiff(oldDef, newDef) {
+  const diff = {
+    charts: { added: [], removed: [], changed: [] },
+    engine: { changed: false, series: { added: [], removed: [], changed: [] }, scalars: { added: [], removed: [], changed: [] }, inputs: { added: [], removed: [], changed: [] } },
+  };
+  const byTitle = (charts) => new Map((charts || []).map((c) => [c.title, c]));
+  const oc = byTitle(oldDef && oldDef.charts);
+  const nc = byTitle(newDef && newDef.charts);
+  for (const [t, c] of nc) {
+    if (!oc.has(t)) diff.charts.added.push(t);
+    else if (JSON.stringify(oc.get(t)) !== JSON.stringify(c)) diff.charts.changed.push(t);
+  }
+  for (const t of oc.keys()) if (!nc.has(t)) diff.charts.removed.push(t);
+  const mapDiff = (oldMap, newMap) => {
+    const out = { added: [], removed: [], changed: [] };
+    for (const [k, v] of Object.entries(newMap || {})) {
+      if (!(k in (oldMap || {}))) out.added.push(k);
+      else if (JSON.stringify(oldMap[k]) !== JSON.stringify(v)) out.changed.push(k);
+    }
+    for (const k of Object.keys(oldMap || {})) if (!(k in (newMap || {}))) out.removed.push(k);
+    return out;
+  };
+  const oe = (oldDef && oldDef.engine) || {};
+  const ne = (newDef && newDef.engine) || {};
+  diff.engine.series = mapDiff(oe.series, ne.series);
+  diff.engine.scalars = mapDiff(oe.scalars, ne.scalars);
+  const oldInputs = Object.fromEntries((oe.inputs || []).map((i) => [i.key, i]));
+  const newInputs = Object.fromEntries((ne.inputs || []).map((i) => [i.key, i]));
+  diff.engine.inputs = mapDiff(oldInputs, newInputs);
+  diff.engine.changed = [...Object.values(diff.engine.series), ...Object.values(diff.engine.scalars), ...Object.values(diff.engine.inputs)].some((a) => a.length > 0);
+  return diff;
+}
+// Execute an AI engine definition over one strategy's preset-engine
+// figures. base: { monthly: [{mortgage_balance, stock_value,
+// total_value, pool_balance, interest, principal, ...}], scalars:
+// {cost, gain, net, ...} }. Returns { series, scalars, inputs,
+// errors } — series are monthly arrays (same length as base.monthly),
+// scalars are numbers; on any evaluation error the whole engine is
+// rejected (errors non-empty, figures fall back to the preset ones
+// at the call site — never a half-executed definition).
+export function evaluateAiEngine(engine, base) {
+  const out = { series: {}, scalars: {}, inputs: {}, errors: [] };
+  if (!engine) return out;
+  const months = (base && base.monthly) || [];
+  const n = months.length;
+  const inputVals = {};
+  for (const inp of engine.inputs || []) {
+    if (inp && inp.key) {
+      inputVals[inp.key] = inp.default != null ? Number(inp.default) : 0;
+      out.inputs[inp.key] = inputVals[inp.key];
+    }
+  }
+  const ctx = { ...inputVals };
+  for (const sid of AI_ENGINE_SERIES) ctx[sid] = months.map((r) => (r[sid] == null ? 0 : Number(r[sid])));
+  for (const sid of AI_ENGINE_SCALARS) ctx[sid] = base && base.scalars && base.scalars[sid] != null ? Number(base.scalars[sid]) : 0;
+  try {
+    for (const [id, expr] of Object.entries(engine.series || {})) {
+      const v = aiExprEval(aiExprParse(expr), ctx);
+      if (!Array.isArray(v) || v.length !== n) throw new Error(`series '${id}' did not evaluate to ${n} monthly values`);
+      aiExprCheckFinite(v, `series '${id}'`);
+      out.series[id] = v.map((x) => round2(x));
+    }
+    for (const [id, expr] of Object.entries(engine.scalars || {})) {
+      const v = aiExprEval(aiExprParse(expr), ctx);
+      if (Array.isArray(v)) throw new Error(`scalar '${id}' evaluated to a monthly series, not a number`);
+      aiExprCheckFinite(v, `scalar '${id}'`);
+      out.scalars[id] = round2(v);
+    }
+  } catch (e) {
+    out.errors.push(e.message);
+    out.series = {};
+    out.scalars = {};
+  }
+  return out;
+}
 
 // Principal-gain series for one strategy: month by month, the excess
 // of the strategy's holdings value over the do-nothing baseline
@@ -1028,19 +1390,27 @@ export function validateAiCreateProposal(parsed) {
 // can aggregate without re-walking the engine series.
 export function reportMonthlySeries(perProperty, side, stockSeries, assessedTotal, growthPct = null, currentMonth = null, opts = {}) {
   const byMonth = new Map();
-  for (const per of Object.values(perProperty || {})) {
-    const s = per[side] && per[side].series ? per[side].series : [];
-    for (const row of s) {
-      const cur = byMonth.get(row.month) || { balance: 0, interest: 0, principal: 0 };
-      cur.balance += row.balance || 0;
-      cur.interest += row.interest || 0;
-      cur.principal += row.principal || 0;
-      byMonth.set(row.month, cur);
+  // Investment scope: the trajectory months are the stock ∪ pool
+  // months only. Mortgage months must not seed the table — a pool
+  // report's first month is the stock series start, not the
+  // mortgage series start (which 0-pads stock_value and drags the
+  // table back to Feb 2025 with 0/0/0 rows).
+  if (!opts.investmentScope) {
+    for (const per of Object.values(perProperty || {})) {
+      const s = per[side] && per[side].series ? per[side].series : [];
+      for (const row of s) {
+        const cur = byMonth.get(row.month) || { balance: 0, interest: 0, principal: 0 };
+        cur.balance += row.balance || 0;
+        cur.interest += row.interest || 0;
+        cur.principal += row.principal || 0;
+        byMonth.set(row.month, cur);
+      }
     }
   }
   const stockByMonth = new Map((stockSeries || []).map((r) => [r.month, r.value || 0]));
   for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
   const poolByMonth = new Map(((opts.poolSeries) || []).map((r) => [r.month, r.value || 0]));
+  if (opts.investmentScope) for (const m of poolByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
   const g = num(growthPct);
   return [...byMonth.keys()].sort().map((m) => {
     const b = byMonth.get(m);
@@ -1150,6 +1520,17 @@ export function validateAiReportChartSeries(charts) {
 // baseline, not the ops — a cash-pool baseline allows pool/stock
 // charts only (mortgage charts are forbidden and rejected server-
 // side), a property baseline allows property charts.
+export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount, baselineKind, definition, text }) {
+  const base = aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind });
+  return [
+    base,
+    'You are REFINING an existing report definition — return the COMPLETE revised definition (charts + engine), never a partial patch.',
+    `Current definition: ${JSON.stringify(definition)}`,
+    'Keep every chart and engine formula that still fits; change only what the follow-up asks for. The revised definition must satisfy every rule above (templates, series, methods, engine identifiers).',
+    `Follow-up: ${text}`,
+  ].join('\n');
+}
+
 export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind }) {
   const kindLine = baselineKind === 'pool'
     ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected.'
@@ -1164,6 +1545,24 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text,
     'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
     'Never invent a number: the app computes every series; you only order and title charts.',
     'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
+    // The AI engine: alongside the charts you may define a
+    // calculation the app EXECUTES (the preset engine cannot express
+    // it — e.g. a fixed-rate GIC, a custom growth path). "engine":
+    // {"inputs": [{"key": "gic_rate", "label": "GIC rate %/yr", "default": 4.12}],
+    // "series": {"stock_value": "stock_value + ..."}, "scalars": {"gain": "..."}}.
+    // Formulas use numbers, identifiers, + - * / ( ) and min/max only.
+    // Series formulas are monthly: they may use the monthly series
+    // mortgage_balance, stock_value, total_value, pool_balance,
+    // interest, principal, the scalars below (broadcast), and your
+    // declared inputs. Scalar formulas may use only the scalars
+    // cost, gain, net, interestSaved, stockGain, valueAtHorizon,
+    // payoffShiftMonths, paymentDelta, fees, penaltyTotal and your
+    // inputs. Anything you do not override keeps the preset engine\'s
+    // figure. An "engine" key is REQUIRED in your reply — use {} when
+    // the preset engine already covers every figure (no custom
+    // calculation needed). Unknown identifiers or unknown series /
+    // scalar ids are rejected, as is any formula that is not a number
+    // expression.',
     ...(kindLine ? [kindLine] : []),
     `Charts render over the whole snapshot: ${mortgagedCount} ${mortgagedCount === 1 ? 'property carries' : 'properties carry'} a mortgage, ${holdingCount} stock ${holdingCount === 1 ? 'holding exists' : 'holdings exist'}. Do not use mortgage_balance when no property carries a mortgage, and do not use stock_value when no stock holding exists.`,
     `Strategies: ${JSON.stringify(strategies)}`,
@@ -1259,6 +1658,11 @@ export function validateReportDefinition(def) {
       if (!c || typeof c !== 'object' || typeof c.template !== 'string' || !c.template || typeof c.title !== 'string' || !c.title) errs.push('each chart needs a template and a title');
     }
   }
+  // Report variables (saved with the report) and the AI engine
+  // definition travel inside the definition too — same validation as
+  // the dedicated endpoints, so a PUT can never store a bad one.
+  if (def.variables !== undefined) errs.push(...validateReportVariables(def.variables));
+  if (def.engine !== undefined) errs.push(...validateAiEngine(def.engine));
   return errs;
 }
 

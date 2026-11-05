@@ -689,7 +689,7 @@ export async function run(H, S) {
   }
   // AI report: generate → preview → save (nothing writes before Save),
   // report block arithmetic, fixed-default save path, attached model spec.
-  const aiReportDef = { charts: [
+  const aiReportDef = { engine: {}, charts: [
     { template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
     { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
     { template: 'yearly_bars', title: 'Year-end balance', series: ['mortgage_balance'], method: 'Year-end outstanding principal per year from the engine projection.' },
@@ -817,7 +817,13 @@ export async function run(H, S) {
       await waitR(1500);
       const listed = await page.evaluate(() => document.querySelector('#planReportList').textContent.includes('AI report browser'));
       H.check('planning: saved AI report appears in the Reports list', listed);
-      await page.evaluate(() => { document.querySelector('[data-plan-report-view]').click(); });
+      // Open the report the browser flow just saved (it pins the
+      // strategy, so the Headline cards render) — not the first card
+      // in the list, which is an API-saved report pinning nothing.
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('[data-plan-report-view]')].find((el) => el.textContent.includes('AI report browser'));
+        if (card) card.click();
+      });
       await waitR(1500);
       const view = await page.evaluate(() => ({
         hash: location.hash,
@@ -826,10 +832,12 @@ export async function run(H, S) {
         doughnut: !!document.querySelector('#planReportChart3'),
         defs: document.querySelector('#planReport').textContent.includes('Cost = fees + penalty + cash out'),
         lane: document.querySelector('#planReport').textContent.includes('Planning Test Lane'),
-        metric: document.querySelector('#planReport').textContent.includes('Total cost'),
+        // ENGINE round (item 9): the metric cards live in the
+        // Headline section now, not as a metric_cards chart.
+        headline: document.querySelector('#planReport').textContent.includes('Total cost'),
       }));
       H.check('planning: report view renders charts, tables and how-calculated lines',
-        view.hash.startsWith('#planning/project/') && view.line && view.yearly && view.doughnut && view.defs && view.lane && view.metric,
+        view.hash.startsWith('#planning/project/') && view.line && view.yearly && view.doughnut && view.defs && view.lane && view.headline,
         JSON.stringify(view));
       await page.goto(`http://ff.local/#planning/strategy/${planStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitR(1500);
@@ -837,8 +845,11 @@ export async function run(H, S) {
         const el = document.querySelector('#planStrategy');
         return el ? { trial: el.textContent.includes('Month-1 trial row'), bindings: el.textContent.includes('Bindings'), formula: el.textContent.includes('prior balance * monthly rate / 12') } : {};
       });
-      H.check('planning: strategy model panel shows bindings, formulas and the month-1 trial row',
-        modelPanel.trial && modelPanel.bindings && modelPanel.formula, JSON.stringify(modelPanel));
+      // ENGINE round (item 1): the Model panel is gone — even for a
+      // strategy carrying a dormant API-attached model row, the
+      // strategy page shows no trial row, no Bindings, no formula.
+      H.check('engine: strategy page shows no Model panel for a strategy with an attached model row',
+        modelPanel.trial === false && modelPanel.bindings === false && modelPanel.formula === false, JSON.stringify(modelPanel));
     } finally { await browserR.close(); }
   }
   // --------------------------------------------- template metadata
@@ -1081,6 +1092,13 @@ export async function run(H, S) {
   H.check('ai-model no-id: an answer by name binds to the entity and produces a spec, not a re-ask',
     r.status === 201 && r.data.model && Array.isArray(r.data.resolved) && r.data.resolved.some((x) => x.entity === 'property' && x.label.includes('77 Planning Test Lane')),
     JSON.stringify(r.data));
+  // ENGINE round (item 1): the model row stays dormant data — attach
+  // it to the strategy so the no-UI pin below can prove the row
+  // survives while nothing renders it.
+  const aiModelRowId = r.data.model && r.data.model.id;
+  r = await H.req('PUT', `/api/planning/strategies/${aiModelStratId}`, { model_id: aiModelRowId });
+  H.check('engine: attach the AI model row to the strategy (dormant data)',
+    r.status === 200 && aiModelRowId > 0, JSON.stringify(r.data));
   const answeredHistory = [
     { role: 'ai', questions: [{ field: 'effective_date', label: 'Effective date?', type: 'date' }] },
     { role: 'user', answers: { effective_date: '2027-01-31' } },
@@ -1160,36 +1178,27 @@ export async function run(H, S) {
       const aiWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
       await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await aiWait(1500);
-      // Model design now lives in the Generate with AI modal (user
-      // decision 2026-11-03: the panel keeps scenario/baseline/ops
-      // only); same ask/answer/thread rules, and the designed model
-      // still attaches to the STRATEGY via PUT model_id.
+      // ENGINE round: the Model concept is dead — the Generate with
+      // AI modal has NO model-design entry at all (no section, no
+      // strategy checkboxes, no Propose button). The modal keeps
+      // exactly three sections (Baseline, Scenarios, Strategies).
+      // The strategy keeps its API-attached model row (dormant
+      // data, endpoints stay) — but no UI shows it, and the routing
+      // rule is cancelled.
       await page.evaluate(() => document.querySelector('#planAiReportBtn').click());
       await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
-      await page.waitForFunction((sid) => [...document.querySelectorAll('#planReportAiModelStrategies input')].some((o) => Number(o.value) === sid), { timeout: 10000 }, aiModelStratId);
-      await page.evaluate((sid) => {
-        document.querySelector(`#planReportAiModelStrategies input[value="${sid}"]`).checked = true;
-        document.querySelector('#planReportAiModelText').value = 'design a model';
-      }, aiModelStratId);
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ ask: [{ field: 'target_contribution', label: 'Target monthly contribution?', type: 'number' }] }));
-      await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
-      await page.waitForFunction((sid) => !!document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-ask-field="target_contribution"]`), { timeout: 10000 }, aiModelStratId);
-      await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-continue]`).click(), aiModelStratId);
-      await page.waitForFunction(() => (document.querySelector('#planReportAiModelMsg')?.textContent || '').length > 0, { timeout: 10000 });
-      const errText = await page.evaluate(() => document.querySelector('#planReportAiModelMsg')?.textContent || '');
-      H.check('modelmove: empty answer shows a generic error, never the question text as a field name',
-        errText.includes('Please answer all questions before continuing.') && !errText.includes('Target monthly contribution? is required'),
-        JSON.stringify({ errText }));
-      fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
-      await page.evaluate((sid) => { document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-ask-field="target_contribution"]`).value = '600'; }, aiModelStratId);
-      await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-continue]`).click(), aiModelStratId);
-      await page.waitForFunction((sid) => (document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-out]`)?.textContent || '').includes('Bindings:'), { timeout: 10000 }, aiModelStratId);
-      const threadText = await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-thread]`)?.textContent || '', aiModelStratId);
-      H.check('modelmove: thread pairs the answer with its question, no raw key = value line',
-        threadText.includes('You: Target monthly contribution?: 600') && !threadText.includes('target_contribution = 600'),
-        JSON.stringify({ threadText }));
-      await page.evaluate((sid) => document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-apply]`).click(), aiModelStratId);
-      await page.waitForFunction((sid) => (document.querySelector(`[data-plan-model-strategy="${sid}"] [data-plan-model-status]`)?.textContent || '') === 'Designed', { timeout: 10000 }, aiModelStratId);
+      const aiModalState = await page.evaluate(() => ({
+        cards: [...document.querySelectorAll('#planReportAiModal .plan-ai-modal-card .section-head h3')].map((h) => h.textContent.trim()),
+        modelSection: !!document.querySelector('#planReportAiModelSection'),
+        modelStrategies: !!document.querySelector('#planReportAiModelStrategies'),
+        modelBtn: !!document.querySelector('#planReportAiModelBtn'),
+      }));
+      H.check('engine: Generate-with-AI modal has exactly three sections (Baseline, Scenarios, Strategies)',
+        JSON.stringify(aiModalState.cards) === JSON.stringify(['Baseline', 'Scenarios', 'Strategies']),
+        JSON.stringify(aiModalState));
+      H.check('engine: no model-design entry in the modal (no section, no strategy checkboxes, no Propose button)',
+        aiModalState.modelSection === false && aiModalState.modelStrategies === false && aiModalState.modelBtn === false,
+        JSON.stringify(aiModalState));
       // Close the modal before navigating: the overlay is body-level
       // and survives hash routing, so a later click would land on it
       // instead of the page underneath.
@@ -1198,50 +1207,47 @@ export async function run(H, S) {
       const stratAfter = await H.req('GET', `/api/planning/strategies/${aiModelStratId}`);
       const projAfter = await H.req('GET', `/api/planning/projects/${metaBuyId}`);
       const projStrat = (projAfter.data.strategies || []).find((x) => x.id === aiModelStratId);
-      H.check('modelmove: modal-designed model attaches to the strategy with modelSource ai',
+      H.check('engine: API-attached model row stays (dormant data, endpoints stay) — modelSource ai',
         stratAfter.data.model && stratAfter.data.model.source === 'ai' && projStrat && projStrat.modelSource === 'ai',
         JSON.stringify({ modelSource: stratAfter.data.model && stratAfter.data.model.source, projModelSource: projStrat && projStrat.modelSource }));
-      // Strategy Model panel still shows the attached model with Detach
-      // and Refine (view/detach/follow-up stay; only design moved).
+      // Strategy page: no Model panel anywhere (even though this
+      // strategy carries a dormant API-attached model row), and both
+      // Generate buttons stay enabled — choosing the button IS
+      // choosing the engine, no routing notice.
       await page.goto(`http://ff.local/#planning/strategy/${aiModelStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await aiWait(1200);
       const modelBefore = await page.evaluate(() => ({
         panel: [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'),
+        modelText: !!document.querySelector('#planStrategyModelText'),
+        modelBtn: !!document.querySelector('#planStrategyModelBtn'),
         detach: !!document.querySelector('#planModelDetachBtn'),
         follow: !!document.querySelector('#planModelFollowBtn'),
+        genDisabled: !!document.querySelector('#planStrategyGenerateBtn')?.disabled,
+        aiDisabled: !!document.querySelector('#planStrategyAiReportBtn')?.disabled,
       }));
-      H.check('modelmove: strategy Model panel shows the modal-designed model with Detach + Refine',
-        modelBefore.panel && modelBefore.detach && modelBefore.follow, JSON.stringify(modelBefore));
-      // Routing: a fresh project load picks every strategy (wiring
-      // null = all), so the modal-designed model disables preset
-      // Generate from the server-derived modelSource alone.
+      H.check('engine: strategy page has no Model panel (no design box, no Detach, no Follow) even for an AI-designed strategy',
+        modelBefore.panel === false && modelBefore.modelText === false && modelBefore.modelBtn === false && modelBefore.detach === false && modelBefore.follow === false,
+        JSON.stringify(modelBefore));
+      H.check('engine: both Generate buttons enabled on the strategy page for an AI-designed strategy',
+        modelBefore.genDisabled === false && modelBefore.aiDisabled === false, JSON.stringify(modelBefore));
+      // Routing is cancelled: a fresh project load picks every
+      // strategy (wiring null = all), and preset Generate stays
+      // available even though the selection includes an AI-designed
+      // strategy.
       await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await aiWait(1500);
       await page.waitForFunction(() => {
         const b = document.querySelector('#planFlowGenerateBtn');
-        const n = document.querySelector('#planFlowGenerateNote')?.textContent || '';
-        return !!b?.disabled && n.includes('AI-designed');
+        return !!b && !b.disabled;
       }, { timeout: 15000 }).catch(() => {});
       const routeState = await page.evaluate(() => ({
         disabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
         aiEnabled: !document.querySelector('#planAiReportBtn')?.disabled,
       }));
-      H.check('modelmove: preset Generate stays disabled for a modal-designed AI model, AI Generate stays available',
-        routeState.disabled && routeState.note.includes('AI-designed') && routeState.note.includes('strategy') && routeState.aiEnabled,
+      H.check('engine: preset Generate stays enabled for an AI-designed selection (routing cancelled), AI Generate stays available',
+        routeState.disabled === false && !routeState.note.includes('AI-designed') && routeState.aiEnabled,
         JSON.stringify(routeState));
-      // Detach still works from the strategy page.
-      page.on('dialog', (d) => d.accept());
-      await page.goto(`http://ff.local/#planning/strategy/${aiModelStratId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await aiWait(1200);
-      await page.click('#planModelDetachBtn');
-      // Wait for the detach reload itself, not a fixed sleep: under
-      // load the old panel lingers past 1200ms.
-      await page.waitForFunction(() => ![...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'), { timeout: 15000 }).catch(() => {});
-      const modelAfter = await page.evaluate(() => [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'));
-      const stratDetached = await H.req('GET', `/api/planning/strategies/${aiModelStratId}`);
-      H.check('modelmove: Detach removes the model link and the panel leaves',
-        !modelAfter && stratDetached.data.model === null, JSON.stringify({ panelLeft: modelAfter, model: stratDetached.data.model }));
     } finally { await aiBrowser.close(); }
   }
   // ---- Generate-with-AI modal beautify + Model multi-select + tier alignment ----
@@ -1340,8 +1346,6 @@ export async function run(H, S) {
       await mbWait(1500);
       await page.evaluate(() => document.querySelector('#planAiReportBtn').click());
       await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
-      await page.waitForFunction((s1, s2) => [...document.querySelectorAll('#planReportAiModelStrategies input')].some((o) => Number(o.value) === s1)
-        && [...document.querySelectorAll('#planReportAiModelStrategies input')].some((o) => Number(o.value) === s2), { timeout: 10000 }, mbStrat1, mbStrat2);
       const styleState = await page.evaluate(() => {
         const cards = [...document.querySelectorAll('#planReportAiModal .plan-ai-modal-card')];
         const card = cards[0];
@@ -1359,14 +1363,15 @@ export async function run(H, S) {
           pickRadius: ps ? ps.borderRadius : '',
           genSmall: !!gen?.classList.contains('small'),
           genPrimary: !!gen?.classList.contains('primary'),
-          modelBoxes: document.querySelectorAll('#planReportAiModelStrategies input[type="checkbox"]').length > 0,
-          modelSelectGone: !document.querySelector('#planReportAiModelStrategy'),
+          // ENGINE round: the modal has three sections now (Baseline,
+          // Scenarios, Strategies) — the Model section is gone.
+          modelSectionGone: !document.querySelector('#planReportAiModelSection') && !document.querySelector('#planReportAiModelStrategies') && !document.querySelector('#planReportAiModelBtn'),
         };
       });
       H.check('modalbeautify: modal sections render as compact cards with pill-chip picks and small buttons',
-        styleState.cardCount === 4 && styleState.cardPad === '10px 14px' && styleState.headSize === '15px' && styleState.headWeight === '650'
+        styleState.cardCount === 3 && styleState.cardPad === '10px 14px' && styleState.headSize === '15px' && styleState.headWeight === '650'
           && styleState.pickRadius === '999px' && styleState.genSmall && styleState.genPrimary
-          && styleState.modelBoxes && styleState.modelSelectGone,
+          && styleState.modelSectionGone,
         JSON.stringify(styleState));
       // --- pick-chip geometry (modalchips): horizontal chips, flowing
       // rows, graceful wrap for long names, checked styling kept ---
@@ -1405,61 +1410,22 @@ export async function run(H, S) {
       H.check('modalchips: checked chip keeps the blue border + light-blue background',
         chipState.checkedBorder === 'rgb(22, 104, 196)' && chipState.checkedBg === 'rgb(240, 246, 252)',
         JSON.stringify(chipState));
-      // --- multi-select: two strategies designed + attached ---
-      fs.writeFileSync(H.aiStubFile, JSON.stringify(aiModelDef));
-      const pinsBefore = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b));
-      await page.evaluate((s1, s2) => {
-        document.querySelector(`#planReportAiModelStrategies input[value="${s1}"]`).checked = true;
-        document.querySelector(`#planReportAiModelStrategies input[value="${s2}"]`).checked = true;
-        document.querySelector('#planReportAiModelText').value = 'design a model';
-      }, mbStrat1, mbStrat2);
-      const checkedBoth = await page.evaluate((s1, s2) => [...document.querySelectorAll('#planReportAiModelStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b).join(',') === [s1, s2].sort((a, b) => a - b).join(','), mbStrat1, mbStrat2);
-      H.check('modalbeautify: Model section shows checkboxes, checking two lists both',
-        checkedBoth, JSON.stringify({ checkedBoth }));
-      await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
-      // Sequential by design: each model's Apply gates the next
-      // strategy's design, so Apply 1 must be clicked before Apply 2
-      // even exists; a failed design skips the gate and continues.
-      await page.waitForFunction((s1) => !!document.querySelector(`[data-plan-model-strategy="${s1}"] [data-plan-model-apply]`), { timeout: 20000 }, mbStrat1);
-      await page.evaluate((s1) => document.querySelector(`[data-plan-model-strategy="${s1}"] [data-plan-model-apply]`).click(), mbStrat1);
-      await page.waitForFunction((s2) => !!document.querySelector(`[data-plan-model-strategy="${s2}"] [data-plan-model-apply]`), { timeout: 20000 }, mbStrat2);
-      await page.evaluate((s2) => document.querySelector(`[data-plan-model-strategy="${s2}"] [data-plan-model-apply]`).click(), mbStrat2);
-      await page.waitForFunction((s1, s2) => (document.querySelector(`[data-plan-model-strategy="${s1}"] [data-plan-model-status]`)?.textContent || '') === 'Designed'
-        && (document.querySelector(`[data-plan-model-strategy="${s2}"] [data-plan-model-status]`)?.textContent || '') === 'Designed', { timeout: 15000 }, mbStrat1, mbStrat2);
-      const m1 = await H.req('GET', `/api/planning/strategies/${mbStrat1}`);
-      const m2 = await H.req('GET', `/api/planning/strategies/${mbStrat2}`);
-      H.check('modalbeautify: Propose designs models for both checked strategies and both attach',
-        m1.data.model && m1.data.model.source === 'ai' && m2.data.model && m2.data.model.source === 'ai',
-        JSON.stringify({ m1: m1.data.model && m1.data.model.source, m2: m2.data.model && m2.data.model.source }));
-      const pinsAfter = await page.evaluate(() => [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value)).sort((a, b) => a - b));
-      H.check('modalbeautify: model picks leave the report Strategies pins unchanged',
-        JSON.stringify(pinsBefore) === JSON.stringify(pinsAfter), JSON.stringify({ pinsBefore, pinsAfter }));
-      H.check('modalchips: Model multi-select flow still attaches both models after the chip fix',
-        m1.data.model && m1.data.model.source === 'ai' && m2.data.model && m2.data.model.source === 'ai',
-        JSON.stringify({ m1: m1.data.model && m1.data.model.source, m2: m2.data.model && m2.data.model.source }));
-      // --- failure on one does not block the other: the failing
-      // strategy is checked FIRST (DOM order), so the later strategy
-      // must still design after the failure.
-      await page.evaluate((s1, s2, s3, s4) => {
-        document.querySelector(`#planReportAiModelStrategies input[value="${s1}"]`).checked = false;
-        document.querySelector(`#planReportAiModelStrategies input[value="${s2}"]`).checked = false;
-        document.querySelector(`#planReportAiModelStrategies input[value="${s3}"]`).checked = true;
-        document.querySelector(`#planReportAiModelStrategies input[value="${s4}"]`).checked = true;
-      }, mbStrat1, mbStrat2, mbStrat3, mbStrat4);
-      r = await H.req('DELETE', `/api/planning/strategies/${mbStrat3}`);
-      H.check('modalbeautify: fixture strategy three deleted for the failure run',
-        r.status === 200, JSON.stringify(r.data));
-      await page.evaluate(() => document.querySelector('#planReportAiModelBtn').click());
-      await page.waitForFunction((s4) => !!document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-apply]`), { timeout: 20000 }, mbStrat4);
-      await page.evaluate((s4) => document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-apply]`).click(), mbStrat4);
-      await page.waitForFunction((s3, s4) => (document.querySelector(`[data-plan-model-strategy="${s3}"] [data-plan-model-status]`)?.textContent || '').startsWith('Failed')
-        && (document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-status]`)?.textContent || '') === 'Designed', { timeout: 20000 }, mbStrat3, mbStrat4);
-      const failState = await page.evaluate((s3, s4) => ({
-        fail: document.querySelector(`[data-plan-model-strategy="${s3}"] [data-plan-model-status]`)?.textContent || '',
-        other: document.querySelector(`[data-plan-model-strategy="${s4}"] [data-plan-model-status]`)?.textContent || '',
-      }), mbStrat3, mbStrat4);
-      H.check('modalbeautify: one strategy design failure does not block the other',
-        failState.fail.startsWith('Failed') && failState.other === 'Designed', JSON.stringify(failState));
+      // --- ENGINE round: no model-design entry in the modal at all ---
+      // The multi-select model-design flow is gone with the Model
+      // concept; the modal keeps its three sections (Baseline,
+      // Scenarios, Strategies) and nothing model-shaped.
+      const noModelState = await page.evaluate(() => ({
+        cards: [...document.querySelectorAll('#planReportAiModal .plan-ai-modal-card .section-head h3')].map((h) => h.textContent.trim()),
+        modelSection: !!document.querySelector('#planReportAiModelSection'),
+        modelStrategies: !!document.querySelector('#planReportAiModelStrategies'),
+        modelBtn: !!document.querySelector('#planReportAiModelBtn'),
+        modelText: !!document.querySelector('#planReportAiModelText'),
+      }));
+      H.check('engine: Generate-with-AI modal has no model-design entry (three sections only, nothing model-shaped)',
+        JSON.stringify(noModelState.cards) === JSON.stringify(['Baseline', 'Scenarios', 'Strategies'])
+          && noModelState.modelSection === false && noModelState.modelStrategies === false
+          && noModelState.modelBtn === false && noModelState.modelText === false,
+        JSON.stringify(noModelState));
       // Close the modal before navigating: the overlay is body-level
       // and survives hash routing.
       await page.evaluate(() => document.querySelector('#planReportAiModal [data-close-modal]').click());
@@ -1485,11 +1451,11 @@ export async function run(H, S) {
       await page.evaluate(() => document.querySelector('#planReportTabAiBtn').click());
       await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
       const appendState = await page.evaluate(() => ({
-        modelHidden: !!document.querySelector('#planReportAiModelSection')?.classList.contains('hidden'),
+        modelGone: !document.querySelector('#planReportAiModelSection'),
         note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
       }));
-      H.check('modalbeautify: append mode still hides the Model section',
-        appendState.modelHidden && appendState.note.includes('pins unchanged'), JSON.stringify(appendState));
+      H.check('engine: append mode has no Model section at all (gone, not hidden)',
+        appendState.modelGone && appendState.note.includes('pins unchanged'), JSON.stringify(appendState));
       await page.evaluate(() => document.querySelector('#planReportAiModal [data-close-modal]').click());
       await page.waitForFunction(() => !!document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
       // --- tier alignment on the fresh project (flat world first) ---
@@ -1622,7 +1588,7 @@ export async function run(H, S) {
         // either target — naming is automatic, from the design.
         noNameRow: !document.querySelector('#planAiPanelScenarioNameRow') && !document.querySelector('#planAiPanelStrategyNameRow') && ![...document.querySelectorAll('#planAiPanel input')].some((i) => /name/i.test(i.placeholder || '') && i.id !== 'planAiPanelPreviewName'),
       }));
-      H.check('modelmove: panel shows exactly two targets (no Strategy·model, no Baseline — baselines are fixed), scenario default, strategy row hidden',
+      H.check('engine: panel shows exactly two targets (no Strategy·model, no Baseline — baselines are fixed), scenario default, strategy row hidden',
         JSON.stringify(targets.targets) === JSON.stringify(['scenario', 'ops']) && targets.stratRowHidden, JSON.stringify(targets));
       H.check('aipanel11: Design panel has no Name field (scenario target)',
         targets.noNameRow, JSON.stringify(targets));
@@ -1852,32 +1818,28 @@ export async function run(H, S) {
       const pageTpl = await page.evaluate(() => fetch('/api/planning/templates').then((x) => x.json()).catch((e) => ({ error: String(e) })));
       H.check('planning detail: page fetch sees the saved templates',
         Array.isArray(pageTpl.templates) && pageTpl.templates.length >= 1, JSON.stringify(pageTpl).slice(0, 200));
-      // Template refine: saved templates live as a card in the preset
-      // chooser; Refine with AI still opens the model form prefilled
-      // with the template summary.
+      // Template refine: the saved-template Refine-with-AI button is
+      // gone with the Model concept — the saved form offers Apply
+      // only; the in-project Design-with-AI panel is the AI entry.
       await page.click('#planAddStrategyBtn');
-      const refinePresent = await page.evaluate(async () => {
+      const savedForm = await page.evaluate(async () => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         for (let i = 0; i < 12; i++) {
           const card = document.querySelector('#planChooseSaved');
           if (card) card.click();
           await sleep(500);
-          if (document.querySelector('#planSavedTemplateRefine')) return true;
+          if (document.querySelector('#planSavedTemplateSel')) return true;
         }
         return false;
       });
-      const refineDiag = refinePresent ? '' : await page.evaluate(() => document.querySelector('#planStrategyModalBody')?.textContent?.slice(0, 200) || 'no modal body');
-      H.check('planning detail: saved-template body offers Refine with AI', refinePresent, refineDiag);
-      if (refinePresent) {
-        await page.click('#planSavedTemplateRefine');
-        await waitD(800);
-        const prefilled = await page.evaluate(() => {
-          const ta = document.querySelector('#planStrategyModelText');
-          return ta ? ta.value : '';
-        });
-        H.check('planning detail: Refine with AI prefills the model form with the template summary',
-          prefilled.includes('Refine the "'), JSON.stringify(prefilled.slice(0, 120)));
-      }
+      const savedFormState = await page.evaluate(() => ({
+        refine: !!document.querySelector('#planSavedTemplateRefine'),
+        modelText: !!document.querySelector('#planStrategyModelText'),
+        apply: !!document.querySelector('#planSavedTemplateApply'),
+      }));
+      H.check('engine: saved-template form offers Apply only, no Refine-with-AI button, no model form',
+        savedForm && savedFormState.refine === false && savedFormState.modelText === false && savedFormState.apply === true,
+        JSON.stringify({ savedForm, ...savedFormState }));
     } finally { await browserD.close(); }
   }
   r = await H.req('DELETE', `/api/planning/templates/${detailTplId}`);
@@ -3330,38 +3292,24 @@ export async function run(H, S) {
       await waitP(500);
       await page.select('#planOpTypeSel', 'buy');
       await waitP(500);
-      const pickerBefore = await page.evaluate(() => ({
-        hasBtn: !!document.querySelector('#planOpSourceBtn'),
-        panelHidden: document.querySelector('#planOpSourcePanel') ? document.querySelector('#planOpSourcePanel').classList.contains('hidden') : null,
-        options: [...document.querySelectorAll('#planOpSourcePanel [data-plan-op-source]')].map((el) => el.dataset.planOpSource),
-        legs: [...document.querySelectorAll('#planOpLegs .plan-leg-row .plan-leg-src')].map((el) => el.value),
-      }));
-      H.check('planning picker: buy form shows a multi-select source picker with both sell ops',
-        pickerBefore.hasBtn && pickerBefore.panelHidden === true
-          && pickerBefore.options.includes('op:1') && pickerBefore.options.includes('op:2'),
-        JSON.stringify(pickerBefore));
-      await page.click('#planOpSourceBtn');
-      await waitP(300);
-      await page.evaluate(() => {
-        // The new buy starts with the default cash leg checked; uncheck
-        // it first (unchecking removes the leg), then check both sells.
-        const cash = document.querySelector('#planOpSourcePanel [data-plan-op-source="cash"]');
-        if (cash && cash.checked) cash.click();
-        for (const v of ['op:1', 'op:2']) {
-          const box = document.querySelector(`#planOpSourcePanel [data-plan-op-source="${v}"]`);
-          if (box && !box.checked) box.click();
-        }
+      // ENGINE round (item 11a): the Buy form has no Funded-by
+      // picker anymore — a new buy shows the Cash pool readout and
+      // funds from the cash pool by default, even when sell ops
+      // exist that used to be pickable sources.
+      const pickerBefore = await page.evaluate(() => {
+        const modal = document.querySelector('#planOpSymbol') ? document.querySelector('#planOpSymbol').closest('.modal-card') : null;
+        return {
+          hasBtn: !!document.querySelector('#planOpSourceBtn'),
+          hasPanel: !!document.querySelector('#planOpSourcePanel'),
+          hasLegs: !!document.querySelector('#planOpLegs'),
+          fundingReadout: modal ? modal.textContent : '',
+        };
       });
-      await waitP(300);
-      const pickerAfter = await page.evaluate(() => ({
-        btnLabel: document.querySelector('#planOpSourceBtn') ? document.querySelector('#planOpSourceBtn').textContent : '',
-        legs: [...document.querySelectorAll('#planOpLegs .plan-leg-row .plan-leg-src')].map((el) => el.value),
-      }));
-      H.check('planning picker: checking two sources renders two funding legs',
-        pickerAfter.legs.length === 2 && pickerAfter.legs.includes('op:1') && pickerAfter.legs.includes('op:2')
-          && pickerAfter.btnLabel.includes('2 sources'),
-        JSON.stringify(pickerAfter));
-      // Fill the buy and save: both legs validate together.
+      H.check('planning picker: new buy form has no Funded-by picker, shows the Cash pool readout',
+        pickerBefore.hasBtn === false && pickerBefore.hasPanel === false && pickerBefore.hasLegs === false
+          && pickerBefore.fundingReadout.includes('Cash pool'),
+        JSON.stringify({ hasBtn: pickerBefore.hasBtn, hasPanel: pickerBefore.hasPanel, hasLegs: pickerBefore.hasLegs, funding: pickerBefore.fundingReadout.includes('Cash pool') }));
+      // Fill the buy and save: it funds from the cash pool.
       await page.evaluate((acct) => {
         const sel = document.querySelector('#planOpAccount');
         sel.value = String(acct);
@@ -3374,10 +3322,9 @@ export async function run(H, S) {
       await waitP(1200);
       r = await H.req('GET', `/api/planning/strategies/${pkStrat}`);
       const buyOp = (r.data.ops || []).find((o) => o.op_type === 'buy');
-      H.check('planning picker: saved buy carries both funding legs',
-        !!buyOp && (buyOp.legs || []).length === 2
-          && (buyOp.legs || []).map((l) => l.source_ref).includes('op:1')
-          && (buyOp.legs || []).map((l) => l.source_ref).includes('op:2'),
+      H.check('planning picker: saved buy carries the implicit cash-pool leg only',
+        !!buyOp && (buyOp.legs || []).length === 1
+          && buyOp.legs[0].source_ref === 'cash' && buyOp.legs[0].amount === 'remainder',
         JSON.stringify(buyOp));
       r = await H.req('DELETE', `/api/planning/projects/${pkProj}`);
       H.check('planning picker: project cleanup', r.status === 200);
@@ -3729,6 +3676,84 @@ export async function run(H, S) {
         v.noteHidden === false && v.note.includes('No price data') && priceEditable, JSON.stringify(v));
       await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
       await waitBf(500);
+      // (g) No Funded-by leg picker in the Buy form: a new buy
+      // funds from the cash pool (implicit leg) — the form shows a
+      // plain "Cash pool" readout, no "Funded by" label, no leg
+      // rows. (Existing-buy leg editing stays — item 11a.)
+      // (h) Date-bug pin: open the Add-strategy modal first (its
+      // first-op section renders a duplicate #planOpDateVal), close
+      // it, then pick the date in the op form via the month picker —
+      // the pick must land in the OP modal's hidden input, and Save
+      // must pass (no "date is required").
+      await page.goto(`http://ff.local/#planning/project/${bfProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitBf(1500);
+      await page.click('#planAddStrategyBtn');
+      await waitBf(500);
+      await page.evaluate(() => { document.querySelector('#planStrategyModalBody [data-plan-preset="buy"]')?.click(); });
+      await page.waitForFunction(() => !!document.querySelector('#planStrategyModalBody #planOpDateVal'), { timeout: 15000 });
+      await page.evaluate(() => { document.querySelector('#planStrategyModal [data-close-modal]')?.click(); });
+      await waitBf(500);
+      await page.goto(`http://ff.local/#planning/strategy/${bfStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitBf(1500);
+      await page.click('#planAddOpBtn');
+      await waitBf(500);
+      await page.select('#planOpTypeSel', 'buy');
+      await page.waitForFunction(() => {
+        const row = document.querySelector('#planOpBuyActionsRow');
+        return row && !row.classList.contains('hidden');
+      }, { timeout: 15000 });
+      const fundedBy = await page.evaluate(() => ({
+        modalText: document.querySelector('#planOpModal')?.textContent || '',
+        legs: !!document.querySelector('#planOpModal #planOpLegs'),
+        fundingReadout: (() => {
+          const labels = [...document.querySelectorAll('#planOpModal label')];
+          const f = labels.find((l) => l.textContent.trim() === 'Funding');
+          return f ? f.parentElement.textContent : '';
+        })(),
+      }));
+      H.check('buyform: Buy form has no Funded-by leg picker, shows a plain Cash pool readout',
+        !fundedBy.modalText.includes('Funded by') && !fundedBy.legs && fundedBy.fundingReadout.includes('Cash pool'),
+        JSON.stringify(fundedBy));
+      // Pick Jan 2027 via the month picker (opens at the current
+      // year, so step forward one year first).
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-plan-month]')?.click(); });
+      await page.waitForFunction(() => !document.querySelector('#monthPop')?.classList.contains('hidden'), { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#monthPopNext')?.click(); });
+      await page.waitForFunction(() => document.querySelector('#monthPopYear')?.textContent === '2027', { timeout: 10000 });
+      await page.evaluate(() => { document.querySelector('#monthPopGrid button[data-ym="2027-01"]')?.click(); });
+      await waitBf(300);
+      const pickedDate = await page.evaluate(() => ({
+        opModalVal: document.querySelector('#planOpModal #planOpDateVal')?.value || '',
+        btnLabel: document.querySelector('#planOpModal [data-plan-month]')?.textContent || '',
+      }));
+      H.check('buyform: month-picker pick lands in the op modal hidden input (not the lingering strategy form)',
+        pickedDate.opModalVal === '2027-01-01' && pickedDate.btnLabel.includes('Jan 2027'),
+        JSON.stringify(pickedDate));
+      // The strategy modal's buy-preset form lingers in the DOM
+      // (hidden) with the same ids, first in document order — so
+      // these selectors MUST scope to the op modal, like the date
+      // pin above (same duplicate-id hazard as item 11b).
+      await page.evaluate(() => {
+        const el = document.querySelector('#planOpModal #planOpSymbol');
+        el.value = 'XQQ.TO';
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const el = document.querySelector('#planOpModal #planOpPrice');
+        return el && el.value.trim() !== '';
+      }, { timeout: 15000 });
+      await page.evaluate(() => {
+        const u = document.querySelector('#planOpModal #planOpUnits');
+        u.value = '1';
+        u.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.click('#planOpSaveBtn');
+      await page.waitForFunction(() => document.querySelector('#planOpModal')?.classList.contains('hidden'), { timeout: 15000 });
+      const dateOpMsg = await page.evaluate(() => document.querySelector('#planOpModalMsg')?.textContent || '');
+      r = await H.req('GET', `/api/planning/strategies/${bfStrat}`);
+      const dateOp = (r.data.ops || []).find((o) => o.op_type === 'buy' && o.params && o.params.date === '2027-01-01');
+      H.check('buyform: date picked via the month picker after the strategy form saves (no "date is required")',
+        dateOpMsg === '' && !!dateOp, JSON.stringify({ dateOpMsg, op: dateOp }));
       // Template form shares the wiring: Buy preset on the project page.
       await page.goto(`http://ff.local/#planning/project/${bfProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitBf(1500);
@@ -3953,6 +3978,10 @@ export async function run(H, S) {
   H.check('comparison: pin prepay op added', r.status === 201, JSON.stringify(r.data));
   r = await H.req('POST', `/api/planning/projects/${cmpProjectId}/scenarios`, { name: 'Compare world' });
   H.check('comparison: scenario created for the pin project', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
+  const cmpScenId = r.data.scenario.id;
+  r = await H.req('POST', `/api/planning/projects/${cmpProjectId}/reports`, { name: 'Compare Report', definition: { charts: [] }, strategy_ids: [cmpStrategyId], scenario_ids: [cmpScenId] });
+  const cmpRepId = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+  H.check('comparison: fixture report created', r.status === 201 && cmpRepId > 0, JSON.stringify(r.data));
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('comparison browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
@@ -4004,22 +4033,30 @@ export async function run(H, S) {
       });
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueC, domain: 'ff.local', path: '/', httpOnly: true });
       const waitC = (ms) => new Promise((res2) => setTimeout(res2, ms));
-      await page.goto(`http://ff.local/#planning/strategy/${cmpStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // ENGINE round: the Difference table lives ONLY inside a
+      // generated report (item 10) — the strategy page keeps none of
+      // it. Open the fixture report and pin the table section there:
+      // monthly rows, baseline/strategy/diff columns, year pager.
+      await page.goto(`http://ff.local/#planning/project/${cmpProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitC(1500);
+      await page.waitForFunction((rid) => !!document.querySelector(`[data-plan-report-view="${rid}"]`), { timeout: 15000 }, cmpRepId);
+      await page.evaluate((rid) => { document.querySelector(`[data-plan-report-view="${rid}"]`).click(); }, cmpRepId);
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 30000 });
+      await waitC(500);
       const diff = await page.evaluate(() => ({
-        panel: !!document.querySelector('#planDiffPanel'),
-        head: document.querySelector('#planDiffTable thead')?.textContent || '',
-        rows: document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length,
-        chart: !!document.querySelector('#planDiffChart'),
-        allActive: !!document.querySelector('[data-plan-diff-preset="all"].active'),
-        presets: [...document.querySelectorAll('[data-plan-diff-preset]')].map((b) => b.dataset.planDiffPreset),
-        pagerYears: [...document.querySelectorAll('#planDiffYearPager [data-plan-diff-year]')].map((b) => b.dataset.planDiffYear),
-        pagerActive: document.querySelector('#planDiffYearPager [data-plan-diff-year].active')?.dataset.planDiffYear || null,
-        totalRows: document.querySelectorAll('#planDiffTable tbody tr.plan-year-total').length,
+        panel: !!document.querySelector('#planReportTableBody'),
+        head: document.querySelector('#planReportTableBody thead')?.textContent || '',
+        rows: document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)').length,
+        pagerYears: [...document.querySelectorAll('#planReportTablePager [data-plan-report-table-year]')].map((b) => b.dataset.planReportTableYear),
+        pagerActive: document.querySelector('#planReportTablePager [data-plan-report-table-year].active')?.dataset.planReportTableYear || null,
+        totalRows: document.querySelectorAll('#planReportTableBody tbody tr.plan-year-total').length,
+        noStrategyDiff: !document.querySelector('#planDiffPanel') && !document.querySelector('#planDiffTable'),
       }));
-      H.check('comparison: strategy detail diff section renders baseline/strategy/diff columns, All default',
-        diff.panel && diff.head.includes('Baseline') && diff.head.includes('Strategy') && diff.head.includes('Δ') && diff.rows > 0 && diff.chart && diff.allActive && diff.presets.includes('all') && diff.totalRows === 1,
+      H.check('comparison: report table section renders baseline/strategy/diff columns, monthly rows',
+        diff.panel && diff.head.includes('Baseline balance') && diff.head.includes('Strategy balance') && diff.head.includes('Balance Δ') && diff.rows > 0 && diff.totalRows === 1,
         JSON.stringify(diff));
+      H.check('engine: strategy page keeps no Difference table (moved to the report)',
+        diff.noStrategyDiff, JSON.stringify(diff));
       // Monthly row count vs the API month union (same union the
       // client builds: mortgage baseline/strategy + stock series).
       r = await H.req('GET', `/api/planning/strategies/${cmpStrategyId}`);
@@ -4033,41 +4070,21 @@ export async function run(H, S) {
       // year, and paging through all years covers the full span.
       const spanYears = [...new Set([...apiMonths].map((m) => m.slice(0, 4)))].sort();
       const firstYearMonths = [...apiMonths].filter((m) => m.slice(0, 4) === spanYears[0]).length;
-      H.check('cleanup: diff table pages by year — default first year, pager lists the span years',
+      H.check('cleanup: report table pages by year — default first year, pager lists the span years',
         JSON.stringify(diff.pagerYears) === JSON.stringify(spanYears) && diff.pagerActive === spanYears[0] && diff.rows === firstYearMonths && diff.totalRows === 1,
         JSON.stringify({ pagerYears: diff.pagerYears, pagerActive: diff.pagerActive, rows: diff.rows, firstYearMonths, spanYears }));
       let pagedRows = diff.rows;
       for (const y of spanYears.slice(1)) {
-        await page.click(`#planDiffYearPager [data-plan-diff-year="${y}"]`);
+        await page.click(`#planReportTablePager [data-plan-report-table-year="${y}"]`);
         await waitC(300);
-        pagedRows += await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
+        pagedRows += await page.evaluate(() => document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
       }
-      H.check('cleanup: diff pager pages sum to the full projection span',
+      H.check('cleanup: report table pager pages sum to the full projection span',
         pagedRows === apiMonths.size, JSON.stringify({ pagedRows, apiMonths: apiMonths.size }));
-      await page.click(`#planDiffYearPager [data-plan-diff-year="${spanYears[0]}"]`);
+      await page.click(`#planReportTablePager [data-plan-report-table-year="${spanYears[0]}"]`);
       await waitC(300);
-      await page.click('[data-plan-diff-preset="1y"]');
-      await waitC(800);
-      const shortState = await page.evaluate(() => ({
-        rows: document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length,
-        pagerYears: [...document.querySelectorAll('#planDiffYearPager [data-plan-diff-year]')].map((b) => b.dataset.planDiffYear),
-      }));
-      const first12Years = [...new Set([...apiMonths].sort().slice(0, 12).map((m) => m.slice(0, 4)))];
-      H.check('cleanup: diff 1y preset narrows the pager to the first 12 months',
-        shortState.rows > 0 && shortState.rows <= 12 && JSON.stringify(shortState.pagerYears) === JSON.stringify(first12Years),
-        JSON.stringify({ shortState, first12Years }));
-      await page.click('[data-plan-diff-preset="all"]');
-      await waitC(800);
-      const backRows = await page.evaluate(() => document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
-      H.check('comparison: diff All preset restores the first-year page', backRows === diff.rows, JSON.stringify({ backRows, fullRows: diff.rows }));
-      await page.click('[data-plan-diff-gran="annual"]');
-      await waitC(800);
-      const annual = await page.evaluate(() => ({
-        head: document.querySelector('#planDiffTable thead')?.textContent || '',
-        first: document.querySelector('#planDiffTable tbody tr td')?.textContent || '',
-      }));
-      H.check('comparison: diff annual toggle switches to year rows with Equity Δ (peak)',
-        annual.head.includes('Equity Δ (peak)') && /^\d{4}$/.test(annual.first.trim()), JSON.stringify(annual));
+      const backRows = await page.evaluate(() => document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)').length);
+      H.check('comparison: report table pager returns to the first-year page', backRows === diff.rows, JSON.stringify({ backRows, fullRows: diff.rows }));
     } finally { await browserC.close(); }
   }
   // ------------------------------------------- monthly payment scope
@@ -4307,60 +4324,59 @@ export async function run(H, S) {
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueP, domain: 'ff.local', path: '/', httpOnly: true });
       const waitP = (ms) => new Promise((res2) => setTimeout(res2, ms));
       page.on('dialog', (d) => d.accept());
-      // Detail caption names the entity property, never "summed".
+      // ENGINE round: the strategy page NEVER shows trajectory
+      // charts, the headline, or the Difference table — before or
+      // after Generate (psRep is generated, so the gate is open).
+      // They live only inside a generated report tab.
       await page.goto(`http://ff.local/#planning/strategy/${psStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1500);
-      const cap = await page.evaluate(() => {
-        const panel = document.querySelector('#planStrategyMortChart')?.closest('.panel');
-        return panel ? (panel.querySelector('.note')?.textContent || '') : '';
-      });
-      H.check('propscope: strategy detail caption names the entity property, not summed across properties',
-        cap.includes('777 PropScope Entity Lane') && !cap.includes('summed across properties'), JSON.stringify({ cap }));
-      // Item 6 revised (user 2026-11-04): a property strategy detail
-      // shows the entity's equity, remaining balance, and payment
-      // breakdown — AFTER Generate. The gate is open here via psRep,
-      // so the panels + the report-headline block render on load.
-      try {
-        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyEquityChart, { timeout: 15000 });
-      } catch { /* checks below */ }
-      const stratKindB = await page.evaluate(() => {
-        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
-        const vis = (sel) => {
-          const el = document.querySelector(sel);
-          return !!el && el.offsetParent !== null;
-        };
-        const chartLens = (id) => (typeof planCharts !== 'undefined' && planCharts[id]) ? planCharts[id].data.datasets.map((d) => d.data.filter((v) => v != null).length) : null;
-        return {
-          mortPanel: vis('#planStrategyMortChart'),
-          eqPanel: vis('#planStrategyEquityChart'),
-          eqData: chartLens('planStrategyEquityChart'),
-          mortData: chartLens('planStrategyMortChart'),
-          annualPanel: heads.includes('Annual interest'),
-          breakTitle: (() => { const t = document.querySelector('#planDiffBreakdownTitle'); return !!t && t.style.display !== 'none'; })(),
-          eqCap: document.querySelector('#planStrategyEquityChart')?.closest('.panel')?.querySelector('.note')?.textContent || '',
-          headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
-        };
-      });
-      H.check('stratpanels: property strategy detail shows Mortgage balance + Equity + Annual interest + payment breakdown, equity caption names the entity',
-        stratKindB.mortPanel && stratKindB.eqPanel && stratKindB.annualPanel && stratKindB.breakTitle
-          && Array.isArray(stratKindB.eqData) && stratKindB.eqData.length === 2 && stratKindB.eqData.every((n) => n > 0)
-          && Array.isArray(stratKindB.mortData) && stratKindB.mortData.length === 2
-          && stratKindB.eqCap.includes('777 PropScope Entity Lane') && !stratKindB.eqCap.includes('summed across properties'),
-        JSON.stringify(stratKindB));
-      H.check('stratpanels: property headline shows all 9 metric cards after Generate',
-        stratKindB.headline.length === 9
-          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Interest saved', 'Stock gain', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((k) => stratKindB.headline.includes(k)),
-        JSON.stringify({ headline: stratKindB.headline }));
-      // Report HOW line (opened from the strategy tier LIST) names it too.
+      const stratAbsence = await page.evaluate(() => ({
+        mortChart: !!document.querySelector('#planStrategyMortChart'),
+        eqChart: !!document.querySelector('#planStrategyEquityChart'),
+        annualChart: !!document.querySelector('#planStrategyAnnualChart'),
+        poolChart: !!document.querySelector('#planStrategyPoolChart'),
+        stockChart: !!document.querySelector('#planStrategyStockChart'),
+        headline: !!document.querySelector('#planStrategyHeadline'),
+        diffPanel: !!document.querySelector('#planDiffPanel'),
+        diffTable: !!document.querySelector('#planDiffTable'),
+        diffChart: !!document.querySelector('#planDiffChart'),
+        heads: [...document.querySelectorAll('h3')].map((h) => h.textContent),
+      }));
+      H.check('engine: strategy page shows no trajectory charts, no headline, no Difference table (moved to the report)',
+        stratAbsence.mortChart === false && stratAbsence.eqChart === false && stratAbsence.annualChart === false
+          && stratAbsence.poolChart === false && stratAbsence.stockChart === false && stratAbsence.headline === false
+          && stratAbsence.diffPanel === false && stratAbsence.diffTable === false && stratAbsence.diffChart === false
+          && !stratAbsence.heads.includes('Annual interest'),
+        JSON.stringify(stratAbsence));
+      // The report (opened from the strategy tier LIST) has them:
+      // the 9-card headline + the Mortgage balance chart + the
+      // entity-named how-line.
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
-      const how = await page.evaluate(() => {
+      const repState = await page.evaluate(() => {
+        const chartByTitle = (title) => {
+          const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === title);
+          const canvas = block ? block.querySelector('canvas') : null;
+          return canvas && typeof planCharts !== 'undefined' && planCharts[canvas.id]
+            ? planCharts[canvas.id].data.datasets.map((d) => d.data.filter((v) => v != null).length) : null;
+        };
         const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Mortgage balance');
-        return block ? [...block.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '';
+        return {
+          headline: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((k) => k.textContent),
+          mortData: chartByTitle('Mortgage balance'),
+          how: block ? [...block.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
+        };
       });
+      H.check('stratpanels: report shows the Mortgage balance chart (baseline + strategy, both with data)',
+        Array.isArray(repState.mortData) && repState.mortData.length === 2 && repState.mortData.every((n) => n > 0),
+        JSON.stringify(repState));
+      H.check('stratpanels: report headline shows all 9 metric cards',
+        repState.headline.length === 9
+          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Interest saved', 'Stock gain', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((k) => repState.headline.includes(k)),
+        JSON.stringify({ headline: repState.headline }));
       H.check('propscope: report Mortgage balance how-line names the entity property, not summed across properties',
-        how.includes('Mortgage balance = outstanding principal') && how.includes('777 PropScope Entity Lane') && !how.includes('summed across properties'), JSON.stringify({ how }));
+        repState.how.includes('Mortgage balance = outstanding principal') && repState.how.includes('777 PropScope Entity Lane') && !repState.how.includes('summed across properties'), JSON.stringify({ how: repState.how }));
       // (opform): in a property project the op form's property
       // picker offers ONLY the entity property, and a form-created
       // op lands on it.
@@ -4797,7 +4813,7 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${icProj}/ai-report`, { text: 'Show mortgage balance' });
   H.check('aireport: mortgage chart on a cash-pool baseline is rejected',
     r.status === 502 && /cash pool|baseline/i.test(JSON.stringify(r.data)), JSON.stringify(r.data));
-  fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'], method: 'Monthly pool balance from the engine projection.' }] }));
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ engine: {}, charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'], method: 'Monthly pool balance from the engine projection.' }] }));
   r = await H.req('POST', `/api/planning/projects/${icProj}/ai-report`, { text: 'Show pool trajectory' });
   H.check('aireport: pool chart on a cash-pool baseline passes',
     r.status === 200 && Array.isArray(r.data.definition && r.data.definition.charts) && r.data.definition.charts.length === 1, JSON.stringify(r.data));
@@ -4847,70 +4863,73 @@ export async function run(H, S) {
         }
       });
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueI, domain: 'ff.local', path: '/', httpOnly: true });
+      // ENGINE round: the strategy page keeps no Difference table,
+      // no trajectory charts, no headline — they live only inside a
+      // generated report. The pool report's table + Δ chart have
+      // Value Δ only, no mortgage columns.
       await page.goto(`http://ff.local/#planning/strategy/${icStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
-      const diffState = await page.evaluate(() => ({
-        deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planDiffChart) ? planCharts.planDiffChart.data.datasets.map((d) => d.label) : null,
-        breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planDiffBreakdownChart == null : null,
-        breakdownTitleHidden: document.querySelector('#planDiffBreakdownTitle')?.style.display === 'none',
-        breakdownWrapHidden: document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap')?.style.display === 'none',
+      await page.waitForFunction(() => !!document.querySelector('#planStrategyTitle'), { timeout: 15000 });
+      const stratNoDiff = await page.evaluate(() => ({
+        diffPanel: !!document.querySelector('#planDiffPanel'),
+        diffTable: !!document.querySelector('#planDiffTable'),
+        diffChart: !!document.querySelector('#planDiffChart'),
+        mortChart: !!document.querySelector('#planStrategyMortChart'),
+        eqChart: !!document.querySelector('#planStrategyEquityChart'),
+        poolChart: !!document.querySelector('#planStrategyPoolChart'),
+        stockChart: !!document.querySelector('#planStrategyStockChart'),
+        headline: !!document.querySelector('#planStrategyHeadline'),
+        heads: [...document.querySelectorAll('h3')].map((h) => h.textContent),
       }));
-      H.check('invcomp: detail diff has Value Δ only, no Balance Δ line, breakdown block hidden',
-        diffState.deltaLabels && !diffState.deltaLabels.some((l) => /Balance Δ/.test(l)) && diffState.deltaLabels.some((l) => /Value Δ/.test(l))
-          && diffState.breakdownNull === true && diffState.breakdownTitleHidden === true && diffState.breakdownWrapHidden === true,
-        JSON.stringify(diffState));
-      // Item 6 revised (a): a cash-pool-baseline strategy detail shows
-      // NO mortgage panels at all — no Mortgage balance, no Equity,
-      // no Annual interest — and the cash-pool trajectory instead.
-      // The gate is open here via icRep, so the panels render.
-      try {
-        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyPoolChart, { timeout: 15000 });
-      } catch { /* checks below */ }
-      const stratKindA = await page.evaluate(() => {
-        const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
-        const pool = (typeof planCharts !== 'undefined' && planCharts.planStrategyPoolChart) ? planCharts.planStrategyPoolChart.data.datasets.map((d) => ({ label: d.label, n: d.data.filter((v) => v != null).length, max: Math.max(...d.data.filter((v) => v != null), -Infinity) })) : null;
-        return {
-          mortAbsent: !document.querySelector('#planStrategyMortChart'),
-          eqAbsent: !document.querySelector('#planStrategyEquityChart'),
-          annualAbsent: !heads.includes('Annual interest'),
-          stockPresent: !!document.querySelector('#planStrategyStockChart'),
-          pool,
-          poolCap: document.querySelector('#planStrategyPoolChart')?.closest('.panel')?.querySelector('.note')?.textContent || '',
-          headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
-        };
-      });
-      H.check('stratpanels: pure stock strategy detail hides all mortgage panels and shows the cash-pool trajectory',
-        stratKindA.mortAbsent && stratKindA.eqAbsent && stratKindA.annualAbsent && stratKindA.stockPresent
-          && Array.isArray(stratKindA.pool) && stratKindA.pool.length === 4
-          && stratKindA.pool.some((d) => /pool/.test(d.label) && d.max === 2400)
-          && stratKindA.poolCap.includes('property equity is not included'),
-        JSON.stringify(stratKindA));
-      H.check('stratpanels: cash-pool headline shows pool/stock metrics only, zero mortgage metric cards',
-        stratKindA.headline.length === 5
-          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => stratKindA.headline.includes(k))
-          && !stratKindA.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
-        JSON.stringify({ headline: stratKindA.headline }));
+      H.check('engine: stock strategy page shows no Difference table/chart, no trajectory charts, no headline (moved to the report)',
+        stratNoDiff.diffPanel === false && stratNoDiff.diffTable === false && stratNoDiff.diffChart === false
+          && stratNoDiff.mortChart === false && stratNoDiff.eqChart === false && stratNoDiff.poolChart === false
+          && stratNoDiff.stockChart === false && stratNoDiff.headline === false && !stratNoDiff.heads.includes('Annual interest'),
+        JSON.stringify(stratNoDiff));
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Pool trajectory'), { timeout: 15000 });
-      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
-      const repState = await page.evaluate(() => ({
-        deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
-        breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
-        breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
-      }));
-      H.check('invcomp: report comparison has Value Δ only, no Balance Δ line, breakdown block hidden',
-        repState.deltaLabels && !repState.deltaLabels.some((l) => /Balance Δ/.test(l)) && repState.deltaLabels.some((l) => /Value Δ/.test(l))
-          && repState.breakdownNull === true && repState.breakdownWrapHidden === true,
-        JSON.stringify(repState));
-      const trajTable = await page.evaluate(() => {
-        const panels = [...document.querySelectorAll('[data-plan-report-block]')];
-        const p = panels.find((el) => el.querySelector('h3')?.textContent === 'Pool trajectory');
-        return p ? p.querySelector('table')?.textContent || '' : '';
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      const repPool = await page.evaluate(() => {
+        const chartByTitle = (title) => {
+          const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === title);
+          const canvas = block ? block.querySelector('canvas') : null;
+          return canvas && typeof planCharts !== 'undefined' && planCharts[canvas.id]
+            ? planCharts[canvas.id].data.datasets.map((d) => ({ label: d.label, n: d.data.filter((v) => v != null).length, max: Math.max(...d.data.filter((v) => v != null), -Infinity) })) : null;
+        };
+        const poolBlock = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Pool trajectory');
+        return {
+          pool: chartByTitle('Pool trajectory'),
+          poolCap: poolBlock ? [...poolBlock.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
+          trajTable: poolBlock ? poolBlock.querySelector('table')?.textContent || '' : '',
+          headline: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((k) => k.textContent),
+          tableHead: document.querySelector('#planReportTableBody thead')?.textContent || '',
+          tableCap: document.querySelector('#planReportTableCaption')?.textContent || '',
+          deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
+          breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
+          breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
+        };
       });
+      H.check('stratpanels: report shows the cash-pool trajectory (6 datasets, pool max 2,400) with the equity-excluded caption',
+        Array.isArray(repPool.pool) && repPool.pool.length === 6
+          && repPool.pool.some((d) => /pool/.test(d.label) && d.max === 2400)
+          && repPool.poolCap.includes('property equity is not included'),
+        JSON.stringify(repPool));
+      H.check('stratpanels: cash-pool headline shows pool/stock metrics only, zero mortgage metric cards',
+        repPool.headline.length === 5
+          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => repPool.headline.includes(k))
+          && !repPool.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
+        JSON.stringify({ headline: repPool.headline }));
+      H.check('invcomp: report comparison has Value Δ only, no Balance Δ line, breakdown block hidden',
+        repPool.deltaLabels && !repPool.deltaLabels.some((l) => /Balance Δ/.test(l)) && repPool.deltaLabels.some((l) => /Value Δ/.test(l))
+          && repPool.breakdownNull === true && repPool.breakdownWrapHidden === true,
+        JSON.stringify(repPool));
+      H.check('invcomp: report table has Value Δ only, no mortgage columns',
+        repPool.tableHead.includes('Value Δ') && !repPool.tableHead.includes('Balance Δ') && !repPool.tableHead.includes('Baseline balance')
+          && repPool.tableCap.includes('Value Δ') && !repPool.tableCap.includes('Balance Δ'),
+        JSON.stringify({ tableHead: repPool.tableHead, tableCap: repPool.tableCap }));
       H.check('invcomp: report trajectory table shows the pool at the sell month (Dec row: strategy pool 2,400, stock 7,600, total 10,000)',
-        trajTable.includes('2,400.00') && trajTable.includes('7,600.00') && trajTable.includes('10,000.00'),
-        JSON.stringify(trajTable.slice(0, 600)));
+        repPool.trajTable.includes('2,400.00') && repPool.trajTable.includes('7,600.00') && repPool.trajTable.includes('10,000.00'),
+        JSON.stringify(repPool.trajTable.slice(0, 600)));
       // Item 6 revised report tier: the same strategy's tier LIST
       // carries the mortgage-chart report; opening it hides the
       // mortgage block (with a plain baseline-phrased note) and
@@ -4925,7 +4944,7 @@ export async function run(H, S) {
         await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icHideRep);
         await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icHideRep);
       }
-      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
       const hideState = await page.evaluate(() => ({
         heads: [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent),
         note: document.querySelector('#planReport')?.textContent.includes('Mortgage charts hidden') || false,
@@ -4935,17 +4954,14 @@ export async function run(H, S) {
         JSON.stringify(hideState));
       // Item 6 revised (c): BASELINE WINS over op nature — the mixed
       // sell + prepay strategy lives on the investment project, so
-      // its baseline is a cash pool: pool + stock panels ONLY, no
-      // mortgage/equity/annual panels, breakdown hidden, Δ chart
-      // Value Δ only. (The old "both sets" reading is superseded.)
+      // its baseline is a cash pool. ENGINE round: the strategy page
+      // shows none of the panels; the mixed report's table has
+      // Value Δ only (kind-gated), no mortgage columns.
       await page.goto(`http://ff.local/#planning/strategy/${icMixStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       // The diff table exists on every strategy page, so it cannot
       // prove the new page rendered — wait for this strategy's title
       // or a stale-page read passes on the previous strategy's state.
       await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Mixed prepay + sell'), { timeout: 15000 });
-      try {
-        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyPoolChart, { timeout: 15000 });
-      } catch { /* checks below */ }
       const stratKindC = await page.evaluate(() => {
         const heads = [...document.querySelectorAll('h3')].map((h) => h.textContent);
         return {
@@ -4954,14 +4970,24 @@ export async function run(H, S) {
           annual: heads.includes('Annual interest'),
           pool: !!document.querySelector('#planStrategyPoolChart'),
           stock: !!document.querySelector('#planStrategyStockChart'),
-          breakTitle: (() => { const t = document.querySelector('#planDiffBreakdownTitle'); return !!t && t.style.display !== 'none'; })(),
-          deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planDiffChart) ? planCharts.planDiffChart.data.datasets.map((d) => d.label) : null,
+          headline: !!document.querySelector('#planStrategyHeadline'),
+          diffTable: !!document.querySelector('#planDiffTable'),
         };
       });
-      H.check('stratpanels: mixed strategy on a cash-pool baseline shows pool/stock only, no mortgage panels, breakdown hidden, Value Δ only',
-        !stratKindC.mort && !stratKindC.eq && !stratKindC.annual && stratKindC.pool && stratKindC.stock && !stratKindC.breakTitle
-          && stratKindC.deltaLabels && stratKindC.deltaLabels.some((l) => /Value Δ/.test(l)) && !stratKindC.deltaLabels.some((l) => /Balance Δ/.test(l)),
+      H.check('engine: mixed strategy page shows no panels, no headline, no Difference table (moved to the report)',
+        !stratKindC.mort && !stratKindC.eq && !stratKindC.annual && !stratKindC.pool && !stratKindC.stock && !stratKindC.headline && !stratKindC.diffTable,
         JSON.stringify(stratKindC));
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icMixRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icMixRep);
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      const mixTable = await page.evaluate(() => ({
+        head: document.querySelector('#planReportTableBody thead')?.textContent || '',
+        cap: document.querySelector('#planReportTableCaption')?.textContent || '',
+      }));
+      H.check('stratpanels: mixed report table has Value Δ only, no mortgage columns (baseline wins over op nature)',
+        mixTable.head.includes('Value Δ') && !mixTable.head.includes('Balance Δ') && !mixTable.head.includes('Baseline balance')
+          && mixTable.cap.includes('Value Δ') && !mixTable.cap.includes('Balance Δ'),
+        JSON.stringify(mixTable));
       // Item 6 revised gating: a strategy with NO report shows no
       // headline and no chart panels on load (Operations/Sink/
       // Difference table still present); after UI Generate + reload
@@ -4983,30 +5009,42 @@ export async function run(H, S) {
           stock: !!document.querySelector('#planStrategyStockChart'),
           ops: heads.includes('Operations'),
           sink: heads.includes('Sink'),
-          diffTable: !!document.querySelector('#planDiffTable table'),
+          diffTable: !!document.querySelector('#planDiffTable'),
         };
       });
-      H.check('gating: no-report pool strategy page shows no headline and no chart panels, keeps Operations/Sink/Difference table',
+      H.check('gating: no-report pool strategy page shows no headline and no chart panels, keeps Operations/Sink, no Difference table',
         !gatePoolClosed.headline && !gatePoolClosed.mort && !gatePoolClosed.eq && !gatePoolClosed.pool && !gatePoolClosed.stock
-          && gatePoolClosed.ops && gatePoolClosed.sink && gatePoolClosed.diffTable,
+          && gatePoolClosed.ops && gatePoolClosed.sink && !gatePoolClosed.diffTable,
         JSON.stringify(gatePoolClosed));
       await page.waitForFunction(() => { const b = document.querySelector('#planStrategyGenerateBtn'); if (!b) return false; const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, { timeout: 10000 });
       await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
       await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
+      // The generated report tab shows the pool trajectory + the
+      // pool-only headline; the strategy page itself still shows
+      // none of it after a reload. (Preset title for a pool
+      // baseline is 'Cash pool', not 'Pool trajectory'.)
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Cash pool'), { timeout: 15000 });
+      const gatePoolRep = await page.evaluate(() => ({
+        headline: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((k) => k.textContent),
+        poolBlock: [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Cash pool'),
+        mortBlock: [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'),
+      }));
+      H.check('gating: after Generate, the report shows the Cash pool chart + pool-only headline, no mortgage chart',
+        gatePoolRep.poolBlock && !gatePoolRep.mortBlock
+          && gatePoolRep.headline.length === 5 && !gatePoolRep.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
+        JSON.stringify(gatePoolRep));
       await page.goto(`http://ff.local/#planning/strategy/${gatePoolStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      try {
-        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyPoolChart, { timeout: 15000 });
-      } catch { /* checks below */ }
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Gate pool'), { timeout: 15000 });
       const gatePoolOpen = await page.evaluate(() => ({
-        headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
+        headline: !!document.querySelector('#planStrategyHeadline'),
         mort: !!document.querySelector('#planStrategyMortChart'),
         eq: !!document.querySelector('#planStrategyEquityChart'),
         pool: !!document.querySelector('#planStrategyPoolChart'),
         stock: !!document.querySelector('#planStrategyStockChart'),
+        diffTable: !!document.querySelector('#planDiffTable'),
       }));
-      H.check('gating: after Generate, pool strategy shows pool/stock panels + pool-only headline, no mortgage panels',
-        gatePoolOpen.pool && gatePoolOpen.stock && !gatePoolOpen.mort && !gatePoolOpen.eq
-          && gatePoolOpen.headline.length === 5 && !gatePoolOpen.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
+      H.check('gating: after Generate + reload, the strategy page still shows no panels/headline/Difference table',
+        !gatePoolOpen.headline && !gatePoolOpen.mort && !gatePoolOpen.eq && !gatePoolOpen.pool && !gatePoolOpen.stock && !gatePoolOpen.diffTable,
         JSON.stringify(gatePoolOpen));
       r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Gate property' });
       H.check('gating: no-report property strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
@@ -5024,29 +5062,40 @@ export async function run(H, S) {
           pool: !!document.querySelector('#planStrategyPoolChart'),
           ops: heads.includes('Operations'),
           pen: heads.includes('Penalties'),
-          diffTable: !!document.querySelector('#planDiffTable table'),
+          diffTable: !!document.querySelector('#planDiffTable'),
         };
       });
-      H.check('gating: no-report property strategy page shows no headline and no chart panels, keeps Operations/Penalties/Difference table',
+      H.check('gating: no-report property strategy page shows no headline and no chart panels, keeps Operations, no Penalties panel, no Difference table',
         !gatePropClosed.headline && !gatePropClosed.mort && !gatePropClosed.eq && !gatePropClosed.pool
-          && gatePropClosed.ops && gatePropClosed.pen && gatePropClosed.diffTable,
+          && gatePropClosed.ops && !gatePropClosed.pen && !gatePropClosed.diffTable,
         JSON.stringify(gatePropClosed));
       await page.waitForFunction(() => { const b = document.querySelector('#planStrategyGenerateBtn'); if (!b) return false; const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, { timeout: 10000 });
       await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
       await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
+      // The generated report tab shows the Mortgage balance chart +
+      // the all-9 headline with the entity-named how-line; the
+      // strategy page itself still shows none of it after a reload.
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
+      const gatePropRep = await page.evaluate(() => {
+        const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Mortgage balance');
+        return {
+          headline: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((k) => k.textContent),
+          how: block ? [...block.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
+        };
+      });
+      H.check('gating: after Generate, the report shows the Mortgage balance chart + all-9 headline, entity named',
+        gatePropRep.headline.length === 9 && gatePropRep.how.includes('777 PropScope Entity Lane') && !gatePropRep.how.includes('summed across properties'),
+        JSON.stringify(gatePropRep));
       await page.goto(`http://ff.local/#planning/strategy/${gatePropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      try {
-        await page.waitForFunction(() => typeof planCharts !== 'undefined' && !!planCharts.planStrategyEquityChart, { timeout: 15000 });
-      } catch { /* checks below */ }
+      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Gate property'), { timeout: 15000 });
       const gatePropOpen = await page.evaluate(() => ({
-        headline: [...document.querySelectorAll('#planStrategyHeadline .k')].map((k) => k.textContent),
+        headline: !!document.querySelector('#planStrategyHeadline'),
         mort: !!document.querySelector('#planStrategyMortChart'),
         eq: !!document.querySelector('#planStrategyEquityChart'),
-        eqCap: document.querySelector('#planStrategyEquityChart')?.closest('.panel')?.querySelector('.note')?.textContent || '',
+        diffTable: !!document.querySelector('#planDiffTable'),
       }));
-      H.check('gating: after Generate, property strategy shows mortgage/equity panels + all-9 headline, entity named',
-        gatePropOpen.mort && gatePropOpen.eq && gatePropOpen.headline.length === 9
-          && gatePropOpen.eqCap.includes('777 PropScope Entity Lane') && !gatePropOpen.eqCap.includes('summed across properties'),
+      H.check('gating: after Generate + reload, the strategy page still shows no panels/headline/Difference table',
+        !gatePropOpen.headline && !gatePropOpen.mort && !gatePropOpen.eq && !gatePropOpen.diffTable,
         JSON.stringify(gatePropOpen));
       // (d) Property strategy panels still render: open the payscope
       // report and confirm the breakdown block + Balance Δ line exist.
@@ -5064,7 +5113,7 @@ export async function run(H, S) {
         await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
         await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, psRep);
       }
-      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
       const propState = await page.evaluate(() => ({
         deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
         breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
@@ -5126,24 +5175,10 @@ export async function run(H, S) {
       });
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
       await page.goto(`http://ff.local/#planning/strategy/${icDropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planStrategyTitle'), { timeout: 15000 });
       const detailErrs = await page.evaluate(() => [...document.querySelectorAll('.msg.err')].map((el) => el.textContent));
       H.check('reporterr: strategy detail still shows the dropped-buy error',
         detailErrs.some((t) => /unfunded/.test(t)), JSON.stringify(detailErrs));
-      // Item 6 refinement 2 (c): the dropped-buy headline zeros appear
-      // TOGETHER with the error notice (gate open via icDropRep), so
-      // the zeros are explained, not silent — pool-only headline.
-      const dropHead = await page.evaluate(() => {
-        const cards = [...document.querySelectorAll('#planStrategyHeadline .summary-card, #planStrategyHeadline .breakdown-card')];
-        return cards.map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' }));
-      });
-      const dropVal = (k) => (dropHead.find((c) => c.k === k) || {}).v || '';
-      H.check('headline: dropped-buy headline shows pool-only zeros + non-zero Value at horizon alongside the error notice',
-        dropHead.length === 5 && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => dropHead.some((c) => c.k === k))
-          && ['Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((k) => /0\.00/.test(dropVal(k)) && !/[1-9]/.test(dropVal(k).replace(/0\.00/, '')))
-          && /\d/.test(dropVal('Value at horizon')) && !/^\$?0\.00$/.test(dropVal('Value at horizon').trim())
-          && detailErrs.some((t) => /unfunded/.test(t)),
-        JSON.stringify({ dropHead, detailErrs }));
       await page.goto(`http://ff.local/#planning/project/${icProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icDropRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icDropRep);
@@ -5157,6 +5192,21 @@ export async function run(H, S) {
       const repErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => el.textContent));
       H.check('reporterr: report view shows a prominent notice naming the dropped buy + unfunded reason',
         repErrs.some((t) => /Dropped buy/.test(t) && /buy operation \d+/.test(t) && /unfunded/.test(t)), JSON.stringify(repErrs));
+      // Item 6 refinement 2 (c): the dropped-buy headline zeros appear
+      // TOGETHER with the error notice (gate open via icDropRep), so
+      // the zeros are explained, not silent — pool-only headline, now
+      // in the report (the strategy page has no headline).
+      const dropHead = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
+        return cards.map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' }));
+      });
+      const dropVal = (k) => (dropHead.find((c) => c.k === k) || {}).v || '';
+      H.check('headline: dropped-buy headline shows pool-only zeros + non-zero Value at horizon alongside the error notice',
+        dropHead.length === 5 && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => dropHead.some((c) => c.k === k))
+          && ['Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((k) => /0\.00/.test(dropVal(k)) && !/[1-9]/.test(dropVal(k).replace(/0\.00/, '')))
+          && /\d/.test(dropVal('Value at horizon')) && !/^\$?0\.00$/.test(dropVal('Value at horizon').trim())
+          && repErrs.some((t) => /unfunded/.test(t)),
+        JSON.stringify({ dropHead, repErrs }));
       await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
@@ -5166,7 +5216,7 @@ export async function run(H, S) {
         await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
         await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icRep);
       }
-      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
       const cleanErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => el.textContent));
       H.check('reporterr: clean report shows no projection-error notice',
         cleanErrs.length === 0, JSON.stringify(cleanErrs));
@@ -5211,6 +5261,22 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'DiffTable report', definition: { strategies: [dtStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value'] }] }, strategy_ids: [dtStrat], scenario_ids: [] });
   H.check('difftable: pool report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const dtRep = r.data.report.id;
+  // (e/f/g) need MULTI-strategy reports (the merged table renders
+  // only when the report pins multiple strategies): a second 0-op
+  // strategy on the pool project, plus multi-strategy reports for
+  // the mixed and property fixtures.
+  r = await H.req('POST', `/api/planning/projects/${dtProj}/strategies`, { name: 'Zero ops 2' });
+  H.check('difftable: second 0-op strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const dtStrat2 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'DiffTable multi report', definition: { charts: [] }, strategy_ids: [dtStrat, dtStrat2], scenario_ids: [] });
+  const dtRepMulti = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+  H.check('difftable: multi-strategy pool report created', r.status === 201 && dtRepMulti > 0, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Mixed multi report', definition: { charts: [] }, strategy_ids: [icMixStrat, icStrat], scenario_ids: [] });
+  const icMixRepMulti = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+  H.check('difftable: multi-strategy mixed report created', r.status === 201 && icMixRepMulti > 0, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope multi report', definition: { charts: [] }, strategy_ids: [psStrat, psEdge], scenario_ids: [] });
+  const psRepMulti = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+  H.check('difftable: multi-strategy property report created', r.status === 201 && psRepMulti > 0, JSON.stringify(r.data));
   // Entity series for the property regression pin (Fix E strategy).
   r = await H.req('GET', `/api/planning/strategies/${psStrat}`);
   const psEBaseSeries = (((r.data.baseline || {}).mortgage || {}).perProperty || {})[psE]?.baseline?.series || [];
@@ -5262,19 +5328,33 @@ export async function run(H, S) {
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueD, domain: 'ff.local', path: '/', httpOnly: true });
       const waitD = (ms) => new Promise((res2) => setTimeout(res2, ms));
       const ymOfLabel = (label) => { const [mon, y] = (label || '').split(' '); return `${y}-${String(dtMonName.indexOf(mon) + 1).padStart(2, '0')}`; };
-      // (a/b) Pool 0-op strategy page: no mortgage columns, caption
+      const openReport = async (projId, repId) => {
+        const openOnce = async () => {
+          await page.goto(`http://ff.local/#planning/project/${projId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+          await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, repId);
+          await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, repId);
+        };
+        try { await openOnce(); } catch { await openOnce(); }
+        try {
+          await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, repId);
+        } catch {
+          await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, repId);
+          await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, repId);
+        }
+        await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      };
+      // (a/b) Pool 0-op REPORT table: no mortgage columns, caption
       // Value Δ only, table starts at the stock series with Value Δ 0.
-      await page.goto(`http://ff.local/#planning/strategy/${dtStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Zero ops'), { timeout: 15000 });
-      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      // (The table moved from the strategy page into the report.)
+      await openReport(dtProj, dtRep);
       const dtTable = await page.evaluate(() => {
         const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
-        const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+        const headCells = [...document.querySelectorAll('#planReportTableBody thead th')].map((th) => th.textContent.trim());
         const col = (name) => headCells.indexOf(name);
-        const rows = [...document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
         return {
           head: headCells,
-          cap: document.querySelector('#planDiffCaption')?.textContent || '',
+          cap: document.querySelector('#planReportTableCaption')?.textContent || '',
           firstMonth: rows[0] ? rows[0][0] : null,
           firstBaseVal: rows[0] ? parse(rows[0][col('Baseline value')]) : null,
           firstStratVal: rows[0] ? parse(rows[0][col('Strategy value')]) : null,
@@ -5284,37 +5364,26 @@ export async function run(H, S) {
         };
       });
       const dtFirstYearRows = dtStockSeries.filter((pt) => pt.month.slice(0, 4) === dtNowYm.slice(0, 4)).length;
-      H.check('difftable: pool strategy table has no mortgage columns and its caption names Value Δ only',
+      H.check('difftable: pool report table has no mortgage columns and its caption names Value Δ only',
         !dtTable.head.some((h) => ['Baseline balance', 'Strategy balance', 'Balance Δ', 'Baseline interest', 'Strategy interest', 'Interest saved'].includes(h))
           && ['Baseline value', 'Strategy value', 'Value Δ'].every((h) => dtTable.head.includes(h))
           && !dtTable.cap.includes('Balance Δ') && dtTable.cap.includes('Value Δ'),
         JSON.stringify(dtTable));
-      H.check('difftable: pool table starts at the stock series, no leading "—" months, Value Δ is 0 for a 0-op strategy',
+      H.check('difftable: pool report table starts at the stock series, no leading "—" months, Value Δ is 0 for a 0-op strategy',
         dtTable.firstMonth === dtFirstLabel && dtTable.firstBaseVal === 10000 && dtTable.firstStratVal === 10000 && dtTable.firstValDiff === 0 && dtTable.allValDiffZero && dtTable.rows === dtFirstYearRows,
         JSON.stringify({ ...dtTable, expectedFirst: dtFirstLabel, expectedRows: dtFirstYearRows }));
-      // (c) Pool annual view: Value Δ only, no mortgage columns.
-      await page.click('[data-plan-diff-gran="annual"]');
-      await waitD(800);
-      const dtAnnual = await page.evaluate(() => ({
-        head: [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim()),
-        cap: document.querySelector('#planDiffCaption')?.textContent || '',
-      }));
-      H.check('difftable: pool annual table has Value Δ only, no mortgage columns',
-        dtAnnual.head.includes('Value Δ') && !dtAnnual.head.some((h) => ['Baseline balance', 'Strategy balance', 'Equity Δ (peak)', 'Baseline interest', 'Strategy interest', 'Interest saved'].includes(h))
-          && !dtAnnual.cap.includes('Equity Δ') && dtAnnual.cap.includes('Value Δ'),
-        JSON.stringify(dtAnnual));
+      // (c) is gone: the report table is monthly only (no annual
+      // toggle — the merged comparison carries annual summaries).
       // (d) Property regression: mortgage columns stay, and the
       // balance series is the entity property's own (777 PropScope
       // Entity Lane) — no summed jump at the other property's
       // funding month.
-      await page.goto(`http://ff.local/#planning/strategy/${psStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Fix E'), { timeout: 15000 });
-      await page.waitForFunction(() => !!document.querySelector('#planDiffTable table'), { timeout: 15000 });
+      await openReport(psProj, psRep);
       const psTable = await page.evaluate(() => {
         const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
-        const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+        const headCells = [...document.querySelectorAll('#planReportTableBody thead th')].map((th) => th.textContent.trim());
         const col = (name) => headCells.indexOf(name);
-        const rows = [...document.querySelectorAll('#planDiffTable tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
         return { head: headCells, months: rows.map((m) => m[0]), bals: rows.map((m) => parse(m[col('Baseline balance')])) };
       });
       const psApiByMonth = new Map(psEBaseSeries.map((pt) => [pt.month, pt.balance]));
@@ -5324,7 +5393,7 @@ export async function run(H, S) {
       let psMaxJump = 0;
       for (let i = 1; i < psTable.bals.length; i++) psMaxJump = Math.max(psMaxJump, (psTable.bals[i] || 0) - (psTable.bals[i - 1] || 0));
       const psJunBal = psTable.bals[psTable.months.indexOf('Jun 2026')];
-      H.check('difftable: property strategy table keeps mortgage columns and its balance series is entity-only (no cross-property jump)',
+      H.check('difftable: property report table keeps mortgage columns and its balance series is entity-only (no cross-property jump)',
         ['Baseline balance', 'Strategy balance', 'Balance Δ', 'Baseline interest', 'Strategy interest', 'Interest saved'].every((h) => psTable.head.includes(h))
           && psTable.bals.length === psExpectedRows && psTable.months[0] === psFirstLabel && psMaxJump < 5000 && (psJunBal || 0) < 450000
           && psTable.bals.every((v, i) => v != null && Math.abs(v - (psApiByMonth.get(ymOfLabel(psTable.months[i])) || 0)) < 0.01),
@@ -5351,20 +5420,230 @@ export async function run(H, S) {
         await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
         return page.evaluate(() => [...document.querySelectorAll('#planReportMergedTable tbody tr td:first-child')].map((td) => td.textContent.trim()));
       };
-      const dtMerged = await openMerged(dtProj, dtRep);
+      const dtMerged = await openMerged(dtProj, dtRepMulti);
       H.check('difftable: pool report merged table has no mortgage rows',
         !dtMerged.some((l) => l.startsWith('Monthly payment') || l === 'Total interest' || l === 'Payoff')
           && ['Value at horizon', 'Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((l) => dtMerged.includes(l)),
         JSON.stringify(dtMerged));
-      const mixMerged = await openMerged(icProj, icMixRep);
+      const mixMerged = await openMerged(icProj, icMixRepMulti);
       H.check('difftable: pool report with a mortgage-touching strategy keeps the mortgage rows',
         mixMerged.some((l) => l.startsWith('Monthly payment')) && mixMerged.includes('Total interest') && mixMerged.includes('Payoff'),
         JSON.stringify(mixMerged));
-      const propMerged = await openMerged(psProj, psRep);
+      const propMerged = await openMerged(psProj, psRepMulti);
       H.check('difftable: property report merged table keeps the mortgage rows',
         propMerged.some((l) => l.startsWith('Monthly payment')) && propMerged.includes('Total interest') && propMerged.includes('Payoff'),
         JSON.stringify(propMerged));
     } finally { await browserD.close(); }
+  }
+  // ------------------------------------------- engine: penalty variables + report sections + flat horizon
+  // Penalty is a report variable (item 4): one amount input per
+  // pinned strategy, default $0, live cost/net update, saved with
+  // the report, ≥ 0 enforced on Apply. Report sections in order:
+  // headline → chart → table → [strategy对比] → engine explanation.
+  // VALUE AT HORIZON is the flat figure (item 8): $10,000.00 for
+  // the flat $10,000 difftable pool (the grown-vs-flat discrimination
+  // is pinned by the unit tests; this pins the headline wiring).
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('engine browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardE = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (ch) => chunks.push(ch));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResE = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueE = loginResE.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserE = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserE.newPage();
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardE({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueE, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitE = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      const openRepE = async (projId, repId) => {
+        await page.goto(`http://ff.local/#planning/project/${projId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, repId);
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, repId);
+        await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      };
+      const headVals = () => page.evaluate(() => {
+        const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
+        const get = (k) => (cards.find((c) => c.querySelector('.k')?.textContent === k)?.querySelector('.v')?.textContent || '');
+        return { cost: get('Total cost'), net: get('Net benefit'), pen: get('Penalty'), horizon: get('Value at horizon') };
+      });
+      const penVal = (sid) => page.evaluate((s) => {
+        const input = document.querySelector(`[data-plan-report-penalty="${s}"]`);
+        return input ? input.value : null;
+      }, sid);
+      const num = (t) => Number(String(t || '').replace(/[$,\s]/g, ''));
+      // Penalty variable on the payscope report (rate_switch has a
+      // computed penalty estimate, so the default-$0 behavior change
+      // is visible: cost excludes it until typed).
+      await openRepE(psProj, psRep);
+      const pen0 = await penVal(psStrat);
+      H.check('engine: penalty variable defaults to $0 for the pinned strategy',
+        pen0 != null && num(pen0) === 0, JSON.stringify({ pen0 }));
+      const head0 = await headVals();
+      await page.evaluate((sid) => {
+        const input = document.querySelector(`[data-plan-report-penalty="${sid}"]`);
+        input.value = '5000';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }, psStrat);
+      await waitE(500);
+      const head1 = await headVals();
+      H.check('engine: typing a penalty updates Total cost +5000, Net benefit −5000, Penalty card live',
+        Math.abs(num(head1.cost) - num(head0.cost) - 5000) < 0.01 && Math.abs(num(head1.net) - num(head0.net) + 5000) < 0.01 && Math.abs(num(head1.pen) - 5000) < 0.01,
+        JSON.stringify({ head0, head1 }));
+      // Stamp the pre-Apply input and wait for a FRESH input element
+      // showing 5000: the reload replaces #planReport. Waiting on the
+      // value alone resolves immediately on the typed value, before
+      // the Apply's reload lands — and that reload then clobbers a
+      // -100 typed into the old element.
+      await page.evaluate((sid) => {
+        const input = document.querySelector(`[data-plan-report-penalty="${sid}"]`);
+        if (input) input.__preApply = 'old';
+      }, psStrat);
+      await page.evaluate(() => { document.querySelector('#planReportVarsApplyBtn')?.click(); });
+      await page.waitForFunction((sid) => {
+        const input = document.querySelector(`[data-plan-report-penalty="${sid}"]`);
+        return input && !input.__preApply && Number(String(input.value || '').replace(/[$,\s]/g, '')) === 5000;
+      }, { timeout: 15000 }, psStrat);
+      const penSaved = await penVal(psStrat);
+      const headSaved = await headVals();
+      H.check('engine: penalty variable saves with the report (persists across the Apply reload, headline keeps it)',
+        penSaved != null && Math.abs(num(penSaved) - 5000) < 0.01
+          && Math.abs(num(headSaved.cost) - num(head1.cost)) < 0.01 && Math.abs(num(headSaved.net) - num(head1.net)) < 0.01,
+        JSON.stringify({ penSaved, headSaved, head1 }));
+      // A negative penalty is rejected on Apply and the saved $5,000
+      // survives a reload.
+      await page.evaluate((sid) => {
+        const input = document.querySelector(`[data-plan-report-penalty="${sid}"]`);
+        input.value = '-100';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }, psStrat);
+      await page.evaluate(() => { document.querySelector('#planReportVarsApplyBtn')?.click(); });
+      await waitE(800);
+      const negMsg = await page.evaluate(() => document.querySelector('#planReportVarsMsg')?.textContent || '');
+      H.check('engine: negative penalty is rejected on Apply with a ≥ 0 error',
+        negMsg.includes('≥ 0'), JSON.stringify({ negMsg }));
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await openRepE(psProj, psRep);
+      const penAfterNeg = await penVal(psStrat);
+      H.check('engine: failed Apply leaves the saved penalty untouched ($5,000 after reload)',
+        penAfterNeg != null && Math.abs(num(penAfterNeg) - 5000) < 0.01, JSON.stringify({ penAfterNeg }));
+      // Section order on the same (single-strategy) report.
+      const order = await page.evaluate(() => [...document.querySelectorAll('#planReport h3')].map((h) => h.textContent.trim()));
+      H.check('engine: report sections in order headline → chart → table → strategy对比 → engine, engine last',
+        order.indexOf('Headline') > 0 && order.indexOf('Headline') < order.indexOf('Mortgage balance')
+          && order.indexOf('Mortgage balance') < order.indexOf('Difference vs baseline')
+          && order.indexOf('Difference vs baseline') < order.indexOf('Strategy comparison')
+          && order.indexOf('Strategy comparison') < order.indexOf('Engine')
+          && order[order.length - 1] === 'Engine',
+        JSON.stringify(order));
+      const mergedGone = await page.evaluate(() => !document.querySelector('#planReportMergedTable table'));
+      H.check('engine: single-strategy report has no merged table (strategy对比 is multi-strategy only)',
+        mergedGone, JSON.stringify({ mergedGone }));
+      // VALUE AT HORIZON is the flat figure on the difftable pool.
+      await openRepE(dtProj, dtRep);
+      const dtHead = await headVals();
+      H.check('engine: VALUE AT HORIZON is the flat figure ($10,000.00 for the flat $10,000 pool)',
+        dtHead.horizon === '$10,000.00', JSON.stringify(dtHead));
+      // AI engine execution (item 2, AI-engine half): a report whose
+      // definition carries a NON-EMPTY engine must render executed
+      // figures, not preset ones — scalars override the headline,
+      // series override the strategy trajectory in the table. The
+      // difftable 0-op pool has known preset figures (cost $0, net
+      // $0, stock flat $10,000), so +100 / ×1.1 are unambiguous.
+      r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'Engine exec report', definition: { strategies: [dtStrat], engine: { series: { stock_value: 'stock_value * 1.1' }, scalars: { cost: 'cost + 100' } }, charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value'], method: 'Monthly pool balance from the engine projection.' }] }, strategy_ids: [dtStrat], scenario_ids: [] });
+      H.check('engine: AI engine report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const engRep = r.data.report.id;
+      // The page already sits on this project (dtRep's tab open), so a
+      // same-URL goto is a no-op — no reload, no hashchange, stale
+      // list. Force a real reload so the new report card renders.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await openRepE(dtProj, engRep);
+      const engHead = await headVals();
+      H.check('engine: AI engine scalars execute in the report headline (cost preset $0 + 100, net −$100)',
+        Math.abs(num(engHead.cost) - 100) < 0.01 && Math.abs(num(engHead.net) + 100) < 0.01, JSON.stringify(engHead));
+      const engTable = await page.evaluate(() => {
+        const headCells = [...document.querySelectorAll('#planReportTableBody thead th')].map((th) => th.textContent.trim());
+        const col = (name) => headCells.indexOf(name);
+        const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+        const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        return { head: headCells, firstStratVal: rows[0] ? parse(rows[0][col('Strategy value')]) : null, firstValDiff: rows[0] ? parse(rows[0][col('Value Δ')]) : null };
+      });
+      H.check('engine: AI engine series execute in the report table (strategy stock ×1.1 → $11,000, Value Δ $1,000)',
+        engTable.firstStratVal === 11000 && engTable.firstValDiff === 1000, JSON.stringify(engTable));
+      // AI refine flow (item 3, AI path): an AI report (definition
+      // carries an engine object) shows the Refine with AI block;
+      // Send → ai-refine (stubbed) → old→new diff preview → Apply
+      // writes the revised definition and the headline executes it.
+      r = await H.req('POST', `/api/planning/projects/${dtProj}/reports`, { name: 'Refine AI report', definition: { strategies: [dtStrat], engine: {}, charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value'], method: 'Monthly pool balance from the engine projection.' }] }, strategy_ids: [dtStrat], scenario_ids: [] });
+      H.check('engine: AI refine fixture report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const refRep = r.data.report.id;
+      const refinedDef = { engine: { scalars: { cost: 'cost + 100' } }, charts: [
+        { template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value'], method: 'Monthly pool balance from the engine projection.' },
+        { template: 'metric_cards', title: 'Refined headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
+      ] };
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(refinedDef));
+      // Same-URL trap as the engine-exec pin above: the page sits on
+      // this project, so reload before opening the new report.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await openRepE(dtProj, refRep);
+      const refineHere = await page.evaluate(() => !!document.querySelector('#planReportRefineText'));
+      H.check('engine: AI report shows the Refine with AI block', refineHere, JSON.stringify({ refineHere }));
+      await page.evaluate(() => { document.querySelector('#planReportRefineText').value = 'Add a headlines card and charge $100 of cost'; });
+      await page.click('#planReportRefineSendBtn');
+      await page.waitForFunction(() => !!document.querySelector('#planReportRefineApplyBtn'), { timeout: 15000 });
+      const diffText = await page.evaluate(() => document.querySelector('#planReportRefineOut')?.textContent || '');
+      H.check('engine: refine Send shows the old→new diff (+ Chart Refined headlines, + Engine scalars cost)',
+        diffText.includes('+ Chart Refined headlines') && diffText.includes('+ Engine scalars cost'), JSON.stringify({ diffText }));
+      await page.click('#planReportRefineApplyBtn');
+      await page.waitForFunction(() => {
+        const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
+        const c = cards.find((x) => x.querySelector('.k')?.textContent === 'Total cost');
+        return c && c.querySelector('.v')?.textContent === '$100.00';
+      }, { timeout: 15000 });
+      const refHead = await headVals();
+      H.check('engine: refine Apply reloads the report and the headline executes the revised engine (Total cost $100.00)',
+        Math.abs(num(refHead.cost) - 100) < 0.01, JSON.stringify(refHead));
+      r = await H.req('GET', `/api/planning/projects/${dtProj}`);
+      const savedRef = (r.data.reports || []).find((x) => x.id === refRep);
+      let savedDef = {};
+      try { savedDef = typeof savedRef?.definition === 'string' ? JSON.parse(savedRef.definition || '{}') : (savedRef?.definition || {}); } catch { savedDef = {}; }
+      H.check('engine: refined definition persisted (new chart title + engine scalar cost)',
+        (savedDef.charts || []).some((c) => c.title === 'Refined headlines') && savedDef.engine && savedDef.engine.scalars && savedDef.engine.scalars.cost === 'cost + 100', JSON.stringify(savedDef));
+    } finally { await browserE.close(); }
   }
   // ------------------------------------------- item 7 revised: scenario
   // stock factors per holding (baseline card display-only)
@@ -5867,8 +6146,17 @@ export async function run(H, S) {
   H.check('switchfix: merge preview for the override switch inserts a 10y split term',
     r.status === 200 && sfTerm && sfTerm.values && sfTerm.values.start_date === psOpDate && sfTerm.values.amortization_years === 10 && sfTerm.values.payment_override == null,
     JSON.stringify({ status: r.status, term: sfTerm }));
-  // Report view for the single project: same scoped payment.
-  r = await H.req('POST', `/api/planning/projects/${ps1Proj}/reports`, { name: 'PS report', definition: { strategies: [ps1Strat], charts: [{ template: 'time_line', title: 'T', series: ['mortgage_balance'] }] }, strategy_ids: [ps1Strat], scenario_ids: [ps1Scen] });
+  // Report view for the single project: same scoped payment. The
+  // merged table renders only for multi-strategy reports, so the
+  // report pins a second strategy switching the SAME property A
+  // (same paymentScope key → the row label still names A, and
+  // column 0 stays ps1Strat).
+  r = await H.req('POST', `/api/planning/projects/${ps1Proj}/strategies`, { name: 'Fix A2', source: 'template' });
+  H.check('payscope: second strategy created for the merged-table report', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const ps1Strat2 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${ps1Strat2}/ops`, { op_type: 'rate_switch', params: { propertyId: ps1A, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  H.check('payscope: second rate-switch op added', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${ps1Proj}/reports`, { name: 'PS report', definition: { strategies: [ps1Strat, ps1Strat2], charts: [{ template: 'time_line', title: 'T', series: ['mortgage_balance'] }] }, strategy_ids: [ps1Strat, ps1Strat2], scenario_ids: [ps1Scen] });
   H.check('payscope: single report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const ps1Rep = r.data.report.id;
   const ps1Exp = { baseline: psFmt(ps1Scope.baseline), strategy: psFmt(ps1Scope.strategy), delta: psSigned(ps1Scope.delta) };
@@ -5999,7 +6287,12 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${sgPropProjectId}/scenarios`, { name: 'SG world' });
   H.check('stockgain: scenario created for the property project', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
   const sgScenId = r.data.scenario.id;
-  r = await H.req('POST', `/api/planning/projects/${sgPropProjectId}/reports`, { name: 'SG report', definition: { strategies: [sgPropStrategyId], charts: [] }, baseline_id: null, strategy_ids: [sgPropStrategyId], scenario_ids: [sgScenId] });
+  // The merged table renders only for multi-strategy reports — pin
+  // a second 0-op strategy alongside the mixed one.
+  r = await H.req('POST', `/api/planning/projects/${sgPropProjectId}/strategies`, { name: 'SG second', source: 'template' });
+  H.check('stockgain: second strategy created for the merged-table report', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const sgPropStrategy2 = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/projects/${sgPropProjectId}/reports`, { name: 'SG report', definition: { strategies: [sgPropStrategyId, sgPropStrategy2], charts: [] }, baseline_id: null, strategy_ids: [sgPropStrategyId, sgPropStrategy2], scenario_ids: [sgScenId] });
   H.check('stockgain: pin report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const sgRepId = r.data.report.id;
   r = await H.req('GET', `/api/planning/strategies/${sgPropStrategyId}`);
@@ -6074,13 +6367,15 @@ export async function run(H, S) {
       });
       await clientSG.send('Network.setCookie', { name: 'ff_session', value: cookieValueSG, domain: 'ff.local', path: '/', httpOnly: true });
       const waitSG = (ms) => new Promise((res2) => setTimeout(res2, ms));
-      await pageSG.goto(`http://ff.local/#planning/strategy/${sgPropStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitSG(1500);
-      const sgCards = await pageSG.evaluate(() => [...document.querySelectorAll('.breakdown-card')].map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' })));
-      const sgCard = sgCards.find((c) => c.k === 'Stock gain');
-      H.check('stockgain: strategy detail shows Stock gain as its own card', !!sgCard && sgCard.v !== '—' && sgCard.v !== '', JSON.stringify(sgCards));
+      // ENGINE round: the headline lives in the report, not on the
+      // strategy page. Open the report and read both the Stock gain
+      // headline card and the merged table's Stock gain row.
       await pageSG.goto(`http://ff.local/#planning/report/${sgPropProjectId}/${sgRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitSG(2500);
+      await pageSG.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      await pageSG.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      const sgCards = await pageSG.evaluate(() => [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')].map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' })));
+      const sgCard = sgCards.find((c) => c.k === 'Stock gain');
+      H.check('stockgain: report headline shows Stock gain as its own card', !!sgCard && sgCard.v !== '—' && sgCard.v !== '', JSON.stringify(sgCards));
       const sgRepMerged = await pageSG.evaluate(() => document.querySelector('#planReportMergedTable')?.textContent || '');
       H.check('stockgain: report merged table shows a Stock gain row', sgRepMerged.includes('Stock gain'),
         JSON.stringify(sgRepMerged.slice(0, 200)));
@@ -6150,8 +6445,13 @@ export async function run(H, S) {
   const repPinRow2 = (r.data.reports || []).find((x) => x.id === repPinId);
   H.check('report: re-pinned scenario ids stored',
     !!repPinRow2 && JSON.stringify(repPinRow2.scenarioIds) === JSON.stringify([repScen2Id]), JSON.stringify(repPinRow2 && repPinRow2.scenarioIds));
-  const repMethodDef = { strategies: [repStrategyId], charts: [{ template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs strategy.' }] };
-  r = await H.req('POST', `/api/planning/projects/${repProjectId}/reports`, { name: 'Method report', definition: repMethodDef, strategy_ids: [repStrategyId], scenario_ids: [repScenId] });
+  // The merged table renders only for multi-strategy reports — pin
+  // a second 0-op strategy alongside the prepay one.
+  r = await H.req('POST', `/api/planning/projects/${repProjectId}/strategies`, { name: 'Method second', source: 'template' });
+  H.check('report: second strategy created for the method report', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const repStrategy2Id = r.data.strategy.id;
+  const repMethodDef = { strategies: [repStrategyId, repStrategy2Id], charts: [{ template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs strategy.' }] };
+  r = await H.req('POST', `/api/planning/projects/${repProjectId}/reports`, { name: 'Method report', definition: repMethodDef, strategy_ids: [repStrategyId, repStrategy2Id], scenario_ids: [repScenId] });
   H.check('report: method-carrying report saves', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const repMethodId = r.data.report.id;
   if (!H.puppeteer || !H.chromeAvailable) {
@@ -6224,7 +6524,8 @@ export async function run(H, S) {
       await waitP(400);
       // Pinned report view: world label + method line + comparison component.
       await page.goto(`http://ff.local/#planning/report/${repProjectId}/${repMethodId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitP(2500);
+      try { await page.waitForSelector('#planReportTrajectoryChart', { timeout: 15000 }); } catch { /* fall through: the check below FAILs with the diagnostic */ }
+      await waitP(300);
       const view = await page.evaluate(() => {
         const el = document.querySelector('#planReport');
         const t = el ? el.textContent : '';
@@ -6263,14 +6564,18 @@ export async function run(H, S) {
       });
       H.check('report: re-pinned view renders under the new scenario',
         repinned.world2 && repinned.traj, JSON.stringify(repinned));
-      // Strategy detail Reports tier: current strategy × pinned scenarios.
+      // Strategy detail Reports tier: no scenario display (item 7
+      // removed the "Scenarios (pinned)" line) — the panel and both
+      // Generate buttons are present, the pinned world is not shown.
       await page.goto(`http://ff.local/#planning/strategy/${repStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitP(1500);
       const detailPanel = await page.evaluate(() => ({
         panel: !!document.querySelector('#planStrategyReportsPanel'),
-        scen: (document.querySelector('#planStrategyReportScenarios')?.textContent || '').includes('Report world 2'),
+        gen: !!document.querySelector('#planStrategyGenerateBtn'),
+        ai: !!document.querySelector('#planStrategyAiReportBtn'),
+        scenDisplay: !!document.querySelector('#planStrategyReportScenarios'),
       }));
-      H.check('report: strategy detail has a Reports tier with the pinned scenarios', detailPanel.panel && detailPanel.scen, JSON.stringify(detailPanel));
+      H.check('report: strategy detail Reports tier has no scenario display (panel + both Generate buttons present)', detailPanel.panel && detailPanel.gen && detailPanel.ai && !detailPanel.scenDisplay, JSON.stringify(detailPanel));
       await page.click('#planStrategyGenerateBtn');
       await waitP(2500);
       const detailReport = await page.evaluate(() => ({
@@ -6483,14 +6788,16 @@ export async function run(H, S) {
       const buyOp3 = (r.data.ops || []).find((o) => o.id === rdBuyOpId);
       H.check('redesign: leg Delete leaves the surviving leg only',
         (buyOp3.legs || []).length === 1 && buyOp3.legs[0].source_ref === 'cash', JSON.stringify(buyOp3.legs));
-      // The newer panels survive the redesign, in place.
+      // The newer panels survive the redesign, in place — the
+      // Difference panel is gone from the strategy page (items 6/10
+      // moved it into the report); Operations is the first section.
       const panels = await page.evaluate(() => ({
         diff: !!document.querySelector('#planDiffPanel'),
         report: !!document.querySelector('#planStrategyReportsPanel'),
-        opsFirst: (() => { const heads = [...document.querySelectorAll('#planStrategy .panel .section-head h3')].map((h) => h.textContent.trim()); return heads.indexOf('Operations') < heads.indexOf('Difference vs baseline'); })(),
+        opsFirst: (() => { const heads = [...document.querySelectorAll('#planStrategy .panel .section-head h3')].map((h) => h.textContent.trim()); return heads.indexOf('Operations') > 0 && heads.indexOf('Operations') < heads.indexOf('Reports'); })(),
       }));
-      H.check('redesign: diff + report panels still render, Operations sits before the diff section',
-        panels.diff && panels.report && panels.opsFirst, JSON.stringify(panels));
+      H.check('redesign: no Difference panel on the strategy page, Reports tier present, Operations first',
+        !panels.diff && panels.report && panels.opsFirst, JSON.stringify(panels));
       // Header Delete removes an unmerged strategy.
       r = await H.req('POST', `/api/planning/projects/${rdProjectId}/strategies`, { name: 'Delete me', source: 'template' });
       const rdDelId = r.data.strategy.id;
@@ -6525,13 +6832,15 @@ export async function run(H, S) {
       r = await H.req('GET', `/api/planning/strategies/${rdMergeId}`);
       H.check('redesign: header Delete on a merged strategy is refused and the strategy stays',
         /merged/i.test(mergedDel.msg) && mergedDel.stillThere && r.status === 200, JSON.stringify({ msg: mergedDel.msg, status: r.status }));
-      // AI spec detach: stub a spec, attach it, Delete drops the panel.
+      // No-model (item 1): the spec stays attachable server-side
+      // (backend dormant), but the strategy page shows NO Model panel
+      // and no detach/follow buttons.
       const rdAiDef = { bindings: [{ name: 'balance', entity: 'property', field: 'mortgage_balance' }], formulas: [{ output: 'monthly interest', expression: 'prior balance * monthly rate / 12' }], assumptions: [{ key: 'stockReturnPct', value: 5, source: 'user' }], outputs: [{ id: 'monthly_interest', label: 'Monthly interest' }], charts: [{ template: 'time_line', title: 'Interest path', series: ['monthly_interest'] }] };
       fs.writeFileSync(H.aiStubFile, JSON.stringify(rdAiDef));
       r = await H.req('POST', `/api/planning/projects/${rdProjectId}/strategies`, { name: 'AI strat', source: 'template' });
       const rdAiId = r.data.strategy.id;
       r = await H.req('POST', `/api/planning/strategies/${rdAiId}/ai-model`, { text: 'Model interest', name: 'Interest model' });
-      H.check('redesign: ai-model spec saved for detach pin', r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
+      H.check('redesign: ai-model spec saved for no-model pin', r.status === 201 && r.data.model && r.data.model.id > 0, JSON.stringify(r.data));
       r = await H.req('PUT', `/api/planning/strategies/${rdAiId}`, { model_id: r.data.model.id });
       H.check('redesign: model attached to strategy', r.status === 200, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/strategy/${rdAiId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -6541,13 +6850,15 @@ export async function run(H, S) {
         detach: !!document.querySelector('#planModelDetachBtn'),
         follow: !!document.querySelector('#planModelFollowBtn'),
       }));
-      H.check('redesign: attached AI spec renders with follow-up Edit + Delete (detach)',
-        modelBefore.panel && modelBefore.detach && modelBefore.follow, JSON.stringify(modelBefore));
-      await page.click('#planModelDetachBtn');
-      await waitR(1200);
+      H.check('redesign: attached AI spec shows NO Model panel, no detach/follow buttons',
+        !modelBefore.panel && !modelBefore.detach && !modelBefore.follow, JSON.stringify(modelBefore));
+      // Detach via API (no panel button exists): the model row stays,
+      // the strategy's model link clears.
+      r = await H.req('PUT', `/api/planning/strategies/${rdAiId}`, { model_id: null });
+      H.check('redesign: detach via API clears the model link', r.status === 200, JSON.stringify(r.data));
       const modelAfter = await page.evaluate(() => [...document.querySelectorAll('#planStrategy .panel .section-head h3')].some((h) => h.textContent.trim() === 'Model'));
       r = await H.req('GET', `/api/planning/strategies/${rdAiId}`);
-      H.check('redesign: spec Delete detaches the model and the panel leaves',
+      H.check('redesign: after detach the strategy has no model and still no Model panel',
         !modelAfter && r.data.model === null, JSON.stringify({ panelLeft: modelAfter, model: r.data.model }));
       // Sink Edit + Delete on a minimal pool project.
       r = await H.req('POST', '/api/investments/accounts', { name: 'Redesign Pool Acct', type: 'NonRegistered' });
@@ -6586,28 +6897,29 @@ export async function run(H, S) {
       r = await H.req('GET', `/api/planning/strategies/${rdPoolStrat.id}`);
       H.check('redesign: sink Delete clears to the pick state and drops the sink ops',
         sinkCleared && r.data.sink === null && !(r.data.ops || []).some((o) => o.source === 'sink'), JSON.stringify({ cleared: sinkCleared, sink: r.data.sink, ops: (r.data.ops || []).map((o) => o.source) }));
-      // Model thread display starts collapsed behind its toggle (the
-      // modal model form now opens via saved-template Refine with AI;
-      // the old Add → AI → Model path is gone with the fallback).
+      // Model thread display is gone with the Model concept (item 1):
+      // the saved-template form offers Apply only — no Refine-with-AI
+      // button, no model thread toggle. (The old Add → AI → Model
+      // path is gone with the fallback.)
       r = await H.req('POST', '/api/planning/templates', { name: 'Redesign thread template', spec: { bindings: [], formulas: [], assumptions: [], outputs: [], charts: [] }, metadata_schema: [], metadata_answers: {} });
       H.check('redesign: thread template created', r.status === 201, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/project/${rdProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitR(1200);
-      await page.click('#planAddStrategyBtn');
-      await waitR(800);
-      await page.click('#planChooseSaved');
-      await waitR(800);
-      await page.click('#planSavedTemplateRefine');
-      await waitR(800);
+      await page.waitForSelector('#planAddStrategyBtn', { timeout: 15000 });
+      // Synthetic click: a coordinate click can land on a covering
+      // overlay (sticky tab bar / outline nav) and never reach the
+      // button — the modal then never opens and the card never
+      // appears. The pin asserts the saved form, not the click.
+      await page.evaluate(() => { document.querySelector('#planAddStrategyBtn').click(); });
+      await page.waitForSelector('#planChooseSaved', { timeout: 15000 });
+      await page.evaluate(() => { document.querySelector('#planChooseSaved').click(); });
+      await page.waitForSelector('#planSavedTemplateSel', { timeout: 15000 });
       const thread = await page.evaluate(() => ({
+        refine: !!document.querySelector('#planSavedTemplateRefine'),
         toggle: !!document.querySelector('#planStrategyModelThreadToggle'),
-        hidden: !!document.querySelector('#planStrategyModelThread.hidden'),
+        apply: !!document.querySelector('#planSavedTemplateApply'),
       }));
-      H.check('redesign: model thread starts collapsed behind a toggle', thread.toggle && thread.hidden, JSON.stringify(thread));
-      await page.click('#planStrategyModelThreadToggle');
-      await waitR(400);
-      const threadShown = await page.evaluate(() => !document.querySelector('#planStrategyModelThread.hidden'));
-      H.check('redesign: thread toggle reveals the thread', threadShown);
+      H.check('redesign: saved-template form offers Apply only, no Refine button, no model thread toggle',
+        thread.refine === false && thread.toggle === false && thread.apply === true, JSON.stringify(thread));
     } finally { await browserR.close(); }
   }
   // ------------------------------------------- strategy-detail clarity
@@ -6727,71 +7039,69 @@ export async function run(H, S) {
       page.on('dialog', (d) => d.accept());
       await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
+      // Engine round (items 1/4/6/10): charts, headline, Difference
+      // table, Penalties/Assumptions and Model panels no longer
+      // render on the strategy page — they live in the report (or
+      // are deleted). The strategy page keeps tiers + Operations +
+      // Reports only; this block asserts that shape, and the API
+      // still returns the dormant assumption data.
       const order = await page.evaluate(() => {
         const heads = [...document.querySelectorAll('#planStrategy .panel h3')].map((h) => h.textContent.trim());
         const idx = (h) => heads.indexOf(h);
-        const chartLabels = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
         return {
           heads,
-          // Item B tier structure: Scenarios tier, then the
-          // Baseline+Operations row, then the analysis panels.
-          // 'Assumptions' may appear ONLY inside the Model panel
-          // (its spec sections) — never as a standalone panel.
           tiersFirst: idx('Scenarios') === 1 && idx('Baseline') === 2 && idx('Operations') === 3,
-          asmTop: idx('Assumptions') === -1 || idx('Assumptions') > idx('Model'),
-          reportAfterDiff: idx('Reports') === idx('Difference vs baseline') + 2,
-          penAfterReport: idx('Penalties') === idx('Reports') + 1,
-          modelLast: idx('Model') === heads.length - 1 || idx('Model') > idx('Penalties'),
-          mortCap: !!document.querySelector('#planStrategyMortChart')?.closest('.panel')?.textContent.includes('X: month'),
-          stockCap: !!document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent.includes('X: month'),
-          stockPanel: !!document.querySelector('#planStrategyStockChart'),
-          diffCap: (document.querySelector('#planDiffCaption')?.textContent || '').includes('X: month'),
+          reportsLast: idx('Reports') === heads.length - 1,
+          noRemovedPanels: !heads.includes('Difference vs baseline') && !heads.includes('Penalties') && !heads.includes('Model') && !heads.includes('Assumptions') && !heads.includes('Describe in words'),
+          mortChart: !!document.querySelector('#planStrategyMortChart'),
+          stockChart: !!document.querySelector('#planStrategyStockChart'),
+          diffPanel: !!document.querySelector('#planDiffPanel'),
           diffBreak: !!document.querySelector('#planDiffBreakdownChart'),
-          diffBreakLabels: chartLabels('planDiffBreakdownChart'),
-          diffBreakCap: (document.querySelector('#planDiffBreakdownCaption')?.textContent || '').includes('X: month'),
+          penPanel: !!document.querySelector('#planStrategyPenPanel'),
           asmDel: [...document.querySelectorAll('[data-plan-asm-del]')].map((b) => b.dataset.planAsmDel),
-          privVal: document.querySelector('#planAsmPrivilege')?.value || '',
-          privChecked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
+          asmComparable: !!document.querySelector('#planAsmComparable'),
+          asmPrivilege: !!document.querySelector('#planAsmPrivilege'),
+          asmSave: !!document.querySelector('#planAsmSaveBtn'),
         };
       });
-      H.check('detail-clarity: panel order — Scenarios tier, Baseline+Operations row, no standalone Assumptions, Reports + Penalties above Model, no Describe panel',
-        order.tiersFirst && order.asmTop && order.reportAfterDiff && order.penAfterReport && order.modelLast && !order.heads.includes('Describe in words'), JSON.stringify(order.heads));
-      H.check('detail-clarity: detail charts + diff carry axis captions and a breakdown chart',
-        order.mortCap && order.diffCap && order.diffBreak && order.diffBreakLabels > 12 && order.diffBreakCap, JSON.stringify(order));
+      H.check('detail-clarity: panel order — Scenarios tier, Baseline+Operations row, Reports last, no removed panels',
+        order.tiersFirst && order.reportsLast && order.noRemovedPanels, JSON.stringify(order.heads));
+      H.check('detail-clarity: no charts, no Difference panel, no breakdown chart on the strategy page',
+        !order.mortChart && !order.stockChart && !order.diffPanel && !order.diffBreak, JSON.stringify(order));
       // DC strat is mortgage-only (prepay + rate switch, no stock
       // op, no sink) — the Stock value chart must be hidden.
       H.check('cleanup: mortgage-only strategy hides the Stock value chart',
-        !order.stockPanel && !order.stockCap, JSON.stringify(order));
-      H.check('detail-clarity: assumptions panel has per-assumption Delete, privilege preset from API',
-        order.asmDel.includes('comparableRate') && order.asmDel.includes('privilegePct') && order.privVal.replace(/,/g, '') === '10' && order.privChecked, JSON.stringify(order));
-      await page.click('[data-plan-asm-del="privilegePct"]');
-      await waitD(1500);
-      const afterDel = await page.evaluate(() => ({
-        val: document.querySelector('#planAsmPrivilege')?.value || '',
-        checked: !!document.querySelector('#planAsmPrivilegeOk')?.checked,
-        note: document.querySelector('#planStrategyPenPanel')?.textContent.includes('Blank privilege % = penalty on the full amount (upper bound)') || false,
-      }));
-      H.check('detail-clarity: assumption Delete resets to unset, upper-bound note still true',
-        afterDel.val === '' && !afterDel.checked && afterDel.note, JSON.stringify(afterDel));
+        !order.stockChart, JSON.stringify(order));
+      H.check('detail-clarity: no assumptions UI on the strategy page (no Delete buttons, no inputs, no Penalties panel)',
+        order.asmDel.length === 0 && !order.asmComparable && !order.asmPrivilege && !order.asmSave && !order.penPanel, JSON.stringify(order));
+      r = await H.req('GET', `/api/planning/strategies/${dcStrategyId}`);
+      const privAsmBefore = (r.data.assumptions || []).find((a) => a.key === 'privilegePct');
+      H.check('detail-clarity: dormant privilege assumption still in the API (value 10, confirmed)',
+        r.status === 200 && privAsmBefore && Number(privAsmBefore.value) === 10 && Number(privAsmBefore.confirmed) === 1, JSON.stringify(privAsmBefore));
+      // The UI Delete is gone with the Penalties panel; the same
+      // reset is done via the API (PUT null + unconfirmed).
+      r = await H.req('PUT', `/api/planning/strategies/${dcStrategyId}/assumptions`, { key: 'privilegePct', value: null, confirmed: false });
+      H.check('detail-clarity: assumption reset via API accepted', r.status === 200, JSON.stringify(r.data));
       r = await H.req('GET', `/api/planning/strategies/${dcStrategyId}`);
       const privAsm = (r.data.assumptions || []).find((a) => a.key === 'privilegePct');
       H.check('detail-clarity: deleted assumption is NULL + unconfirmed in the API',
         r.status === 200 && privAsm && privAsm.value == null && !privAsm.confirmed, JSON.stringify(privAsm));
-      // Diff year pager: each page holds one year's months + its
-      // annual-sum row (same arithmetic as the old grouped table —
-      // flows summed, balances year-end), verified page by page.
-      await page.click('[data-plan-diff-gran="monthly"]');
-      await waitD(800);
-      const pagerYears = await page.evaluate(() => [...document.querySelectorAll('#planDiffYearPager [data-plan-diff-year]')].map((b) => b.dataset.planDiffYear));
+      // Diff year pager (in the report now, item 10): each page
+      // holds one year's months + its annual-sum row (same
+      // arithmetic as the old grouped table — flows summed, balances
+      // year-end), verified page by page.
+      await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('#planReportTableBody table', { timeout: 15000 });
+      const pagerYears = await page.evaluate(() => [...document.querySelectorAll('#planReportTablePager [data-plan-report-table-year]')].map((b) => b.dataset.planReportTableYear));
       const grouped = [];
       for (const y of pagerYears) {
-        await page.click(`#planDiffYearPager [data-plan-diff-year="${y}"]`);
+        await page.evaluate((yy) => { document.querySelector(`#planReportTablePager [data-plan-report-table-year="${yy}"]`).click(); }, y);
         await waitD(300);
         grouped.push(await page.evaluate(() => {
           const parse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
-          const headCells = [...document.querySelectorAll('#planDiffTable thead th')].map((th) => th.textContent.trim());
+          const headCells = [...document.querySelectorAll('#planReportTableBody table thead th')].map((th) => th.textContent.trim());
           const col = (name) => headCells.indexOf(name);
-          const rows = [...document.querySelectorAll('#planDiffTable tbody tr')];
+          const rows = [...document.querySelectorAll('#planReportTableBody table tbody tr')];
           let cur = null;
           for (const tr of rows) {
             if (tr.classList.contains('plan-year-head')) { cur = { year: tr.textContent.trim(), months: [], total: null }; }
@@ -6826,54 +7136,62 @@ export async function run(H, S) {
       const scStrategyId = r.data.strategy.id;
       r = await H.req('POST', `/api/planning/strategies/${scStrategyId}/ops`, { op_type: 'buy', params: { accountId: planAcctId, holdingId: planHoldingId, date: planOpDate, units: 10, price: 60 }, legs: [{ source_ref: 'cash', amount: 600 }] });
       H.check('cleanup: stock-chart pin buy op posted', r.status === 201, JSON.stringify(r.data));
-      // Item 6 revised gating: the Stock value panel renders only
-      // after Generate, so this fixture needs a report pinning the
-      // strategy before its page is visited.
+      // Item 6 (engine round): the Stock value chart lives in the
+      // report now, never on the strategy page. The fixture report
+      // pins the strategy; open it and check the pool chart there.
       r = await H.req('POST', `/api/planning/projects/${scProjectId}/reports`, { name: 'Cleanup stock report', definition: { strategies: [scStrategyId], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [scStrategyId], scenario_ids: [] });
       H.check('cleanup: stock-chart pin report created (opens its Generate gate)', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
-      await page.goto(`http://ff.local/#planning/strategy/${scStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(1500);
+      const scRepId = r.data.report.id;
+      await page.goto(`http://ff.local/#planning/report/${scProjectId}/${scRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      // Title-specific wait: a bare #planReportTrajectoryChart wait
+      // resolves on the PREVIOUS report's stale chart before this
+      // report loads.
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'Pool trajectory'), { timeout: 15000 });
       const buyStock = await page.evaluate(() => ({
-        panel: !!document.querySelector('#planStrategyStockChart'),
-        cap: !!document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent.includes('X: month'),
+        poolChart: [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'Pool trajectory'),
+        cap: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
+        noStrategyChart: !document.querySelector('#planStrategyStockChart'),
       }));
-      H.check('cleanup: stock-op strategy shows the Stock value chart',
-        buyStock.panel && buyStock.cap, JSON.stringify(buyStock));
-      // Assumptions follow THAT strategy: stock strategies show the
-      // picked scenario's stock return (read-only, in the Stock value
-      // panel) and hide the mortgage pair; mortgage strategies keep
-      // the pair (in the Penalties panel) and hide the return; mixed
-      // shows both; empty shows neither (no section, no note).
+      H.check('cleanup: stock-op strategy shows the pool chart in its report, none on the strategy page',
+        buyStock.poolChart && buyStock.cap && buyStock.noStrategyChart, JSON.stringify(buyStock));
+      // Assumptions follow THAT strategy — in the engine round the
+      // mortgage pair (Penalties panel) is deleted and the stock
+      // return shows in the scenario summary / baseline card, never
+      // as inputs on the strategy page.
       // (a) Stock-only, flat world (Cleanup Buy Strat's project has
-      // no scenarios): no mortgage inputs, no Save, historical note.
+      // no scenarios): no mortgage inputs, no Save, no Penalties
+      // panel, flat-world card in the Scenarios tier.
       await page.goto(`http://ff.local/#planning/strategy/${scStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmStock = await page.evaluate(() => {
-        const t = document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '';
+        const tier = document.querySelector('#planStrategyScenarioTier')?.textContent || '';
         return {
           comparable: !!document.querySelector('#planAsmComparable'),
           privilege: !!document.querySelector('#planAsmPrivilege'),
           save: !!document.querySelector('#planAsmSaveBtn'),
-          stockLabel: t.includes('Stock return'),
-          flatNote: t.includes('Current rates (no scenario)') && t.includes('own historical rates'),
+          penPanel: !!document.querySelector('#planStrategyPenPanel'),
+          stockChart: !!document.querySelector('#planStrategyStockChart'),
+          flatCard: tier.includes('Flat world — current rates'),
         };
       });
-      H.check('asmfollow: stock strategy shows stock return, hides mortgage pair (flat world)',
-        !asmStock.comparable && !asmStock.privilege && !asmStock.save && asmStock.stockLabel && asmStock.flatNote, JSON.stringify(asmStock));
-      // (b) Mortgage-only (DC strat) keeps the pair, hides the return.
+      H.check('asmfollow: stock strategy shows no mortgage inputs, flat-world card (flat world)',
+        !asmStock.comparable && !asmStock.privilege && !asmStock.save && !asmStock.penPanel && !asmStock.stockChart && asmStock.flatCard, JSON.stringify(asmStock));
+      // (b) Mortgage-only (DC strat): no mortgage inputs either —
+      // the pair is gone — and no stock-return text anywhere.
       await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmMort = await page.evaluate(() => {
-        const t = document.querySelector('#planStrategyPenPanel')?.textContent || '';
+        const t = document.querySelector('#planStrategy')?.textContent || '';
         return {
           comparable: !!document.querySelector('#planAsmComparable'),
           privilege: !!document.querySelector('#planAsmPrivilege'),
           save: !!document.querySelector('#planAsmSaveBtn'),
-          stockLabel: t.includes('Stock return'),
+          penPanel: !!document.querySelector('#planStrategyPenPanel'),
+          stockReturn: /Stock \d+(\.\d+)?%\/yr/.test(t),
         };
       });
-      H.check('asmfollow: mortgage strategy keeps the pair, hides stock return',
-        asmMort.comparable && asmMort.privilege && asmMort.save && !asmMort.stockLabel, JSON.stringify(asmMort));
+      H.check('asmfollow: mortgage strategy shows no mortgage inputs and no stock return',
+        !asmMort.comparable && !asmMort.privilege && !asmMort.save && !asmMort.penPanel && !asmMort.stockReturn, JSON.stringify(asmMort));
       // (c) Picked-scenario switch changes the displayed return.
       r = await H.req('POST', '/api/planning/projects', { name: 'Asm Follow', question: 'q' });
       H.check('asmfollow: pin project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
@@ -6891,9 +7209,9 @@ export async function run(H, S) {
       r = await H.req('POST', `/api/planning/projects/${afProjectId}/scenarios`, { name: 'Asm Plain World' });
       H.check('asmfollow: pin plain scenario created', r.status === 201 && r.data.scenario && r.data.scenario.id > 0, JSON.stringify(r.data));
       const afScenPlainId = r.data.scenario.id;
-      // Item 6 revised gating: the Stock value panel (which carries
-      // the return note these pins read) renders only after
-      // Generate, so open the gate with a pinning report first.
+      // (c) Picked-scenario switch changes the displayed return:
+      // the return now reads from the scenario card summary in the
+      // Scenarios tier (the Stock value panel is gone).
       r = await H.req('POST', `/api/planning/projects/${afProjectId}/reports`, { name: 'Asm Gate', definition: { strategies: [afBuyId], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [afBuyId], scenario_ids: [afScenStockId] });
       H.check('asmfollow: gate report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
       await page.goto(`http://ff.local/#planning/strategy/${afBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -6901,16 +7219,16 @@ export async function run(H, S) {
       await page.click(`[data-plan-strategy-scenario-select="${afScenStockId}"]`);
       await waitD(1500);
       const asmPicked = await page.evaluate(() => ({
-        text: document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '',
+        text: document.querySelector('#planStrategyScenarioCards .plan-selected')?.textContent || '',
         comparable: !!document.querySelector('#planAsmComparable'),
       }));
       H.check('asmfollow: picked scenario stock factor shows with source',
-        asmPicked.text.includes('7%/yr') && asmPicked.text.includes('From scenario Asm Stock World') && asmPicked.text.includes('Price CAGR') && !asmPicked.comparable, JSON.stringify(asmPicked));
+        asmPicked.text.includes('Stock 7%/yr') && asmPicked.text.includes('Price CAGR') && asmPicked.text.includes('Asm Stock World') && !asmPicked.comparable, JSON.stringify(asmPicked));
       await page.click(`[data-plan-strategy-scenario-select="${afScenPlainId}"]`);
       await waitD(1500);
-      const asmPlain = await page.evaluate(() => document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '');
-      H.check('asmfollow: switching to a scenario without a stock factor shows the historical-rates note',
-        asmPlain.includes('sets no stock return') && asmPlain.includes('own historical rates') && !asmPlain.includes('From scenario'), JSON.stringify(asmPlain));
+      const asmPlain = await page.evaluate(() => document.querySelector('#planStrategyScenarioCards .plan-selected')?.textContent || '');
+      H.check('asmfollow: switching to a scenario without a stock factor shows the flat-world card',
+        asmPlain.includes('Flat world — current rates') && !asmPlain.includes('Stock 7%/yr'), JSON.stringify(asmPlain));
       // (d) Mixed (buy + prepay) shows both sections.
       r = await H.req('POST', '/api/properties', {
         address: '88 Asm Follow Lane, Victoria, BC',
@@ -6928,17 +7246,26 @@ export async function run(H, S) {
       H.check('asmfollow: pin mixed buy op posted', r.status === 201, JSON.stringify(r.data));
       r = await H.req('POST', `/api/planning/strategies/${afMixedId}/ops`, { op_type: 'prepay', params: { propertyId: afPropId, date: planOpDate, amount: 10000, openClosed: 'open' } });
       H.check('asmfollow: pin mixed prepay op posted', r.status === 201, JSON.stringify(r.data));
+      // (d) Mixed (buy + prepay): no mortgage inputs on the page
+      // (the pair is gone) and the stock leg shows in the report —
+      // open the mixed gate report and check its pool chart.
       r = await H.req('POST', `/api/planning/projects/${afProjectId}/reports`, { name: 'Asm Mixed Gate', definition: { strategies: [afMixedId], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [afMixedId], scenario_ids: [afScenStockId] });
       H.check('asmfollow: mixed gate report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+      const afMixedRepId = r.data.report.id;
       await page.goto(`http://ff.local/#planning/strategy/${afMixedId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitD(1500);
       const asmMixed = await page.evaluate(() => ({
-        text: document.querySelector('#planStrategyStockChart')?.closest('.panel')?.textContent || '',
         comparable: !!document.querySelector('#planAsmComparable'),
         save: !!document.querySelector('#planAsmSaveBtn'),
+        penPanel: !!document.querySelector('#planStrategyPenPanel'),
       }));
-      H.check('asmfollow: mixed strategy shows both sections',
-        asmMixed.comparable && asmMixed.save && asmMixed.text.includes('Stock return'), JSON.stringify(asmMixed));
+      H.check('asmfollow: mixed strategy shows no mortgage inputs on the page',
+        !asmMixed.comparable && !asmMixed.save && !asmMixed.penPanel, JSON.stringify(asmMixed));
+      await page.goto(`http://ff.local/#planning/report/${afProjectId}/${afMixedRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'Pool trajectory'), { timeout: 15000 });
+      const asmMixedRep = await page.evaluate(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'Pool trajectory'));
+      H.check('asmfollow: mixed strategy report carries the pool chart',
+        asmMixedRep, JSON.stringify({ poolChart: asmMixedRep }));
       // (e) Empty strategy (no ops) shows no assumptions UI at all:
       // no inputs, no Save, no Penalties panel, no Stock panel, and
       // no standalone Assumptions section (the old neutral note is
@@ -6961,32 +7288,25 @@ export async function run(H, S) {
       });
       H.check('asmfollow: empty strategy shows no assumptions UI at all',
         !asmEmpty.comparable && !asmEmpty.save && !asmEmpty.penPanel && !asmEmpty.stockPanel && !asmEmpty.asmHead && !asmEmpty.stockReturn, JSON.stringify(asmEmpty));
-      // Saving from the new location (Penalties panel) still writes:
-      // set a comparable rate + Confirmed on the DC mortgage strategy
-      // and read it back from the strategy GET.
-      await page.goto(`http://ff.local/#planning/strategy/${dcStrategyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(1500);
-      const saveHere = await page.evaluate(() => !!document.querySelector('#planStrategyPenPanel #planAsmSaveBtn'));
-      H.check('asmfold: Save assumptions button renders inside the Penalties panel', saveHere, JSON.stringify({ saveHere }));
-      await page.evaluate(() => {
-        const inp = document.querySelector('#planAsmComparable');
-        inp.focus(); inp.select(); document.execCommand('insertText', false, '4.2');
-        document.querySelector('#planAsmComparableOk').click();
-      });
-      await page.click('#planAsmSaveBtn');
-      await waitD(1500);
+      // The Penalties panel (and its Save button) is gone with the
+      // engine round — assumptions still write via the API: set a
+      // comparable rate + Confirmed on the DC mortgage strategy and
+      // read it back from the strategy GET.
+      r = await H.req('PUT', `/api/planning/strategies/${dcStrategyId}/assumptions`, { key: 'comparableRate', value: 4.2, confirmed: true });
+      H.check('asmfold: comparable-rate assumption saved via API', r.status === 200, JSON.stringify(r.data));
       r = await H.req('GET', `/api/planning/strategies/${dcStrategyId}`);
       const savedAsm = (r.data.assumptions || []).find((a) => a.key === 'comparableRate') || {};
-      H.check('asmfold: saving from the Penalties panel writes a confirmed comparable rate',
+      H.check('asmfold: API save writes a confirmed comparable rate',
         Number(savedAsm.value) === 4.2 && Number(savedAsm.confirmed) === 1, JSON.stringify(savedAsm));
-      // Leave the picker on flat world so no cross-project scenario id
-      // leaks into later strategy visits in this browser session.
-      await page.click('[data-plan-strategy-scenario-select="0"]');
-      await waitD(1000);
+      // (Picker reset no longer needed: browserD closes at the end
+      // of this section, and the assumption save above is API-only.)
       // Report views: template path + AI path both carry titles +
       // axis captions (AI path keeps its method line).
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(2500);
+      // Title-specific wait (see cleanup pin): a bare chart wait
+      // resolves on the previous report's stale canvas.
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'DC balance path'), { timeout: 15000 });
+      await waitD(300);
       const repView = await page.evaluate(() => ({
         title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC balance path'),
         axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
@@ -7004,7 +7324,8 @@ export async function run(H, S) {
       H.check('detail-clarity: report difference 1y preset narrows both the difference chart and the breakdown bars',
         repNarrowed.labels === 12 && repNarrowed.labelsBreak === 12 && repNarrowed.active, JSON.stringify(repNarrowed));
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcAiRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await waitD(2500);
+      try { await page.waitForFunction(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'DC AI balance path'), { timeout: 15000 }); } catch { /* fall through: the check below FAILs with the diagnostic */ }
+      await waitD(300);
       const aiView = await page.evaluate(() => ({
         title: !!document.querySelector('#planReportChart0')?.closest('.panel')?.querySelector('h3')?.textContent.includes('DC AI balance path'),
         axis: (document.querySelector('#planReport')?.textContent || '').includes('X: month'),
@@ -7370,8 +7691,8 @@ export async function run(H, S) {
       H.check('flow: no connector lines in the flow panel',
         !tiers.svg && tiers.paths === 0, JSON.stringify(tiers));
       // Guard: the baseline is FIXED — no baseline pick is ever
-      // missing. Deselect the AI strategy first, or the routing rule
-      // (not the guard) would own the button state from here on.
+      // missing. Deselect the AI strategy first so the guard read
+      // is not confounded by the AI pick.
       await page.click(`[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const guard0 = await page.evaluate(() => ({
@@ -7558,8 +7879,12 @@ export async function run(H, S) {
       H.check('reportsticky: print keeps the sticky bar static and hides the outline', pr.pos === 'static' && pr.out === 'none', JSON.stringify(pr));
       const outEntries = async () => page.evaluate(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent));
       const entries = await outEntries();
+      // Engine round: the outline lists every report section
+      // (Variables, Headline, chart blocks, table, Engine) with the
+      // comparison appended last by construction; the metric_cards
+      // block is the Headline now, never a separate entry.
       H.check('reportoutline: OPEN shows one entry per block + comparison',
-        JSON.stringify(entries) === JSON.stringify(['Sticky balance', 'Sticky headlines', 'Strategy comparison']),
+        JSON.stringify(entries) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
         JSON.stringify(entries));
       await page.evaluate(() => { [...document.querySelectorAll('#planReportOutlineList a')].find((a) => a.textContent === 'Strategy comparison').click(); });
       await waitF(1500);
@@ -7586,20 +7911,22 @@ export async function run(H, S) {
       await waitF(1000);
       const entriesGen = await outEntries();
       H.check('reportoutline: tab switch refreshes entries to the new report',
-        JSON.stringify(entriesGen) === JSON.stringify(['Mortgage balance', 'Headlines', 'Strategy comparison']),
+        JSON.stringify(entriesGen) === JSON.stringify(['Variables', 'Headline', 'Mortgage balance', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
         JSON.stringify(entriesGen));
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab="${id}"]`).click(); }, stRepId);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky balance'), { timeout: 30000 });
       await waitF(1000);
       const entriesBack = await outEntries();
       H.check('reportoutline: switching back restores the first report entries',
-        JSON.stringify(entriesBack) === JSON.stringify(['Sticky balance', 'Sticky headlines', 'Strategy comparison']),
+        JSON.stringify(entriesBack) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
         JSON.stringify(entriesBack));
       await page.evaluate(() => { document.querySelector('[data-plan-report-block-del="0"]').click(); });
-      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Sticky headlines|Strategy comparison', { timeout: 30000 });
+      // Deleting chart block 0 ('Sticky balance') drops only that
+      // entry; Variables/Headline/table/Engine/comparison stay.
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Variables|Headline|Difference vs baseline|Engine|Strategy comparison', { timeout: 30000 });
       const entriesDel = await outEntries();
       H.check('reportoutline: per-block Delete removes that block entry',
-        JSON.stringify(entriesDel) === JSON.stringify(['Sticky headlines', 'Strategy comparison']),
+        JSON.stringify(entriesDel) === JSON.stringify(['Variables', 'Headline', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
         JSON.stringify(entriesDel));
       await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
       await page.waitForFunction(() => !document.querySelector('[data-plan-report-tab]'), { timeout: 15000 });
@@ -7631,7 +7958,10 @@ export async function run(H, S) {
       await page.setViewport({ width: 1500, height: 900 });
       await waitF(800);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, stRepId);
-      await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky headlines'), { timeout: 30000 });
+      // The metric_cards block ('Sticky headlines') never renders as
+      // a block — it IS the Headline section now — so wait for the
+      // tab itself, which is what this pin asserts.
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 30000 }, stRepId);
       const gridOpened = await page.evaluate((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), stRepId);
       H.check('reportgrid: clicking a grid card opens its tab', gridOpened);
       await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
@@ -7643,12 +7973,13 @@ export async function run(H, S) {
       H.check('reportgrid: Delete on a grid card deletes only that report',
         !gridLeft.includes(stRepId) && gridLeft.includes(genRep.id) && gridLeft.includes(fRep2Id),
         JSON.stringify(gridLeft));
-      // Routing: each AI-designed pick disables preset Generate with
-      // a reason, while Generate with AI stays available.
+      // Routing is CANCELLED (engine round): each AI-designed pick
+      // keeps preset Generate enabled — choosing the button IS
+      // choosing the engine. No routing note, no disabled state.
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await waitF(1500);
       // Reload resets wiring state, so start from the engine-only
-      // selection (AI strategy off) before each routing case.
+      // selection (AI strategy off) before each case.
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const routingState = async () => page.evaluate(() => ({
@@ -7656,28 +7987,19 @@ export async function run(H, S) {
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
         aiEnabled: !document.querySelector('#planAiReportBtn')?.disabled,
       }));
-      // Baselines are FIXED, so there is no AI-baseline routing case
-      // anymore — an AI baseline record can never be picked.
+      // Baselines are FIXED, so there is no AI-baseline case anymore
+      // — an AI baseline record can never be picked.
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fAiScenId}"]`);
-      // Wait for the scenario-click render itself, not a fixed sleep:
-      // a fixed 1200ms read the pre-click routing (disabled false, note
-      // empty) under full-run load and flaked this check. Waiting for
-      // the asserted state keeps the pin exactly as strong — a broken
-      // render times out here and the check below still fails.
-      await page.waitForFunction(() => {
-        const b = document.querySelector('#planFlowGenerateBtn');
-        const n = document.querySelector('#planFlowGenerateNote')?.textContent || '';
-        return !!b?.disabled && n.includes('scenario');
-      }, { timeout: 15000 }).catch(() => {});
+      await waitF(1200);
       const routeScen = await routingState();
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-scenario-select="${fScenId}"]`);
       await waitF(1200);
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-strategy-select="${fAiStratId}"]`);
       await waitF(800);
       const routeStrat = await routingState();
-      H.check('flow: AI-designed scenario/strategy each disable preset Generate with reason, AI Generate stays available',
-        routeScen.disabled && routeScen.note.includes('AI-designed') && routeScen.note.includes('scenario') && routeScen.aiEnabled
-          && routeStrat.disabled && routeStrat.note.includes('AI-designed') && routeStrat.note.includes('strategy') && routeStrat.aiEnabled,
+      H.check('engine: AI-designed scenario/strategy each keep preset Generate enabled (routing cancelled), AI Generate stays available',
+        routeScen.disabled === false && !routeScen.note.includes('AI-designed') && routeScen.aiEnabled
+          && routeStrat.disabled === false && !routeStrat.note.includes('AI-designed') && routeStrat.aiEnabled,
         JSON.stringify({ routeScen, routeStrat }));
       // AI title vs preset title: the AI modal prefills its name
       // from the AI title; without one it falls back to the
@@ -7687,7 +8009,7 @@ export async function run(H, S) {
         { template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
         { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain − cost.' },
       ];
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Flow AI outlook', charts: fAiCharts }));
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Flow AI outlook', engine: {}, charts: fAiCharts }));
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiReportBtn');
       await waitF(1000);
       await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Compare balance paths and headlines'; });
@@ -7699,7 +8021,7 @@ export async function run(H, S) {
       await waitF(1200);
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const aiTitled = (r.data.reports || []).find((x) => x.name === 'Flow AI outlook');
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ charts: fAiCharts }));
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ engine: {}, charts: fAiCharts }));
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planAiReportBtn');
       await waitF(1000);
       await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Compare balance paths and headlines'; });
@@ -7820,10 +8142,10 @@ export async function run(H, S) {
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'AI balance'), { timeout: 15000 });
       const tabRoute = await page.evaluate(() => ({
         genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
-        note: document.querySelector('#planReportTabNote')?.textContent || '',
+        noteEl: !!document.querySelector('#planReportTabNote'),
         aiEnabled: !document.querySelector('#planReportTabAiBtn')?.disabled,
       }));
-      H.check('reporttab: AI-pinned tab disables preset Generate with reason, AI stays enabled', tabRoute.genDisabled && tabRoute.note.includes('AI-designed') && tabRoute.aiEnabled, JSON.stringify(tabRoute));
+      H.check('engine: AI-pinned tab keeps preset Generate enabled (routing cancelled), AI stays enabled, no routing note element', tabRoute.genDisabled === false && tabRoute.noteEl === false && tabRoute.aiEnabled, JSON.stringify(tabRoute));
       const tierAi = await readTier(fAiScenId, fAiBaseId, fAiStratId);
       H.check('reporttab: AI tab highlights its own pins above, not the engine pins',
         JSON.stringify(tierAi.scenPins) === JSON.stringify([fAiScenId]) && JSON.stringify(tierAi.basePins) === JSON.stringify([]) && JSON.stringify(tierAi.stratPins) === JSON.stringify([fAiStratId]), JSON.stringify(tierAi));
@@ -7848,12 +8170,12 @@ export async function run(H, S) {
         // Pickers hide by their .plan-ai-modal-card (modalbeautify
         // restructure): the picker's closest div is now .plan-ai-picks.
         pickersHidden: ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.contains('hidden')),
-        modelHidden: !!document.querySelector('#planReportAiModelSection.hidden'),
+        modelGone: !document.querySelector('#planReportAiModelSection'),
         note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
       }));
       H.check('reporttab: per-tab AI opens append mode (pickers hidden, pins-unchanged note)', appendUi.modalOpen && appendUi.pickersHidden && appendUi.note.includes('pins unchanged'), JSON.stringify(appendUi));
-      H.check('modelmove: model-design section stays out of append mode', appendUi.modelHidden, JSON.stringify(appendUi));
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', charts: [{ template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
+      H.check('engine: model-design section is gone from append mode (not hidden)', appendUi.modelGone, JSON.stringify(appendUi));
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', engine: {}, charts: [{ template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
       await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Add an extra balance path'; });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiGenBtn');
       await waitF(1200);
@@ -7883,20 +8205,25 @@ export async function run(H, S) {
       const blocksBefore = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
       await page.evaluate((s) => { document.querySelector(s).click(); }, '[data-plan-report-block-del="0"]');
       // Wait for the post-delete render (server already applied the
-      // delete; a fixed sleep read the pre-delete DOM).
-      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 1 && b[0] === 'Headlines'; }, { timeout: 15000 });
+      // delete; a fixed sleep read the pre-delete DOM). The
+      // metric_cards block is the Headline section now, so the
+      // remaining blocks are Variables / Headline / table / Engine.
+      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 4 && !b.includes('Mortgage balance') && b.includes('Headline'); }, { timeout: 15000 });
       const blocksAfter = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const genDef = ((r.data.reports || []).find((x) => x.id === genRep.id) || {}).definition || {};
       H.check('reporttab: block delete removes one block and persists',
-        blocksBefore.length === 2 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 1 && blocksAfter[0] === 'Headlines' && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
+        blocksBefore.length === 5 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 4 && !blocksAfter.includes('Mortgage balance') && blocksAfter.includes('Headline') && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
       await page.waitForSelector(`[data-plan-report-tab-close="${genRep.id}"]`, { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${genRep.id}"]`);
       await waitF(1000);
-      await openCard(genRep.id, 'Headlines');
+      await openCard(genRep.id, 'Headline');
       const blocksReopen = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
-      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 1 && blocksReopen[0] === 'Headlines', JSON.stringify(blocksReopen));
+      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 4 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
       // Polish: quiet defs note + subtitle + metric cards + current tab wrap.
+      // The metric_cards block is the Headline section now, so the
+      // count is the headline's 9 cards (property project), not the
+      // old block's 3 series cards.
       const polish = await page.evaluate(() => ({
         defs: !!document.querySelector('#planReport .plan-report-defs'),
         subtitle: !!document.querySelector('#planReport .plan-report-subtitle'),
@@ -7904,7 +8231,7 @@ export async function run(H, S) {
         currentWrap: !!document.querySelector('.plan-report-tabwrap-current'),
       }));
       H.check('reporttab: polished elements render (quiet defs note, subtitle, metric cards, current tab wrap)',
-        polish.defs && polish.subtitle && polish.metric === 3 && polish.currentWrap, JSON.stringify(polish));
+        polish.defs && polish.subtitle && polish.metric === 9 && polish.currentWrap, JSON.stringify(polish));
       // Per-tab Save triggers the browser print/export path.
       await page.evaluate(() => { window.__printCalled = false; window.print = () => { window.__printCalled = true; }; });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabSaveBtn');
@@ -8043,12 +8370,12 @@ export async function run(H, S) {
       const ubBefore = await page.evaluate(() => ({
         removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
         genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
-        note: document.querySelector('#planReportTabNote')?.textContent || '',
+        noteEl: !!document.querySelector('#planReportTabNote'),
         cols: document.querySelectorAll('#planReportMergedTable thead th').length,
       }));
-      H.check('uibundle: report picker shows a remove control per pinned strategy and AI pin disables preset Generate',
+      H.check('engine: report picker shows a remove control per pinned strategy; preset Generate stays enabled even with an AI pin, no routing note',
         ubBefore.removes.length === 2 && ubBefore.removes.includes(fStratId) && ubBefore.removes.includes(fAiStratId)
-          && ubBefore.genDisabled && ubBefore.note.includes('AI-designed') && ubBefore.note.includes('strategy') && ubBefore.cols === 4,
+          && !ubBefore.genDisabled && !ubBefore.noteEl && ubBefore.cols === 4,
         JSON.stringify(ubBefore));
       // Remove the AI strategy: routing recomputes from the
       // remaining pins (preset Generate re-enables) and the
@@ -8064,9 +8391,9 @@ export async function run(H, S) {
       }));
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const ubRow = (r.data.reports || []).find((x) => x.id === ubRepId);
-      H.check('uibundle: removing one strategy persists in pins, re-enables preset Generate, and narrows the comparison',
+      H.check('uibundle: removing one strategy persists in pins and leaves a single-strategy report (merged table gone), preset Generate stays enabled',
         ubAfter.removes.length === 1 && ubAfter.removes[0] === fStratId && !ubAfter.genDisabled && ubAfter.note === ''
-          && ubAfter.cols === 3 && ubAfter.subtitle.includes('Flow prepay') && !ubAfter.subtitle.includes('Flow AI strategy')
+          && ubAfter.cols === 0 && ubAfter.subtitle.includes('Flow prepay') && !ubAfter.subtitle.includes('Flow AI strategy')
           && !!ubRow && JSON.stringify(JSON.parse(ubRow.strategy_ids)) === JSON.stringify([fStratId]),
         JSON.stringify({ ubAfter, pins: ubRow && ubRow.strategy_ids }));
       // Close + reopen: the removal stays gone.
@@ -8082,8 +8409,8 @@ export async function run(H, S) {
         removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
         cols: document.querySelectorAll('#planReportMergedTable thead th').length,
       }));
-      H.check('uibundle: removed strategy stays gone after close + reopen',
-        ubReopen.removes.length === 1 && ubReopen.removes[0] === fStratId && ubReopen.cols === 3, JSON.stringify(ubReopen));
+      H.check('uibundle: removed strategy stays gone after close + reopen (single-strategy report, no merged table)',
+        ubReopen.removes.length === 1 && ubReopen.removes[0] === fStratId && ubReopen.cols === 0, JSON.stringify(ubReopen));
       // Last-strategy removal: the server sets no minimum, so the
       // report becomes baseline-only (pins []) rather than blocking.
       await page.evaluate((id) => { document.querySelector(`#planReportComparePicker [data-plan-remove="${id}"]`).click(); }, fStratId);
@@ -8125,10 +8452,10 @@ export async function run(H, S) {
       await page.waitForSelector('#planSavedTemplateApply', { timeout: 15000 });
       const ubTpl = await page.evaluate(() => ({
         applySmall: !!document.querySelector('#planSavedTemplateApply.small'),
-        refineSmall: !!document.querySelector('#planSavedTemplateRefine.small'),
+        refineGone: !document.querySelector('#planSavedTemplateRefine'),
       }));
-      H.check('uibundle: saved-template Apply/Refine buttons are small',
-        ubTpl.applySmall && ubTpl.refineSmall, JSON.stringify(ubTpl));
+      H.check('uibundle: saved-template Apply button is small, Refine button is gone',
+        ubTpl.applySmall && ubTpl.refineGone, JSON.stringify(ubTpl));
       await page.evaluate(() => { document.querySelector('[data-close-modal]')?.click(); });
       await waitF(500);
       // Strategy detail header: Merge is small and the tools sit at
@@ -8249,7 +8576,9 @@ export async function run(H, S) {
       const aeState = await page.evaluate(() => {
         const blocks = [...document.querySelectorAll('[data-plan-report-block]')];
         const costBlock = blocks.find((b) => (b.querySelector('h3')?.textContent || '') === 'Cost Comparison');
-        const headBlock = blocks.find((b) => (b.querySelector('h3')?.textContent || '') === 'Headlines');
+        // The metric_cards block is the Headline section now (h3
+        // 'Headline', not 'Headlines').
+        const headBlock = blocks.find((b) => (b.querySelector('h3')?.textContent || '') === 'Headline');
         return {
           costNote: costBlock ? (costBlock.querySelector('.note')?.textContent || '') : 'MISSING BLOCK',
           costTable: !!costBlock?.querySelector('table'),
@@ -8601,9 +8930,10 @@ export async function run(H, S) {
         r.status === 200 && (r.data.ops || []).length === 1, JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
       // Strategy stays picked via the null=all wiring default: clicking
       // its Select would toggle the only strategy OFF and trip the
-      // pick-a-strategy guard instead of the AI-routing note. The
-      // scenario click picks the AI scenario; the baseline is fixed
-      // and never picked, so the old baseline leg is gone.
+      // pick-a-strategy guard instead. The scenario click picks the
+      // AI scenario; the baseline is fixed and never picked. Routing
+      // is cancelled (engine round): preset Generate stays enabled
+      // even for an AI-designed selection.
       await page.evaluate(() => {
         document.querySelector('[data-plan-scenario-select]').click();
       });
@@ -8613,8 +8943,8 @@ export async function run(H, S) {
         note: document.querySelector('#planFlowGenerateNote')?.textContent || '',
         aiEnabled: document.querySelector('#planAiReportBtn')?.disabled === false,
       }));
-      H.check('aicreate: AI-designed scenario/strategy disable preset Generate, AI Generate stays available',
-        routing.genDisabled && routing.note.includes('AI-designed') && routing.aiEnabled, JSON.stringify(routing));
+      H.check('engine: AI-designed scenario/strategy keep preset Generate enabled (routing cancelled), AI Generate stays available',
+        routing.genDisabled === false && !routing.note.includes('AI-designed') && routing.aiEnabled, JSON.stringify(routing));
     } finally { await browserAi.close(); }
     }
   }

@@ -63,6 +63,8 @@ import {
   currentReturnRateFromPoints, validatePoolItemShapes, poolExternalCash,
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
   validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind, aiSuggestNamePrompt, cleanAiSuggestedName,
+  validateReportVariables, applyReportVariables, validateAiEngine, evaluateAiEngine,
+  aiReportRefinePrompt, aiReportDefinitionDiff,
 } from './planning.js';
 
 // Region-specific providers (assessment search/fetch) are reached
@@ -4641,7 +4643,7 @@ function planHoldingGrowth(mainline, currentMonth) {
 // sinkInput: undefined = the strategy row's sink column; null = no sink.
 // The sink's trend overrides the scenario's stock return — the sink is
 // strategy equipment, and a picked sink always wins, as before.
-async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
+async function planProjectionFor(strategy, project, scenarioInput, sinkInput, overrides) {
   await ensureFreshPrime();
   const baseMainline = planAssembleMainline(project.id);
   const currentMonth = currentMonthKey();
@@ -4652,7 +4654,13 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
   // is then entity-only by construction. Holdings are untouched.
   const entityProp = planEntityProperty(project);
   if (entityProp) mainline = scopeMainlineToProperty(mainline, entityProp.id);
-  const ops = planOpsOf(strategy.id);
+  const rawOps = planOpsOf(strategy.id);
+  // Preview-only op overrides (report variables, trajectory tier):
+  // patch op params IN MEMORY — the caller validates the patched
+  // ops via planValidateStrategyOps first; nothing is written.
+  const ops = overrides && overrides.opParams
+    ? rawOps.map((o) => (overrides.opParams[o.id] ? { ...o, params: { ...(o.params || {}), ...overrides.opParams[o.id] } } : o))
+    : rawOps;
   const legs = [];
   for (const o of ops) for (const l of o.legs) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
   let scenarioRow = null;
@@ -4696,7 +4704,7 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput) {
     }
   }
   const strategyProj = computeProjection({ ...args, mainline: strategyMainline, assumptions: strategyAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
-  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property' }), factors, sink, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property', investmentScope: project.category === 'investment' }), factors, sink, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
 }
 function planScenarioRow(r) {
   if (!r) return null;
@@ -5901,6 +5909,113 @@ app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, r
   res.json({ scenario: r.appliedScenario, ...r });
 });
 
+// One comparison block (one scenario world): baseline + per-strategy
+// rows + report-ready trajectories. Shared by the GET comparison and
+// the preview endpoint — the preview passes factor/op overrides
+// (report variables, trajectory tier), which are applied IN MEMORY
+// only; the GET passes none. Factor overrides merge onto the
+// scenario's factors; op overrides patch op params (validated by the
+// caller via planValidateStrategyOps).
+async function planComparisonBlock(p, scenarioRow, opts = {}) {
+  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  const entityProp = planEntityProperty(p);
+  let factors = planScenarioFactorsOfRow(scenarioRow);
+  if (opts.factorOverrides) factors = { ...(factors || {}), ...opts.factorOverrides };
+  const rows = [];
+  let baseline = null;
+  for (const st of strategies) {
+    let r;
+    try {
+      // No factor overrides: pass the row (appliedScenario stays
+      // set). With overrides: pass the merged factors object.
+      const scenInput = opts.factorOverrides ? factors : scenarioRow;
+      r = await planProjectionFor(st, p, scenInput, undefined, opts.opParamOverrides ? { opParams: opts.opParamOverrides } : undefined);
+    } catch (err) {
+      throw new Error(`projection failed: ${err.message}`);
+    }
+    if (!baseline) baseline = r.baseline;
+    rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, sink: r.sink, opCount: planOpsOf(st.id).length });
+  }
+  // Baseline-only projection: the reference the strategy deltas are
+  // computed against, and the chart's baseline line.
+  if (!baseline) {
+    const baseMainline = planAssembleMainline(p.id);
+    await ensureFreshPrime();
+    const cur = getCurrentPrime();
+    const currentMonth = currentMonthKey();
+    let mainline = planPoolMainline(p, baseMainline, currentMonth);
+    const fallbackEntity = planEntityProperty(p);
+    if (fallbackEntity) mainline = scopeMainlineToProperty(mainline, fallbackEntity.id);
+    const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
+    baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: factorsToAssumptions(factors, {}), primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: primeFactorToScenario(factors), holdingGrowth, potInitial: poolExternalCash(planProjectEntityOf(p)) });
+    baseline.currentRates = currentRates;
+  }
+  // Strategy-centric deltas: per strategy, Equity Δ (peak balance
+  // advantage over baseline) and Principal Δ (buyCash vs baseline).
+  // A delta is null when the strategy does not touch that asset type
+  // at all — the client renders '—' — so a buy strategy never shows a
+  // spurious $0 equity delta and vice versa. Baseline stays only the
+  // reference the deltas are computed against, never a table column.
+  for (const r of rows) {
+    const sops = planOpsOf(r.strategy.id);
+    const slegs = [];
+    for (const o of sops) for (const l of o.legs || []) slegs.push(l);
+    const touchesMortgage = sops.some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
+      || slegs.some((l) => String(l.source_ref || '').startsWith('repay:'));
+    const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
+    r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
+    r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
+    // Monthly-payment scope: for property projects the 2026-11-04
+    // entity rule SUBSUMES the 2026-11-02 op-touched rule — the
+    // payment follows the entity property, not the touched set.
+    // Legacy and non-property projects keep op-touched scope.
+    // Stock-only / no-op strategies carry nulls and render '—'.
+    // The single-property label names the property so the figure is
+    // self-evident.
+    const scope = paymentScopeFor(baseline, r.projection, sops, entityProp ? [entityProp.id] : null);
+    let scopeLabel = 'Monthly payment';
+    if (scope.propertyIds.length === 1) {
+      const addr = db.prepare('SELECT address FROM properties WHERE id = ?').get(scope.propertyIds[0]);
+      if (addr && addr.address) scopeLabel = `Monthly payment · ${addr.address}`;
+    }
+    r.paymentScope = { ...scope, label: scopeLabel };
+    // Comparison chart inputs: which asset types each strategy touches
+    // (the client picks the chart mode from these), plus the
+    // principal-gain series for stock strategies (do-nothing
+    // baseline, one definition shared with the table's stockGain).
+    r.touchesMortgage = touchesMortgage;
+    r.touchesStocks = touchesStocks;
+    r.principalGainSeries = touchesStocks ? principalGainSeries(baseline, r.projection) : null;
+  }
+  // Report-ready series: one monthly trajectory per baseline/strategy,
+  // plus each strategy's cost breakdown. The report view renders from
+  // this block only — it never recomputes engine figures client-side.
+  // The scenario's property growth (if any) grows BOTH the baseline
+  // and the strategy trajectories: one world, one assessed path.
+  const mainlineForReport = planAssembleMainline(p.id);
+  const assessedByProperty = mainlineForReport.assessed || {};
+  // Entity scope: a property project's total value grows ONLY its
+  // entity property's assessed value — never the all-properties sum.
+  const assessedTotal = entityProp
+    ? (Number(assessedByProperty[entityProp.id]) || 0)
+    : Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
+  const growth = factors && factors.propertyGrowth ? factors.propertyGrowth.valuePct : null;
+  // Investment scope: report trajectories carry the cash-pool series
+  // and their total is pool + stocks only (never property equity).
+  const investmentScope = p.category === 'investment';
+  const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: baseline.stocks.potSeries, investmentScope }) }];
+  for (const r of rows) {
+    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope }) });
+  }
+  const report = {
+    assessedTotal, assessedByProperty,
+    trajectories: reportTrajectories,
+    costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
+    investmentScope,
+  };
+  return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
+}
+
 app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res) => {
   const p = planProjectById(Number(req.params.id), req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
@@ -5932,106 +6047,10 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
     const base = planBaseScenario(p.id);
     selected = base ? [base] : [null];
   }
-  const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
-  // Entity property for the 2026-11-04 scope rule (null unless this
-  // is a property project with a resolvable entity property).
   const entityProp = planEntityProperty(p);
-  const buildBlock = async (scenarioRow) => {
-    const factors = planScenarioFactorsOfRow(scenarioRow);
-    const rows = [];
-    let baseline = null;
-    for (const st of strategies) {
-      let r;
-      try {
-        r = await planProjectionFor(st, p, scenarioRow);
-      } catch (err) {
-        throw new Error(`projection failed: ${err.message}`);
-      }
-      if (!baseline) baseline = r.baseline;
-      rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, sink: r.sink, opCount: planOpsOf(st.id).length });
-    }
-    // Baseline-only projection: the reference the strategy deltas are
-    // computed against, and the chart's baseline line.
-    if (!baseline) {
-      const baseMainline = planAssembleMainline(p.id);
-      await ensureFreshPrime();
-      const cur = getCurrentPrime();
-      const currentMonth = currentMonthKey();
-      let mainline = planPoolMainline(p, baseMainline, currentMonth);
-      const fallbackEntity = planEntityProperty(p);
-      if (fallbackEntity) mainline = scopeMainlineToProperty(mainline, fallbackEntity.id);
-      const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
-      baseline = computeProjection({ mainline, ops: [], legs: [], assumptions: factorsToAssumptions(factors, {}), primeHistory: getPrimeHistory(), currentPrime: cur ? cur.rate : null, currentMonth, scenario: primeFactorToScenario(factors), holdingGrowth, potInitial: poolExternalCash(planProjectEntityOf(p)) });
-      baseline.currentRates = currentRates;
-    }
-    // Strategy-centric deltas: per strategy, Equity Δ (peak balance
-    // advantage over baseline) and Principal Δ (buyCash vs baseline).
-    // A delta is null when the strategy does not touch that asset type
-    // at all — the client renders '—' — so a buy strategy never shows a
-    // spurious $0 equity delta and vice versa. Baseline stays only the
-    // reference the deltas are computed against, never a table column.
-    for (const r of rows) {
-      const sops = planOpsOf(r.strategy.id);
-      const slegs = [];
-      for (const o of sops) for (const l of o.legs || []) slegs.push(l);
-      const touchesMortgage = sops.some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
-        || slegs.some((l) => String(l.source_ref || '').startsWith('repay:'));
-      const touchesStocks = sops.some((o) => ['buy', 'sell', 'position'].includes(o.op_type));
-      r.equityDelta = touchesMortgage ? equityDeltaPeak(r.projection) : null;
-      r.principalDelta = touchesStocks ? principalDeltaVsBaseline(baseline, r.projection) : null;
-      // Monthly-payment scope: for property projects the 2026-11-04
-      // entity rule SUBSUMES the 2026-11-02 op-touched rule — the
-      // payment follows the entity property, not the touched set.
-      // Legacy and non-property projects keep op-touched scope.
-      // Stock-only / no-op strategies carry nulls and render '—'.
-      // The single-property label names the property so the figure is
-      // self-evident.
-      const scope = paymentScopeFor(baseline, r.projection, sops, entityProp ? [entityProp.id] : null);
-      let scopeLabel = 'Monthly payment';
-      if (scope.propertyIds.length === 1) {
-        const addr = db.prepare('SELECT address FROM properties WHERE id = ?').get(scope.propertyIds[0]);
-        if (addr && addr.address) scopeLabel = `Monthly payment · ${addr.address}`;
-      }
-      r.paymentScope = { ...scope, label: scopeLabel };
-      // Comparison chart inputs: which asset types each strategy touches
-      // (the client picks the chart mode from these), plus the
-      // principal-gain series for stock strategies (do-nothing
-      // baseline, one definition shared with the table's stockGain).
-      r.touchesMortgage = touchesMortgage;
-      r.touchesStocks = touchesStocks;
-      r.principalGainSeries = touchesStocks ? principalGainSeries(baseline, r.projection) : null;
-    }
-    // Report-ready series: one monthly trajectory per baseline/strategy,
-    // plus each strategy's cost breakdown. The report view renders from
-    // this block only — it never recomputes engine figures client-side.
-    // The scenario's property growth (if any) grows BOTH the baseline
-    // and the strategy trajectories: one world, one assessed path.
-    const mainlineForReport = planAssembleMainline(p.id);
-    const assessedByProperty = mainlineForReport.assessed || {};
-    // Entity scope: a property project's total value grows ONLY its
-    // entity property's assessed value — never the all-properties sum.
-    const assessedTotal = entityProp
-      ? (Number(assessedByProperty[entityProp.id]) || 0)
-      : Object.values(assessedByProperty).reduce((s, v) => s + (Number(v) || 0), 0);
-    const growth = factors && factors.propertyGrowth ? factors.propertyGrowth.valuePct : null;
-    // Investment scope: report trajectories carry the cash-pool series
-    // and their total is pool + stocks only (never property equity).
-    const investmentScope = p.category === 'investment';
-    const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: baseline.stocks.potSeries, investmentScope }) }];
-    for (const r of rows) {
-      reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope }) });
-    }
-    const report = {
-      assessedTotal, assessedByProperty,
-      trajectories: reportTrajectories,
-      costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
-      investmentScope,
-    };
-    return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
-  };
   const scenarioBlocks = [];
   try {
-    for (const sc of selected) scenarioBlocks.push(await buildBlock(sc));
+    for (const sc of selected) scenarioBlocks.push(await planComparisonBlock(p, sc));
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -6039,11 +6058,106 @@ app.get('/api/planning/projects/:id/comparison', requireApiAuth, async (req, res
   // these fields; with scenarios present it renders under the first
   // selected world (the base scenario when no ids were pinned).
   const first = scenarioBlocks[0] || null;
+  // AI engine execution (item 2): when the caller names a report
+  // whose definition carries an engine, evaluate it per strategy over
+  // that strategy's preset-engine trajectory + comparison scalars and
+  // attach the executed figures to the row. Preset reports (no engine
+  // key) get no engine block — their figures are the preset engine's.
+  // An engine that fails evaluation attaches its errors and the row
+  // falls back to preset figures at the call site.
+  if (req.query.reportId !== undefined && req.query.reportId !== null && req.query.reportId !== '' && first) {
+    const rep = db.prepare('SELECT * FROM plan_reports WHERE id = ? AND project_id = ?').get(Number(req.query.reportId), p.id);
+    if (rep) {
+      let def = {};
+      try { def = JSON.parse(rep.definition || '{}'); } catch { def = {}; }
+      if (def.engine && typeof def.engine === 'object') {
+        const trajs = (first.report && first.report.trajectories) || [];
+        for (const row of first.strategies) {
+          const traj = trajs.find((t) => t.key === String(row.strategy.id));
+          const ev = evaluateAiEngine(def.engine, { monthly: (traj && traj.monthly) || [], scalars: row.comparison || {} });
+          row.engine = { series: ev.series, scalars: ev.scalars, inputs: ev.inputs, errors: ev.errors };
+        }
+      }
+    }
+  }
   res.json({
     project: p, scenarios: allScenarios, selectedScenarioIds: selected.filter(Boolean).map((x) => x.id),
     scenarioBlocks, scenario: first ? first.scenario : null,
     baseline: first ? first.baseline : null, strategies: first ? first.strategies : [],
     report: first ? first.report : null, chosenBaseline, entityProperty: entityProp,
+  });
+});
+
+// Report variables, trajectory tier (item 5): re-run the comparison
+// with in-memory overrides — prime points, stock return, property
+// growth, op params — and return the same shape as the GET
+// comparison. PREVIEW ONLY: nothing is written. Apply writes back
+// to the bound scenario/op via the normal PUT endpoints.
+app.post('/api/planning/projects/:id/comparison/preview', requireApiAuth, async (req, res) => {
+  const p = planProjectById(Number(req.params.id), req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  planMigrateStrategyFactors(p.id);
+  const b = req.body || {};
+  const overrides = b.overrides || {};
+  const factorOverrides = {};
+  if (overrides.prime !== undefined) {
+    if (!overrides.prime || !Array.isArray(overrides.prime.points)) return res.status(400).json({ error: 'overrides.prime.points must be an array of {month, rate}' });
+    for (const pt of overrides.prime.points) {
+      if (!/^\d{4}-\d{2}$/.test(String(pt.month || '')) || !isFinite(Number(pt.rate))) return res.status(400).json({ error: 'prime points must be {month: YYYY-MM, rate: number}' });
+    }
+    factorOverrides.prime = { points: overrides.prime.points.map((pt) => ({ month: pt.month, rate: Number(pt.rate) })) };
+  }
+  if (overrides.stock !== undefined) {
+    if (overrides.stock == null || !isFinite(Number(overrides.stock.valuePct))) return res.status(400).json({ error: 'overrides.stock.valuePct must be a number' });
+    factorOverrides.stock = { valuePct: Number(overrides.stock.valuePct) };
+  }
+  if (overrides.propertyGrowth !== undefined) {
+    if (overrides.propertyGrowth == null || !isFinite(Number(overrides.propertyGrowth.valuePct))) return res.status(400).json({ error: 'overrides.propertyGrowth.valuePct must be a number' });
+    factorOverrides.propertyGrowth = { valuePct: Number(overrides.propertyGrowth.valuePct) };
+  }
+  const opParamOverrides = {};
+  if (overrides.ops !== undefined) {
+    if (typeof overrides.ops !== 'object' || Array.isArray(overrides.ops)) return res.status(400).json({ error: 'overrides.ops must be an object keyed by op id' });
+    const strategyIds = db.prepare('SELECT id FROM plan_strategies WHERE project_id = ?').all(p.id).map((x) => x.id);
+    for (const [opId, patch] of Object.entries(overrides.ops)) {
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return res.status(400).json({ error: `overrides.ops.${opId} must be an object of params` });
+      const op = db.prepare('SELECT * FROM plan_ops WHERE id = ?').get(Number(opId));
+      if (!op || !strategyIds.includes(op.strategy_id)) return res.status(400).json({ error: `op ${opId} is not in this project` });
+      const existing = planOpsOf(op.strategy_id);
+      const patched = existing.map((o) => (o.id === Number(opId) ? { ...o, params: { ...(o.params || {}), ...patch } } : o));
+      const legs = [];
+      for (const o of patched) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
+      const errs = planValidateStrategyOps(op.strategy_id, patched, legs);
+      if (errs.length) return res.status(400).json({ error: `op ${opId}: ${errs.join('; ')}` });
+      opParamOverrides[Number(opId)] = patch;
+    }
+  }
+  const allScenarios = planScenariosOf(p.id);
+  let selected;
+  if (b.scenarioIds !== undefined && b.scenarioIds !== null && b.scenarioIds !== '') {
+    const wanted = new Set(String(b.scenarioIds).split(',').map((x) => Number(x)).filter((x) => Number.isFinite(x)));
+    for (const id of wanted) if (!allScenarios.some((x) => x.id === id)) return res.status(404).json({ error: 'scenario not found' });
+    selected = allScenarios.filter((x) => wanted.has(x.id));
+  } else {
+    const base = planBaseScenario(p.id);
+    selected = base ? [base] : [null];
+  }
+  const blocks = [];
+  try {
+    for (const sc of selected) blocks.push(await planComparisonBlock(p, sc, {
+      factorOverrides: Object.keys(factorOverrides).length ? factorOverrides : null,
+      opParamOverrides: Object.keys(opParamOverrides).length ? opParamOverrides : null,
+    }));
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  const first = blocks[0] || null;
+  res.json({
+    preview: true,
+    project: p, scenarios: allScenarios, selectedScenarioIds: selected.filter(Boolean).map((x) => x.id),
+    scenarioBlocks: blocks, scenario: first ? first.scenario : null,
+    baseline: first ? first.baseline : null, strategies: first ? first.strategies : [],
+    report: first ? first.report : null, chosenBaseline: null, entityProperty: planEntityProperty(p),
   });
 });
 
@@ -7517,7 +7631,57 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   // (the engine path gets its how-calculated lines from the app).
   const methodErrs = validateAiChartMethods(parsed.charts);
   if (methodErrs.length) return res.status(502).json({ error: methodErrs.join('; ') });
+  // The AI engine: a calculation definition the app executes. The
+  // key is required ({} when the preset engine already covers every
+  // figure) so Generate-with-AI always yields a real engine, never
+  // a preset report in AI clothing; unknown identifiers or bad
+  // formulas are the same 502 path as a bad chart spec.
+  if (parsed.engine === undefined || parsed.engine === null) return res.status(502).json({ error: 'the AI response did not contain an engine definition (use {} when the preset engine covers every figure)' });
+  const engineErrs = validateAiEngine(parsed.engine);
+  if (engineErrs.length) return res.status(502).json({ error: engineErrs.join('; ') });
   res.json({ definition: parsed, configured: true });
+});
+
+// AI report refine (item 3, AI path): the AI rewrites the report's
+// definition (charts + engine) from a follow-up. Preview-only: the
+// response carries the COMPLETE revised definition + an old→new
+// diff; nothing is written — the client Applies via PUT
+// /api/planning/reports/:id with the revised definition.
+app.post('/api/planning/reports/:id/ai-refine', requireApiAuth, async (req, res) => {
+  const r = db.prepare('SELECT * FROM plan_reports WHERE id = ?').get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: 'report not found' });
+  const p = planProjectById(r.project_id, req.user.id);
+  if (!p) return res.status(404).json({ error: 'project not found' });
+  if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  let current = {};
+  try { current = JSON.parse(r.definition || '{}'); } catch { current = {}; }
+  const strategies = db.prepare('SELECT id, name, letter FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  const mortgagedCount = db.prepare(`SELECT COUNT(*) AS n FROM properties WHERE mortgage_balance IS NOT NULL AND mortgage_balance > 0 AND EXISTS (SELECT 1 FROM rate_segments WHERE rate_segments.property_id = properties.id)`).get().n;
+  const holdingCount = db.prepare('SELECT COUNT(*) AS n FROM invest_holdings').get().n;
+  const baselineKind = p.category === 'investment' ? 'pool' : p.category === 'property' ? 'property' : 'other';
+  const prompt = aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount, baselineKind, definition: current, text });
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch (e) {
+    return res.status(502).json({ error: `AI call failed: ${e.message}` });
+  }
+  const parsed = parseModelJson(raw);
+  if (!parsed || !Array.isArray(parsed.charts)) return res.status(502).json({ error: 'the AI response did not contain a report definition' });
+  const errs = planAiValidateChartSpecs(parsed.charts, p.id);
+  if (errs.length) return res.status(502).json({ error: errs.join('; ') });
+  const seriesErrs = validateAiReportChartSeries(parsed.charts);
+  if (seriesErrs.length) return res.status(502).json({ error: seriesErrs.join('; ') });
+  const kindErrs = validateAiReportBaselineKind(parsed.charts, baselineKind);
+  if (kindErrs.length) return res.status(502).json({ error: kindErrs.join('; ') });
+  const methodErrs = validateAiChartMethods(parsed.charts);
+  if (methodErrs.length) return res.status(502).json({ error: methodErrs.join('; ') });
+  if (parsed.engine === undefined || parsed.engine === null) return res.status(502).json({ error: 'the AI response did not contain an engine definition (use {} when the preset engine covers every figure)' });
+  const engineErrs = validateAiEngine(parsed.engine);
+  if (engineErrs.length) return res.status(502).json({ error: engineErrs.join('; ') });
+  res.json({ definition: parsed, diff: aiReportDefinitionDiff(current, parsed), configured: true });
 });
 
 // AI name suggestion: a NAME only, never auto-saved — the client
@@ -7552,6 +7716,12 @@ app.post('/api/planning/projects/:id/reports', requireApiAuth, (req, res) => {
   if (errs.length) return res.status(400).json({ error: errs.join('; ') });
   const defSeriesErrs = validateAiReportChartSeries(def.charts || []);
   if (defSeriesErrs.length) return res.status(400).json({ error: defSeriesErrs.join('; ') });
+  // Report variables + AI engine travel inside the definition and
+  // are validated here the same way the PUT path validates them.
+  const defVarErrs = validateReportVariables(def.variables);
+  if (defVarErrs.length) return res.status(400).json({ error: defVarErrs.join('; ') });
+  const defEngErrs = validateAiEngine(def.engine);
+  if (defEngErrs.length) return res.status(400).json({ error: defEngErrs.join('; ') });
   const strategyIds = db.prepare('SELECT id FROM plan_strategies WHERE project_id = ?').all(p.id).map((r) => r.id);
   for (const sid of def.strategies || []) {
     if (!strategyIds.includes(Number(sid))) return res.status(400).json({ error: `strategy ${sid} is not in this project` });

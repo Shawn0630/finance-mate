@@ -8405,12 +8405,6 @@ function monthPopField() {
     const wrap = document.querySelector(`[data-earn-range="${key}"]`);
     return wrap ? wrap.querySelector(`[data-earn-month="${which}"]`) : null;
   }
-  // Strategy-diff range fields live in the diff panel's range bar
-  // (re-rendered by planDiffRender, so looked up live each time).
-  if (monthPopFor && monthPopFor.startsWith('planDiff:')) {
-    const which = monthPopFor.split(':')[1];
-    return document.querySelector(`#planDiffRange [data-plan-diff-month="${which}"]`);
-  }
   // Comparison-trajectory range fields live in the report panel's
   // range bar (per planTrajActive).
   if (monthPopFor && monthPopFor.startsWith('planTraj:')) {
@@ -8434,8 +8428,6 @@ function monthPopSpan() {
     if (!years.length) return null;
     return { start: `${years[0]}-01`, end: `${years[years.length - 1]}-12` };
   }
-  // Strategy-diff range: the projection months (set by planDiffRender).
-  if (monthPopFor && monthPopFor.startsWith('planDiff:')) return planDiffSpan;
   // Comparison-trajectory range: the trajectory months (set by
   // planCompareNewRender).
   if (monthPopFor && monthPopFor.startsWith('planTraj:')) return planTrajSpan;
@@ -8518,9 +8510,6 @@ function openMonthPop(which) {
     const wrap = b.closest('[data-earn-range]');
     b.setAttribute('aria-expanded', String(!!wrap && monthPopFor === `earn:${wrap.dataset.earnRange}:${b.dataset.earnMonth}`));
   });
-  document.querySelectorAll('[data-plan-diff-month]').forEach((b) => {
-    b.setAttribute('aria-expanded', String(monthPopFor === `planDiff:${b.dataset.planDiffMonth}`));
-  });
   document.querySelectorAll('[data-plan-traj-month]').forEach((b) => {
     b.setAttribute('aria-expanded', String(monthPopFor === `planTraj:${b.dataset.planTrajMonth}`));
   });
@@ -8555,10 +8544,17 @@ $('#monthPop').addEventListener('click', (e) => {
   if (monthPopIsEntry()) { setEntryMonth(monthPopFor, cell.dataset.ym); closeMonthPop(); return; }
   // Planning op date: a pick fills the button label (formatted
   // month) and the hidden input (YYYY-MM-01, day fixed to 01).
+  // The hidden input is written via the BUTTON'S SIBLING, never via
+  // getElementById: planMonthBtnHtml renders the same
+  // #planOpDateVal id in both the Add-strategy first-op section and
+  // the Add-operation modal, so a global lookup wrote the lingering
+  // strategy form's input while the submit read the op modal's own
+  // (still empty) one — "date is required" on a picked date.
   if (monthPopFor === 'planOp') {
     const ym = cell.dataset.ym;
     if (planMonthBtn) { planMonthBtn.dataset.value = ym; planMonthBtn.textContent = formatYM(ym); }
-    const hid = document.getElementById('planOpDateVal');
+    const sib = planMonthBtn ? planMonthBtn.nextElementSibling : null;
+    const hid = (sib && sib.id === 'planOpDateVal') ? sib : document.getElementById('planOpDateVal');
     if (hid) hid.value = ym + '-01';
     closeMonthPop();
     return;
@@ -8579,31 +8575,6 @@ $('#monthPop').addEventListener('click', (e) => {
     document.querySelectorAll(`[data-earn-range="${key}"] [data-years]`).forEach((b) => b.classList.remove('active'));
     document.querySelectorAll(`[data-earn-range="${key}"] [data-preset]`).forEach((b) => b.classList.remove('active'));
     drawEarnVisibleChart();
-    return;
-  }
-  // Strategy-diff range: a pick fills that side only, keeps the
-  // other side's current effective value, clamps the pair (a start
-  // past the end pulls the end up to the start), clears the preset
-  // highlight, and re-renders the diff — no refetch, the series is
-  // already on the page.
-  if (monthPopFor.startsWith('planDiff:')) {
-    const which = monthPopFor.split(':')[1];
-    const ym = cell.dataset.ym;
-    closeMonthPop();
-    if (!planDiffData || !ym) return;
-    const eff = planDiffEffectiveRange(planDiffMonthly(planDiffData));
-    if (which === 'from') {
-      planDiffState.from = ym;
-      if (planDiffState.preset !== 'custom') planDiffState.to = eff.to;
-    } else {
-      planDiffState.to = ym;
-      if (planDiffState.preset !== 'custom') planDiffState.from = eff.from;
-    }
-    if (planDiffState.from && planDiffState.to && planDiffState.from > planDiffState.to) {
-      if (which === 'from') planDiffState.to = planDiffState.from; else planDiffState.from = planDiffState.to;
-    }
-    planDiffState.preset = 'custom';
-    planDiffRender();
     return;
   }
   // Comparison-trajectory range: same fill-one-side + clamp + custom
@@ -12043,29 +12014,6 @@ function planFlowPickedStrategies() {
   const all = (d.strategies || []).map((s) => s.id);
   return planWiringStrategyIds == null ? all : all.filter((id) => planWiringStrategyIds.includes(id));
 }
-// Routing rule: any AI-designed entity in the wiring selection
-// (scenario source 'ai', baseline source 'ai', or a strategy whose
-// attached model row carries source 'ai') blocks the preset button —
-// the written static model cannot cover AI-authored specs. Unmarked
-// legacy entities count as engine.
-function planFlowAiHits() {
-  const d = planProjectData || {};
-  const hits = [];
-  const scenId = planWiringScenarioId();
-  if (scenId != null) {
-    const sc = (d.scenarios || []).find((x) => x.id === scenId);
-    if (sc && sc.source === 'ai') hits.push(`scenario ${sc.name}`);
-  }
-  if (planWiringBaselineId != null) {
-    const b = (d.project && d.project.baselines ? d.project.baselines : []).find((x) => x.id === planWiringBaselineId);
-    if (b && b.source === 'ai') hits.push(`baseline ${b.name}`);
-  }
-  for (const sid of planFlowPickedStrategies()) {
-    const s = (d.strategies || []).find((x) => x.id === sid);
-    if (s && s.modelSource === 'ai') hits.push(`strategy ${s.letter} · ${s.name}`);
-  }
-  return hits;
-}
 function planFlowPresetTitle() {
   const d = planProjectData || {};
   const scenId = planWiringScenarioId();
@@ -12082,13 +12030,12 @@ function planFlowGenerateRefresh() {
   const missing = [];
   if ((d.scenarios || []).length && planWiringScenarioId() == null) missing.push('a scenario');
   if (!planFlowPickedStrategies().length) missing.push('at least one strategy');
-  const aiHits = planFlowAiHits();
+  // No forced routing anymore (user 2026-11-04): both Generate
+  // buttons are always available once the picks are complete —
+  // choosing the button IS choosing the engine (preset vs AI).
   if (missing.length) {
     btn.disabled = true;
     note.textContent = `Pick ${missing.join(', ')} to generate.`;
-  } else if (aiHits.length) {
-    btn.disabled = true;
-    note.textContent = `Selection includes AI-designed ${aiHits.join(', ')} — use Generate with AI.`;
   } else {
     btn.disabled = false;
     note.textContent = '';
@@ -12632,11 +12579,6 @@ function openPlanReportAiModal(projectId, opts = {}) {
   $('#planReportAiText').value = '';
   $('#planReportAiOut').innerHTML = '';
   showMsg($('#planReportAiMsg'), '', '');
-  // Model-design section resets on every open (its thread is per-open;
-  // the modal is transient, unlike the project-page panel).
-  $('#planReportAiModelText').value = '';
-  $('#planReportAiModelResults').innerHTML = '';
-  showMsg($('#planReportAiModelMsg'), '', '');
   openModal('planReportAiModal');
   // Append mode (per-tab AI Generate): pin pickers are irrelevant —
   // the report keeps its pins, only charts are appended. Reset the
@@ -12647,15 +12589,12 @@ function openPlanReportAiModal(projectId, opts = {}) {
   for (const id of ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
     document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.remove('hidden');
   }
-  $('#planReportAiModelSection').classList.remove('hidden');
   const appendNote = $('#planReportAiAppendNote');
   appendNote.classList.add('hidden');
   if (appendTo) {
     for (const id of ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
       document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.add('hidden');
     }
-    // Append mode appends charts only: model design stays out of it.
-    $('#planReportAiModelSection').classList.add('hidden');
     appendNote.textContent = `Appends to ${appendTo.reportName} · pins unchanged.`;
     appendNote.classList.remove('hidden');
   }
@@ -12681,7 +12620,6 @@ function openPlanReportAiModal(projectId, opts = {}) {
     const locked = opts.lockedStrategyIds || null;
     const shown = locked ? strs.filter((x) => locked.includes(x.id)) : strs;
     $('#planReportAiStrategies').innerHTML = shown.map((x) => `<label><input type="checkbox" value="${x.id}" checked${locked ? ' disabled' : ''}> ${esc(x.letter)} · ${esc(x.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
-    $('#planReportAiModelStrategies').innerHTML = strs.map((x) => `<label><input type="checkbox" value="${x.id}"> ${esc(x.letter)} · ${esc(x.name)}</label>`).join('') || '<div class="note">No strategies yet.</div>';
   }).catch(() => { /* pickers stay empty; save falls back to project base */ });
   $('#planReportAiGenBtn').onclick = async () => {
     const msg = $('#planReportAiMsg');
@@ -12729,129 +12667,6 @@ function openPlanReportAiModal(projectId, opts = {}) {
       };
     } catch (err) { showMsg(msg, 'err', err.message); }
   };
-  $('#planReportAiModelBtn').onclick = () => planReportAiModelDesign(projectId);
-}
-
-// Model design inside the Generate with AI modal (moved here from the
-// project-page AI panel, user decision 2026-11-03): same ai-model
-// endpoint, same ask/answer/thread rules — the designed model still
-// attaches to the STRATEGY via PUT model_id (modelSource 'ai'), never
-// to the report. The modal's thread is per-open (the modal is
-// transient); the strategy page's Refine with AI keeps the stored
-// thread for follow-ups on an attached model. Model design is
-// independent of the report's pins: the strategy picker here is its
-// own picker, and attaching a model does not change the report.
-// Multi-select: Propose walks the checked strategies IN ORDER, each
-// with its own ask/answer thread (bindings differ per strategy, so
-// questions may differ). A failure on one strategy is shown on its
-// block and does NOT block the others. A fresh Propose supersedes a
-// running one (run token); the modal stays open showing results.
-let planReportAiModelRunSeq = 0;
-async function planReportAiModelDesign(projectId) {
-  const msg = $('#planReportAiModelMsg');
-  const resultsEl = $('#planReportAiModelResults');
-  const sids = [...document.querySelectorAll('#planReportAiModelStrategies input:checked')].map((el) => Number(el.value));
-  const text = $('#planReportAiModelText').value.trim();
-  if (!sids.length) { showMsg(msg, 'err', 'Select at least one strategy first'); return; }
-  if (!text) { showMsg(msg, 'err', 'Describe the model first'); return; }
-  showMsg(msg, '', '');
-  resultsEl.innerHTML = '';
-  const runSeq = ++planReportAiModelRunSeq;
-  const names = {};
-  document.querySelectorAll('#planReportAiModelStrategies label').forEach((lab) => {
-    const inp = lab.querySelector('input');
-    if (inp) names[Number(inp.value)] = lab.textContent.trim();
-  });
-  for (const sid of sids) {
-    if (runSeq !== planReportAiModelRunSeq) return;
-    const block = document.createElement('div');
-    block.className = 'plan-row';
-    block.dataset.planModelStrategy = String(sid);
-    block.innerHTML = `<span>${esc(names[sid] || `Strategy ${sid}`)} — <span data-plan-model-status>Designing…</span></span><div data-plan-model-thread></div><div data-plan-model-ask></div><div data-plan-model-out></div>`;
-    resultsEl.appendChild(block);
-    const setStatus = (t) => { const el = block.querySelector('[data-plan-model-status]'); if (el) el.textContent = t; };
-    try {
-      await designOnePlanReportAiModel(sid, text, block, projectId);
-      if (runSeq !== planReportAiModelRunSeq) return;
-      setStatus('Designed');
-    } catch (err) {
-      if (runSeq !== planReportAiModelRunSeq) return;
-      setStatus(`Failed: ${err.message}`);
-    }
-  }
-}
-async function designOnePlanReportAiModel(sid, text, block, projectId) {
-  const msg = $('#planReportAiModelMsg');
-  const askHost = block.querySelector('[data-plan-model-ask]');
-  const out = block.querySelector('[data-plan-model-out]');
-  const threadEl = block.querySelector('[data-plan-model-thread]');
-  const thread = [];
-  const renderThread = () => {
-    const labels = {};
-    threadEl.innerHTML = thread.map((t) => {
-      if (t.role === 'ai' && t.questions) {
-        for (const q of t.questions) if (q.field) labels[q.field] = q.label;
-        return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
-      }
-      if (t.role === 'ai') return `<div class="plan-row"><span>AI: ${esc(t.summary || '')}</span></div>`;
-      if (t.answers) return Object.entries(t.answers).map(([k, v]) => `<div class="plan-row"><span>You: ${labels[k] ? `${esc(labels[k])}: ` : ''}${esc(String(v))}</span></div>`).join('');
-      return '';
-    }).join('');
-  };
-  const design = async (answers) => {
-      const history = thread.filter((t) => (t.role === 'ai' && t.questions) || (t.role === 'user' && t.answers));
-      const r = await api(`/api/planning/strategies/${sid}/ai-model`, { method: 'POST', body: { text, answers, history } });
-      if (r.ask) {
-        thread.push({ role: 'ai', questions: r.ask });
-        renderThread();
-        askHost.innerHTML = `${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input data-plan-model-ask-field="${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}<div class="toolbar"><button class="small primary" data-plan-model-continue>Continue design</button></div>`;
-        // Wait for this strategy's Continue click. A missing answer
-        // is a retry-in-place (message shown, form kept); only an API
-        // failure rejects the strategy so the next one still runs.
-        await new Promise((resolve, reject) => {
-          block.querySelector('[data-plan-model-continue]').onclick = async () => {
-            let next;
-            try {
-              next = {};
-              for (const q of r.ask) {
-                const el = askHost.querySelector(`[data-plan-model-ask-field="${CSS.escape(q.field)}"]`);
-                const v = el ? el.value.trim() : '';
-                if (!v) throw new Error('Please answer all questions before continuing.');
-                next[q.field] = q.type === 'number' ? Number(v) : v;
-              }
-            } catch (err) { showMsg(msg, 'err', err.message); return; }
-            thread.push({ role: 'user', answers: next });
-            renderThread();
-            askHost.innerHTML = '';
-            try { await design(next); resolve(); } catch (err) { reject(err); }
-          };
-        });
-        return;
-      }
-      const spec = r.model.spec;
-      const summary = `Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}`;
-      thread.push({ role: 'ai', summary });
-      renderThread();
-      out.innerHTML = `<div class="plan-row"><span>${summary}</span></div><div class="toolbar"><button class="small primary" data-plan-model-apply>Use this model</button></div>`;
-      // Wait for this strategy's Use this model click; a failed attach
-      // keeps the button so the user can retry, and never fails the
-      // strategy outright.
-      await new Promise((resolve) => {
-        block.querySelector('[data-plan-model-apply]').onclick = async () => {
-          try {
-            await api(`/api/planning/strategies/${sid}`, { method: 'PUT', body: { model_id: r.model.id } });
-            out.innerHTML = '';
-            // The page snapshot is stale: mark the strategy AI-modelled
-            // in memory so preset Generate disables immediately.
-            const s = (planProjectData && planProjectData.strategies || []).find((x) => x.id === sid);
-            if (s) s.modelSource = 'ai';
-            planFlowGenerateRefresh();
-            resolve();
-          } catch (err) { showMsg(msg, 'err', err.message); }
-        };
-      });
-    };
-  await design(null);
 }
 
 // ---- report view: charts + tables + how each figure is calculated ----
@@ -13171,6 +12986,346 @@ window.addEventListener('scroll', () => {
   if (!$('#view-planning').classList.contains('hidden') && (!$('#planProject').classList.contains('hidden') || !$('#planStrategy').classList.contains('hidden')) && planReportOutlineTargets.length) planReportOutlineWake();
 }, { passive: true });
 
+// ------------------------------------------- report viewer: engine
+// Report-view state for the current tab: the fetched comparison +
+// report, the chip-selected strategy, the live (unsaved) variable
+// values and the table's year page. Re-render functions read this,
+// never the server, so chip clicks and variable typing never
+// refetch. Apply (variables / AI refine) PUTs and reloads.
+let planReportView = null;
+
+// Client mirror of the server's reportPenaltyFor (src/planning.js):
+// penalty variable for one strategy, default $0, ≥ 0.
+function planReportPenaltyFor(vars, strategyId) {
+  if (!vars || !vars.penalty) return 0;
+  const v = vars.penalty[String(strategyId)];
+  if (v == null || !isFinite(Number(v)) || Number(v) < 0) return 0;
+  return Math.round(Number(v) * 100) / 100;
+}
+
+// Effective comparison for one strategy row under a set of report
+// variables: (1) AI-engine scalars override the preset figures
+// (only when the engine executed without errors); (2) the report's
+// penalty variable replaces the engine penalty in cost
+// (cost = cost − penaltyTotal + variable; net = gain − cost).
+// Pure — the live headline and the saved render both use it.
+function planReportEffectiveComparison(row, vars) {
+  const eff = { ...(row.comparisonBase || row.comparison || {}) };
+  const eng = row.engine;
+  if (eng && !(eng.errors && eng.errors.length)) {
+    for (const [k, v] of Object.entries(eng.scalars || {})) eff[k] = v;
+  }
+  const penalty = planReportPenaltyFor(vars, row.strategy.id);
+  const enginePenalty = Math.round((eff.penaltyTotal || 0) * 100) / 100;
+  eff.penalty = penalty;
+  eff.cost = Math.round(((eff.cost || 0) - enginePenalty + penalty) * 100) / 100;
+  eff.net = Math.round(((eff.gain || 0) - eff.cost) * 100) / 100;
+  return eff;
+}
+
+// Engine + variables overlay (items 2 + 4): mutates the comparison
+// rows and trajectories in place so every section renders executed
+// figures. row.comparisonBase keeps the preset figures for the live
+// (unsaved-variable) recompute; row.comparison is the saved-variable
+// view. AI-engine series override the strategy's trajectory monthly
+// values, so charts and the Difference table show executed figures.
+// A failed engine (errors non-empty) falls back to preset figures.
+function planReportApplyOverlay(comp, report) {
+  const vars = (report.definition && report.definition.variables) || null;
+  const trajs = (comp.report && comp.report.trajectories) || [];
+  for (const row of comp.strategies || []) {
+    row.comparisonBase = { ...(row.comparison || {}) };
+    row.comparison = planReportEffectiveComparison(row, vars);
+    const eng = row.engine;
+    if (eng && !(eng.errors && eng.errors.length) && eng.series) {
+      const traj = trajs.find((t) => t.key === String(row.strategy.id));
+      if (traj && traj.monthly) {
+        for (const [sid, arr] of Object.entries(eng.series)) {
+          if (!Array.isArray(arr)) continue;
+          traj.monthly.forEach((r, i) => { if (i < arr.length && arr[i] != null) r[sid] = arr[i]; });
+        }
+      }
+    }
+  }
+}
+
+// Headline cards for the selected strategy (items 6 + 9): the nine
+// metric cards that used to live on the strategy page. Pool
+// baselines show five (no mortgage figures). Values come from the
+// LIVE variables, so typing a penalty updates cost and net here
+// before Apply.
+function planReportHeadlineCardsHtml(view) {
+  const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
+  if (!row) return '<div class="note">No strategies yet.</div>';
+  const c = planReportEffectiveComparison(row, view.vars);
+  const pool = !!(view.comp.report && view.comp.report.investmentScope);
+  const card = (k, v) => `<div class="card breakdown-card plan-metric-card"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`;
+  const cards = [
+    card('Net benefit', planMoney(c.net)),
+    card('Total cost', planMoney(c.cost)),
+    card('Total gain', planMoney(c.gain)),
+    card('Value at horizon', planMoney(c.valueAtHorizon)),
+  ];
+  if (!pool) cards.push(card('Interest saved', planSigned(c.interestSaved)));
+  cards.push(card('Stock gain', planSigned(c.stockGain)));
+  if (!pool) {
+    cards.push(card('Payoff shift', c.payoffShiftMonths == null ? '—' : `${c.payoffShiftMonths >= 0 ? '+' : ''}${c.payoffShiftMonths} months`));
+    cards.push(card('Monthly payment Δ', planSigned(c.paymentDelta)));
+    cards.push(card('Penalty', planMoney(c.penalty)));
+  }
+  return `<div class="cards">${cards.join('')}</div>`;
+}
+
+// Difference monthly rows for the report table (item 10), built
+// from the report trajectories (baseline + selected strategy) —
+// already entity-scoped and engine-overridden by the overlay.
+function planReportTableRows(view) {
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  const base = trajs[0] || { monthly: [] };
+  const strat = trajs.find((t) => t.key === String(view.selectedStrategyId)) || { monthly: [] };
+  const baseByMonth = new Map((base.monthly || []).map((r) => [r.month, r]));
+  const stratByMonth = new Map((strat.monthly || []).map((r) => [r.month, r]));
+  const months = [...new Set([...baseByMonth.keys(), ...stratByMonth.keys()])].sort();
+  return months.map((m) => {
+    const b = baseByMonth.get(m) || {};
+    const s = stratByMonth.get(m) || {};
+    const balBase = b.mortgage_balance ?? null;
+    const balStrat = s.mortgage_balance ?? null;
+    const intBase = b.interest ?? null;
+    const intStrat = s.interest ?? null;
+    const valBase = b.stock_value ?? null;
+    const valStrat = s.stock_value ?? null;
+    return {
+      month: m, balBase, balStrat,
+      balDiff: (balBase != null && balStrat != null) ? balBase - balStrat : null,
+      intBase, intStrat,
+      intSaved: (intBase != null && intStrat != null) ? intBase - intStrat : null,
+      valBase, valStrat,
+      valDiff: (valBase != null && valStrat != null) ? valStrat - valBase : null,
+    };
+  });
+}
+
+// Report table section (item 10): the monthly Difference table with
+// the difftable kind-gating (pool → no mortgage columns, rows follow
+// the pool/stock series; property → balance columns whenever balance
+// data exists; other → op-nature rule). Monthly only + year pager —
+// the merged comparison already carries annual summaries.
+function planReportTableRender(view) {
+  const host = $('#planReportTableBody');
+  const pager = $('#planReportTablePager');
+  if (!host) return;
+  const rows = planReportTableRows(view);
+  const kind = (view.comp.report && view.comp.report.investmentScope) ? 'pool' : (view.projectCategory === 'property' ? 'property' : 'other');
+  const hasMort = rows.some((r) => r.balBase != null || r.balStrat != null);
+  const hasStock = rows.some((r) => r.valBase != null || r.valStrat != null);
+  const selRow = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId);
+  const touchesMort = !!(selRow && selRow.touchesMortgage);
+  const showBalance = kind === 'pool' ? false : kind === 'property' ? hasMort : touchesMort;
+  const diffRows = kind === 'pool' ? rows.filter((r) => r.valBase != null || r.valStrat != null) : rows;
+  const cap = $('#planReportTableCaption');
+  if (cap) cap.textContent = kind === 'pool' ? 'X: month · Y: CAD — Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
+  if (!diffRows.length) {
+    if (pager) pager.innerHTML = '';
+    host.innerHTML = '<div class="note">No months in this range.</div>';
+    return;
+  }
+  const pageYears = [...new Set(diffRows.map((r) => r.month.slice(0, 4)))];
+  if (!view.tableYear || !pageYears.includes(view.tableYear)) view.tableYear = pageYears[0];
+  if (pager) {
+    pager.innerHTML = pageYears.length > 1 ? pageYears.map((y) => `<button class="small${y === view.tableYear ? ' active' : ''}" data-plan-report-table-year="${y}">${y}</button>`).join('') : '';
+    pager.querySelectorAll('[data-plan-report-table-year]').forEach((b) => b.addEventListener('click', () => { view.tableYear = b.dataset.planReportTableYear; planReportTableRender(view); }));
+  }
+  const pageRows = diffRows.filter((r) => r.month.slice(0, 4) === view.tableYear);
+  const diffCls = (v) => (v != null && v !== 0) ? ' class="plan-diff"' : '';
+  let head = '<tr><th>Month</th>';
+  if (showBalance) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Balance Δ</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
+  if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
+  head += '</tr>';
+  const cols = 1 + (showBalance ? 6 : 0) + (hasStock ? 3 : 0);
+  let body = '';
+  let curYear = null; let yearRows = [];
+  const flushYear = () => {
+    if (!yearRows.length) return;
+    const last = yearRows[yearRows.length - 1];
+    const sum = (f) => yearRows.reduce((a, r) => a + (r[f] || 0), 0);
+    body += `<tr class="plan-year-total"><td>${curYear} total</td>`;
+    if (showBalance) body += `<td>${planMoney(last.balBase)}</td><td>${planMoney(last.balStrat)}</td><td${diffCls(last.balDiff)}>${planSigned(last.balDiff)}</td><td>${planMoney(sum('intBase'))}</td><td>${planMoney(sum('intStrat'))}</td><td${diffCls(sum('intSaved'))}>${planSigned(sum('intSaved'))}</td>`;
+    if (hasStock) body += `<td>${planMoney(last.valBase)}</td><td>${planMoney(last.valStrat)}</td><td${diffCls(last.valDiff)}>${planSigned(last.valDiff)}</td>`;
+    body += '</tr>';
+  };
+  for (const r of pageRows) {
+    const y = r.month.slice(0, 4);
+    if (y !== curYear) { flushYear(); curYear = y; yearRows = []; body += `<tr class="plan-year-head"><td colspan="${cols}">${y}</td></tr>`; }
+    yearRows.push(r);
+    let x = `<tr><td>${formatYM(r.month)}</td>`;
+    if (showBalance) x += `<td>${planMoney(r.balBase)}</td><td>${planMoney(r.balStrat)}</td><td${diffCls(r.balDiff)}>${planSigned(r.balDiff)}</td><td>${planMoney(r.intBase)}</td><td>${planMoney(r.intStrat)}</td><td${diffCls(r.intSaved)}>${planSigned(r.intSaved)}</td>`;
+    if (hasStock) x += `<td>${planMoney(r.valBase)}</td><td>${planMoney(r.valStrat)}</td><td${diffCls(r.valDiff)}>${planSigned(r.valDiff)}</td>`;
+    body += x + '</tr>';
+  }
+  flushYear();
+  host.innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+// Engine explanation (item 9): plain language, actual numbers,
+// always last. Names the engine (preset vs AI), what the AI engine
+// defined vs what fell back to preset, the flat VALUE AT HORIZON
+// definition, and the penalty-variable state.
+function planReportEngineHtml(view) {
+  const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
+  const c = row ? planReportEffectiveComparison(row, view.vars) : {};
+  const eng = row && row.engine;
+  const hasEngine = !!(view.report.definition && view.report.definition.engine && typeof view.report.definition.engine === 'object');
+  const engFailed = !!(eng && eng.errors && eng.errors.length);
+  const engDef = hasEngine ? (view.report.definition.engine || {}) : {};
+  const definedSeries = Object.keys(engDef.series || {});
+  const definedScalars = Object.keys(engDef.scalars || {});
+  const definedInputs = (engDef.inputs || []).map((i) => i.key).filter(Boolean);
+  const engineLine = !hasEngine
+    ? 'Preset engine — the app\u2019s deterministic engine: operations, terms and scenario factors, computed by the app. No AI figures.'
+    : engFailed
+      ? `AI engine — the AI wrote a calculation definition, but it failed to evaluate (${esc((eng.errors || []).join('; '))}), so every figure below is the preset engine\u2019s.`
+      : `AI engine — the AI wrote a calculation definition and the app executed it. Defined: ${[...definedSeries.map((s) => `series ${s}`), ...definedScalars.map((s) => `scalar ${s}`), ...definedInputs.map((s) => `input ${s}`)].join(', ') || 'nothing — the preset engine covers every figure'}. Everything else is the preset engine\u2019s figure.`;
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  const months = ((trajs[0] || {}).monthly || []).map((r) => r.month);
+  const horizonLine = months.length ? `Horizon: ${formatYM(months[0])} – ${formatYM(months[months.length - 1])} (${months.length} months).` : '';
+  const bd = row && view.costBreakdown ? view.costBreakdown[row.strategy.id] : null;
+  const costLine = row
+    ? `${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost ${planMoney(c.cost)}${bd ? ` (fees ${planMoney(bd.fees)} + penalty ${planMoney(c.penalty)} + cash out ${planMoney(bd.cashOut)})` : ''} · gain ${planMoney(c.gain)} (interest saved ${planSigned(c.interestSaved)} + stock gain ${planSigned(c.stockGain)}) · net ${planMoney(c.net)}. Value at horizon ${planMoney(c.valueAtHorizon)}.`
+    : '';
+  const penState = (view.comp.strategies || []).map((r) => {
+    const v = planReportPenaltyFor(view.vars, r.strategy.id);
+    return `${esc(r.strategy.letter)} · ${esc(r.strategy.name)}: ${planMoney(v)}`;
+  }).join(' · ');
+  return `<div class="panel"><div class="section-head"><h3>Engine</h3></div>
+    <div class="note">${engineLine}</div>
+    ${horizonLine ? `<div class="note">${horizonLine}</div>` : ''}
+    ${costLine ? `<div class="note">${costLine}</div>` : ''}
+    <div class="note">Value at horizon = property equity at the horizon month + stock value at the horizon month at today\u2019s known prices (no growth) + cash pot.</div>
+    <div class="note">Penalty is a report variable (default $0): ${penState || 'none'}. It changes cost and net only — never the trajectories.</div>
+    <div class="note">Refine: edit this strategy\u2019s operations, funding or scenario on its page, then press Generate again. ${row ? `<a href="#planning/strategy/${row.strategy.id}">Edit ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</a>` : ''}</div>
+  </div>`;
+}
+
+// Variables panel (items 4 + 5): one penalty amount input per pinned
+// strategy, default $0. Typing updates the headline, the cost
+// breakdown table and the engine note live; Apply saves the
+// variables with the report (PUT) and reloads, which refreshes the
+// charts and the comparison table. What-if never writes.
+function planReportVariablesHtml(view) {
+  const rows = (view.comp.strategies || []).map((r) => {
+    const v = planReportPenaltyFor(view.vars, r.strategy.id);
+    return `<div><label>Penalty — ${esc(r.strategy.letter)} · ${esc(r.strategy.name)} ($)</label><input type="text" inputmode="decimal" data-money data-plan-report-penalty="${r.strategy.id}" value="${v}"><div class="note">Default $0. Changes cost and net only.</div></div>`;
+  }).join('');
+  return `<div class="panel"><div class="section-head"><h3>Variables</h3></div>
+    <div class="note">Penalty is a report variable: type an amount to see cost and net change live. It changes cost and net only — never the trajectories.</div>
+    ${rows || '<div class="note">No strategies yet.</div>'}
+    <div class="toolbar"><button class="small primary" id="planReportVarsApplyBtn">Apply</button></div>
+    <div class="msg" id="planReportVarsMsg"></div>
+  </div>`;
+}
+
+// Cost-breakdown table body (shared by the chart panel and the live
+// variable update): fees + penalty variable + cash out.
+function planReportCostBodyHtml(fees, penVar, cashOut) {
+  const total = (fees || 0) + (penVar || 0) + (cashOut || 0);
+  const labels = ['Fees', 'Penalty (report variable)', 'Cash out'];
+  const data = [fees || 0, penVar || 0, cashOut || 0];
+  return labels.map((l, li) => `<tr><td>${l}</td><td>${money2(data[li])}</td><td>${total ? `${((data[li] / total) * 100).toFixed(1)}%` : '—'}</td></tr>`).join('');
+}
+
+// Refine-with-AI panel (item 3, AI path only): follow-up text →
+// ai-refine → complete revised definition + old→new diff preview →
+// Apply (PUT) writes it. Preview-only until Apply.
+function planReportRefineHtml() {
+  return `<div class="panel"><div class="section-head"><h3>Refine with AI</h3></div>
+    <div class="note">Ask the AI to change this report — it rewrites the engine definition and the charts, then shows the changes for you to apply. Nothing is saved until you press Apply.</div>
+    <div><textarea id="planReportRefineText" rows="3" placeholder="e.g. Show the payoff month instead of the payment delta"></textarea></div>
+    <div class="toolbar"><button class="small primary" id="planReportRefineSendBtn">Send</button></div>
+    <div id="planReportRefineOut"></div>
+    <div class="msg" id="planReportRefineMsg"></div>
+  </div>`;
+}
+
+function planReportRefineDiffHtml(diff) {
+  const lines = [];
+  for (const t of (diff.charts.added || [])) lines.push(`+ Chart ${t}`);
+  for (const t of (diff.charts.removed || [])) lines.push(`− Chart ${t}`);
+  for (const t of (diff.charts.changed || [])) lines.push(`~ Chart ${t}`);
+  for (const [section, d] of [['series', diff.engine.series], ['scalars', diff.engine.scalars], ['inputs', diff.engine.inputs]]) {
+    if (!d) continue;
+    for (const k of (d.added || [])) lines.push(`+ Engine ${section} ${k}`);
+    for (const k of (d.removed || [])) lines.push(`− Engine ${section} ${k}`);
+    for (const k of (d.changed || [])) lines.push(`~ Engine ${section} ${k}`);
+  }
+  return lines.length ? `<div class="note">${lines.map((l) => esc(l)).join('<br>')}</div>` : '<div class="note">No changes.</div>';
+}
+
+// Wiring for the report sections: headline chip picker, variable
+// inputs (live) + Apply, AI refine Send/Apply.
+function planReportViewWire(view) {
+  document.querySelectorAll('[data-plan-report-headline-strategy]').forEach((b) => b.addEventListener('click', () => {
+    view.selectedStrategyId = Number(b.dataset.planReportHeadlineStrategy);
+    document.querySelectorAll('[data-plan-report-headline-strategy]').forEach((x) => x.classList.toggle('active', Number(x.dataset.planReportHeadlineStrategy) === view.selectedStrategyId));
+    const cards = $('#planReportHeadlineCards');
+    if (cards) cards.innerHTML = planReportHeadlineCardsHtml(view);
+    planReportTableRender(view);
+    const eng = $('#planReportEngineBody');
+    if (eng) eng.innerHTML = planReportEngineHtml(view);
+  }));
+  document.querySelectorAll('[data-plan-report-penalty]').forEach((input) => input.addEventListener('input', () => {
+    const sid = input.dataset.planReportPenalty;
+    const raw = String(input.value || '').replace(/,/g, '').trim();
+    const v = raw === '' ? 0 : Number(raw);
+    if (!view.vars.penalty) view.vars.penalty = {};
+    view.vars.penalty[sid] = Number.isFinite(v) && v >= 0 ? Math.round(v * 100) / 100 : 0;
+    const cards = $('#planReportHeadlineCards');
+    if (cards) cards.innerHTML = planReportHeadlineCardsHtml(view);
+    const eng = $('#planReportEngineBody');
+    if (eng) eng.innerHTML = planReportEngineHtml(view);
+    const costBody = $('#planReportCostBody');
+    if (costBody && view.costDoughnut) {
+      const penVar = planReportPenaltyFor(view.vars, view.costDoughnut.strategyId);
+      costBody.innerHTML = planReportCostBodyHtml(view.costDoughnut.fees, penVar, view.costDoughnut.cashOut);
+    }
+  }));
+  const applyBtn = $('#planReportVarsApplyBtn');
+  if (applyBtn) applyBtn.addEventListener('click', async () => {
+    const msg = $('#planReportVarsMsg');
+    try {
+      const penalty = {};
+      document.querySelectorAll('[data-plan-report-penalty]').forEach((input) => {
+        const raw = String(input.value || '').replace(/,/g, '').trim();
+        const v = raw === '' ? 0 : Number(raw);
+        if (!Number.isFinite(v) || v < 0) throw new Error('Penalty must be a number ≥ 0');
+        penalty[input.dataset.planReportPenalty] = Math.round(v * 100) / 100;
+      });
+      const def = { ...(view.report.definition || {}), variables: { penalty } };
+      await api(`/api/planning/reports/${view.reportId}`, { method: 'PUT', body: { definition: def } });
+      loadPlanReport(view.projectId, view.reportId);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+  const refineSend = $('#planReportRefineSendBtn');
+  if (refineSend) refineSend.addEventListener('click', async () => {
+    const msg = $('#planReportRefineMsg');
+    const out = $('#planReportRefineOut');
+    const text = String($('#planReportRefineText').value || '').trim();
+    if (!text) { showMsg(msg, 'err', 'Say what to change first.'); return; }
+    try {
+      const r = await api(`/api/planning/reports/${view.reportId}/ai-refine`, { method: 'POST', body: { text } });
+      view.refineDefinition = r.definition;
+      if (out) out.innerHTML = `${planReportRefineDiffHtml(r.diff || {})}<div class="toolbar"><button class="small primary" id="planReportRefineApplyBtn">Apply</button></div>`;
+      const applyBtn2 = $('#planReportRefineApplyBtn');
+      if (applyBtn2) applyBtn2.addEventListener('click', async () => {
+        try {
+          await api(`/api/planning/reports/${view.reportId}`, { method: 'PUT', body: { definition: view.refineDefinition } });
+          loadPlanReport(view.projectId, view.reportId);
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      });
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+}
+
 async function loadPlanReport(projectId, reportId) {
   return withLoading(async () => {
     const mySeq = ++planReportLoadSeq;
@@ -13227,6 +13382,10 @@ async function loadPlanReport(projectId, reportId) {
     const q = [];
     if (report.baseline_id) q.push(`baselineId=${report.baseline_id}`);
     if (scenarioIds.length) q.push(`scenarioIds=${scenarioIds.join(',')}`);
+    // reportId: the comparison evaluates the report's AI engine (if
+    // any) per strategy and attaches row.engine — preset reports get
+    // no engine block.
+    q.push(`reportId=${reportId}`);
     let comp;
     try {
       comp = await api(`/api/planning/projects/${projectId}/comparison${q.length ? `?${q.join('&')}` : ''}`);
@@ -13251,6 +13410,28 @@ async function loadPlanReport(projectId, reportId) {
       comp.strategies = kept;
       if (comp.report) comp.report.trajectories = keptTrajs;
     }
+    // Engine + variables overlay (items 2 + 4): AI-engine scalars /
+    // series override the preset figures, and the report's penalty
+    // variables replace the engine penalty in cost. Applied once
+    // here so every section renders executed figures.
+    planReportApplyOverlay(comp, report);
+    // Report-view state: the chip-selected strategy drives the
+    // headline, the table and the engine note; it survives reloads
+    // within the tab while the report stays open.
+    const prevView = planReportView && planReportView.reportId === reportId ? planReportView : null;
+    const selectedStrategyId = prevView && prevView.selectedStrategyId && comp.strategies.some((r) => r.strategy.id === prevView.selectedStrategyId)
+      ? prevView.selectedStrategyId
+      : (comp.strategies[0] ? comp.strategies[0].strategy.id : null);
+    planReportView = {
+      projectId, reportId, comp, report, scenarioIds, pickedIds,
+      selectedStrategyId,
+      vars: JSON.parse(JSON.stringify((report.definition && report.definition.variables) || {})),
+      tableYear: prevView ? prevView.tableYear : null,
+      projectCategory: proj.project ? proj.project.category : null,
+      costBreakdown: (comp.report && comp.report.costBreakdown) || null,
+      costDoughnut: null,
+      refineDefinition: null,
+    };
     // Mortgage-chart visibility follows the BASELINE kind, not the
     // pins or the page (user 2026-11-04): on a cash-pool baseline
     // (the report's investmentScope flag) mortgage-only chart blocks
@@ -13298,6 +13479,11 @@ async function loadPlanReport(projectId, reportId) {
     const panels = [];
     const draws = [];
     charts.forEach((c, i) => {
+      // metric_cards blocks are the headline now (item 9) — the
+      // headline section renders the fixed card set for the selected
+      // strategy, so the definition's metric_cards block never
+      // renders twice.
+      if (c.template === 'metric_cards') return;
       const series = (c.series && c.series.length ? c.series : null);
       // Mortgage-only blocks hide on a cash-pool baseline (see
       // cashPoolBaseline above). A block with any non-mortgage series
@@ -13397,11 +13583,18 @@ async function loadPlanReport(projectId, reportId) {
           const row = comp.strategies[0];
           if (row && rep.costBreakdown) {
             const bd = rep.costBreakdown[row.strategy.id];
-            const labels = ['Fees', 'Penalty (estimate)', 'Cash out'];
-            const data = [bd.fees, bd.penalty, bd.cashOut];
-            const total = bd.total;
-            const body = labels.map((l, li) => `<tr><td>${l}</td><td>${money2(data[li])}</td><td>${total ? `${((data[li] / total) * 100).toFixed(1)}%` : '—'}</td></tr>`).join('');
-            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Component</th><th>Amount</th><th>Share</th></tr></thead><tbody>${body}</tbody></table><div class="note">Cost breakdown for ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost = fees + penalty + cash out (prepay cash + buy cash). Penalty is an estimate; the bank quote governs.</div></div>`);
+            // Penalty slice = the report variable (default $0), not
+            // the engine estimate (item 4): cost = fees + penalty
+            // variable + cash out. The chart draws the saved value;
+            // typing updates the table live and Apply reloads the
+            // chart.
+            const penVar = planReportPenaltyFor(planReportView.vars, row.strategy.id);
+            const labels = ['Fees', 'Penalty (report variable)', 'Cash out'];
+            const data = [bd.fees, penVar, bd.cashOut];
+            const total = (bd.fees || 0) + (penVar || 0) + (bd.cashOut || 0);
+            const body = planReportCostBodyHtml(bd.fees, penVar, bd.cashOut);
+            planReportView.costDoughnut = { strategyId: row.strategy.id, fees: bd.fees, cashOut: bd.cashOut };
+            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Component</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planReportCostBody">${body}</tbody></table><div class="note">Cost breakdown for ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost = fees + penalty + cash out (prepay cash + buy cash). Penalty is a report variable (default $0) — it changes cost and net only.</div></div>`);
             draws.push(() => planDoughnutChart(cid, labels, data, 'Total cost', total));
           } else {
             panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no strategy cost breakdown available.</div></div>`);
@@ -13459,6 +13652,17 @@ async function loadPlanReport(projectId, reportId) {
       : 'Current rates (no scenario)';
     planReportTabsOpen(projectId, reportId, report.name);
     const renderedStrategyIds = comp.strategies.map((r) => r.strategy.id);
+    // Report sections (item 9), in order: headline → chart → table →
+    // strategy对比 (the merged cross-strategy table, multi-strategy
+    // reports only — the Δ chart + breakdown in the comparison
+    // panel stay for every report) → engine explanation (always
+    // last). Variables sit above the headline; Refine with AI
+    // follows the engine note, AI reports only. Each section is a
+    // data-plan-report-block so the floating outline nav lists it;
+    // the comparison panel keeps its own id (the outline adds it
+    // once, by id).
+    const isAiReport = !!(report.definition && report.definition.engine && typeof report.definition.engine === 'object');
+    const headlineChips = comp.strategies.map((r) => `<button class="small${r.strategy.id === planReportView.selectedStrategyId ? ' active' : ''}" data-plan-report-headline-strategy="${r.strategy.id}">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}</button>`).join(' ');
     $('#planReport').innerHTML = `
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
@@ -13467,7 +13671,19 @@ async function loadPlanReport(projectId, reportId) {
         ${mortHidden ? `<div class="note">Mortgage charts hidden — this report's baseline is a cash pool.</div>` : ''}
         <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
       </div>
+      <div data-plan-report-block="variables">${planReportVariablesHtml(planReportView)}</div>
+      <div data-plan-report-block="headline"><div class="panel">
+        <div class="section-head"><h3>Headline</h3></div>
+        <div class="toolbar">${headlineChips}</div>
+        <div id="planReportHeadlineCards">${planReportHeadlineCardsHtml(planReportView)}</div>
+      </div></div>
       ${panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>'}
+      <div data-plan-report-block="table"><div class="panel">
+        <div class="section-head"><h3>Difference vs baseline</h3></div>
+        <div class="note" id="planReportTableCaption"></div>
+        <div class="toolbar" id="planReportTablePager"></div>
+        <div id="planReportTableBody"></div>
+      </div></div>
       <div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
@@ -13483,11 +13699,16 @@ async function loadPlanReport(projectId, reportId) {
         <div id="planReportTrajectoryBreakdownEmpty"></div>
         <div id="planReportMergedTable"></div>
         <div class="note">${(comp.report && comp.report.investmentScope) ? 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Trajectory total value = cash pool balance + stock value (investment scope — property equity excluded); Value at horizon = property equity + stock value + cash pot.' : 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Total value = property equity + stock value; equity = assessed value − outstanding principal.'}</div>
-      </div>`;
+      </div>
+      <div data-plan-report-block="engine"><div id="planReportEngineBody">${planReportEngineHtml(planReportView)}</div></div>
+      ${isAiReport ? `<div data-plan-report-block="refine">${planReportRefineHtml()}</div>` : ''}`;
     draws.forEach((d) => { try { d(); } catch { /* a failed chart never blocks the tables */ } });
-    // Project report includes the comparison component, reused from
-    // the project page (same renderers, report-scoped ids) — the
-    // block here is already filtered to the report's picked strategies.
+    // Table section renders from the already-fetched trajectories.
+    planReportTableRender(planReportView);
+    // Comparison component: the Δ chart + payment breakdown render
+    // for every report; the merged cross-strategy table inside it
+    // renders only for multi-strategy reports (gated in
+    // planCompareNewRender).
     try {
       planCompareNewRender({ scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report }, {
         note: '#planReportTrajectoryNote', chart: 'planReportTrajectoryChart', empty: '#planReportTrajectoryEmpty',
@@ -13508,30 +13729,21 @@ async function loadPlanReport(projectId, reportId) {
         },
       });
     } catch { /* a failed comparison chart never blocks the report tables */ }
+    planReportViewWire(planReportView);
     planReportViewSync(projectId, reportId);
     // Per-tab actions live in the sticky bar above the viewer (the
     // sync above rebuilds the bar, so fill it here before wiring);
     // the header panel keeps title/subtitle/definitions only.
     const planTabActions = $('#planReportTabActionsBar');
-    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="note" id="planReportTabNote"></div><div class="msg" id="planReportMsg"></div>`;
-    // Per-tab actions. Routing applies per tab by THIS report's pins:
-    // any AI-designed pinned entity disables preset Generate (AI
-    // Generate stays enabled). Preset Generate re-pins the report,
+    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="msg" id="planReportMsg"></div>`;
+    // Per-tab actions. Both Generate buttons are always available:
+    // the button IS the engine choice (preset vs AI) — no routing
+    // rule disables either. Preset Generate re-pins the report,
     // which bumps updated_at and clears the computed stale flag; the
     // view itself always renders live comparison data. Save exports
     // the tab as PDF via the browser print path. Block Delete drops
     // one chart from the saved definition and reloads.
-    const tabAiHits = [];
-    const tabBase = (proj.project.baselines || []).find((x) => x.id === report.baseline_id);
-    if (tabBase && tabBase.source === 'ai') tabAiHits.push(`baseline ${tabBase.name}`);
-    for (const sid of scenarioIds) { const sc = projScenarios.find((x) => x.id === sid); if (sc && sc.source === 'ai') tabAiHits.push(`scenario ${sc.name}`); }
-    const stratById = new Map((proj.strategies || []).map((s) => [s.id, s]));
-    for (const row of comp.strategies) { const s = stratById.get(row.strategy.id); if (s && s.modelSource === 'ai') tabAiHits.push(`strategy ${s.letter} · ${s.name}`); }
     const tabGenBtn = $('#planReportTabGenerateBtn');
-    if (tabAiHits.length) {
-      tabGenBtn.disabled = true;
-      $('#planReportTabNote').textContent = `This report includes AI-designed ${tabAiHits.join(', ')} — use Generate with AI.`;
-    }
     tabGenBtn.addEventListener('click', async () => {
       try {
         const body = { scenario_ids: scenarioIds };
@@ -13614,72 +13826,6 @@ function planStrategyHtml(d) {
       <div class="n">Source: ${esc(o.source || '')}</div>${legRows}
       <div class="toolbar"><button class="small" data-plan-op-edit="${o.id}">Edit</button><button class="small danger" data-plan-op-del="${o.id}">Delete</button></div></div>`;
   }).join('');
-  const penRows = (d.projection.penalties || []).map((x) => `
-    <div class="plan-row"><span>${esc(x.reason || 'Penalty')} · ${esc(x.date)} · ${esc(x.method)} · ${money2(x.penalty)}</span>
-    <span class="note">Estimate — the bank quote governs</span></div>`).join('');
-  // No scenario table anymore: rate paths live on this strategy's
-  // factors (the Factors panel below).
-  // Annual interest table from the summed series.
-  const yearMap = new Map();
-  const addSeries = (series, key) => {
-    for (const row of series || []) {
-      const y = row.month.slice(0, 4);
-      if (!yearMap.has(y)) yearMap.set(y, { base: 0, strat: 0 });
-      yearMap.get(y)[key] += row.interest || 0;
-    }
-  };
-  for (const per of Object.values(d.projection.mortgage.perProperty)) {
-    addSeries(per.baseline && per.baseline.series, 'base');
-    addSeries(per.strategy && per.strategy.series, 'strat');
-  }
-  const yearRows = [...yearMap.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([y, v]) => `
-    <tr><td>${y}</td><td>${money2(v.base)}</td><td>${money2(v.strat)}</td><td>${planSigned(v.base - v.strat)}</td></tr>`).join('');
-  const asm = {};
-  for (const a of d.assumptions) asm[a.key] = a;
-  // Stock value chart only when the strategy touches stocks: a stock
-  // op (buy/sell/position) makes the strategy series differ from the
-  // do-nothing baseline, while a mortgage-only strategy's two lines
-  // coincide exactly (same holdings, no unit deltas). A sink also
-  // counts: saving a sink generates sink buy ops, and even a sink
-  // without ops overrides the strategy run's growth rate
-  // (stockReturnPct), so its series differs from baseline.
-  const showStockChart = (d.ops || []).some((o) => ['buy', 'sell', 'position'].includes(o.op_type)) || !!d.sink;
-  // Assumptions follow THIS strategy, never one global set — but
-  // they are NOT their own section anymore (user 2026-11-04): the
-  // mortgage pair lives in the Penalties panel, the stock return
-  // read-only display lives in the Stock value panel, and empty
-  // strategies show neither (no neutral note anymore). What shows
-  // still depends on the strategy's own ops (a sink counts as
-  // stock — it is investment equipment that overrides the strategy
-  // run's growth rate).
-  const asmHasStock = (d.ops || []).some((o) => ['buy', 'sell', 'position'].includes(o.op_type)) || !!d.sink;
-  const asmHasMortgage = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type));
-  const asmNum = (v) => { const x = Number(v); return Number.isFinite(x) ? x : null; };
-  // Effective stock return, mirroring how the numbers are computed
-  // (server planProjectionFor): a sink return wins over the picked
-  // scenario's stock factor, which wins over per-holding historical
-  // rates. Displayed read-only with its source labeled; editing
-  // stays on the scenario page (or the Sink panel for a sink).
-  const asmSinkRet = d.sink ? (d.sink.kind === 'custom' ? asmNum(d.sink.expectedReturnPct) : asmNum(d.sink.trendPct)) : null;
-  const asmPickedScen = d.appliedScenario ? (d.scenarios || []).find((x) => x.id === d.appliedScenario.id) : null;
-  const asmScenStock = asmPickedScen && asmPickedScen.factors && asmPickedScen.factors.stock ? asmPickedScen.factors.stock : null;
-  const asmScenRet = asmScenStock ? asmNum(asmScenStock.valuePct) : null;
-  const asmStockBlock = !asmHasStock ? '' : asmSinkRet != null
-    ? `<div><label>Stock return (%/yr)</label><div>${asmSinkRet}%/yr · From sink${d.sink.kind === 'custom' && d.sink.name ? ` ${esc(d.sink.name)}` : ' trend'}</div><div class="note">The sink's return overrides the scenario return. Edit it in the Sink panel.</div>${asmScenRet != null ? `<div class="note">Scenario ${esc(asmPickedScen.name)} sets ${asmScenRet}%/yr — overridden by the sink.</div>` : ''}</div>`
-    : asmScenRet != null
-      ? `<div><label>Stock return (%/yr)</label><div>${asmScenRet}%/yr · From scenario ${esc(asmPickedScen.name)}${asmScenStock.basis ? ` (${esc(asmScenStock.basis)}${asmScenStock.window ? ` · ${esc(asmScenStock.window)}` : ''})` : ''}</div><div class="note">Set on the scenario page — shown here read-only.</div></div>`
-      : `<div><label>Stock return (%/yr)</label><div class="note">${asmPickedScen ? `Scenario ${esc(asmPickedScen.name)} sets no stock return — holdings compound at their own historical rates.` : 'Current rates (no scenario) — holdings compound at their own historical rates.'} Set a global return on the scenario page.</div></div>`;
-  // Mortgage penalty inputs (comparable rate + privilege, with
-  // Confirmed checkboxes, per-assumption Delete, Save, and the
-  // functional note — the note stays: it explains computation).
-  // Rendered inside the Penalties panel below, not as a section.
-  const asmMortgageBlock = !asmHasMortgage ? '' : `<div class="grid2">
-        <div><label>Comparable rate (%)</label><input id="planAsmComparable" type="text" inputmode="decimal" data-money value="${asm.comparableRate ? esc(asm.comparableRate.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmComparableOk"${asm.comparableRate && asm.comparableRate.confirmed ? ' checked' : ''}> Confirmed</label><div class="toolbar"><button class="small danger" data-plan-asm-del="comparableRate">Delete</button></div></div>
-        <div><label>Annual prepayment privilege (%)</label><input id="planAsmPrivilege" type="text" inputmode="decimal" data-money value="${asm.privilegePct ? esc(asm.privilegePct.value ?? '') : ''}"><label class="btnlike"><input type="checkbox" id="planAsmPrivilegeOk"${asm.privilegePct && asm.privilegePct.confirmed ? ' checked' : ''}> Confirmed</label><div class="toolbar"><button class="small danger" data-plan-asm-del="privilegePct">Delete</button></div></div>
-      </div>
-      <div class="toolbar"><button class="small" id="planAsmSaveBtn">Save assumptions</button></div>
-      <div class="msg" id="planAsmMsg"></div>
-      <div class="note">Unconfirmed assumptions never enter computation. Blank privilege % = penalty on the full amount (upper bound).</div>`;
   // Strategy page mirrors the project page's tiers (user 2026-11-04):
   // top Scenarios tier (single-select, same semantics as the old
   // picker — a click reloads the detail page under that world; the
@@ -13696,19 +13842,6 @@ function planStrategyHtml(d) {
   // Baseline card's effective returns run under the applied world.
   const fbScen = d.appliedScenario ? (d.scenarios || []).find((x) => x.id === d.appliedScenario.id) : null;
   const fbScenStock = fbScen && fbScen.factors && fbScen.factors.stock ? { name: fbScen.name, stock: fbScen.factors.stock } : null;
-  // Generate-gated chart panels (user 2026-11-04): no computed chart
-  // panel renders on page load — only after Generate report (preset
-  // or AI) in the Reports tier. Contents follow the BASELINE kind,
-  // which wins over op nature on any conflict: a cash-pool baseline
-  // shows the pool/stock panels only, a property baseline the
-  // mortgage/equity/annual panels only, any other baseline the old
-  // op-nature rules. (The Difference TABLE stays visible before
-  // Generate — it is the working comparison, not a report; its
-  // charts are kind-forced in planDiffRender.)
-  const stratKind = d.baselineKind || 'other';
-  const genOpen = !!d.hasGeneratedReport;
-  const showMortPanels = genOpen && (stratKind === 'property' || (stratKind === 'other' && asmHasMortgage));
-  const showPoolPanels = genOpen && (stratKind === 'pool' || (stratKind === 'other' && showStockChart));
   return `
     <div><a id="planStrategyBackLink" href="#planning/project/${d.project.id}">← Back to ${esc(d.project.name)}</a></div>
     <div class="panel">
@@ -13723,44 +13856,6 @@ function planStrategyHtml(d) {
       </div>
       <div class="msg" id="planStrategyMsg"></div>
       ${c.errors && c.errors.length ? `<div class="msg err">${esc(c.errors.join('; '))}</div>` : ''}
-      ${(() => {
-        // Headline = the report's headline (user 2026-11-04): it is
-        // Generate-gated like the chart panels — nothing renders on
-        // page load; after Generate it renders as the report's
-        // headline block. The projection-error notice above stays
-        // visible before Generate (a functional warning, not a
-        // visualization) so headline zeros are explained, not silent.
-        // Contents follow the BASELINE kind: a cash-pool baseline
-        // shows pool/stock metrics only (Value at horizon = pool +
-        // stock, never property equity); a property baseline shows
-        // all 9 cards, entity-scoped.
-        if (!d.hasGeneratedReport) return '';
-        const poolVal = d.projection && d.projection.stocks ? d.projection.stocks.valueAtHorizon : null;
-        if (d.baselineKind === 'pool') return `<div id="planStrategyHeadline">
-        <div class="summary-strip">
-        <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
-        <div class="summary-card"><div class="k">Total cost</div><div class="v">${planMoney(c.cost)}</div></div>
-        <div class="summary-card"><div class="k">Total gain</div><div class="v">${planMoney(c.gain)}</div></div>
-        <div class="summary-card"><div class="k">Value at horizon</div><div class="v">${planMoney(poolVal)}</div></div>
-      </div>
-      <div class="cards">
-        <div class="card breakdown-card"><div class="k">Stock gain</div><div class="v">${planMoney(c.stockGain)}</div></div>
-      </div></div>`;
-        return `<div id="planStrategyHeadline">
-      <div class="summary-strip">
-        <div class="summary-card"><div class="k">Net benefit</div><div class="v">${planSigned(c.net)}</div></div>
-        <div class="summary-card"><div class="k">Total cost</div><div class="v">${planMoney(c.cost)}</div></div>
-        <div class="summary-card"><div class="k">Total gain</div><div class="v">${planMoney(c.gain)}</div></div>
-        <div class="summary-card"><div class="k">Value at horizon</div><div class="v">${planMoney(c.valueAtHorizon)}</div></div>
-      </div>
-      <div class="cards">
-        <div class="card breakdown-card"><div class="k">Interest saved</div><div class="v">${planMoney(c.interestSaved)}</div></div>
-        <div class="card breakdown-card"><div class="k">Stock gain</div><div class="v">${planMoney(c.stockGain)}</div></div>
-        <div class="card breakdown-card"><div class="k">Payoff shift</div><div class="v">${c.payoffShiftMonths != null ? `${c.payoffShiftMonths} months` : '—'}</div></div>
-        <div class="card breakdown-card"><div class="k">Monthly payment Δ</div><div class="v">${planSigned(c.paymentDelta)}</div></div>
-        <div class="card breakdown-card"><div class="k">Penalty</div><div class="v">${planMoney(c.penaltyTotal)}</div><div class="n">Estimate — the bank quote governs</div></div>
-      </div></div>`;
-      })()}
     </div>
     <div class="panel" id="planStrategyFlowPanel">
       <div class="plan-flow-tier" id="planStrategyScenarioTier">
@@ -13781,101 +13876,20 @@ function planStrategyHtml(d) {
       </div>
       </div>
     </div>
-    ${showMortPanels ? `<div class="panel">
-      <div class="section-head"><h3>Mortgage balance</h3></div>
-      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyMortChart"></canvas></div>
-      <div class="note">X: month · Y: outstanding principal (CAD), baseline vs strategy, ${d.project.category === 'property' && d.entityProperty && d.entityProperty.address ? `for ${esc(d.entityProperty.address)}.` : 'summed across properties.'}</div>
-    </div>
-    <div class="panel">
-      <div class="section-head"><h3>Equity</h3></div>
-      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyEquityChart"></canvas></div>
-      <div class="note">X: month · Y: equity (CAD), baseline vs strategy, ${d.project.category === 'property' && d.entityProperty && d.entityProperty.address ? `for ${esc(d.entityProperty.address)}.` : 'summed across properties.'} Equity = assessed value − outstanding principal.${d.equityGrowthPct != null ? ` Assessed grown at ${d.equityGrowthPct}%/yr under ${d.appliedScenario ? esc(d.appliedScenario.name) : 'the scenario'}.` : ' Assessed held flat at the current roll.'}</div>
-    </div>` : ''}
-    ${showPoolPanels ? `<div class="panel">
-      <div class="section-head"><h3>Cash pool</h3></div>
-      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyPoolChart"></canvas></div>
-      <div class="note">X: month · Y: CAD, baseline vs strategy. Cash pool + stock value; property equity is not included.</div>
-    </div>` : ''}
-    ${showPoolPanels ? `<div class="panel">
-      <div class="section-head"><h3>Stock value</h3></div>
-      ${asmStockBlock}
-      <div class="chart-wrap" style="height:260px"><canvas id="planStrategyStockChart"></canvas></div>
-      <div class="note">X: month · Y: stock value (CAD), baseline vs strategy.</div>
-    </div>` : ''}
     ${d.project.category === 'investment' ? `<div class="panel" id="planSinkPanel">
       <div class="section-head"><h3>Sink</h3></div>
       <div id="planFactorSink"></div>
       <div class="msg" id="planSinkMsg"></div>
     </div>` : ''}
-    ${showMortPanels ? `<div class="panel">
-      <div class="section-head"><h3>Annual interest</h3></div>
-      <table class="tbl"><thead><tr><th>Year</th><th>Baseline interest</th><th>Strategy interest</th><th>Saved</th></tr></thead><tbody>${yearRows}</tbody></table>
-    </div>` : ''}
-    <div class="panel" id="planDiffPanel">
-      <div class="section-head"><h3>Difference vs baseline</h3>
-        <div class="toolbar"><button class="small" data-plan-diff-gran="monthly">Monthly</button><button class="small" data-plan-diff-gran="annual">Annual</button></div>
-      </div>
-      <div class="toolbar" id="planDiffRange"><span>Range:</span>
-        <button class="small" data-plan-diff-preset="all">All</button><button class="small" data-plan-diff-preset="1y">1y</button><button class="small" data-plan-diff-preset="2y">2y</button><button class="small" data-plan-diff-preset="5y">5y</button><button class="small" data-plan-diff-preset="10y">10y</button>
-        <span class="range-pick">From <button type="button" class="month-field" data-plan-diff-month="from" data-value="">—</button></span>
-        <span class="range-pick">To <button type="button" class="month-field" data-plan-diff-month="to" data-value="">—</button></span>
-      </div>
-      <div class="chart-wrap" style="height:260px"><canvas id="planDiffChart"></canvas></div>
-      <div class="note" id="planDiffCaption"></div>
-      <div id="planDiffEmpty"></div>
-      <div class="section-head"><h3 id="planDiffBreakdownTitle">Monthly payment breakdown</h3></div>
-      <div class="note" id="planDiffBreakdownCaption"></div>
-      <div class="chart-wrap" style="height:260px"><canvas id="planDiffBreakdownChart"></canvas></div>
-      <div id="planDiffBreakdownEmpty"></div>
-      <div class="toolbar" id="planDiffYearPager"></div>
-      <div id="planDiffTable"></div>
-    </div>
     <div class="panel" id="planStrategyReportsPanel">
       <div class="section-head"><h3>Reports</h3>
         <div class="toolbar"><button class="small primary" id="planStrategyGenerateBtn">Generate report</button><button class="small" id="planStrategyAiReportBtn">Generate with AI</button></div>
       </div>
-      <div class="note" id="planStrategyGenerateNote"></div>
-      <div id="planStrategyReportScenarios"></div>
-      <div><label>Baseline</label><div id="planStrategyReportFixedBaseline" class="note"></div></div>
       <div class="msg" id="planStrategyReportMsg"></div>
       <div id="planReportTabsHost"></div>
       <div id="planReportList"></div>
       <div id="planReport"></div>
-    </div>
-    ${(asmHasMortgage || penRows) ? `<div class="panel" id="planStrategyPenPanel"><div class="section-head"><h3>Penalties</h3></div>${penRows}${asmMortgageBlock}</div>` : ''}
-    ${(() => {
-      if (!d.model || !d.model.spec) return '';
-      const spec = d.model.spec;
-      const bindRows = (spec.bindings || []).map((b) => `<tr><td>${esc(b.name || '')}</td><td>${esc(b.entity || '')}</td><td>${esc(b.field || '')}</td></tr>`).join('');
-      const formRows = (spec.formulas || []).map((f) => `<div class="plan-row"><span>${esc(f.output || '')} = ${esc(f.expression || '')}</span></div>`).join('');
-      const asmRows = (spec.assumptions || []).map((a) => `<div class="plan-row"><span>${esc(a.key || '')} = ${esc(String(a.value ?? ''))}${a.source ? ` · ${esc(a.source)}` : ''}</span></div>`).join('');
-      const outRows = (spec.outputs || []).map((o) => `<div class="plan-row"><span>${esc(o.id || '')}${o.label ? ` · ${esc(o.label)}` : ''}</span></div>`).join('');
-      const chartRows = (spec.charts || []).map((x) => `<div class="plan-row"><span>${esc(x.template || '')} · ${esc(x.title || '')}${x.series ? ` · ${(x.series || []).join(', ')}` : ''}</span></div>`).join('');
-      let mBal = 0; let mInt = 0;
-      for (const per of Object.values(d.projection.mortgage.perProperty)) {
-        const s = per.strategy && per.strategy.series ? per.strategy.series : [];
-        if (s.length) { mBal += s[0].balance || 0; mInt += s[0].interest || 0; }
-      }
-      const firstMonth = (d.projection.stocks.series || [])[0];
-      const trialMonth = firstMonth ? firstMonth.month : ((d.projection.mortgage.perProperty[Object.keys(d.projection.mortgage.perProperty)[0]] || {}).strategy || {}).series?.[0]?.month || '—';
-      return `<div class="panel"><div class="section-head"><h3>Model</h3><div class="toolbar"><button class="small danger" id="planModelDetachBtn">Delete</button></div></div>
-        <div class="note">${esc(d.model.name)} · v${d.model.version} · ${esc(d.model.source)}</div>
-        <div class="section-head"><h3>Bindings</h3></div>
-        <table class="tbl"><thead><tr><th>Name</th><th>Entity</th><th>Field</th></tr></thead><tbody>${bindRows || '<tr><td colspan="3">No bindings.</td></tr>'}</tbody></table>
-        <div class="section-head"><h3>Formulas</h3></div>${formRows || '<div class="note">No formulas.</div>'}
-        <div class="section-head"><h3>Assumptions</h3></div>${asmRows || '<div class="note">No assumptions.</div>'}
-        <div class="section-head"><h3>Outputs</h3></div>${outRows || '<div class="note">No outputs.</div>'}
-        <div class="section-head"><h3>Charts</h3></div>${chartRows || '<div class="note">No charts.</div>'}
-        <div class="section-head"><h3>Month-1 trial row</h3></div>
-        <table class="tbl"><thead><tr><th>Month</th><th>Mortgage balance</th><th>Month interest</th><th>Stock value</th></tr></thead><tbody><tr><td>${trialMonth}</td><td>${money2(mBal)}</td><td>${money2(mInt)}</td><td>${firstMonth ? money2(firstMonth.value) : '—'}</td></tr></tbody></table>
-        <div class="note">Trial row = the engine's first projected month for this strategy. The formulas above are the model's own expressions; the app does not evaluate them — compare their substituted inputs against these engine figures.</div>
-        <div class="section-head"><h3>Refine with AI</h3></div>
-        <div><label>Follow-up *</label><textarea id="planModelFollowText" rows="2" placeholder="e.g. Add a buy leg for the new holding"></textarea></div>
-        <div class="toolbar"><button class="small primary" id="planModelFollowBtn">Design</button></div>
-        <div id="planModelFollowOut"></div>
-        <div class="msg" id="planModelFollowMsg"></div>
-      </div>`;
-    })()}`;
+    </div>`;
 }
 function planStrategyWire(d) {
   const s = d.strategy;
@@ -13975,61 +13989,9 @@ function planStrategyWire(d) {
       loadPlanStrategy(s.id);
     } catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
   }));
-  // AI spec detach: Delete drops the model link; the panel itself
-  // disappears on reload because the strategy carries no model.
-  const detachBtn = $('#planModelDetachBtn');
-  if (detachBtn) detachBtn.addEventListener('click', async () => {
-    if (!confirm('Detach the AI model spec from this strategy?')) return;
-    try { await api(`/api/planning/strategies/${s.id}`, { method: 'PUT', body: { model_id: null } }); loadPlanStrategy(s.id); }
-    catch (err) { showMsg($('#planStrategyMsg'), 'err', err.message); }
-  });
   $('#planAddOpBtn').addEventListener('click', () => openPlanOpModal(s.id, null));
   document.querySelectorAll('[data-plan-quick-op]').forEach((b) => b.addEventListener('click', () => openPlanOpModal(s.id, null, b.dataset.planQuickOp)));
   planStrategyReportsWire(d);
-  // Model follow-up iterates the strategy spec via ai-model (stored
-  // thread continues). The baseline changes nothing, so it is not a
-  // follow-up target.
-  const followBtn = $('#planModelFollowBtn');
-  if (followBtn) followBtn.addEventListener('click', async () => {
-    const msg = $('#planModelFollowMsg');
-    const out = $('#planModelFollowOut');
-    try {
-      const text = $('#planModelFollowText').value.trim();
-      if (!text) throw new Error('describe the follow-up first');
-      const design = async (answers) => {
-        const r = await api(`/api/planning/strategies/${s.id}/ai-model`, { method: 'POST', body: { text, answers } });
-        if (r.ask) {
-          out.innerHTML = `
-            ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planFollowAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}
-            <div class="toolbar"><button class="small primary" id="planModelFollowContinue">Continue design</button></div>`;
-          $('#planModelFollowContinue').onclick = async () => {
-            try {
-              const next = {};
-              for (const q of r.ask) {
-                const el = document.querySelector(`#planFollowAsk_${CSS.escape(q.field)}`);
-                const v = el ? el.value.trim() : '';
-                if (!v) throw new Error('Please answer all questions before continuing.');
-                next[q.field] = q.type === 'number' ? Number(v) : v;
-              }
-              await design(next);
-            } catch (err) { showMsg(msg, 'err', err.message); }
-          };
-          return;
-        }
-        const spec = r.model.spec;
-        out.innerHTML = `
-          <div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div>
-          <div class="toolbar"><button class="small primary" id="planModelFollowApply">Use this model</button></div>`;
-        $('#planModelFollowApply').onclick = async () => {
-          try {
-            await api(`/api/planning/strategies/${s.id}`, { method: 'PUT', body: { model_id: r.model.id } });
-            loadPlanStrategy(s.id);
-          } catch (err) { showMsg(msg, 'err', err.message); }
-        };
-      };
-      await design(null);
-    } catch (err) { showMsg(msg, 'err', err.message); }
-  });
   document.querySelectorAll('[data-plan-op-edit]').forEach((b) => b.addEventListener('click', () => {
     const op = d.ops.find((o) => o.id === Number(b.dataset.planOpEdit));
     openPlanOpModal(s.id, op);
@@ -14038,89 +14000,83 @@ function planStrategyWire(d) {
     try { await api(`/api/planning/ops/${b.dataset.planOpDel}`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
     catch (err) { showMsg($('#planOpsMsg'), 'err', err.message); }
   }));
-  // Mortgage balance lines: baseline vs strategy (entity-scoped for
-  // property projects, summed across properties otherwise).
-  const sumBalance = (proj, side) => {
-    const byMonth = new Map();
-    for (const per of Object.values(proj.mortgage.perProperty)) {
-      const series = per[side] && per[side].series ? per[side].series : [];
-      for (const row of series) byMonth.set(row.month, (byMonth.get(row.month) || 0) + row.balance);
-    }
-    return [...byMonth.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  };
-  const baseBal = sumBalance(d.baseline, 'baseline');
-  const stratBal = sumBalance(d.projection, 'strategy');
-  const labels = baseBal.map(([m]) => m);
-  const stratMap = new Map(stratBal);
-  planLineChart('planStrategyMortChart', labels, [
-    { label: 'Baseline', data: baseBal.map(([, v]) => v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
-    { label: s.name, data: labels.map((m) => stratMap.get(m) ?? null), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
-  ]);
-  // Equity lines: assessed − outstanding, baseline vs strategy, on
-  // the same months as the balance chart. Assessed follows the report
-  // rule: grown month by month under the applied scenario's
-  // property-growth factor, flat at the current roll without one.
-  // (planLineChart no-ops when the panel is gated out.)
-  const eqMonthIdx = (m) => { const [y, mo] = m.split('-').map(Number); return y * 12 + (mo - 1); };
-  const assessedAt = (m) => {
-    const total = d.equityAssessedTotal || 0;
-    if (d.equityGrowthPct == null || !d.equityCurrentMonth) return total;
-    return total * Math.pow(1 + d.equityGrowthPct / 100, (eqMonthIdx(m) - eqMonthIdx(d.equityCurrentMonth)) / 12);
-  };
-  planLineChart('planStrategyEquityChart', labels, [
-    { label: 'Baseline', data: baseBal.map(([m, v]) => assessedAt(m) - v), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
-    { label: s.name, data: labels.map((m) => { const b = stratMap.get(m); return b == null ? null : assessedAt(m) - b; }), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
-  ]);
-  // Cash-pool trajectory: baseline pool vs strategy pool + stock
-  // value. Total = pool + stock; property equity is not included.
-  const poolBaseMap = new Map((d.baseline.stocks.potSeries || []).map((r) => [r.month, r.value]));
-  const poolStratMap = new Map((d.projection.stocks.potSeries || []).map((r) => [r.month, r.value]));
-  const poolMonths = d.baseline.stocks.series.map((r) => r.month);
-  planLineChart('planStrategyPoolChart', poolMonths, [
-    { label: 'Baseline pool', data: poolMonths.map((m) => poolBaseMap.get(m) ?? null), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0, spanGaps: true },
-    { label: `${s.name} pool`, data: poolMonths.map((m) => poolStratMap.get(m) ?? null), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, spanGaps: true },
-    { label: 'Baseline stock', data: d.baseline.stocks.series.map((r) => r.value), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0, borderDash: [6, 4], spanGaps: true },
-    { label: `${s.name} stock`, data: d.projection.stocks.series.map((r) => r.value), borderColor: planColor(1), backgroundColor: planColor(1), fill: false, pointRadius: 0, borderDash: [6, 4], spanGaps: true },
-  ]);
-  planLineChart('planStrategyStockChart', d.baseline.stocks.series.map((r) => r.month), [
-    { label: 'Baseline', data: d.baseline.stocks.series.map((r) => r.value), borderColor: '#888', backgroundColor: '#888', fill: false, pointRadius: 0 },
-    { label: s.name, data: d.projection.stocks.series.map((r) => r.value), borderColor: planColor(1), backgroundColor: planColor(1), fill: false, pointRadius: 0 },
-  ]);
-  // Assumptions save (comparable rate + privilege only — stock return
-  // lives in the scenario and is displayed read-only in the Stock
-  // value panel). The button exists only when the mortgage inputs
-  // render, so guard the binding: a stock-only or empty strategy
-  // has no Save button.
-  const asmSaveBtn = $('#planAsmSaveBtn');
-  if (asmSaveBtn) asmSaveBtn.addEventListener('click', async () => {
-    const msg = $('#planAsmMsg');
-    const parse = (id) => { const el = $(id); const v = el.value.replace(/,/g, '').trim(); return v === '' ? null : v; };
-    try {
-      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'comparableRate', value: parse('#planAsmComparable'), confirmed: $('#planAsmComparableOk').checked } });
-      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: 'privilegePct', value: parse('#planAsmPrivilege'), confirmed: $('#planAsmPrivilegeOk').checked } });
-      showMsg(msg, 'ok', 'Assumptions saved');
-      loadPlanStrategy(s.id);
-    } catch (err) { showMsg(msg, 'err', err.message); }
-  });
-  // Assumption Delete resets that assumption to UNSET (value null,
-  // unconfirmed) — the existing unset semantics apply unchanged
-  // (blank privilege = penalty on the full amount, upper bound).
-  document.querySelectorAll('[data-plan-asm-del]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm('Reset this assumption to unset?')) return;
-    try {
-      await api(`/api/planning/strategies/${s.id}/assumptions`, { method: 'PUT', body: { key: b.dataset.planAsmDel, value: null, confirmed: false } });
-      loadPlanStrategy(s.id);
-    } catch (err) { showMsg($('#planAsmMsg'), 'err', err.message); }
-  }));
   // Scenarios tier: single-select, same semantics as the old picker
   // (a click reloads the detail page under that world; the flat
   // card is scenarioId 0). Cards never navigate.
   document.querySelectorAll('[data-plan-strategy-scenario-select]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); loadPlanStrategy(s.id, Number(b.dataset.planStrategyScenarioSelect)); }));
   document.querySelectorAll('[data-plan-strategy-scenario]').forEach((card) => card.addEventListener('click', () => loadPlanStrategy(s.id, Number(card.dataset.planStrategyScenario))));
   planSinkWire(d);
-  planDiffWire(d);
-  planDiffRender(d);
 }
+// Strategy-tier Reports wiring (ENGINE round, item 7): the routing
+// displays and the aiHits() guard are GONE (both Generate buttons
+// are always available — choosing the button IS choosing the
+// engine), but the tier keeps its two Generate handlers and its
+// report list. The report's scenario pins follow the page's current
+// world (the Scenarios tier single-select): flat (0/undefined) pins
+// nothing, a picked scenario pins it. Restored from ff9c2a9 minus
+// the removed picker/guard — the wholesale cut dropped the list
+// and the handlers with them.
+function planStrategyReportsWire(d) {
+  const s = d.strategy;
+  const pid = d.project.id;
+  const panel = $('#planStrategyReportsPanel');
+  if (!panel) return;
+  const scenarios = d.scenarios || [];
+  // The page's current world (planStrategyScenarioId: undefined =
+  // server default, 0 = explicit flat, N = scenario N).
+  const currentScenarioIds = () => (planStrategyScenarioId !== undefined && planStrategyScenarioId !== 0) ? [planStrategyScenarioId] : [];
+  const pickedBaseline = () => (d.fixedBaseline ? d.fixedBaseline.recordId : null);
+  $('#planStrategyGenerateBtn').addEventListener('click', async () => {
+    const msg = $('#planStrategyReportMsg');
+    try {
+      const scenarioIds = currentScenarioIds();
+      // Kind-aware preset definition (user 2026-11-04): a cash-pool
+      // baseline gets a pool trajectory chart, never the hardcoded
+      // Mortgage balance chart; property/other keep it. The preset
+      // POST stays permissive — the viewer enforces at render.
+      const presetCharts = d.baselineKind === 'pool'
+        ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
+        : [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }];
+      const r = await api(`/api/planning/projects/${pid}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: presetCharts }, baseline_id: pickedBaseline(), strategy_ids: [s.id], scenario_ids: scenarioIds } });
+      // AI-handler pattern: reload first so the Generate gate opens
+      // (headline + kind panels render), then open the new tab.
+      await loadPlanStrategy(s.id);
+      planOpenReportTab(pid, r.report.id);
+    } catch (err) { showMsg(msg, 'err', err.message); }
+  });
+  $('#planStrategyAiReportBtn').addEventListener('click', () => openPlanReportAiModal(pid, {
+    lockedStrategyIds: [s.id],
+    defaultScenarioIds: currentScenarioIds(),
+    afterSave: async (reportId) => { await loadPlanStrategy(s.id); loadPlanReport(pid, reportId); },
+  }));
+  api(`/api/planning/projects/${pid}`).then((proj) => {
+    // LIST, filtered to this strategy (same card template as the
+    // project tier; same records, filtered view).
+    const filtered = (proj.reports || []).filter((r) => {
+      if (r.strategy_ids == null) return true;
+      try { const ids = JSON.parse(r.strategy_ids); return Array.isArray(ids) && ids.includes(s.id); } catch { return false; }
+    });
+    const list = $('#planReportList');
+    list.innerHTML = filtered.map((r) => planReportCardHtml(r, { scenarios })).join('') || '<div class="note">No reports yet.</div>';
+    panel.querySelectorAll('[data-plan-report-view]').forEach((el) => {
+      el.addEventListener('click', () => { planOpenReportTab(pid, Number(el.dataset.planReportView)); });
+    });
+    panel.querySelectorAll('[data-plan-report-del]').forEach((b) => b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
+      catch (err) { showMsg($('#planStrategyReportMsg'), 'err', err.message); }
+    }));
+    // OPEN restore: a surviving tab re-renders only when it belongs
+    // to this strategy's list; otherwise the tier stays on LIST
+    // (tabs themselves are per-project state, preserved for the
+    // project page and for strategies whose list includes them).
+    if (planReportTabsProject === pid && planReportTabs.length) {
+      const cur = planReportTabs.find((t) => t.id === planReportCurrentId) || planReportTabs[planReportTabs.length - 1];
+      if (filtered.some((r) => r.id === cur.id)) loadPlanReport(pid, cur.id);
+    }
+  }).catch(() => { /* list stays empty; pickers still work */ });
+}
+
 
 
 // Strategy factors editor: prime (history chart + date/rate points +
@@ -14248,350 +14204,6 @@ function planSinkWire(d) {
 // months); All is the default — projections have no 1-year
 // trailing default. Charts are legend-toggle-only like every
 // planning chart (never wired to the Colors panel).
-let planDiffState = { strategyId: null, gran: 'monthly', preset: 'all', from: '', to: '', year: null };
-let planDiffData = null;
-let planDiffSpan = null;
-function planDiffMonthly(d) {
-  const rows = new Map();
-  const row = (m) => {
-    if (!rows.has(m)) rows.set(m, { month: m, balBase: null, balStrat: null, intBase: null, intStrat: null, prinBase: null, prinStrat: null, valBase: null, valStrat: null });
-    return rows.get(m);
-  };
-  for (const per of Object.values((d.baseline.mortgage && d.baseline.mortgage.perProperty) || {})) {
-    for (const pt of ((per.baseline && per.baseline.series) || [])) { const r = row(pt.month); r.balBase = (r.balBase || 0) + pt.balance; r.intBase = (r.intBase || 0) + pt.interest; r.prinBase = (r.prinBase || 0) + (pt.principal || 0); }
-  }
-  for (const per of Object.values((d.projection.mortgage && d.projection.mortgage.perProperty) || {})) {
-    for (const pt of ((per.strategy && per.strategy.series) || [])) { const r = row(pt.month); r.balStrat = (r.balStrat || 0) + pt.balance; r.intStrat = (r.intStrat || 0) + pt.interest; r.prinStrat = (r.prinStrat || 0) + (pt.principal || 0); }
-  }
-  for (const pt of (((d.baseline.stocks) || {}).series || [])) { const r = row(pt.month); r.valBase = (r.valBase || 0) + pt.value; }
-  for (const pt of (((d.projection.stocks) || {}).series || [])) { const r = row(pt.month); r.valStrat = (r.valStrat || 0) + pt.value; }
-  return [...rows.values()].sort((a, b) => (a.month < b.month ? -1 : 1)).map((r) => ({
-    ...r,
-    balDiff: (r.balBase != null && r.balStrat != null) ? r.balBase - r.balStrat : null,
-    intSaved: (r.intBase != null && r.intStrat != null) ? r.intBase - r.intStrat : null,
-    valDiff: (r.valBase != null && r.valStrat != null) ? r.valStrat - r.valBase : null,
-  }));
-}
-function planDiffAnnual(monthly) {
-  const years = new Map();
-  for (const r of monthly) {
-    const y = r.month.slice(0, 4);
-    if (!years.has(y)) years.set(y, { year: y, balBase: null, balStrat: null, equityPeak: null, intBase: 0, intStrat: 0, intSaved: 0, valBase: null, valStrat: null, valDiff: null });
-    const a = years.get(y);
-    if (r.balBase != null) a.balBase = r.balBase;
-    if (r.balStrat != null) a.balStrat = r.balStrat;
-    if (r.balDiff != null) a.equityPeak = a.equityPeak == null ? r.balDiff : Math.max(a.equityPeak, r.balDiff);
-    if (r.intBase != null) a.intBase += r.intBase;
-    if (r.intStrat != null) a.intStrat += r.intStrat;
-    if (r.intSaved != null) a.intSaved += r.intSaved;
-    if (r.valBase != null) a.valBase = r.valBase;
-    if (r.valStrat != null) a.valStrat = r.valStrat;
-    if (r.valDiff != null) a.valDiff = r.valDiff;
-  }
-  return [...years.values()];
-}
-function planDiffEffectiveRange(monthly) {
-  if (planDiffState.preset === 'custom' || !monthly.length) return { from: planDiffState.from, to: planDiffState.to };
-  const n = planDiffState.preset === 'all' ? 0 : parseInt(planDiffState.preset, 10) * 12;
-  return { from: monthly[0].month, to: n ? monthly[Math.min(n, monthly.length) - 1].month : monthly[monthly.length - 1].month };
-}
-// Strategy detail report: the CURRENT strategy × the pinned scenarios
-// vs the baseline. Generates (saves) a report scoped to this strategy
-// and navigates to the report view — the view renders it under the
-// pinned scenarios with the comparison component.
-// Strategy-page Reports tier: the project page's Reports tier,
-// scoped to THIS strategy. The viewer itself is reused as-is
-// (loadPlanReport + tabs + outline + per-tab actions resolve their
-// tier ids to this page's tier, because the project tier DOM is
-// cleared while a strategy page is shown). What is scoped here:
-// LIST shows only reports whose pins include this strategy (legacy
-// unpinned reports count as all-strategy, so they appear; explicit
-// [] pins appear nowhere); creation pins ONLY this strategy.
-// Per-tab actions keep the opened report's OWN pins — opening a
-// multi-strategy report from here never rewrites its pins.
-function planStrategyReportsWire(d) {
-  const s = d.strategy;
-  const pid = d.project.id;
-  const panel = $('#planStrategyReportsPanel');
-  if (!panel) return;
-  // Creation pin source: the page's scenario checkboxes + the FIXED
-  // baseline (never picked — the fixed baseline's record, or null =
-  // the do-nothing label when no record exists).
-  const host = $('#planStrategyReportScenarios');
-  const scenarios = d.scenarios || [];
-  const base = d.baseScenario;
-  host.innerHTML = scenarios.length
-    ? `<div><label>Scenarios (pinned)</label>${scenarios.map((sc) => `<label><input type="checkbox" value="${sc.id}"${base && sc.id === base.id ? ' checked' : ''}> ${esc(sc.name)}${sc.is_base ? ' (Default)' : ''}</label>`).join(' ')}</div>`
-    : '<div class="note">Current rates (no scenario)</div>';
-  $('#planStrategyReportFixedBaseline').textContent = d.fixedBaseline ? d.fixedBaseline.name : 'Do-nothing baseline';
-  const pickedScenarios = () => [...panel.querySelectorAll('#planStrategyReportScenarios input:checked')].map((el) => Number(el.value));
-  const pickedBaseline = () => (d.fixedBaseline ? d.fixedBaseline.recordId : null);
-  const aiHits = () => {
-    const hits = [];
-    for (const id of pickedScenarios()) { const sc = scenarios.find((x) => x.id === id); if (sc && sc.source === 'ai') hits.push(`scenario ${sc.name}`); }
-    // The fixed baseline is never AI-designed (recommendation record
-    // or null), so it never trips the routing guard.
-    // Same fact the project guard reads as modelSource: the attached
-    // model's source (no attached model = no strategy hit, matching
-    // the project page, where pure-AI trios trip via scenario/base).
-    if (d.model && d.model.source === 'ai') hits.push(`strategy ${s.letter} · ${s.name}`);
-    return hits;
-  };
-  const refreshGuard = () => {
-    const btn = $('#planStrategyGenerateBtn');
-    const note = $('#planStrategyGenerateNote');
-    if (!btn || !note) return;
-    // The fixed baseline always resolves (record or do-nothing
-    // label), so only the scenario pin can block Generate here.
-    if (scenarios.length && !pickedScenarios().length) {
-      btn.disabled = true;
-      note.textContent = 'Pin at least one scenario first.';
-    } else {
-      const hits = aiHits();
-      if (hits.length) {
-        btn.disabled = true;
-        note.textContent = `Selection includes AI-designed ${hits.join(', ')} — use Generate with AI.`;
-      } else {
-        btn.disabled = false;
-        note.textContent = '';
-      }
-    }
-  };
-  host.addEventListener('change', refreshGuard);
-  $('#planStrategyGenerateBtn').addEventListener('click', async () => {
-    const btn = $('#planStrategyGenerateBtn');
-    if (btn.disabled) return;
-    const msg = $('#planStrategyReportMsg');
-    try {
-      const scenarioIds = pickedScenarios();
-      if (scenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
-      // Kind-aware preset definition (user 2026-11-04): a cash-pool
-      // baseline gets a pool trajectory chart, never the hardcoded
-      // Mortgage balance chart; property/other keep it. The preset
-      // POST stays permissive — the viewer enforces at render.
-      const presetCharts = d.baselineKind === 'pool'
-        ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
-        : [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }];
-      const r = await api(`/api/planning/projects/${pid}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: presetCharts }, baseline_id: pickedBaseline(), strategy_ids: [s.id], scenario_ids: scenarioIds } });
-      // AI-handler pattern: reload first so the Generate gate opens
-      // (headline + kind panels render), then open the new tab.
-      await loadPlanStrategy(s.id);
-      planOpenReportTab(pid, r.report.id);
-    } catch (err) { showMsg(msg, 'err', err.message); }
-  });
-  $('#planStrategyAiReportBtn').addEventListener('click', () => openPlanReportAiModal(pid, {
-    lockedStrategyIds: [s.id],
-    defaultScenarioIds: pickedScenarios(),
-    afterSave: async (reportId) => { await loadPlanStrategy(s.id); loadPlanReport(pid, reportId); },
-  }));
-  api(`/api/planning/projects/${pid}`).then((proj) => {
-    refreshGuard();
-    // LIST, filtered to this strategy (same card template as the
-    // project tier; same records, filtered view).
-    const filtered = (proj.reports || []).filter((r) => {
-      if (r.strategy_ids == null) return true;
-      try { const ids = JSON.parse(r.strategy_ids); return Array.isArray(ids) && ids.includes(s.id); } catch { return false; }
-    });
-    const list = $('#planReportList');
-    list.innerHTML = filtered.map((r) => planReportCardHtml(r, { scenarios })).join('') || '<div class="note">No reports yet.</div>';
-    panel.querySelectorAll('[data-plan-report-view]').forEach((el) => {
-      el.addEventListener('click', () => { planOpenReportTab(pid, Number(el.dataset.planReportView)); });
-    });
-    panel.querySelectorAll('[data-plan-report-del]').forEach((b) => b.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      try { await api(`/api/planning/reports/${b.dataset.planReportDel}`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
-      catch (err) { showMsg($('#planStrategyReportMsg'), 'err', err.message); }
-    }));
-    // OPEN restore: a surviving tab re-renders only when it belongs
-    // to this strategy's list; otherwise the tier stays on LIST
-    // (tabs themselves are per-project state, preserved for the
-    // project page and for strategies whose list includes them).
-    if (planReportTabsProject === pid && planReportTabs.length) {
-      const cur = planReportTabs.find((t) => t.id === planReportCurrentId) || planReportTabs[planReportTabs.length - 1];
-      if (filtered.some((r) => r.id === cur.id)) loadPlanReport(pid, cur.id);
-    }
-  }).catch(() => { /* list stays empty; pickers still work */ });
-}
-function planDiffWire(d) {
-  planDiffData = d;
-  const host = $('#planDiffPanel');
-  if (!host) return;
-  host.querySelectorAll('[data-plan-diff-gran]').forEach((b) => b.addEventListener('click', () => { planDiffState.gran = b.dataset.planDiffGran; planDiffRender(); }));
-  host.querySelectorAll('[data-plan-diff-preset]').forEach((b) => b.addEventListener('click', () => { planDiffState.preset = b.dataset.planDiffPreset; planDiffState.from = ''; planDiffState.to = ''; planDiffRender(); }));
-  host.querySelectorAll('[data-plan-diff-month]').forEach((b) => b.addEventListener('click', () => onMonthFieldClick(`planDiff:${b.dataset.planDiffMonth}`)));
-}
-function planDiffRender(d) {
-  if (d) planDiffData = d;
-  d = planDiffData;
-  const host = $('#planDiffPanel');
-  if (!host || !d) return;
-  if (planDiffState.strategyId !== d.strategy.id) planDiffState = { strategyId: d.strategy.id, gran: 'monthly', preset: 'all', from: '', to: '', year: null };
-  const monthly = planDiffMonthly(d);
-  const hasMort = monthly.some((r) => r.balBase != null || r.balStrat != null);
-  const hasStock = monthly.some((r) => r.valBase != null || r.valStrat != null);
-  // Mortgage-touching (same definition as the server's comparison
-  // touchesMortgage): a mortgage op, or a sell whose proceeds repay a
-  // mortgage. The Difference TABLE follows the same BASELINE-kind
-  // rule as the charts (user 2026-11-04): a cash-pool baseline shows
-  // NO mortgage columns, ever; a property baseline shows them
-  // whenever balance data exists, even for a stock-only strategy on
-  // that property; any other baseline keeps the op-nature rule (a
-  // pure stock strategy's Balance Δ would be a flat $0 line, so it
-  // hides). The old table rule (columns whenever balance data
-  // exists) leaked the summed all-properties mortgage series onto
-  // pool-baseline pages.
-  const touchesMort = (d.ops || []).some((o) => ['prepay', 'rate_switch', 'refinance', 'payment_change'].includes(o.op_type))
-    || (d.ops || []).flatMap((o) => o.legs || []).some((l) => String(l.source_ref || '').startsWith('repay:'));
-  const diffKind = d.baselineKind || 'other';
-  const diffShowBalance = diffKind === 'pool' ? false : diffKind === 'property' ? hasMort : touchesMort;
-  const diffShowValue = diffKind === 'property' ? false : hasStock;
-  const diffShowBreakdown = diffKind === 'pool' ? false : diffKind === 'property' ? hasMort : touchesMort;
-  // Pool baseline: the table (and its range/pager) covers the
-  // pool/stock series only. The summed mortgage series must not
-  // contribute months — its leading months carry no stock values, so
-  // their value cells render "—".
-  const diffRows = diffKind === 'pool' ? monthly.filter((r) => r.valBase != null || r.valStrat != null) : monthly;
-  planDiffSpan = diffRows.length ? { start: diffRows[0].month, end: diffRows[diffRows.length - 1].month } : null;
-  const eff = planDiffEffectiveRange(diffRows);
-  const filtered = diffRows.filter((r) => (!eff.from || r.month >= eff.from) && (!eff.to || r.month <= eff.to));
-  host.querySelectorAll('[data-plan-diff-gran]').forEach((b) => b.classList.toggle('active', b.dataset.planDiffGran === planDiffState.gran));
-  host.querySelectorAll('[data-plan-diff-preset]').forEach((b) => b.classList.toggle('active', b.dataset.planDiffPreset === planDiffState.preset));
-  const fromBtn = host.querySelector('[data-plan-diff-month="from"]');
-  const toBtn = host.querySelector('[data-plan-diff-month="to"]');
-  if (fromBtn) { fromBtn.textContent = eff.from ? formatYM(eff.from) : '—'; fromBtn.dataset.value = eff.from || ''; }
-  if (toBtn) { toBtn.textContent = eff.to ? formatYM(eff.to) : '—'; toBtn.dataset.value = eff.to || ''; }
-  const empty = $('#planDiffEmpty');
-  const wrap = host.querySelector('.chart-wrap');
-  if (!filtered.length) {
-    planDestroyChart('planDiffChart');
-    planDestroyChart('planDiffBreakdownChart');
-    if (wrap) wrap.style.display = 'none';
-    const bWrap0 = document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap');
-    if (bWrap0) bWrap0.style.display = 'none';
-    if (empty) empty.innerHTML = '<div class="note">No months in this range.</div>';
-    const cap0 = $('#planDiffCaption'); if (cap0) cap0.textContent = '';
-    const bCap0 = $('#planDiffBreakdownCaption'); if (bCap0) bCap0.textContent = '';
-    const pg0 = $('#planDiffYearPager'); if (pg0) pg0.innerHTML = '';
-    $('#planDiffTable').innerHTML = '';
-    return;
-  }
-  if (wrap) wrap.style.display = '';
-  if (empty) empty.innerHTML = '';
-  const cap = $('#planDiffCaption');
-  const bCap = $('#planDiffBreakdownCaption');
-  const bTitle = $('#planDiffBreakdownTitle');
-  const bWrap = document.querySelector('#planDiffBreakdownChart')?.closest('.chart-wrap');
-  // The payment-breakdown block (title + caption + chart) renders
-  // only when the baseline kind allows it (see diffShowBreakdown);
-  // otherwise it hides whole.
-  if (bWrap) bWrap.style.display = diffShowBreakdown ? '' : 'none';
-  if (bTitle) bTitle.style.display = diffShowBreakdown ? '' : 'none';
-  if (bCap) bCap.style.display = diffShowBreakdown ? '' : 'none';
-  if (!diffShowBreakdown) planDestroyChart('planDiffBreakdownChart');
-  if (planDiffState.gran === 'annual') {
-    const pgA = $('#planDiffYearPager'); if (pgA) pgA.innerHTML = '';
-    if (cap) cap.textContent = diffKind === 'pool' ? 'X: year · Y: CAD — Value Δ = year-end.' : 'X: year · Y: CAD — Equity Δ = the year\'s peak monthly balance advantage; Value Δ = year-end.';
-    if (bTitle) bTitle.textContent = 'Annual payment breakdown';
-    if (bCap) bCap.textContent = 'X: year · Y: CAD per year — scheduled payment split into interest (solid) + principal (light), baseline vs strategy, summed over the year\'s months.';
-  } else {
-    if (cap) cap.textContent = diffKind === 'pool' ? 'X: month · Y: CAD — Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
-    if (bTitle) bTitle.textContent = 'Monthly payment breakdown';
-    if (bCap) bCap.textContent = 'X: month · Y: CAD per month — scheduled payment split into interest (solid) + principal (light), baseline vs strategy.';
-  }
-  const diffCls = (v) => (v != null && v !== 0) ? ' class="plan-diff"' : '';
-  if (planDiffState.gran === 'annual') {
-    const years = planDiffAnnual(filtered);
-    const datasets = [];
-    if (diffShowBalance) datasets.push({ label: 'Equity Δ (peak)', data: years.map((a) => a.equityPeak), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
-    if (diffShowValue) datasets.push({ label: 'Value Δ (year-end)', data: years.map((a) => a.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
-    if (datasets.length) planLineChart('planDiffChart', years.map((a) => a.year), datasets); else planDestroyChart('planDiffChart');
-    // Annual breakdown: per-year sums of scheduled interest/principal.
-    const prinByYear = new Map();
-    for (const r of filtered) {
-      const y = r.month.slice(0, 4);
-      const cur = prinByYear.get(y) || { prinBase: 0, prinStrat: 0 };
-      cur.prinBase += r.prinBase || 0; cur.prinStrat += r.prinStrat || 0;
-      prinByYear.set(y, cur);
-    }
-    const bDatasetsA = [];
-    if (diffShowBreakdown) {
-      bDatasetsA.push({ label: 'Baseline interest', data: years.map((a) => a.intBase), backgroundColor: '#888888', stack: 'base' });
-      bDatasetsA.push({ label: 'Baseline principal', data: years.map((a) => (prinByYear.get(a.year) || {}).prinBase || 0), backgroundColor: planColorAlpha('#888888', 0.45), stack: 'base' });
-      bDatasetsA.push({ label: 'Strategy interest', data: years.map((a) => a.intStrat), backgroundColor: planColor(0), stack: 'strat' });
-      bDatasetsA.push({ label: 'Strategy principal', data: years.map((a) => (prinByYear.get(a.year) || {}).prinStrat || 0), backgroundColor: planColorAlpha(planColor(0), 0.45), stack: 'strat' });
-    }
-    if (bDatasetsA.length) planBarChart('planDiffBreakdownChart', years.map((a) => a.year), bDatasetsA); else planDestroyChart('planDiffBreakdownChart');
-    let head = '<tr><th>Year</th>';
-    if (diffShowBalance) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Equity Δ (peak)</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
-    if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
-    head += '</tr>';
-    const rows = years.map((a) => {
-      let r = `<tr><td>${a.year}</td>`;
-      if (diffShowBalance) r += `<td>${planMoney(a.balBase)}</td><td>${planMoney(a.balStrat)}</td><td${diffCls(a.equityPeak)}>${planSigned(a.equityPeak)}</td><td>${planMoney(a.intBase)}</td><td>${planMoney(a.intStrat)}</td><td${diffCls(a.intSaved)}>${planSigned(a.intSaved)}</td>`;
-      if (hasStock) r += `<td>${planMoney(a.valBase)}</td><td>${planMoney(a.valStrat)}</td><td${diffCls(a.valDiff)}>${planSigned(a.valDiff)}</td>`;
-      return r + '</tr>';
-    }).join('');
-    $('#planDiffTable').innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
-  } else {
-    const datasets = [];
-    if (diffShowBalance) datasets.push({ label: 'Balance Δ', data: filtered.map((r) => r.balDiff), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true });
-    if (diffShowValue) datasets.push({ label: 'Value Δ', data: filtered.map((r) => r.valDiff), borderColor: planColor(1), backgroundColor: planColor(1), spanGaps: true });
-    if (datasets.length) planLineChart('planDiffChart', filtered.map((r) => formatYM(r.month)), datasets); else planDestroyChart('planDiffChart');
-    // Monthly breakdown: per-month scheduled interest (solid) +
-    // principal (light), baseline vs strategy.
-    const bDatasets = [];
-    if (diffShowBreakdown) {
-      bDatasets.push({ label: 'Baseline interest', data: filtered.map((r) => r.intBase), backgroundColor: '#888888', stack: 'base' });
-      bDatasets.push({ label: 'Baseline principal', data: filtered.map((r) => r.prinBase), backgroundColor: planColorAlpha('#888888', 0.45), stack: 'base' });
-      bDatasets.push({ label: 'Strategy interest', data: filtered.map((r) => r.intStrat), backgroundColor: planColor(0), stack: 'strat' });
-      bDatasets.push({ label: 'Strategy principal', data: filtered.map((r) => r.prinStrat), backgroundColor: planColorAlpha(planColor(0), 0.45), stack: 'strat' });
-    }
-    if (bDatasets.length) planBarChart('planDiffBreakdownChart', filtered.map((r) => formatYM(r.month)), bDatasets); else planDestroyChart('planDiffBreakdownChart');
-    let head = '<tr><th>Month</th>';
-    if (diffShowBalance) head += '<th>Baseline balance</th><th>Strategy balance</th><th>Balance Δ</th><th>Baseline interest</th><th>Strategy interest</th><th>Interest saved</th>';
-    if (hasStock) head += '<th>Baseline value</th><th>Strategy value</th><th>Value Δ</th>';
-    head += '</tr>';
-    // Year pager, table only (charts keep the full filtered range):
-    // one year per page — the year's months + its annual total row.
-    // Default = first year of the filtered span; a year outside the
-    // span (after a preset/range change) falls back to the first.
-    const pageYears = [...new Set(filtered.map((r) => r.month.slice(0, 4)))];
-    if (!planDiffState.year || !pageYears.includes(planDiffState.year)) planDiffState.year = pageYears[0] || null;
-    const pager = $('#planDiffYearPager');
-    if (pager) {
-      pager.innerHTML = pageYears.length > 1 ? pageYears.map((y) => `<button class="small${y === planDiffState.year ? ' active' : ''}" data-plan-diff-year="${y}">${y}</button>`).join('') : '';
-      pager.querySelectorAll('[data-plan-diff-year]').forEach((b) => b.addEventListener('click', () => { planDiffState.year = b.dataset.planDiffYear; planDiffRender(); }));
-    }
-    const pageRows = filtered.filter((r) => r.month.slice(0, 4) === planDiffState.year);
-    // Monthly rows group BY YEAR: a year header, the year's months,
-    // then an annual-sum row — flows summed over the year's months,
-    // balances/value at year-end.
-    const cols = 1 + (diffShowBalance ? 6 : 0) + (hasStock ? 3 : 0);
-    let rows = '';
-    let curYear = null; let yearRows = [];
-    const flushYear = () => {
-      if (!yearRows.length) return;
-      const last = yearRows[yearRows.length - 1];
-      const sum = (f) => yearRows.reduce((a, r) => a + (r[f] || 0), 0);
-      rows += `<tr class="plan-year-total"><td>${curYear} total</td>`;
-      if (diffShowBalance) rows += `<td>${planMoney(last.balBase)}</td><td>${planMoney(last.balStrat)}</td><td${diffCls(last.balDiff)}>${planSigned(last.balDiff)}</td><td>${planMoney(sum('intBase'))}</td><td>${planMoney(sum('intStrat'))}</td><td${diffCls(sum('intSaved'))}>${planSigned(sum('intSaved'))}</td>`;
-      if (hasStock) rows += `<td>${planMoney(last.valBase)}</td><td>${planMoney(last.valStrat)}</td><td${diffCls(last.valDiff)}>${planSigned(last.valDiff)}</td>`;
-      rows += '</tr>';
-    };
-    for (const r of pageRows) {
-      const y = r.month.slice(0, 4);
-      if (y !== curYear) { flushYear(); curYear = y; yearRows = []; rows += `<tr class="plan-year-head"><td colspan="${cols}">${y}</td></tr>`; }
-      yearRows.push(r);
-      let x = `<tr><td>${formatYM(r.month)}</td>`;
-      if (diffShowBalance) x += `<td>${planMoney(r.balBase)}</td><td>${planMoney(r.balStrat)}</td><td${diffCls(r.balDiff)}>${planSigned(r.balDiff)}</td><td>${planMoney(r.intBase)}</td><td>${planMoney(r.intStrat)}</td><td${diffCls(r.intSaved)}>${planSigned(r.intSaved)}</td>`;
-      if (hasStock) x += `<td>${planMoney(r.valBase)}</td><td>${planMoney(r.valStrat)}</td><td${diffCls(r.valDiff)}>${planSigned(r.valDiff)}</td>`;
-      rows += x + '</tr>';
-    }
-    flushYear();
-    $('#planDiffTable').innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
-  }
-}
-
 // -------------------------------------------- project comparison --
 // Shared comparison renderers: report-only since the project-page
 // panel was removed. The report view passes report-scoped ids +
@@ -14660,6 +14272,31 @@ function planTrajRangeHtml(st, months) {
   const eff = planTrajEffectiveRange(months, st);
   return `<div class="toolbar">${presets.map((p) => `<button class="small${st.preset === p ? ' active' : ''}" data-plan-traj-preset="${p}">${p === 'all' ? 'All' : p}</button>`).join(' ')} <span class="range-label">${eff.length ? `${formatYM(eff[0])} – ${formatYM(eff[eff.length - 1])}` : '—'}</span> <button class="small month-field" data-plan-traj-month="from" data-value="${st.from || ''}">${st.from ? formatYM(st.from) : 'From'}</button> <button class="small month-field" data-plan-traj-month="to" data-value="${st.to || ''}">${st.to ? formatYM(st.to) : 'To'}</button></div>`;
 }
+// Monthly difference rows from baseline + strategy projections —
+// now used only by the comparison Δ chart (the strategy-page
+// Difference panel and its table moved into the report view).
+function planDiffMonthly(d) {
+  const rows = new Map();
+  const row = (m) => {
+    if (!rows.has(m)) rows.set(m, { month: m, balBase: null, balStrat: null, intBase: null, intStrat: null, prinBase: null, prinStrat: null, valBase: null, valStrat: null });
+    return rows.get(m);
+  };
+  for (const per of Object.values((d.baseline.mortgage && d.baseline.mortgage.perProperty) || {})) {
+    for (const pt of ((per.baseline && per.baseline.series) || [])) { const r = row(pt.month); r.balBase = (r.balBase || 0) + pt.balance; r.intBase = (r.intBase || 0) + pt.interest; r.prinBase = (r.prinBase || 0) + (pt.principal || 0); }
+  }
+  for (const per of Object.values((d.projection.mortgage && d.projection.mortgage.perProperty) || {})) {
+    for (const pt of ((per.strategy && per.strategy.series) || [])) { const r = row(pt.month); r.balStrat = (r.balStrat || 0) + pt.balance; r.intStrat = (r.intStrat || 0) + pt.interest; r.prinStrat = (r.prinStrat || 0) + (pt.principal || 0); }
+  }
+  for (const pt of (((d.baseline.stocks) || {}).series || [])) { const r = row(pt.month); r.valBase = (r.valBase || 0) + pt.value; }
+  for (const pt of (((d.projection.stocks) || {}).series || [])) { const r = row(pt.month); r.valStrat = (r.valStrat || 0) + pt.value; }
+  return [...rows.values()].sort((a, b) => (a.month < b.month ? -1 : 1)).map((r) => ({
+    ...r,
+    balDiff: (r.balBase != null && r.balStrat != null) ? r.balBase - r.balStrat : null,
+    intSaved: (r.intBase != null && r.intStrat != null) ? r.intBase - r.intStrat : null,
+    valDiff: (r.valBase != null && r.valStrat != null) ? r.valStrat - r.valBase : null,
+  }));
+}
+
 function planCompareNewRender(block, ids) {
   const t = ids;
   t.block = block;
@@ -14778,7 +14415,13 @@ function planCompareNewRender(block, ids) {
       if (confirm(`Remove ${row.strategy.letter} · ${row.strategy.name} from this report?`)) t.onRemoveStrategy(id);
     }));
   }
-  planMergedRender(t);
+  // The merged cross-strategy table renders only when the report
+  // pins multiple strategies (item 9): it IS the project report's
+  // strategy对比 section. The Δ chart and the payment breakdown
+  // above stay for every report — they compare each strategy
+  // against the baseline, not strategies against each other.
+  if (block.strategies.length > 1) planMergedRender(t);
+  else { const m = $(t.merged); if (m) m.innerHTML = ''; }
 }
 // Merged comparison table: one table replaces the old Master +
 // Apple pair. Baseline column: absolute figures. Each picked
@@ -15327,8 +14970,9 @@ function planMonthBtnHtml(valueYm, inputId) {
   const ym = valueYm || '';
   return `<button type="button" class="month-field" data-plan-month data-value="${esc(ym)}" aria-haspopup="dialog" aria-expanded="false">${ym ? formatYM(ym) : '—'}</button><input type="hidden" id="${inputId}" value="${ym ? `${ym}-01` : ''}">`;
 }
-function planOpFormHtml(type, params, ctx) {
+function planOpFormHtml(type, params, ctx, opts) {
   const p = params || {};
+  const existingLegs = (opts && opts.existingLegs) || null;
   // Entity scope (user rule 2026-11-04): in a property project the
   // picker offers ONLY the project entity property, so the UI path
   // cannot produce a POST-then-excluded op. Server behavior is
@@ -15394,7 +15038,7 @@ function planOpFormHtml(type, params, ctx) {
       <button type="button" class="small" id="planOpBuyHalfBtn">Half</button>
       <span id="planOpPoolTotal" class="n"></span>
     </div>
-    <div><label>Funding sources *</label>
+    ${existingLegs && existingLegs.length ? `<div><label>Funding sources *</label>
       <div class="spend-tx-catwrap">
         <button type="button" class="small" id="planOpSourceBtn">Sources: Cash pot</button>
         <div class="spend-tx-catpanel hidden" id="planOpSourcePanel">
@@ -15408,7 +15052,7 @@ function planOpFormHtml(type, params, ctx) {
         </div>
       </div>
     </div>
-    <div><label>Funded by</label><div id="planOpLegs"></div></div>`;
+    <div><label>Funded by</label><div id="planOpLegs"></div></div>` : `<div><label>Funding</label><div>Cash pool</div></div>`}`;
   if (type === 'sell') body = `
     <div><label>Holding *</label><select id="planOpHolding">${holdOpts}</select></div>
     ${dateRow}
@@ -15783,6 +15427,22 @@ function planReadOpForm(type, root) {
     const amount = mode === 'fixed' ? parseMoneyInput(row.querySelector('.plan-leg-amount').value) : mode;
     legs.push({ source_ref: src, amount });
   });
+  // New buys carry no leg picker anymore: funding defaults to the
+  // cash pool — an implicit single pool leg. The pool-overflow guard
+  // (planBuyPoolOverflow, applied at Save) still caps the amount at
+  // the pool total. The implicit leg is the existing 'cash'
+  // (Declared cash) source: the engine's 'pot' is seeded only from
+  // external cash and would reject a pool buy with no external cash.
+  // A recommendation-prefilled form may stash its own implicit leg
+  // (cash pot for sink strategies) on the modal card — it wins.
+  if (type === 'buy' && !legs.length) {
+    let implicit = { source_ref: 'cash', amount: 'remainder' };
+    try {
+      const stashed = scope && scope.dataset ? JSON.parse(scope.dataset.planImplicitLeg || 'null') : null;
+      if (stashed && stashed.source_ref) implicit = stashed;
+    } catch { /* a bad stash never blocks the save — fall back to cash */ }
+    legs.push(implicit);
+  }
   return { params, legs };
 }
 // Buy overflow guard (both buy forms): a buy bigger than the project's
@@ -15809,7 +15469,7 @@ async function openPlanOpModal(strategyId, existing, presetType) {
     <option value="buy">Buy</option><option value="sell">Sell</option><option value="position">Position (cost unknown)</option></select></div>`;
   $('#planOpModalBody').innerHTML = `
     ${typeSel}
-    <div id="planOpFormFields">${planOpFormHtml(type, existing ? existing.params : {}, ctx)}</div>
+    <div id="planOpFormFields">${planOpFormHtml(type, existing ? existing.params : {}, ctx, { existingLegs: existing ? existing.legs : null })}</div>
     <div class="toolbar"><button class="primary" id="planOpSaveBtn">Save</button><button type="button" data-close-modal>Cancel</button></div>`;
   $('#planOpModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   const opCard = $('#planOpModalBody').closest('.modal-card');
@@ -15832,8 +15492,12 @@ async function openPlanOpModal(strategyId, existing, presetType) {
   planLegsWire(type, ctx, opCard);
   if ((type === 'buy' || type === 'sell') && existing && existing.legs) {
     const box = opCard.querySelector('#planOpLegs');
-    box.innerHTML = existing.legs.map((l) => planLegRowHtml(type, ctx, l)).join('');
-    box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    // A buy with no stored legs renders the cash-pool readout (no
+    // legs box) — its save falls back to the implicit leg.
+    if (box) {
+      box.innerHTML = existing.legs.map((l) => planLegRowHtml(type, ctx, l)).join('');
+      box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+    }
   } else if (type === 'buy' || type === 'sell') {
     const box = opCard.querySelector('#planOpLegs');
     if (box && !box.children.length) {
@@ -15866,6 +15530,11 @@ async function openPlanOpModal(strategyId, existing, presetType) {
         if (box) {
           box.innerHTML = planLegRowHtml(tp.opType, ctx, { source_ref: tp.source || 'pot', amount: 'remainder' });
           box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
+        } else if (tp.opType === 'buy' && tp.source) {
+          // New buys have no leg picker: the recommendation's funding
+          // leg (cash pot for sink strategies) is stashed as this
+          // form's implicit leg instead of being dropped silently.
+          opCard.dataset.planImplicitLeg = JSON.stringify({ source_ref: tp.source, amount: 'remainder' });
         }
       }
       if (tp.opType === 'buy') planOpSourceWire(opCard, ctx);
@@ -16014,126 +15683,6 @@ async function openPlanStrategyModal(projectId) {
       planAiSuggestName(aiNameBtn, $('#planStrategyName'), 'strategy', { ops, category: proj.category || null, entityLabel: (proj.categoryLabels && proj.categoryLabels.entity) || null }, $('#planStrategyModalMsg'));
     });
   }
-  // AI model design form: "Refine with AI" on a saved template opens
-  // it prefilled with that template's summary, so template output is
-  // AI-refinable via follow-up. (New model design lives in the
-  // project-page AI panel; the old fallback card is gone.)
-  function openPlanModelForm(prefillText) {
-    $('#planStrategyModalBody').innerHTML = `
-      <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
-      <div><label>Strategy name *</label><div style="display:flex;gap:8px"><input id="planStrategyName" placeholder="e.g. Refinance and invest" style="flex:1"><button type="button" class="small" id="planStrategyAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
-      <div><label>What should the model do? *</label><textarea id="planStrategyModelText" rows="4" placeholder="e.g. Model refinancing Christina at renewal and investing the cash-out">${esc(prefillText || '')}</textarea></div>
-      <div class="toolbar"><button class="small" id="planStrategyModelThreadToggle">Show conversation thread</button></div>
-      <div id="planStrategyModelThread" class="hidden"></div>
-      <div class="toolbar"><button class="primary" id="planStrategyModelBtn">Design model</button></div>
-      <div id="planStrategyModelOut"></div>`;
-    $('#planBackToPresets').addEventListener('click', renderChooser);
-    // ✨ name from the model description (no ops exist yet here).
-    const aiNameBtnM = $('#planStrategyAiNameBtn');
-    if (aiNameBtnM) aiNameBtnM.addEventListener('click', () => {
-      const proj = planProjectData && planProjectData.project ? planProjectData.project : {};
-      const desc = $('#planStrategyModelText') ? $('#planStrategyModelText').value.trim() : '';
-      planAiSuggestName(aiNameBtnM, $('#planStrategyName'), 'strategy', { ops: [], description: desc || null, category: proj.category || null, entityLabel: (proj.categoryLabels && proj.categoryLabels.entity) || null }, $('#planStrategyModalMsg'));
-    });
-    // The thread stays collapsed until the user asks to see it —
-    // design rounds accumulate turns behind this toggle, never in
-    // the open by default.
-    $('#planStrategyModelThreadToggle').addEventListener('click', () => {
-      const el = $('#planStrategyModelThread');
-      const btn = $('#planStrategyModelThreadToggle');
-      if (!el || !btn) return;
-      el.classList.toggle('hidden');
-      btn.textContent = el.classList.contains('hidden') ? 'Show conversation thread' : 'Hide conversation thread';
-    });
-    // One strategy row for the whole design session: repeated Design
-    // clicks (after answering questions) reuse it instead of orphaning
-    // a new empty strategy per round.
-    let modelSid = null;
-    let modelAsk = null;
-    let modelAnswers = null;
-    let modelThread = null;
-    // The conversation thread, rendered as turns: AI questions stay
-    // visible next to the user's answers; each Design call sends the
-    // accumulated turns so the model continues instead of restarting.
-    // Answers pair with the question they answered (values only — the
-    // internal field key never renders as "key = value").
-    const renderModelThread = () => {
-      const el = $('#planStrategyModelThread');
-      if (!el) return;
-      if (!modelThread || !modelThread.length) { el.innerHTML = ''; return; }
-      const labels = {};
-      el.innerHTML = modelThread.map((t) => {
-        if (t.role === 'ai') {
-          for (const q of (t.questions || [])) if (q.field) labels[q.field] = q.label;
-          return t.questions.map((q) => `<div class="plan-row"><span>AI: ${esc(q.label)}</span></div>`).join('');
-        }
-        return Object.entries(t.answers || {}).map(([k, v]) => `<div class="plan-row"><span>You: ${labels[k] ? `${esc(labels[k])}: ` : ''}${esc(String(v))}</span></div>`).join('');
-      }).join('');
-    };
-    const design = async (msg, name, text, answers) => {
-      if (!modelSid) {
-        const s = await api(`/api/planning/projects/${projectId}/strategies`, { method: 'POST', body: { name, source: 'ai' } });
-        modelSid = s.strategy.id;
-      }
-      const r = await api(`/api/planning/strategies/${modelSid}/ai-model`, { method: 'POST', body: { text, name, answers, history: modelThread } });
-      if (r.ask) {
-        // Structured ask: questions naming metadata fields, answered in
-        // a form — never the old free-text dead end. Answers are kept
-        // as the model's metadata and offered as the template schema.
-        modelAsk = r.ask;
-        modelAnswers = answers || null;
-        modelThread = r.thread || modelThread;
-        renderModelThread();
-        $('#planStrategyModelOut').innerHTML = `
-          ${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input id="planModelAsk_${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}" data-money="${q.type === 'number' ? '' : null}"></div>`).join('')}
-          <div class="toolbar"><button class="small primary" id="planStrategyModelContinue">Continue design</button></div>`;
-        $('#planStrategyModelContinue').addEventListener('click', async () => {
-          try {
-            const next = {};
-            for (const q of r.ask) {
-              const el = document.querySelector(`#planModelAsk_${CSS.escape(q.field)}`);
-              const v = el ? el.value.trim() : '';
-              if (!v) throw new Error('Please answer all questions before continuing.');
-              next[q.field] = q.type === 'number' ? Number(v) : v;
-            }
-            await design(msg, name, text, next);
-          } catch (err) { showMsg(msg, 'err', err.message); }
-        });
-        return;
-      }
-      const spec = r.model.spec;
-      modelAnswers = r.model.metadata || modelAnswers;
-      modelThread = r.thread || modelThread;
-      renderModelThread();
-      $('#planStrategyModelOut').innerHTML = `
-          <div class="plan-row"><span>Bindings: ${(spec.bindings || []).length} · Formulas: ${(spec.formulas || []).length} · Assumptions: ${(spec.assumptions || []).length} · Outputs: ${(spec.outputs || []).length} · Charts: ${(spec.charts || []).length}</span></div>
-          <div class="toolbar"><button class="small primary" id="planStrategyModelAttach">Use this model</button><button class="small" id="planStrategyModelSaveTpl">Save as template</button></div>
-          <div class="msg" id="planStrategyModelTplMsg"></div>`;
-      $('#planStrategyModelAttach').addEventListener('click', async () => {
-        try {
-          await api(`/api/planning/strategies/${modelSid}`, { method: 'PUT', body: { model_id: r.model.id } });
-          closeModalEl($('#planStrategyModal'));
-          location.hash = `#planning/strategy/${modelSid}`;
-        } catch (err) { showMsg(msg, 'err', err.message); }
-      });
-      $('#planStrategyModelSaveTpl').addEventListener('click', async () => {
-        try {
-          await api('/api/planning/templates', { method: 'POST', body: { name, spec, metadata_schema: modelAsk || [], metadata_answers: modelAnswers } });
-          showMsg($('#planStrategyModelTplMsg'), 'ok', 'Saved as template');
-        } catch (err) { showMsg($('#planStrategyModelTplMsg'), 'err', err.message); }
-      });
-    };
-    $('#planStrategyModelBtn').addEventListener('click', async () => {
-      const msg = $('#planStrategyModalMsg');
-      try {
-        const name = $('#planStrategyName').value.trim();
-        const text = $('#planStrategyModelText').value.trim();
-        if (!name) throw new Error('strategy name is required');
-        if (!text) throw new Error('describe the model first');
-        await design(msg, name, text, null);
-      } catch (err) { showMsg(msg, 'err', err.message); }
-    });
-  }
   async function openSavedForm() {
     const msg = $('#planStrategyModalMsg');
     try {
@@ -16144,7 +15693,7 @@ async function openPlanStrategyModal(projectId) {
       <div><label>Strategy name *</label><div style="display:flex;gap:8px"><input id="planStrategyName" placeholder="e.g. Refinance and invest" style="flex:1"><button type="button" class="small" id="planStrategyAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
       ${list.length ? `<div><label>Saved template *</label><select id="planSavedTemplateSel">${list.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></div>
       <div id="planSavedTemplateQs"></div>
-      <div class="toolbar"><button class="small primary" id="planSavedTemplateApply">Apply template</button><button class="small" id="planSavedTemplateRefine">Refine with AI</button></div>`
+      <div class="toolbar"><button class="small primary" id="planSavedTemplateApply">Apply template</button></div>`
         : '<div class="note">No saved templates yet.</div>'}`;
       const sel = $('#planSavedTemplateSel');
       // ✨ name from the picked saved template (no ops exist yet here).
@@ -16164,16 +15713,6 @@ async function openPlanStrategyModal(projectId) {
       };
       if (sel) { renderQs(); sel.addEventListener('change', renderQs); }
       const applyBtn = $('#planSavedTemplateApply');
-      const refineBtn = $('#planSavedTemplateRefine');
-      if (refineBtn) refineBtn.addEventListener('click', () => {
-        const cur = list.find((x) => String(x.id) === String(sel.value));
-        if (!cur) return;
-        const spec = cur.spec || {};
-        const summary = `Refine the "${cur.name}" template. Outputs: ${(spec.outputs || []).map((o) => o.id || o.label || '').filter(Boolean).join(', ') || '—'}. `
-          + `Bindings: ${(spec.bindings || []).map((b) => b.name || '').filter(Boolean).join(', ') || '—'}. `
-          + `Saved metadata answers: ${JSON.stringify(cur.metadata_answers || {})}.`;
-        openPlanModelForm(summary);
-      });
       if (applyBtn) applyBtn.addEventListener('click', async () => {
         try {
           const name = $('#planStrategyName').value.trim();
