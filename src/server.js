@@ -7823,12 +7823,15 @@ app.post('/api/planning/projects/:id/ai-report', requireApiAuth, async (req, res
   // (the engine path gets its how-calculated lines from the app).
   const methodErrs = validateAiChartMethods(parsed.charts);
   if (methodErrs.length) return res.status(502).json({ error: methodErrs.join('; ') });
-  // The AI engine: a calculation definition the app executes. The
-  // key is required ({} when the preset engine already covers every
-  // figure) so Generate-with-AI always yields a real engine, never
-  // a preset report in AI clothing; unknown identifiers or bad
-  // formulas are the same 502 path as a bad chart spec.
-  if (parsed.engine === undefined || parsed.engine === null) return res.status(502).json({ error: 'the AI response did not contain an engine definition (use {} when the preset engine covers every figure)' });
+  // The AI engine: a calculation definition the app executes. A
+  // missing key means the preset engine already covers every figure
+  // (validateAiEngine treats null as valid, and the viewer treats a
+  // missing engine as {}) — the model routinely omits the key when
+  // it has no custom calculation, so normalize it to {} here rather
+  // than rejecting an otherwise complete definition (user bug
+  // 2026-11-05: "total interest difference" 502'd on a missing
+  // engine). A present-but-unusable engine is still rejected below.
+  if (parsed.engine == null) parsed.engine = {};
   const engineErrs = validateAiEngine(parsed.engine);
   if (engineErrs.length) return res.status(502).json({ error: engineErrs.join('; ') });
   res.json({ definition: parsed, configured: true });
@@ -7870,7 +7873,10 @@ app.post('/api/planning/reports/:id/ai-refine', requireApiAuth, async (req, res)
   if (kindErrs.length) return res.status(502).json({ error: kindErrs.join('; ') });
   const methodErrs = validateAiChartMethods(parsed.charts);
   if (methodErrs.length) return res.status(502).json({ error: methodErrs.join('; ') });
-  if (parsed.engine === undefined || parsed.engine === null) return res.status(502).json({ error: 'the AI response did not contain an engine definition (use {} when the preset engine covers every figure)' });
+  // Same normalization as ai-report: a missing engine key means the
+  // preset engine covers every figure (user bug 2026-11-05); a
+  // present-but-unusable engine is still rejected below.
+  if (parsed.engine == null) parsed.engine = {};
   const engineErrs = validateAiEngine(parsed.engine);
   if (engineErrs.length) return res.status(502).json({ error: engineErrs.join('; ') });
   res.json({ definition: parsed, diff: aiReportDefinitionDiff(current, parsed), configured: true });

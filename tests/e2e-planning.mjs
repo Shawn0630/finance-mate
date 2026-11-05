@@ -710,6 +710,45 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${planProjectId}/reports`, { name: 'AI report test', definition: aiReportDef });
   H.check('planning: save AI report', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const aiReportId = r.data.report.id;
+  // Missing-engine fix (user bug 2026-11-05): the model omits the
+  // engine key when the preset engine covers the question ("What is
+  // the total interest difference between baseline and strategy A")
+  // — the endpoint normalizes it to {} instead of 502ing, and the
+  // saved report still renders preset-engine figures.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Interest Difference', charts: [
+    { template: 'metric_cards', title: 'Interest difference', series: ['cost', 'gain', 'net'], method: 'Gain = interest saved vs baseline; net = gain - cost; the total interest difference is the gain figure.' },
+  ] }));
+  r = await H.req('POST', `/api/planning/projects/${planProjectId}/ai-report`, { text: 'What is the total interest difference between baseline and strategy A' });
+  H.check('aireport: preset-covered question without an engine key succeeds (engine normalized to {})',
+    r.status === 200 && r.data.definition && JSON.stringify(r.data.definition.engine) === '{}' && Array.isArray(r.data.definition.charts) && r.data.definition.charts.length === 1, JSON.stringify(r.data));
+  const noEngineDef = r.data.definition;
+  r = await H.req('POST', `/api/planning/projects/${planProjectId}/reports`, { name: 'Interest Difference', definition: noEngineDef });
+  H.check('aireport: missing-engine definition saves as an AI report', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const noEngineRepId = r.data.report.id;
+  r = await H.req('GET', `/api/planning/projects/${planProjectId}/comparison?reportId=${noEngineRepId}`);
+  const noEngCmp = r.data.strategies && r.data.strategies[0] && r.data.strategies[0].comparison;
+  H.check('aireport: saved missing-engine report renders preset-engine figures',
+    r.status === 200 && !!noEngCmp && Number.isFinite(noEngCmp.cost) && Number.isFinite(noEngCmp.gain) && Number.isFinite(noEngCmp.net), JSON.stringify({ status: r.status, noEngCmp }));
+  // Error path preserved: a model that ATTEMPTS a custom engine for
+  // a question the preset engine cannot answer (a custom growth
+  // figure referencing an undeclared input) but produces an
+  // unusable definition is still rejected — never silently rendered
+  // as preset figures.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Custom growth', engine: { scalars: { gain: 'gain + gic_rate' } }, charts: [
+    { template: 'metric_cards', title: 'Custom gain', series: ['cost', 'gain', 'net'], method: 'Gain from the custom GIC growth path at the declared rate.' },
+  ] }));
+  r = await H.req('POST', `/api/planning/projects/${planProjectId}/ai-report`, { text: 'Show the gain if the pool grew at a custom GIC rate' });
+  H.check('aireport: present-but-unusable engine is still rejected (502, unknown identifier)',
+    r.status === 502 && /gic_rate/.test(JSON.stringify(r.data)), JSON.stringify(r.data));
+  // ai-refine shares the fix: a revised definition without an engine
+  // key normalizes to {} instead of 502ing.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Interest Difference', charts: [
+    { template: 'metric_cards', title: 'Interest difference', series: ['cost', 'gain', 'net'], method: 'Gain = interest saved vs baseline; net = gain - cost.' },
+    { template: 'yearly_bars', title: 'Year-end balance', series: ['mortgage_balance'], method: 'Year-end outstanding principal per year from the engine projection.' },
+  ] }));
+  r = await H.req('POST', `/api/planning/reports/${noEngineRepId}/ai-refine`, { text: 'Add a year-end balance chart' });
+  H.check('aireport: ai-refine without an engine key succeeds (engine normalized to {})',
+    r.status === 200 && r.data.definition && JSON.stringify(r.data.definition.engine) === '{}' && r.data.diff && Array.isArray(r.data.diff.charts.added) && r.data.diff.charts.added.includes('Year-end balance'), JSON.stringify(r.data));
   r = await H.req('POST', `/api/planning/projects/${planProjectId}/reports`, { name: 'Fixed report test', definition: { strategies: [], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] } });
   H.check('planning: fixed-default save path still works', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/projects/${planProjectId}/comparison`);
