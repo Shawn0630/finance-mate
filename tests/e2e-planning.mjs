@@ -5407,22 +5407,39 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Mortgage hidden report', definition: { strategies: [icStrat], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [icStrat], scenario_ids: [] });
   H.check('stratpanels: mortgage-chart report on the stock strategy created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const icHideRep = r.data.report.id;
-  // (reporterr): a pot-funded buy with NO funding legs passes
-  // validation but is dropped at projection with the unfunded
-  // error; the report view must surface it prominently, and a
-  // clean report must show no notice.
-  r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Dropped buy' });
-  H.check('reporterr: dropped-buy strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  // (reportaudit): a buy with NO funding legs defaults to the
+  // implicit cash leg (remainder) — the same rule the op form
+  // applies at save. It executes, funded by the pool; it is NOT
+  // dropped at projection with the unfunded error (the old
+  // reporterr behavior pinned the bug: the GIC buy's "49671.72
+  // unfunded" error, user 2026-11-05). A clean report shows no
+  // notice; the buy's funding is the pool swap.
+  r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Legless buy' });
+  H.check('reportaudit: leg-less buy strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const icDropStrat = r.data.strategy.id;
   r = await H.req('POST', `/api/planning/strategies/${icDropStrat}/ops`, { op_type: 'buy', params: { accountId: icAcct, symbol: 'INVCOMP.Z', date: icBuyYm, units: 10, price: 100, currency: 'CAD' } });
-  H.check('reporterr: leg-less buy op created (validation passes, projection drops it)', r.status === 201, JSON.stringify(r.data));
+  H.check('reportaudit: leg-less buy op created (validation passes, no legs stored)', r.status === 201, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/strategies/${icDropStrat}`);
+  const dropProj = r.data.projection || {};
   const dropErrs = (r.data.comparison && r.data.comparison.errors) || [];
-  H.check('reporterr: projection errors name the buy op + unfunded reason',
-    dropErrs.some((e) => /buy operation \d+: funding covers only part of the purchase — .* unfunded/.test(e)), JSON.stringify(dropErrs));
-  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Dropped buy report', definition: { strategies: [icDropStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [icDropStrat], scenario_ids: [] });
-  H.check('reporterr: dropped-buy report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  H.check('reportaudit: leg-less pool buy executes with the implicit cash leg (no errors, pool-funded swap)',
+    dropErrs.length === 0 && (dropProj.stocks && dropProj.stocks.buyCash) === 1000 && (dropProj.stocks && dropProj.stocks.buyCashFromSells) === 1000,
+    JSON.stringify({ errors: dropErrs, stocks: dropProj.stocks }));
+  r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'Legless buy report', definition: { strategies: [icDropStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance'] }] }, strategy_ids: [icDropStrat], scenario_ids: [] });
+  H.check('reportaudit: leg-less buy report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const icDropRep = r.data.report.id;
+  // GIC-style legless buy: accountId null, rate on the op, no legs.
+  r = await H.req('POST', `/api/planning/projects/${icProj}/strategies`, { name: 'Legless GIC buy' });
+  H.check('reportaudit: leg-less GIC buy strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const icGicStrat = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${icGicStrat}/ops`, { op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: icBuyYm, amount: 1000, price: 100, currency: 'CAD', expectedReturnPct: 4.6 } });
+  H.check('reportaudit: legless GIC-style buy op created (no legs, rate on the op)', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${icGicStrat}`);
+  const gicProj = r.data.projection || {};
+  const gicErrs = (r.data.comparison && r.data.comparison.errors) || [];
+  H.check('reportaudit: legless GIC buy executes from the pool, no unfunded error',
+    gicErrs.length === 0 && (gicProj.stocks && gicProj.stocks.buyCash) === 1000 && (gicProj.stocks && gicProj.stocks.buyCashFromSells) === 1000,
+    JSON.stringify({ errors: gicErrs, stocks: gicProj.stocks }));
   // Item 6 revised (d): AI report on a cash-pool baseline — a
   // mortgage-family chart in the AI definition is rejected by the
   // server validation (same 502 style as the chart-spec check),
@@ -5548,6 +5565,31 @@ export async function run(H, S) {
       H.check('gic-caption-rate: pool report Difference chart caption names Value Δ only (no Balance Δ)',
         repPool.trajCap.includes('Value Δ') && !repPool.trajCap.includes('Balance Δ'),
         JSON.stringify({ trajCap: repPool.trajCap }));
+      // (reportaudit) The Penalty variable is mortgage-only: a
+      // cash-pool report has no Penalty input and no Variables
+      // section at all, and no mortgage-worded copy anywhere in the
+      // report — the method note names the swap, not interest saved.
+      const repAudit = await page.evaluate(() => ({
+        hasPenaltyInput: !!document.querySelector('[data-plan-report-penalty]'),
+        hasVariablesBlock: !!document.querySelector('[data-plan-report-block="variables"]'),
+        hasVariablesH3: [...document.querySelectorAll('#planReport h3')].some((h) => h.textContent === 'Variables'),
+        defs: document.querySelector('.plan-report-defs')?.textContent || '',
+        engineText: document.querySelector('#planReportEngineBody')?.textContent || '',
+        wholeText: document.querySelector('#planReport')?.textContent || '',
+      }));
+      H.check('reportaudit: pool report has no Penalty variable (no input, no Variables section)',
+        !repAudit.hasPenaltyInput && !repAudit.hasVariablesBlock && !repAudit.hasVariablesH3,
+        JSON.stringify({ hasPenaltyInput: repAudit.hasPenaltyInput, hasVariablesBlock: repAudit.hasVariablesBlock, hasVariablesH3: repAudit.hasVariablesH3 }));
+      H.check('reportaudit: pool report method note names no penalty / interest saved (swap framing)',
+        !repAudit.defs.includes('interest saved') && !repAudit.defs.includes('penalty') && repAudit.defs.includes('swap'),
+        JSON.stringify({ defs: repAudit.defs }));
+      H.check('reportaudit: pool report engine note names no penalty / interest saved, horizon is pool + stock only',
+        !repAudit.engineText.includes('Penalty is a report variable') && !repAudit.engineText.includes('interest saved')
+          && repAudit.engineText.includes('pool + stock only'),
+        JSON.stringify({ engineText: repAudit.engineText.slice(0, 600) }));
+      H.check('reportaudit: pool report carries no Penalty / interest-saved copy anywhere',
+        !repAudit.wholeText.includes('Penalty') && !repAudit.wholeText.includes('interest saved'),
+        JSON.stringify({ wholeText: repAudit.wholeText.slice(0, 800) }));
       H.check('invcomp: report table has Value Δ only, no mortgage columns',
         repPool.tableHead.includes('Value Δ') && !repPool.tableHead.includes('Balance Δ') && !repPool.tableHead.includes('Baseline balance')
           && repPool.tableCap.includes('Value Δ') && !repPool.tableCap.includes('Balance Δ'),
@@ -5674,6 +5716,9 @@ export async function run(H, S) {
       H.check('gating: after Generate + reload, the strategy page still shows no panels/headline/Difference table',
         !gatePoolOpen.headline && !gatePoolOpen.mort && !gatePoolOpen.eq && !gatePoolOpen.pool && !gatePoolOpen.stock && !gatePoolOpen.diffTable,
         JSON.stringify(gatePoolOpen));
+      // (reportaudit D1 moved below, after the Gate-property flow:
+      // opening a second report tab on the project page here leaves
+      // the next strategy-page Generate button unmeasurable.)
       r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Gate property' });
       H.check('gating: no-report property strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
       const gatePropStrat = r.data.strategy.id;
@@ -5725,6 +5770,36 @@ export async function run(H, S) {
       H.check('gating: after Generate + reload, the strategy page still shows no panels/headline/Difference table',
         !gatePropOpen.headline && !gatePropOpen.mort && !gatePropOpen.eq && !gatePropOpen.diffTable,
         JSON.stringify(gatePropOpen));
+      // (reportaudit D1) Project-page preset Generate on a pool project
+      // renders the Cash pool chart (kind-aware definition) — before
+      // the fix it hardcoded the Mortgage balance chart, which the
+      // viewer hides, so the report read "No charts in this report".
+      // Placed AFTER the Gate-property flow: opening a second report
+      // tab on the project page before that flow leaves the
+      // strategy-page Generate button unmeasurable (0-size rect) and
+      // the title wait timing out — the tab state must not precede a
+      // strategy-page navigation. The tab is closed right after the
+      // check, leaving zero open tabs (no restore reload in flight)
+      // before the next section navigates.
+      await page.goto(`http://ff.local/#planning/project/${icProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => { const b = document.querySelector('#planFlowGenerateBtn'); return !!b && !b.disabled; }, { timeout: 15000 });
+      await page.evaluate(() => { document.querySelector('#planFlowGenerateBtn')?.click(); });
+      // Scope every query to the VISIBLE project tier: loadPlanProject
+      // only HIDES #planStrategy (it never clears it), so the hidden
+      // strategy tier still holds the Gate-property report's
+      // 'Mortgage balance' block and its tab — document-wide queries
+      // read that stale tier and the pin misfires (run 5).
+      await page.waitForFunction(() => !!document.querySelector('#planProject [data-plan-report-tab]'), { timeout: 15000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('#planProject [data-plan-report-block] h3')].some((h) => h.textContent === 'Cash pool'), { timeout: 15000 });
+      const flowPool = await page.evaluate(() => ({
+        cashPool: [...document.querySelectorAll('#planProject #planReport [data-plan-report-block] h3')].some((h) => h.textContent === 'Cash pool'),
+        mortBlock: [...document.querySelectorAll('#planProject #planReport [data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'),
+        noCharts: (document.querySelector('#planProject #planReport')?.textContent || '').includes('No charts in this report'),
+      }));
+      H.check('reportaudit: project-page preset Generate on a pool project renders the Cash pool chart (no "No charts" note, no mortgage chart)',
+        flowPool.cashPool && !flowPool.mortBlock && !flowPool.noCharts, JSON.stringify(flowPool));
+      await page.evaluate(() => { document.querySelector('#planProject .plan-report-tabwrap-current [data-plan-report-tab-close]')?.click(); });
+      await page.waitForFunction(() => document.querySelectorAll('#planProject [data-plan-report-tab]').length === 0, { timeout: 15000 });
       // (d) Property strategy panels still render: open the payscope
       // report and confirm the breakdown block + balance chart exist.
       // The pin opens the pure-switch report (psRepPure), not psRep:
@@ -5825,11 +5900,11 @@ export async function run(H, S) {
         JSON.stringify(twoState));
     } finally { await browserI.close(); }
   }
-  // (reporterr browser): the dropped-buy notice renders in the
-  // report view; the strategy detail still shows it; the clean
-  // report shows no notice.
+  // (reportaudit browser): the leg-less buy executes, so neither
+  // the strategy detail nor the report view shows a projection-error
+  // notice; the clean report shows no notice either.
   if (!H.puppeteer || !H.chromeAvailable) {
-    console.log('reporterr browser checks skipped (puppeteer-core / probe Chrome not available)');
+    console.log('reportaudit browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
     const forwardR = (rq) => new Promise((resolve, reject) => {
       const rr = http.request(
@@ -5876,9 +5951,9 @@ export async function run(H, S) {
       await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueR, domain: 'ff.local', path: '/', httpOnly: true });
       await page.goto(`http://ff.local/#planning/strategy/${icDropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await page.waitForFunction(() => !!document.querySelector('#planStrategyTitle'), { timeout: 15000 });
-      const detailErrs = await page.evaluate(() => [...document.querySelectorAll('.msg.err')].map((el) => el.textContent));
-      H.check('reporterr: strategy detail still shows the dropped-buy error',
-        detailErrs.some((t) => /unfunded/.test(t)), JSON.stringify(detailErrs));
+      const detailErrs = await page.evaluate(() => [...document.querySelectorAll('.msg.err')].map((el) => ({ id: el.id || el.className, text: el.textContent.trim() })).filter((x) => x.text));
+      H.check('reportaudit: leg-less buy strategy detail shows no projection error',
+        detailErrs.length === 0, JSON.stringify(detailErrs));
       await page.goto(`http://ff.local/#planning/project/${icProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icDropRep);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icDropRep);
@@ -5888,24 +5963,23 @@ export async function run(H, S) {
         await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icDropRep);
         await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icDropRep);
       }
-      await page.waitForFunction(() => !!document.querySelector('#planReport .msg.err'), { timeout: 15000 });
-      const repErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => el.textContent));
-      H.check('reporterr: report view shows a prominent notice naming the dropped buy + unfunded reason',
-        repErrs.some((t) => /Dropped buy/.test(t) && /buy operation \d+/.test(t) && /unfunded/.test(t)), JSON.stringify(repErrs));
-      // Item 6 refinement 2 (c): the dropped-buy headline zeros appear
-      // TOGETHER with the error notice (gate open via icDropRep), so
-      // the zeros are explained, not silent — pool-only headline, now
-      // in the report (the strategy page has no headline).
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      const repErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => ({ id: el.id || el.className, text: el.textContent.trim() })).filter((x) => x.text));
+      H.check('reportaudit: leg-less buy report shows no projection-error notice',
+        repErrs.length === 0, JSON.stringify(repErrs));
+      // The leg-less buy is a flat swap ($1,000 of flat H for $1,000
+      // of flat Z), so the headline is pool-only zeros + the $10,000
+      // flat Value at horizon — with no error notice alongside.
       const dropHead = await page.evaluate(() => {
         const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
         return cards.map((c) => ({ k: c.querySelector('.k')?.textContent || '', v: c.querySelector('.v')?.textContent || '' }));
       });
       const dropVal = (k) => (dropHead.find((c) => c.k === k) || {}).v || '';
-      H.check('headline: dropped-buy headline shows pool-only zeros + non-zero Value at horizon alongside the error notice',
+      H.check('reportaudit: leg-less buy headline shows pool-only zeros + non-zero Value at horizon, no error notice',
         dropHead.length === 5 && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => dropHead.some((c) => c.k === k))
           && ['Net benefit', 'Total cost', 'Total gain', 'Stock gain'].every((k) => /0\.00/.test(dropVal(k)) && !/[1-9]/.test(dropVal(k).replace(/0\.00/, '')))
           && /\d/.test(dropVal('Value at horizon')) && !/^\$?0\.00$/.test(dropVal('Value at horizon').trim())
-          && repErrs.some((t) => /unfunded/.test(t)),
+          && repErrs.length === 0,
         JSON.stringify({ dropHead, repErrs }));
       await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, icRep);
@@ -5917,8 +5991,8 @@ export async function run(H, S) {
         await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, icRep);
       }
       await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
-      const cleanErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => el.textContent));
-      H.check('reporterr: clean report shows no projection-error notice',
+      const cleanErrs = await page.evaluate(() => [...document.querySelectorAll('#planReport .msg.err')].map((el) => ({ id: el.id || el.className, text: el.textContent.trim() })).filter((x) => x.text));
+      H.check('reportaudit: clean report shows no projection-error notice',
         cleanErrs.length === 0, JSON.stringify(cleanErrs));
     } finally { await browserR.close(); }
   }
@@ -6138,6 +6212,20 @@ export async function run(H, S) {
         psTpl.hasBreakdownH3 && psTpl.hasBreakdownCanvas
           && ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((l) => psTpl.headlineCards.includes(l)),
         JSON.stringify(psTpl));
+      // (reportaudit) The property template keeps the Penalty
+      // variable and the mortgage-worded method note — the pool
+      // removal above is kind-scoped, not global.
+      const psAudit = await page.evaluate(() => ({
+        hasPenaltyInput: !!document.querySelector('[data-plan-report-penalty]'),
+        hasVariablesBlock: !!document.querySelector('[data-plan-report-block="variables"]'),
+        defs: document.querySelector('.plan-report-defs')?.textContent || '',
+        engineText: document.querySelector('#planReportEngineBody')?.textContent || '',
+      }));
+      H.check('reportaudit: property report keeps the Penalty variable (input + Variables section) and the mortgage-worded method note',
+        psAudit.hasPenaltyInput && psAudit.hasVariablesBlock
+          && psAudit.defs.includes('interest saved') && psAudit.defs.includes('penalty')
+          && psAudit.engineText.includes('Penalty is a report variable'),
+        JSON.stringify(psAudit));
       // (e/f/g) Report-view merged table: pool + no mortgage-touching
       // strategy hides the mortgage rows; a picked mortgage-touching
       // strategy (mixed) and a property report keep them.

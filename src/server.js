@@ -7230,7 +7230,7 @@ app.post('/api/planning/strategies/:id/ai-model', requireApiAuth, async (req, re
     '2. formulas: [{output, expression}] — structured expressions over bound inputs and intermediate series ids, e.g. "monthly interest = prior balance * monthly rate / 12".',
     '3. assumptions: [{key, value, source}] — every assumption explicit; nothing hidden.',
     '4. outputs: [{id, label}] — the computed series this model produces.',
-    '5. charts: [{template, title, series}] — template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards; series entries bind to output ids.',
+    '5. charts: [{template, title, series}] — template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, metric_cards (funds_flow is not offered: the app cannot render it); series entries bind to output ids.',
     'If a value you need is genuinely absent from the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never a value present in the snapshot.',
     'NEVER ask the user for a database ID (property_id, term_id, account_id, holding_id, segment_id, or any *_id field): the user does not know database IDs and cannot answer them. When you need the user to choose an entity, ask by NAME: name the candidates from the snapshot (property addresses, mortgage terms by property + start date, account names, holding symbols) and ask the user to pick one by name. The app binds the chosen name to the ID itself — never put an *_id field in an ask list.',
     `Named candidates the user can pick from: ${candidateLines}`,
@@ -7715,7 +7715,13 @@ app.post('/api/planning/ai-create/apply', requireApiAuth, async (req, res) => {
       if (o.op_type === 'buy') planNormalizeBuyParams(o.params);
       const oi = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(st.lastInsertRowid, o.seq, o.op_type, JSON.stringify(o.params), 'ai', now, now);
-      for (const l of (o.legs || [])) {
+      // A buy with no legs stores the implicit cash leg (remainder)
+      // — the same rule the op form applies at save. Without it the
+      // buy passes validation (validateLegs checks existing legs
+      // only) and fails at report time as unfunded.
+      const opLegs = o.op_type === 'buy' && !(o.legs || []).length
+        ? [{ source_ref: 'cash', amount: 'remainder' }] : (o.legs || []);
+      for (const l of opLegs) {
         db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
           .run(oi.lastInsertRowid, l.source_ref, String(l.amount), now);
       }

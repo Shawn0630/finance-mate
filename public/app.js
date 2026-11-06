@@ -12330,13 +12330,21 @@ async function planFlowGenerate(projectId) {
   if (btn && btn.disabled) return;
   const scenId = planWiringScenarioId();
   const picked = planFlowPickedStrategies();
+  // Kind-aware preset definition (user 2026-11-05 — the template is
+  // keyed on the BASELINE kind): a cash-pool baseline gets a pool
+  // trajectory chart, never the hardcoded Mortgage balance chart
+  // (the viewer hides it, so a preset pool report read "No charts
+  // in this report"). Property/other keep it. Same rule as the
+  // strategy-page Generate.
+  const fb = (planProjectData || {}).project && planProjectData.project.fixedBaseline;
+  const isPool = !!(fb && fb.kind === 'investment' && fb.figures && fb.figures.poolValue != null);
+  const presetCharts = isPool
+    ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
+    : [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }];
   try {
     const r = await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: {
       name: planFlowPresetTitle(),
-      definition: { strategies: picked, charts: [
-        { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] },
-        { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] },
-      ] },
+      definition: { strategies: picked, charts: presetCharts },
       baseline_id: planWiringBaselineId,
       strategy_ids: picked,
       scenario_ids: scenId != null ? [scenId] : [],
@@ -13009,7 +13017,8 @@ const PLAN_REPORT_SERIES_LABEL = {
   cost: 'Total cost', gain: 'Total gain', net: 'Net benefit', stock_gain: 'Stock gain',
   payoff_month: 'Payoff shift (months)', monthly_payment: 'Monthly payment Δ',
 };
-const PLAN_REPORT_DEFS = 'Cost = fees + penalty + cash out. Gain = interest saved vs baseline + asset growth under assumptions. Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
+const PLAN_REPORT_DEFS_PROPERTY = 'Cost = fees + penalty + cash out. Gain = interest saved vs baseline + asset growth under assumptions. Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
+const PLAN_REPORT_DEFS_POOL = 'Cost = fees + cash out (new cash only — a buy funded by selling the pool is a swap, not new cash). Gain = asset growth vs the baseline trajectory (same return assumption, no ops). Net = gain − cost. New cash put in is cost; the growth it earns is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
 const PLAN_REPORT_HOW = {
   mortgage_balance: 'Mortgage balance = outstanding principal by month from the engine projection, summed across properties. Baseline and strategies price the variable rate off the same prime history: actual observations plus the scenario steps.',
   stock_value: 'Stock value = units × last price at or before the month (last price carried forward, never invented). The cash pot is included only at the horizon month.',
@@ -13021,7 +13030,16 @@ const PLAN_REPORT_HOW = {
   payoff_month: 'Payoff shift = baseline payoff month − strategy payoff month, in months (positive = earlier).',
   monthly_payment: 'Monthly payment Δ = strategy payment at effect − baseline payment at effect, summed across properties.',
 };
+const PLAN_REPORT_HOW_POOL = {
+  cost: 'Cost = fees + cash out (new cash only — a buy funded by selling the pool is a swap, not new cash).',
+  gain: 'Gain = stock growth vs the baseline trajectory (same return assumption, no ops). A do-nothing strategy books no gain.',
+  net: 'Net = gain − cost. New cash put in is cost; the growth it earns is gain — no double count.',
+};
 const planReportHowFor = (series, scopeAddress, investmentScope) => [...new Set(series || [])].map((s) => {
+  // Pool reports: the mortgage-worded cost/gain/net lines are false
+  // here (no interest saved, no penalty) — the pool wording replaces
+  // them; every other series keeps the shared line.
+  if (investmentScope && PLAN_REPORT_HOW_POOL[s]) return PLAN_REPORT_HOW_POOL[s];
   let t = PLAN_REPORT_HOW[s];
   // Entity scope (user rule 2026-11-04): a property project's figures
   // cover its entity property only — the "summed across properties"
@@ -13343,13 +13361,15 @@ function planReportPenaltyFor(vars, strategyId) {
 // penalty variable replaces the engine penalty in cost
 // (cost = cost − penaltyTotal + variable; net = gain − cost).
 // Pure — the live headline and the saved render both use it.
-function planReportEffectiveComparison(row, vars) {
+// On a cash-pool report the penalty variable does not exist: a stale
+// saved value is ignored (penalty 0), so cost is the engine cost.
+function planReportEffectiveComparison(row, vars, isPool) {
   const eff = { ...(row.comparisonBase || row.comparison || {}) };
   const eng = row.engine;
   if (eng && !(eng.errors && eng.errors.length)) {
     for (const [k, v] of Object.entries(eng.scalars || {})) eff[k] = v;
   }
-  const penalty = planReportPenaltyFor(vars, row.strategy.id);
+  const penalty = isPool ? 0 : planReportPenaltyFor(vars, row.strategy.id);
   const enginePenalty = Math.round((eff.penaltyTotal || 0) * 100) / 100;
   eff.penalty = penalty;
   eff.cost = Math.round(((eff.cost || 0) - enginePenalty + penalty) * 100) / 100;
@@ -13367,9 +13387,13 @@ function planReportEffectiveComparison(row, vars) {
 function planReportApplyOverlay(comp, report) {
   const vars = (report.definition && report.definition.variables) || null;
   const trajs = (comp.report && comp.report.trajectories) || [];
+  // The penalty variable does not exist on a cash-pool report: a
+  // stale saved value is ignored there (template keyed on the
+  // baseline kind).
+  const isPool = !!(comp.report && comp.report.investmentScope);
   for (const row of comp.strategies || []) {
     row.comparisonBase = { ...(row.comparison || {}) };
-    row.comparison = planReportEffectiveComparison(row, vars);
+    row.comparison = planReportEffectiveComparison(row, vars, isPool);
     const eng = row.engine;
     if (eng && !(eng.errors && eng.errors.length) && eng.series) {
       const traj = trajs.find((t) => t.key === String(row.strategy.id));
@@ -13396,6 +13420,7 @@ const PLAN_REPORT_TEMPLATES = {
   property: {
     key: 'property',
     sections: ['variables', 'headline', 'charts', 'table', 'comparison', 'engine'],
+    variables: ['penalty'], // report variables that apply on this kind
     mortgageCharts: true,        // mortgage-only chart blocks render
     mortgageHeadlineCards: true, // Interest saved / Payoff shift / Monthly payment Δ / Penalty
     breakdown: true,             // Monthly payment breakdown inside the comparison panel
@@ -13403,7 +13428,14 @@ const PLAN_REPORT_TEMPLATES = {
   },
   pool: {
     key: 'pool',
-    sections: ['variables', 'headline', 'charts', 'table', 'comparison', 'engine'],
+    // No Variables section: penalty is a mortgage concept (breaking
+    // a term / refinance / rate switch) and has no meaning on a
+    // cash-pool strategy — it must not appear here at all (user
+    // 2026-11-05: "为啥GIC有penalty啊"). The template is keyed on
+    // the BASELINE kind (cash pool vs property mortgage), never on
+    // the strategy.
+    sections: ['headline', 'charts', 'table', 'comparison', 'engine'],
+    variables: [],
     mortgageCharts: false,
     mortgageHeadlineCards: false,
     breakdown: false,
@@ -13424,7 +13456,7 @@ function planReportTemplateFor(kind) {
 function planReportHeadlineCardsHtml(view) {
   const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
   if (!row) return '<div class="note">No strategies yet.</div>';
-  const c = planReportEffectiveComparison(row, view.vars);
+  const c = planReportEffectiveComparison(row, view.vars, view.templateKey === 'pool');
   // Which mortgage cards show follows the report TEMPLATE, not a
   // local investmentScope check. Stock gain stays for pool reports:
   // it is a stock figure, not a mortgage figure.
@@ -13544,7 +13576,9 @@ function planReportTableRender(view) {
 // definition, and the penalty-variable state.
 function planReportEngineHtml(view) {
   const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
-  const c = row ? planReportEffectiveComparison(row, view.vars) : {};
+  const isPool = view.templateKey === 'pool';
+  const hasPenaltyVar = !!(view.template && (view.template.variables || []).includes('penalty'));
+  const c = row ? planReportEffectiveComparison(row, view.vars, isPool) : {};
   const eng = row && row.engine;
   const hasEngine = !!(view.report.definition && view.report.definition.engine && typeof view.report.definition.engine === 'object');
   const engFailed = !!(eng && eng.errors && eng.errors.length);
@@ -13561,19 +13595,27 @@ function planReportEngineHtml(view) {
   const months = ((trajs[0] || {}).monthly || []).map((r) => r.month);
   const horizonLine = months.length ? `Horizon: ${formatYM(months[0])} – ${formatYM(months[months.length - 1])} (${months.length} months).` : '';
   const bd = row && view.costBreakdown ? view.costBreakdown[row.strategy.id] : null;
+  // Pool reports measure no mortgage: no penalty, no interest saved
+  // — the cost line names fees + cash out and the gain is stock gain
+  // only. Property reports keep the full breakdown.
   const costLine = row
-    ? `${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost ${planMoney(c.cost)}${bd ? ` (fees ${planMoney(bd.fees)} + penalty ${planMoney(c.penalty)} + cash out ${planMoney(bd.cashOut)})` : ''} · gain ${planMoney(c.gain)} (interest saved ${planSigned(c.interestSaved)} + stock gain ${planSigned(c.stockGain)}) · net ${planMoney(c.net)}. Value at horizon ${planMoney(c.valueAtHorizon)}.`
+    ? isPool
+      ? `${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost ${planMoney(c.cost)}${bd ? ` (fees ${planMoney(bd.fees)} + cash out ${planMoney(bd.cashOut)})` : ''} · gain ${planMoney(c.gain)} (stock gain ${planSigned(c.stockGain)}) · net ${planMoney(c.net)}. Value at horizon ${planMoney(c.valueAtHorizon)}.`
+      : `${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost ${planMoney(c.cost)}${bd ? ` (fees ${planMoney(bd.fees)} + penalty ${planMoney(c.penalty)} + cash out ${planMoney(bd.cashOut)})` : ''} · gain ${planMoney(c.gain)} (interest saved ${planSigned(c.interestSaved)} + stock gain ${planSigned(c.stockGain)}) · net ${planMoney(c.net)}. Value at horizon ${planMoney(c.valueAtHorizon)}.`
     : '';
   const penState = (view.comp.strategies || []).map((r) => {
     const v = planReportPenaltyFor(view.vars, r.strategy.id);
     return `${esc(r.strategy.letter)} · ${esc(r.strategy.name)}: ${planMoney(v)}`;
   }).join(' · ');
+  const horizonDefLine = isPool
+    ? 'Value at horizon = stock value at the horizon month at today\u2019s known prices (no growth) + cash pot (pool + stock only — no property equity).'
+    : 'Value at horizon = property equity at the horizon month + stock value at the horizon month at today\u2019s known prices (no growth) + cash pot.';
   return `<div class="panel"><div class="section-head"><h3>Engine</h3></div>
     <div class="note">${engineLine}</div>
     ${horizonLine ? `<div class="note">${horizonLine}</div>` : ''}
     ${costLine ? `<div class="note">${costLine}</div>` : ''}
-    <div class="note">Value at horizon = property equity at the horizon month + stock value at the horizon month at today\u2019s known prices (no growth) + cash pot.</div>
-    <div class="note">Penalty is a report variable (default $0): ${penState || 'none'}. It changes cost and net only — never the trajectories.</div>
+    <div class="note">${horizonDefLine}</div>
+    ${hasPenaltyVar ? `<div class="note">Penalty is a report variable (default $0): ${penState || 'none'}. It changes cost and net only — never the trajectories.</div>` : ''}
     <div class="note">Refine: edit this strategy\u2019s operations, funding or scenario on its page, then press Generate again. ${row ? `<a href="#planning/strategy/${row.strategy.id}">Edit ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</a>` : ''}</div>
   </div>`;
 }
@@ -13583,7 +13625,11 @@ function planReportEngineHtml(view) {
 // breakdown table and the engine note live; Apply saves the
 // variables with the report (PUT) and reloads, which refreshes the
 // charts and the comparison table. What-if never writes.
+// The panel renders ONLY for templates that declare variables: a
+// cash-pool report has none (penalty is mortgage-only), so the
+// section is absent there, not empty.
 function planReportVariablesHtml(view) {
+  if (!view.template || !(view.template.variables || []).length) return '';
   const rows = (view.comp.strategies || []).map((r) => {
     const v = planReportPenaltyFor(view.vars, r.strategy.id);
     return `<div><label>Penalty — ${esc(r.strategy.letter)} · ${esc(r.strategy.name)} ($)</label><input type="text" inputmode="decimal" data-money data-plan-report-penalty="${r.strategy.id}" value="${v}"><div class="note">Default $0. Changes cost and net only.</div></div>`;
@@ -13597,11 +13643,13 @@ function planReportVariablesHtml(view) {
 }
 
 // Cost-breakdown table body (shared by the chart panel and the live
-// variable update): fees + penalty variable + cash out.
-function planReportCostBodyHtml(fees, penVar, cashOut) {
-  const total = (fees || 0) + (penVar || 0) + (cashOut || 0);
-  const labels = ['Fees', 'Penalty (report variable)', 'Cash out'];
-  const data = [fees || 0, penVar || 0, cashOut || 0];
+// variable update): fees + penalty variable + cash out. On a
+// cash-pool report there is no penalty variable, so the row is
+// omitted (showPenalty false).
+function planReportCostBodyHtml(fees, penVar, cashOut, showPenalty = true) {
+  const total = (fees || 0) + (showPenalty ? (penVar || 0) : 0) + (cashOut || 0);
+  const labels = showPenalty ? ['Fees', 'Penalty (report variable)', 'Cash out'] : ['Fees', 'Cash out'];
+  const data = showPenalty ? [fees || 0, penVar || 0, cashOut || 0] : [fees || 0, cashOut || 0];
   return labels.map((l, li) => `<tr><td>${l}</td><td>${money2(data[li])}</td><td>${total ? `${((data[li] / total) * 100).toFixed(1)}%` : '—'}</td></tr>`).join('');
 }
 
@@ -13657,7 +13705,7 @@ function planReportViewWire(view) {
     const costBody = $('#planReportCostBody');
     if (costBody && view.costDoughnut) {
       const penVar = planReportPenaltyFor(view.vars, view.costDoughnut.strategyId);
-      costBody.innerHTML = planReportCostBodyHtml(view.costDoughnut.fees, penVar, view.costDoughnut.cashOut);
+      costBody.innerHTML = planReportCostBodyHtml(view.costDoughnut.fees, penVar, view.costDoughnut.cashOut, !!(view.template && (view.template.variables || []).includes('penalty')));
     }
   }));
   const applyBtn = $('#planReportVarsApplyBtn');
@@ -13958,14 +14006,16 @@ async function loadPlanReport(projectId, reportId) {
             // the engine estimate (item 4): cost = fees + penalty
             // variable + cash out. The chart draws the saved value;
             // typing updates the table live and Apply reloads the
-            // chart.
-            const penVar = planReportPenaltyFor(planReportView.vars, row.strategy.id);
-            const labels = ['Fees', 'Penalty (report variable)', 'Cash out'];
-            const data = [bd.fees, penVar, bd.cashOut];
-            const total = (bd.fees || 0) + (penVar || 0) + (bd.cashOut || 0);
-            const body = planReportCostBodyHtml(bd.fees, penVar, bd.cashOut);
+            // chart. On a cash-pool report there is no penalty
+            // variable — the slice and the mention are omitted.
+            const hasPenaltyVar = !!(template.variables || []).includes('penalty');
+            const penVar = hasPenaltyVar ? planReportPenaltyFor(planReportView.vars, row.strategy.id) : 0;
+            const labels = hasPenaltyVar ? ['Fees', 'Penalty (report variable)', 'Cash out'] : ['Fees', 'Cash out'];
+            const data = hasPenaltyVar ? [bd.fees, penVar, bd.cashOut] : [bd.fees, bd.cashOut];
+            const total = (bd.fees || 0) + (hasPenaltyVar ? (penVar || 0) : 0) + (bd.cashOut || 0);
+            const body = planReportCostBodyHtml(bd.fees, penVar, bd.cashOut, hasPenaltyVar);
             planReportView.costDoughnut = { strategyId: row.strategy.id, fees: bd.fees, cashOut: bd.cashOut };
-            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Component</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planReportCostBody">${body}</tbody></table><div class="note">Cost breakdown for ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost = fees + penalty + cash out (prepay cash + buy cash). Penalty is a report variable (default $0) — it changes cost and net only.</div></div>`);
+            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Component</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planReportCostBody">${body}</tbody></table><div class="note">Cost breakdown for ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost = fees + ${hasPenaltyVar ? 'penalty + ' : ''}cash out (prepay cash + buy cash).${hasPenaltyVar ? ' Penalty is a report variable (default $0) — it changes cost and net only.' : ''}</div></div>`);
             draws.push(() => planDoughnutChart(cid, labels, data, 'Total cost', total));
           } else {
             panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no strategy cost breakdown available.</div></div>`);
@@ -14009,7 +14059,7 @@ async function loadPlanReport(projectId, reportId) {
           const sbody = table.map((r) => `<tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
           return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><div class="note">X: month · Y: mortgage balance (CAD) across scenarios.</div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}<div class="note">Fan bands need multiple rate paths per strategy — rate paths now live on each strategy's prime factor, so no envelope is drawn here.</div></div>`);
+        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}</div>`);
       } else if (c.template === 'funds_flow') {
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Funds flow diagram — not rendered yet.</div></div>`);
       } else {
@@ -14063,7 +14113,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planReportTrajectoryBreakdownChart"></canvas></div>
         <div id="planReportTrajectoryBreakdownEmpty"></div>` : ''}
         <div id="planReportMergedTable"></div>
-        <div class="note">${template.key === 'pool' ? 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Trajectory total value = cash pool balance + stock value (investment scope — property equity excluded); Value at horizon = property equity + stock value + cash pot.' : 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Total value = property equity + stock value; equity = assessed value − outstanding principal.'}</div>
+        <div class="note">${template.key === 'pool' ? 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Trajectory total value = cash pool balance + stock value (investment scope — property equity excluded); Value at horizon = stock value + cash pot.' : 'Baseline: absolute figures. Strategy cells: absolute figure with delta vs baseline below. Total value = property equity + stock value; equity = assessed value − outstanding principal.'}</div>
       </div>`,
       engine: `<div data-plan-report-block="engine"><div id="planReportEngineBody">${planReportEngineHtml(planReportView)}</div></div>`,
     };
@@ -14073,7 +14123,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
         ${projWarnLines.map((l) => `<div class="msg warn">${esc(l)}</div>`).join('')}
-        <div class="note plan-report-defs">${PLAN_REPORT_DEFS}</div>
+        <div class="note plan-report-defs">${template.key === 'pool' ? PLAN_REPORT_DEFS_POOL : PLAN_REPORT_DEFS_PROPERTY}</div>
       </div>
       ${template.sections.map((s) => sections[s] || '').join('')}
       ${isAiReport ? `<div data-plan-report-block="refine">${planReportRefineHtml()}</div>` : ''}`;

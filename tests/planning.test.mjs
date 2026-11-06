@@ -456,6 +456,42 @@ test('computeProjection: pool-funded buy the pool cannot cover errors and is ski
   const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }) }));
   assert.equal(poolSeriesAt(strat, '2026-11'), poolSeriesAt(baseline, '2026-11'));
 });
+test('computeProjection: a buy with no stored legs defaults to the implicit cash leg (GIC report bug)', () => {
+  // The GIC buy was created by a path that stores no legs (AI / old
+  // sink): the projection flagged the whole purchase unfunded and
+  // skipped it, even though the buy row reads "Sell from pool". A
+  // legless buy now takes the same implicit {cash, remainder} leg
+  // the op form attaches at save — it executes, funded by the pool.
+  const strat = computeProjection(poolBuyArgs({ legs: [] }));
+  assert.deepEqual(strat.errors, []);
+  assert.equal(strat.stocks.buyCash, 500);
+  assert.equal(strat.stocks.buyCashFromSells, 500);
+  const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }), holdingGrowth: { 1: 12 } }));
+  const d12 = poolSeriesAt(strat, '2027-11') - poolSeriesAt(baseline, '2027-11');
+  assert.ok(d12 < -50 && d12 > -70, `Δ went to ${d12}`);
+});
+test('computeProjection: a legless custom-product (GIC-style) buy executes from the pool', () => {
+  // accountId null + a rate on the op (a GIC): no stored legs, no
+  // price history — the buy still executes, pool-funded, growing at
+  // its own rate from the buy price.
+  const strat = computeProjection(poolBuyArgs({
+    legs: [],
+    ops: [{ seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2026-11-01', amount: 500, price: 100, expectedReturnPct: 4.6 } }],
+  }));
+  assert.deepEqual(strat.errors, []);
+  assert.equal(strat.stocks.buyCash, 500);
+  assert.equal(strat.stocks.buyCashFromSells, 500);
+  // A year on the GIC (4.6%) trails the sold XQQ (12%) — the swap
+  // is visible in the trajectory, not silently flat.
+  const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }), holdingGrowth: { 1: 12 } }));
+  assert.ok(poolSeriesAt(strat, '2027-11') < poolSeriesAt(baseline, '2027-11'));
+});
+test('computeProjection: without a pool, a legless buy still funds from external cash', () => {
+  const strat = computeProjection(poolBuyArgs({ poolHoldingIds: null, legs: [] }));
+  assert.deepEqual(strat.errors, []);
+  assert.ok(Math.abs(poolSeriesAt(strat, '2026-11') - 1509.49) < 1);
+  assert.equal(strat.stocks.buyCashFromSells, 0);
+});
 
 // ------------------------------------------------------- merge-write build
 test('buildMergeWrites: prepay inserts, switch replaces later segments, conflicts surface', () => {
@@ -1088,8 +1124,14 @@ test('aiReportPrompt carries the baseline kind and its chart restriction', () =>
   const pool = aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 1, text: 'x', baselineKind: 'pool' });
   assert.match(pool, /Baseline kind: cash pool/);
   assert.match(pool, /FORBIDDEN/);
+  // Pool method language: the AI must not describe interest saved,
+  // mortgage, payoff or penalty on a cash-pool report.
+  assert.match(pool, /never mention interest saved, mortgage, payoff, or penalty/);
   assert.match(aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x', baselineKind: 'property' }), /Baseline kind: property/);
   assert.doesNotMatch(aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 0, text: 'x' }), /Baseline kind/);
+  // funds_flow is not offered anywhere: the app cannot render it,
+  // so the AI is told so explicitly and never asked to produce it.
+  assert.match(aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 1, text: 'x', baselineKind: 'pool' }), /funds_flow is not offered/);
 });
 
 test('aiSuggestNamePrompt: strategy names come from ops, entity is context only', () => {

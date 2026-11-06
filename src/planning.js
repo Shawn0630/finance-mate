@@ -655,8 +655,19 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       if (units == null || amount == null || units <= 0 || amount <= 0) { errors.push(`buy operation ${op.seq} needs units or an amount with a price`); continue; }
       // Funding legs must cover the amount (in holding currency; pot is
       // CAD — convert pot draws at the latest FX when the holding is USD).
+      // A buy with NO stored legs defaults to the implicit cash leg
+      // (remainder) — the same rule the op form applies at save
+      // (planReadOpForm). Buys created by AI or the old sink rebuild
+      // carry no legs; without this the projection flagged the whole
+      // purchase unfunded and skipped the buy (the GIC report's
+      // "49671.72 unfunded" error, user 2026-11-05), even though the
+      // buy row reads "Sell from pool". validateLegs only checks
+      // existing legs, so a legless buy passes validation and only
+      // fails at report time — the default closes that gap for
+      // already-stored buys as well as future ones.
       const opLegs = (legs || []).filter((l) => l.op_seq === op.seq);
-      const resolved = resolveBuyLegs(opLegs, amount, {
+      const effLegs = opLegs.length ? opLegs : [{ source_ref: 'cash', amount: 'remainder' }];
+      const resolved = resolveBuyLegs(effLegs, amount, {
         pot, opOutputs: opOutput, declaredAssets: mainline.declaredAssets || [],
         opDate: p.date, holdingCurrency: holding.currency, fxRate, buySeq: op.seq,
       });
@@ -1659,14 +1670,14 @@ export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount,
 
 export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind }) {
   const kindLine = baselineKind === 'pool'
-    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected.'
+    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected. Method sentences must describe only pool/stock figures — never mention interest saved, mortgage, payoff, or penalty on a cash-pool report: those concepts do not exist here.'
     : baselineKind === 'property'
       ? 'Baseline kind: property. This report covers one property: use property charts (mortgage_balance, total_value for equity, monthly_payment, payoff_month) and the pool/stock charts only where the strategies actually touch stocks.'
       : null;
   return [
     'You compose a report definition as JSON only. No prose outside the JSON object.',
     'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
-    'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, funds_flow, metric_cards.',
+    'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, metric_cards. (funds_flow is not offered: the app cannot render it.)',
     'Series ids are: mortgage_balance, stock_value, total_value, pool_balance, cost, gain, net, payoff_month, monthly_payment.',
     'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
     'Never invent a number: the app computes every series; you only order and title charts.',
