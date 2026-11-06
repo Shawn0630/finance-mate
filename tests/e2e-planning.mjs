@@ -441,7 +441,8 @@ export async function run(H, S) {
       H.check('planning category picker renders all five big categories',
         cats.open && JSON.stringify(cats.categories) === JSON.stringify(['property', 'investment', 'earning', 'saving', 'tax_saving']),
         JSON.stringify(cats));
-      // Big category → data entity → subcategory's optimal.
+      // Big category → data entity → project modal (no subcategory
+      // step anymore: Create project is baseline-only).
       await page.evaluate(() => { document.querySelector('#planCategoryCards [data-plan-cat="property"]').click(); });
       await waitT(800);
       const entityStep = await page.evaluate(() => ({
@@ -457,15 +458,6 @@ export async function run(H, S) {
         if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
       });
       await waitT(800);
-      const subs = await page.evaluate(() => [...document.querySelectorAll('#planCategorySubs [data-plan-sub]')].map((el) => ({
-        key: el.dataset.planSub, text: el.textContent,
-      })));
-      H.check('planning subcategory cards show recommended baseline + strategy for the picked property',
-        subs.some((x) => x.key === 'interest_rate' && x.text.includes('Baseline:') && x.text.includes('Strategy:'))
-          && subs.some((x) => x.key === 'refinance' && x.text.includes('Baseline:') && x.text.includes('Strategy:')),
-        JSON.stringify(subs));
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="refinance"]').click(); });
-      await waitT(800);
       const intake = await page.evaluate(() => {
         const saveBtn = document.querySelector('#planProjectSaveBtn');
         const aiBtn = document.querySelector('#planAiCreateBtn');
@@ -473,6 +465,8 @@ export async function run(H, S) {
         const s = cs(saveBtn); const a = cs(aiBtn);
         return {
           modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+          catModalClosed: document.querySelector('#planCategoryModal').classList.contains('hidden'),
+          noSubCards: !document.querySelector('#planCategorySubs'),
           catNote: document.querySelector('#planProjectCategoryNote') ? document.querySelector('#planProjectCategoryNote').textContent : '',
           saveLabel: saveBtn ? saveBtn.textContent : '',
           aiVisible: aiBtn ? !aiBtn.classList.contains('hidden') : false,
@@ -483,12 +477,14 @@ export async function run(H, S) {
           question: document.querySelector('#planProjectForm [name=question]').value,
         };
       });
+      H.check('planning entity pick opens the project modal directly with no subcategory cards',
+        intake.modalOpen && intake.catModalClosed && intake.noSubCards,
+        JSON.stringify(intake));
       H.check('planning category intake shows exactly two creation buttons + Cancel, AI button in primary style',
         intake.modalOpen && intake.saveLabel === 'Create project' && intake.aiVisible && intake.aiLabel.includes('Create with AI')
           && intake.noApplyBtn && intake.cancelVisible && intake.sameStyle
-          && intake.catNote.includes('property') && intake.catNote.includes('refinance')
-          && intake.catNote.includes('Baseline:') && intake.catNote.includes('Strategy:')
-          && intake.question.length > 0,
+          && intake.catNote.includes('property') && !intake.catNote.includes('Baseline:') && !intake.catNote.includes('Strategy:')
+          && intake.question.length === 0,
         JSON.stringify(intake));
       await page.type('#planProjectForm [name=name]', 'Category Flow Test');
       await page.click('#planProjectSaveBtn');
@@ -520,18 +516,18 @@ export async function run(H, S) {
           && !landed.panelTitles.includes('Category Flow Test'),
         JSON.stringify({ headerTitle: landed.headerTitle, panelTitles: landed.panelTitles }));
       H.check('planning detail shows the category as read-only metadata',
-        landed.catLine.includes('Property') && landed.catLine.includes('Refinance') && landed.catLine.includes('77 Planning Test Lane'),
+        landed.catLine.includes('Property') && landed.catLine.includes('77 Planning Test Lane'),
         JSON.stringify({ catLine: landed.catLine }));
       const titleTags = await page.evaluate(() => ({
         tags: [...document.querySelectorAll('#planProjectHeader .plan-title-tag')].map((el) => el.textContent),
         noteLine: !!document.querySelector('div.note#planProjectCategoryLine'),
       }));
-      H.check('beautify: project title row carries category/subcategory/entity as tags (no separate note line)',
-        titleTags.tags.length === 3 && titleTags.tags[0] === 'Property' && titleTags.tags[1] === 'Refinance' && titleTags.tags[2].includes('77 Planning Test Lane') && !titleTags.noteLine,
+      H.check('beautify: project title row carries category/entity as tags (no subcategory tag, no separate note line)',
+        titleTags.tags.length === 2 && titleTags.tags[0] === 'Property' && titleTags.tags[1].includes('77 Planning Test Lane') && !titleTags.noteLine,
         JSON.stringify(titleTags));
-      H.check('planning applied recommendation renders the fixed baseline as metadata only (no Edit/Delete/Select) + strategy cards as click-to-navigate only (no card toolbar)',
+      H.check('planning baseline-only creation renders the fixed baseline as metadata only (no Edit/Delete/Select) + zero strategies',
         landed.fixedBase.present && landed.fixedBase.text.includes('Fixed baseline') && landed.fixedBase.text.includes('77 Planning Test Lane') && landed.fixedBase.buttons === 0
-          && landed.stratCards.length === 1 && !landed.stratCards[0].edit && !landed.stratCards[0].del,
+          && landed.stratCards.length === 0,
         JSON.stringify({ fixedBase: landed.fixedBase, stratCards: landed.stratCards }));
       const catProjectId = landed.hash.split('/').pop();
       // Edit modal carries no category control, and PUT rejects a change.
@@ -551,8 +547,8 @@ export async function run(H, S) {
       r = await H.req('PUT', `/api/planning/projects/${catProjectId}`, { name: 'Category Flow Test', category: 'investment' });
       H.check('planning PUT changing the category returns 400',
         r.status === 400 && String(r.data.error || '').includes('cannot be changed'), JSON.stringify(r.data));
-      // Create project (interest_rate): the same flow now applies the
-      // recommendation — the old create-without path is gone by design.
+      // Create project again (same flow): baseline-only — no
+      // recommendation is applied, no strategy is pre-built.
       await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
       await waitT(1000);
       await page.click('#planAddProjectBtn');
@@ -565,8 +561,6 @@ export async function run(H, S) {
         if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
       });
       await waitT(800);
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="interest_rate"]').click(); });
-      await waitT(800);
       await page.type('#planProjectForm [name=name]', 'Category Bare Test');
       await page.click('#planProjectSaveBtn');
       try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
@@ -577,9 +571,47 @@ export async function run(H, S) {
         JSON.stringify(bareLanded));
       const bareProjectId = bareLanded.hash.split('/').pop();
       r = await H.req('GET', `/api/planning/projects/${bareProjectId}`);
-      H.check('planning create-project applies the recommendation (baseline + strategy present)',
-        (r.data.project.baselines || []).length === 1 && (r.data.strategies || []).length === 1,
+      H.check('planning create-project creates baseline-only (fixed baseline present, zero strategies)',
+        (r.data.project.baselines || []).length === 1 && (r.data.strategies || []).length === 0,
         JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length }));
+      // Baseline-only project page: empty Strategies section, the
+      // preset Generate button disabled with a plain note, and
+      // + Add strategy opens the chooser.
+      const barePage = await page.evaluate(() => ({
+        stratCards: document.querySelectorAll('#planStrategyCards [data-plan-strategy]').length,
+        genDisabled: !!document.querySelector('#planFlowGenerateBtn')?.disabled,
+        genNote: document.querySelector('#planFlowGenerateNote')?.textContent || '',
+      }));
+      H.check('planning baseline-only project page shows zero strategies and a disabled Generate with a plain note',
+        barePage.stratCards === 0 && barePage.genDisabled && barePage.genNote.includes('at least one strategy'),
+        JSON.stringify(barePage));
+      await page.evaluate(() => { document.querySelector('#planAddStrategyBtn')?.click(); });
+      await waitT(800);
+      const addStrat = await page.evaluate(() => ({
+        modalOpen: !document.querySelector('#planStrategyModal').classList.contains('hidden'),
+        presets: [...document.querySelectorAll('#planStrategyModalBody [data-plan-preset]')].map((el) => el.dataset.planPreset),
+      }));
+      H.check('planning baseline-only project page Add strategy opens the preset chooser',
+        addStrat.modalOpen && addStrat.presets.includes('prepay') && addStrat.presets.includes('refinance'),
+        JSON.stringify(addStrat));
+      await page.evaluate(() => { document.querySelector('#planStrategyModal [data-close-modal]')?.click(); });
+      await waitT(300);
+      // Generate with AI on a strategy-less project: the picker says
+      // "No strategies yet." and Generate preview fails plainly.
+      await page.evaluate(() => { document.querySelector('#planAiReportBtn')?.click(); });
+      await waitT(800);
+      await page.type('#planReportAiText', 'Compare nothing');
+      await page.evaluate(() => { document.querySelector('#planReportAiGenBtn')?.click(); });
+      await waitT(800);
+      const aiGuard = await page.evaluate(() => ({
+        pickerNote: document.querySelector('#planReportAiStrategies')?.textContent || '',
+        msg: document.querySelector('#planReportAiMsg')?.textContent || '',
+      }));
+      H.check('planning Generate with AI on a strategy-less project shows no-strategies plainly',
+        aiGuard.pickerNote.includes('No strategies yet.') && aiGuard.msg.includes('Pin at least one strategy first'),
+        JSON.stringify(aiGuard));
+      await page.evaluate(() => { document.querySelector('#planReportAiModal [data-close-modal]')?.click(); });
+      await waitT(300);
       // Scope categories (saving / tax_saving): no property dropdown
       // may appear, survive a switch, or arrive late — and creation
       // completes through recommendations with the scope entity.
@@ -623,11 +655,12 @@ export async function run(H, S) {
         !rapidSettled.hasSelect && rapidSettled.hasGo, JSON.stringify(rapidSettled));
       await page.evaluate(() => { document.querySelector('#planCatEntityGo').click(); });
       await waitT(800);
-      const savingSubs = await page.evaluate(() => [...document.querySelectorAll('#planCategorySubs [data-plan-sub]')].map((el) => el.dataset.planSub));
-      H.check('planning saving recommendations render the spending_analysis subcategory',
-        savingSubs.includes('spending_analysis'), JSON.stringify(savingSubs));
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="spending_analysis"]').click(); });
-      await waitT(800);
+      const savingIntake = await page.evaluate(() => ({
+        modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+        noSubCards: !document.querySelector('#planCategorySubs'),
+      }));
+      H.check('planning saving scope continues straight to the project modal (no subcategory cards)',
+        savingIntake.modalOpen && savingIntake.noSubCards, JSON.stringify(savingIntake));
       await page.type('#planProjectForm [name=name]', 'Saving Scope Test');
       await page.click('#planProjectSaveBtn');
       try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
@@ -655,11 +688,12 @@ export async function run(H, S) {
         JSON.stringify(taxFirst));
       await page.evaluate(() => { document.querySelector('#planCatEntityGo').click(); });
       await waitT(800);
-      const taxSubs = await page.evaluate(() => [...document.querySelectorAll('#planCategorySubs [data-plan-sub]')].map((el) => el.dataset.planSub));
-      H.check('planning tax_saving recommendations render the tax_analysis subcategory',
-        taxSubs.includes('tax_analysis'), JSON.stringify(taxSubs));
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub="tax_analysis"]').click(); });
-      await waitT(800);
+      const taxIntake = await page.evaluate(() => ({
+        modalOpen: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+        noSubCards: !document.querySelector('#planCategorySubs'),
+      }));
+      H.check('planning tax_saving scope continues straight to the project modal (no subcategory cards)',
+        taxIntake.modalOpen && taxIntake.noSubCards, JSON.stringify(taxIntake));
       await page.type('#planProjectForm [name=name]', 'Tax Scope Test');
       await page.click('#planProjectSaveBtn');
       try { await page.waitForFunction(() => location.hash.startsWith('#planning/project/'), { timeout: 5000 }); } catch {}
@@ -2686,7 +2720,21 @@ export async function run(H, S) {
       // A custom-product buy with a BLANK expected return is blocked
       // client-side: the modal stays open with a visible error naming
       // the return, and no fourth buy is added.
-      await page.click('#planSinkAddBuyBtn');
+      // Visibility wait + dispatched click (same click-miss flake class
+      // as the Back buttons): a raw page.click right after the GIC
+      // buy's save + page re-render can miss, and the steps below
+      // would then silently edit the HIDDEN leftover form — which
+      // still holds the GIC buy's 4.12 rate, so the save would post
+      // a fourth buy instead of tripping the rate check.
+      try {
+        await page.waitForFunction(() => {
+          const b = document.querySelector('#planSinkAddBuyBtn');
+          if (!b) return false;
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        }, { timeout: 10000 });
+      } catch { /* dispatched click below still applies */ }
+      await page.evaluate(() => { document.querySelector('#planSinkAddBuyBtn')?.click(); });
       await waitQ(500);
       await page.waitForSelector('#planOpSymbol', { timeout: 15000 });
       await page.evaluate(() => { document.querySelector('#planOpCustom').click(); });
@@ -2924,32 +2972,24 @@ export async function run(H, S) {
         const inp = row.querySelector('[data-pool-entry-input]');
         inp.value = '30';
         inp.dispatchEvent(new Event('input', { bubbles: true }));
+        const poolTotal = document.querySelector('#planPoolTotal')?.textContent || '';
         document.querySelector('#planCatEntityGo').click();
-        return { subs: document.querySelector('#planCategorySubs')?.textContent || '' };
+        return { poolTotal };
       });
       await waitQ(300);
-      // Wait for the subcategory preview to render (recommendations
-      // round-trip) instead of a fixed sleep: under load the render
-      // can land after 1200ms, which used to read an empty container.
-      try {
-        await page.waitForFunction(() => {
-          const s = document.querySelector('#planCategorySubs');
-          return s && s.textContent.trim() !== '';
-        }, { timeout: 10000 });
-      } catch { /* falls through to the check below with what rendered */ }
-      const vizPreview = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
-      H.check('poolviz: fixing to 30% of holding B continues to a preview carrying the 600.00 pool value',
+      const vizPreview = vizFixed.poolTotal;
+      H.check('poolviz: fixing to 30% of holding B shows the 600.00 pool total',
         vizPreview.includes('600.00'), JSON.stringify(vizPreview.slice(0, 300)));
       // Item 5 (user 2026-11-04): Back button on the Add project modal.
       // State here: category modal open, investment picked, pool = 30%
-      // of holding B, subcategory cards rendered with a 600.00 pool.
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      // of holding B (600.00 pool total). Continue goes straight to
+      // the project modal — no subcategory step anymore.
       try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
       const backVisible = await page.evaluate(() => ({
         visible: !!document.querySelector('#planProjectBackBtn') && !document.querySelector('#planProjectBackBtn').classList.contains('hidden'),
         note: document.querySelector('#planProjectCategoryNote')?.textContent || '',
       }));
-      H.check('projectback: Back button visible on the recommendation step',
+      H.check('projectback: Back button visible on the project modal',
         backVisible.visible, JSON.stringify(backVisible));
       // Dispatched click, not page.click: the modal has just opened and
       // Puppeteer's clickable-point check flakes on settling modals
@@ -2970,36 +3010,29 @@ export async function run(H, S) {
         projHidden: !!document.querySelector('#planProjectModal') && document.querySelector('#planProjectModal').classList.contains('hidden'),
         catSelected: !!document.querySelector('#planCategoryCards [data-plan-cat="investment"]') && document.querySelector('#planCategoryCards [data-plan-cat="investment"]').classList.contains('plan-selected'),
         entryVal: document.querySelector('[data-pool-entry-input]')?.value ?? null,
-        subSelected: !!document.querySelector('#planCategorySubs [data-plan-sub].plan-selected'),
       }));
       H.check('projectback: Back shows the pickers with the previous category/entity still selected',
-        backState.catVisible && backState.projHidden && backState.catSelected && backState.entryVal === '30' && backState.subSelected,
+        backState.catVisible && backState.projHidden && backState.catSelected && backState.entryVal === '30',
         JSON.stringify(backState));
       // Re-pick with a changed pool: 30% -> 50% of holding B, Continue,
-      // subcategory preview must carry the updated 1,000.00 pool value.
-      await page.evaluate(() => {
+      // the pool total must update to 1,000.00.
+      const backSubs = await page.evaluate(() => {
         const inp = document.querySelector('[data-pool-entry-input]');
         inp.value = '50';
         inp.dispatchEvent(new Event('input', { bubbles: true }));
+        const poolTotal = document.querySelector('#planPoolTotal')?.textContent || '';
         document.querySelector('#planCatEntityGo').click();
+        return poolTotal;
       });
-      try {
-        await page.waitForFunction(() => {
-          const s = document.querySelector('#planCategorySubs');
-          return s && s.textContent.includes('1,000.00');
-        }, { timeout: 10000 });
-      } catch { /* check below */ }
-      const backSubs = await page.evaluate(() => document.querySelector('#planCategorySubs')?.textContent || '');
-      H.check('projectback: re-picking after a pool change shows an updated recommendation preview (1,000.00)',
+      H.check('projectback: re-picking after a pool change shows an updated pool total (1,000.00)',
         backSubs.includes('1,000.00'), JSON.stringify(backSubs.slice(0, 300)));
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
       try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
       const backModal2 = await page.evaluate(() => ({
         visible: !!document.querySelector('#planProjectModal') && !document.querySelector('#planProjectModal').classList.contains('hidden'),
         backVisible: !!document.querySelector('#planProjectBackBtn') && !document.querySelector('#planProjectBackBtn').classList.contains('hidden'),
         note: document.querySelector('#planProjectCategoryNote')?.textContent || '',
       }));
-      H.check('projectback: forward again returns to the recommendation screen with Back still available',
+      H.check('projectback: forward again returns to the project modal with Back still available',
         backModal2.visible && backModal2.backVisible && backModal2.note.includes('investment'), JSON.stringify(backModal2));
       // Create with AI opens from the round-tripped modal (modal-open
       // is the proxy: full AI creation needs LLM config and is covered
@@ -3026,20 +3059,16 @@ export async function run(H, S) {
       await page.evaluate(() => {
         const row = document.querySelector('[data-pool-entry]');
         const sel = row.querySelector('[data-pool-entry-source]');
-        const holdOpt = [...sel.options].find((o) => o.value.startsWith('holding:'));
+        // First holding WITH value: the suite's first option is PLAN.TO,
+        // which has NAV prices but no units — a $0 pool, and the server
+        // rightly rejects 'pool contributions add up to 0' on Create.
+        const holdOpt = [...sel.options].find((o) => o.value.startsWith('holding:') && !/\$0\.00$/.test(o.textContent));
         if (holdOpt) { sel.value = holdOpt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
         const inp = row.querySelector('[data-pool-entry-input]');
         inp.value = '10';
         inp.dispatchEvent(new Event('input', { bubbles: true }));
         document.querySelector('#planCatEntityGo').click();
       });
-      try {
-        await page.waitForFunction(() => {
-          const s = document.querySelector('#planCategorySubs');
-          return s && s.textContent.trim() !== '';
-        }, { timeout: 10000 });
-      } catch { /* check below */ }
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
       try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
       try {
         await page.waitForFunction(() => {
@@ -3059,7 +3088,7 @@ export async function run(H, S) {
       H.check('projectback: second Back preserves the fresh flow picks too',
         backState2.catVisible && backState2.catSelected && backState2.entryVal === '10',
         JSON.stringify(backState2));
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
+      await page.evaluate(() => { document.querySelector('#planCatEntityGo')?.click(); });
       try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
       await page.evaluate(() => {
         const name = document.querySelector('#planProjectForm [name="name"]');
@@ -3101,13 +3130,6 @@ export async function run(H, S) {
         inp.dispatchEvent(new Event('input', { bubbles: true }));
         document.querySelector('#planCatEntityGo').click();
       });
-      try {
-        await page.waitForFunction(() => {
-          const s = document.querySelector('#planCategorySubs');
-          return s && s.textContent.trim() !== '';
-        }, { timeout: 10000 });
-      } catch { /* check below */ }
-      await page.evaluate(() => { document.querySelector('#planCategorySubs [data-plan-sub]')?.click(); });
       try { await page.waitForFunction(() => { const m = document.querySelector('#planProjectModal'); return m && !m.classList.contains('hidden'); }, { timeout: 10000 }); } catch { /* check below */ }
       await page.evaluate(() => {
         const btns = [...document.querySelectorAll('#planProjectModal [data-close-modal]')];
@@ -3165,6 +3187,35 @@ export async function run(H, S) {
   H.check('poolviz: percent on an external leg is rejected', r.status === 400 && /not a percent/.test(r.data.error || ''), JSON.stringify(r.data));
   r = await H.req('POST', '/api/planning/projects', { name: 'PoolViz Bad2', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ source: 'external', amount: 0 }] } });
   H.check('poolviz: zero external amount is rejected', r.status === 400 && /above 0/.test(r.data.error || ''), JSON.stringify(r.data));
+  // Baseline-only creation (user 2026-11-05): no subcategory in the
+  // request → 201, fixed baseline present, zero strategies, and the
+  // stored subcategory is NULL. An explicitly unknown subcategory
+  // is still a 400.
+  r = await H.req('POST', '/api/planning/projects', { name: 'No Subcategory', question: 'q', category: 'investment', entity: { type: 'pool', items: [{ holdingId: poolHoldA, percent: 100 }] } });
+  H.check('creation-flow: project without a subcategory creates baseline-only',
+    r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const noSubId = r.data.project.id;
+  r = await H.req('GET', `/api/planning/projects/${noSubId}`);
+  H.check('creation-flow: baseline-only project stores subcategory null with one fixed baseline and zero strategies',
+    r.data.project.subcategory === null && (r.data.project.baselines || []).length === 1 && (r.data.strategies || []).length === 0
+      && r.data.project.fixedBaseline && r.data.project.fixedBaseline.name,
+    JSON.stringify({ subcategory: r.data.project.subcategory, baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length, fixedBaseline: r.data.project.fixedBaseline && r.data.project.fixedBaseline.name }));
+  r = await H.req('POST', '/api/planning/projects', { name: 'Bad Sub', question: 'q', category: 'investment', subcategory: 'nope', entity: { type: 'pool', items: [{ holdingId: poolHoldA, percent: 100 }] } });
+  H.check('creation-flow: an explicit unknown subcategory is still a 400',
+    r.status === 400 && /unknown subcategory/.test(r.data.error || ''), JSON.stringify(r.data));
+  // AI-create without a subcategory: a GIC request still takes the
+  // deterministic template (the stub below is ignored by it), while
+  // a non-GIC request goes to the model and echoes the stub.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ project: { name: 'Stub Project', question: 'q' }, scenario: { name: 'Base Scenario', factors: {} }, baseline: { name: 'Do Nothing', description: 'Hold the pool as-is', assumptions: [] }, strategy: { name: 'Stub Strategy', ops: [] } }));
+  r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy GIC 4.6% from 2027-01-01, 180 days', category: 'investment', entity: { type: 'pool', items: [{ holdingId: poolHoldA, percent: 100 }] } });
+  H.check('creation-flow: AI-create without a subcategory still routes a GIC request to the deterministic template',
+    r.status === 200 && r.data.proposal && r.data.proposal.strategy && (r.data.proposal.strategy.ops || []).length === 1
+      && r.data.proposal.strategy.ops[0].op_type === 'buy' && r.data.proposal.strategy.ops[0].params.symbol === 'GIC 4.6% 180d',
+    JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'buy more of the pool holding', category: 'investment', entity: { type: 'pool', items: [{ holdingId: poolHoldA, percent: 100 }] } });
+  H.check('creation-flow: AI-create without a subcategory sends a non-GIC request to the model (stub echoed, no GIC template)',
+    r.status === 200 && r.data.proposal && r.data.proposal.project && r.data.proposal.project.name === 'Stub Project',
+    JSON.stringify(r.data));
   r = await H.req('POST', `/api/planning/projects/${pvProj}/strategies`, { name: 'Buy from external' });
   H.check('poolviz: external-pool strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const pvStrat = r.data.strategy.id;
@@ -9864,8 +9915,8 @@ export async function run(H, S) {
       await page.evaluate(() => document.querySelector('[data-plan-cat="property"]').click());
       await page.waitForSelector('#planCatEntitySel', { timeout: 15000 });
       await page.select('#planCatEntitySel', String(aiPropId));
-      await page.waitForSelector('[data-plan-sub="interest_rate"]', { timeout: 15000 });
-      await page.evaluate(() => document.querySelector('[data-plan-sub="interest_rate"]').click());
+      // Creation-flow simplify (user 2026-11-05): picking the entity
+      // opens the project modal directly — no subcategory cards anymore.
       await page.waitForSelector('#planAiCreateBtn', { timeout: 15000 });
       const entryState = await page.evaluate(() => {
         const b = document.querySelector('#planAiCreateBtn');

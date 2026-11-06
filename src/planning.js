@@ -1889,6 +1889,14 @@ export function planOptSubcategory(category, subcategory) {
   const c = planOptCategory(category);
   return (c && subcategory && c.subcategories[subcategory]) || null;
 }
+// First subcategory of a category, for baseline-only reads: the
+// baseline figures are identical across a category's subcategories
+// (only the strategy differs), so a project with no subcategory
+// reads its baseline off this one. Never used to pick a strategy.
+export function planFirstSubcategory(category) {
+  const c = planOptCategory(category);
+  return (c && Object.keys(c.subcategories)[0]) || null;
+}
 export function planProjectSections(key) {
   const t = planProjectTemplate(key);
   return t ? t.sections : null;

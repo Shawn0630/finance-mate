@@ -11283,24 +11283,24 @@ function planListHtml(projects) {
     <div class="card breakdown-card" data-plan-project="${p.id}" style="cursor:pointer">
       <div class="k">${esc(p.name)}</div>
       <div class="v">${p.strategies.length} strateg${p.strategies.length === 1 ? 'y' : 'ies'}</div>
-      <div class="n">${esc(p.question || '')}${p.categoryLabels ? ` · ${esc(p.categoryLabels.category)} · ${esc(p.categoryLabels.subcategory)}` : ''}${p.stale ? ' · Stale baseline' : ''}</div>
+      <div class="n">${esc(p.question || '')}${p.categoryLabels ? ` · ${[p.categoryLabels.category, p.categoryLabels.subcategory].filter((x) => x).map((x) => esc(x)).join(' · ')}` : ''}${p.stale ? ' · Stale baseline' : ''}</div>
     </div>`).join('');
   return `
     <div class="section-head"><h2>Planning</h2><div class="toolbar"><button class="primary" id="planAddProjectBtn">+ Add project</button></div></div>
     <div class="msg" id="planListMsg"></div>
     ${projects.length ? `<div class="cards">${cards}</div>` : '<div class="panel"><div class="note">No projects yet.</div></div>'}`;
 }
-// CREATION FLOW: big category → data entity → subcategory's optimal.
-// The category picker is the project-creation entry point; it is also
-// reused for "Add baseline" on an existing project (mode addBaseline),
-// where picking a subcategory appends its recommended baseline.
+// CREATION FLOW: big category → data entity → project modal.
+// The strategy is defined inside the project (user 2026-11-05) —
+// there is no subcategory pick and no recommendation step here.
+// "Create project" creates a baseline-only project; "+ Add strategy"
+// on the project page is where strategies are defined.
 let planCatFlow = null;
 let planCatPickSeq = 0;
 function openPlanCategoryFlow(opts) {
-  planCatFlow = { mode: (opts && opts.mode) || 'create', project: (opts && opts.project) || null, category: null, entity: null, subcategory: null, recommendations: null, categories: null };
+  planCatFlow = { mode: (opts && opts.mode) || 'create', project: (opts && opts.project) || null, category: null, entity: null, categories: null };
   showMsg($('#planCategoryMsg'), '', '');
   $('#planCategoryEntity').innerHTML = '';
-  $('#planCategorySubs').innerHTML = '';
   openModal('planCategoryModal');
   api('/api/planning/categories').then((r) => {
     planCatFlow.categories = r.categories || [];
@@ -11319,8 +11319,6 @@ async function planCatPickCategory(key) {
   // pickers with the previous pick still visibly selected.
   document.querySelectorAll('#planCategoryCards [data-plan-cat]').forEach((el) => el.classList.toggle('plan-selected', el.dataset.planCat === key));
   planCatFlow.entity = null;
-  planCatFlow.subcategory = null;
-  planCatFlow.recommendations = null;
   const host = $('#planCategoryEntity');
   const msg = $('#planCategoryMsg');
   showMsg(msg, '', '');
@@ -11328,7 +11326,6 @@ async function planCatPickCategory(key) {
   // picker (e.g. the property dropdown) must never survive a switch
   // to a category whose branch renders nothing of its own.
   host.innerHTML = '';
-  $('#planCategorySubs').innerHTML = '';
   const seq = ++planCatPickSeq;
   try {
     if (cat.entityType === 'property') {
@@ -11494,47 +11491,14 @@ async function planCatPickCategory(key) {
     }
   } catch (err) { if (seq === planCatPickSeq) showMsg(msg, 'err', err.message); }
 }
-async function planCatPickEntity(entity) {
+// Entity picked: straight to the project modal. There is no
+// subcategory step anymore (user 2026-11-05) — Create project
+// creates baseline-only, and the strategy is defined on the
+// project page.
+function planCatPickEntity(entity) {
   planCatFlow.entity = entity;
-  const msg = $('#planCategoryMsg');
-  showMsg(msg, '', '');
-  const seq = planCatPickSeq;
-  try {
-    const r = await api('/api/planning/recommendations', { method: 'POST', body: { category: planCatFlow.category.key, entity } });
-    if (seq !== planCatPickSeq) return;
-    planCatFlow.recommendations = r.recommendations || {};
-    const subs = planCatFlow.category.subcategories || [];
-    $('#planCategorySubs').innerHTML = subs.map((s) => {
-      const rec = planCatFlow.recommendations[s.key];
-      if (!rec) return '';
-      const figs = rec.baseline.figures || {};
-      const poolLine = figs.poolValue != null ? `<div class="n">Pool value ${money2(figs.poolValue)} · ${(figs.stockCount ?? (figs.items || []).length)} stock${(figs.stockCount ?? (figs.items || []).length) === 1 ? '' : 's'}</div>` : '';
-      return `<div class="card breakdown-card" data-plan-sub="${s.key}" style="cursor:pointer">
-        <div class="k">${esc(s.label)}</div>
-        <div class="n">Baseline: ${esc(rec.baseline.name || '')} · Strategy: ${esc(rec.strategy.name || '')}</div>
-        <div class="n">Scenario: ${rec.scenario && rec.scenario.name ? esc(rec.scenario.name) : '—'}</div>
-        <div class="n">${esc(rec.strategy.summary || '')}</div>${poolLine}</div>`;
-    }).join('');
-    document.querySelectorAll('#planCategorySubs [data-plan-sub]').forEach((el) => {
-      el.addEventListener('click', () => planCatPickSubcategory(el.dataset.planSub));
-    });
-  } catch (err) { if (seq === planCatPickSeq) showMsg(msg, 'err', err.message); }
-}
-function planCatPickSubcategory(key) {
-  planCatFlow.subcategory = key;
-  document.querySelectorAll('#planCategorySubs [data-plan-sub]').forEach((el) => el.classList.toggle('plan-selected', el.dataset.planSub === key));
-  if (planCatFlow.mode === 'addBaseline') {
-    // Append-only: the recommended baseline joins the project's list.
-    const rec = (planCatFlow.recommendations || {})[key];
-    if (!rec) return;
-    const p = planCatFlow.project;
-    api(`/api/planning/projects/${p.id}/baselines`, { method: 'POST', body: { name: rec.baseline.name, source: 'recommendation', category: planCatFlow.category.key, subcategory: key, entity: planCatFlow.entity, definition: rec.baseline } })
-      .then(() => { closeModalEl($('#planCategoryModal')); loadPlanProject(p.id); })
-      .catch((err) => showMsg($('#planCategoryMsg'), 'err', err.message));
-    return;
-  }
   closeModalEl($('#planCategoryModal'));
-  openPlanProjectModal(null, { category: planCatFlow.category.key, subcategory: key, entity: planCatFlow.entity, recommendation: (planCatFlow.recommendations || {})[key] });
+  openPlanProjectModal(null, { category: planCatFlow.category.key, entity: planCatFlow.entity });
 }
 function openPlanProjectModal(existing, catCtx) {
   const form = $('#planProjectForm');
@@ -11565,29 +11529,26 @@ function openPlanProjectModal(existing, catCtx) {
     $('#planProjectSaveBtn').textContent = 'Save';
   } else if (catCtx) {
     form.dataset.planCategory = catCtx.category;
-    form.dataset.planSubcategory = catCtx.subcategory;
+    form.dataset.planSubcategory = '';
     form.dataset.planEntity = JSON.stringify(catCtx.entity || null);
-    const rec = catCtx.recommendation || null;
-    form.question.value = rec ? `${rec.strategy.name} — ${rec.strategy.summary || ''}` : '';
+    form.question.value = '';
     catRow.classList.remove('hidden');
-    $('#planProjectCategoryNote').textContent = `${catCtx.category} · ${catCtx.subcategory}${rec ? ` — Scenario: ${rec.scenario && rec.scenario.name ? rec.scenario.name : '—'} · Baseline: ${rec.baseline.name} · Strategy: ${rec.strategy.name}` : ''}`;
+    $('#planProjectCategoryNote').textContent = `${catCtx.category}`;
     aiBtn.classList.remove('hidden');
     if (planCatFlow && planCatFlow.category) $('#planProjectBackBtn').classList.remove('hidden');
-    // The creation button creates WITH the displayed recommendation
-    // (the old Apply-recommendation behavior, now the only path);
-    // a subcategory with no displayed recommendation has nothing to
-    // apply, so the button just creates (never a dead end).
-    form.dataset.planHasRec = rec ? '1' : '';
+    // Create project creates baseline-only (user 2026-11-05): no
+    // recommendation is applied, and the strategy is defined on the
+    // project page. planHasRec stays empty, so planApply never trips.
+    form.dataset.planHasRec = '';
     $('#planProjectSaveBtn').textContent = 'Create project';
   }
   showMsg($('#planProjectModalMsg'), '', '');
   openModal('planProjectModal');
 }
 $('#planProjectForm').question.addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
-// Creation with a displayed recommendation creates WITH it (the old
-// Apply-recommendation behavior, now the Save button's job — the
-// separate Apply button is gone). Edit mode has no category, so the
-// flag never trips there.
+// Legacy Apply-recommendation hook: planHasRec is never set by the
+// creation flow anymore (baseline-only, user 2026-11-05), so the
+// flag never trips; the server path stays for API callers.
 $('#planProjectSaveBtn').addEventListener('click', () => {
   const f = $('#planProjectForm');
   if (f.dataset.planCategory && f.dataset.planHasRec === '1') f.dataset.planApply = '1';
@@ -11595,12 +11556,11 @@ $('#planProjectSaveBtn').addEventListener('click', () => {
 $('#planAiCreateBtn').addEventListener('click', openPlanAiCreateModal);
 // Back: close the project modal and re-open the category modal.
 // Nothing is reset — the pickers' DOM (category selection mark,
-// entity picker values, pool-builder entries, subcategory marks)
-// persists exactly as left, so the user re-picks and comes forward
-// again instead of Cancel-restarting the whole flow. A typed project
-// name or edited Question is NOT preserved: coming forward re-runs
-// openPlanProjectModal, which resets the form and refills Question
-// from the (possibly new) recommendation, as before.
+// entity picker values, pool-builder entries) persists exactly as
+// left, so the user re-picks and comes forward again instead of
+// Cancel-restarting the whole flow. A typed project name or edited
+// Question is NOT preserved: coming forward re-runs
+// openPlanProjectModal, which resets the form.
 $('#planProjectBackBtn').addEventListener('click', () => {
   if (!planCatFlow || !planCatFlow.category) return;
   closeModalEl($('#planProjectModal'));
@@ -11642,14 +11602,13 @@ let planAiCreateAnswers = null;
 let planAiCreateHistoryText = '';
 function openPlanAiCreateModal() {
   const f = planCatFlow;
-  if (!f || !f.category || !f.subcategory || !f.entity) return;
-  const sub = (f.category.subcategories || []).find((s) => s.key === f.subcategory);
-  planAiCreateCtx = { category: f.category.key, subcategory: f.subcategory, entity: f.entity };
+  if (!f || !f.category || !f.entity) return;
+  planAiCreateCtx = { category: f.category.key, subcategory: null, entity: f.entity };
   planAiCreateProposal = null;
   planAiCreateAnswers = null;
   planAiCreateHistoryText = '';
   planAiCreateQueue = [];
-  $('#planAiCreateCtx').textContent = `${f.category.label} · ${sub ? sub.label : f.subcategory}`;
+  $('#planAiCreateCtx').textContent = `${f.category.label}`;
   $('#planAiCreateText').value = '';
   $('#planAiCreateQueue').innerHTML = '';
   $('#planAiCreateAsk').innerHTML = '';
@@ -12968,6 +12927,13 @@ function openPlanReportAiModal(projectId, opts = {}) {
     try {
       const text = $('#planReportAiText').value.trim();
       if (!text) throw new Error('describe the report first');
+      // Fail fast on a strategy-less project (a report with no
+      // strategy compares nothing): plain message before the AI
+      // call. Append mode keeps the report's pins, so it is exempt.
+      if (!appendTo) {
+        const preStrategyIds = [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value));
+        if (!preStrategyIds.length) throw new Error('Pin at least one strategy first');
+      }
       const r = await api(`/api/planning/projects/${projectId}/ai-report`, { method: 'POST', body: { text } });
       const charts = (r.definition && r.definition.charts) || [];
       // AI title: the model is asked for a short report title; when
@@ -12996,6 +12962,10 @@ function openPlanReportAiModal(projectId, opts = {}) {
           const scenarioIds = planReportPickedScenarios('#planReportAiScenarios');
           if (aiReportScenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
           const strategyIds = [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value));
+          // A report with no strategy compares nothing (a project
+          // with no strategy has no report to generate): plain
+          // message, same wording as the scenario guard above.
+          if (!strategyIds.length) throw new Error('Pin at least one strategy first');
           // Name chain: typed name → AI title → auto-name pattern.
           const aiTitle = (r.definition && typeof r.definition.title === 'string' && r.definition.title.trim()) ? r.definition.title.trim() : '';
           const name = $('#planReportAiName').value.trim() || aiTitle || planReportAiFallbackName(strategyIds);

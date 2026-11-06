@@ -56,7 +56,7 @@ import {
   equityDeltaPeak, principalDeltaVsBaseline,
   principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
   scopeMainlineToProperty,
-  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory,
+  PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory, planFirstSubcategory,
   validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
   primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
@@ -5327,7 +5327,11 @@ function planRecommendationFor(category, subcategory, entity) {
 // legacy AI/manual records are never the fixed baseline.
 function planFixedBaseline(view) {
   const category = view.category;
-  const subcategory = view.subcategory;
+  // The baseline figures are identical across a category's
+  // subcategories (only the strategy differs), so a project with no
+  // subcategory (baseline-only creation, user 2026-11-05) reads its
+  // baseline off the category's first subcategory.
+  const subcategory = view.subcategory || planFirstSubcategory(category);
   const entity = view.entity;
   if (!category || !entity) return null;
   const rec = planRecommendationFor(category, subcategory, entity);
@@ -5436,7 +5440,11 @@ app.post('/api/planning/projects', requireApiAuth, (req, res) => {
   const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
   if (category || subcategory || entity) {
     if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
-    if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
+    // Subcategory is optional now (user 2026-11-05): the creation
+    // flow no longer picks one, so a new project carries NULL and
+    // creates baseline-only. An explicitly given subcategory must
+    // still be valid for the category.
+    if (subcategory && !planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
     const entErr = planValidateOptEntity(category, entity);
     if (entErr) return res.status(400).json({ error: entErr });
   }
@@ -7541,7 +7549,10 @@ function planGicTemplateProposal(text, answers, category, subcategory, entity) {
   let amount = null;
   if (ans.gic_amount != null && String(ans.gic_amount).trim() !== '') amount = Number(String(ans.gic_amount).replace(/,/g, '').trim());
   if (amount == null || Number.isNaN(amount)) {
-    const rec = planRecommendationFor(category, subcategory, entity);
+    // Baseline figures are identical across subcategories; a null
+    // subcategory (AI-create without a pick) reads them off the
+    // first subcategory of the category.
+    const rec = planRecommendationFor(category, subcategory || planFirstSubcategory(category), entity);
     if (rec.error) return { error: rec.error };
     const figs = (rec.baseline && rec.baseline.figures) || {};
     const total = figs.poolValue != null ? figs.poolValue : (figs.value != null ? figs.value : null);
@@ -7588,7 +7599,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
   const subcategory = b.subcategory ? String(b.subcategory) : null;
   const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
   if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
-  if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
+  if (subcategory && !planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
   const entErr = planValidateOptEntity(category, entity);
   if (entErr) return res.status(400).json({ error: entErr });
   const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
@@ -7597,8 +7608,13 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
   // (one buy op carrying the rate, mirroring the manual GIC path), so
   // the model cannot draft it into a fund position op again. It needs
   // no LLM, so it also runs when the LLM is unconfigured. Missing
-  // rate/date/amount are asked for, never invented.
-  if (subcategory === 'gic') {
+  // rate/date/amount are asked for, never invented. With no
+  // subcategory pick, a GIC request under investment still takes the
+  // template — the text must name GIC, so a non-GIC investment
+  // request never lands here.
+  const isGicRequest = subcategory === 'gic'
+    || (subcategory == null && category === 'investment' && /\bgic\b/i.test(text));
+  if (isGicRequest) {
     const gic = planGicTemplateProposal(text, answers, category, subcategory, entity);
     if (gic.ask) return res.json({ ask: normalizeAiAsk(gic.ask) || gic.ask, configured: true });
     if (gic.error) return res.status(400).json({ error: gic.error });
@@ -7619,7 +7635,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
     'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position. A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price. Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas). Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids. For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
     'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as ONE buy op {"accountId": null, "symbol": "GIC <rate>%", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100, "expectedReturnPct": <rate>} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing.',
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. This is a NEW project: it has no existing scenarios, baselines, or strategies yet.',
-    `Optimization: category ${category}, subcategory ${subcategory}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
+    `Optimization: category ${category}, subcategory ${subcategory || '—'}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
     `App data snapshot: ${JSON.stringify(snapshot)}`,
     ...(answers ? [`User-provided answers (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
     ...(historyText ? [`Conversation so far:\n${historyText}`, 'Continue this conversation: do not repeat parts already proposed unless the user contradicts them.'] : []),
@@ -7671,7 +7687,7 @@ app.post('/api/planning/ai-create/apply', requireApiAuth, async (req, res) => {
   const subcategory = b.subcategory ? String(b.subcategory) : null;
   const entity = b.entity && typeof b.entity === 'object' ? b.entity : null;
   if (!planOptCategory(category)) return res.status(400).json({ error: 'unknown optimization category' });
-  if (!planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
+  if (subcategory && !planOptSubcategory(category, subcategory)) return res.status(400).json({ error: 'unknown subcategory for this category' });
   const entErr = planValidateOptEntity(category, entity);
   if (entErr) return res.status(400).json({ error: entErr });
   const { proposal: norm, errors: shapeErrors } = validateAiCreateProposal(proposal);
