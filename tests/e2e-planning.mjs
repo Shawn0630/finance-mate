@@ -9830,9 +9830,8 @@ export async function run(H, S) {
         ai: !!document.querySelector('#planReportTabAiBtn'),
         aiLabel: document.querySelector('#planReportTabAiBtn')?.textContent.trim(),
         save: !!document.querySelector('#planReportTabSaveBtn'),
-        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
       }));
-      H.check('reporttab: per-tab Generate, AI Generate, Save buttons present; preset enabled for engine pins', tabBtns.gen && tabBtns.ai && tabBtns.save && !tabBtns.genDisabled, JSON.stringify(tabBtns));
+      H.check('reporttab: per-tab buttons are Follow up with AI + Save only, no Generate button', !tabBtns.gen && tabBtns.ai && tabBtns.save, JSON.stringify(tabBtns));
       H.check('reporttab: per-tab AI button reads Follow up with AI (it appends to the open report, not a new one)', tabBtns.aiLabel === 'Follow up with AI', JSON.stringify(tabBtns));
       // Highlight: engine tab highlights its own pins on the tiers
       // above (amber); the scenario card — wiring-selected AND
@@ -9868,24 +9867,20 @@ export async function run(H, S) {
       H.check('highlight: pinned-only card shows amber frame + left bar, no blue border; toggling back restores the combined frame',
         pinOnly && pinOnly.pin && !pinOnly.sel && pinOnly.outline === 'rgb(183, 121, 31)' && pinOnly.outlineStyle === 'solid' && pinOnly.shadow.includes('183, 121, 31') && pinOnly.shadow.includes('inset') && pinOnly.border === 'rgb(221, 228, 236)' && pinOnly.bg === 'rgb(255, 255, 255)'
         && restored && restored.pin && restored.sel && restored.outlineStyle === 'none' && restored.border === 'rgb(22, 104, 196)', JSON.stringify({ pinOnly, restored }));
-      // Preset regenerate: touching the strategy stales the report;
-      // per-tab Generate clears the stale badge (reopening the tab
-      // re-reads the report, so no page reload is needed).
+      // No regenerate action: touching the strategy makes the report
+      // stale server-side (strategy updated after the report), but
+      // the client never shows it — the view always renders live
+      // data, so no badge appears in the view header and no tag on
+      // the report card. Re-render the list first so the card meta
+      // is read from post-touch data, then open the tab.
       r = await H.req('PUT', `/api/planning/strategies/${fStratId}`, { name: 'Flow prepay' });
       H.check('reporttab: strategy touch succeeds', r.status === 200, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector(`[data-plan-report-view="${genRep.id}"]`, { timeout: 15000 });
+      const cardStale = await page.evaluate((id) => (document.querySelector(`[data-plan-report-view="${id}"] .n`)?.textContent || '').includes('Stale'), genRep.id);
       await openCard(genRep.id, 'Mortgage balance');
-      // Wait for the post-touch render itself: the badge must appear
-      // (the touch bumped the strategy past the report), so a read
-      // taken before that render lands sees a stale-free viewer.
-      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length > 0, { timeout: 15000 });
-      const staleBefore = await page.evaluate(() => !!document.querySelector('#planReport .msg.warn') || [...document.querySelectorAll('#planReport .section-head .msg.warn')].length > 0);
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabGenerateBtn');
-      // Regenerate re-renders after a PUT + comparison fetch: wait for
-      // the badge to clear instead of a fixed sleep (1500ms was too
-      // short under full-run load: staleAfter stayed 1).
-      await page.waitForFunction(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length === 0, { timeout: 15000 });
-      const staleAfter = await page.evaluate(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length);
-      H.check('reporttab: per-tab Generate clears the stale badge', staleBefore && staleAfter === 0, JSON.stringify({ staleBefore, staleAfter }));
+      const viewStale = await page.evaluate(() => [...document.querySelectorAll('#planReport .section-head .msg.warn')].length);
+      H.check('reporttab: no stale badge or card tag after a strategy touch (view is live; no regenerate action)', !cardStale && viewStale === 0, JSON.stringify({ cardStale, viewStale }));
       // Per-tab routing on the AI-pinned report + its highlight.
       // First open is via deep link: the report was created via API
       // after the last project render, so it has no card yet.
@@ -9893,11 +9888,11 @@ export async function run(H, S) {
       await waitF(2000);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'AI balance'), { timeout: 15000 });
       const tabRoute = await page.evaluate(() => ({
-        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
+        noGen: !document.querySelector('#planReportTabGenerateBtn'),
         noteEl: !!document.querySelector('#planReportTabNote'),
         aiEnabled: !document.querySelector('#planReportTabAiBtn')?.disabled,
       }));
-      H.check('engine: AI-pinned tab keeps preset Generate enabled (routing cancelled), AI stays enabled, no routing note element', tabRoute.genDisabled === false && tabRoute.noteEl === false && tabRoute.aiEnabled, JSON.stringify(tabRoute));
+      H.check('engine: AI-pinned tab has no Generate button (routing cancelled), AI stays enabled, no routing note element', tabRoute.noGen && tabRoute.noteEl === false && tabRoute.aiEnabled, JSON.stringify(tabRoute));
       const tierAi = await readTier(fAiScenId, fAiBaseId, fAiStratId);
       H.check('reporttab: AI tab highlights its own pins above, not the engine pins',
         JSON.stringify(tierAi.scenPins) === JSON.stringify([fAiScenId]) && JSON.stringify(tierAi.basePins) === JSON.stringify([]) && JSON.stringify(tierAi.stratPins) === JSON.stringify([fAiStratId]), JSON.stringify(tierAi));
@@ -10122,13 +10117,12 @@ export async function run(H, S) {
       H.check('uibundle: UI bundle report opens with its Mortgage balance block', ubOpen.opened && ubOpen.blocks.includes('Mortgage balance'), JSON.stringify(ubOpen));
       const ubBefore = await page.evaluate(() => ({
         removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
-        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
         noteEl: !!document.querySelector('#planReportTabNote'),
         cols: document.querySelectorAll('#planReportMergedTable thead th').length,
       }));
-      H.check('engine: report picker shows a remove control per pinned strategy; preset Generate stays enabled even with an AI pin, no routing note',
+      H.check('engine: report picker shows a remove control per pinned strategy; no routing note',
         ubBefore.removes.length === 2 && ubBefore.removes.includes(fStratId) && ubBefore.removes.includes(fAiStratId)
-          && !ubBefore.genDisabled && !ubBefore.noteEl && ubBefore.cols === 4,
+          && !ubBefore.noteEl && ubBefore.cols === 4,
         JSON.stringify(ubBefore));
       // Remove the AI strategy: routing recomputes from the
       // remaining pins (preset Generate re-enables) and the
@@ -10137,15 +10131,14 @@ export async function run(H, S) {
       await page.waitForFunction(() => document.querySelectorAll('#planReportComparePicker [data-plan-remove]').length === 1, { timeout: 30000 });
       const ubAfter = await page.evaluate(() => ({
         removes: [...document.querySelectorAll('#planReportComparePicker [data-plan-remove]')].map((b) => Number(b.dataset.planRemove)),
-        genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
         note: document.querySelector('#planReportTabNote')?.textContent || '',
         cols: document.querySelectorAll('#planReportMergedTable thead th').length,
         subtitle: document.querySelector('#planReport .plan-report-subtitle')?.textContent || '',
       }));
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const ubRow = (r.data.reports || []).find((x) => x.id === ubRepId);
-      H.check('uibundle: removing one strategy persists in pins and leaves a single-strategy report (merged table gone), preset Generate stays enabled',
-        ubAfter.removes.length === 1 && ubAfter.removes[0] === fStratId && !ubAfter.genDisabled && ubAfter.note === ''
+      H.check('uibundle: removing one strategy persists in pins and leaves a single-strategy report (merged table gone)',
+        ubAfter.removes.length === 1 && ubAfter.removes[0] === fStratId && ubAfter.note === ''
           && ubAfter.cols === 0 && ubAfter.subtitle.includes('Flow prepay') && !ubAfter.subtitle.includes('Flow AI strategy')
           && !!ubRow && JSON.stringify(JSON.parse(ubRow.strategy_ids)) === JSON.stringify([fStratId]),
         JSON.stringify({ ubAfter, pins: ubRow && ubRow.strategy_ids }));
@@ -10179,12 +10172,11 @@ export async function run(H, S) {
         JSON.stringify({ ubEmpty, pins: ubRow0 && ubRow0.strategy_ids }));
       // Report viewer tab buttons are small (still on the report view).
       const ubViewer = await page.evaluate(() => ({
-        genSmall: !!document.querySelector('#planReportTabGenerateBtn.small'),
         aiSmall: !!document.querySelector('#planReportTabAiBtn.small'),
         saveSmall: !!document.querySelector('#planReportTabSaveBtn.small'),
       }));
       H.check('uibundle: report viewer tab buttons are small',
-        ubViewer.genSmall && ubViewer.aiSmall && ubViewer.saveSmall, JSON.stringify(ubViewer));
+        ubViewer.aiSmall && ubViewer.saveSmall, JSON.stringify(ubViewer));
       // The project-page comparison panel is gone; the tier buttons
       // are small.
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });

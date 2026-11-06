@@ -12045,7 +12045,6 @@ function planReportCardHtml(r, d) {
   const tags = [];
   if (r.scenarioIds === null || r.scenarioIds === undefined) tags.push('Unpinned');
   else if (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) tags.push('Flat world');
-  if (r.stale) tags.push('Stale — regenerate');
   let under = null;
   if (r.scenarioIds !== null && r.scenarioIds !== undefined) {
     under = (Array.isArray(r.scenarioIds) && r.scenarioIds.length === 0) ? 'Current rates (no scenario)'
@@ -14435,7 +14434,7 @@ async function loadPlanReport(projectId, reportId) {
     })();
     $('#planReport').innerHTML = `
       <div class="panel">
-        <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
+        <div class="section-head"><h3>${esc(report.name)}</h3></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
         ${maturityLines}
         ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
@@ -14485,24 +14484,14 @@ async function loadPlanReport(projectId, reportId) {
     // sync above rebuilds the bar, so fill it here before wiring);
     // the header panel keeps title/subtitle/definitions only.
     const planTabActions = $('#planReportTabActionsBar');
-    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Follow up with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="msg" id="planReportMsg"></div>`;
-    // Per-tab actions. Both Generate buttons are always available:
-    // the button IS the engine choice (preset vs AI) — no routing
-    // rule disables either. Preset Generate re-pins the report,
-    // which bumps updated_at and clears the computed stale flag; the
-    // view itself always renders live comparison data. Save exports
-    // the tab as PDF via the browser print path. Block Delete drops
-    // one chart from the saved definition and reloads.
-    const tabGenBtn = $('#planReportTabGenerateBtn');
-    tabGenBtn.addEventListener('click', async () => {
-      try {
-        const body = { scenario_ids: scenarioIds };
-        if (report.baseline_id != null) body.baseline_id = report.baseline_id;
-        if (pickedIds != null) body.strategy_ids = pickedIds;
-        await api(`/api/planning/reports/${reportId}`, { method: 'PUT', body });
-        loadPlanReport(projectId, reportId);
-      } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
-    });
+    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabAiBtn">Follow up with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="msg" id="planReportMsg"></div>`;
+    // Per-tab actions. There is no regenerate action: the view
+    // always renders live comparison data, so a per-tab Generate
+    // only re-pinned the report and cleared the (misleading) stale
+    // badge — both are gone (user 2026-11-06). Follow up with AI
+    // opens the append modal; Save exports the tab as PDF via the
+    // browser print path. Block Delete drops one chart from the
+    // saved definition and reloads.
     $('#planReportTabAiBtn').addEventListener('click', () => openPlanReportAiModal(projectId, { appendTo: { reportId, reportName: report.name } }));
     $('#planReportTabSaveBtn').addEventListener('click', () => window.print());
     document.querySelectorAll('[data-plan-report-block-del]').forEach((b) => b.addEventListener('click', async () => {
