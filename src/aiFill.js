@@ -125,6 +125,23 @@ export function buildMessages(context, text, fileInfo) {
   ];
 }
 
+// Sequence stubs (test-only): a stub file of the form
+// { "responses": [<response>, ...] } answers one entry per call, in
+// order, clamping to the last entry when exhausted. The cursor lives
+// per file and resets whenever the file is rewritten (mtime change),
+// so each test scenario starts its sequence from the top.
+const stubSequenceState = new Map();
+export function stubSequenceResponse(file, parsed) {
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.responses) || !parsed.responses.length) return null;
+  let mtimeMs = 0;
+  try { mtimeMs = fs.statSync(file).mtimeMs; } catch { /* file vanished mid-read; keep cursor 0 */ }
+  const prev = stubSequenceState.get(file);
+  const idx = prev && prev.mtimeMs === mtimeMs ? prev.idx : 0;
+  stubSequenceState.set(file, { mtimeMs, idx: idx + 1 });
+  const entry = parsed.responses[Math.min(idx, parsed.responses.length - 1)];
+  return typeof entry === 'string' ? entry : JSON.stringify(entry);
+}
+
 export async function callLlm(messages, env = process.env, model = null) {
   const useModel = model || llmDefaultModel(env);
   if (env.LLM_STUB_RESPONSE_FILE) {
@@ -139,6 +156,13 @@ export async function callLlm(messages, env = process.env, model = null) {
         if (entry === undefined) throw new Error(`stub has no response for model ${useModel}`);
         return typeof entry === 'string' ? entry : JSON.stringify(entry);
       }
+      // A stub file may also answer one entry per call, in order:
+      // { "responses": [<response>, ...] } — so a two-call flow
+      // (draft, then clarify) can be pinned. The cursor is keyed by
+      // file path + mtime: rewriting the file resets the sequence.
+      // Entries past the end clamp to the last one.
+      const seq = stubSequenceResponse(env.LLM_STUB_RESPONSE_FILE, parsed);
+      if (seq != null) return seq;
     } catch (e) {
       if (e instanceof SyntaxError) return raw; // not JSON at all — the raw response
       throw e;

@@ -7702,6 +7702,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
     'The baseline changes nothing: a pure do-nothing reference (name + one-line description + assumptions only). It carries NO prime path and NO stock reference.',
     'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position. A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price. Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas). Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids. For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
     'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as ONE buy op {"accountId": null, "symbol": "GIC <rate>%", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100, "expectedReturnPct": <rate>} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing. When the user gives a term ("180 days", "1 year"), add "termDays": <days> to the buy params — at maturity the proceeds return to the pot as cash and the comparison ends at the maturity month.',
+    'If a value you need is genuinely missing from the user\'s need and the snapshot, return {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "text|number|date"}]} — one question per missing value, never prose, never invent a value.',
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. This is a NEW project: it has no existing scenarios, baselines, or strategies yet.',
     `Optimization: category ${category}, subcategory ${subcategory || '—'}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
     `App data snapshot: ${JSON.stringify(snapshot)}`,
@@ -7731,6 +7732,37 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
   const legs = [];
   for (const o of seqOps) for (const l of o.legs || []) legs.push({ op_seq: o.seq, source_ref: l.source_ref, amount: l.amount });
   const opErrs = planValidateStrategyOps(null, seqOps, legs);
+  // A draft that would fail Apply (every warning category above is
+  // apply-fatal) never surfaces its raw validation strings as the
+  // primary message: ONE clarify call feeds the exact failing rules
+  // back to the model and asks it to ask the user for the missing or
+  // invalid values instead of guessing them. A clarify that asks
+  // goes through the ask path; anything else falls back to the
+  // proposal + warnings below (the preview stays the edit surface).
+  const blocking = [...shapeErrors, ...scenarioErrs, ...baselineErrs, ...opErrs, ...unresolved.map((u) => u.reason)];
+  if (blocking.length) {
+    let ask = null;
+    try {
+      const clarifyPrompt = [
+        'You asked the user to design a planning project as JSON. Your draft failed validation for these reasons:',
+        ...blocking.map((e) => `- ${e}`),
+        `User need: ${text}`,
+        ...(historyText ? [`Conversation so far:\n${historyText}`] : []),
+        ...(answers ? [`User-provided answers (already answered — do not ask for these again): ${JSON.stringify(answers)}`] : []),
+        'Draft (for reference only — do not reuse its invalid values):',
+        JSON.stringify(parsed),
+        'Do not guess or invent values. Ask the user for the missing or invalid values only. Reply with JSON only: {"ask": [{"field": "snake_case_field", "label": "plain question", "type": "date"|"number"|"text"}]} — one question per missing or invalid value, no prose, no values.',
+      ].join('\n');
+      const rawClarify = await callLlm([{ role: 'user', content: clarifyPrompt }], process.env, modelCheck.model);
+      const parsedClarify = parseModelJson(rawClarify);
+      if (parsedClarify) ask = normalizeAiAsk(parsedClarify.ask);
+    } catch (e) {
+      // Clarify failed (e.g. LLM 502) — fall through to the proposal
+      // + warnings below; the client shows a plain note, not the raw
+      // strings, as the thread message.
+    }
+    if (ask) return res.json({ ask, configured: true });
+  }
   res.json({
     proposal: { ...proposal, scenario: { ...proposal.scenario, factors }, strategy: { ...proposal.strategy, ops: seqOps } },
     unresolved,

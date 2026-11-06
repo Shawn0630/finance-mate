@@ -713,12 +713,14 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
    tint, same as wiring Selected). Scoped to the modal only. */
 #planReportAiModal .plan-ai-modal-card { border: 1px solid #e6ecf2; border-radius: 10px; padding: 10px 14px; margin: 12px 0; }
 #planReportFollowUp { margin: 12px 0; }
-#planReportFollowUpThread { max-height: 340px; overflow-y: auto; margin: 12px 0; }
-#planReportFollowUpThread .plan-ai-turn { border: 1px solid #e6ecf2; border-radius: 10px; padding: 10px 14px; margin: 10px 0; }
-#planReportFollowUpThread .plan-ai-turn-user { background: #f0f6fc; }
-#planReportFollowUpThread .plan-ai-turn-ai { background: #fff; }
-#planReportFollowUpThread .plan-ai-turn-who { font-size: 12px; font-weight: 650; color: #5b6b7a; margin-bottom: 6px; }
-#planReportFollowUpThread .plan-ai-turn .toolbar { margin-top: 8px; }
+/* AI conversation threads (Follow up panel + Create-with-AI modal):
+   shared turn styles, scoped to the .plan-ai-thread container. */
+.plan-ai-thread { max-height: 340px; overflow-y: auto; margin: 12px 0; }
+.plan-ai-thread .plan-ai-turn { border: 1px solid #e6ecf2; border-radius: 10px; padding: 10px 14px; margin: 10px 0; }
+.plan-ai-thread .plan-ai-turn-user { background: #f0f6fc; }
+.plan-ai-thread .plan-ai-turn-ai { background: #fff; }
+.plan-ai-thread .plan-ai-turn-who { font-size: 12px; font-weight: 650; color: #5b6b7a; margin-bottom: 6px; }
+.plan-ai-thread .plan-ai-turn .toolbar { margin-top: 8px; }
 #planReportAiModal .plan-ai-modal-card .section-head { margin-bottom: 8px; }
 #planReportAiModal .plan-ai-modal-card .section-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
 #planReportAiModal .plan-ai-picks { display: flex; flex-wrap: wrap; gap: 8px; }

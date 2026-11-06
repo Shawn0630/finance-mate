@@ -11620,6 +11620,23 @@ let planAiCreateQueue = [];
 let planAiCreateProposal = null;
 let planAiCreateAnswers = null;
 let planAiCreateHistoryText = '';
+// Conversation thread (user 2026-11-06): the modal is a thread —
+// user turns + AI turns (questions, draft notices, plain notices),
+// input at the bottom. Per-modal-session in memory (v1): there is
+// no project yet to attach a thread to, so closing the modal drops
+// it. Same .plan-ai-turn styles as the Follow up panel.
+let planAiCreateThread = [];
+let planAiCreateBusy = false;
+function planAiCreateRenderThread() {
+  const host = $('#planAiCreateThread');
+  if (!host) return;
+  host.innerHTML = planAiCreateThread.map((t) => {
+    if (t.role === 'user') return `<div class="plan-ai-turn plan-ai-turn-user"><div class="plan-ai-turn-who">You</div><div>${esc(t.text)}</div></div>`;
+    if (t.role === 'ai' && Array.isArray(t.questions)) return `<div class="plan-ai-turn plan-ai-turn-ai"><div class="plan-ai-turn-who">AI</div><div>${t.questions.map((q) => esc(q.label)).join('<br>')}</div></div>`;
+    return `<div class="plan-ai-turn plan-ai-turn-ai"><div class="plan-ai-turn-who">AI</div><div>${esc(t.text || '')}</div></div>`;
+  }).join('');
+  host.scrollTop = host.scrollHeight;
+}
 function openPlanAiCreateModal() {
   const f = planCatFlow;
   if (!f || !f.category || !f.entity) return;
@@ -11628,6 +11645,9 @@ function openPlanAiCreateModal() {
   planAiCreateAnswers = null;
   planAiCreateHistoryText = '';
   planAiCreateQueue = [];
+  planAiCreateThread = [];
+  planAiCreateBusy = false;
+  planAiCreateRenderThread();
   $('#planAiCreateCtx').textContent = `${f.category.label}`;
   $('#planAiCreateText').value = '';
   $('#planAiCreateQueue').innerHTML = '';
@@ -11678,11 +11698,21 @@ function planAiCreateRenderPreview() {
   });
   $('#planAiCreateApplyBar').classList.remove('hidden');
 }
-async function planAiCreateSend() {
+async function planAiCreateSend(opts) {
   const msg = $('#planAiCreateMsg');
-  const text = $('#planAiCreateText').value.trim();
+  const text = (opts && opts.text) || $('#planAiCreateText').value.trim();
   if (!text) { showMsg(msg, 'err', 'Describe what you want first'); return; }
+  if (planAiCreateBusy) return;
+  planAiCreateBusy = true;
+  const goBtn = $('#planAiCreateGoBtn');
+  if (goBtn) goBtn.disabled = true;
   showMsg(msg, '', '');
+  // A follow-up re-send (after answering the AI's questions) is a
+  // continuation, not a new user message — the answers turn already
+  // stands for the user's reply, so no second copy of the prompt.
+  if (!opts || !opts.followUp) planAiCreateThread.push({ role: 'user', text });
+  $('#planAiCreateText').value = '';
+  planAiCreateRenderThread();
   try {
     const files = await planAiCreateSerializeQueue();
     const model = $('#planAiCreateModel').value || undefined;
@@ -11694,6 +11724,8 @@ async function planAiCreateSend() {
     const r = await api('/api/planning/ai-create/propose', { method: 'POST', body });
     planAiCreateHistoryText = `${planAiCreateHistoryText}\nYou: ${text}`.trim();
     if (r.ask) {
+      planAiCreateThread.push({ role: 'ai', questions: r.ask });
+      planAiCreateRenderThread();
       const askHost = $('#planAiCreateAsk');
       askHost.innerHTML = `<div>${r.ask.map((q) => `<div><label>${esc(q.label)} *</label><input data-plan-ai-create-ask="${esc(q.field)}" type="${q.type === 'number' ? 'number' : q.type === 'date' ? 'date' : 'text'}"></div>`).join('')}</div><div class="toolbar"><button class="small primary" id="planAiCreateAskSend">Send</button></div>`;
       $('#planAiCreateAskSend').addEventListener('click', () => {
@@ -11705,16 +11737,36 @@ async function planAiCreateSend() {
         });
         if (!ok) { showMsg(msg, 'err', 'Please answer all questions before continuing.'); return; }
         planAiCreateAnswers = { ...(planAiCreateAnswers || {}), ...answers };
-        planAiCreateHistoryText = `${planAiCreateHistoryText}\nYou: ${r.ask.map((q) => `${q.label}: ${answers[q.field]}`).join(', ')}`.trim();
+        const answerLine = r.ask.map((q) => `${q.label}: ${answers[q.field]}`).join(', ');
+        planAiCreateHistoryText = `${planAiCreateHistoryText}\nYou: ${answerLine}`.trim();
+        planAiCreateThread.push({ role: 'user', text: answerLine });
+        planAiCreateRenderThread();
         askHost.innerHTML = '';
-        planAiCreateSend();
+        planAiCreateSend({ followUp: true, text });
       });
       return;
     }
     $('#planAiCreateAsk').innerHTML = '';
     planAiCreateProposal = r;
+    // A proposal whose warnings would fail Apply gets a plain
+    // thread note, not the raw strings — the raw strings stay only
+    // in the preview's warn banner, which is the edit surface.
+    const w = r.warnings || {};
+    const blocking = [...(w.shape || []), ...(w.scenario || []), ...(w.baseline || []), ...(w.ops || []), ...(r.unresolved || []).map((u) => u.reason)];
+    planAiCreateThread.push({ role: 'ai', text: blocking.length
+      ? 'I drafted something, but a few values still need fixing — you can edit the operations below, or tell me what should change.'
+      : 'Here is a draft — review it below.' });
+    planAiCreateRenderThread();
     planAiCreateRenderPreview();
-  } catch (err) { showMsg(msg, 'err', err.message); }
+  } catch (err) {
+    // Service errors (502/503) are plain sentences, not raw
+    // validation strings — they read fine as an AI turn.
+    planAiCreateThread.push({ role: 'ai', text: err.message });
+    planAiCreateRenderThread();
+  } finally {
+    planAiCreateBusy = false;
+    if (goBtn) goBtn.disabled = false;
+  }
 }
 async function planAiCreateApply() {
   const msg = $('#planAiCreateMsg');
@@ -11741,7 +11793,14 @@ async function planAiCreateApply() {
     const newId = (data.project || {}).id;
     closeModalEl($('#planAiCreateModal'));
     location.hash = `#planning/project/${newId}`;
-  } catch (err) { showMsg(msg, 'err', err.message); }
+  } catch (err) {
+    // Apply re-validates: a hand-edited draft can still fail. The
+    // raw error goes to the console only — the thread gets a plain
+    // message, and the preview stays open for editing.
+    console.warn('ai-create apply failed:', err.message);
+    planAiCreateThread.push({ role: 'ai', text: 'That draft still has a problem — check the operations below and fix the invalid value, or tell me what should change.' });
+    planAiCreateRenderThread();
+  }
 }
 (function planAiCreateWire() {
   const goBtn = $('#planAiCreateGoBtn');
@@ -12911,7 +12970,7 @@ function planReportAiChartRowsHtml(charts) {
 }
 function planReportFollowUpHtml() {
   return `<div class="panel"><div class="section-head"><h3>Follow up with AI</h3><button class="small" data-followup-close>Close</button></div>
-    <div id="planReportFollowUpThread"></div>
+    <div class="plan-ai-thread" id="planReportFollowUpThread"></div>
     <div><textarea id="planReportFollowUpText" rows="3" placeholder="e.g. Add a chart comparing payoff months"></textarea></div>
     <div class="toolbar"><button class="small primary" id="planReportFollowUpSendBtn">Send</button></div>
     <div class="msg" id="planReportFollowUpMsg"></div></div>`;

@@ -143,6 +143,22 @@ test('callLlm: the stub file can answer per model name', async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('callLlm: the stub file can answer one entry per call, in order', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fm-stub-'));
+  const file = path.join(dir, 'stub.json');
+  fs.writeFileSync(file, JSON.stringify({ responses: [{ a: 1 }, { b: 2 }] }));
+  const env = { LLM_STUB_RESPONSE_FILE: file };
+  assert.equal(await callLlm([], env, 'm1'), '{"a":1}');
+  assert.equal(await callLlm([], env, 'm1'), '{"b":2}');
+  // Past the end the last entry repeats.
+  assert.equal(await callLlm([], env, 'm1'), '{"b":2}');
+  // Rewriting the file resets the sequence.
+  fs.writeFileSync(file, JSON.stringify({ responses: [{ c: 3 }, { d: 4 }] }));
+  assert.equal(await callLlm([], env, 'm1'), '{"c":3}');
+  assert.equal(await callLlm([], env, 'm1'), '{"d":4}');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('callLlm: LLM_MODEL_FALLBACK takes over when the primary call fails', async () => {
   const realFetch = globalThis.fetch;
   const seen = [];

@@ -10720,6 +10720,42 @@ export async function run(H, S) {
       && (r.data.warnings?.ops || []).some((w) => /needs a price/.test(w))
       && !(r.data.proposal?.strategy?.ops || []).some((o) => o.params.propertyRef === 'No Such Address Anywhere'),
       JSON.stringify(r.data));
+    // ---- Item 4: ai-create conversation — an invalid draft asks
+    // for the missing values instead of returning raw errors. The
+    // stub answers the draft call with an invalid rate_switch and
+    // the clarify call with questions (sequence stub).
+    const invalidSwitch = {
+      project: { name: 'Switch Plan', question: 'q' }, scenario: { name: 'W', factors: {} },
+      baseline: { name: 'B', description: 'd', assumptions: [] },
+      strategy: { name: 'S', ops: [{ op_type: 'rate_switch', params: { propertyRef: aiPropAddr } }] },
+    };
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ responses: [invalidSwitch,
+      { ask: [{ field: 'switch_date', label: 'Which date should the switch happen on?', type: 'date' }, { field: 'rate_type', label: 'Fixed or variable?', type: 'text' }] }] }));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'switch to fix', category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate-chat: an invalid draft asks for the missing values instead of returning raw errors',
+      r.status === 200 && Array.isArray(r.data.ask)
+      && r.data.ask.some((q) => q.type === 'date')
+      && r.data.ask.some((q) => /fixed|variable/i.test(q.label))
+      && !r.data.proposal, JSON.stringify(r.data));
+    // Answering the questions completes the proposal.
+    const validSwitch = {
+      project: { name: 'Switch Plan', question: 'q' }, scenario: { name: 'W', factors: {} },
+      baseline: { name: 'B', description: 'd', assumptions: [] },
+      strategy: { name: 'S', ops: [{ op_type: 'rate_switch', params: { date: '2027-01-01', rateType: 'fixed', annualRate: 4.6, propertyRef: aiPropAddr } }] },
+    };
+    fs.writeFileSync(H.aiStubFile, JSON.stringify(validSwitch));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'switch to fix', category: 'property', subcategory: 'interest_rate', entity: aiEntity, answers: { switch_date: '2027-01-01', rate_type: 'fixed' } });
+    H.check('aicreate-chat: answering the questions completes the proposal',
+      r.status === 200 && r.data.proposal && (r.data.warnings?.ops || []).length === 0
+      && r.data.proposal.strategy.ops[0].params.date === '2027-01-01'
+      && r.data.proposal.strategy.ops[0].params.rateType === 'fixed'
+      && r.data.proposal.strategy.ops[0].params.annualRate === 4.6, JSON.stringify(r.data));
+    // A clarify that yields no usable ask falls back to the
+    // proposal + warnings (degraded path, no regression).
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ responses: [invalidSwitch, { ask: [] }] }));
+    r = await H.req('POST', '/api/planning/ai-create/propose', { text: 'switch to fix', category: 'property', subcategory: 'interest_rate', entity: aiEntity });
+    H.check('aicreate-chat: an unusable clarify falls back to the proposal with warnings',
+      r.status === 200 && r.data.proposal && (r.data.warnings?.ops || []).some((w) => /date must be YYYY-MM-DD/.test(w)), JSON.stringify(r.data));
     r = await H.req('POST', '/api/planning/ai-create/apply', { proposal: boundProposal, category: 'property', subcategory: 'interest_rate', entity: aiEntity });
     H.check('aicreate: Apply creates project + scenario + baseline + strategy, all AI-designed',
       r.status === 201 && r.data.project?.id > 0 && r.data.scenario?.source === 'ai'
@@ -10881,6 +10917,65 @@ export async function run(H, S) {
       r = await H.req('GET', `/api/planning/strategies/${browserSid}`);
       H.check('aicreate: browser preview Remove reflected in the created strategy',
         r.status === 200 && (r.data.ops || []).length === 1, JSON.stringify((r.data.ops || []).map((o) => o.op_type)));
+      // Conversation thread: "switch to fix" with no date asks in
+      // the thread (date input rendered), no raw error as the
+      // primary message; answering completes the draft and Apply
+      // creates the project.
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('#planAddProjectBtn', { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('#planAddProjectBtn').click());
+      await page.waitForSelector('[data-plan-cat="property"]', { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('[data-plan-cat="property"]').click());
+      // The category card is just-rendered: a dispatched click can
+      // miss (click-miss family) — re-click once if the entity
+      // picker never appears. The pick handler is idempotent
+      // (re-render + seq guard on the properties fetch).
+      try {
+        await page.waitForSelector('#planCatEntitySel', { timeout: 15000 });
+      } catch {
+        await page.evaluate(() => document.querySelector('[data-plan-cat="property"]')?.click());
+        await page.waitForSelector('#planCatEntitySel', { timeout: 15000 });
+      }
+      await page.select('#planCatEntitySel', String(aiPropId));
+      await page.waitForSelector('#planAiCreateBtn', { timeout: 15000 });
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ responses: [invalidSwitch,
+        { ask: [{ field: 'switch_date', label: 'Which date should the switch happen on?', type: 'date' }, { field: 'rate_type', label: 'Fixed or variable?', type: 'text' }] }] }));
+      await page.evaluate(() => document.querySelector('#planAiCreateBtn').click());
+      await page.waitForSelector('#planAiCreateModal:not(.hidden)', { timeout: 15000 });
+      await page.evaluate(() => { document.querySelector('#planAiCreateText').value = 'switch to fix'; });
+      await page.evaluate(() => document.querySelector('#planAiCreateGoBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planAiCreateThread .plan-ai-turn').length >= 2, { timeout: 20000 });
+      const chatThread = await page.evaluate(() => ({
+        text: document.querySelector('#planAiCreateThread')?.textContent || '',
+        dateInput: !!document.querySelector('#planAiCreateAsk input[type="date"]'),
+        askInputs: [...document.querySelectorAll('#planAiCreateAsk input')].length,
+      }));
+      H.check('aicreate-chat: "switch to fix" asks for the date in the thread, with a date input and no raw error',
+        chatThread.dateInput && chatThread.askInputs === 2
+        && /Which date should the switch happen on/.test(chatThread.text)
+        && !/date must be YYYY-MM-DD/.test(chatThread.text), JSON.stringify(chatThread));
+      // Answer the questions: the stub now returns the completed
+      // draft; the ask Send re-proposes with the answers.
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(validSwitch));
+      await page.evaluate(() => {
+        const inputs = [...document.querySelectorAll('#planAiCreateAsk input')];
+        const date = inputs.find((i) => i.type === 'date');
+        if (date) date.value = '2027-01-01';
+        const txt = inputs.find((i) => i.type === 'text');
+        if (txt) txt.value = 'fixed';
+      });
+      await page.evaluate(() => document.querySelector('#planAiCreateAskSend').click());
+      await page.waitForFunction(() => document.querySelectorAll('[data-plan-ai-create-op]').length === 1, { timeout: 20000 });
+      const chatPreview = await page.evaluate(() => ({
+        turns: document.querySelectorAll('#planAiCreateThread .plan-ai-turn').length,
+        opType: document.querySelector('[data-plan-ai-create-op] span')?.textContent || '',
+      }));
+      H.check('aicreate-chat: answering completes the draft preview in the same thread',
+        chatPreview.turns >= 4 && chatPreview.opType === 'rate_switch', JSON.stringify(chatPreview));
+      await page.evaluate(() => document.querySelector('#planAiCreateApplyBtn').click());
+      await page.waitForFunction(() => (location.hash || '').includes('#planning/project/'), { timeout: 20000 });
+      const chatHash = await page.evaluate(() => location.hash);
+      H.check('aicreate-chat: Apply after the conversation creates the project', /project\/\d+/.test(chatHash), chatHash);
       // Strategy stays picked via the null=all wiring default: clicking
       // its Select would toggle the only strategy OFF and trip the
       // pick-a-strategy guard instead. The scenario click picks the
