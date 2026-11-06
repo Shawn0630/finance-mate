@@ -11259,12 +11259,48 @@ function planListHtml(sections) {
     <div class="msg" id="planListMsg"></div>
     ${body}`;
 }
+// List card meta (user 2026-11-06): the meta line is ["N strategies",
+// ONE topic descriptor] (+ "Stale baseline", a functional warning).
+// The stored question often restates the entity ("Rate switch · 2985
+// CHRISTINA PL COQUITLAM — Bound to 2985 CHRISTINA PL COQUITLAM")
+// and the subcategory ("Interest rate") duplicates the topic, while
+// the category ("Property") repeats the section heading — all of that
+// is already on the card as the headline, the tag row, or the section
+// heading, so the meta keeps only the topic. Cleaning is display-only;
+// stored question data is never changed. Dedup: the descriptor is the
+// cleaned question whenever it is non-empty (so a question containing
+// the subcategory still shows only the question), and the subcategory
+// only when the question is empty after cleaning.
+function planListMetaStripLabel(text, label) {
+  const lab = String(label || '').trim();
+  if (!lab) return String(text || '');
+  const escLab = lab.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const left = /[A-Za-z0-9]/.test(lab[0]) ? '(?<![A-Za-z0-9])' : '';
+  const right = /[A-Za-z0-9]/.test(lab[lab.length - 1]) ? '(?![A-Za-z0-9])' : '';
+  let t = String(text || '');
+  t = t.replace(new RegExp(`${left}Bound to\\s+${escLab}${right}`, 'gi'), ' ');
+  t = t.replace(new RegExp(`${left}${escLab}${right}`, 'gi'), ' ');
+  return t;
+}
+function planListMetaTidy(text) {
+  const parts = String(text || '')
+    .split(/[·—–|]/)
+    .flatMap((x) => x.split(/\s+-\s+/))
+    .map((x) => x.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  return parts.join(' · ');
+}
+function planListMetaDescriptor(p) {
+  const sub = (p.categoryLabels && p.categoryLabels.subcategory) || '';
+  let q = (p.question || '').trim();
+  for (const lab of (p.entityTags || [])) q = planListMetaStripLabel(q, lab);
+  return planListMetaTidy(q) || sub;
+}
 function planListCardHtml(p) {
   const tags = (p.entityTags || []).map((t) => `<span class="meta-tag">${esc(t)}</span>`).join('');
   const metaParts = [
     `${p.strategies.length} strateg${p.strategies.length === 1 ? 'y' : 'ies'}`,
-    p.question || '',
-    p.categoryLabels ? [p.categoryLabels.category, p.categoryLabels.subcategory].filter((x) => x).join(' · ') : '',
+    planListMetaDescriptor(p),
   ];
   if (p.stale) metaParts.push('Stale baseline');
   return `

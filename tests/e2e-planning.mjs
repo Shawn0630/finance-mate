@@ -3397,6 +3397,30 @@ export async function run(H, S) {
   r = await H.req('POST', '/api/planning/projects', { name: 'List Sections Other', question: 'q' });
   H.check('plan-list: fixture legacy project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const listOtherId = r.data.project.id;
+  // ---- Planning list card meta cleanup (user 2026-11-06): the meta
+  // line is ["N strategies", ONE topic descriptor] — the question is
+  // cleaned of the entity name / "Bound to <entity>" and the category
+  // is dropped. Fixtures: a Test-1-like card (entity restated 3x in
+  // the old meta), an informative question, an empty question (falls
+  // back to the subcategory), and a stale card. The stale card is
+  // created BEFORE a trigger property lands (any mainline change
+  // after a project is created makes it stale); the other three are
+  // created after it, so they stay fresh.
+  r = await H.req('POST', '/api/planning/projects', { name: 'List Meta Stale', question: 'Refinance now', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: listPropPid } });
+  H.check('plan-list-meta: fixture stale project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const listMetaStaleId = r.data.project.id;
+  r = await H.req('POST', '/api/properties', { address: '9 Meta Stale Lane', purchase_date: '2024-01-15', mortgage_balance: 500000, amortization_years: 25 });
+  H.check('plan-list-meta: stale-trigger property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const listMetaStalePid = r.data.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'List Meta Property', question: 'Rate switch · 1 List Sections Way — Bound to 1 List Sections Way', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: listPropPid } });
+  H.check('plan-list-meta: fixture Test-1-like project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const listMetaPropId = r.data.project.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'List Meta Informative', question: 'Compare payoff under a rate rise', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: listPropPid } });
+  H.check('plan-list-meta: fixture informative-question project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const listMetaInfoId = r.data.project.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'List Meta Empty', question: '', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: listPropPid } });
+  H.check('plan-list-meta: fixture empty-question project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const listMetaEmptyId = r.data.project.id;
   r = await H.req('GET', '/api/planning/projects');
   const listRows = (r.data.projects || []);
   const listSecs = (r.data.sections || []);
@@ -3516,6 +3540,39 @@ export async function run(H, S) {
         listView.sections.flatMap((s) => s.cards).length > 0
           && listView.sections.flatMap((s) => s.cards).every((c) => !/strateg(y|ies)/.test(c.name)),
         JSON.stringify(listView.sections.flatMap((s) => s.cards).map((c) => c.name)));
+      // Meta cleanup (user 2026-11-06): ["N strategies", ONE topic
+      // descriptor] — no entity name, no category in the meta.
+      const listMetaCard = listCardIn('Property', 'List Meta Property');
+      const listMetaInfoCard = listCardIn('Property', 'List Meta Informative');
+      const listMetaEmptyCard = listCardIn('Property', 'List Meta Empty');
+      const listMetaStaleCard = listCardIn('Property', 'List Meta Stale');
+      H.check('plan-list-meta: Test-1-like card meta is "0 strategies · Rate switch" — entity name and category gone',
+        !!listMetaCard && listMetaCard.meta === '0 strategies · Rate switch'
+          && JSON.stringify(listMetaCard.tags) === JSON.stringify(['1 List Sections Way']),
+        JSON.stringify(listMetaCard));
+      H.check('plan-list-meta: informative question is kept verbatim in the meta',
+        !!listMetaInfoCard && listMetaInfoCard.meta === '0 strategies · Compare payoff under a rate rise',
+        JSON.stringify(listMetaInfoCard));
+      H.check('plan-list-meta: empty question falls back to the subcategory in the meta',
+        !!listMetaEmptyCard && listMetaEmptyCard.meta === '0 strategies · Interest rate',
+        JSON.stringify(listMetaEmptyCard));
+      H.check('plan-list-meta: stale flag still shows after the descriptor',
+        !!listMetaStaleCard && listMetaStaleCard.meta === '0 strategies · Refinance now · Stale baseline',
+        JSON.stringify(listMetaStaleCard));
+      const metaHelper = await page.evaluate(() => {
+        const d = (q, tags, sub) => planListMetaDescriptor({ question: q, entityTags: tags, categoryLabels: sub ? { category: 'Property', subcategory: sub } : null });
+        return {
+          entityOnly: d('1 List Sections Way', ['1 List Sections Way'], 'Interest rate'),
+          containsSub: d('Interest rate switch', [], 'Interest rate'),
+          lowerCase: d('rate switch · 1 list sections way', ['1 List Sections Way'], 'Interest rate'),
+          poolTag: d('Buy GIC · Pool Acct A', ['Pool Acct A', 'POOL.B'], 'GIC'),
+          noQuestionNoSub: d(null, [], null),
+        };
+      });
+      H.check('plan-list-meta: helper — entity-only question falls back to subcategory; question containing subcategory wins; strip is case-insensitive; pool tags stripped; empty in/out',
+        metaHelper.entityOnly === 'Interest rate' && metaHelper.containsSub === 'Interest rate switch'
+          && metaHelper.lowerCase === 'rate switch' && metaHelper.poolTag === 'Buy GIC' && metaHelper.noQuestionNoSub === '',
+        JSON.stringify(metaHelper));
     } finally { await browserList.close(); }
   }
   r = await H.req('DELETE', `/api/planning/projects/${listPropId}`);
@@ -3524,6 +3581,16 @@ export async function run(H, S) {
   H.check('plan-list: fixture legacy project cleanup', r.status === 200);
   r = await H.req('DELETE', `/api/properties/${listPropPid}`);
   H.check('plan-list: fixture property cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/planning/projects/${listMetaPropId}`);
+  H.check('plan-list-meta: fixture Test-1-like project cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/planning/projects/${listMetaInfoId}`);
+  H.check('plan-list-meta: fixture informative-question project cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/planning/projects/${listMetaEmptyId}`);
+  H.check('plan-list-meta: fixture empty-question project cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/planning/projects/${listMetaStaleId}`);
+  H.check('plan-list-meta: fixture stale project cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/properties/${listMetaStalePid}`);
+  H.check('plan-list-meta: stale-trigger property cleanup', r.status === 200);
   r = await H.req('POST', `/api/planning/projects/${pvProj}/strategies`, { name: 'Buy from external' });
   H.check('poolviz: external-pool strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const pvStrat = r.data.strategy.id;
