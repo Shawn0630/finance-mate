@@ -11103,6 +11103,11 @@ function planLineChart(id, labels, datasets, opts = {}) {
     scales: { y: { ticks: { callback: (v) => moneyTick(v) } } },
     plugins: { tooltip: { callbacks: { label: (it) => ` ${it.dataset.label}: ${money2(it.parsed.y)}` } } },
   };
+  // Fill-band datasets (the pool Difference chart's shaded diff)
+  // carry `band: true` and must not appear in the tooltip or the
+  // legend — the band is read visually, not as a series.
+  if (opts.tooltipFilter) chartOpts.plugins.tooltip.filter = opts.tooltipFilter;
+  if (opts.legendFilter) chartOpts.plugins.legend = { labels: { filter: opts.legendFilter } };
   // End-point labels reserve a right-hand label column; without
   // them the chart keeps its full width (no dead padding). The
   // labels travel as plugin options (available during the
@@ -13389,7 +13394,7 @@ function planReportApplyOverlay(comp, report) {
 const PLAN_REPORT_TEMPLATES = {
   property: {
     key: 'property',
-    sections: ['variables', 'headline', 'charts', 'table', 'comparison', 'engine'],
+    sections: ['variables', 'headline', 'charts', 'comparison', 'engine'],
     variables: ['penalty'], // report variables that apply on this kind
     mortgageCharts: true,        // mortgage-only chart blocks render
     mortgageHeadlineCards: true, // Interest saved / Payoff shift / Monthly payment Δ / Penalty
@@ -13404,7 +13409,7 @@ const PLAN_REPORT_TEMPLATES = {
     // 2026-11-05: "为啥GIC有penalty啊"). The template is keyed on
     // the BASELINE kind (cash pool vs property mortgage), never on
     // the strategy.
-    sections: ['headline', 'charts', 'table', 'comparison', 'engine'],
+    sections: ['headline', 'charts', 'comparison', 'engine'],
     variables: [],
     mortgageCharts: false,
     mortgageHeadlineCards: false,
@@ -14077,10 +14082,10 @@ async function loadPlanReport(projectId, reportId) {
     planReportTabsOpen(projectId, reportId, report.name);
     const renderedStrategyIds = comp.strategies.map((r) => r.strategy.id);
     // Report sections, in the TEMPLATE's order: headline → chart →
-    // table → strategy对比 (the merged cross-strategy table,
-    // multi-strategy reports only — the Δ chart + breakdown in the
-    // comparison panel stay for every report of a template that has
-    // them) → engine explanation (always last). Variables sit above
+    // comparison (the Δ chart + the month-by-month Difference table
+    // directly below it + breakdown, in one panel) → strategy对比
+    // (the merged cross-strategy table, multi-strategy reports only)
+    // → engine explanation (always last). Variables sit above
     // the headline; Refine with AI follows the engine note, AI
     // reports only. Each section is a data-plan-report-block so the
     // floating outline nav lists it; the comparison panel keeps its
@@ -14096,21 +14101,18 @@ async function loadPlanReport(projectId, reportId) {
         <div id="planReportHeadlineCards">${planReportHeadlineCardsHtml(planReportView)}</div>
       </div></div>`,
       charts: panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>',
-      table: `<div data-plan-report-block="table"><div class="panel">
-        <div class="section-head"><h3>Difference vs baseline</h3></div>
-        <div class="note" id="planReportTableCaption"></div>
-        <div class="toolbar" id="planReportTablePager"></div>
-        <div id="planReportTableBody"></div>
-      </div></div>`,
       comparison: `<div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
         <div id="planReportComparePicker" class="toolbar"></div>
         <div class="section-head"><h3>Difference vs baseline</h3></div>
-        <div class="note" id="planReportTrajCaption">${template.key === 'pool' ? 'X: month · Y: CAD — Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.'}</div>
+        <div class="note" id="planReportTrajCaption">${template.key === 'pool' ? 'X: month · Y: CAD — Baseline and strategy lines show absolute value; the shaded band between them is the Value Δ (strategy value − baseline value).' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.'}</div>
         <div id="planReportTrajRange"></div>
         <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
+        <div class="note" id="planReportTableCaption"></div>
+        <div class="toolbar" id="planReportTablePager"></div>
+        <div id="planReportTableBody"></div>
         ${template.breakdown ? `<div class="section-head"><h3>Monthly payment breakdown</h3></div>
         <div class="note">X: month · Y: CAD per month — each month's scheduled payment split into interest (solid) + principal (light), stacked per trajectory.</div>
         <div class="chart-wrap plan-traj-breakdown-wrap" style="height:260px"><canvas id="planReportTrajectoryBreakdownChart"></canvas></div>
@@ -14750,7 +14752,10 @@ function planCompareNewRender(block, ids) {
     // overlapped, the axis ran dead to the horizon year, and a line
     // going DOWN meant "worse off". After the switch month a strategy
     // line above the baseline reads at a glance as owing more. Pool
-    // reports keep the Δ chart (their Value Δ is meaningful). The X
+    // reports draw the same absolute-trajectory shape for VALUE
+    // (baseline + each strategy, actual $) with a translucent band
+    // between the baseline and each strategy — the band IS the Value
+    // Δ, and the Δ numbers live in the table below the chart. The X
     // axis ends at the baseline's last month (its payoff): the
     // comparison only exists while the baseline exists, and the
     // series themselves end at payoff with balance 0, so running to
@@ -14800,25 +14805,73 @@ function planCompareNewRender(block, ids) {
         }
       }
       if (!drewBalance) {
-        const dDatasets = [];
-        diffRows.forEach(({ r, monthly }, i) => {
-          const byMo = new Map(monthly.map((m) => [m.month, m]));
-          if (r.touchesMortgage && monthly.some((m) => m.balDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Balance Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.balDiff; }), borderColor: planColor(2 * i), backgroundColor: planColor(2 * i), spanGaps: true });
-          if (monthly.some((m) => m.valDiff != null && m.valDiff !== 0)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Value Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valDiff; }), borderColor: planColor(2 * i + 1), backgroundColor: planColor(2 * i + 1), spanGaps: true });
-        });
-        if (dDatasets.length) {
-          planLineChart(t.chart, effMonths.map(formatYM), dDatasets);
-          if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
-          const caption = t.caption ? $(t.caption) : null;
-          if (caption) {
-            // The caption names only what is actually drawn: a
-            // Balance Δ line exists only when a picked strategy
-            // touches a mortgage, so a pool report (Value Δ only)
-            // never carries the mortgage text.
-            const drewBalDelta = dDatasets.some((d) => /Balance Δ/.test(d.label));
-            caption.textContent = drewBalDelta ? 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Value Δ = strategy value − baseline value.';
-          }
-        } else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
+        if (isPool) {
+          // Pool Difference chart (user 2026-11-06): absolute
+          // trajectories — the baseline line + each picked strategy
+          // line — with a translucent band between the baseline and
+          // each strategy; the band IS the diff. The Δ line is gone
+          // (the Δ numbers live in the table below the chart). A
+          // strategy that moves no stocks coincides with the
+          // baseline, so with no move at all only the baseline line
+          // is drawn, plus the one-line note. The band fills to
+          // dataset 0 (the baseline) and is hidden from the tooltip,
+          // the legend, and the end labels.
+          const baseHas = diffRows[0].monthly.some((m) => m.valBase != null);
+          const stratLines = diffRows.filter(({ monthly }) => monthly.some((m) => m.valStrat != null));
+          if (baseHas && stratLines.length) {
+            const baseByMo = new Map(diffRows[0].monthly.map((m) => [m.month, m]));
+            const valDatasets = [{ label: 'Baseline', data: effMonths.map((mo) => { const m = baseByMo.get(mo); return m == null ? null : m.valBase; }), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true }];
+            const valShorts = ['Baseline'];
+            if (hasStockMove) {
+              let ci = 1;
+              stratLines.forEach(({ r, monthly }) => {
+                const byMo = new Map(monthly.map((m) => [m.month, m]));
+                const data = effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valStrat; });
+                valDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data, borderColor: planColor(ci), backgroundColor: planColor(ci), spanGaps: true });
+                valShorts.push(r.strategy.letter);
+                valDatasets.push({ label: '', band: true, data, fill: 0, borderColor: planColor(ci), backgroundColor: planColorAlpha(planColor(ci), 0.12), borderWidth: 0, pointRadius: 0, spanGaps: true });
+                valShorts.push('');
+                ci += 1;
+              });
+            }
+            const endLabels = valDatasets.map((ds, i) => {
+              if (ds.band) return null;
+              let v = null;
+              for (let k = ds.data.length - 1; k >= 0; k--) { if (ds.data[k] != null) { v = ds.data[k]; break; } }
+              return v == null ? null : `${valShorts[i]} · $${moneyTick(Math.round(v))}`;
+            });
+            planLineChart(t.chart, effMonths.map(formatYM), valDatasets, {
+              endLabels,
+              tooltipFilter: (it) => !it.dataset.band,
+              legendFilter: (item, data) => !data.datasets[item.datasetIndex].band,
+            });
+            if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
+            const caption = t.caption ? $(t.caption) : null;
+            if (caption) caption.textContent = hasStockMove
+              ? 'X: month · Y: CAD — Baseline and strategy lines show absolute value; the shaded band between them is the Value Δ (strategy value − baseline value).'
+              : 'X: month · Y: CAD — Baseline value; the strategy moves no stocks, so it tracks the baseline exactly (Value Δ is $0).';
+          } else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
+        } else {
+          const dDatasets = [];
+          diffRows.forEach(({ r, monthly }, i) => {
+            const byMo = new Map(monthly.map((m) => [m.month, m]));
+            if (r.touchesMortgage && monthly.some((m) => m.balDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Balance Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.balDiff; }), borderColor: planColor(2 * i), backgroundColor: planColor(2 * i), spanGaps: true });
+            if (monthly.some((m) => m.valDiff != null && m.valDiff !== 0)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Value Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valDiff; }), borderColor: planColor(2 * i + 1), backgroundColor: planColor(2 * i + 1), spanGaps: true });
+          });
+          if (dDatasets.length) {
+            planLineChart(t.chart, effMonths.map(formatYM), dDatasets);
+            if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
+            const caption = t.caption ? $(t.caption) : null;
+            if (caption) {
+              // The caption names only what is actually drawn: a
+              // Balance Δ line exists only when a picked strategy
+              // touches a mortgage, so a pool report (Value Δ only)
+              // never carries the mortgage text.
+              const drewBalDelta = dDatasets.some((d) => /Balance Δ/.test(d.label));
+              caption.textContent = drewBalDelta ? 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Value Δ = strategy value − baseline value.';
+            }
+          } else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
+        }
       }
     } else {
       planDestroyChart(t.chart);

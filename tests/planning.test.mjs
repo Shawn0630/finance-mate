@@ -620,6 +620,31 @@ test('computeProjection: without a pool, a legless buy still funds from external
   assert.equal(strat.stocks.buyCashFromSells, 0);
 });
 
+// ------------------------------------------------------- diff-band chart
+// The pool Difference chart draws absolute trajectories (baseline +
+// strategy lines) with a band between them; the band's width at a
+// month IS |strategy − baseline| at that month — the Value Δ the
+// table below the chart shows. Pin the two absolute series the chart
+// is drawn from, so the band is pinned too.
+test('computeProjection: pool chart absolute series — buy month they agree, a year on the band is ~$60 wide', () => {
+  const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }), holdingGrowth: { 1: 12 } }));
+  const strat = computeProjection(poolBuyArgs());
+  // Buy month: the swap nets to zero — baseline and strategy agree,
+  // so the band has zero width there.
+  const base0 = poolSeriesAt(baseline, '2026-11');
+  const strat0 = poolSeriesAt(strat, '2026-11');
+  assert.ok(Math.abs(strat0 - base0) < 1, `buy month ${strat0} vs ${base0}`);
+  // A year on the sold XQQ would have grown 12%: baseline $1,130.63,
+  // strategy $1,070.63 (AMZN $500 flat + the kept XQQ grown) — the
+  // band between them is exactly $60.00 wide, the Value Δ magnitude.
+  const base12 = poolSeriesAt(baseline, '2027-11');
+  const strat12 = poolSeriesAt(strat, '2027-11');
+  assert.ok(Math.abs(base12 - 1130.63) < 1, `baseline 12mo ${base12}`);
+  assert.ok(Math.abs(strat12 - 1070.63) < 1, `strategy 12mo ${strat12}`);
+  const width12 = Math.abs(strat12 - base12);
+  assert.ok(Math.abs(width12 - 60) < 1, `band width 12mo ${width12}`);
+});
+
 // ------------------------------------------------------- merge-write build
 test('buildMergeWrites: prepay inserts, switch replaces later segments, conflicts surface', () => {
   const snapshot = {

@@ -5635,7 +5635,15 @@ export async function run(H, S) {
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, icRep);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Pool trajectory'), { timeout: 15000 });
       await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
-      const repPool = await page.evaluate(() => {
+      // Diff-band month labels, computed from the fixture dates (the
+      // run date moves them): sell month = psOpDate's month, buy
+      // month = icBuyYm's month, last chart month = current + 360.
+      const icMonName = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const icSellLabel = `${icMonName[Number(psOpDate.slice(5, 7)) - 1]} ${psOpDate.slice(0, 4)}`;
+      const icBuyLabel = `${icMonName[Number(icBuyYm.slice(5, 7)) - 1]} ${icBuyYm.slice(0, 4)}`;
+      const icLastDate = new Date(Date.UTC(_psNow.getUTCFullYear(), _psNow.getUTCMonth() + 360, 1));
+      const icLastLabel = `${icMonName[icLastDate.getUTCMonth()]} ${icLastDate.getUTCFullYear()}`;
+      const repPool = await page.evaluate(({ sellLabel, buyLabel }) => {
         const chartByTitle = (title) => {
           const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === title);
           const canvas = block ? block.querySelector('canvas') : null;
@@ -5643,6 +5651,22 @@ export async function run(H, S) {
             ? planCharts[canvas.id].data.datasets.map((d) => ({ label: d.label, n: d.data.filter((v) => v != null).length, max: Math.max(...d.data.filter((v) => v != null), -Infinity) })) : null;
         };
         const poolBlock = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Pool trajectory');
+        // Difference chart datasets + the sell/buy-month values the
+        // band is drawn from, and the sell-month table row the band
+        // must agree with.
+        const diffCh = (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryChart : null;
+        const sellIdx = diffCh ? diffCh.data.labels.indexOf(sellLabel) : -1;
+        const buyIdx = diffCh ? diffCh.data.labels.indexOf(buyLabel) : -1;
+        const atIdx = (i) => (diffCh && i >= 0) ? diffCh.data.datasets.map((d) => d.data[i]) : null;
+        const parseMoney = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+        const sellRow = (() => {
+          const head = [...document.querySelectorAll('#planReportTableBody thead th')].map((th) => th.textContent.trim());
+          const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')];
+          const tr = rows.find((r) => (r.querySelector('td')?.textContent || '').trim() === sellLabel);
+          if (!tr) return null;
+          const tds = [...tr.querySelectorAll('td')].map((td) => td.textContent.trim());
+          return { base: parseMoney(tds[head.indexOf('Baseline value')]), strat: parseMoney(tds[head.indexOf('Strategy value')]), diff: parseMoney(tds[head.indexOf('Value Δ')]) };
+        })();
         return {
           pool: chartByTitle('Pool trajectory'),
           poolCap: poolBlock ? [...poolBlock.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
@@ -5651,13 +5675,23 @@ export async function run(H, S) {
           tableHead: document.querySelector('#planReportTableBody thead')?.textContent || '',
           tableCap: document.querySelector('#planReportTableCaption')?.textContent || '',
           trajCap: document.querySelector('#planReportTrajCaption')?.textContent || '',
-          deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
+          deltaLabels: diffCh ? diffCh.data.datasets.map((d) => d.label) : null,
+          diffSets: diffCh ? diffCh.data.datasets.map((d) => ({ label: d.label, fill: (d.fill == null ? null : d.fill), band: !!d.band })) : null,
+          diffEndLabels: diffCh ? (diffCh.$endLabels || null) : null,
+          diffLastLabel: diffCh ? diffCh.data.labels[diffCh.data.labels.length - 1] : null,
+          diffSellIdx: sellIdx, diffBuyIdx: buyIdx,
+          diffAtSell: atIdx(sellIdx), diffAtBuy: atIdx(buyIdx),
+          sellRow,
+          // DOM order: the Difference table sits inside the
+          // comparison panel, directly below the chart.
+          tableInComparePanel: !!document.querySelector('#planReportComparePanel #planReportTableBody'),
+          chartBeforeTable: (() => { const c = document.querySelector('#planReportTrajectoryChart'); const t = document.querySelector('#planReportTableBody'); return !!(c && t && (c.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING)); })(),
           breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
           // The pool template has no breakdown section at all — the
           // wrap is absent, not merely hidden (templates, not gates).
           breakdownAbsent: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap') == null,
         };
-      });
+      }, { sellLabel: icSellLabel, buyLabel: icBuyLabel });
       H.check('stratpanels: report shows the cash-pool trajectory (6 datasets, pool max 2,400) with the equity-excluded caption',
         Array.isArray(repPool.pool) && repPool.pool.length === 6
           && repPool.pool.some((d) => /pool/.test(d.label) && d.max === 2400)
@@ -5668,10 +5702,34 @@ export async function run(H, S) {
           && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => repPool.headline.includes(k))
           && !repPool.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
         JSON.stringify({ headline: repPool.headline }));
-      H.check('invcomp: report comparison has Value Δ only, no Balance Δ line, no breakdown section',
-        repPool.deltaLabels && !repPool.deltaLabels.some((l) => /Balance Δ/.test(l)) && repPool.deltaLabels.some((l) => /Value Δ/.test(l))
+      // Diff-band (user 2026-11-06): the pool Difference chart draws
+      // absolute baseline + strategy lines with a translucent band
+      // between them — the band IS the Value Δ. Fixture numbers:
+      // baseline flat $10,000; at the sell month the strategy holds
+      // $7,600 of stock (band $2,400 wide); from the buy month on it
+      // holds $8,800 (band $1,200 wide). The table's Value Δ at the
+      // sell month must agree (−$2,400).
+      H.check('diff-band: pool Difference chart draws absolute baseline + strategy lines with a band, no Δ line, no breakdown section',
+        repPool.diffSets && repPool.diffSets.length === 3
+          && repPool.diffSets[0].label === 'Baseline' && repPool.diffSets[1].label.includes('Sell then buy')
+          && repPool.diffSets[2].label === '' && repPool.diffSets[2].band === true && repPool.diffSets[2].fill === 0
+          && !repPool.diffSets.some((d) => /Δ/.test(d.label || ''))
+          && Array.isArray(repPool.diffEndLabels) && repPool.diffEndLabels.length === 3
+          && repPool.diffEndLabels[0] === 'Baseline · $10,000' && repPool.diffEndLabels[1] === 'A · $8,800' && repPool.diffEndLabels[2] === null
+          && repPool.diffLastLabel === icLastLabel
           && repPool.breakdownNull === true && repPool.breakdownAbsent === true,
-        JSON.stringify(repPool));
+        JSON.stringify({ diffSets: repPool.diffSets, endLabels: repPool.diffEndLabels, lastLabel: repPool.diffLastLabel, expectedLast: icLastLabel }));
+      H.check('diff-band: band width equals |Value Δ| at the sell month ($2,400) and the buy month ($1,200), and matches the table',
+        repPool.diffSellIdx >= 0 && repPool.diffBuyIdx >= 0
+          && repPool.diffAtSell && repPool.diffAtSell[0] === 10000 && repPool.diffAtSell[1] === 7600 && repPool.diffAtSell[2] === 7600
+          && Math.abs(repPool.diffAtSell[1] - repPool.diffAtSell[0]) === 2400
+          && repPool.diffAtBuy && repPool.diffAtBuy[0] === 10000 && repPool.diffAtBuy[1] === 8800 && repPool.diffAtBuy[2] === 8800
+          && Math.abs(repPool.diffAtBuy[1] - repPool.diffAtBuy[0]) === 1200
+          && repPool.sellRow && repPool.sellRow.base === 10000 && repPool.sellRow.strat === 7600 && repPool.sellRow.diff === -2400,
+        JSON.stringify({ atSell: repPool.diffAtSell, atBuy: repPool.diffAtBuy, sellRow: repPool.sellRow }));
+      H.check('diff-band: Difference table renders inside the comparison panel, below the chart',
+        repPool.tableInComparePanel === true && repPool.chartBeforeTable === true,
+        JSON.stringify({ inPanel: repPool.tableInComparePanel, before: repPool.chartBeforeTable }));
       H.check('gic-caption-rate: pool report Difference chart caption names Value Δ only (no Balance Δ)',
         repPool.trajCap.includes('Value Δ') && !repPool.trajCap.includes('Balance Δ'),
         JSON.stringify({ trajCap: repPool.trajCap }));
@@ -6517,11 +6575,11 @@ export async function run(H, S) {
         penAfterNeg != null && Math.abs(num(penAfterNeg) - 5000) < 0.01, JSON.stringify({ penAfterNeg }));
       // Section order on the same (single-strategy) report.
       const order = await page.evaluate(() => [...document.querySelectorAll('#planReport h3')].map((h) => h.textContent.trim()));
-      H.check('engine: report sections in order headline → chart → table → strategy对比 → engine, engine last',
+      H.check('engine: report sections in order headline → chart → strategy comparison (Difference chart + table inside) → engine, engine last',
         order.indexOf('Headline') > 0 && order.indexOf('Headline') < order.indexOf('Mortgage balance')
-          && order.indexOf('Mortgage balance') < order.indexOf('Difference vs baseline')
-          && order.indexOf('Difference vs baseline') < order.indexOf('Strategy comparison')
-          && order.indexOf('Strategy comparison') < order.indexOf('Engine')
+          && order.indexOf('Mortgage balance') < order.indexOf('Strategy comparison')
+          && order.indexOf('Strategy comparison') < order.indexOf('Difference vs baseline')
+          && order.indexOf('Difference vs baseline') < order.indexOf('Engine')
           && order[order.length - 1] === 'Engine',
         JSON.stringify(order));
       const mergedGone = await page.evaluate(() => !document.querySelector('#planReportMergedTable table'));
@@ -8929,11 +8987,14 @@ export async function run(H, S) {
       const outEntries = async () => page.evaluate(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent));
       const entries = await outEntries();
       // Engine round: the outline lists every report section
-      // (Variables, Headline, chart blocks, table, Engine) with the
+      // (Variables, Headline, chart blocks, Engine) with the
       // comparison appended last by construction; the metric_cards
-      // block is the Headline now, never a separate entry.
+      // block is the Headline now, never a separate entry. The
+      // Difference table lives inside the comparison panel, so it
+      // has no outline entry of its own — 'Strategy comparison'
+      // reaches both the chart and the table.
       H.check('reportoutline: OPEN shows one entry per block + comparison',
-        JSON.stringify(entries) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entries) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Engine', 'Strategy comparison']),
         JSON.stringify(entries));
       await page.evaluate(() => { [...document.querySelectorAll('#planReportOutlineList a')].find((a) => a.textContent === 'Strategy comparison').click(); });
       await waitF(1500);
@@ -8960,22 +9021,22 @@ export async function run(H, S) {
       await waitF(1000);
       const entriesGen = await outEntries();
       H.check('reportoutline: tab switch refreshes entries to the new report',
-        JSON.stringify(entriesGen) === JSON.stringify(['Variables', 'Headline', 'Mortgage balance', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entriesGen) === JSON.stringify(['Variables', 'Headline', 'Mortgage balance', 'Engine', 'Strategy comparison']),
         JSON.stringify(entriesGen));
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab="${id}"]`).click(); }, stRepId);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky balance'), { timeout: 30000 });
       await waitF(1000);
       const entriesBack = await outEntries();
       H.check('reportoutline: switching back restores the first report entries',
-        JSON.stringify(entriesBack) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entriesBack) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Engine', 'Strategy comparison']),
         JSON.stringify(entriesBack));
       await page.evaluate(() => { document.querySelector('[data-plan-report-block-del="0"]').click(); });
       // Deleting chart block 0 ('Sticky balance') drops only that
-      // entry; Variables/Headline/table/Engine/comparison stay.
-      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Variables|Headline|Difference vs baseline|Engine|Strategy comparison', { timeout: 30000 });
+      // entry; Variables/Headline/Engine/comparison stay.
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Variables|Headline|Engine|Strategy comparison', { timeout: 30000 });
       const entriesDel = await outEntries();
       H.check('reportoutline: per-block Delete removes that block entry',
-        JSON.stringify(entriesDel) === JSON.stringify(['Variables', 'Headline', 'Difference vs baseline', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entriesDel) === JSON.stringify(['Variables', 'Headline', 'Engine', 'Strategy comparison']),
         JSON.stringify(entriesDel));
       await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
       await page.waitForFunction(() => !document.querySelector('[data-plan-report-tab]'), { timeout: 15000 });
@@ -9255,20 +9316,21 @@ export async function run(H, S) {
       await page.evaluate((s) => { document.querySelector(s).click(); }, '[data-plan-report-block-del="0"]');
       // Wait for the post-delete render (server already applied the
       // delete; a fixed sleep read the pre-delete DOM). The
-      // metric_cards block is the Headline section now, so the
-      // remaining blocks are Variables / Headline / table / Engine.
-      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 4 && !b.includes('Mortgage balance') && b.includes('Headline'); }, { timeout: 15000 });
+      // metric_cards block is the Headline section now, and the
+      // Difference table lives inside the comparison panel, so the
+      // remaining blocks are Variables / Headline / Engine.
+      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 3 && !b.includes('Mortgage balance') && b.includes('Headline'); }, { timeout: 15000 });
       const blocksAfter = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const genDef = ((r.data.reports || []).find((x) => x.id === genRep.id) || {}).definition || {};
       H.check('reporttab: block delete removes one block and persists',
-        blocksBefore.length === 5 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 4 && !blocksAfter.includes('Mortgage balance') && blocksAfter.includes('Headline') && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
+        blocksBefore.length === 4 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 3 && !blocksAfter.includes('Mortgage balance') && blocksAfter.includes('Headline') && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
       await page.waitForSelector(`[data-plan-report-tab-close="${genRep.id}"]`, { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${genRep.id}"]`);
       await waitF(1000);
       await openCard(genRep.id, 'Headline');
       const blocksReopen = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
-      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 4 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
+      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 3 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
       // Polish: quiet defs note + subtitle + metric cards + current tab wrap.
       // The metric_cards block is the Headline section now, so the
       // count is the headline's 9 cards (property project), not the
