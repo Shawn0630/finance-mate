@@ -23,6 +23,7 @@ import {
   validateScenarioFactors, droppedScenarioPrimeSteps, primeStepDroppedMessage,
   factorsToAssumptions, applyStoredCustomSinkRate,
   customBuyMaturity, latestMaturityMonth, maturityHorizonMonths,
+  activeTermEndMonth, windowedHeadlineFigures,
 } from '../src/planning.js';
 import { derivePayment, primeHistoryResolver } from '../src/engine.js';
 
@@ -770,6 +771,156 @@ test('reportMonthlySeries: pool balance series and investment-scope total (pool 
   const plain = reportMonthlySeries(perProperty, 'baseline', stock, 500000, null, null, { poolSeries: pool });
   assert.equal(plain[0].pool_balance, 1200);
   assert.equal(plain[0].total_value, 410000);
+});
+
+// ------------------------------------------- headline time window
+// (user 2026-11-06): the Headline cards recompute over a window
+// [current month, slider end] from the monthly trajectories.
+test('activeTermEndMonth: the term covering the current month governs, start + term months', () => {
+  assert.equal(activeTermEndMonth([{ start_date: '2024-12-17', term_months: 60 }], '2026-11'), '2029-12');
+  // Two terms: the latest covering one wins (the earlier one ended).
+  assert.equal(activeTermEndMonth([
+    { start_date: '2020-01-01', term_months: 60 },
+    { start_date: '2025-03-20', term_months: 60 },
+  ], '2026-11'), '2030-03');
+  // No covering term (all start after the current month) → null.
+  assert.equal(activeTermEndMonth([{ start_date: '2027-01-01', term_months: 60 }], '2026-11'), null);
+  // term_months missing → 60.
+  assert.equal(activeTermEndMonth([{ start_date: '2024-12-17' }], '2026-11'), '2029-12');
+  assert.equal(activeTermEndMonth([], '2026-11'), null);
+  assert.equal(activeTermEndMonth(null, '2026-11'), null);
+});
+
+// Literal monthly rows for the windowed-figures pins: 12 months,
+// baseline interest $1,000/mo vs strategy $800/mo, baseline stock
+// flat $10,000, strategy stock $10,000 → $10,600, $5,000 prepay
+// cash out in Dec 2026, balances paying off Jun 2027 (baseline)
+// and Mar 2027 (strategy).
+const winRows = () => {
+  const months = ['2026-11', '2026-12', '2027-01', '2027-02', '2027-03', '2027-04', '2027-05', '2027-06', '2027-07', '2027-08', '2027-09', '2027-10'];
+  const base = months.map((m, i) => ({
+    month: m, interest: 1000, stock_value: 10000, total_value: 500000 - i * 1000,
+    mortgage_balance: m <= '2027-05' ? 400000 - i * 50000 : 0, cash_out: 0,
+  }));
+  const strat = months.map((m, i) => ({
+    month: m, interest: 800, stock_value: 10000 + i * 60, total_value: 510000 - i * 1000,
+    mortgage_balance: m <= '2027-02' ? 400000 - i * 100000 : 0, cash_out: m === '2026-12' ? 5000 : 0,
+  }));
+  return { base, strat };
+};
+test('windowedHeadlineFigures: interest saved + stock gain + cost + value at horizon over the window', () => {
+  const { base, strat } = winRows();
+  // Full 12-month window: interest saved 12 × $200 = $2,400; stock
+  // gain = (10,660 − 10,000) − 0 = $660; cost = $5,000 prepay +
+  // $100 penalty; gain $3,060; net −$2,040.
+  const full = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2026-11', endMonth: '2027-10', penalty: 100 });
+  assert.equal(full.interestSaved, 2400);
+  assert.equal(full.stockGain, 660);
+  assert.equal(full.gain, 3060);
+  assert.equal(full.cost, 5100);
+  assert.equal(full.net, -2040);
+  assert.equal(full.valueAtHorizon, 510000 - 11 * 1000);
+  // 3-month window (Nov 2026–Jan 2027): interest saved 3 × $200 =
+  // $600; stock gain = (10,120 − 10,000) − 0 = $120; cost = $5,000
+  // (the Dec prepay is inside) + $100; value at horizon = the
+  // strategy total at Jan 2027.
+  const short = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2026-11', endMonth: '2027-01', penalty: 100 });
+  assert.equal(short.interestSaved, 600);
+  assert.equal(short.stockGain, 120);
+  assert.equal(short.cost, 5100);
+  assert.equal(short.valueAtHorizon, 510000 - 2 * 1000);
+  // 1-month window (Nov 2026 only): no prepay inside → cost is the
+  // penalty alone; stock gain 0 (no change within one month).
+  const one = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2026-11', endMonth: '2026-11', penalty: 100 });
+  assert.equal(one.interestSaved, 200);
+  assert.equal(one.stockGain, 0);
+  assert.equal(one.cost, 100);
+  assert.equal(one.valueAtHorizon, 510000);
+});
+test('windowedHeadlineFigures: a later start narrows the window (dual-thumb start handle)', () => {
+  const { base, strat } = winRows();
+  // Window Feb 2027–Oct 2027 (9 months): interest saved 9 × $200 =
+  // $1,800; stock gain = Δ(Oct) − Δ(Feb) = 660 − 180 = $480; the Dec
+  // 2026 prepay falls BEFORE the start, so cost is the $100 penalty
+  // alone; gain $2,280; net $2,180. The payoffs (Mar + Jun 2027)
+  // are inside the window, so the +3 shift shows.
+  const w = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2027-02', endMonth: '2027-10', penalty: 100 });
+  assert.equal(w.interestSaved, 1800);
+  assert.equal(w.stockGain, 480);
+  assert.equal(w.gain, 2280);
+  assert.equal(w.cost, 100);
+  assert.equal(w.net, 2180);
+  assert.equal(w.valueAtHorizon, 510000 - 11 * 1000);
+  assert.equal(w.payoffShiftMonths, 3);
+  assert.equal(w.payoffBeyondWindow, false);
+});
+test('windowedHeadlineFigures: payoff shift is — before both payoffs, the shift once the window reaches one', () => {
+  const { base, strat } = winRows();
+  // Payoffs: baseline Jun 2027, strategy Mar 2027 (shift +3). A
+  // window ending Feb 2027 ends before both → null + the note flag.
+  const early = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2026-11', endMonth: '2027-02' });
+  assert.equal(early.payoffShiftMonths, null);
+  assert.equal(early.payoffBeyondWindow, true);
+  // A window ending Mar 2027 reaches the strategy payoff → +3.
+  const reached = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2026-11', endMonth: '2027-03' });
+  assert.equal(reached.payoffShiftMonths, 3);
+  assert.equal(reached.payoffBeyondWindow, false);
+  // No mortgage at all (all balances 0) → no payoff, no note.
+  const noMort = windowedHeadlineFigures({
+    baseRows: [{ month: '2026-11', interest: 0, stock_value: 10000, total_value: 10000, mortgage_balance: 0, cash_out: 0 }],
+    stratRows: [{ month: '2026-11', interest: 0, stock_value: 10000, total_value: 10000, mortgage_balance: 0, cash_out: 0 }],
+    startMonth: '2026-11', endMonth: '2026-11',
+  });
+  assert.equal(noMort.payoffShiftMonths, null);
+  assert.equal(noMort.payoffBeyondWindow, false);
+});
+test('windowedHeadlineFigures: property rule keeps gain = interest saved only (stock gain still reported)', () => {
+  const { base, strat } = winRows();
+  const w = windowedHeadlineFigures({ baseRows: base, stratRows: strat, startMonth: '2026-11', endMonth: '2027-10', excludeStockGain: true });
+  assert.equal(w.stockGain, 660);
+  assert.equal(w.gain, 2400);
+  assert.equal(w.net, 2400 - 5000);
+});
+test('computeProjection: cashOutSeries carries fees + prepay cash + external buy cash, never swaps', () => {
+  // Prepay $100,000: one cash-out row, and Σ = cost − penaltyTotal.
+  const pre = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'prepay', params: { propertyId: 1, date: '2026-12-01', amount: 100000, openClosed: 'open' } }],
+  }));
+  assert.deepEqual(pre.cashOutSeries, [{ month: '2026-12', amount: 100000 }]);
+  assert.equal(pre.cashOutSeries.reduce((s, r) => s + r.amount, 0), pre.cost - pre.penaltyTotal);
+  // External-cash buy $600: the buy month carries the full amount.
+  const holding = {
+    id: 1, accountId: 1, symbol: 'XQQ.TO', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 50 }],
+    pricePoints: [{ date: '2026-10-31', price: 60 }],
+  };
+  const buy = computeProjection(ARGS({
+    mainline: MAINLINE({ holdings: [holding] }),
+    ops: [{ seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', date: '2026-12-01', units: 10, price: 60 } }],
+    legs: [{ op_seq: 1, source_ref: 'cash', amount: 'remainder' }],
+  }));
+  assert.deepEqual(buy.cashOutSeries, [{ month: '2026-12', amount: 600 }]);
+  assert.equal(buy.cashOutSeries.reduce((s, r) => s + r.amount, 0), buy.cost - buy.penaltyTotal);
+  // Pool-funded buy $500: a swap, no new cash out at all.
+  const pool = computeProjection(poolBuyArgs());
+  assert.deepEqual(pool.cashOutSeries, []);
+  assert.equal(pool.cashOutSeries.reduce((s, r) => s + r.amount, 0), pool.cost - pool.penaltyTotal);
+  // Refinance with $2,500 fees: the fee month carries the fees.
+  const refi = computeProjection(ARGS({
+    ops: [{ seq: 1, op_type: 'refinance', params: { propertyId: 1, date: '2026-12-01', termMonths: 60, amortizationYears: 25, rateType: 'fixed', annualRate: 4, fees: 2500 } }],
+  }));
+  assert.deepEqual(refi.cashOutSeries, [{ month: '2026-12', amount: 2500 }]);
+  assert.equal(refi.cashOutSeries.reduce((s, r) => s + r.amount, 0), refi.cost - refi.penaltyTotal);
+});
+test('reportMonthlySeries: cash_out rows ride the trajectory (0 on the baseline, the buy month on the strategy)', () => {
+  const perProperty = { 1: { baseline: { series: [{ month: '2026-11', balance: 100000, interest: 400 }, { month: '2026-12', balance: 99000, interest: 395 }] } } };
+  const stock = [{ month: '2026-11', value: 10000 }, { month: '2026-12', value: 11000 }];
+  const rows = reportMonthlySeries(perProperty, 'baseline', stock, 500000, null, '2026-11', { cashOutSeries: [{ month: '2026-12', amount: 5000 }] });
+  assert.equal(rows[0].cash_out, 0);
+  assert.equal(rows[1].cash_out, 5000);
+  const noSeries = reportMonthlySeries(perProperty, 'baseline', stock, 500000);
+  assert.equal(noSeries[0].cash_out, 0);
+  assert.equal(noSeries[1].cash_out, 0);
 });
 
 test('validateAiReportChartSeries: pool_balance allowed on trajectory templates only', () => {

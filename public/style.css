@@ -640,6 +640,24 @@ table.seg-table td:last-child { text-align: right; }
 .plan-flow-card.plan-flow-flat { border-style: dashed; }
 .plan-flow-select[aria-pressed="true"] { background: #1668c4; color: #fff; border-color: #1668c4; }
 .plan-report-tabs { gap: 6px; flex-wrap: wrap; border-bottom: 1px solid #dde4ec; }
+/* Headline time window (user 2026-11-06): label + range slider +
+   window label on one row, under the strategy chips. */
+.plan-headline-window { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; }
+.plan-headline-window label { white-space: nowrap; font-size: 12px; color: #5a6a7a; }
+.plan-headline-window span { white-space: nowrap; font-size: 12px; }
+/* Dual-thumb range (user 2026-11-06): two range inputs stacked over
+one track bar. The inputs themselves ignore pointer events — only
+their thumbs are draggable — so either handle can be grabbed where
+the thumbs overlap; the end handle sits on top. The track div paints
+the fill between the handles (set by planHeadlineWindowTrackFill). */
+.plan-range-dual { position: relative; flex: 1; min-width: 120px; height: 24px; }
+.plan-range-track { position: absolute; left: 0; right: 0; top: 10px; height: 4px; border-radius: 2px; background: #d7dee6; }
+.plan-range-dual input[type="range"] { position: absolute; left: 0; top: 0; width: 100%; margin: 0; padding: 0; pointer-events: none; -webkit-appearance: none; appearance: none; background: transparent; height: 24px; }
+.plan-range-dual input[type="range"]::-webkit-slider-runnable-track { background: transparent; height: 24px; }
+.plan-range-dual input[type="range"]::-webkit-slider-thumb { pointer-events: auto; -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #fff; border: 2px solid #2f7de1; margin-top: 4px; cursor: ew-resize; }
+.plan-range-dual input[type="range"]::-moz-range-track { background: transparent; height: 24px; }
+.plan-range-dual input[type="range"]::-moz-range-thumb { pointer-events: auto; width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid #2f7de1; cursor: ew-resize; }
+.plan-range-dual input[type="range"]:last-child { z-index: 1; }
 /* Browser-like tabs: the wrap is the tab (card border/radius on top,
    current tab white with a blue top accent, connected to the viewer
    below); the name/close buttons inside are borderless. */

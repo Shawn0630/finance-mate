@@ -5041,6 +5041,18 @@ export async function run(H, S) {
   H.check('propscope: rate_switch op on E created', r.status === 201, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/projects/${psProj}/comparison`);
   H.check('propscope: comparison loads', r.status === 200 && !!r.data.report, JSON.stringify({ status: r.status }));
+  // Headline time window (user 2026-11-06): the comparison carries
+  // the window anchors — the current month and the end of the entity
+  // property's active term (Term 1: 2026-01 + 60 → 2031-01).
+  const psCurYm = (r.data.report && r.data.report.currentMonth) || null;
+  H.check('headline-window: comparison carries currentMonth + termEndMonth (active term end)',
+    psCurYm && /^\d{4}-\d{2}$/.test(psCurYm) && r.data.report.termEndMonth === '2031-01',
+    JSON.stringify({ currentMonth: psCurYm, termEndMonth: r.data.report && r.data.report.termEndMonth }));
+  H.check('headline-window: trajectories carry cash_out (0 on the baseline before any op)',
+    Array.isArray((r.data.report.trajectories[0] || {}).monthly)
+      && r.data.report.trajectories[0].monthly.every((row) => typeof row.cash_out === 'number')
+      && r.data.report.trajectories[0].monthly.every((row) => row.cash_out === 0),
+    JSON.stringify({ months: (r.data.report.trajectories[0] || {}).monthly.length }));
   const psRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === psStrat);
   const psBase = r.data.baseline;
   const psEnt = r.data.entityProperty;
@@ -5263,6 +5275,249 @@ export async function run(H, S) {
           const pre = ops.find((o) => o.op_type === 'prepay' && Number(o.params && o.params.amount) === 5000);
           return !!pre && Number(pre.params.propertyId) === psE;
         })()), JSON.stringify({ formOpMsg }));
+      // Headline time window (user 2026-11-06): the slider sits in
+      // the Headline panel; default = the end of the current term
+      // (Jan 2031); the cards recompute over the window from the
+      // trajectories. Expected values come from the comparison API
+      // (ground truth), not from the DOM.
+      const winCmp = await H.req('GET', `/api/planning/projects/${psProj}/comparison`);
+      const winTrajs = (winCmp.data.report && winCmp.data.report.trajectories) || [];
+      const winMonths = ((winTrajs[0] || {}).monthly || []).map((x) => x.month);
+      const winStart = winCmp.data.report.currentMonth;
+      const winMinIdx = winMonths.indexOf(winStart);
+      const winTermIdx = winMonths.indexOf('2031-01');
+      const winMaxIdx = winMonths.length - 1;
+      const winByMonth = (traj) => new Map((traj.monthly || []).map((x) => [x.month, x]));
+      const winBase = winByMonth(winTrajs[0] || { monthly: [] });
+      const winPureTraj = winTrajs.find((t) => t.key === String(psPure)) || { monthly: [] };
+      const winPure = winByMonth(winPureTraj);
+      // Interest saved over [startIdx, endIdx] from the API trajectories
+      // (ground truth); the absolute interest sum for a trajectory is
+      // winSumAbs. Both take an explicit start — the start handle can
+      // move the window start later than the current month.
+      const winSumInt = (startIdx, endIdx) => {
+        let s = 0;
+        for (let i = startIdx; i <= endIdx; i++) {
+          const m = winMonths[i];
+          s += ((winBase.get(m) || {}).interest || 0) - ((winPure.get(m) || {}).interest || 0);
+        }
+        return Math.round(s * 100) / 100;
+      };
+      const winSumAbs = (byMonth, startIdx, endIdx) => {
+        let s = 0;
+        for (let i = startIdx; i <= endIdx; i++) {
+          const m = winMonths[i];
+          s += ((byMonth.get(m) || {}).interest || 0);
+        }
+        return Math.round(s * 100) / 100;
+      };
+      const winValAt = (idx) => (winPure.get(winMonths[idx]) || {}).total_value;
+      const winPureRow = (winCmp.data.strategies || []).find((x) => x.strategy && x.strategy.id === psPure);
+      const winFullInt = winPureRow && winPureRow.comparison ? winPureRow.comparison.interestSaved : null;
+      const winFullShift = winPureRow && winPureRow.comparison ? winPureRow.comparison.payoffShiftMonths : null;
+      // Dual-thumb slider (user 2026-11-06): the end handle sets the
+      // window end, the start handle the window start; each clamps to
+      // the other, so the handles never cross.
+      const winSetSlider = async (idx) => page.evaluate((i) => {
+        const s = document.querySelector('#planReportHeadlineWindowEnd');
+        s.value = String(i);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, idx);
+      const winSetStart = async (idx) => page.evaluate((i) => {
+        const s = document.querySelector('#planReportHeadlineWindowStart');
+        s.value = String(i);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, idx);
+      const winCard = async (label) => page.evaluate((lab) => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === lab);
+        return card ? (card.querySelector('.v')?.textContent || '').trim() : null;
+      }, label);
+      const winParse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+      // (a) Fix E report (psRep): the $5,000 prepay (Dec 2026) is the
+      // cost pin — $0 inside a Nov-2026-only window, $5,000 inside
+      // the default term window. The op save above re-renders the
+      // strategy page, so wait for the report card before clicking
+      // it (the card is momentarily absent during the re-render).
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
+      await page.waitForFunction(() => !!document.querySelector('#planReportHeadlineWindowEnd'), { timeout: 15000 });
+      H.check('headline-window: Fix E report defaults to the term window with Total cost $5,000 (the Dec prepay)',
+        winParse(await winCard('Total cost')) === 5000, JSON.stringify({ cost: await winCard('Total cost') }));
+      await winSetSlider(winMinIdx);
+      await page.waitForFunction(() => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Total cost');
+        return card && (card.querySelector('.v')?.textContent || '').includes('$0.00');
+      }, { timeout: 15000 });
+      H.check('headline-window: Nov-2026-only window drops Total cost to $0 (prepay outside the window)',
+        winParse(await winCard('Total cost')) === 0, JSON.stringify({ cost: await winCard('Total cost') }));
+      await winSetSlider(winTermIdx);
+      await page.waitForFunction(() => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Total cost');
+        return card && (card.querySelector('.v')?.textContent || '').includes('5,000.00');
+      }, { timeout: 15000 });
+      H.check('headline-window: back at the term window, Total cost is $5,000 again',
+        winParse(await winCard('Total cost')) === 5000, JSON.stringify({ cost: await winCard('Total cost') }));
+      // Start handle: moving the window start past the Dec 2026
+      // prepay drops it from the cost (the prepay is before the
+      // window), and moving it back restores the cost.
+      await winSetStart(winMinIdx + 2);
+      await page.waitForFunction(() => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Total cost');
+        return card && (card.querySelector('.v')?.textContent || '').includes('$0.00');
+      }, { timeout: 15000 });
+      H.check('headline-window: moving the start handle past the prepay drops Total cost to $0 (prepay before the window)',
+        winParse(await winCard('Total cost')) === 0, JSON.stringify({ cost: await winCard('Total cost') }));
+      await winSetStart(winMinIdx);
+      await page.waitForFunction(() => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Total cost');
+        return card && (card.querySelector('.v')?.textContent || '').includes('5,000.00');
+      }, { timeout: 15000 });
+      H.check('headline-window: start handle back at the current month restores Total cost $5,000',
+        winParse(await winCard('Total cost')) === 5000, JSON.stringify({ cost: await winCard('Total cost') }));
+      // Close the Fix E tab, then open the pure switch report from
+      // the project page (it lists all reports).
+      await page.evaluate(() => { document.querySelector('.plan-report-tab-close')?.click(); });
+      await page.goto(`http://ff.local/#planning/project/${psProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRepPure);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRepPure);
+      await page.waitForFunction(() => !!document.querySelector('#planReportHeadlineWindowEnd'), { timeout: 15000 });
+      const winSlider = await page.evaluate(() => {
+        const s = document.querySelector('#planReportHeadlineWindowStart');
+        const e = document.querySelector('#planReportHeadlineWindowEnd');
+        return s && e ? { sMin: Number(s.min), sMax: Number(s.max), sVal: Number(s.value), eMin: Number(e.min), eMax: Number(e.max), eVal: Number(e.value), label: document.querySelector('#planReportHeadlineWindowLabel')?.textContent || '' } : null;
+      });
+      H.check('headline-window: dual slider present, default start = current month, end = term end Jan 2031 (51 months inclusive)',
+        winSlider && winSlider.sMin === 0 && winSlider.sMax === winMaxIdx && winSlider.sVal === winMinIdx
+          && winSlider.eMin === 0 && winSlider.eMax === winMaxIdx && winSlider.eVal === winTermIdx
+          && winSlider.label.includes('Nov 2026') && winSlider.label.includes('Jan 2031') && winSlider.label.includes('Term end') && winSlider.label.includes('51 months'),
+        JSON.stringify({ slider: winSlider, minIdx: winMinIdx, termIdx: winTermIdx, maxIdx: winMaxIdx }));
+      const winIntDefault = winSumInt(winMinIdx, winTermIdx);
+      const winValDefault = winValAt(winTermIdx);
+      H.check('headline-window: default window Interest saved + Value at horizon match the trajectory sums',
+        Math.abs((winParse(await winCard('Interest saved')) || 0) - winIntDefault) < 0.05
+          && Math.abs((winParse(await winCard('Value at horizon')) || 0) - (winValDefault || 0)) < 0.05,
+        JSON.stringify({ intCard: await winCard('Interest saved'), intExpected: winIntDefault, valCard: await winCard('Value at horizon'), valExpected: winValDefault }));
+      // Start handle on the pure switch: moving the start 12 months
+      // later narrows the interest sum to the windowed sum from the
+      // API trajectories (ground truth), with Value at horizon
+      // unchanged (same end month).
+      const winIntBeforeNarrow = await winCard('Interest saved');
+      const winIntNarrow = winSumInt(winMinIdx + 12, winTermIdx);
+      await winSetStart(winMinIdx + 12);
+      await page.waitForFunction((old) => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Interest saved');
+        return card && (card.querySelector('.v')?.textContent || '').trim() !== old;
+      }, { timeout: 15000 }, winIntBeforeNarrow);
+      H.check('headline-window: start handle 12 months later narrows Interest saved to the windowed sum (Value at horizon unchanged)',
+        Math.abs((winParse(await winCard('Interest saved')) || 0) - winIntNarrow) < 0.05
+          && Math.abs((winParse(await winCard('Value at horizon')) || 0) - (winValDefault || 0)) < 0.05,
+        JSON.stringify({ intCard: await winCard('Interest saved'), intExpected: winIntNarrow, valCard: await winCard('Value at horizon'), valExpected: winValDefault }));
+      await winSetStart(winMinIdx);
+      H.check('headline-window: Payoff shift is — at the term window (payoffs are beyond it)',
+        (await winCard('Payoff shift')) === '—', JSON.stringify({ shift: await winCard('Payoff shift') }));
+      const winPayDeltaDefault = await winCard('Monthly payment Δ');
+      // Full horizon: interest saved is the full figure, the payoff
+      // shift appears, payment Δ is unchanged.
+      const winIntAtDefault = await winCard('Interest saved');
+      await winSetSlider(winMaxIdx);
+      await page.waitForFunction((old) => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Interest saved');
+        return card && (card.querySelector('.v')?.textContent || '').trim() !== old;
+      }, { timeout: 15000 }, winIntAtDefault);
+      H.check('headline-window: full horizon shows the full Interest saved figure',
+        Math.abs((winParse(await winCard('Interest saved')) || 0) - (winFullInt || 0)) < 0.05,
+        JSON.stringify({ intCard: await winCard('Interest saved'), intExpected: winFullInt }));
+      const winShiftFull = await winCard('Payoff shift');
+      H.check('headline-window: full horizon shows the payoff shift (not —)',
+        winShiftFull !== '—' && Number(String(winShiftFull).replace(' months', '')) === winFullShift,
+        JSON.stringify({ shift: winShiftFull, expected: winFullShift }));
+      H.check('headline-window: Monthly payment Δ is unchanged when the slider moves',
+        (await winCard('Monthly payment Δ')) === winPayDeltaDefault,
+        JSON.stringify({ before: winPayDeltaDefault, after: await winCard('Monthly payment Δ') }));
+      // Strategy comparison follows the same window (user 2026-11-06):
+      // the two-switch report (psRep2) carries the merged table, so
+      // its Total interest / Value at horizon rows recompute over the
+      // window, the Payoff row reads '—' while the payoffs are beyond
+      // it, and the payment breakdown chart slices to the window.
+      // The Difference chart keeps its own range picker (untouched).
+      await page.evaluate(() => { document.querySelector('.plan-report-tab-close')?.click(); });
+      await page.goto(`http://ff.local/#planning/project/${psProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep2);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep2);
+      await page.waitForFunction(() => !!document.querySelector('#planReportMergedTable table'), { timeout: 15000 });
+      const winLateTraj = winTrajs.find((t) => t.key === String(psLate)) || { monthly: [] };
+      const winLate = winByMonth(winLateTraj);
+      const winValAtTraj = (byMonth, idx) => (byMonth.get(winMonths[idx]) || {}).total_value;
+      const mergedRow = async (label) => page.evaluate((lab) => {
+        const tr = [...document.querySelectorAll('#planReportMergedTable tbody tr')].find((r) => (r.querySelector('td')?.textContent || '').trim().startsWith(lab));
+        if (!tr) return null;
+        return [...tr.querySelectorAll('td')].slice(1).map((td) => {
+          const divs = [...td.querySelectorAll('div')].map((d) => d.textContent.trim());
+          return divs.length ? { abs: divs[0], delta: divs[1] || null } : { abs: td.textContent.trim(), delta: null };
+        });
+      }, label);
+      const breakdownLen = async () => page.evaluate(() => {
+        const cv = document.getElementById('planReportTrajectoryBreakdownChart');
+        try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; }
+      });
+      // Default term window: Total interest = absolute windowed sums
+      // (baseline + both strategies), deltas = −interest saved.
+      const mInt = await mergedRow('Total interest');
+      H.check('headline-window: merged table Total interest recomputes over the default term window (absolute sums + saved deltas)',
+        mInt && Math.abs((winParse(mInt[0].abs) || 0) - winSumAbs(winBase, winMinIdx, winTermIdx)) < 0.05
+          && Math.abs((winParse(mInt[1].abs) || 0) - winSumAbs(winPure, winMinIdx, winTermIdx)) < 0.05
+          && Math.abs((winParse(mInt[1].delta) || 0) + winSumInt(winMinIdx, winTermIdx)) < 0.05
+          && Math.abs((winParse(mInt[2].abs) || 0) - winSumAbs(winLate, winMinIdx, winTermIdx)) < 0.05,
+        JSON.stringify({ row: mInt, base: winSumAbs(winBase, winMinIdx, winTermIdx), pure: winSumAbs(winPure, winMinIdx, winTermIdx), late: winSumAbs(winLate, winMinIdx, winTermIdx) }));
+      // Payoff row: every payoff is beyond the term window → '—'
+      // cells + the note under the table.
+      const mPay = await mergedRow('Payoff');
+      const mPayNote = await page.evaluate(() => document.querySelector('#planReportMergedTable')?.textContent || '');
+      H.check('headline-window: merged table Payoff row is — at the term window (payoffs beyond it) with the note',
+        mPay && mPay.every((c) => c.abs === '—') && mPayNote.includes('Payoff is beyond this window.'),
+        JSON.stringify({ row: mPay, note: mPayNote.slice(-120) }));
+      // Value at horizon row at the default window = total value at
+      // the term-end month, baseline + both strategies.
+      const mVal = await mergedRow('Value at horizon');
+      H.check('headline-window: merged table Value at horizon matches the trajectory totals at the term-end month',
+        mVal && Math.abs((winParse(mVal[0].abs) || 0) - (winValAtTraj(winBase, winTermIdx) || 0)) < 0.05
+          && Math.abs((winParse(mVal[1].abs) || 0) - (winValAtTraj(winPure, winTermIdx) || 0)) < 0.05
+          && Math.abs((winParse(mVal[2].abs) || 0) - (winValAtTraj(winLate, winTermIdx) || 0)) < 0.05,
+        JSON.stringify({ row: mVal }));
+      // Breakdown chart slices to the window: 51 labels at default.
+      H.check('headline-window: payment breakdown chart draws the window (51 labels at the default term window)',
+        (await breakdownLen()) === 51, JSON.stringify({ labels: await breakdownLen() }));
+      // Narrow to the Nov-2026-only window: one month of interest,
+      // value at the current month, breakdown down to 1 label, and
+      // the Monthly payment row does not move.
+      const mPayRowBefore = await mergedRow('Monthly payment');
+      const mIntBefore = await mergedRow('Total interest');
+      await winSetSlider(winMinIdx);
+      await page.waitForFunction((old) => {
+        const tr = [...document.querySelectorAll('#planReportMergedTable tbody tr')].find((r) => (r.querySelector('td')?.textContent || '').trim().startsWith('Total interest'));
+        const cell = tr ? tr.querySelectorAll('td')[1] : null;
+        return cell && (cell.textContent || '').trim() !== old;
+      }, { timeout: 15000 }, mIntBefore ? mIntBefore[0].abs : '');
+      const mInt1 = await mergedRow('Total interest');
+      H.check('headline-window: merged table Total interest narrows to one month at the Nov-2026-only window',
+        mInt1 && Math.abs((winParse(mInt1[0].abs) || 0) - winSumAbs(winBase, winMinIdx, winMinIdx)) < 0.05
+          && Math.abs((winParse(mInt1[1].abs) || 0) - winSumAbs(winPure, winMinIdx, winMinIdx)) < 0.05,
+        JSON.stringify({ row: mInt1 }));
+      const mVal1 = await mergedRow('Value at horizon');
+      H.check('headline-window: merged table Value at horizon narrows to the current-month total at the Nov-2026-only window',
+        mVal1 && Math.abs((winParse(mVal1[0].abs) || 0) - (winValAtTraj(winBase, winMinIdx) || 0)) < 0.05
+          && Math.abs((winParse(mVal1[1].abs) || 0) - (winValAtTraj(winPure, winMinIdx) || 0)) < 0.05,
+        JSON.stringify({ row: mVal1 }));
+      H.check('headline-window: payment breakdown chart narrows to 1 label at the Nov-2026-only window',
+        (await breakdownLen()) === 1, JSON.stringify({ labels: await breakdownLen() }));
+      H.check('headline-window: merged table Monthly payment row is unchanged when the window moves',
+        JSON.stringify(await mergedRow('Monthly payment')) === JSON.stringify(mPayRowBefore),
+        JSON.stringify({ before: mPayRowBefore, after: await mergedRow('Monthly payment') }));
+      // Restore the term window (leave the tab as the flow found it).
+      await winSetSlider(winTermIdx);
+      await waitP(400);
     } finally { await browserP.close(); }
   }
   // Prime-step caption: the stale baseline-only wording survives
@@ -5635,6 +5890,13 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${icProj}/reports`, { name: 'InvComp report', definition: { strategies: [icStrat], charts: [{ template: 'time_line', title: 'Pool trajectory', series: ['pool_balance', 'stock_value', 'total_value'] }] }, strategy_ids: [icStrat], scenario_ids: [] });
   H.check('invcomp: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const icRep = r.data.report.id;
+  // Headline time window (user 2026-11-06): a pool report has no
+  // mortgage term, so termEndMonth is null and the slider defaults
+  // to the full horizon.
+  r = await H.req('GET', `/api/planning/projects/${icProj}/comparison`);
+  H.check('headline-window: pool comparison carries currentMonth but no termEndMonth (full-horizon default)',
+    r.status === 200 && /^\d{4}-\d{2}$/.test(r.data.report.currentMonth || '') && r.data.report.termEndMonth == null,
+    JSON.stringify({ currentMonth: r.data.report && r.data.report.currentMonth, termEndMonth: r.data.report && r.data.report.termEndMonth }));
   // Item 6 fixtures: a MIXED strategy (mortgage + stock ops) in the
   // investment project — prepay on the propscope property executes
   // under the op-touched rule for non-property projects — and a
@@ -5898,6 +6160,63 @@ export async function run(H, S) {
       H.check('reportaudit: pool report carries no Penalty / interest-saved copy anywhere',
         !repAudit.wholeText.includes('Penalty') && !repAudit.wholeText.includes('interest saved'),
         JSON.stringify({ wholeText: repAudit.wholeText.slice(0, 800) }));
+      // Headline time window (user 2026-11-06): the pool report's
+      // slider defaults to the full horizon (no term); dragging it
+      // to the sell month recomputes the headline over that window.
+      // The icRep tab is still open from the reportaudit pins above.
+      const poolSlider = await page.evaluate(() => {
+        const s = document.querySelector('#planReportHeadlineWindowStart');
+        const e = document.querySelector('#planReportHeadlineWindowEnd');
+        return s && e ? { sVal: Number(s.value), eMin: Number(e.min), eMax: Number(e.max), eVal: Number(e.value), label: document.querySelector('#planReportHeadlineWindowLabel')?.textContent || '' } : null;
+      });
+      H.check('headline-window: pool slider defaults to the full horizon',
+        poolSlider && poolSlider.sVal === 0 && poolSlider.eVal === poolSlider.eMax && poolSlider.label.includes('Full horizon'),
+        JSON.stringify({ slider: poolSlider }));
+      const poolCard = async (label) => page.evaluate((lab) => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === lab);
+        return card ? (card.querySelector('.v')?.textContent || '').trim() : null;
+      }, label);
+      const poolParse = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+      // Full horizon (the settled figures): stock gain −$1,200 — the
+      // strategy ends holding $8,800 of stock vs the $10,000 baseline
+      // (sold 24 units, bought 12 of G, both flat). The buy was
+      // pool-funded, so the loss is the swap itself, not new cash.
+      H.check('headline-window: pool report at the full horizon shows the settled Stock gain −$1,200',
+        poolParse(await poolCard('Stock gain')) === -1200, JSON.stringify({ gain: await poolCard('Stock gain') }));
+      // Sell month = the month after the current month (psOpDate):
+      // end handle to start + 1. Stock gain over the sell-month window
+      // is the Value Δ change: (7,600 − 10,000) − 0 = −$2,400.
+      // Value at horizon stays $10,000 (pool 2,400 + stock 7,600).
+      const poolGainAtDefault = await poolCard('Stock gain');
+      await page.evaluate(() => {
+        const s = document.querySelector('#planReportHeadlineWindowStart');
+        const e = document.querySelector('#planReportHeadlineWindowEnd');
+        e.value = String(Number(s.value) + 1);
+        e.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.waitForFunction((old) => {
+        const card = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Stock gain');
+        return card && (card.querySelector('.v')?.textContent || '').trim() !== old;
+      }, { timeout: 15000 }, poolGainAtDefault);
+      const poolSellLabel = await page.evaluate(() => document.querySelector('#planReportHeadlineWindowLabel')?.textContent || '');
+      H.check('headline-window: pool slider at the sell month recomputes Stock gain to −$2,400 (Value at horizon stays $10,000)',
+        poolSellLabel.includes(icSellLabel) && poolSellLabel.includes('2 months')
+          && poolParse(await poolCard('Stock gain')) === -2400
+          && poolParse(await poolCard('Value at horizon')) === 10000,
+        JSON.stringify({ label: poolSellLabel, gain: await poolCard('Stock gain'), value: await poolCard('Value at horizon') }));
+      H.check('headline-window: the engine note names the window while it is shorter than the full horizon',
+        (await page.evaluate(() => document.querySelector('#planReportEngineBody')?.textContent || '')).includes('Headline window:'),
+        JSON.stringify({ engine: (await page.evaluate(() => document.querySelector('#planReportEngineBody')?.textContent || '')).slice(0, 300) }));
+      // Back to the full horizon (both handles to their defaults —
+      // leave the tab as the flow found it).
+      await page.evaluate(() => {
+        const s = document.querySelector('#planReportHeadlineWindowStart');
+        const e = document.querySelector('#planReportHeadlineWindowEnd');
+        s.value = String(s.min);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        e.value = String(e.max);
+        e.dispatchEvent(new Event('input', { bubbles: true }));
+      });
       H.check('invcomp: report table has Value Δ only, no mortgage columns',
         repPool.tableHead.includes('Value Δ') && !repPool.tableHead.includes('Balance Δ') && !repPool.tableHead.includes('Baseline balance')
           && repPool.tableCap.includes('Value Δ') && !repPool.tableCap.includes('Balance Δ'),
@@ -6756,6 +7075,52 @@ export async function run(H, S) {
       });
       H.check('engine: AI engine series execute in the report table (strategy stock ×1.1 → $11,000, Value Δ $1,000)',
         engTable.firstStratVal === 11000 && engTable.firstValDiff === 1000, JSON.stringify(engTable));
+      // Headline window on an AI report (user 2026-11-06): the AI
+      // time-series chart slices to the window, and the headline
+      // switches from the AI scalar override (full horizon) to the
+      // windowed trajectory figures. The override cannot be
+      // re-derived over a sliced series — the engine has no
+      // series-reduction functions (no sum/last/first, only
+      // element-wise min/max) and evaluates server-side at Generate
+      // time — so AI scalars stay full-horizon by design; the
+      // windowed figures come from the AI-overridden trajectories.
+      const engCmp = await H.req('GET', `/api/planning/projects/${dtProj}/comparison`);
+      const engMonths = (((engCmp.data.report || {}).trajectories || [])[0] || { monthly: [] }).monthly.map((x) => x.month);
+      const engStartIdx = engMonths.indexOf(engCmp.data.report.currentMonth);
+      const engChartLen = async () => page.evaluate(() => {
+        const cv = document.getElementById('planReportChart0');
+        try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; }
+      });
+      H.check('headline-window: AI report chart draws the full horizon by default',
+        (await engChartLen()) === engMonths.length, JSON.stringify({ labels: await engChartLen(), months: engMonths.length }));
+      await page.evaluate((i) => {
+        const e = document.querySelector('#planReportHeadlineWindowEnd');
+        e.value = String(i);
+        e.dispatchEvent(new Event('input', { bubbles: true }));
+      }, engStartIdx + 11);
+      await page.waitForFunction(() => {
+        const cv = document.getElementById('planReportChart0');
+        try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === 12; } catch { return false; }
+      }, { timeout: 15000 });
+      const engHeadWin = await headVals();
+      H.check('headline-window: AI chart slices to the 12-month window and the headline drops the AI scalar override (cost $0, net $0 from the trajectories)',
+        (await engChartLen()) === 12 && Math.abs(num(engHeadWin.cost) - 0) < 0.01 && Math.abs(num(engHeadWin.net) - 0) < 0.01,
+        JSON.stringify({ labels: await engChartLen(), head: engHeadWin }));
+      // Restore the full horizon: the AI scalar override applies
+      // again (cost $100, net −$100).
+      await page.evaluate(() => {
+        const e = document.querySelector('#planReportHeadlineWindowEnd');
+        e.value = String(e.max);
+        e.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await page.waitForFunction(() => {
+        const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
+        const c = cards.find((x) => x.querySelector('.k')?.textContent === 'Total cost');
+        return c && c.querySelector('.v')?.textContent === '$100.00';
+      }, { timeout: 15000 });
+      const engHeadBack = await headVals();
+      H.check('headline-window: back at the full horizon the AI scalar override applies again (cost $100, net −$100)',
+        Math.abs(num(engHeadBack.cost) - 100) < 0.01 && Math.abs(num(engHeadBack.net) + 100) < 0.01, JSON.stringify(engHeadBack));
       // AI refine flow (item 3, AI path): an AI report (definition
       // carries an engine object) shows the Refine with AI block;
       // Send → ai-refine (stubbed) → old→new diff preview → Apply
@@ -8568,8 +8933,12 @@ export async function run(H, S) {
         const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
         return { labels: chartOf('planReportTrajectoryChart'), labelsBreak: chartOf('planReportTrajectoryBreakdownChart'), active: !!document.querySelector('#planReportComparePanel [data-plan-traj-preset="1y"].active') };
       });
-      H.check('detail-clarity: report difference 1y preset narrows both the difference chart and the breakdown bars',
-        repNarrowed.labels === 12 && repNarrowed.labelsBreak === 12 && repNarrowed.active, JSON.stringify(repNarrowed));
+      // The 1y preset narrows the Difference chart only. The payment
+      // breakdown chart follows the headline window (user 2026-11-06
+      // refinement — the window sits at its default full horizon
+      // here, so the breakdown stays at 361), not the Δ picker.
+      H.check('detail-clarity: report difference 1y preset narrows the difference chart; the breakdown bars follow the headline window (unchanged at 361)',
+        repNarrowed.labels === 12 && repNarrowed.labelsBreak === 361 && repNarrowed.active, JSON.stringify(repNarrowed));
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcAiRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       try { await page.waitForFunction(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'DC AI balance path'), { timeout: 15000 }); } catch { /* fall through: the check below FAILs with the diagnostic */ }
       await waitD(300);

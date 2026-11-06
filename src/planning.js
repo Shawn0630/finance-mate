@@ -386,6 +386,11 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
 
   const penalties = [];
   let fees = 0;
+  // New cash out per month (refinance fees + prepay cash + external
+  // buy cash — never sell-funded or pool-funded takes, which are
+  // swaps). The headline time window sums these over the window, so
+  // the windowed cost never needs a refetch or an engine rerun.
+  const cashOutEvents = []; // {month, amount}
   const implicitLumpSums = []; // {propertyId, date, amount} from sell repay legs (applied below)
   const sortedOps = [...ops].sort((a, b) => (a.seq - b.seq) || (a.id - b.id));
 
@@ -447,6 +452,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       for (let y = 0; y < years; y++) {
         const d = addYearsDate(p.date, y);
         plan.lumpSums.push({ property_id: plan.property.id, date: d, amount: num(p.amount) });
+        if (num(p.amount) > 0) cashOutEvents.push({ month: d.slice(0, 7), amount: num(p.amount) });
       }
       // Penalty on the portion above the annual privilege (fixed/variable
       // closed only; open plans and post-term prepays pay none).
@@ -497,6 +503,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       const pen = breakPenalty(plan, p.date, bal ?? 0, { openClosed: p.openClosed || 'closed' });
       if (pen && pen.penalty > 0) penalties.push({ ...pen, opSeq: op.seq, reason: 'refinance break' });
       fees += num(p.fees) || 0;
+      if (num(p.fees) > 0) cashOutEvents.push({ month: String(p.date || '').slice(0, 7), amount: num(p.fees) });
       plan.terms.push({
         property_id: plan.property.id, start_date: p.date,
         term_months: Number(p.termMonths), amortization_years: Number(p.amortizationYears),
@@ -745,6 +752,10 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       // count as cash out nor as opportunity-costed principal. A
       // pool-funded take is the same kind of swap.
       buyCashFromSells += toCad(holding, resolved.fromSellsNative || 0) + toCad(holding, poolTakeNative);
+      // New cash this buy actually spent (amount minus sell-funded
+      // and pool-funded takes) — the windowed cost's per-month leg.
+      const buyNewCash = round2(toCad(holding, amount) - toCad(holding, resolved.fromSellsNative || 0) - toCad(holding, poolTakeNative));
+      if (buyNewCash > 0) cashOutEvents.push({ month: monthKey, amount: buyNewCash });
       pushUnitsDelta(holding.id, monthKey, units);
       opOutput.set(op.seq, { amountCad: toCad(holding, amount), note: 'buy' });
       // A bought holding's price path starts at its buy price, then
@@ -964,6 +975,13 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   }
   const flatValueAtHorizon = round2(equityAtHorizon + flatStockAtHorizon + pot);
 
+  // Per-month new cash out, merged (one row per month, sorted) — the
+  // headline window sums these over the window. Identity (pinned):
+  // Σ cashOutSeries = fees + mortgagePrepayCash + buyCash −
+  // buyCashFromSells = cost − penaltyTotal.
+  const cashOutSeries = [...cashOutEvents.reduce((m, e) => m.set(e.month, round2((m.get(e.month) || 0) + e.amount)), new Map()).entries()]
+    .map(([month, amount]) => ({ month, amount })).sort((a, b) => (a.month < b.month ? -1 : 1));
+
   return {
     mortgage: { perProperty: mortgagePerProperty, baselineInterest: round2(baselineInterest), strategyInterest: round2(strategyInterest), interestSaved },
     stocks: { series: stockSeries, potSeries, startingValue: round2(startingValue), valueAtHorizon, flatValueAtHorizon: round2(flatStockAtHorizon + pot), buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
@@ -971,7 +989,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     cost, valueAtHorizon: projectedTotalAtHorizon, flatValueAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
     paymentDelta: paymentDeltaOf(mortgagePerProperty),
-    maturities, stockFan,
+    maturities, stockFan, cashOutSeries,
     errors, warnings,
   };
 }
@@ -1658,6 +1676,12 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
   for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
   const poolByMonth = new Map(((opts.poolSeries) || []).map((r) => [r.month, r.value || 0]));
   if (opts.investmentScope) for (const m of poolByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
+  // New cash out by month (fees + prepay cash + external buy cash —
+  // the headline window sums this over the window). A cash-out month
+  // with no other series still seeds a row (from the current month
+  // on; earlier months are outside every window anyway).
+  const cashOutByMonth = new Map(((opts.cashOutSeries) || []).map((r) => [r.month, r.amount || 0]));
+  if (currentMonth) for (const m of cashOutByMonth.keys()) if (m >= currentMonth && !byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
   const g = num(growthPct);
   return [...byMonth.keys()].sort().map((m) => {
     const b = byMonth.get(m);
@@ -1678,12 +1702,85 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
       // not swamp it. Every other scope keeps the old definition.
       total_value: opts.investmentScope ? round2(pool + sv) : round2(assessedAt - b.balance + sv),
       interest: round2(b.interest),
+      // New cash out in this month (fees + prepay cash + external
+      // buy cash) — the headline window's cost leg. Baseline rows
+      // carry 0; sell-funded and pool-funded takes are swaps and
+      // never appear here.
+      cash_out: round2(cashOutByMonth.get(m) || 0),
       // Scheduled principal (the payment split) — lump sums deduct
       // balance directly and never flow into this field, so the
       // breakdown caption says "scheduled".
       principal: round2(b.principal),
     };
   });
+}
+
+// Active mortgage term end (user 2026-11-06): the headline's default
+// window ends at the end of the CURRENT mortgage term (term start +
+// term months, default 60), not at the 30-year horizon. The term
+// covering the current month governs; a term that already ended (or
+// no terms at all) yields null and the caller falls back to the full
+// horizon.
+export function activeTermEndMonth(terms, currentMonth) {
+  if (!terms || !terms.length || !currentMonth) return null;
+  const cur = monthIdxOf(currentMonth);
+  let t = null;
+  for (const term of terms) {
+    const start = monthIdxOf(String(term.start_date || '').slice(0, 7));
+    if (start <= cur) t = term;
+  }
+  if (!t) return null;
+  return ymOfIdx(monthIdxOf(String(t.start_date).slice(0, 7)) + (Number(t.term_months) || 60));
+}
+
+// Windowed headline figures (user 2026-11-06): the Headline cards
+// recomputed over [startMonth, endMonth] from the already-fetched
+// monthly trajectories — no refetch, no engine rerun. Windowed
+// definitions (pinned): INTEREST SAVED = Σ(baseline interest −
+// strategy interest) over the window; STOCK GAIN = stock Value Δ at
+// the window end − stock Value Δ at the window start; TOTAL GAIN =
+// interest saved + stock gain (or interest saved only when
+// excludeStockGain — the property rule); TOTAL COST = new cash out
+// (cash_out rows) over the window + the penalty variable; NET =
+// gain − cost; VALUE AT HORIZON = strategy total value at the window
+// end; PAYOFF SHIFT = the payoff-month shift when the window reaches
+// at least one payoff, else null (payoffBeyondWindow flags the
+// "payoff is beyond this window" case).
+export function windowedHeadlineFigures({ baseRows = [], stratRows = [], startMonth, endMonth, penalty = 0, excludeStockGain = false }) {
+  const base = new Map((baseRows || []).map((r) => [r.month, r]));
+  const strat = new Map((stratRows || []).map((r) => [r.month, r]));
+  const months = [...new Set([...base.keys(), ...strat.keys()])]
+    .filter((m) => m >= startMonth && m <= endMonth).sort();
+  let interestSaved = 0;
+  let cost = num(penalty) || 0;
+  for (const m of months) {
+    const b = base.get(m) || {};
+    const s = strat.get(m) || {};
+    interestSaved += (b.interest || 0) - (s.interest || 0);
+    cost += s.cash_out || 0;
+  }
+  const valDiffAt = (m) => round2(((strat.get(m) || {}).stock_value || 0) - ((base.get(m) || {}).stock_value || 0));
+  const stockGain = months.length ? round2(valDiffAt(months[months.length - 1]) - valDiffAt(months[0])) : 0;
+  const lastStrat = months.length ? (strat.get(months[months.length - 1]) || {}) : {};
+  const valueAtHorizon = months.length && lastStrat.total_value != null ? round2(lastStrat.total_value) : null;
+  const payoffOf = (rows) => {
+    const sorted = [...(rows || [])].sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : 0));
+    if (!sorted.some((r) => (r.mortgage_balance || 0) > 0)) return null;
+    const zero = sorted.find((r) => (r.mortgage_balance || 0) === 0);
+    return zero ? zero.month : null;
+  };
+  const basePayoff = payoffOf(baseRows);
+  const stratPayoff = payoffOf(stratRows);
+  const payoffShiftMonths = (basePayoff && stratPayoff && monthIdxOf(endMonth) >= Math.min(monthIdxOf(basePayoff), monthIdxOf(stratPayoff)))
+    ? monthIdxOf(basePayoff) - monthIdxOf(stratPayoff)
+    : null;
+  const payoffBeyondWindow = !!(basePayoff && stratPayoff && monthIdxOf(endMonth) < Math.min(monthIdxOf(basePayoff), monthIdxOf(stratPayoff)));
+  const gain = excludeStockGain ? round2(interestSaved) : round2(interestSaved + stockGain);
+  return {
+    interestSaved: round2(interestSaved), stockGain, gain,
+    cost: round2(cost), net: round2(gain - round2(cost)),
+    valueAtHorizon, payoffShiftMonths, payoffBeyondWindow,
+  };
 }
 
 // Cost breakdown for one strategy comparison: cost = fees + penalty +

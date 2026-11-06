@@ -13442,6 +13442,204 @@ function planReportTemplateFor(kind) {
   return PLAN_REPORT_TEMPLATES[kind] || PLAN_REPORT_TEMPLATES.property;
 }
 
+// Headline time window (user 2026-11-06): the window starts at the
+// current month; the slider picks its end month. Default = the end
+// of the current mortgage term for property reports (the server's
+// report.termEndMonth), the full horizon for pool reports (no term).
+// The client mirror of windowedHeadlineFigures in src/planning.js —
+// same definitions, read straight off the report trajectories
+// (already engine/AI overridden by the overlay). Kept as a near-copy
+// on purpose: the unit tests pin the server copy, the e2e pins pin
+// this one.
+const planRound2 = (v) => Math.round(v * 100) / 100;
+function planHeadlineWindowedFigures(baseRows, stratRows, startMonth, endMonth, penalty, excludeStockGain) {
+  const base = new Map((baseRows || []).map((r) => [r.month, r]));
+  const strat = new Map((stratRows || []).map((r) => [r.month, r]));
+  const months = [...new Set([...base.keys(), ...strat.keys()])]
+    .filter((m) => m >= startMonth && m <= endMonth).sort();
+  let interestSaved = 0;
+  let cost = Number(penalty) || 0;
+  for (const m of months) {
+    const b = base.get(m) || {};
+    const s = strat.get(m) || {};
+    interestSaved += (b.interest || 0) - (s.interest || 0);
+    cost += s.cash_out || 0;
+  }
+  const valDiffAt = (m) => planRound2(((strat.get(m) || {}).stock_value || 0) - ((base.get(m) || {}).stock_value || 0));
+  const stockGain = months.length ? planRound2(valDiffAt(months[months.length - 1]) - valDiffAt(months[0])) : 0;
+  const lastStrat = months.length ? (strat.get(months[months.length - 1]) || {}) : {};
+  const valueAtHorizon = months.length && lastStrat.total_value != null ? planRound2(lastStrat.total_value) : null;
+  const payoffOf = (rows) => {
+    const sorted = [...(rows || [])].sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : 0));
+    if (!sorted.some((r) => (r.mortgage_balance || 0) > 0)) return null;
+    const zero = sorted.find((r) => (r.mortgage_balance || 0) === 0);
+    return zero ? zero.month : null;
+  };
+  const basePayoff = payoffOf(baseRows);
+  const stratPayoff = payoffOf(stratRows);
+  const monthIdx = (ym) => Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7));
+  const payoffShiftMonths = (basePayoff && stratPayoff && monthIdx(endMonth) >= Math.min(monthIdx(basePayoff), monthIdx(stratPayoff)))
+    ? monthIdx(basePayoff) - monthIdx(stratPayoff)
+    : null;
+  const payoffBeyondWindow = !!(basePayoff && stratPayoff && monthIdx(endMonth) < Math.min(monthIdx(basePayoff), monthIdx(stratPayoff)));
+  const gain = excludeStockGain ? planRound2(interestSaved) : planRound2(interestSaved + stockGain);
+  return {
+    interestSaved: planRound2(interestSaved), stockGain, gain,
+    cost: planRound2(cost), net: planRound2(gain - planRound2(cost)),
+    valueAtHorizon, payoffShiftMonths, payoffBeyondWindow,
+  };
+}
+function planHeadlineWindowMonths(view) {
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  return ((trajs[0] || {}).monthly || []).map((r) => r.month);
+}
+// Default window start: the current month (the comparison starts
+// now). The slider's start handle can move it later.
+function planHeadlineWindowDefaultStartIdx(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return 0;
+  const startMonth = (view.comp.report && view.comp.report.currentMonth) || months[0];
+  return Math.max(0, months.indexOf(startMonth));
+}
+function planHeadlineWindowStartIdx(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return 0;
+  const maxIdx = months.length - 1;
+  const defStart = planHeadlineWindowDefaultStartIdx(view);
+  const defEnd = planHeadlineWindowDefaultIdx(view);
+  const endRaw = view.headlineEndIdx != null ? view.headlineEndIdx : defEnd;
+  const raw = view.headlineStartIdx != null ? view.headlineStartIdx : defStart;
+  // Clamped to the end handle (never crosses it); both handles range
+  // over the whole trajectory, so the start may sit before the
+  // current month. Reads raw stored values only — no call back into
+  // the end accessor (that would recurse).
+  return Math.min(Math.max(raw, 0), Math.min(endRaw, maxIdx));
+}
+function planHeadlineWindowDefaultIdx(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return null;
+  const minIdx = planHeadlineWindowDefaultStartIdx(view);
+  const maxIdx = months.length - 1;
+  const termEnd = view.comp.report && view.comp.report.termEndMonth;
+  if (termEnd) {
+    const ti = months.indexOf(termEnd);
+    if (ti >= minIdx) return Math.min(ti, maxIdx);
+  }
+  return maxIdx;
+}
+function planHeadlineWindowEndIdx(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return null;
+  const maxIdx = months.length - 1;
+  const defStart = planHeadlineWindowDefaultStartIdx(view);
+  const defEnd = planHeadlineWindowDefaultIdx(view);
+  const startRaw = view.headlineStartIdx != null ? view.headlineStartIdx : defStart;
+  const raw = view.headlineEndIdx != null ? view.headlineEndIdx : defEnd;
+  return Math.min(Math.max(raw, Math.max(startRaw, 0)), maxIdx);
+}
+// The full horizon: the window sits at its default start (current
+// month) and runs to the last trajectory month. Only then do the
+// cards/table show the settled full-horizon figures (flat value at
+// horizon, opportunity-costed stock gain); any narrowed window shows
+// the literal windowed figures over [start, end].
+function planHeadlineWindowIsFull(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return true;
+  return planHeadlineWindowStartIdx(view) === planHeadlineWindowDefaultStartIdx(view)
+    && planHeadlineWindowEndIdx(view) === months.length - 1;
+}
+// Windowed figures for the selected strategy, or null when there
+// are no trajectories to window over.
+function planHeadlineWindowed(view) {
+  const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
+  if (!row) return null;
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  const base = trajs[0] || { monthly: [] };
+  const strat = trajs.find((t) => t.key === String(row.strategy.id)) || { monthly: [] };
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return null;
+  const startIdx = planHeadlineWindowStartIdx(view);
+  const startMonth = months[startIdx];
+  const endIdx = planHeadlineWindowEndIdx(view);
+  const endMonth = months[endIdx];
+  if (!endMonth) return null;
+  const penalty = planReportPenaltyFor(view.vars, row.strategy.id);
+  const w = planHeadlineWindowedFigures(base.monthly, strat.monthly, startMonth, endMonth, penalty, view.projectCategory === 'property');
+  return { ...w, startIdx, endIdx, maxIdx: months.length - 1, startMonth, endMonth };
+}
+// Windowed figures for ANY strategy row (the merged comparison
+// table needs one per picked strategy, not just the selected one).
+function planHeadlineWindowedFor(view, row) {
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  const base = trajs[0] || { monthly: [] };
+  const strat = trajs.find((t) => t.key === String(row.strategy.id)) || { monthly: [] };
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return null;
+  const startIdx = planHeadlineWindowStartIdx(view);
+  const endIdx = planHeadlineWindowEndIdx(view);
+  const penalty = planReportPenaltyFor(view.vars, row.strategy.id);
+  return planHeadlineWindowedFigures(base.monthly, strat.monthly, months[startIdx], months[endIdx], penalty, view.projectCategory === 'property');
+}
+function planHeadlineWindowLabel(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return '';
+  const w = planHeadlineWindowed(view);
+  if (!w) return '';
+  const count = w.endIdx - w.startIdx + 1; // inclusive months in the window
+  const defIdx = planHeadlineWindowDefaultIdx(view);
+  const termEnd = view.comp.report && view.comp.report.termEndMonth;
+  let suffix = '';
+  if (w.endIdx === defIdx) suffix = termEnd ? ' · Term end' : ' · Full horizon';
+  else if (w.endIdx === w.maxIdx) suffix = ' · Full horizon';
+  return `${formatYM(w.startMonth)} – ${formatYM(w.endMonth)} · ${count} months${suffix}`;
+}
+function planHeadlineWindowNote(view) {
+  const termEnd = view.comp.report && view.comp.report.termEndMonth;
+  const isPool = view.templateKey === 'pool';
+  const def = termEnd
+    ? `Default: current month – end of the current mortgage term (${formatYM(termEnd)}).`
+    : 'Default: current month – full horizon.';
+  const defs = isPool
+    ? 'Cost is summed over the window; Value at horizon is the value at the window end. Drag both handles to set the window.'
+    : 'Interest saved and cost are summed over the window; Value at horizon is the value at the window end. Drag both handles to set the window.';
+  const w = planHeadlineWindowed(view);
+  const payoffNote = w && w.payoffBeyondWindow ? ' Payoff is beyond this window.' : '';
+  return `${def} ${defs}${payoffNote}`;
+}
+// Dual-thumb range slider (user 2026-11-06: "拉动条是可以前后拉动
+// 的设置范围的"): two overlaid range inputs, one per handle, so
+// BOTH the start and the end of the window are draggable. The
+// handles cannot cross — each input clamps to the other handle on
+// input. The track fill between the handles is painted by
+// planHeadlineWindowTrackFill (called on render + every input).
+function planHeadlineWindowHtml(view) {
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length || !(view.comp.strategies || []).length) return '';
+  const maxIdx = months.length - 1;
+  const startIdx = planHeadlineWindowStartIdx(view);
+  const endIdx = planHeadlineWindowEndIdx(view);
+  return `<div class="plan-headline-window">
+    <label>Compare</label>
+    <div class="plan-range-dual" id="planReportHeadlineWindowDual">
+      <div class="plan-range-track" id="planReportHeadlineWindowTrack"></div>
+      <input type="range" id="planReportHeadlineWindowStart" min="0" max="${maxIdx}" step="1" value="${startIdx}" aria-label="Window start month">
+      <input type="range" id="planReportHeadlineWindowEnd" min="0" max="${maxIdx}" step="1" value="${endIdx}" aria-label="Window end month">
+    </div>
+    <span id="planReportHeadlineWindowLabel">${esc(planHeadlineWindowLabel(view))}</span>
+  </div>
+  <div class="note" id="planReportHeadlineWindowNote">${esc(planHeadlineWindowNote(view))}</div>`;
+}
+// Paint the track fill between the two handles (0–100% of the range).
+function planHeadlineWindowTrackFill(view) {
+  const track = $('#planReportHeadlineWindowTrack');
+  const months = planHeadlineWindowMonths(view);
+  if (!track || !months.length) return;
+  const maxIdx = months.length - 1;
+  const lo = maxIdx ? (planHeadlineWindowStartIdx(view) / maxIdx) * 100 : 0;
+  const hi = maxIdx ? (planHeadlineWindowEndIdx(view) / maxIdx) * 100 : 100;
+  track.style.background = `linear-gradient(to right, #d7dee6 0%, #d7dee6 ${lo}%, #2f7de1 ${lo}%, #2f7de1 ${hi}%, #d7dee6 ${hi}%, #d7dee6 100%)`;
+}
+
 // Headline cards for the selected strategy (items 6 + 9): the nine
 // metric cards that used to live on the strategy page. Pool
 // baselines show five (no mortgage figures). Values come from the
@@ -13451,6 +13649,22 @@ function planReportHeadlineCardsHtml(view) {
   const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
   if (!row) return '<div class="note">No strategies yet.</div>';
   const c = planReportEffectiveComparison(row, view.vars, view.templateKey === 'pool');
+  // Time window (user 2026-11-06): when the slider sits short of the
+  // full horizon, the cumulative / horizon-bound cards recompute over
+  // the window from the trajectories. At the full horizon the cards
+  // show the settled full-horizon figures (flat value at horizon,
+  // opportunity-costed stock gain) — the window covers everything,
+  // so the full definitions apply. Monthly payment Δ and Penalty are
+  // per-month / one-off and never move with the slider.
+  const w = planHeadlineWindowed(view);
+  const windowed = !!(w && !planHeadlineWindowIsFull(view));
+  const net = windowed ? w.net : c.net;
+  const cost = windowed ? w.cost : c.cost;
+  const gain = windowed ? w.gain : c.gain;
+  const valueAtHorizon = windowed ? w.valueAtHorizon : c.valueAtHorizon;
+  const interestSaved = windowed ? w.interestSaved : c.interestSaved;
+  const stockGain = windowed ? w.stockGain : c.stockGain;
+  const payoffShiftMonths = windowed ? w.payoffShiftMonths : c.payoffShiftMonths;
   // Which mortgage cards show follows the report TEMPLATE, not a
   // local investmentScope check. Stock gain stays for pool reports:
   // it is a stock figure, not a mortgage figure.
@@ -13458,15 +13672,15 @@ function planReportHeadlineCardsHtml(view) {
   const showMortCards = template.mortgageHeadlineCards;
   const card = (k, v) => `<div class="card breakdown-card plan-metric-card"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`;
   const cards = [
-    card('Net benefit', planMoney(c.net)),
-    card('Total cost', planMoney(c.cost)),
-    card('Total gain', planMoney(c.gain)),
-    card('Value at horizon', planMoney(c.valueAtHorizon)),
+    card('Net benefit', planMoney(net)),
+    card('Total cost', planMoney(cost)),
+    card('Total gain', planMoney(gain)),
+    card('Value at horizon', planMoney(valueAtHorizon)),
   ];
-  if (showMortCards) cards.push(card('Interest saved', planSigned(c.interestSaved)));
-  cards.push(card('Stock gain', planSigned(c.stockGain)));
+  if (showMortCards) cards.push(card('Interest saved', planSigned(interestSaved)));
+  cards.push(card('Stock gain', planSigned(stockGain)));
   if (showMortCards) {
-    cards.push(card('Payoff shift', c.payoffShiftMonths == null ? '—' : `${c.payoffShiftMonths >= 0 ? '+' : ''}${c.payoffShiftMonths} months`));
+    cards.push(card('Payoff shift', payoffShiftMonths == null ? '—' : `${payoffShiftMonths >= 0 ? '+' : ''}${payoffShiftMonths} months`));
     cards.push(card('Monthly payment Δ', planSigned(c.paymentDelta)));
     cards.push(card('Penalty', planMoney(c.penalty)));
   }
@@ -13588,6 +13802,14 @@ function planReportEngineHtml(view) {
   const trajs = (view.comp.report && view.comp.report.trajectories) || [];
   const months = ((trajs[0] || {}).monthly || []).map((r) => r.month);
   const horizonLine = months.length ? `Horizon: ${formatYM(months[0])} – ${formatYM(months[months.length - 1])} (${months.length} months).` : '';
+  // Headline window: when the window is shorter than the full horizon
+  // the headline cards cover the window only; the comparison table,
+  // the payment breakdown and the AI charts follow the same window,
+  // while the Difference chart keeps its own range picker.
+  const win = planHeadlineWindowed(view);
+  const windowLine = win && !planHeadlineWindowIsFull(view)
+    ? `Headline window: ${planHeadlineWindowLabel(view)} — the headline, comparison table, payment breakdown and AI charts cover this window only; the Difference chart keeps its own range.`
+    : '';
   const bd = row && view.costBreakdown ? view.costBreakdown[row.strategy.id] : null;
   // Pool reports measure no mortgage: no penalty, no interest saved
   // — the cost line names fees + cash out and the gain is stock gain
@@ -13607,6 +13829,7 @@ function planReportEngineHtml(view) {
   return `<div class="panel"><div class="section-head"><h3>Engine</h3></div>
     <div class="note">${engineLine}</div>
     ${horizonLine ? `<div class="note">${horizonLine}</div>` : ''}
+    ${windowLine ? `<div class="note">${windowLine}</div>` : ''}
     ${costLine ? `<div class="note">${costLine}</div>` : ''}
     <div class="note">${horizonDefLine}</div>
     ${hasPenaltyVar ? `<div class="note">Penalty is a report variable (default $0): ${penState || 'none'}. It changes cost and net only — never the trajectories.</div>` : ''}
@@ -13674,6 +13897,60 @@ function planReportRefineDiffHtml(diff) {
   return lines.length ? `<div class="note">${lines.map((l) => esc(l)).join('<br>')}</div>` : '<div class="note">No changes.</div>';
 }
 
+// AI charts follow the headline window (user 2026-11-06): each
+// time-series chart recorded in the charts loop is redrawn with its
+// series sliced to [startMonth, endMonth]. Snapshots (share
+// doughnut) are not time series and are left alone; the tables under
+// the charts keep their full-range snapshots, like the Difference
+// table under its own range picker. AI scalar overrides
+// (metric_cards = the headline) stay full-horizon: the engine has no
+// series reduction (no sum/last/first — only element-wise min/max),
+// so a scalar cannot be re-derived over a sliced series without
+// rebuilding the evaluator; the windowed headline instead reads the
+// AI-overridden trajectories (round 1).
+function planReportAiChartsSlice(view) {
+  const specs = view.aiCharts || [];
+  if (!specs.length) return;
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return;
+  const startMonth = months[planHeadlineWindowStartIdx(view)];
+  const endMonth = months[planHeadlineWindowEndIdx(view)];
+  for (const spec of specs) {
+    const labels = spec.labels || [];
+    const labelMonths = spec.labelMonths || labels;
+    const idxs = labels.map((_, i) => i).filter((i) => labelMonths[i] >= startMonth && labelMonths[i] <= endMonth);
+    if (!idxs.length) { planDestroyChart(spec.cid); continue; }
+    const slicedLabels = idxs.map((i) => labels[i]);
+    const sliced = (spec.datasets || []).map((d) => ({ ...d, data: idxs.map((i) => (d.data || [])[i] ?? null) }));
+    let opts;
+    if (spec.endLabels) opts = { endLabels: sliced.map((d) => `${d.label} ${money2(d.data[d.data.length - 1])}`) };
+    if (spec.kind === 'line') planLineChart(spec.cid, slicedLabels, sliced, opts || {});
+    else if (spec.kind === 'bar') planBarChart(spec.cid, slicedLabels, sliced);
+    else if (spec.kind === 'groupedBar') planGroupedBarChart(spec.cid, slicedLabels, sliced);
+  }
+}
+
+// One slider, one window: re-render every section the window drives.
+// Called on either handle's input. The Difference chart + table keep
+// their own range pickers and are never touched here.
+function planReportWindowRefresh(view) {
+  const cards = $('#planReportHeadlineCards');
+  if (cards) cards.innerHTML = planReportHeadlineCardsHtml(view);
+  const lab = $('#planReportHeadlineWindowLabel');
+  if (lab) lab.textContent = planHeadlineWindowLabel(view);
+  const note = $('#planReportHeadlineWindowNote');
+  if (note) note.textContent = planHeadlineWindowNote(view);
+  const eng = $('#planReportEngineBody');
+  if (eng) eng.innerHTML = planReportEngineHtml(view);
+  planHeadlineWindowTrackFill(view);
+  if (view.compareT) {
+    const winMonths = planCompareWindowMonths(view.compareT.block);
+    if (winMonths) planCompareBreakdownDraw(view.compareT, winMonths);
+    planMergedRender(view.compareT);
+  }
+  planReportAiChartsSlice(view);
+}
+
 // Wiring for the report sections: headline chip picker, variable
 // inputs (live) + Apply, AI refine Send/Apply.
 function planReportViewWire(view) {
@@ -13682,10 +13959,32 @@ function planReportViewWire(view) {
     document.querySelectorAll('[data-plan-report-headline-strategy]').forEach((x) => x.classList.toggle('active', Number(x.dataset.planReportHeadlineStrategy) === view.selectedStrategyId));
     const cards = $('#planReportHeadlineCards');
     if (cards) cards.innerHTML = planReportHeadlineCardsHtml(view);
+    const winNote = $('#planReportHeadlineWindowNote');
+    if (winNote) winNote.textContent = planHeadlineWindowNote(view);
     planReportTableRender(view);
     const eng = $('#planReportEngineBody');
     if (eng) eng.innerHTML = planReportEngineHtml(view);
   }));
+  // Headline time window (user 2026-11-06): dragging either handle
+  // re-renders everything the window drives — headline cards, window
+  // label/note, engine note, merged comparison table, payment
+  // breakdown chart and AI charts — from the trajectories already in
+  // view, no refetch. The Difference chart keeps its own range
+  // picker and is never touched here. The handles cannot cross:
+  // each input clamps to the other handle.
+  const winStart = $('#planReportHeadlineWindowStart');
+  const winEnd = $('#planReportHeadlineWindowEnd');
+  if (winStart) winStart.addEventListener('input', () => {
+    view.headlineStartIdx = Math.min(Number(winStart.value), planHeadlineWindowEndIdx(view));
+    winStart.value = String(planHeadlineWindowStartIdx(view));
+    planReportWindowRefresh(view);
+  });
+  if (winEnd) winEnd.addEventListener('input', () => {
+    view.headlineEndIdx = Math.max(Number(winEnd.value), planHeadlineWindowStartIdx(view));
+    winEnd.value = String(planHeadlineWindowEndIdx(view));
+    planReportWindowRefresh(view);
+  });
+  planHeadlineWindowTrackFill(view);
   document.querySelectorAll('[data-plan-report-penalty]').forEach((input) => input.addEventListener('input', () => {
     const sid = input.dataset.planReportPenalty;
     const raw = String(input.value || '').replace(/,/g, '').trim();
@@ -13849,6 +14148,10 @@ async function loadPlanReport(projectId, reportId) {
       template, templateKey: template.key,
       vars: JSON.parse(JSON.stringify((report.definition && report.definition.variables) || {})),
       tableYear: prevView ? prevView.tableYear : null,
+      headlineStartIdx: prevView ? prevView.headlineStartIdx : null,
+      headlineEndIdx: prevView ? prevView.headlineEndIdx : null,
+      aiCharts: [],
+      compareT: null,
       projectCategory: proj.project ? proj.project.category : null,
       costBreakdown: (comp.report && comp.report.costBreakdown) || null,
       costDoughnut: null,
@@ -13932,6 +14235,7 @@ async function loadPlanReport(projectId, reportId) {
         }).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
         draws.push(() => planLineChart(cid, months, datasets));
+        planReportView.aiCharts.push({ cid, kind: 'line', labels: months, datasets });
       } else if (c.template === 'metric_cards') {
         const sids = series || ['cost', 'gain', 'net'];
         const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'stock_gain' ? row.comparison.stockGain : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
@@ -13954,6 +14258,7 @@ async function loadPlanReport(projectId, reportId) {
         const body = years.map((y, yi) => `<tr><td>${y}</td>${datasets.map((d) => `<td>${d.data[yi] == null ? '—' : money2(d.data[yi])}</td>`).join('')}</tr>`).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: year · Y: year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} (CAD), baseline vs each strategy. ${esc(how)}</div></div>`);
         draws.push(() => planGroupedBarChart(cid, years, datasets));
+        planReportView.aiCharts.push({ cid, kind: 'groupedBar', labels: years, labelMonths: years.map((y) => months.filter((m) => m.startsWith(`${y}-`)).pop() || `${y}-12`), datasets });
       } else if (c.template === 'stacked_bar') {
         const sids = series || ['mortgage_balance'];
         const base = comp.baseline;
@@ -13989,6 +14294,7 @@ async function loadPlanReport(projectId, reportId) {
         const body = snapIdx.map((mi) => `<tr><td>${months[mi]}</td>${datasets.map((d) => `<td>${d.data[mi] == null ? '—' : money2(d.data[mi])}</td>`).join('')}</tr>`).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline and strategies share the same prime history. ${esc(how)}</div></div>`);
         draws.push(() => planBarChart(cid, months, datasets));
+        planReportView.aiCharts.push({ cid, kind: 'bar', labels: months, datasets });
         }
       } else if (c.template === 'share_doughnut') {
         if (sidsHas(series, 'cost') && !sidsHas(series, 'mortgage_balance') && !sidsHas(series, 'total_value')) {
@@ -14049,11 +14355,13 @@ async function loadPlanReport(projectId, reportId) {
             const end = n ? n - 1 : 0;
             // Band fill: P90 fills back to P10 (two datasets back),
             // light so the median line reads through it.
-            draws.push(() => planLineChart(fcid, fan.months, [
+            const fanDatasets = [
               { label: 'P10', data: fan.p10, borderColor: '#7fb0e8', backgroundColor: '#7fb0e8', fill: false, pointRadius: 0 },
               { label: 'Median', data: fan.median, borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, borderWidth: 2 },
               { label: 'P90', data: fan.p90, borderColor: '#7fb0e8', backgroundColor: 'rgba(47,125,225,0.15)', fill: '-2', pointRadius: 0 },
-            ], { endLabels: [`P10 ${money2(fan.p10[end])}`, `Median ${money2(fan.median[end])}`, `P90 ${money2(fan.p90[end])}`] }));
+            ];
+            draws.push(() => planLineChart(fcid, fan.months, fanDatasets, { endLabels: [`P10 ${money2(fan.p10[end])}`, `Median ${money2(fan.median[end])}`, `P90 ${money2(fan.p90[end])}`] }));
+            planReportView.aiCharts.push({ cid: fcid, kind: 'line', labels: fan.months, datasets: fanDatasets, endLabels: true });
             const snap = planReportYearRows(fan.months.map((m) => ({ month: m })));
             const sbody = snap.map((row) => {
               const idx = fan.months.indexOf(row.month);
@@ -14077,11 +14385,13 @@ async function loadPlanReport(projectId, reportId) {
           const min = fmonths.map((_, mi) => Math.min(...table.map((r) => r.balanceByMonth[mi].balance)));
           const max = fmonths.map((_, mi) => Math.max(...table.map((r) => r.balanceByMonth[mi].balance)));
           const fcid = `${cid}f${row.strategy.id}`;
-          draws.push(() => planLineChart(fcid, fmonths, [
+          const mortFanDatasets = [
             { label: 'Best', data: min, borderColor: '#2f7de1', backgroundColor: '#2f7de1', fill: false, pointRadius: 0 },
             { label: 'Base', data: baseRow.balanceByMonth.map((r) => r.balance), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0 },
             { label: 'Worst', data: max, borderColor: '#b03a3a', backgroundColor: '#b03a3a', fill: false, pointRadius: 0 },
-          ]));
+          ];
+          draws.push(() => planLineChart(fcid, fmonths, mortFanDatasets));
+          planReportView.aiCharts.push({ cid: fcid, kind: 'line', labels: fmonths, datasets: mortFanDatasets });
           const sbody = table.map((r) => `<tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
           return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><div class="note">X: month · Y: mortgage balance (CAD) across scenarios.</div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
@@ -14117,6 +14427,7 @@ async function loadPlanReport(projectId, reportId) {
       headline: `<div data-plan-report-block="headline"><div class="panel">
         <div class="section-head"><h3>Headline</h3></div>
         <div class="toolbar">${headlineChips}</div>
+        ${planHeadlineWindowHtml(planReportView)}
         <div id="planReportHeadlineCards">${planReportHeadlineCardsHtml(planReportView)}</div>
       </div></div>`,
       charts: panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>',
@@ -14171,7 +14482,8 @@ async function loadPlanReport(projectId, reportId) {
     // renders only for multi-strategy reports (gated in
     // planCompareNewRender).
     try {
-      planCompareNewRender({ scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report }, {
+      const compareBlock = { scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report };
+      const compareIds = {
         template,
         note: '#planReportTrajectoryNote', chart: 'planReportTrajectoryChart', empty: '#planReportTrajectoryEmpty',
         caption: '#planReportTrajCaption',
@@ -14190,7 +14502,12 @@ async function loadPlanReport(projectId, reportId) {
             loadPlanReport(projectId, reportId);
           } catch (err) { showMsg($('#planReportMsg'), 'err', err.message); }
         },
-      });
+      };
+      planCompareNewRender(compareBlock, compareIds);
+      // Retained so the window slider can re-draw the breakdown chart
+      // and the merged table without re-running the whole comparison
+      // (which would reset the Difference chart's range picker).
+      planReportView.compareT = compareIds;
     } catch { /* a failed comparison chart never blocks the report tables */ }
     planReportViewWire(planReportView);
     planReportViewSync(projectId, reportId);
@@ -14727,6 +15044,63 @@ function planDiffMonthly(d) {
   }));
 }
 
+// The shared report window's month list for a comparison block, or
+// null when the report view does not cover this block (the
+// Difference chart's own range is the fallback then).
+function planCompareWindowMonths(block) {
+  const view = planReportView;
+  if (!view || !view.comp || !view.comp.report || !block || block.report !== view.comp.report) return null;
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return null;
+  return months.slice(planHeadlineWindowStartIdx(view), planHeadlineWindowEndIdx(view) + 1);
+}
+// Monthly payment breakdown, drawn over the shared report window
+// (user 2026-11-06 — the same window as the headline), NOT over the
+// Difference chart's own range: the breakdown is part of the
+// comparison section, so it follows the slider. Re-drawn on every
+// slider input via planReportWindowRefresh.
+function planCompareBreakdownDraw(t, months) {
+  const block = t.block || {};
+  const bWrap = document.querySelector(t.breakdownWrapSel);
+  const bEmpty = $(t.breakdownEmpty);
+  // Payment breakdown (property template only — the pool template
+  // has no breakdown section at all, so there is nothing to draw
+  // or hide here): baseline + mortgage-touching picked
+  // trajectories only. A strategy with no mortgage ops must not
+  // render mortgage bars at all — its interest/principal series are
+  // the untouched mainline mortgages, not the strategy's effect.
+  // With no mortgage-touching strategy picked, the whole block hides
+  // (this hide stays inside the property template).
+  const hasBreakdown = !t.template || t.template.breakdown !== false;
+  if (!hasBreakdown) {
+    planDestroyChart(t.breakdown);
+    return;
+  }
+  const trajs = (block.report && block.report.trajectories) || [];
+  if (!trajs.length || !(months || []).length) {
+    planDestroyChart(t.breakdown);
+    return;
+  }
+  const picked = (block.strategies || []).filter((r) => (t.getAppleIds ? t.getAppleIds() : []).includes(r.strategy.id));
+  const byMonth = (tr) => { const m = new Map((tr.monthly || []).map((r) => [r.month, r])); return (mo) => m.get(mo); };
+  const mortPickedIds = picked.filter((r) => r.touchesMortgage).map((r) => r.strategy.id);
+  if (!mortPickedIds.length) {
+    if (bWrap) bWrap.style.display = 'none';
+    planDestroyChart(t.breakdown);
+    if (bEmpty) bEmpty.innerHTML = '';
+    return;
+  }
+  if (bWrap) bWrap.style.display = '';
+  if (bEmpty) bEmpty.innerHTML = '';
+  const shownTrajs = trajs.filter((tr) => tr.key === 'baseline' || mortPickedIds.includes(Number(tr.key)));
+  const bDatasets = [];
+  shownTrajs.forEach((tr, i) => {
+    const get = byMonth(tr);
+    bDatasets.push({ label: `${tr.label} interest`, data: months.map((mo) => { const r = get(mo); return r == null ? null : (r.interest || 0); }), backgroundColor: planColor(i), stack: tr.label });
+    bDatasets.push({ label: `${tr.label} principal`, data: months.map((mo) => { const r = get(mo); return r == null ? null : (r.principal || 0); }), backgroundColor: planColorAlpha(planColor(i), 0.45), stack: tr.label });
+  });
+  planBarChart(t.breakdown, months.map(formatYM), bDatasets);
+}
 function planCompareNewRender(block, ids) {
   const t = ids;
   t.block = block;
@@ -14896,36 +15270,6 @@ function planCompareNewRender(block, ids) {
       planDestroyChart(t.chart);
       if (empty) empty.innerHTML = '<div class="note">Pick a strategy to compare.</div>';
     }
-    // Payment breakdown (property template only — the pool template
-    // has no breakdown section at all, so there is nothing to draw
-    // or hide here): baseline + mortgage-touching picked
-    // trajectories only. A strategy with no mortgage ops must not
-    // render mortgage bars at all — its interest/principal series are
-    // the untouched mainline mortgages, not the strategy's effect.
-    // With no mortgage-touching strategy picked, the whole block hides
-    // (this hide stays inside the property template).
-    const hasBreakdown = !t.template || t.template.breakdown !== false;
-    if (!hasBreakdown) {
-      planDestroyChart(t.breakdown);
-    } else {
-      const mortPickedIds = picked.filter((r) => r.touchesMortgage).map((r) => r.strategy.id);
-      if (!mortPickedIds.length) {
-        if (bWrap) bWrap.style.display = 'none';
-        planDestroyChart(t.breakdown);
-        if (bEmpty) bEmpty.innerHTML = '';
-      } else {
-        if (bWrap) bWrap.style.display = '';
-        if (bEmpty) bEmpty.innerHTML = '';
-        const shownTrajs = trajs.filter((tr) => tr.key === 'baseline' || mortPickedIds.includes(Number(tr.key)));
-        const bDatasets = [];
-        shownTrajs.forEach((tr, i) => {
-          const get = byMonth(tr);
-          bDatasets.push({ label: `${tr.label} interest`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.interest || 0); }), backgroundColor: planColor(i), stack: tr.label });
-          bDatasets.push({ label: `${tr.label} principal`, data: effMonths.map((mo) => { const r = get(mo); return r == null ? null : (r.principal || 0); }), backgroundColor: planColorAlpha(planColor(i), 0.45), stack: tr.label });
-        });
-        planBarChart(t.breakdown, effMonths.map(formatYM), bDatasets);
-      }
-    }
   } else {
     planDestroyChart(t.chart);
     planDestroyChart(t.breakdown);
@@ -14934,6 +15278,10 @@ function planCompareNewRender(block, ids) {
     if (empty) empty.innerHTML = `<div class="note">${trajs.length && months.length ? 'No months in this range.' : 'No trajectory data.'}</div>`;
     if (bEmpty) bEmpty.innerHTML = '';
   }
+  // The breakdown follows the shared window even when the Difference
+  // chart's own range is empty — it is a comparison-section chart,
+  // not a Difference-chart chart.
+  planCompareBreakdownDraw(t, planCompareWindowMonths(block) || effMonths);
   // Strategy picker: horizontal toggle chips at the panel top. One
   // picker drives the difference chart, the breakdown bars and the
   // merged table. Each pinned chip also carries a × that removes
@@ -14999,6 +15347,39 @@ function planMergedRender(t) {
   const baseAbs = planMortAbs(block.baseline, 'baseline');
   const payMeta = planPaymentScopeMeta(block);
   const baseValue = planBaselineValue(block);
+  // Shared window (user 2026-11-06): the merged table's cumulative
+  // rows recompute over the window — Total interest / Total gain /
+  // Value at horizon / Total cost (+ Stock gain, Net benefit, and
+  // the Payoff cells). The Monthly payment row is a per-month
+  // figure and never moves. At the full horizon the settled
+  // comparison figures apply. Equity Δ (a peak over the horizon)
+  // and Principal Δ (total buy cash) are not windowed in this round
+  // — they keep their full-horizon settled values.
+  const view = planReportView;
+  const win = (view && view.comp && view.comp.report && block.report === view.comp.report)
+    ? (() => {
+        const months = planHeadlineWindowMonths(view);
+        if (!months.length) return null;
+        const startIdx = planHeadlineWindowStartIdx(view);
+        const endIdx = planHeadlineWindowEndIdx(view);
+        return { months, startIdx, endIdx, startMonth: months[startIdx], endMonth: months[endIdx], isFull: planHeadlineWindowIsFull(view) };
+      })()
+    : null;
+  const windowed = !!(win && !win.isFull);
+  const winTrajs = windowed ? ((block.report && block.report.trajectories) || []) : [];
+  const winByMonth = (traj) => new Map(((traj && traj.monthly) || []).map((r) => [r.month, r]));
+  const winBaseByMonth = windowed ? winByMonth(winTrajs[0] || { monthly: [] }) : null;
+  const winMonthsIn = windowed ? win.months.slice(win.startIdx, win.endIdx + 1) : [];
+  const winSum = (byMonth, field) => winMonthsIn.reduce((s, m) => s + (((byMonth.get(m) || {}))[field] || 0), 0);
+  const winAt = (byMonth, field) => (byMonth.get(win.endMonth) || {})[field];
+  const winStratByMonth = (row) => winByMonth(winTrajs.find((x) => x.key === String(row.strategy.id)) || { monthly: [] });
+  const winFigCache = new Map();
+  const winFigs = (row) => {
+    if (!winFigCache.has(row.strategy.id)) winFigCache.set(row.strategy.id, planHeadlineWindowedFor(view, row));
+    return winFigCache.get(row.strategy.id);
+  };
+  const anyPayoffBeyond = windowed && [baseAbs.payoff, ...picked.map((r) => planMortAbs(r.projection, 'strategy').payoff)]
+    .filter(Boolean).some((p) => win.endMonth < p);
   const months = (v) => (v == null ? '—' : ((v >= 0 ? '+' : '') + v + ' months'));
   const rows = [
     { mort: true, label: payMeta ? payMeta.label : 'Monthly payment', base: payMeta ? planMoney(payMeta.baseline) : planMoney(baseAbs.payment), strat: (r) => {
@@ -15008,27 +15389,38 @@ function planMergedRender(t) {
       if (abs === '—' && delta === '—') return { single: '—' };
       return { abs, delta, bold: dv != null && dv !== 0 };
     } },
-    { mort: true, label: 'Total interest', base: planMoney(baseAbs.interest), strat: (r) => {
-      const dv = r.comparison.interestSaved == null ? null : -r.comparison.interestSaved;
-      return { abs: planMoney(planMortAbs(r.projection, 'strategy').interest), delta: planSigned(dv), bold: dv != null && dv !== 0 };
+    { mort: true, label: 'Total interest', base: planMoney(windowed ? winSum(winBaseByMonth, 'interest') : baseAbs.interest), strat: (r) => {
+      const wf = windowed ? winFigs(r) : null;
+      const dv = wf ? -wf.interestSaved : (r.comparison.interestSaved == null ? null : -r.comparison.interestSaved);
+      return { abs: planMoney(windowed ? winSum(winStratByMonth(r), 'interest') : planMortAbs(r.projection, 'strategy').interest), delta: planSigned(dv), bold: dv != null && dv !== 0 };
     } },
-    { mort: true, label: 'Payoff', base: baseAbs.payoff || '—', strat: (r) => {
+    { mort: true, label: 'Payoff', base: windowed ? ((baseAbs.payoff && win.endMonth >= baseAbs.payoff) ? baseAbs.payoff : '—') : (baseAbs.payoff || '—'), strat: (r) => {
       const shift = r.comparison.payoffShiftMonths;
       const stratPayoff = planMortAbs(r.projection, 'strategy').payoff || '—';
       const ymIdx = (s) => (s && /^\d{4}-\d{2}$/.test(s) ? Number(s.slice(0, 4)) * 12 + Number(s.slice(5, 7)) : null);
+      if (windowed) {
+        // Same rule as the headline shift: the shift shows once the
+        // window reaches at least one payoff; a payoff the window
+        // has not reached yet reads '—'.
+        const payoffs = [baseAbs.payoff, stratPayoff === '—' ? null : stratPayoff].filter(Boolean);
+        if (!payoffs.length || !payoffs.some((p) => win.endMonth >= p)) return { single: '—' };
+        return { abs: (stratPayoff !== '—' && win.endMonth >= stratPayoff) ? stratPayoff : '—', delta: months(shift), bold: shift !== 0 };
+      }
       const consistent = shift != null && ymIdx(baseAbs.payoff) != null && ymIdx(stratPayoff) != null
         && (ymIdx(stratPayoff) - ymIdx(baseAbs.payoff)) === -shift;
       if (consistent) return { abs: stratPayoff, delta: months(shift), bold: shift !== 0 };
       return { single: months(shift), bold: shift != null && shift !== 0 };
     } },
-    { label: 'Value at horizon', base: planMoney(baseValue), strat: (r) => {
-      const dv = (r.comparison.valueAtHorizon != null && r.comparison.baselineValueAtHorizon != null) ? r.comparison.valueAtHorizon - r.comparison.baselineValueAtHorizon : null;
-      return { abs: planMoney(r.comparison.valueAtHorizon), delta: planSigned(dv), bold: dv != null && dv !== 0 };
+    { label: 'Value at horizon', base: planMoney(windowed ? winAt(winBaseByMonth, 'total_value') : baseValue), strat: (r) => {
+      const dv = windowed
+        ? (() => { const s = winAt(winStratByMonth(r), 'total_value'); const b = winAt(winBaseByMonth, 'total_value'); return (s != null && b != null) ? s - b : null; })()
+        : (r.comparison.valueAtHorizon != null && r.comparison.baselineValueAtHorizon != null) ? r.comparison.valueAtHorizon - r.comparison.baselineValueAtHorizon : null;
+      return { abs: planMoney(windowed ? winAt(winStratByMonth(r), 'total_value') : r.comparison.valueAtHorizon), delta: planSigned(dv), bold: dv != null && dv !== 0 };
     } },
-    { label: 'Total cost', base: '—', strat: (r) => ({ single: planMoney(r.comparison.cost) }) },
-    { label: 'Total gain', base: '—', strat: (r) => ({ single: planMoney(r.comparison.gain) }) },
-    { label: 'Stock gain', base: '—', strat: (r) => ({ single: planMoney(r.comparison.stockGain) }) },
-    { label: 'Net benefit', base: '—', strat: (r) => ({ single: planSigned(r.comparison.net) }) },
+    { label: 'Total cost', base: '—', strat: (r) => ({ single: planMoney(windowed ? winFigs(r).cost : r.comparison.cost) }) },
+    { label: 'Total gain', base: '—', strat: (r) => ({ single: planMoney(windowed ? winFigs(r).gain : r.comparison.gain) }) },
+    { label: 'Stock gain', base: '—', strat: (r) => ({ single: planMoney(windowed ? winFigs(r).stockGain : r.comparison.stockGain) }) },
+    { label: 'Net benefit', base: '—', strat: (r) => ({ single: planSigned(windowed ? winFigs(r).net : r.comparison.net) }) },
     { label: 'Equity Δ', base: '—', strat: (r) => ({ single: r.equityDelta != null ? planSigned(r.equityDelta) : '—', bold: r.equityDelta != null && r.equityDelta !== 0 }) },
     { label: 'Principal Δ', base: '—', strat: (r) => ({ single: r.principalDelta != null ? planSigned(r.principalDelta) : '—', bold: r.principalDelta != null && r.principalDelta !== 0 }) },
   ];
@@ -15041,7 +15433,8 @@ function planMergedRender(t) {
   const host = $(t.merged);
   if (!host) return;
   host.innerHTML = `<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table>`
-    + (picked.length === 0 && block.strategies.length > 0 ? '<div class="note">Pick a strategy to compare.</div>' : '');
+    + (picked.length === 0 && block.strategies.length > 0 ? '<div class="note">Pick a strategy to compare.</div>' : '')
+    + (anyPayoffBeyond ? '<div class="note">Payoff is beyond this window.</div>' : '');
 }
 
 function planScenarioHtml(d) {

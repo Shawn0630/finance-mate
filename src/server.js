@@ -49,7 +49,7 @@ import {
   calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
-  latestMaturityMonth, maturityHorizonMonths,
+  latestMaturityMonth, maturityHorizonMonths, activeTermEndMonth,
   reportMonthlySeries, reportCostBreakdown,
   planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
   planAiEntityCandidates, rewriteAiIdQuestions, dropAnsweredAiQuestions, bindAiNameAnswers,
@@ -6181,15 +6181,23 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
   // Investment scope: report trajectories carry the cash-pool series
   // and their total is pool + stocks only (never property equity).
   const investmentScope = p.category === 'investment';
-  const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: baseline.stocks.potSeries, investmentScope }) }];
+  const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: baseline.stocks.potSeries, investmentScope, cashOutSeries: baseline.cashOutSeries || [] }) }];
   for (const r of rows) {
-    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope }) });
+    reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope, cashOutSeries: r.projection.cashOutSeries || [] }) });
   }
   const report = {
     assessedTotal, assessedByProperty,
     trajectories: reportTrajectories,
     costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
     investmentScope,
+    // Headline time window (user 2026-11-06): the window starts at
+    // the current month; the default end is the end of the entity
+    // property's ACTIVE mortgage term (property reports) or the full
+    // horizon (pool reports — no term, null here).
+    currentMonth: currentMonthKey(),
+    termEndMonth: entityProp
+      ? activeTermEndMonth(db.prepare('SELECT start_date, term_months FROM mortgage_terms WHERE property_id = ? ORDER BY start_date').all(entityProp.id), currentMonthKey())
+      : null,
     // Maturing custom buys, for the report view's maturity line:
     // each names the product, its maturity date, and the matured
     // amount that returned to the pot as cash.
