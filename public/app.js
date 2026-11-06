@@ -8405,12 +8405,6 @@ function monthPopField() {
     const wrap = document.querySelector(`[data-earn-range="${key}"]`);
     return wrap ? wrap.querySelector(`[data-earn-month="${which}"]`) : null;
   }
-  // Comparison-trajectory range fields live in the report panel's
-  // range bar (per planTrajActive).
-  if (monthPopFor && monthPopFor.startsWith('planTraj:')) {
-    const which = monthPopFor.split(':')[1];
-    return document.querySelector(`#planReportComparePanel [data-plan-traj-month="${which}"]`);
-  }
   return { start: $('#rangeStart'), end: $('#rangeEnd'), entryStart: $('#earnEntryStartBtn'), entryEnd: $('#earnEntryEndBtn') }[monthPopFor] || null;
 }
 function monthPopIsEntry() {
@@ -8428,9 +8422,6 @@ function monthPopSpan() {
     if (!years.length) return null;
     return { start: `${years[0]}-01`, end: `${years[years.length - 1]}-12` };
   }
-  // Comparison-trajectory range: the trajectory months (set by
-  // planCompareNewRender).
-  if (monthPopFor && monthPopFor.startsWith('planTraj:')) return planTrajSpan;
   return dataSpanMonths();
 }
 // Rent entry modal fields: a pick fills that field only — the
@@ -8510,9 +8501,6 @@ function openMonthPop(which) {
     const wrap = b.closest('[data-earn-range]');
     b.setAttribute('aria-expanded', String(!!wrap && monthPopFor === `earn:${wrap.dataset.earnRange}:${b.dataset.earnMonth}`));
   });
-  document.querySelectorAll('[data-plan-traj-month]').forEach((b) => {
-    b.setAttribute('aria-expanded', String(monthPopFor === `planTraj:${b.dataset.planTrajMonth}`));
-  });
 }
 
 function closeMonthPop() {
@@ -8524,7 +8512,6 @@ function closeMonthPop() {
   }
   document.querySelectorAll('[data-earn-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
   document.querySelectorAll('[data-plan-diff-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
-  document.querySelectorAll('[data-plan-traj-month]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
 }
 
 function onMonthFieldClick(which) {
@@ -8577,33 +8564,6 @@ $('#monthPop').addEventListener('click', (e) => {
     drawEarnVisibleChart();
     return;
   }
-  // Comparison-trajectory range: same fill-one-side + clamp + custom
-  // rule as the diff range, then re-render the active panel — the
-  // picker drives both the difference chart and the breakdown bars.
-  if (monthPopFor.startsWith('planTraj:')) {
-    const which = monthPopFor.split(':')[1];
-    const ym = cell.dataset.ym;
-    closeMonthPop();
-    const active = planTrajActive;
-    if (!active || !ym) return;
-    const st = active.ids.trajState || (active.ids.trajState = { preset: 'all', from: '', to: '' });
-    const trajs = (active.block.report && active.block.report.trajectories) || [];
-    const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
-    const eff = planTrajEffectiveRange(months, st);
-    if (which === 'from') {
-      st.from = ym;
-      if (st.preset !== 'custom') st.to = eff.length ? eff[eff.length - 1] : '';
-    } else {
-      st.to = ym;
-      if (st.preset !== 'custom') st.from = eff.length ? eff[0] : '';
-    }
-    if (st.from && st.to && st.from > st.to) {
-      if (which === 'from') st.to = st.from; else st.from = st.to;
-    }
-    st.preset = 'custom';
-    planCompareNewRender(active.block, active.ids);
-    return;
-  }
   const start = monthPopFor === 'start' ? cell.dataset.ym : $('#rangeStart').dataset.value;
   const end = monthPopFor === 'end' ? cell.dataset.ym : $('#rangeEnd').dataset.value;
   closeMonthPop();
@@ -8645,7 +8605,7 @@ window.addEventListener('scroll', () => {
 }, { capture: true, passive: true });
 document.addEventListener('click', (e) => {
   if (!monthPopFor) return;
-  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]') || e.target.closest('[data-plan-month]') || e.target.closest('[data-plan-diff-month]') || e.target.closest('[data-plan-traj-month]')) return;
+  if (e.target.closest('#monthPop') || e.target.closest('#rangeStart') || e.target.closest('#rangeEnd') || e.target.closest('#earnEntryStartBtn') || e.target.closest('#earnEntryEndBtn') || e.target.closest('[data-earn-month]') || e.target.closest('[data-plan-month]') || e.target.closest('[data-plan-diff-month]')) return;
   closeMonthPop();
 });
 document.addEventListener('keydown', (e) => {
@@ -13726,7 +13686,17 @@ function planReportTableRender(view) {
   const host = $('#planReportTableBody');
   const pager = $('#planReportTablePager');
   if (!host) return;
-  const rows = planReportTableRows(view);
+  let rows = planReportTableRows(view);
+  // Difference table follows the Difference slider (user 2026-11-06):
+  // only months inside the slider window render. The year pager
+  // below derives from these rows, so it covers window years only
+  // (a window inside one year shows that year alone, no pager).
+  // A partial year's "YYYY total" sums the displayed months only.
+  const trajWin = planTrajWindowMonths(view);
+  if (trajWin) {
+    const winMonths = new Set(trajWin.months.slice(trajWin.startIdx, trajWin.endIdx + 1));
+    rows = rows.filter((r) => winMonths.has(r.month));
+  }
   const kind = view.templateKey === 'pool' ? 'pool' : (view.projectCategory === 'property' ? 'property' : 'other');
   const hasMort = rows.some((r) => r.balBase != null || r.balStrat != null);
   const hasStock = rows.some((r) => r.valBase != null || r.valStrat != null);
@@ -13805,10 +13775,10 @@ function planReportEngineHtml(view) {
   // Headline window: when the window is shorter than the full horizon
   // the headline cards cover the window only; the comparison table,
   // the payment breakdown and the AI charts follow the same window,
-  // while the Difference chart keeps its own range picker.
+  // while the Difference chart keeps its own range slider.
   const win = planHeadlineWindowed(view);
   const windowLine = win && !planHeadlineWindowIsFull(view)
-    ? `Headline window: ${planHeadlineWindowLabel(view)} — the headline, comparison table, payment breakdown and AI charts cover this window only; the Difference chart keeps its own range.`
+    ? `Headline window: ${planHeadlineWindowLabel(view)} — the headline, comparison table, payment breakdown and AI charts cover this window only; the Difference chart keeps its own range slider.`
     : '';
   const bd = row && view.costBreakdown ? view.costBreakdown[row.strategy.id] : null;
   // Pool reports measure no mortgage: no penalty, no interest saved
@@ -14506,7 +14476,7 @@ async function loadPlanReport(projectId, reportId) {
       planCompareNewRender(compareBlock, compareIds);
       // Retained so the window slider can re-draw the breakdown chart
       // and the merged table without re-running the whole comparison
-      // (which would reset the Difference chart's range picker).
+      // (which would reset the Difference chart's range slider).
       planReportView.compareT = compareIds;
     } catch { /* a failed comparison chart never blocks the report tables */ }
     planReportViewWire(planReportView);
@@ -14997,27 +14967,68 @@ function planBaselineValue(block) {
   if (base && base.monthly && base.monthly.length) return base.monthly[base.monthly.length - 1].total_value;
   return null;
 }
-// Difference-chart range state: per-ctx for the report view. The
-// active target lets the shared month picker re-render the panel
-// it came from; only one comparison panel is visible at a time, so
-// a single active target is safe.
-let planTrajSpan = null;
-let planTrajActive = null;
+// Difference-chart range (user 2026-11-06): a dual-thumb slider above
+// the chart, the same component as the headline window — two overlaid
+// range inputs, both handles draggable, they cannot cross. State is
+// per-ctx indices into the trajectory months ({ startIdx, endIdx });
+// default = All (the full trajectory months). The slider is
+// independent of the headline slider: it drives only this chart +
+// the Difference table below it.
+function planTrajIdxs(months, st) {
+  if (!months.length) return { startIdx: 0, endIdx: -1 };
+  const end = Math.min(Math.max(st.endIdx ?? months.length - 1, 0), months.length - 1);
+  const start = Math.min(Math.max(st.startIdx ?? 0, 0), end);
+  return { startIdx: start, endIdx: end };
+}
 function planTrajEffectiveRange(months, st) {
   if (!months.length) return [];
-  if (st.preset === 'custom' && st.from && st.to) {
-    const lo = st.from <= st.to ? st.from : st.to;
-    const hi = st.from <= st.to ? st.to : st.from;
-    return months.filter((m) => m >= lo && m <= hi);
-  }
-  const n = { '1y': 12, '2y': 24, '5y': 60, '10y': 120 }[st.preset];
-  if (n) return months.slice(0, n);
-  return months;
+  const { startIdx, endIdx } = planTrajIdxs(months, st);
+  return months.slice(startIdx, endIdx + 1);
+}
+function planTrajWindowLabel(months, st) {
+  if (!months.length) return '';
+  const { startIdx, endIdx } = planTrajIdxs(months, st);
+  const count = endIdx - startIdx + 1;
+  const all = startIdx === 0 && endIdx === months.length - 1;
+  return `${formatYM(months[startIdx])} – ${formatYM(months[endIdx])} · ${count} months${all ? ' · All' : ''}`;
 }
 function planTrajRangeHtml(st, months) {
-  const presets = ['all', '1y', '2y', '5y', '10y'];
-  const eff = planTrajEffectiveRange(months, st);
-  return `<div class="toolbar">${presets.map((p) => `<button class="small${st.preset === p ? ' active' : ''}" data-plan-traj-preset="${p}">${p === 'all' ? 'All' : p}</button>`).join(' ')} <span class="range-label">${eff.length ? `${formatYM(eff[0])} – ${formatYM(eff[eff.length - 1])}` : '—'}</span> <button class="small month-field" data-plan-traj-month="from" data-value="${st.from || ''}">${st.from ? formatYM(st.from) : 'From'}</button> <button class="small month-field" data-plan-traj-month="to" data-value="${st.to || ''}">${st.to ? formatYM(st.to) : 'To'}</button></div>`;
+  if (!months.length) return '';
+  const { startIdx, endIdx } = planTrajIdxs(months, st);
+  const maxIdx = months.length - 1;
+  return `<div class="plan-headline-window">
+    <label>Range</label>
+    <div class="plan-range-dual" id="planReportTrajWindowDual">
+      <div class="plan-range-track" id="planReportTrajWindowTrack"></div>
+      <input type="range" id="planReportTrajWindowStart" min="0" max="${maxIdx}" step="1" value="${startIdx}" aria-label="Difference range start month">
+      <input type="range" id="planReportTrajWindowEnd" min="0" max="${maxIdx}" step="1" value="${endIdx}" aria-label="Difference range end month">
+    </div>
+    <span id="planReportTrajWindowLabel">${esc(planTrajWindowLabel(months, st))}</span>
+  </div>`;
+}
+// Paint the track fill between the two handles (0–100% of the range).
+function planTrajWindowTrackFill(months, st) {
+  const track = $('#planReportTrajWindowTrack');
+  if (!track || !months.length) return;
+  const maxIdx = months.length - 1;
+  const { startIdx, endIdx } = planTrajIdxs(months, st);
+  const lo = maxIdx ? (startIdx / maxIdx) * 100 : 0;
+  const hi = maxIdx ? (endIdx / maxIdx) * 100 : 100;
+  track.style.background = `linear-gradient(to right, #d7dee6 0%, #d7dee6 ${lo}%, #2f7de1 ${lo}%, #2f7de1 ${hi}%, #d7dee6 ${hi}%, #d7dee6 100%)`;
+}
+// Difference window for the report table: the slider's window on the
+// report view's comparison ctx, or the full trajectory months when
+// the comparison has not rendered yet (the table renders before the
+// comparison on first load — and the default window IS the full
+// range, so the first render is already correct).
+function planTrajWindowMonths(view) {
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
+  if (!months.length) return null;
+  const st = (view.compareT && view.compareT.trajState) || null;
+  if (!st) return { months, startIdx: 0, endIdx: months.length - 1 };
+  const { startIdx, endIdx } = planTrajIdxs(months, st);
+  return { months, startIdx, endIdx };
 }
 // Monthly difference rows from baseline + strategy projections —
 // now used only by the comparison Δ chart (the strategy-page
@@ -15101,36 +15112,14 @@ function planCompareBreakdownDraw(t, months) {
   });
   planBarChart(t.breakdown, months.map(formatYM), bDatasets);
 }
-function planCompareNewRender(block, ids) {
-  const t = ids;
-  t.block = block;
-  if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id);
-  // Picker state lives on the passed ctx so each report view's
-  // picker re-renders only its own panel.
-  t.getAppleIds = () => t.appleIds;
-  t.setAppleIds = (v) => { t.appleIds = v; };
-  const note = $(t.note);
-  if (note) note.textContent = block.scenario ? `Under ${block.scenario.name}` : 'Current rates (no scenario)';
+// Difference chart draw (extracted from planCompareNewRender so the
+// range slider can redraw the chart + table on every input without
+// re-running the whole comparison — rebuilding the range HTML
+// mid-drag would destroy the input being dragged).
+function planTrajChartDraw(t, block, effMonths) {
   const trajs = (block.report && block.report.trajectories) || [];
   const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
-  // Range state + active target (month picker re-renders this panel).
-  if (t.trajState == null) t.trajState = { preset: 'all', from: '', to: '' };
-  const trajState = t.trajState;
-  planTrajActive = { block, ids };
-  planTrajSpan = months.length ? { start: months[0], end: months[months.length - 1] } : null;
-  const rangeEl = $(t.range);
-  if (rangeEl) {
-    rangeEl.innerHTML = planTrajRangeHtml(trajState, months);
-    rangeEl.querySelectorAll('[data-plan-traj-preset]').forEach((b) => b.addEventListener('click', () => {
-      trajState.preset = b.dataset.planTrajPreset; trajState.from = ''; trajState.to = '';
-      planCompareNewRender(block, ids);
-    }));
-    rangeEl.querySelectorAll('[data-plan-traj-month]').forEach((b) => b.addEventListener('click', () => onMonthFieldClick(`planTraj:${b.dataset.planTrajMonth}`)));
-  }
-  const effMonths = planTrajEffectiveRange(months, trajState);
-  const byMonth = (tr) => { const m = new Map((tr.monthly || []).map((r) => [r.month, r])); return (mo) => m.get(mo); };
   const picked = block.strategies.filter((r) => t.getAppleIds().includes(r.strategy.id));
-  const pickedIds = picked.map((r) => r.strategy.id);
   const wrap = document.querySelector(t.wrapSel);
   const empty = $(t.empty);
   const bWrap = document.querySelector(t.breakdownWrapSel);
@@ -15278,6 +15267,58 @@ function planCompareNewRender(block, ids) {
     if (empty) empty.innerHTML = `<div class="note">${trajs.length && months.length ? 'No months in this range.' : 'No trajectory data.'}</div>`;
     if (bEmpty) bEmpty.innerHTML = '';
   }
+}
+
+function planCompareNewRender(block, ids) {
+  const t = ids;
+  t.block = block;
+  if (t.appleIds == null) t.appleIds = block.strategies.map((r) => r.strategy.id);
+  // Picker state lives on the passed ctx so each report view's
+  // picker re-renders only its own panel.
+  t.getAppleIds = () => t.appleIds;
+  t.setAppleIds = (v) => { t.appleIds = v; };
+  const note = $(t.note);
+  if (note) note.textContent = block.scenario ? `Under ${block.scenario.name}` : 'Current rates (no scenario)';
+  const trajs = (block.report && block.report.trajectories) || [];
+  const months = trajs.length ? ((trajs[0].monthly || []).map((m) => m.month)) : [];
+  // Difference range (user 2026-11-06): a dual-thumb slider above the
+  // chart, same component as the headline window — both handles drag,
+  // they cannot cross. Default = All (the full trajectory months).
+  // The slider is independent of the headline slider: it drives only
+  // this chart + the Difference table below it.
+  if (t.trajState == null) t.trajState = { startIdx: 0, endIdx: months.length - 1 };
+  const trajState = t.trajState;
+  const trajNorm = planTrajIdxs(months, trajState);
+  trajState.startIdx = trajNorm.startIdx;
+  trajState.endIdx = trajNorm.endIdx;
+  const rangeEl = $(t.range);
+  if (rangeEl) {
+    rangeEl.innerHTML = planTrajRangeHtml(trajState, months);
+    // Slider input redraws the chart + table in place (never the whole
+    // comparison — that would rebuild the slider DOM mid-drag).
+    const trajRedraw = () => {
+      planTrajWindowTrackFill(months, trajState);
+      const lab = $('#planReportTrajWindowLabel');
+      if (lab) lab.textContent = planTrajWindowLabel(months, trajState);
+      planTrajChartDraw(t, block, planTrajEffectiveRange(months, trajState));
+      planReportTableRender(planReportView);
+    };
+    const trajStart = rangeEl.querySelector('#planReportTrajWindowStart');
+    if (trajStart) trajStart.addEventListener('input', () => {
+      trajState.startIdx = Math.min(Number(trajStart.value), trajState.endIdx);
+      trajStart.value = String(trajState.startIdx);
+      trajRedraw();
+    });
+    const trajEnd = rangeEl.querySelector('#planReportTrajWindowEnd');
+    if (trajEnd) trajEnd.addEventListener('input', () => {
+      trajState.endIdx = Math.max(Number(trajEnd.value), trajState.startIdx);
+      trajEnd.value = String(trajState.endIdx);
+      trajRedraw();
+    });
+    planTrajWindowTrackFill(months, trajState);
+  }
+  const effMonths = planTrajEffectiveRange(months, trajState);
+  planTrajChartDraw(t, block, effMonths);
   // The breakdown follows the shared window even when the Difference
   // chart's own range is empty — it is a comparison-section chart,
   // not a Difference-chart chart.

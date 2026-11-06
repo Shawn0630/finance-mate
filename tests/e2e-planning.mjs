@@ -6217,6 +6217,61 @@ export async function run(H, S) {
         e.value = String(e.max);
         e.dispatchEvent(new Event('input', { bubbles: true }));
       });
+      // Difference range slider (user 2026-11-06), pool kind: the band
+      // chart + the table below it follow the same dual-thumb slider;
+      // the headline slider (and its Stock gain card) never move.
+      const poolDiffSlider = async () => page.evaluate(() => {
+        const s = document.querySelector('#planReportTrajWindowStart');
+        const e = document.querySelector('#planReportTrajWindowEnd');
+        return s && e ? { sMin: Number(s.min), sMax: Number(s.max), sVal: Number(s.value), eMin: Number(e.min), eMax: Number(e.max), eVal: Number(e.value), label: document.querySelector('#planReportTrajWindowLabel')?.textContent || '' } : null;
+      });
+      const poolDiffSet = async (which, idx) => page.evaluate((w, i) => {
+        const s = document.querySelector(w === 'start' ? '#planReportTrajWindowStart' : '#planReportTrajWindowEnd');
+        s.value = String(i);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, which, idx);
+      const poolDiffState = async () => page.evaluate(() => {
+        const cv = document.getElementById('planReportTrajectoryChart');
+        let labels = [];
+        try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; labels = ch ? ch.data.labels : []; } catch { labels = []; }
+        const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')];
+        return {
+          labels,
+          firstRow: rows.length ? (rows[0].querySelector('td')?.textContent || '').trim() : null,
+          lastRow: rows.length ? (rows[rows.length - 1].querySelector('td')?.textContent || '').trim() : null,
+          rowCount: rows.length,
+          pager: [...document.querySelectorAll('#planReportTablePager button')].map((b) => b.textContent.trim()),
+          headStart: document.querySelector('#planReportHeadlineWindowStart') ? Number(document.querySelector('#planReportHeadlineWindowStart').value) : null,
+          headEnd: document.querySelector('#planReportHeadlineWindowEnd') ? Number(document.querySelector('#planReportHeadlineWindowEnd').value) : null,
+        };
+      });
+      const poolDiffInit = await poolDiffState();
+      const poolDiffLabels = poolDiffInit.labels;
+      const poolDiffSl = await poolDiffSlider();
+      H.check('diffslider: pool Difference slider defaults to All (full trajectory months)',
+        poolDiffSl && poolDiffSl.sMin === 0 && poolDiffSl.sMax === poolDiffLabels.length - 1 && poolDiffSl.sVal === 0 && poolDiffSl.eVal === poolDiffLabels.length - 1
+          && poolDiffLabels.length === 361
+          && poolDiffSl.label === `${poolDiffLabels[0]} – ${poolDiffLabels[poolDiffLabels.length - 1]} · 361 months · All`,
+        JSON.stringify({ slider: poolDiffSl, n: poolDiffLabels.length }));
+      const poolDiffHeadStart = poolDiffInit.headStart;
+      const poolDiffHeadEnd = poolDiffInit.headEnd;
+      const poolDiffGain = await poolCard('Stock gain');
+      const poolDiffYears = [...new Set(poolDiffLabels.slice(0, 2).map((l) => l.slice(-4)))];
+      const poolDiffPager = poolDiffYears.length > 1 ? poolDiffYears : [];
+      await poolDiffSet('end', 1);
+      await page.waitForFunction(() => { const cv = document.getElementById('planReportTrajectoryChart'); const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === 2; }, { timeout: 15000 });
+      const poolDiffNarrowed = await poolDiffState();
+      H.check('diffslider: pool end handle narrows the band chart + table to the first 2 months; headline slider + Stock gain untouched',
+        poolDiffNarrowed.labels.length === 2 && JSON.stringify(poolDiffNarrowed.labels) === JSON.stringify(poolDiffLabels.slice(0, 2))
+          && poolDiffNarrowed.firstRow === poolDiffLabels[0] && poolDiffNarrowed.lastRow === poolDiffLabels[1]
+          && poolDiffNarrowed.rowCount === 2 && JSON.stringify(poolDiffNarrowed.pager) === JSON.stringify(poolDiffPager)
+          && poolDiffNarrowed.headStart === poolDiffHeadStart && poolDiffNarrowed.headEnd === poolDiffHeadEnd
+          && poolParse(await poolCard('Stock gain')) === -1200,
+        JSON.stringify({ ...poolDiffNarrowed, gain: poolDiffGain }));
+      // Back to All (leave the tab as the flow found it).
+      await poolDiffSet('end', poolDiffLabels.length - 1);
+      await page.waitForFunction((n) => { const cv = document.getElementById('planReportTrajectoryChart'); const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === n; }, { timeout: 15000 }, poolDiffLabels.length);
       H.check('invcomp: report table has Value Δ only, no mortgage columns',
         repPool.tableHead.includes('Value Δ') && !repPool.tableHead.includes('Balance Δ') && !repPool.tableHead.includes('Baseline balance')
           && repPool.tableCap.includes('Value Δ') && !repPool.tableCap.includes('Balance Δ'),
@@ -8927,18 +8982,94 @@ export async function run(H, S) {
       }));
       H.check('detail-clarity: template report chart has title + axis caption, embedded comparison too',
         repView.title && repView.axis && repView.trajTitle && repView.trajBreak, JSON.stringify(repView));
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportComparePanel [data-plan-traj-preset="1y"]');
-      await waitD(800);
-      const repNarrowed = await page.evaluate(() => {
-        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels.length : -1; } catch { return -2; } };
-        return { labels: chartOf('planReportTrajectoryChart'), labelsBreak: chartOf('planReportTrajectoryBreakdownChart'), active: !!document.querySelector('#planReportComparePanel [data-plan-traj-preset="1y"].active') };
+      // Difference range slider (user 2026-11-06): the old preset
+      // buttons + From/To pickers are a dual-thumb slider above the
+      // chart; the Difference table below follows it. The headline
+      // slider is independent — dragging this one never moves it,
+      // and the payment breakdown (headline window) stays at 361.
+      const diffSlider = async () => page.evaluate(() => {
+        const s = document.querySelector('#planReportTrajWindowStart');
+        const e = document.querySelector('#planReportTrajWindowEnd');
+        return s && e ? { sMin: Number(s.min), sMax: Number(s.max), sVal: Number(s.value), eMin: Number(e.min), eMax: Number(e.max), eVal: Number(e.value), label: document.querySelector('#planReportTrajWindowLabel')?.textContent || '' } : null;
       });
-      // The 1y preset narrows the Difference chart only. The payment
-      // breakdown chart follows the headline window (user 2026-11-06
-      // refinement — the window sits at its default full horizon
-      // here, so the breakdown stays at 361), not the Δ picker.
-      H.check('detail-clarity: report difference 1y preset narrows the difference chart; the breakdown bars follow the headline window (unchanged at 361)',
-        repNarrowed.labels === 12 && repNarrowed.labelsBreak === 361 && repNarrowed.active, JSON.stringify(repNarrowed));
+      const diffSet = async (which, idx) => page.evaluate((w, i) => {
+        const s = document.querySelector(w === 'start' ? '#planReportTrajWindowStart' : '#planReportTrajWindowEnd');
+        s.value = String(i);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, which, idx);
+      const diffState = async () => page.evaluate(() => {
+        const chartOf = (id) => { const cv = document.getElementById(id); try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch ? ch.data.labels : null; } catch { return null; } };
+        const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')];
+        return {
+          labels: chartOf('planReportTrajectoryChart') || [],
+          breakLabels: chartOf('planReportTrajectoryBreakdownChart') || [],
+          firstRow: rows.length ? (rows[0].querySelector('td')?.textContent || '').trim() : null,
+          lastRow: rows.length ? (rows[rows.length - 1].querySelector('td')?.textContent || '').trim() : null,
+          rowCount: rows.length,
+          pager: [...document.querySelectorAll('#planReportTablePager button')].map((b) => b.textContent.trim()),
+          headStart: document.querySelector('#planReportHeadlineWindowStart') ? Number(document.querySelector('#planReportHeadlineWindowStart').value) : null,
+          headEnd: document.querySelector('#planReportHeadlineWindowEnd') ? Number(document.querySelector('#planReportHeadlineWindowEnd').value) : null,
+        };
+      });
+      const diffInit = await diffState();
+      const diffLabels = diffInit.labels;
+      const diffSl = await diffSlider();
+      // The trajectory months run Feb 2025 – Nov 2056 (382 — the
+      // mortgage schedule start, not the current month); the 361 is
+      // the headline window (breakdown), which starts at the current
+      // month. The Difference slider spans the full trajectory list.
+      const diffMonthsN = dcFirst.length;
+      const diffMonName = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const diffFmtYm = (ym) => `${diffMonName[Number(ym.slice(5, 7)) - 1]} ${ym.slice(0, 4)}`;
+      const diffFirstYm = dcFirst[0].month;
+      const diffLastYm = dcFirst[dcFirst.length - 1].month;
+      H.check('diffslider: Difference slider defaults to All (full trajectory months)',
+        diffSl && diffSl.sMin === 0 && diffSl.sMax === diffMonthsN - 1 && diffSl.sVal === 0 && diffSl.eVal === diffMonthsN - 1
+          && diffInit.breakLabels.length === 361
+          && diffSl.label === `${diffFmtYm(diffFirstYm)} – ${diffFmtYm(diffLastYm)} · ${diffMonthsN} months · All`,
+        JSON.stringify({ slider: diffSl, months: diffMonthsN, first: diffFirstYm, last: diffLastYm }));
+      const diffHeadStart = diffInit.headStart;
+      const diffHeadEnd = diffInit.headEnd;
+      // Narrow to the first 12 trajectory months: the chart shows the
+      // first 12 labels; the table shows the first window year only
+      // (Nov–Dec 2026) and the pager covers the window years only.
+      const diffYearOf = (lab) => lab.slice(-4);
+      const diffFirstYearLast = (() => { let i = 0; while (i + 1 < 12 && diffYearOf(diffLabels[i + 1]) === diffYearOf(diffLabels[0])) i += 1; return i; })();
+      const diffFirstYears = [...new Set(diffLabels.slice(0, 12).map(diffYearOf))];
+      await diffSet('end', 11);
+      await page.waitForFunction((n) => { const cv = document.getElementById('planReportTrajectoryChart'); const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === n; }, { timeout: 15000 }, 12);
+      const diffNarrowed = await diffState();
+      H.check('diffslider: end handle narrows the Difference chart + table to the first 12 months; breakdown + headline slider untouched',
+        diffNarrowed.labels.length === 12 && JSON.stringify(diffNarrowed.labels) === JSON.stringify(diffLabels.slice(0, 12))
+          && diffNarrowed.breakLabels.length === 361
+          && diffNarrowed.firstRow === diffLabels[0] && diffNarrowed.lastRow === diffLabels[diffFirstYearLast]
+          && diffNarrowed.rowCount === diffFirstYearLast + 1
+          && JSON.stringify(diffNarrowed.pager) === JSON.stringify(diffFirstYears)
+          && diffNarrowed.headStart === diffHeadStart && diffNarrowed.headEnd === diffHeadEnd,
+        JSON.stringify(diffNarrowed));
+      // Narrow to a mid-horizon window: end back to full, start to
+      // month 120 — the chart shows the payoff-truncated tail from
+      // there, the table shows the first window year from there, and
+      // the pager covers the trajectory years in the window.
+      await diffSet('end', diffMonthsN - 1);
+      await diffSet('start', 120);
+      await page.waitForFunction((n) => { const cv = document.getElementById('planReportTrajectoryChart'); const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === n; }, { timeout: 15000 }, diffLabels.length - 120);
+      const diffMid = await diffState();
+      const diffMidYears = [...new Set(dcFirst.slice(120).map((r) => r.month.slice(0, 4)))];
+      const diffMidFirstYearLast = (() => { let i = 120; while (i + 1 < diffLabels.length && diffYearOf(diffLabels[i + 1]) === diffYearOf(diffLabels[120])) i += 1; return i; })();
+      H.check('diffslider: start handle narrows the Difference chart + table to month 120 onward; headline slider untouched',
+        diffMid.labels.length === diffLabels.length - 120 && JSON.stringify(diffMid.labels) === JSON.stringify(diffLabels.slice(120))
+          && diffMid.breakLabels.length === 361
+          && diffMid.firstRow === diffLabels[120] && diffMid.lastRow === diffLabels[diffMidFirstYearLast]
+          && diffMid.rowCount === diffMidFirstYearLast - 120 + 1
+          && JSON.stringify(diffMid.pager) === JSON.stringify(diffMidYears)
+          && diffMid.headStart === diffHeadStart && diffMid.headEnd === diffHeadEnd,
+        JSON.stringify(diffMid));
+      // Back to All (leave the tab as the flow found it).
+      await diffSet('start', 0);
+      await diffSet('end', diffMonthsN - 1);
+      await page.waitForFunction((n) => { const cv = document.getElementById('planReportTrajectoryChart'); const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === n; }, { timeout: 15000 }, diffLabels.length);
       await page.goto(`http://ff.local/#planning/report/${dcProjectId}/${dcAiRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       try { await page.waitForFunction(() => [...document.querySelectorAll('#planReport .panel h3')].some((h) => h.textContent.trim() === 'DC AI balance path'), { timeout: 15000 }); } catch { /* fall through: the check below FAILs with the diagnostic */ }
       await waitD(300);
