@@ -11109,11 +11109,15 @@ function planGroupedBarChart(id, labels, datasets) {
   });
   return planCharts[id];
 }
-let planReportDoughnutCenter = null; // {label, total} for the report share doughnut's hole
 const planReportDoughnutCenterPlugin = {
   id: 'planReportDoughnutCenter',
   afterDraw(chart) {
-    if (!planReportDoughnutCenter || chart !== planCharts[planReportDoughnutCenter.id]) return;
+    // The center is per-chart (stored on the chart instance): the
+    // strategy page hosts several doughnuts at once (baseline pool,
+    // sink, funding viz), and a single shared global would leave
+    // only the last-drawn one with a center.
+    const center = chart.$doughnutCenter;
+    if (!center) return;
     const area = chart.chartArea;
     const x = (area.left + area.right) / 2;
     const y = (area.top + area.bottom) / 2;
@@ -11122,10 +11126,10 @@ const planReportDoughnutCenterPlugin = {
     c.textAlign = 'center';
     c.fillStyle = '#71808f';
     c.font = '11px system-ui, sans-serif';
-    c.fillText(planReportDoughnutCenter.label, x, y - 4);
+    c.fillText(center.label, x, y - 4);
     c.fillStyle = '#22303c';
     c.font = '700 14px system-ui, sans-serif';
-    c.fillText(money2(planReportDoughnutCenter.total), x, y + 14);
+    c.fillText(money2(center.total), x, y + 14);
     c.restore();
   },
 };
@@ -11133,7 +11137,6 @@ function planDoughnutChart(id, labels, data, centerLabel, centerTotal) {
   planDestroyChart(id);
   const el = document.getElementById(id);
   if (!el) return null;
-  planReportDoughnutCenter = { id, label: centerLabel, total: centerTotal };
   planCharts[id] = new Chart(el, {
     type: 'doughnut',
     data: { labels, datasets: [{ data, backgroundColor: labels.map((_, i) => planColor(i)), hoverOffset: 10 }] },
@@ -11143,6 +11146,7 @@ function planDoughnutChart(id, labels, data, centerLabel, centerTotal) {
     },
     plugins: [planReportDoughnutCenterPlugin],
   });
+  planCharts[id].$doughnutCenter = { label: centerLabel, total: centerTotal };
   return planCharts[id];
 }
 const PLAN_COLORS = ['#20573a', '#2f7de1', '#c46a1b', '#7a3fa0', '#b03a3a', '#0f766e', '#8a6d00', '#3f3f46'];
@@ -11572,14 +11576,6 @@ async function planAiCreateSerializeQueue() {
     reader.readAsDataURL(f);
   })));
 }
-// Sink line for the AI-create preview (the GIC shape carries a
-// custom sink; a stock sink names its holding + trend).
-function planAiCreateSinkLabel(sink) {
-  if (!sink || typeof sink !== 'object') return '';
-  if (sink.kind === 'custom') return `Custom — ${sink.name || ''}${sink.expectedReturnPct != null ? ` · ${sink.expectedReturnPct}%/yr` : ''}`;
-  if (sink.kind === 'stock') return sink.symbol ? `Stock ${sink.symbol}${sink.trendPct != null ? ` · ${sink.trendPct}%/yr` : ''}` : `Stock holding ${sink.holdingId ?? ''}${sink.trendPct != null ? ` · ${sink.trendPct}%/yr` : ''}`;
-  return JSON.stringify(sink);
-}
 function planAiCreateRenderPreview() {
   const r = planAiCreateProposal;
   const host = $('#planAiCreatePreview');
@@ -11597,7 +11593,6 @@ function planAiCreateRenderPreview() {
     <div><label>Baseline name *</label><input id="planAiCreateBaselineName" value="${esc(p.baseline.name || '')}"></div>
     <div><label>Baseline description</label><input id="planAiCreateBaselineDesc" value="${esc(p.baseline.description || '')}"></div>
     <div><label>Strategy name *</label><input id="planAiCreateStrategyName" value="${esc(p.strategy.name || '')}"></div>
-    ${p.strategy.sink ? `<div class="n">Sink: ${esc(planAiCreateSinkLabel(p.strategy.sink))}</div>` : ''}
     <div><label>Operations</label>${ops.length ? ops.map((o, i) => `<div class="plan-row" data-plan-ai-create-op="${i}"><span>${esc(o.op_type)}</span><textarea data-plan-ai-create-op-params rows="2" style="flex:1">${esc(JSON.stringify(o.params || {}))}</textarea><button type="button" class="small" data-plan-ai-create-op-remove="${i}">Remove</button></div>`).join('') : '<div class="note">No operations proposed.</div>'}</div>
     ${(r.unresolved && r.unresolved.length) ? `<div><label>Not included (unresolved)</label>${r.unresolved.map((u) => `<div class="plan-row"><span>${esc(u.op ? u.op.op_type : '')} · ${esc(u.reason)}</span></div>`).join('')}</div>` : ''}`;
   host.querySelectorAll('[data-plan-ai-create-op-remove]').forEach((btn) => {
@@ -11664,7 +11659,7 @@ async function planAiCreateApply() {
     project: { name: $('#planAiCreateProjectName').value.trim(), question: p.project.question || null },
     scenario: { name: $('#planAiCreateScenarioName').value.trim(), factors: p.scenario.factors || {} },
     baseline: { name: $('#planAiCreateBaselineName').value.trim(), description: $('#planAiCreateBaselineDesc').value.trim(), assumptions: p.baseline.assumptions },
-    strategy: { name: $('#planAiCreateStrategyName').value.trim(), ops, ...(p.strategy.sink ? { sink: p.strategy.sink } : {}) },
+    strategy: { name: $('#planAiCreateStrategyName').value.trim(), ops },
   };
   try {
     const data = await api('/api/planning/ai-create/apply', { method: 'POST', body: { proposal, category: planAiCreateCtx.category, subcategory: planAiCreateCtx.subcategory, entity: planAiCreateCtx.entity } });
@@ -11763,6 +11758,43 @@ function planBaselinePoolDoughnutDraw(fb, chartId) {
   if (!items.length) return;
   if (!document.getElementById(chartId)) return;
   planDoughnutChart(chartId, items.map((it) => it.account || it.symbol || 'External funding'), items.map((it) => Number(it.value ?? it.amount ?? 0) || 0), 'Pool total', fb.figures.poolValue);
+}
+// Sink doughnut (user 2026-11-05): where the pool goes — one slice
+// per buy (symbol + amount), the unallocated remainder as a "Pool"
+// slice. No buys = the whole pool held as-is, one slice. Same
+// component/style as the Baseline card's pool doughnut; the table
+// under it carries the exact amounts + shares, and it is redrawn on
+// every strategy-page load, so it tracks adds/edits/deletes.
+function planSinkDoughnutDraw(d) {
+  const fb = d && d.fixedBaseline;
+  if (!fb || fb.kind !== 'investment' || !fb.figures || fb.figures.poolValue == null) return;
+  const chartId = 'planSinkDoughnutChart';
+  if (!document.getElementById(chartId)) return;
+  const total = Number(fb.figures.poolValue) || 0;
+  const buys = (d.ops || []).filter((o) => o.op_type === 'buy');
+  const labels = [];
+  const data = [];
+  let allocated = 0;
+  for (const o of buys) {
+    const p = o.params || {};
+    const amt = Number(p.amount) || 0;
+    if (amt <= 0) continue;
+    allocated += amt;
+    labels.push(p.symbol || o.holdingSymbol || 'Buy');
+    data.push(amt);
+  }
+  const rest = Math.max(0, total - allocated);
+  if (rest > 0 || !labels.length) { labels.push('Pool'); data.push(rest); }
+  planDoughnutChart(chartId, labels, data, 'Pool total', total);
+  const tbl = document.getElementById('planSinkDoughnutTable');
+  if (tbl) {
+    const rows = buys.map((o) => {
+      const p = o.params || {};
+      return { label: p.symbol || o.holdingSymbol || 'Buy', amount: Number(p.amount) || 0 };
+    }).filter((r) => r.amount > 0);
+    if (rest > 0 || !rows.length) rows.push({ label: 'Pool (held as-is)', amount: rest });
+    tbl.innerHTML = `<table class="tbl"><thead><tr><th>Buy</th><th>Amount</th><th>Share</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${esc(r.label)}</td><td>${money2(r.amount)}</td><td>${total ? `${((r.amount / total) * 100).toFixed(1)}%` : '—'}</td></tr>`).join('')}</tbody></table>`;
+  }
 }
 function planFixedBaselineHtml(fb, scen, opts = {}) {
   if (!fb) return '<div class="note">No fixed baseline — legacy project without a category.</div>';
@@ -12670,8 +12702,8 @@ $('#planBaselineEditForm').addEventListener('submit', async (e) => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 // One-line summary of a scenario's world factors. Empty = a flat world
-// (current rates/terms throughout). The sink is NOT part of this line:
-// it lives on the strategy, not the world.
+// (current rates/terms throughout). The buy list is NOT part of this
+// line: it lives on the strategy, not the world.
 function planScenarioSummaryLine(factors) {
   const f = factors && typeof factors === 'object' ? factors : {};
   // A disabled factor (enabled === false — unchecked in the editor,
@@ -12694,11 +12726,12 @@ function planScenarioSummaryLine(factors) {
   if (on('rentGrowth') && f.rentGrowth && f.rentGrowth.valuePct != null) parts.push(`Rent +${f.rentGrowth.valuePct}%/yr`);
   return parts.join(' · ');
 }
-// One-line sink summary for a strategy card. Investment strategies
-// without a sink get a prompt instead.
-function planSinkLine(sink, isInvestment) {
-  if (sink) return sink.kind === 'custom' ? `Sink: ${sink.name}` : `Sink: ${sink.symbol || 'existing stock'}`;
-  if (isInvestment) return 'Sink: not picked yet';
+// One-line buy summary for a strategy card (the buy list IS the
+// sink since 2026-11-05): the bought symbols, or a prompt for a
+// pool strategy with no buys yet.
+function planSinkLine(buys, isInvestment) {
+  if (buys && buys.length) return `Buys: ${buys.join(' · ')}`;
+  if (isInvestment) return 'No buys yet';
   return '';
 }
 function planStrategyCardsRender(rows, projectId) {
@@ -12710,8 +12743,8 @@ function planStrategyCardsRender(rows, projectId) {
     let tp = {};
     try { tp = typeof r.strategy.template_params === 'string' ? JSON.parse(r.strategy.template_params) : (r.strategy.template_params || {}); } catch { tp = {}; }
     const isInvestment = planProjectData && planProjectData.project && planProjectData.project.category === 'investment';
-    const sinkLine = planSinkLine(r.sink, isInvestment);
-    const legacySinkLine = !r.sink && tp.source && tp.sink ? `<div class="n">Source: ${esc(tp.source === 'pot' ? 'cash pot' : tp.source)} → Sink: ${esc(tp.sinkLabel || tp.sink)}</div>` : '';
+    const sinkLine = planSinkLine(r.buys, isInvestment);
+    const legacySinkLine = !(r.buys && r.buys.length) && tp.source && tp.sink ? `<div class="n">Source: ${esc(tp.source === 'pot' ? 'cash pot' : tp.source)} → Buys: ${esc(tp.sinkLabel || tp.sink)}</div>` : '';
     return `
     <div class="card breakdown-card plan-flow-card" data-plan-strategy="${r.strategy.id}" style="cursor:pointer">
       <div class="k">${esc(r.strategy.letter)} · ${esc(r.strategy.name)}${r.strategy.merged ? ' · Merged' : ''}</div>
@@ -12746,7 +12779,7 @@ async function loadPlanStrategyCards(projectId) {
   // by the Scenarios tier's Selected state — no "Under …" note line
   // in the mid-tier (user 2026-11-04: tiny and weird, removed).
   if (scenarios.length && !planCompareScenarioIds.length) {
-    planStrategyCardsRender((planProjectData.strategies || []).map((st) => ({ strategy: st, comparison: null, sink: null })), projectId);
+    planStrategyCardsRender((planProjectData.strategies || []).map((st) => ({ strategy: st, comparison: null, buys: [] })), projectId);
     planWiringRefresh();
     return;
   }
@@ -14045,6 +14078,7 @@ async function loadPlanStrategy(id, scenarioId) {
     $('#planStrategy').innerHTML = planStrategyHtml(data);
     planStrategyWire(data);
     planBaselinePoolDoughnutDraw(data.fixedBaseline, 'planStrategyBaselinePoolChart');
+    planSinkDoughnutDraw(data);
   });
 }
 function planLegLabel(l) {
@@ -14057,14 +14091,16 @@ function planLegLabel(l) {
 function planStrategyHtml(d) {
   const s = d.strategy;
   const c = d.comparison;
-  // Merged Sink (user 2026-11-05): a cash-pool investment strategy
-  // shows ONE Sink section instead of Operations — the buy list buys
-  // into the sink, buy-only, no sell rows. Gated on the fixed
-  // baseline BEING a cash pool (figures.poolValue), not on the
-  // project category: an investment strategy over a single account
-  // or holding has no pool and keeps Operations. (baselineKind
-  // alone cannot gate this — it is 'pool' for every investment
-  // project, pool entity or not.)
+  // Sink (user 2026-11-05, simplified): a cash-pool investment
+  // strategy shows ONE Sink section instead of Operations — a
+  // doughnut of where the pool goes + the buy list, buy-only, no
+  // sell rows. No picker: the return lives on the scenario (stock
+  // factor) or on the buy itself (a custom product's rate). Gated
+  // on the fixed baseline BEING a cash pool (figures.poolValue),
+  // not on the project category: an investment strategy over a
+  // single account or holding has no pool and keeps Operations.
+  // (baselineKind alone cannot gate this — it is 'pool' for every
+  // investment project, pool entity or not.)
   const isPool = !!(d.fixedBaseline && d.fixedBaseline.kind === 'investment' && d.fixedBaseline.figures && d.fixedBaseline.figures.poolValue != null);
   const planOpCardHtml = (o) => {
     const p = o.params || {};
@@ -14075,12 +14111,35 @@ function planStrategyHtml(d) {
       : o.op_type === 'buy' ? `Buy ${p.symbol || o.holdingSymbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}`
       : o.op_type === 'sell' ? `Sell ${p.units} units on ${esc(p.date || '')}`
       : `Position ${p.units} units on ${esc(p.date || '')}`;
-    const legRows = (o.op_type === 'buy' || o.op_type === 'sell') ? (o.legs || []).map((l) => `
-      <div class="plan-row" data-plan-leg-op="${o.id}" data-plan-leg-id="${l.id}"><span>↳ Leg · ${esc(planLegLabel(l))}</span>
-        <span class="toolbar"><button class="small" data-plan-leg-edit="${o.id}:${l.id}">Edit</button><button class="small danger" data-plan-leg-del="${o.id}:${l.id}">Delete</button></span></div>`).join('') : '';
+    // A buy's funding legs resolve to money: a 'remainder'/'all' leg
+    // takes the buy amount minus the other legs' fixed amounts, so
+    // the row shows what the pool actually funds (sell how much).
+    const legAmount = (l) => {
+      if (l.amount !== 'remainder' && l.amount !== 'all') return Number(l.amount) || 0;
+      const fixed = (o.legs || []).filter((x) => x !== l && Number(x.amount) > 0).reduce((s, x) => s + Number(x.amount), 0);
+      return Math.max(0, (Number(p.amount) || 0) - fixed);
+    };
+    const legRows = (o.op_type === 'buy' || o.op_type === 'sell') ? (o.legs || []).map((l) => {
+      // Pool buys are funded by the pool: the leg reads as what was
+      // sold from the pool, not as a jargon "Leg · Remainder".
+      const text = o.op_type === 'buy' && isPool && l.source_ref === 'cash'
+        ? `Sell from pool · ${money2(legAmount(l))}`
+        : `Leg · ${esc(planLegLabel(o.op_type === 'buy' ? { ...l, amount: legAmount(l) } : l))}`;
+      return `
+      <div class="plan-row" data-plan-leg-op="${o.id}" data-plan-leg-id="${l.id}"><span>↳ ${text}</span>
+        <span class="toolbar"><button class="small" data-plan-leg-edit="${o.id}:${l.id}">Edit</button><button class="small danger" data-plan-leg-del="${o.id}:${l.id}">Delete</button></span></div>`;
+    }).join('') : '';
+    // A pool buy with no legs at all is pool-funded by definition —
+    // show the sell line rather than nothing.
+    const poolSellLine = isPool && o.op_type === 'buy' && !(o.legs || []).length
+      ? `\n      <div class="plan-row"><span>↳ Sell from pool · ${money2(p.amount || 0)}</span></div>` : '';
+    // The sink is gone: a pool buy's "Source: sink/manual" line is
+    // stale jargon — the three figures (what / sell how much / buy
+    // how much) are the row.
+    const srcLine = isPool && o.op_type === 'buy' ? '' : `<div class="n">Source: ${esc(o.source || '')}</div>`;
     return `<div class="card breakdown-card plan-flow-card" data-plan-op-card="${o.id}">
       <div class="k">${o.seq}. ${esc(o.op_type)} — ${desc}</div>
-      <div class="n">Source: ${esc(o.source || '')}</div>${legRows}
+      ${srcLine}${legRows}${poolSellLine}
       <div class="toolbar"><button class="small" data-plan-op-edit="${o.id}">Edit</button><button class="small danger" data-plan-op-del="${o.id}">Delete</button></div></div>`;
   };
   const opsHtml = d.ops.map(planOpCardHtml).join('');
@@ -14131,8 +14190,9 @@ function planStrategyHtml(d) {
       <div class="plan-flow-group" id="planStrategySinkGroup">
       <div class="section-head"><h3>Sink</h3></div>
       <div class="card breakdown-card plan-flow-card" id="planSinkPanel">
-      <div id="planFactorSink"></div>
-      <div id="planSinkBuyList">${buyOpsHtml || '<div class="note">No buys yet.</div>'}</div>
+      <div class="chart-wrap" style="height:200px"><canvas id="planSinkDoughnutChart"></canvas></div>
+      <div id="planSinkDoughnutTable"></div>
+      <div id="planSinkBuyList">${buyOpsHtml || '<div class="note">No buys yet — the pool is held as-is.</div>'}</div>
       <div class="toolbar"><button class="small" id="planSinkAddBuyBtn">+ Add buy</button></div>
       <div class="msg" id="planOpsMsg"></div>
       </div>
@@ -14147,11 +14207,6 @@ function planStrategyHtml(d) {
       </div>`}
       </div>
     </div>
-    ${d.project.category === 'investment' && !isPool ? `<div class="panel" id="planSinkPanel">
-      <div class="section-head"><h3>Sink</h3></div>
-      <div id="planFactorSink"></div>
-      <div class="msg" id="planSinkMsg"></div>
-    </div>` : ''}
     <div class="panel" id="planStrategyReportsPanel">
       <div class="section-head"><h3>Reports</h3>
         <div class="toolbar"><button class="small primary" id="planStrategyGenerateBtn">Generate report</button><button class="small" id="planStrategyAiReportBtn">Generate with AI</button></div>
@@ -14282,7 +14337,6 @@ function planStrategyWire(d) {
   // card is scenarioId 0). Cards never navigate.
   document.querySelectorAll('[data-plan-strategy-scenario-select]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); loadPlanStrategy(s.id, Number(b.dataset.planStrategyScenarioSelect)); }));
   document.querySelectorAll('[data-plan-strategy-scenario]').forEach((card) => card.addEventListener('click', () => loadPlanStrategy(s.id, Number(card.dataset.planStrategyScenario))));
-  planSinkWire(d);
 }
 // Strategy-tier Reports wiring (ENGINE round, item 7): the routing
 // displays and the aiHits() guard are GONE (both Generate buttons
@@ -14363,310 +14417,12 @@ function planStrategyReportsWire(d) {
 
 
 // Strategy factors editor: prime (history chart + date/rate points +
-// view presets), stock return (historical suggestions), growth rates,
-// and the investment sink. State lives in planFactorState; Save sends
-// the whole set (an existing sink is preserved untouched by a factors
-// save — only the sink block rebuilds operations).
+// view presets), stock return (historical suggestions), growth rates.
+// State lives in planFactorState; Save sends the whole set.
 let planFactorState = null;
 let planFactorActive = new Set();
 let planFactorRedrawPrime = null;
 let planFactorMonthPopWired = false;
-// Sink editor for the strategy detail page (investment projects only).
-// The sink is strategy equipment, not a world factor, so it renders
-// here always — no Add-factor gate. Saving rebuilds the strategy's ops
-// into sell-pool + buy-sink ops, as before. Sink Delete (clear to a
-// re-pick state) belongs to the strategy-page redesign round.
-// The pick is ONE entry, modelled on the pool funding picker ("+ Add
-// funding"): pick a stock (an existing holding, or a new symbol via
-// autocomplete) or a custom product — WITH its expected return
-// attached as part of the pick. A stock with price history offers
-// trend suggestions that fill the return; a new symbol has no
-// history, so the return is typed inline. Nothing blocks Save with
-// a trend gate anymore: the return is a visible field, and Save
-// only requires it to be filled in.
-function planSinkWire(d) {
-  const s = d.strategy;
-  const sinkHost = $('#planFactorSink');
-  if (!sinkHost || d.project.category !== 'investment') return;
-  let holdings = [];
-  let accounts = [];
-  const poolAccounts = Array.isArray(d.poolAccounts) ? d.poolAccounts : [];
-  let sinkTrend = null;
-  let sinkPrice = null;
-  const sink = d.sink || null;
-  let tp = {};
-  try { tp = typeof s.template_params === 'string' ? JSON.parse(s.template_params) : (s.template_params || {}); } catch { tp = {}; }
-  let sinkEditing = false;
-  const render = () => {
-    const defaultKind = sink && sinkEditing ? (sink.kind === 'custom' ? 'custom' : 'stock') : (tp.sinkKind === 'custom' ? 'custom' : 'stock');
-    const sinkSymbol = sink && sink.kind === 'stock'
-      ? (sink.symbol || (holdings.find((h) => Number(h.id) === Number(sink.holdingId)) || {}).symbol || (holdings.find((h) => Number(h.id) === Number(sink.holdingId)) || {}).label || 'existing stock')
-      : null;
-    const curLine = sink
-      ? (sink.kind === 'custom' ? `Current sink: ${sink.name} · ${sink.expectedReturnPct}%/yr expected` : `Current sink: ${sinkSymbol} · trend ${sink.trendPct}%/yr${sink.basis ? ` (${sink.basis}${sink.window ? ` · ${sink.window}` : ''})` : ''}`)
-      : 'No sink picked yet — the strategy holds the pool until you pick one.';
-    // A picked sink shows as a line with Edit + Delete; Delete clears
-    // it back to the pick form below. No sink = the pick form itself.
-    if (sink && !sinkEditing) {
-      sinkHost.innerHTML = `<div class="note">${esc(curLine)}</div>
-        <div class="toolbar"><button class="small" id="planSinkEditBtn">Edit</button><button class="small danger" id="planSinkDelBtn">Delete</button></div>
-        <div class="msg" id="planSinkMsg"></div>`;
-      $('#planSinkEditBtn').addEventListener('click', () => { sinkEditing = true; render(); });
-      $('#planSinkDelBtn').addEventListener('click', async () => {
-        if (!confirm('Delete the sink? This clears the sink and removes its sell/buy operations.')) return;
-        try { await api(`/api/planning/strategies/${s.id}/sink`, { method: 'DELETE' }); loadPlanStrategy(s.id); }
-        catch (err) { showMsg($('#planSinkMsg'), 'err', err.message); }
-      });
-      return;
-    }
-    // The account picker for a new-symbol buy: the pool's accounts
-    // when it spans more than one (default the largest share); all
-    // accounts when the pool holds none; no picker for a
-    // single-account pool — that account is used.
-    const acctOptions = poolAccounts.length === 1 ? null
-      : poolAccounts.length > 1 ? poolAccounts
-      : accounts.map((a) => ({ accountId: a.id, name: a.name, value: null }));
-    sinkHost.innerHTML = `<div class="note">${esc(curLine)}</div>
-      <div class="note">Pick what the pool goes into — a stock or a custom product — and its expected return. Saving rebuilds the strategy's operations into sell-pool + buy-sink operations.</div>
-      <div><label><input type="radio" name="planSinkKind" value="stock"${defaultKind === 'stock' ? ' checked' : ''}> Stock</label>
-      <label><input type="radio" name="planSinkKind" value="custom"${defaultKind === 'custom' ? ' checked' : ''}> Custom product</label></div>
-      <div id="planSinkStockBox"${defaultKind === 'custom' ? ' class="hidden"' : ''}>
-        <div><label>Stock</label><select id="planSinkHolding"></select></div>
-        <div id="planSinkNewBox" class="hidden">
-          <div><label>Symbol</label><div class="suggest-wrap"><input id="planSinkSymbol" placeholder="Symbol for a new stock" autocomplete="off"><ul class="suggest-list hidden" id="planSinkSymbolSuggest"></ul></div></div>
-          <div id="planSinkPriceNote" class="n hidden"></div>
-          <div id="planSinkAccountBox"${acctOptions ? '' : ' class="hidden"'}><label>Account</label><select id="planSinkAccount">${(acctOptions || []).map((a) => `<option value="${a.accountId}">${esc(a.name)}${a.value != null ? ` · ${money2(a.value)}` : ''}</option>`).join('')}</select></div>
-        </div>
-        <div><label>Expected return (% / year) *</label><input id="planSinkReturn" type="text" inputmode="decimal" data-money></div>
-        <div class="toolbar"><button class="small" id="planSinkSuggestBtn">Suggest trend</button></div><div id="planSinkSuggestOut"></div>
-      </div>
-      <div id="planSinkCustomBox"${defaultKind === 'stock' ? ' class="hidden"' : ''}>
-        <div><label>Product name *</label><input id="planSinkName"></div>
-        <div><label>Expected return (% / year) *</label><input id="planSinkCustomReturn" type="text" inputmode="decimal" data-money></div>
-      </div>
-      <div class="toolbar"><button class="small primary" id="planSinkSaveBtn">Save sink (rebuilds operations)</button></div>
-      <div class="msg" id="planSinkMsg"></div>`;
-    sinkHost.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
-    const sel = $('#planSinkHolding');
-    const retEl = $('#planSinkReturn');
-    const newBox = $('#planSinkNewBox');
-    const symInput = $('#planSinkSymbol');
-    const symList = $('#planSinkSymbolSuggest');
-    const priceNote = $('#planSinkPriceNote');
-    const acctBox = $('#planSinkAccountBox');
-    const suggestBtn = $('#planSinkSuggestBtn');
-    const suggestOut = $('#planSinkSuggestOut');
-    // The stock select groups holdings by account, pool-picker style,
-    // with a "New stock…" entry for a symbol the user does not hold.
-    const grouped = accounts.map((a) => ({ name: a.name, holdings: holdings.filter((h) => Number(h.accountId) === Number(a.id)) }));
-    sel.innerHTML = grouped.filter((g) => g.holdings.length).map((g) =>
-      `<optgroup label="${esc(g.name)}">${g.holdings.map((h) => `<option value="${h.id}">${esc(h.symbol || h.label)} · ${money2(h.value || 0)}</option>`).join('')}</optgroup>`).join('')
-      + '<option value="new">New stock…</option>';
-    // The return is a visible field, not a hidden draft: picking a
-    // trend fills it, typing edits it. Changing the stock clears it
-    // (a trend belongs to one holding) so a stale pick never rides
-    // along to a different stock.
-    const clearReturn = () => { sinkTrend = null; retEl.value = ''; suggestOut.innerHTML = ''; };
-    const showPick = (isNew) => {
-      newBox.classList.toggle('hidden', !isNew);
-      suggestBtn.classList.toggle('hidden', isNew);
-      if (!isNew) { priceNote.classList.add('hidden'); sinkPrice = null; }
-    };
-    let priceSeq = 0;
-    const fillSinkPrice = async (symbol) => {
-      const my = ++priceSeq;
-      try {
-        const data = await api('/api/invest/price?symbol=' + encodeURIComponent(symbol));
-        if (my !== priceSeq) return;
-        if (data && data.price != null) {
-          sinkPrice = { price: data.price, date: data.date || null, source: data.source || null };
-          priceNote.textContent = `Current price ${money2(data.price)}${data.date ? ` · ${data.date}` : ''}${data.source ? ` · ${data.source}` : ''}`;
-          priceNote.className = 'n';
-          priceNote.classList.remove('hidden');
-        } else {
-          sinkPrice = null;
-          priceNote.textContent = `No price data for ${symbol} — saving this sink will fail.`;
-          priceNote.className = 'msg err';
-          priceNote.classList.remove('hidden');
-        }
-      } catch { /* best-effort: the save re-fetches and reports */ }
-    };
-    sel.addEventListener('change', () => {
-      showPick(sel.value === 'new');
-      clearReturn();
-      if (sel.value === 'new') symInput.focus();
-    });
-    // Symbol autocomplete for a new stock: the buy form's pattern
-    // (holdings by ticker/name, then /api/invest/search, then the
-    // typed ticker itself). A suggestion that IS a holding switches
-    // the select to that holding; anything else stays a new symbol
-    // and its current price fills the note below it.
-    const acctName = (id) => (accounts.find((a) => a.id === id) || {}).name || '';
-    let symItems = [];
-    let symActive = -1;
-    let symTimer = null;
-    let symSeq = 0;
-    let lastPriced = '';
-    const symClose = () => { symList.classList.add('hidden'); symList.innerHTML = ''; symItems = []; symActive = -1; };
-    const symPick = (i) => {
-      const c = symItems[i];
-      if (!c) return;
-      symClose();
-      if (c.holdingId) {
-        sel.value = String(c.holdingId);
-        showPick(false);
-        clearReturn();
-      } else {
-        symInput.value = c.symbol;
-        symInput.focus();
-        lastPriced = '';
-        fillSinkPrice(c.symbol);
-      }
-    };
-    const symRender = () => {
-      if (!symItems.length) { symClose(); return; }
-      symList.innerHTML = '';
-      symItems.forEach((c, i) => {
-        const li = document.createElement('li');
-        const sym = document.createElement('span');
-        sym.className = 'sg-sym';
-        sym.textContent = c.symbol;
-        li.appendChild(sym);
-        if (c.label) li.appendChild(document.createTextNode(' ' + c.label));
-        const meta = [c.exchange, c.currency, c.account].filter(Boolean).join(' · ');
-        if (meta) { const m = document.createElement('span'); m.className = 'sg-meta'; m.textContent = meta; li.appendChild(m); }
-        if (i === symActive) li.classList.add('active');
-        li.addEventListener('mousedown', (e) => { e.preventDefault(); symPick(i); });
-        symList.appendChild(li);
-      });
-      symList.classList.remove('hidden');
-    };
-    symInput.addEventListener('input', () => {
-      clearTimeout(symTimer);
-      const q = symInput.value.trim();
-      if (q.length < 2) { symClose(); return; }
-      symTimer = setTimeout(async () => {
-        const my = ++symSeq;
-        const needle = q.toLowerCase();
-        const held = holdings.filter((h) => (h.symbol || '').toLowerCase().includes(needle) || (h.label || '').toLowerCase().includes(needle))
-          .map((h) => ({ symbol: (h.symbol || '').toUpperCase(), label: h.label || '', account: acctName(h.accountId), holdingId: h.id }));
-        let remote = [];
-        try { const data = await api('/api/invest/search?q=' + encodeURIComponent(q)); remote = data.results || []; } catch { remote = []; }
-        if (my !== symSeq) return;
-        const seen = new Set(held.map((h) => h.symbol));
-        const merged = held.slice();
-        for (const r of remote) {
-          if (!r.symbol || seen.has(r.symbol)) continue;
-          seen.add(r.symbol);
-          merged.push({ symbol: r.symbol, label: r.label || '', exchange: r.exchange || '', currency: r.currency || '' });
-        }
-        if (/^[A-Za-z][A-Za-z0-9.]{1,11}$/.test(q) && !seen.has(q.toUpperCase())) merged.push({ symbol: q.toUpperCase(), label: '' });
-        symItems = merged;
-        symActive = symItems.length ? 0 : -1;
-        symRender();
-        // Typing a ticker fills the price note too (not only a
-        // suggestion pick): the note shows what the rebuild will pay.
-        if (/^[A-Za-z][A-Za-z0-9.]{1,11}$/.test(q) && q.toUpperCase() !== lastPriced) { lastPriced = q.toUpperCase(); fillSinkPrice(q); }
-      }, 250);
-    });
-    symInput.addEventListener('keydown', (e) => {
-      if (symList.classList.contains('hidden')) return;
-      if (e.key === 'ArrowDown') { e.preventDefault(); symActive = Math.min(symActive + 1, symItems.length - 1); symRender(); }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); symActive = Math.max(symActive - 1, 0); symRender(); }
-      else if (e.key === 'Enter' && symActive >= 0) { e.preventDefault(); symPick(symActive); }
-      else if (e.key === 'Escape') { symClose(); }
-    });
-    document.addEventListener('mousedown', (e) => { if (!symList.contains(e.target) && e.target !== symInput) symClose(); });
-    suggestBtn.addEventListener('click', async () => {
-      try {
-        const r = await api(`/api/planning/return-suggestions?holdingId=${sel.value}`);
-        if (!r.suggestions.length) { suggestOut.innerHTML = `<div class="note">${esc(r.note || 'No suggestion available — pick a custom product instead.')}</div>`; return; }
-        suggestOut.innerHTML = r.suggestions.map((x) => `
-          <button class="small" data-plan-sink-suggest="${x.annualizedReturn != null ? x.annualizedReturn * 100 : x.periodReturn * 100}" data-plan-sink-basis="${esc(x.basis)}" data-plan-sink-window="${esc(x.window)}">${esc(x.label)} · ${esc(x.window)} · ${x.annualizedReturn != null ? `${(x.annualizedReturn * 100).toFixed(2)}%/yr` : `${(x.periodReturn * 100).toFixed(2)}% period`} (${esc(x.basis)})</button>`).join(' ')
-          + `<div class="note">Past returns do not predict future returns.</div>`;
-        suggestOut.querySelectorAll('[data-plan-sink-suggest]').forEach((b) => b.addEventListener('click', () => {
-          sinkTrend = { holdingId: Number(sel.value), trendPct: Number(b.dataset.planSinkSuggest), basis: b.dataset.planSinkBasis || null, window: b.dataset.planSinkWindow || null };
-          retEl.value = formatMoneyInput(String(sinkTrend.trendPct));
-          suggestOut.innerHTML = `<div class="note">Picked: trend ${sinkTrend.trendPct}%/yr (${esc(sinkTrend.basis || '')}${sinkTrend.window ? ` · ${sinkTrend.window}` : ''})</div>`;
-        }));
-      } catch (err) { suggestOut.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
-    });
-    sinkHost.querySelectorAll('input[name="planSinkKind"]').forEach((r) => r.addEventListener('change', () => {
-      const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
-      $('#planSinkStockBox').classList.toggle('hidden', kind !== 'stock');
-      $('#planSinkCustomBox').classList.toggle('hidden', kind !== 'custom');
-    }));
-    $('#planSinkSaveBtn').addEventListener('click', async () => {
-      const msg = $('#planSinkMsg');
-      try {
-        const kind = sinkHost.querySelector('input[name="planSinkKind"]:checked').value;
-        let sinkBody;
-        if (kind === 'stock') {
-          const retRaw = retEl.value.replace(/,/g, '').trim();
-          const ret = retRaw === '' ? null : Number(retRaw);
-          if (ret == null || !isFinite(ret)) throw new Error('Expected return is required');
-          if (sel.value === 'new') {
-            const symbol = (symInput.value || '').trim().toUpperCase();
-            if (!symbol) throw new Error('Enter a symbol for the new stock');
-            // A typed symbol matching a holding is that holding, not
-            // a new stock.
-            const held = holdings.find((h) => (h.symbol || '').toUpperCase() === symbol);
-            if (held) {
-              sinkBody = { kind: 'stock', holdingId: held.id, trendPct: ret, basis: sinkTrend && sinkTrend.holdingId === held.id ? sinkTrend.basis : 'Your expected return', window: sinkTrend && sinkTrend.holdingId === held.id ? sinkTrend.window : 'Annual' };
-            } else {
-              const acctSel = $('#planSinkAccount');
-              const accountId = acctSel && !acctBox.classList.contains('hidden') ? Number(acctSel.value) : (poolAccounts.length === 1 ? poolAccounts[0].accountId : null);
-              sinkBody = { kind: 'stock', symbol, ...(accountId != null ? { accountId } : {}), trendPct: ret, basis: 'Your expected return', window: 'Annual' };
-            }
-          } else {
-            const holdingId = Number(sel.value);
-            sinkBody = { kind: 'stock', holdingId, trendPct: ret, basis: sinkTrend && sinkTrend.holdingId === holdingId ? sinkTrend.basis : 'Your expected return', window: sinkTrend && sinkTrend.holdingId === holdingId ? sinkTrend.window : 'Annual' };
-          }
-        } else {
-          const name = $('#planSinkName').value.trim();
-          const ret = $('#planSinkCustomReturn').value.replace(/,/g, '').trim();
-          if (!name) throw new Error('Product name is required');
-          if (ret === '' || !isFinite(Number(ret))) throw new Error('Expected return is required');
-          sinkBody = { kind: 'custom', name, expectedReturnPct: Number(ret) };
-        }
-        if ((d.ops || []).length && !confirm('Saving a sink replaces this strategy\'s operations with sell-pool + buy-sink operations. Continue?')) return;
-        await api(`/api/planning/strategies/${s.id}/sink`, { method: 'PUT', body: { sink: sinkBody } });
-        showMsg(msg, 'ok', 'Sink saved');
-        loadPlanStrategy(s.id);
-      } catch (err) { showMsg(msg, 'err', err.message); }
-    });
-    // Prefill when editing a picked sink: the holding (or the new
-    // symbol) + the return it was saved with.
-    if (sink && sinkEditing) {
-      if (sink.kind === 'custom') {
-        $('#planSinkName').value = sink.name || '';
-        $('#planSinkCustomReturn').value = sink.expectedReturnPct != null ? formatMoneyInput(String(sink.expectedReturnPct)) : '';
-      } else if (sink.kind === 'stock') {
-        if (sink.symbol) {
-          sel.value = 'new';
-          showPick(true);
-          symInput.value = sink.symbol;
-          retEl.value = sink.trendPct != null ? formatMoneyInput(String(sink.trendPct)) : '';
-          const acctSel = $('#planSinkAccount');
-          if (acctSel && sink.accountId != null && [...acctSel.options].some((o) => Number(o.value) === Number(sink.accountId))) acctSel.value = String(sink.accountId);
-          fillSinkPrice(sink.symbol);
-        } else if (sink.holdingId != null && [...sel.options].some((o) => Number(o.value) === Number(sink.holdingId))) {
-          sel.value = String(sink.holdingId);
-          retEl.value = sink.trendPct != null ? formatMoneyInput(String(sink.trendPct)) : '';
-          if (sink.basis) suggestOut.innerHTML = `<div class="note">Picked: trend ${sink.trendPct}%/yr (${esc(sink.basis || '')}${sink.window ? ` · ${sink.window}` : ''})</div>`;
-        }
-      }
-    }
-  };
-  (async () => {
-    try {
-      const inv = await api('/api/investments');
-      holdings = (inv.accounts || []).flatMap((a) => (a.holdings || []).map((h) => ({ ...h.holding, accountId: (a.account || {}).id, accountName: (a.account || {}).name, value: (h.summary || {}).value || 0 })));
-      accounts = (inv.accounts || []).map((a) => ({ id: (a.account || {}).id, name: (a.account || {}).name || '' }));
-    } catch { holdings = []; accounts = []; }
-    render();
-  })();
-}
 
 // ------------------------------------------------- strategy diff --
 // Strategy detail "Difference vs baseline": month-by-month rows
@@ -15492,10 +15248,23 @@ function planOpFormHtml(type, params, ctx, opts) {
     <div><label>Property *</label><select id="planOpProperty">${propOpts}</select></div>
     ${dateRow}
     <div><label>New payment *</label><input id="planOpPayment" type="text" inputmode="decimal" data-money value="${p.payment != null ? esc(String(p.payment)) : ''}" required></div>`;
-  if (type === 'buy') body = `
+  if (type === 'buy') {
+    // A custom buy (GIC): no account, a product name, and its own
+    // rate — detected from the stored params so Edit reopens it as
+    // custom. The old GIC shape (rate on the sink, price 100, no
+    // holding) is custom too.
+    const isCustomBuy = p.accountId == null && p.symbol && (p.expectedReturnPct != null || (Number(p.price) === 100 && p.holdingId == null));
+    body = `
+    ${opts && opts.allowCustom ? `<div><label><input type="checkbox" id="planOpCustom"${isCustomBuy ? ' checked' : ''}> Custom product (e.g. GIC)</label></div>
+    <div id="planOpCustomBox"${isCustomBuy ? '' : ' class="hidden"'}>
+      <div><label>Product name *</label><input id="planOpCustomName" value="${isCustomBuy ? esc(p.symbol || '') : ''}"></div>
+      <div><label>Expected return (% / year) *</label><input id="planOpCustomReturn" type="text" inputmode="decimal" data-money value="${p.expectedReturnPct != null ? esc(String(p.expectedReturnPct)) : ''}"></div>
+    </div>` : ''}
+    <div id="planOpStockBox"${isCustomBuy ? ' class="hidden"' : ''}>
     <div><label>Account *</label><select id="planOpAccount">${acctOpts}</select></div>
     <div><label>Holding</label><select id="planOpHolding"><option value="">New holding…</option>${holdOpts}</select>
     <div class="suggest-wrap"><input id="planOpSymbol" placeholder="Symbol for a new holding" autocomplete="off" value="${p.symbol ? esc(p.symbol) : ''}"><ul class="suggest-list hidden" id="planOpSymbolSuggest"></ul></div></div>
+    </div>
     ${dateRow}
     <div class="grid2">
       <div><label>Units</label><input id="planOpUnits" type="text" inputmode="decimal" value="${p.units != null ? esc(String(p.units)) : ''}"></div>
@@ -15523,6 +15292,7 @@ function planOpFormHtml(type, params, ctx, opts) {
       </div>
     </div>
     <div><label>Funded by</label><div id="planOpLegs"></div></div>` : `<div><label>Funding</label><div>Cash pool</div></div>`}`;
+  }
   if (type === 'sell') body = `
     <div><label>Holding *</label><select id="planOpHolding">${holdOpts}</select></div>
     ${dateRow}
@@ -15537,6 +15307,29 @@ function planOpFormHtml(type, params, ctx, opts) {
     ${dateRow}
     <div><label>Units *</label><input id="planOpUnits" type="text" inputmode="decimal" data-money value="${p.units != null ? esc(String(p.units)) : ''}" required></div>`;
   return body;
+}
+// Custom-product toggle on the buy form (investment strategies):
+// a custom product (e.g. GIC) has a name + its own expected return
+// and a fixed price of 100 — no account, no holding, no symbol
+// autocomplete. Checking it hides the stock rows and pins the
+// price; unchecking restores them.
+function planBuyCustomWire(root) {
+  const box = root.querySelector('#planOpCustom');
+  if (!box) return;
+  const sync = () => {
+    const on = box.checked;
+    const customBox = root.querySelector('#planOpCustomBox');
+    if (customBox) customBox.classList.toggle('hidden', !on);
+    const stockBox = root.querySelector('#planOpStockBox');
+    if (stockBox) stockBox.classList.toggle('hidden', on);
+    const price = root.querySelector('#planOpPrice');
+    if (price) {
+      if (on) { price.value = '100'; price.disabled = true; }
+      else price.disabled = false;
+    }
+  };
+  box.addEventListener('change', sync);
+  sync();
 }
 function planBuySourceOpts(ctx) {
   const opts = [
@@ -15882,11 +15675,25 @@ function planReadOpForm(type, root) {
   }
   if (type === 'payment_change') { params.propertyId = Number(v('planOpProperty')); params.payment = m('planOpPayment'); }
   if (type === 'buy') {
-    params.accountId = Number(v('planOpAccount'));
-    const hid = v('planOpHolding');
-    if (hid) params.holdingId = Number(hid);
-    params.symbol = v('planOpSymbol') || null;
-    params.units = m('planOpUnits'); params.amount = m('planOpAmount'); params.price = m('planOpPrice');
+    const custom = scope.querySelector('#planOpCustom');
+    if (custom && custom.checked) {
+      // A custom product (e.g. GIC): no account, a product name, its
+      // own expected return, price fixed at 100. The rate travels
+      // with the buy.
+      params.accountId = null;
+      params.symbol = v('planOpCustomName') || null;
+      params.currency = 'CAD';
+      params.price = 100;
+      const ret = m('planOpCustomReturn');
+      if (ret != null) params.expectedReturnPct = ret;
+      params.units = m('planOpUnits'); params.amount = m('planOpAmount');
+    } else {
+      params.accountId = Number(v('planOpAccount'));
+      const hid = v('planOpHolding');
+      if (hid) params.holdingId = Number(hid);
+      params.symbol = v('planOpSymbol') || null;
+      params.units = m('planOpUnits'); params.amount = m('planOpAmount'); params.price = m('planOpPrice');
+    }
   }
   if (type === 'sell') { params.holdingId = Number(v('planOpHolding')); params.units = m('planOpUnits'); params.price = m('planOpPrice'); }
   if (type === 'position') { params.accountId = Number(v('planOpAccount')); params.symbol = v('planOpSymbol') || null; params.units = m('planOpUnits'); }
@@ -15904,7 +15711,7 @@ function planReadOpForm(type, root) {
   // (Declared cash) source: the engine's 'pot' is seeded only from
   // external cash and would reject a pool buy with no external cash.
   // A recommendation-prefilled form may stash its own implicit leg
-  // (cash pot for sink strategies) on the modal card — it wins.
+  // (cash pot for buy strategies) on the modal card — it wins.
   if (type === 'buy' && !legs.length) {
     let implicit = { source_ref: 'cash', amount: 'remainder' };
     try {
@@ -15932,6 +15739,9 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
   const ctx = await planLoadOpCtx(projectId, strategyId);
   planOpCtx = ctx;
   const type = existing ? existing.op_type : (presetType || 'prepay');
+  // A custom product (e.g. GIC) is a buy target on investment
+  // strategies only — the toggle lives on the buy form.
+  const allowCustom = !!(ctx.project && ctx.project.category === 'investment');
   $('#planOpModalTitle').textContent = (opts && opts.title) || (existing ? 'Edit operation' : 'Add operation');
   // A locked form (the merged Sink's + Add buy) opens straight into
   // the preset action with no operation-type select — the section is
@@ -15942,14 +15752,14 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
     <option value="buy">Buy</option><option value="sell">Sell</option><option value="position">Position (cost unknown)</option></select></div>`;
   $('#planOpModalBody').innerHTML = `
     ${typeSel}
-    <div id="planOpFormFields">${planOpFormHtml(type, existing ? existing.params : {}, ctx, { existingLegs: existing ? existing.legs : null })}</div>
+    <div id="planOpFormFields">${planOpFormHtml(type, existing ? existing.params : {}, ctx, { existingLegs: existing ? existing.legs : null, allowCustom })}</div>
     <div class="toolbar"><button class="primary" id="planOpSaveBtn">Save</button><button type="button" data-close-modal>Cancel</button></div>`;
   $('#planOpModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   const opCard = $('#planOpModalBody').closest('.modal-card');
   const typeEl = $('#planOpTypeSel');
   if (typeEl) typeEl.value = type;
   if (typeEl) typeEl.addEventListener('change', () => {
-    $('#planOpFormFields').innerHTML = planOpFormHtml(typeEl.value, {}, ctx);
+    $('#planOpFormFields').innerHTML = planOpFormHtml(typeEl.value, {}, ctx, { allowCustom });
     $('#planOpFormFields').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
     planLegsWire(typeEl.value, ctx, opCard);
     if (typeEl.value === 'buy' || typeEl.value === 'sell') {
@@ -15961,6 +15771,7 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
     }
     if (typeEl.value === 'buy') planOpSourceWire(opCard, ctx);
     if (typeEl.value === 'buy') planBuyAutocompleteWire(opCard, ctx);
+    if (typeEl.value === 'buy') planBuyCustomWire(opCard);
   });
   planLegsWire(type, ctx, opCard);
   if ((type === 'buy' || type === 'sell') && existing && existing.legs) {
@@ -15980,6 +15791,7 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
   }
   if (type === 'buy') planOpSourceWire(opCard, ctx);
   if (type === 'buy') planBuyAutocompleteWire(opCard, ctx);
+  if (type === 'buy') planBuyCustomWire(opCard);
   // Recommendation prefill: a strategy created from a subcategory
   // recommendation opens its op form already bound to the entity
   // (account/holding + cash-pot funding leg for buys; property for
@@ -15995,7 +15807,7 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
       if (sink.accountId) params.accountId = sink.accountId;
       if (sink.holdingId) params.holdingId = sink.holdingId;
       if (tp.entity && tp.entity.propertyId) params.propertyId = tp.entity.propertyId;
-      $('#planOpFormFields').innerHTML = planOpFormHtml(tp.opType, params, ctx);
+      $('#planOpFormFields').innerHTML = planOpFormHtml(tp.opType, params, ctx, { allowCustom });
       $('#planOpFormFields').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
       planLegsWire(tp.opType, ctx, opCard);
       if (tp.opType === 'buy' || tp.opType === 'sell') {
@@ -16005,13 +15817,14 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
           box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
         } else if (tp.opType === 'buy' && tp.source) {
           // New buys have no leg picker: the recommendation's funding
-          // leg (cash pot for sink strategies) is stashed as this
+          // leg (cash pot for buy strategies) is stashed as this
           // form's implicit leg instead of being dropped silently.
           opCard.dataset.planImplicitLeg = JSON.stringify({ source_ref: tp.source, amount: 'remainder' });
         }
       }
       if (tp.opType === 'buy') planOpSourceWire(opCard, ctx);
       if (tp.opType === 'buy') planBuyAutocompleteWire(opCard, ctx);
+      if (tp.opType === 'buy') planBuyCustomWire(opCard);
     }
   }
   showMsg($('#planOpModalMsg'), '', '');
@@ -16077,7 +15890,7 @@ async function openPlanStrategyModal(projectId) {
       <div class="toolbar"><button class="small" id="planBackToPresets">← Presets</button></div>
       <div><label>Strategy name *</label><div style="display:flex;gap:8px"><input id="planStrategyName" placeholder="e.g. Prepay then refinance" style="flex:1"><button type="button" class="small" id="planStrategyAiNameBtn" title="Suggest a name with AI">✨</button></div></div>
       <div><label>First operation (optional)</label></div>
-      <div id="planStrategyOpFields">${planOpFormHtml(opType, ratePreset ? { rateType: ratePreset } : {}, ctx)}</div>
+      <div id="planStrategyOpFields">${planOpFormHtml(opType, ratePreset ? { rateType: ratePreset } : {}, ctx, { allowCustom: !!(ctx.project && ctx.project.category === 'investment') })}</div>
       <div class="toolbar"><button class="primary" id="planStrategyTemplateSave">Create strategy</button></div>`;
     $('#planBackToPresets').addEventListener('click', renderChooser);
     $('#planStrategyModalBody').querySelectorAll('input[data-money]').forEach(wireMoneyInput);
@@ -16090,6 +15903,7 @@ async function openPlanStrategyModal(projectId) {
       }
       if (opType === 'buy') planOpSourceWire(stratCard, ctx);
       if (opType === 'buy') planBuyAutocompleteWire(stratCard, ctx);
+      if (opType === 'buy') planBuyCustomWire(stratCard);
       // A rate preset fixes its direction: hide the rate-type radios
       // and the irrelevant rate input, leaving only the number the
       // user actually sets. The amortization override is fixed-only,

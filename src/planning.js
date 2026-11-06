@@ -199,6 +199,9 @@ export function validateOp(op, ctx = {}) {
     if (p.units != null) pos(p.units, 'units');
     if (p.amount != null) pos(p.amount, 'amount');
     if (p.price != null) pos(p.price, 'price');
+    // A rate carried on the buy (a custom product's own rate, e.g. a
+    // GIC): same bounds as a scenario stock factor.
+    if (p.expectedReturnPct != null && !(num(p.expectedReturnPct) >= -90 && num(p.expectedReturnPct) <= 500)) errs.push('expected return must be -90..500');
   }
   if (op.op_type === 'sell') {
     if (!Number.isInteger(Number(p.holdingId))) errs.push('sell needs a holding');
@@ -256,6 +259,24 @@ export function validateLegs(ops, legs) {
   };
   for (const n of edges.keys()) if (!state.has(n)) visit(n, [n]);
   return errs;
+}
+
+// Compatibility shim for pre-simplification GICs (user 2026-11-05):
+// their rate rode on the stored custom sink, not on the buy. A buy
+// with no account and no rate of its own inherits the stored custom
+// sink's rate IN MEMORY — the sink column is otherwise unread, and a
+// stock sink's trend is simply dropped (the scenario return governs
+// now). A custom sink with no usable (finite) rate inherits nothing.
+// Mutates the buy ops' params in place and returns the ops.
+export function applyStoredCustomSinkRate(ops, sink) {
+  if (!sink || sink.kind !== 'custom') return ops;
+  const rate = Number(sink.expectedReturnPct);
+  if (!Number.isFinite(rate)) return ops;
+  for (const o of ops || []) {
+    if (o.op_type !== 'buy' || !o.params || o.params.accountId != null || o.params.expectedReturnPct != null) continue;
+    o.params = { ...o.params, expectedReturnPct: rate };
+  }
+  return ops;
 }
 
 // ------------------------------------------------------------- projection --
@@ -487,14 +508,20 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   const returnPct = num(assumptions.stockReturnPct);
   const rAnnual = returnPct == null ? 0 : returnPct / 100;
   const byHolding = assumptions.stockReturnByHolding && typeof assumptions.stockReturnByHolding === 'object' ? assumptions.stockReturnByHolding : null;
+  // Rates carried on buy ops (a custom product's own rate, e.g. a
+  // GIC's contractual rate — it travels with the buy, not with a
+  // sink): recorded in the op loop below, read here at series time.
+  const buyReturns = new Map(); // holdingId -> annual %
   // Per-holding current rates (the baseline world): when the run sets
   // no global stock return, each holding grows at its own current
   // rate from its own history; holdings without a usable window stay
-  // flat. Precedence: a per-holding scenario override wins over the
-  // global stockReturnPct (strategy factor or sink), which wins over
-  // every per-holding history rate.
+  // flat. Precedence: a per-holding scenario override wins over a
+  // rate carried on a buy op, which wins over the global
+  // stockReturnPct (scenario stock factor), which wins over every
+  // per-holding history rate.
   const growthFor = (holding) => {
     if (byHolding && num(byHolding[holding.id]) != null) return num(byHolding[holding.id]) / 100;
+    if (buyReturns.has(holding.id)) return buyReturns.get(holding.id) / 100;
     if (returnPct != null) return rAnnual;
     if (holdingGrowth && holdingGrowth[holding.id] != null) {
       const g = num(holdingGrowth[holding.id]);
@@ -582,6 +609,9 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       if (isNew) {
         holding = { id: `new:${op.seq}`, accountId: Number(p.accountId), symbol: p.symbol || null, label: p.symbol || 'New holding', currency: p.currency || 'CAD', events: [], pricePoints: [] };
       }
+      // A rate carried on the buy (a custom product's own rate, e.g.
+      // a GIC) governs this holding's growth from the buy month on.
+      if (num(p.expectedReturnPct) != null) buyReturns.set(holding.id, num(p.expectedReturnPct));
       const pr = p.price != null ? num(p.price) : priceAt(holding, monthKey);
       if (pr == null) { errors.push(`buy operation ${op.seq} has no price for ${holding.symbol || holding.label} at ${monthKey}`); continue; }
       const units = p.units != null ? num(p.units) : (num(p.amount) != null ? round4(num(p.amount) / pr) : null);
@@ -607,8 +637,9 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       pushUnitsDelta(holding.id, monthKey, units);
       opOutput.set(op.seq, { amountCad: toCad(holding, amount), note: 'buy' });
       // A bought holding's price path starts at its buy price, then
-      // grows at the assumed return — this is what lets a custom sink
-      // (no stored price history) project from its buy price.
+      // grows at the assumed return — this is what lets a custom
+      // product (no stored price history, e.g. a GIC) project from
+      // its buy price.
       if (isNew && pr != null) holding.pricePoints = [{ date: p.date, price: pr }];
       if (isNew) {
         if (!mainline.holdings.find((h) => h.id === holding.id)) mainline.holdings.push(holding);
@@ -1393,13 +1424,12 @@ export function validateAiCreateProposal(parsed) {
   if (baseline.assumptions !== undefined && baseline.assumptions !== null && !Array.isArray(baseline.assumptions)) errs.push('baseline assumptions must be an array');
   if (!strategy.name || !String(strategy.name).trim()) errs.push('strategy name is required');
   if (strategy.ops !== undefined && !Array.isArray(strategy.ops)) errs.push('strategy ops must be an array');
-  // A strategy sink rides along when present (the GIC shape: a custom
-  // product sink + one sink buy). It is validated like any sink and
-  // preserved verbatim; a missing sink is simply no sink.
-  if (strategy.sink !== undefined && strategy.sink !== null) {
-    if (typeof strategy.sink !== 'object' || Array.isArray(strategy.sink)) errs.push('strategy sink must be an object');
-    else errs.push(...validateStrategyFactors({ sink: strategy.sink }));
-  }
+  // A strategy sink is dropped, never validated or preserved (the
+  // sink is gone since 2026-11-05 — the buy list IS the sink; a
+  // custom product's rate travels on the buy op). A proposal that
+  // still carries one is normalized, not rejected: the ops carry
+  // the shape now.
+  if (strategy.sink !== undefined && strategy.sink !== null) delete strategy.sink;
   const ops = Array.isArray(strategy.ops) ? strategy.ops : [];
   for (const [i, o] of ops.entries()) {
     if (!o || typeof o !== 'object' || Array.isArray(o)) { errs.push(`operation ${i + 1} must be an object`); continue; }
@@ -1410,7 +1440,7 @@ export function validateAiCreateProposal(parsed) {
     project: { name: project.name ? String(project.name).trim() : '', question: project.question ? String(project.question) : null },
     scenario: { name: scenario.name ? String(scenario.name).trim() : '', factors: scenario.factors && typeof scenario.factors === 'object' && !Array.isArray(scenario.factors) ? scenario.factors : {} },
     baseline: { name: baseline.name ? String(baseline.name).trim() : (baseline.description ? String(baseline.description).trim() : ''), description: baseline.description ? String(baseline.description) : '', assumptions: baseline.assumptions },
-    strategy: { name: strategy.name ? String(strategy.name).trim() : '', ops, ...(strategy.sink && typeof strategy.sink === 'object' && !Array.isArray(strategy.sink) ? { sink: strategy.sink } : {}) },
+    strategy: { name: strategy.name ? String(strategy.name).trim() : '', ops },
   };
   return { proposal, errors: errs };
 }
@@ -1805,14 +1835,10 @@ export const PLAN_STRATEGY_TEMPLATE_LABELS = {
 //   { prime: { points: [{month: 'YYYY-MM', rate}], preset: key|null },
 //     stock: { valuePct, basis?, window? },
 //     propertyGrowth: { valuePct }, salaryGrowth: { valuePct },
-//     rentGrowth: { valuePct },
-//     sink: { kind: 'stock', holdingId, trendPct, basis?, window? }
-//           | { kind: 'stock', symbol, accountId?, trendPct, basis?, window? }
-//           | { kind: 'custom', name, expectedReturnPct } }
-// A stock sink targets an existing holding (holdingId) or a new
-// symbol the user does not hold yet (symbol, with the account the
-// buy lands in when the pool spans more than one) — never both,
-// never neither. Either way the return rides on trendPct.
+//     rentGrowth: { valuePct } }
+// (The sink used to ride here too; it is gone since 2026-11-05 —
+// the buy list IS the sink, and a custom product's rate travels on
+// the buy op's params.expectedReturnPct.)
 // Salary and rent growth are stored and labeled only — the engine has
 // no earnings leg, so they do not change numbers yet.
 export const PLAN_FACTOR_KEYS = ['prime', 'stock', 'propertyGrowth', 'salaryGrowth', 'rentGrowth', 'sink'];
@@ -1871,22 +1897,10 @@ export function validateStrategyFactors(factors, currentMonth = null) {
   pctField('propertyGrowth', -90, 500);
   pctField('salaryGrowth', -90, 500);
   pctField('rentGrowth', -90, 500);
-  if (factors.sink != null) {
-    const s = factors.sink;
-    if (typeof s !== 'object' || Array.isArray(s)) errs.push('sink must be an object');
-    else if (s.kind === 'stock') {
-      const hasHolding = Number.isInteger(s.holdingId);
-      const hasSymbol = typeof s.symbol === 'string' && s.symbol.trim().length > 0;
-      if (hasHolding && hasSymbol) errs.push('stock sink needs either a holdingId or a symbol, not both');
-      else if (!hasHolding && !hasSymbol) errs.push('stock sink needs a holdingId or a symbol');
-      const t = num(s.trendPct);
-      if (t == null || t < -90 || t > 500) errs.push('stock sink needs a trendPct between -90 and 500');
-    } else if (s.kind === 'custom') {
-      if (!String(s.name || '').trim()) errs.push('custom sink needs a name');
-      const r = num(s.expectedReturnPct);
-      if (r == null || r < -90 || r > 500) errs.push('custom sink needs an expectedReturnPct between -90 and 500');
-    } else errs.push(`unknown sink kind ${s.kind}`);
-  }
+  // The sink is gone (user 2026-11-05): the buy list IS the sink,
+  // so a factors object carrying one is rejected outright — a stale
+  // client or proposal must not silently store it.
+  if (factors.sink != null) errs.push('sink is no longer supported — the buy list is the sink now');
   return errs;
 }
 // Scenario factors: the same world-factor keys as strategy factors,
@@ -2025,7 +2039,6 @@ export function planProjectAiSummaries({ scenarios = [], baselines = [], strateg
         if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = {}; } }
         return { seq: o.seq, op_type: o.op_type, date: params.date || null, params };
       }),
-      sink: (() => { try { return s.sink ? JSON.parse(s.sink) : null; } catch { return null; } })(),
     })),
   };
 }

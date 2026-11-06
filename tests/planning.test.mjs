@@ -20,7 +20,7 @@ import {
   scopeMainlineToProperty, validatePoolItemShapes, poolExternalCash,
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
   validateScenarioFactors, droppedScenarioPrimeSteps, primeStepDroppedMessage,
-  factorsToAssumptions,
+  factorsToAssumptions, applyStoredCustomSinkRate,
 } from '../src/planning.js';
 import { derivePayment, primeHistoryResolver } from '../src/engine.js';
 
@@ -108,24 +108,19 @@ test('droppedScenarioPrimeSteps: a past-month step is dropped and named, a curre
   assert.deepEqual(droppedScenarioPrimeSteps(actual, { steps: [{ date: '2026-11-01', rate: 5.45 }] }, '2026-11'), []);
   assert.deepEqual(droppedScenarioPrimeSteps(actual, null, '2026-11'), []);
 });
-test('validateStrategyFactors: shape errors for points, percents and sinks', () => {
+test('validateStrategyFactors: shape errors for points and percents; a sink is rejected outright', () => {
   assert.deepEqual(validateStrategyFactors(null), []);
   assert.deepEqual(validateStrategyFactors({ prime: { points: [{ month: '2027-06', rate: 5.5 }] } }, '2026-11'), []);
   assert.ok(validateStrategyFactors({ prime: { points: [{ month: '2026-10', rate: 5.5 }] } }, '2026-11').some((e) => /past/.test(e)));
   assert.ok(validateStrategyFactors({ prime: { points: [{ month: '2027-06', rate: 5.5 }, { month: '2027-06', rate: 6 }] } }, '2026-11').some((e) => /increasing/.test(e)));
   assert.ok(validateStrategyFactors({ nope: 1 }).some((e) => /unknown factor/.test(e)));
   assert.ok(validateStrategyFactors({ stock: { valuePct: 'x' } }).length > 0);
-  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1 } }).some((e) => /trendPct/.test(e)));
-  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1, trendPct: 10 } }).length === 0);
-  assert.ok(validateStrategyFactors({ sink: { kind: 'custom', name: 'GIC', expectedReturnPct: 4 } }).length === 0);
-  // A new-symbol stock sink (a stock the user does not hold yet) is
-  // valid with a symbol + trendPct, no holdingId; neither target, or
-  // both, is rejected, as is a missing return.
-  assert.deepEqual(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN', trendPct: 12 } }), []);
-  assert.deepEqual(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN', accountId: 1, trendPct: 12 } }), []);
-  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN' } }).some((e) => /trendPct/.test(e)));
-  assert.ok(validateStrategyFactors({ sink: { kind: 'stock' } }).some((e) => /holdingId or a symbol/.test(e)));
-  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1, symbol: 'AMZN', trendPct: 12 } }).some((e) => /not both/.test(e)));
+  // The sink is gone (user 2026-11-05): any factors object carrying
+  // one is rejected outright — a stale client or proposal must not
+  // silently store it. The buy list IS the sink now.
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', holdingId: 1, trendPct: 10 } }).some((e) => /no longer supported/.test(e)));
+  assert.ok(validateStrategyFactors({ sink: { kind: 'custom', name: 'GIC', expectedReturnPct: 4 } }).some((e) => /no longer supported/.test(e)));
+  assert.ok(validateStrategyFactors({ sink: { kind: 'stock', symbol: 'AMZN', trendPct: 12 } }).some((e) => /no longer supported/.test(e)));
   assert.deepEqual(primeFactorToScenario({ prime: { points: [{ month: '2027-06', rate: 5.5 }] } }), { name: 'Strategy prime', steps: [{ date: '2027-06-01', rate: 5.5 }] });
   assert.equal(primeFactorToScenario({}), null);
   assert.deepEqual(factorsToAssumptions({ stock: { valuePct: 6 } }, { stockReturnPct: 3, comparableRate: 4 }), { stockReturnPct: 6, comparableRate: 4 });
@@ -635,11 +630,11 @@ test('expandScenarioPrimePreset: expanded preset passes scenario validation (the
   assert.deepEqual(validateScenarioFactors({ prime: { preset: 'up' } }, '2026-11'), ['prime points must be an array']);
 });
 
-test('planProjectAiSummaries: compact names + factors + definitions + op summaries + sink, no full dumps', () => {
+test('planProjectAiSummaries: compact names + factors + definitions + op summaries, no full dumps', () => {
   const out = planProjectAiSummaries({
     scenarios: [{ name: 'Prime up', is_base: 1, factors: { prime: { preset: 'up', points: [] } } }],
     baselines: [{ name: 'Current path', source: 'ai', definition: { description: 'Do nothing', assumptions: [{ key: 'x', value: 1 }] } }],
-    strategies: [{ id: 7, name: 'Prepay', letter: 'A', source: 'manual', sink: JSON.stringify({ kind: 'custom', name: 'Cash', expectedReturnPct: 2 }) }],
+    strategies: [{ id: 7, name: 'Prepay', letter: 'A', source: 'manual' }],
     opsByStrategy: { 7: [{ seq: 1, op_type: 'prepay', params: JSON.stringify({ date: '2027-01-01', amount: 50000 }) }] },
   });
   assert.equal(out.scenarios[0].name, 'Prime up');
@@ -649,7 +644,7 @@ test('planProjectAiSummaries: compact names + factors + definitions + op summari
   assert.equal(out.strategies[0].ops[0].op_type, 'prepay');
   assert.equal(out.strategies[0].ops[0].date, '2027-01-01');
   assert.equal(out.strategies[0].ops[0].params.amount, 50000);
-  assert.equal(out.strategies[0].sink.name, 'Cash');
+  assert.equal(out.strategies[0].sink, undefined);
 });
 
 test('aiRepairPrompt: names the exact failing rules and demands a complete corrected spec', () => {
@@ -962,23 +957,45 @@ test('validateAiCreateProposal rejects a non-object reply', () => {
   assert.deepEqual(errors, ['proposal must be an object']);
 });
 
-test('validateAiCreateProposal preserves a valid custom sink (GIC shape) and flags a bad one', () => {
+test('validateAiCreateProposal drops a carried sink (GIC shape: the rate rides on the buy op)', () => {
   const gic = {
     project: { name: 'GIC Investment' },
     scenario: { name: 'Base Scenario', factors: {} },
     baseline: { name: 'Do Nothing', description: 'Hold the pool as-is' },
-    strategy: { name: 'GIC Purchase Strategy', sink: { kind: 'custom', name: 'GIC 4.12% 180d', expectedReturnPct: 4.12 }, ops: [{ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12% 180d', currency: 'CAD', date: '2027-01-01', amount: 10000, price: 100 } }] },
+    strategy: { name: 'GIC Purchase Strategy', ops: [{ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12% 180d', currency: 'CAD', date: '2027-01-01', amount: 10000, price: 100, expectedReturnPct: 4.12 } }] },
   };
   const { proposal, errors } = validateAiCreateProposal(gic);
   assert.deepEqual(errors, []);
-  assert.deepEqual(proposal.strategy.sink, { kind: 'custom', name: 'GIC 4.12% 180d', expectedReturnPct: 4.12 });
-  const bad = validateAiCreateProposal({ ...gic, strategy: { ...gic.strategy, sink: { kind: 'custom', name: 'GIC' } } });
-  assert.ok(bad.errors.some((e) => /expectedReturnPct/.test(e)));
-  const nonObj = validateAiCreateProposal({ ...gic, strategy: { ...gic.strategy, sink: 'GIC' } });
-  assert.ok(nonObj.errors.includes('strategy sink must be an object'));
+  assert.equal(proposal.strategy.sink, undefined);
+  assert.equal(proposal.strategy.ops[0].params.expectedReturnPct, 4.12);
+  // A stale proposal still carrying a sink is normalized, not
+  // rejected: the sink is dropped and the ops carry the shape.
+  const stale = validateAiCreateProposal({ ...gic, strategy: { ...gic.strategy, sink: { kind: 'custom', name: 'GIC 4.12% 180d', expectedReturnPct: 4.12 } } });
+  assert.deepEqual(stale.errors, []);
+  assert.equal(stale.proposal.strategy.sink, undefined);
   const noSink = validateAiCreateProposal({ ...gic, strategy: { name: 'GIC Purchase Strategy', ops: [] } });
   assert.deepEqual(noSink.errors, []);
   assert.equal(noSink.proposal.strategy.sink, undefined);
+});
+
+test('sink-simplify: a stored custom sink rate is inherited by a rateless account-less buy (pre-simplification GIC shim); a stock sink trend is dropped', () => {
+  const ops = [
+    { op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12% 180d', date: '2027-01-01', amount: 1000, price: 100 } },
+    { op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', date: '2027-01-01', amount: 500, price: 50 } },
+    { op_type: 'buy', params: { accountId: null, symbol: 'GIC 5% 90d', date: '2027-01-01', amount: 500, price: 100, expectedReturnPct: 5 } },
+  ];
+  applyStoredCustomSinkRate(ops, { kind: 'custom', name: 'GIC 4.12% 180d', expectedReturnPct: 4.12 });
+  assert.equal(ops[0].params.expectedReturnPct, 4.12); // rateless + account-less → inherits the stored rate
+  assert.equal(ops[1].params.expectedReturnPct, undefined); // has an account → untouched
+  assert.equal(ops[2].params.expectedReturnPct, 5); // has its own rate → untouched
+  // A stock sink's trend is dropped, never inherited.
+  const stockOps = [{ op_type: 'buy', params: { accountId: 1, holdingId: 9, date: '2027-01-01', amount: 600, price: 20 } }];
+  applyStoredCustomSinkRate(stockOps, { kind: 'stock', holdingId: 9, trendPct: 12 });
+  assert.equal(stockOps[0].params.expectedReturnPct, undefined);
+  // A custom sink with no usable rate inherits nothing (no NaN).
+  const noRate = [{ op_type: 'buy', params: { accountId: null, symbol: 'GIC', date: '2027-01-01', amount: 100, price: 100 } }];
+  applyStoredCustomSinkRate(noRate, { kind: 'custom', name: 'GIC' });
+  assert.equal(noRate[0].params.expectedReturnPct, undefined);
 });
 
 test('validateAiReportBaselineKind: pool baseline rejects every mortgage-family chart', () => {
@@ -1050,4 +1067,34 @@ test('computeProjection: per-holding scenario override wins over global and hist
   assert.ok(Math.abs(global.stocks.series[0].value - 1015.31) < 0.5, `got ${global.stocks.series[0].value}`);
   const hist = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [holding] }), holdingGrowth: { 7: 5 }, assumptions: {} }));
   assert.ok(Math.abs(hist.stocks.series[0].value - 1004.07) < 0.5, `got ${hist.stocks.series[0].value}`);
+});
+
+test('computeProjection: a buy carrying expectedReturnPct grows at that rate (GIC shape)', () => {
+  const gicBuy = { seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12% 180d', currency: 'CAD', date: '2026-11-01', amount: 10000, price: 100, expectedReturnPct: 4.12 } };
+  const legs = [{ op_seq: 1, source_ref: 'cash', amount: 'remainder' }];
+  const gic = computeProjection(ARGS({ ops: [gicBuy], legs }));
+  assert.deepEqual(gic.errors, []);
+  assert.equal(gic.stocks.series[0].value, 10000);
+  // 100 units × $100 grown 12 months at 4.12%/yr: 10000 × 1.0412 = 10412.
+  assert.ok(Math.abs(gic.stocks.series[12].value - 10412) < 0.5, `got ${gic.stocks.series[12].value}`);
+  // Same buy with no rate: flat at the buy price (no history, no
+  // scenario return) — the rate must ride on the buy, not be assumed.
+  const flat = computeProjection(ARGS({ ops: [{ ...gicBuy, params: { ...gicBuy.params, expectedReturnPct: undefined } }], legs }));
+  assert.deepEqual(flat.errors, []);
+  assert.equal(flat.stocks.series[12].value, 10000);
+  // The buy-carried rate wins over the scenario's global stock return
+  // (the product's own rate governs its holding), but a per-holding
+  // scenario override still wins over the buy.
+  const vsGlobal = computeProjection(ARGS({ ops: [gicBuy], legs, assumptions: { stockReturnPct: 30 } }));
+  assert.ok(Math.abs(vsGlobal.stocks.series[12].value - 10412) < 0.5, `got ${vsGlobal.stocks.series[12].value}`);
+  const vsOverride = computeProjection(ARGS({ ops: [gicBuy], legs, assumptions: { stockReturnByHolding: { 'new:1': 20 } } }));
+  assert.ok(Math.abs(vsOverride.stocks.series[12].value - 12000) < 0.5, `got ${vsOverride.stocks.series[12].value}`);
+});
+
+test('validateOp: a buy expectedReturnPct must be -90..500 when present', () => {
+  const buy = (ret) => ({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12%', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, expectedReturnPct: ret } });
+  assert.deepEqual(validateOp(buy(4.12)), []);
+  assert.deepEqual(validateOp(buy(undefined)), []);
+  assert.ok(validateOp(buy(600)).some((e) => /expected return/.test(e)));
+  assert.ok(validateOp(buy(-100)).some((e) => /expected return/.test(e)));
 });

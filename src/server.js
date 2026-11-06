@@ -45,6 +45,7 @@ import {
   undoCommit, restoreCommit, findDependents, mergeEventFromEntries, eventFromRowStates, readRow,
 } from './history.js';
 import {
+  applyStoredCustomSinkRate,
   calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
@@ -4727,7 +4728,8 @@ function planHoldingGrowth(mainline, currentMonth) {
 // scenario — variable segments price at the last actual prime held
 // flat). "Changes nothing" does NOT mean flat: holdings still earn
 // their current rates, so both runs grow each holding at its current
-// rate unless the strategy overrides it with a stock factor or sink.
+// rate unless the scenario overrides it with a stock factor or a
+// buy carries its own rate (a custom product, e.g. a GIC).
 // Projection under a world: scenario factors apply to BOTH the baseline
 // and the strategy at evaluation time (variable mortgages follow the
 // scenario prime, stocks follow the scenario return; unfactored parts
@@ -4736,10 +4738,10 @@ function planHoldingGrowth(mainline, currentMonth) {
 // scenarioInput: undefined = the project's base scenario (the labeled
 // default); null = flat world; a scenario row = that row's factors
 // (legacy steps restated as prime points); a factors object = itself.
-// sinkInput: undefined = the strategy row's sink column; null = no sink.
-// The sink's trend overrides the scenario's stock return — the sink is
-// strategy equipment, and a picked sink always wins, as before.
-async function planProjectionFor(strategy, project, scenarioInput, sinkInput, overrides) {
+// The return is set on the scenario (stock factor) or carried on a
+// buy op (a custom product's own rate, e.g. a GIC) — there is no
+// sink anymore (user 2026-11-05): the buy list IS the sink.
+async function planProjectionFor(strategy, project, scenarioInput, overrides) {
   await ensureFreshPrime();
   const baseMainline = planAssembleMainline(project.id);
   const currentMonth = currentMonthKey();
@@ -4772,12 +4774,9 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput, ov
   } else {
     factors = scenarioInput;
   }
-  const sink = sinkInput === undefined ? planStrategySink(strategy) : sinkInput;
   const confirmed = planConfirmedAssumptions(strategy.id);
   const baseAssumptions = factorsToAssumptions(factors, {});
   const strategyAssumptions = factorsToAssumptions(factors, confirmed);
-  if (sink && sink.kind === 'stock' && Number(sink.trendPct) != null) strategyAssumptions.stockReturnPct = Number(sink.trendPct);
-  if (sink && sink.kind === 'custom' && Number(sink.expectedReturnPct) != null) strategyAssumptions.stockReturnPct = Number(sink.expectedReturnPct);
   const primeHistory = getPrimeHistory();
   const cur = getCurrentPrime();
   const currentPrime = cur ? cur.rate : null;
@@ -4788,21 +4787,28 @@ async function planProjectionFor(strategy, project, scenarioInput, sinkInput, ov
   const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
   const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
   baseline.currentRates = currentRates;
-  // A stock sink outside the pool is injected into the strategy run's
-  // mainline with empty events + actual price points: its pre-existing
-  // position outside the pool is NOT counted, only the sink buy is.
-  // A symbol-only sink (a new stock the user does not hold yet) has
-  // no holding to inject — the buy op creates it in the engine.
+  // A buy of a holding outside the pool is injected into the
+  // strategy run's mainline with empty events + actual price points:
+  // its pre-existing position outside the pool is NOT counted, only
+  // the buy is. A symbol-only buy (a new stock the user does not
+  // hold yet) has no holding to inject — the buy op creates it in
+  // the engine.
   let strategyMainline = mainline;
-  if (sink && sink.kind === 'stock' && sink.holdingId != null) {
-    const sinkId = Number(sink.holdingId);
-    if (!mainline.holdings.some((h) => Number(h.id) === sinkId)) {
-      const real = baseMainline.holdings.find((h) => Number(h.id) === sinkId);
-      if (real) strategyMainline = { ...mainline, holdings: [...mainline.holdings, { ...real, events: [] }] };
-    }
+  for (const o of ops) {
+    if (o.op_type !== 'buy' || !(o.params && o.params.holdingId != null)) continue;
+    const hid = Number(o.params.holdingId);
+    if (strategyMainline.holdings.some((h) => Number(h.id) === hid)) continue;
+    const real = baseMainline.holdings.find((h) => Number(h.id) === hid);
+    if (real) strategyMainline = { ...strategyMainline, holdings: [...strategyMainline.holdings, { ...real, events: [] }] };
   }
+  // Compatibility shim for pre-simplification GICs (user 2026-11-05):
+  // their rate rode on the stored custom sink, not on the buy — the
+  // stored rate is inherited in memory onto rateless account-less
+  // buys; a stock sink's trend is dropped (the scenario return
+  // governs now). The sink column is otherwise unread.
+  applyStoredCustomSinkRate(ops, planStrategySink(strategy));
   const strategyProj = computeProjection({ ...args, mainline: strategyMainline, assumptions: strategyAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
-  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property', investmentScope: project.category === 'investment' }), factors, sink, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property', investmentScope: project.category === 'investment' }), factors, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
 }
 function planScenarioRow(r) {
   if (!r) return null;
@@ -5186,9 +5192,9 @@ function planRecommendationFor(category, subcategory, entity) {
     // The baseline's starting position IS the pool: its figures are the
     // pool's current value and per-item contributions (a percent OF
     // ITS OWN SOURCE, or a CAD amount from it). The strategy is the
-    // sink the user picks on the strategy page (existing stock or
-    // custom product); the recommendation carries only the binding, and
-    // the sink's ops are generated when the user saves the sink.
+    // buy list the user builds on the strategy page (buys of a stock
+    // or a custom product); the recommendation carries only the
+    // binding.
     const fxRow = db.prepare('SELECT rate FROM invest_fx_rates ORDER BY date DESC LIMIT 1').get();
     const fx = fxRow ? fxRow.rate : 1;
     let poolTotal = 0;
@@ -5232,7 +5238,7 @@ function planRecommendationFor(category, subcategory, entity) {
     const figures = { poolValue: Math.round(poolTotal * 100) / 100, stockCount: stockIds.size, items };
     return {
       baseline: { name: label, description: `Hold the pool as-is`, figures },
-      strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Sink: pick on the strategy page`, template_params: { category, subcategory, entity, opType: 'buy', sinkKind: subcategory === 'gic' ? 'custom' : 'stock', sinkLabel: label, summary: `Pool → sink (pick on the strategy page)` } },
+      strategy: { name: `${sub.strategyLabel} · ${label}`, summary: `Buys: add buys on the strategy page`, template_params: { category, subcategory, entity, opType: 'buy', sinkKind: subcategory === 'gic' ? 'custom' : 'stock', sinkLabel: label, summary: `Pool → buys (add buys on the strategy page)` } },
     };
   }
   if (category === 'investment') {
@@ -5260,7 +5266,7 @@ function planRecommendationFor(category, subcategory, entity) {
     }
     return {
       baseline: { name: `Current plan · ${sinkLabel}`, description: `Keep the current plan for ${sinkLabel}`, figures },
-      strategy: { name: `${sub.strategyLabel} · ${sinkLabel}`, summary: `Source: cash pot → Sink: ${sinkLabel}`, template_params: { category, subcategory, entity, opType: 'buy', source: 'pot', sink, sinkLabel, summary: `Source: cash pot → Sink: ${sinkLabel}` } },
+      strategy: { name: `${sub.strategyLabel} · ${sinkLabel}`, summary: `Source: cash pot → Buys: ${sinkLabel}`, template_params: { category, subcategory, entity, opType: 'buy', source: 'pot', sink, sinkLabel, summary: `Source: cash pot → Buys: ${sinkLabel}` } },
     };
   }
   if (category === 'earning' && entity.type === 'job') {
@@ -5313,31 +5319,6 @@ function planRecommendationFor(category, subcategory, entity) {
 // uses. recordId points at the project's recommendation-source
 // baseline record when one exists (report pins keep working);
 // legacy AI/manual records are never the fixed baseline.
-// Pool accounts for the sink picker: the accounts the pool draws
-// on, with each account's pool contribution, largest first. The
-// client shows an account picker for a new-symbol sink only when
-// the pool spans more than one account (a single-account pool uses
-// that account; an all-external pool has none and the client falls
-// back to all accounts).
-function planPoolAccounts(figures) {
-  const byId = new Map();
-  for (const it of (figures && figures.items) || []) {
-    let aid = it.accountId != null ? Number(it.accountId) : null;
-    if (aid == null && it.holdingId != null) {
-      const h = db.prepare('SELECT account_id FROM invest_holdings WHERE id = ?').get(Number(it.holdingId));
-      if (h) aid = Number(h.account_id);
-    }
-    if (aid == null) continue;
-    byId.set(aid, (byId.get(aid) || 0) + (Number(it.value) || 0));
-  }
-  const out = [];
-  for (const [aid, value] of byId) {
-    const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(aid);
-    out.push({ accountId: aid, name: acc ? acc.name : '', value: Math.round(value * 100) / 100 });
-  }
-  out.sort((a, b) => b.value - a.value);
-  return out;
-}
 function planFixedBaseline(view) {
   const category = view.category;
   const subcategory = view.subcategory;
@@ -5967,9 +5948,9 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
     scenarioArg = allScenarios.find((x) => x.id === Number(req.query.scenarioId));
     if (!scenarioArg) return res.status(404).json({ error: 'scenario not found' });
   }
-  let baseline; let strategy; let comparison; let sink; let appliedScenario;
+  let baseline; let strategy; let comparison; let appliedScenario;
   try {
-    ({ baseline, strategy, comparison, sink, appliedScenario } = await planProjectionFor(s, p, scenarioArg));
+    ({ baseline, strategy, comparison, appliedScenario } = await planProjectionFor(s, p, scenarioArg));
   } catch (err) {
     return res.status(500).json({ error: `projection failed: ${err.message}` });
   }
@@ -5982,7 +5963,7 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
   }
   // The strategy carries no factors anymore: the world lives on the
   // scenario (appliedScenario labels which one these numbers ran under).
-  const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [], factors: null, sink: planStrategySink(s) };
+  const strategyRow = { ...s, template_params: s.template_params ? JSON.parse(s.template_params) : null, ai_thread: s.ai_thread ? JSON.parse(s.ai_thread) : [], factors: null };
   // Equity-chart inputs, computed exactly as the report path does
   // (same assessed map, same entity rule, same growth factor): the
   // entity property's assessed value for property projects, the
@@ -6014,7 +5995,7 @@ app.get('/api/planning/strategies/:id', requireApiAuth, async (req, res) => {
     }
   } catch { /* no reports table rows = gate closed */ }
   const fb = planFixedBaseline({ id: p.id, category: p.category, subcategory: p.subcategory, entity: planProjectEntityOf(p) });
-  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, sink, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: entityProp, equityAssessedTotal, equityGrowthPct, equityCurrentMonth: currentMonthKey(), baselineKind, hasGeneratedReport, fixedBaseline: fb, poolAccounts: planPoolAccounts(fb && fb.figures) });
+  res.json({ strategy: strategyRow, project: p, ops, assumptions, factors: null, scenarios: allScenarios, baseScenario: planBaseScenario(p.id), appliedScenario, baseline, projection: strategy, comparison, scenarioTable: [], model, entityProperty: entityProp, equityAssessedTotal, equityGrowthPct, equityCurrentMonth: currentMonthKey(), baselineKind, hasGeneratedReport, fixedBaseline: fb });
 });
 
 app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, res) => {
@@ -6060,12 +6041,13 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
       // No factor overrides: pass the row (appliedScenario stays
       // set). With overrides: pass the merged factors object.
       const scenInput = opts.factorOverrides ? factors : scenarioRow;
-      r = await planProjectionFor(st, p, scenInput, undefined, opts.opParamOverrides ? { opParams: opts.opParamOverrides } : undefined);
+      r = await planProjectionFor(st, p, scenInput, opts.opParamOverrides ? { opParams: opts.opParamOverrides } : undefined);
     } catch (err) {
       throw new Error(`projection failed: ${err.message}`);
     }
     if (!baseline) baseline = r.baseline;
-    rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, sink: r.sink, opCount: planOpsOf(st.id).length });
+    const stOps = planOpsOf(st.id);
+    rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, buys: stOps.filter((o) => o.op_type === 'buy').map((o) => (o.params && (o.params.symbol || o.holdingSymbol)) || '').filter(Boolean), opCount: stOps.length });
   }
   // Baseline-only projection: the reference the strategy deltas are
   // computed against, and the chart's baseline line.
@@ -6292,6 +6274,26 @@ app.post('/api/planning/projects/:id/comparison/preview', requireApiAuth, async 
   });
 });
 
+// A buy's units + amount are two views of the same fill (the
+// projection derives whichever is missing at read time); store both
+// so the buy list shows units + amount for every buy, however it was
+// posted (the browser form posts both via its Units↔Amount linkage,
+// an API post usually carries amount + price only). Same rounding as
+// the projection: units to 4dp, amount to cents.
+function planNormalizeBuyParams(params) {
+  if (!params || typeof params !== 'object') return params;
+  const price = num(params.price);
+  if (price == null || !(price > 0)) return params;
+  const units = num(params.units);
+  const amount = num(params.amount);
+  if ((units == null || units <= 0) && amount != null && amount > 0) {
+    params.units = Math.round((amount / price + Number.EPSILON) * 10000) / 10000;
+  } else if ((amount == null || amount <= 0) && units != null && units > 0) {
+    params.amount = Math.round((units * price + Number.EPSILON) * 100) / 100;
+  }
+  return params;
+}
+
 app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
   const s = planStrategyById(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'strategy not found' });
@@ -6300,7 +6302,7 @@ app.post('/api/planning/strategies/:id/ops', requireApiAuth, (req, res) => {
   if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
   const b = req.body || {};
   if (!OP_TYPES.includes(b.op_type)) return res.status(400).json({ error: `unknown operation type ${b.op_type}` });
-  const params = b.params || {};
+  const params = b.op_type === 'buy' ? planNormalizeBuyParams(b.params || {}) : (b.params || {});
   const existing = planOpsOf(s.id);
   const seq = existing.length ? Math.max(...existing.map((o) => o.seq)) + 1 : 1;
   const op = { seq, op_type: b.op_type, params };
@@ -6332,7 +6334,7 @@ app.put('/api/planning/ops/:id', requireApiAuth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'project not found' });
   if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
   const b = req.body || {};
-  const params = b.params !== undefined ? b.params : JSON.parse(row.params || '{}');
+  const params = row.op_type === 'buy' ? planNormalizeBuyParams(b.params !== undefined ? b.params : JSON.parse(row.params || '{}')) : (b.params !== undefined ? b.params : JSON.parse(row.params || '{}'));
   const existing = planOpsOf(s.id).map((o) => (o.id === row.id ? { ...o, params } : o));
   const legs = (b.legs !== undefined ? b.legs : db.prepare('SELECT * FROM plan_legs WHERE op_id = ? ORDER BY id').all(row.id))
     .map((l) => ({ op_seq: row.seq, source_ref: l.source_ref, amount: l.amount }));
@@ -6400,8 +6402,8 @@ app.put('/api/planning/strategies/:id/assumptions', requireApiAuth, (req, res) =
 });
 
 // Strategy factors: full replace (the client sends the whole edited
-// set, including any existing sink). Prime points, return and growth
-// percentages are validated; unknown keys are rejected.
+// set). Prime points, return and growth percentages are validated;
+// unknown keys are rejected.
 // Retired by the scenario restructure: factors live on scenarios now.
 // Kept as an explicit 400 (not a silent 404) so old callers fail loudly
 // instead of assuming the write landed.
@@ -6413,148 +6415,25 @@ app.put('/api/planning/strategies/:id/factors', requireApiAuth, (req, res) => {
   return res.status(400).json({ error: 'strategy factors moved to scenarios — edit the scenario instead' });
 });
 
-// Investment sink: where the pool goes. Saves the sink into the
-// strategy's sink column and REPLACES the
-// strategy's ops with generated sell-pool + buy-sink ops: every pool
-// item is sold at its current price, proceeds earmarked to one buy of
-// the sink. A stock sink uses the user-picked historical trend as its
-// return assumption; a custom product uses the user-filled expected
-// annualized return. Investment-pool projects only.
-app.put('/api/planning/strategies/:id/sink', requireApiAuth, async (req, res) => {
+// The sink picker is gone (user 2026-11-05): the buy list IS the
+// sink. These two routes stay as explicit 400s so a stale client (or
+// a saved bookmark) gets a plain message instead of a silent 404 —
+// and so a save attempt through the old flow can never delete the
+// buy list. The stored sink column is dormant (never read, never
+// written by any live path).
+app.put('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
   const s = planStrategyById(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
-  if (p.category !== 'investment') return res.status(400).json({ error: 'sink is only for investment projects' });
-  const entity = planProjectEntityOf(p);
-  if (!entity || entity.type !== 'pool') return res.status(400).json({ error: 'investment sink needs a cash pool — pick pool stocks at creation' });
-  const sink = (req.body || {}).sink;
-  if (!sink || typeof sink !== 'object') return res.status(400).json({ error: 'sink is required' });
-  const errs = validateStrategyFactors({ sink }, currentMonthKey());
-  if (errs.length) return res.status(400).json({ error: errs.join('; ') });
-  const currentMonth = currentMonthKey();
-  const baseMainline = planAssembleMainline(p.id);
-  const poolMainline = planPoolMainline(p, baseMainline, currentMonth);
-  const fx = Number(baseMainline.fxRateLatest) || 1;
-  const cutoff = `${currentMonth}-31`;
-  const priceOn = (h) => {
-    let last = null;
-    for (const pt of h.pricePoints || []) if (String(pt.date).slice(0, 10) <= cutoff) last = pt; else break;
-    return last ? Number(last.price) : null;
-  };
-  // Sell every pool item at its current price; proceeds in CAD.
-  const sells = [];
-  let proceedsCad = 0;
-  for (const ph of poolMainline.holdings) {
-    const units = ph.events.reduce((sum, e) => sum + (Number(e.units) || 0), 0);
-    const price = priceOn(ph);
-    if (price == null) return res.status(400).json({ error: `pool holding ${ph.symbol || ph.label || ''} has no current price` });
-    const amount = Math.round(units * price * 100) / 100;
-    sells.push({ holding: ph, units, price, amount });
-    proceedsCad += ph.currency === 'USD' ? amount * fx : amount;
-  }
-  sells.sort((a, b) => a.holding.id - b.holding.id);
-  let buyParams; let stockFactor;
-  if (sink.kind === 'stock' && sink.holdingId != null) {
-    const h = db.prepare('SELECT * FROM invest_holdings WHERE id = ?').get(Number(sink.holdingId));
-    if (!h) return res.status(400).json({ error: 'sink holding not found' });
-    const pts = listPricePoints(db, h.id).filter((pt) => String(pt.date) <= vancouverToday());
-    const price = pts.length ? pts[pts.length - 1].price : null;
-    if (price == null) return res.status(400).json({ error: 'sink holding has no current price' });
-    const amountNative = h.currency === 'USD' ? proceedsCad / fx : proceedsCad;
-    buyParams = { accountId: h.account_id, holdingId: h.id, date: `${currentMonth}-01`, amount: amountNative, price };
-    stockFactor = { valuePct: Number(sink.trendPct), basis: sink.basis || null, window: sink.window || null };
-  } else if (sink.kind === 'stock') {
-    // A new symbol the user does not hold yet: the buy lands in the
-    // account the form picked (or the pool's only account), priced at
-    // the current price from the same tiers behind GET /api/invest/
-    // price — never guessed, never 100. No currency is set, so the
-    // engine treats the holding as CAD, exactly like a manual buy.
-    const symbol = String(sink.symbol || '').trim().toUpperCase();
-    let accountId = null;
-    if (sink.accountId != null) {
-      const acc = db.prepare('SELECT id FROM invest_accounts WHERE id = ?').get(Number(sink.accountId));
-      if (!acc) return res.status(400).json({ error: 'sink account not found' });
-      accountId = acc.id;
-    } else {
-      const poolAccounts = [...new Set(poolMainline.holdings.map((h) => h.accountId))].filter((x) => x != null);
-      if (poolAccounts.length === 1) accountId = poolAccounts[0];
-      else if (!poolAccounts.length) return res.status(400).json({ error: `pick an account for ${symbol}: the pool holds no account` });
-      else return res.status(400).json({ error: `pick an account for ${symbol}: the pool spans ${poolAccounts.length} accounts` });
-    }
-    const px = await latestPrice(symbol);
-    if (!px || px.price == null) return res.status(400).json({ error: `no current price for ${symbol}` });
-    buyParams = { accountId, symbol, date: `${currentMonth}-01`, amount: proceedsCad, price: px.price };
-    stockFactor = { valuePct: Number(sink.trendPct), basis: sink.basis || 'Your expected return', window: sink.window || 'Annual' };
-  } else {
-    buyParams = { accountId: null, symbol: String(sink.name).trim(), currency: 'CAD', date: `${currentMonth}-01`, amount: proceedsCad, price: 100 };
-    stockFactor = { valuePct: Number(sink.expectedReturnPct), basis: 'Your expected return', window: 'Annual' };
-  }
-  const buySeq = sells.length + 1;
-  const now = nowIso();
-  const before = snapshotByAggregate(db, 'project', p.id);
-  const rebuild = db.transaction(() => {
-    db.prepare('DELETE FROM plan_legs WHERE op_id IN (SELECT id FROM plan_ops WHERE strategy_id = ?)').run(s.id);
-    db.prepare('DELETE FROM plan_ops WHERE strategy_id = ?').run(s.id);
-    const sellIds = [];
-    sells.forEach((sell, i) => {
-      const info = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(s.id, i + 1, 'sell', JSON.stringify({ holdingId: sell.holding.id, date: `${currentMonth}-01`, units: sell.units, price: sell.price }), 'sink', now, now);
-      db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
-        .run(info.lastInsertRowid, `op:${buySeq}`, 'all', now);
-      sellIds.push(info.lastInsertRowid);
-    });
-    const buyInfo = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(s.id, buySeq, 'buy', JSON.stringify(buyParams), 'sink', now, now);
-    sells.forEach((sell, i) => {
-      db.prepare('INSERT INTO plan_legs (op_id, source_ref, amount, created_at) VALUES (?, ?, ?, ?)')
-        .run(buyInfo.lastInsertRowid, `op:${i + 1}`, 'all', now);
-    });
-    // The sink's trend rides on the sink object itself (trendPct for a
-    // stock sink, expectedReturnPct for a custom product); evaluation
-    // applies it over the scenario's stock return.
-    const sinkOut = sink.kind === 'stock'
-      ? { ...sink, trendPct: stockFactor.valuePct, basis: stockFactor.basis, window: stockFactor.window }
-      : { ...sink, expectedReturnPct: stockFactor.valuePct };
-    db.prepare('UPDATE plan_strategies SET sink = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(sinkOut), now, s.id);
-    recordCommit(db, {
-      userId: req.user.id, username: req.user.username, module: 'planning',
-      entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
-      entityLabel: p.name, summary: `Updated sink · ${s.name} · ${p.name}`,
-      before, snapshot: snapshotByAggregate(db, 'project', p.id),
-    });
-    return sinkOut;
-  });
-  const sinkSaved = rebuild();
-  res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), sink: sinkSaved });
+  return res.status(400).json({ error: 'the sink picker is gone — the buy list is the sink now; add or edit buys instead' });
 });
-
-// Clearing a sink returns the strategy to the pick-a-new-sink state:
-// the sink column is nulled and the sink-generated sell/buy operations
-// (source 'sink') go with it; user-added operations are left alone.
 app.delete('/api/planning/strategies/:id/sink', requireApiAuth, (req, res) => {
   const s = planStrategyById(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'strategy not found' });
   const p = planProjectById(s.project_id, req.user.id);
   if (!p) return res.status(404).json({ error: 'project not found' });
-  if (s.merged) return res.status(400).json({ error: 'a merged strategy cannot be edited — revert it first' });
-  if (p.category !== 'investment') return res.status(400).json({ error: 'sink is only for investment projects' });
-  const before = snapshotByAggregate(db, 'project', p.id);
-  const now = nowIso();
-  db.transaction(() => {
-    const sinkOps = db.prepare("SELECT id FROM plan_ops WHERE strategy_id = ? AND source = 'sink'").all(s.id);
-    for (const o of sinkOps) db.prepare('DELETE FROM plan_legs WHERE op_id = ?').run(o.id);
-    db.prepare("DELETE FROM plan_ops WHERE strategy_id = ? AND source = 'sink'").run(s.id);
-    db.prepare('UPDATE plan_strategies SET sink = NULL, updated_at = ? WHERE id = ?').run(now, s.id);
-    recordCommit(db, {
-      userId: req.user.id, username: req.user.username, module: 'planning',
-      entityType: 'project', entityId: p.id, projectId: p.id, strategyId: s.id,
-      entityLabel: p.name, summary: `Cleared sink · ${s.name} · ${p.name}`,
-      before, snapshot: snapshotByAggregate(db, 'project', p.id),
-    });
-  })();
-  res.json({ strategy: planStrategyById(s.id), ops: planOpsOf(s.id), sink: null });
+  return res.status(400).json({ error: 'the sink is gone — delete the buy ops instead' });
 });
 
 // Prime preset paths: complete date+rate point lists from the current
@@ -7606,12 +7485,13 @@ app.post('/api/planning/projects/:id/ai-baseline/apply', requireApiAuth, (req, r
 });
 
 // Deterministic GIC template for ai-create propose (user 2026-11-04):
-// the manual GIC path models a GIC as a custom sink (kind 'custom',
-// name, expectedReturnPct) plus ONE sink-generated buy op
-// {accountId: null, symbol: <GIC name>, currency CAD, date, amount:
-// pool proceeds, price: 100} with no legs (the pool funds it); the
-// engine grows the new holding from its buy price at the sink's
-// expected return. A position op on a fund is never the shape.
+// the manual GIC path models a GIC as ONE buy op {accountId: null,
+// symbol: <GIC name>, currency CAD, date, amount: pool proceeds,
+// price: 100, expectedReturnPct: <rate>} with no legs (the pool
+// funds it); the rate travels WITH THE BUY (the sink is gone since
+// 2026-11-05 — the buy list IS the sink). The engine grows the new
+// holding from its buy price at the buy's rate. A position op on a
+// fund is never the shape.
 // Returns {ask} (missing rate/date/amount — never invented),
 // {error} (bad entity), or {response} (the propose payload, same
 // shape as the LLM path: proposal + unresolved + warnings).
@@ -7669,8 +7549,7 @@ function planGicTemplateProposal(text, answers, category, subcategory, entity) {
     baseline: { name: 'Do Nothing', description: 'Hold the pool as-is', assumptions: [] },
     strategy: {
       name: 'GIC Purchase Strategy',
-      sink: { kind: 'custom', name, expectedReturnPct: rate },
-      ops: [{ op_type: 'buy', params: { accountId: null, symbol: name, currency: 'CAD', date, amount, price: 100 } }],
+      ops: [{ op_type: 'buy', params: { accountId: null, symbol: name, currency: 'CAD', date, amount, price: 100, expectedReturnPct: rate } }],
     },
   };
   const { proposal: norm, errors: shapeErrors } = validateAiCreateProposal(proposal);
@@ -7709,7 +7588,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
   const answers = b.answers && typeof b.answers === 'object' ? b.answers : null;
   // Deterministic GIC template (user 2026-11-04): a GIC request under
   // the gic subcategory never goes to the model — the shape is fixed
-  // (custom sink + one sink buy, mirroring the manual GIC path), so
+  // (one buy op carrying the rate, mirroring the manual GIC path), so
   // the model cannot draft it into a fund position op again. It needs
   // no LLM, so it also runs when the LLM is unconfigured. Missing
   // rate/date/amount are asked for, never invented.
@@ -7732,7 +7611,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
     'The scenario holds ONLY world factors: prime (a rate path), stock (an expected annual return %), propertyGrowth, salaryGrowth, rentGrowth. It NEVER holds a sink, an operation, or a price. prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30. stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one. Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
     'The baseline changes nothing: a pure do-nothing reference (name + one-line description + assumptions only). It carries NO prime path and NO stock reference.',
     'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position. A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price. Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas). Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids. For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
-    'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as strategy.sink {"kind": "custom", "name": "GIC <rate>%", "expectedReturnPct": <rate>} plus ONE buy op {"accountId": null, "symbol": "<same name>", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing.',
+    'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as ONE buy op {"accountId": null, "symbol": "GIC <rate>%", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100, "expectedReturnPct": <rate>} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing.',
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. This is a NEW project: it has no existing scenarios, baselines, or strategies yet.',
     `Optimization: category ${category}, subcategory ${subcategory}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
     `App data snapshot: ${JSON.stringify(snapshot)}`,
@@ -7824,6 +7703,10 @@ app.post('/api/planning/ai-create/apply', requireApiAuth, async (req, res) => {
     const st = db.prepare('INSERT INTO plan_strategies (project_id, name, letter, source, template, template_params, sink, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(pid, norm.strategy.name, planNextLetter(pid), 'ai', null, null, norm.strategy.sink ? JSON.stringify(norm.strategy.sink) : null, now, now);
     for (const o of seqOps) {
+      // Same buy normalization as the op endpoint: a buy posted with
+      // amount + price only stores its units too, so the buy list
+      // shows units + amount (the GIC template buy is amount-only).
+      if (o.op_type === 'buy') planNormalizeBuyParams(o.params);
       const oi = db.prepare('INSERT INTO plan_ops (strategy_id, seq, op_type, params, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(st.lastInsertRowid, o.seq, o.op_type, JSON.stringify(o.params), 'ai', now, now);
       for (const l of (o.legs || [])) {
