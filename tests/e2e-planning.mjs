@@ -2314,8 +2314,11 @@ export async function run(H, S) {
       && newStockOps.some((o) => o.params && o.params.symbol === 'POOL.B'),
     JSON.stringify(newStockOps));
   // AMZN has no price history: under the flat world its buy is
-  // flat. A pool of 100% flat holding B pins it exactly — baseline
-  // B + AMZN buy, both flat, so the series never moves.
+  // flat. Pool-buy funding (user 2026-11-05): the buy is funded BY
+  // the pool, so the $2,000 AMZN buy sells the whole flat pool B —
+  // the strategy holds AMZN only ($2,000 flat), and Value Δ is $0,
+  // not +$2,000. The old pin asserted $4,000 (pool + AMZN both
+  // held): that was the double-count bug, not the behaviour.
   r = await H.req('POST', '/api/planning/projects', { name: 'Flat Pool Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: poolHoldB, percent: 100 }] }, applyRecommendation: true });
   H.check('sink-simplify: flat pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const flatProjId = r.data.project.id;
@@ -2325,9 +2328,34 @@ export async function run(H, S) {
   H.check('sink-simplify: AMZN buy on the flat pool posts', r.status === 201, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/strategies/${flatStrat.id}?scenarioId=0`);
   const flatSeries = r.data.projection && r.data.projection.stocks && r.data.projection.stocks.series;
-  H.check('sink-simplify: AMZN with no history is flat under the flat world',
-    flatSeries && flatSeries.length > 0 && flatSeries[0].value === flatSeries[flatSeries.length - 1].value && Math.abs(flatSeries[0].value - 4000) < 1,
-    JSON.stringify({ first: flatSeries && flatSeries[0], last: flatSeries && flatSeries[flatSeries.length - 1] }));
+  const flatBaseSeries = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
+  H.check('poolbuy-funding: AMZN buy sells the flat pool — strategy holds AMZN only ($2,000 flat, not $4,000)',
+    flatSeries && flatSeries.length > 0 && flatSeries[0].value === flatSeries[flatSeries.length - 1].value && Math.abs(flatSeries[0].value - 2000) < 1
+      && flatBaseSeries && flatBaseSeries.length > 0 && Math.abs(flatBaseSeries[0].value - 2000) < 1,
+    JSON.stringify({ first: flatSeries && flatSeries[0], last: flatSeries && flatSeries[flatSeries.length - 1], baseFirst: flatBaseSeries && flatBaseSeries[0] }));
+  // ---- Pool-buy funding, Buy SPY shape (user 2026-11-05,
+  // "baseline的不对啊"): the whole $2,000 pool buys AMZN (flat, no
+  // history) while the baseline's POOL.C grows at 25% — Value Δ must
+  // DECLINE from ~$0, not sit flat at +$2,000.
+  r = await H.req('POST', `/api/planning/projects/${poolGrowthId}/strategies`, { name: 'Pool Buy Funding', source: 'manual' });
+  H.check('poolbuy-funding: funding pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const poolBuyStratId = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${poolBuyStratId}/ops`, { op_type: 'buy', params: { accountId: poolAcctC, symbol: 'AMZN', date: `${_poolVan.slice(0, 7)}-01`, amount: 2000, price: 266.03 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('poolbuy-funding: AMZN buy of the whole pool posts', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${poolBuyStratId}?scenarioId=0`);
+  const poolBuyBase = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
+  const poolBuySeries = r.data.projection && r.data.projection.stocks && r.data.projection.stocks.series;
+  const poolBuyDelta = (i) => (poolBuySeries && poolBuyBase && poolBuySeries[i] && poolBuyBase[i]) ? poolBuySeries[i].value - poolBuyBase[i].value : null;
+  H.check('poolbuy-funding: Value Δ declines from ~$0 (AMZN flat minus POOL.C growing at 25%)',
+    poolBuySeries && poolBuyBase && poolBuySeries.length > 12
+      && Math.abs(poolBuyDelta(0)) < 1
+      && Math.abs(poolBuyDelta(12) + 500) < 5
+      && poolBuyDelta(poolBuySeries.length - 1) < -1000000,
+    JSON.stringify({ d0: poolBuyDelta(0), d12: poolBuyDelta(12), dLast: poolBuyDelta(poolBuySeries.length - 1), first: poolBuySeries && poolBuySeries[0], last: poolBuySeries && poolBuySeries[poolBuySeries.length - 1] }));
+  H.check('poolbuy-funding: the buy row Sell-from-pool figure equals the pool draw (buyCashFromSells == buy amount)',
+    r.data.projection && r.data.projection.stocks && r.data.projection.stocks.buyCash === 2000 && r.data.projection.stocks.buyCashFromSells === 2000
+      && (r.data.projection.errors || []).length === 0,
+    JSON.stringify({ stocks: r.data.projection && r.data.projection.stocks, errors: r.data.projection && r.data.projection.errors }));
   // The strategy GET no longer carries a sink or poolAccounts, and
   // the comparison row carries the buy list for the card label.
   r = await H.req('GET', `/api/planning/strategies/${newStockStratId}`);

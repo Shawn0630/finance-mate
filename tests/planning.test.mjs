@@ -387,6 +387,74 @@ test('resolveBuyLegs: pot caps, declared maturity gates, remainder fills', () =>
   assert.ok(/matures/.test(immature.error));
   const ok = resolveBuyLegs([{ source_ref: 'pot', amount: 400 }, { source_ref: 'cash', amount: 'remainder' }], 1500, base);
   assert.equal(ok.pot, 600);
+  assert.equal(ok.fromCashNative, 1100);
+  // 'external' is genuinely new money, not pool money: it never
+  // reports as a cash take.
+  const ext = resolveBuyLegs([{ source_ref: 'external', amount: 'remainder' }], 1500, base);
+  assert.equal(ext.fromCashNative, 0);
+  assert.equal(ext.pot, 1000);
+});
+
+// ---------------------------------------------- pool-funded buys (user bug)
+// A buy on a cash-pool project is funded BY the pool: a 'cash' leg
+// sells pool holdings (pro-rata by value at the buy month), so the
+// strategy does not keep both the pool and the purchase. Before the
+// fix the 'cash' leg was unlimited external money: XQQ.TO was never
+// sold and Value Δ sat flat at +$49,672 (Buy SPY).
+const poolXqq = () => ({
+  id: 1, accountId: 1, symbol: 'XQQ.TO', label: 'XQQ', currency: 'CAD',
+  events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 10 }],
+  pricePoints: [{ date: '2026-10-15', price: 10 }],
+});
+const poolBuyArgs = (over = {}) => ARGS({
+  mainline: MAINLINE({ holdings: [poolXqq()] }),
+  holdingGrowth: { 1: 12 },
+  ops: [{ seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'AMZN', date: '2026-11-01', amount: 500, price: 100 } }],
+  legs: [{ op_seq: 1, source_ref: 'cash', amount: 'remainder' }],
+  poolHoldingIds: [1],
+  ...over,
+});
+const poolSeriesAt = (proj, month) => proj.stocks.series.find((r) => r.month === month).value;
+test('computeProjection: pool-funded buy sells the pool — swap nets to zero at the buy month, then Value Δ declines', () => {
+  const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }), holdingGrowth: { 1: 12 } }));
+  const strat = computeProjection(poolBuyArgs());
+  // The buy month: sold $500 of XQQ (growing) for $500 of AMZN (flat)
+  // — the totals agree to the cent.
+  assert.ok(Math.abs(poolSeriesAt(strat, '2026-11') - poolSeriesAt(baseline, '2026-11')) < 1);
+  // A year on, the sold XQQ would have grown 12% and AMZN stayed
+  // flat, so the strategy trails the baseline by ~$60 and falling.
+  const d0 = poolSeriesAt(strat, '2026-11') - poolSeriesAt(baseline, '2026-11');
+  const d12 = poolSeriesAt(strat, '2027-11') - poolSeriesAt(baseline, '2027-11');
+  assert.ok(d12 < d0 && d12 < -50 && d12 > -70, `Δ went ${d0} → ${d12}`);
+  // The take is sell-funded (a swap): no new cash out, no
+  // opportunity cost on it.
+  assert.equal(strat.stocks.buyCash, 500);
+  assert.equal(strat.stocks.buyCashFromSells, 500);
+  assert.deepEqual(strat.errors, []);
+});
+test('computeProjection: pool-funded buy of the whole flat pool leaves AMZN only — no double count', () => {
+  const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }) }));
+  const strat = computeProjection(poolBuyArgs({
+    holdingGrowth: null,
+    ops: [{ seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'AMZN', date: '2026-11-01', amount: 1000, price: 100 } }],
+  }));
+  assert.equal(poolSeriesAt(strat, '2026-11'), 1000);
+  assert.equal(poolSeriesAt(strat, '2029-11'), 1000);
+  assert.equal(poolSeriesAt(strat, '2026-11'), poolSeriesAt(baseline, '2026-11'));
+});
+test('computeProjection: without a pool, a cash leg stays external cash (double count preserved)', () => {
+  const strat = computeProjection(poolBuyArgs({ poolHoldingIds: null }));
+  assert.ok(Math.abs(poolSeriesAt(strat, '2026-11') - 1509.49) < 1);
+  assert.equal(strat.stocks.buyCashFromSells, 0);
+});
+test('computeProjection: pool-funded buy the pool cannot cover errors and is skipped', () => {
+  const strat = computeProjection(poolBuyArgs({
+    holdingGrowth: null,
+    ops: [{ seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'AMZN', date: '2026-11-01', amount: 2000, price: 100 } }],
+  }));
+  assert.ok(strat.errors.some((e) => /pool holds only \$1000\.00/.test(e)), JSON.stringify(strat.errors));
+  const baseline = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [poolXqq()] }) }));
+  assert.equal(poolSeriesAt(strat, '2026-11'), poolSeriesAt(baseline, '2026-11'));
 });
 
 // ------------------------------------------------------- merge-write build

@@ -288,7 +288,7 @@ export function applyStoredCustomSinkRate(ops, sink) {
 // scenario: prime-path scenario object (or null = actual history only)
 // Returns {mortgage: {perProperty, totals}, stocks: {...}, fees, penalties,
 // cost, gain, net, valueAtHorizon, errors[], warnings[]}.
-export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null, potInitial = 0 }) {
+export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null, potInitial = 0, poolHoldingIds = null }) {
   const errors = [];
   const warnings = [];
   const primeHist = scenarioPrimeHistory(primeHistory, scenario, currentMonth);
@@ -598,6 +598,39 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     opUnitsDelta.get(hid).push({ month: monthKey, delta });
   };
 
+  // Sell pool holdings to raise cash for a pool-funded buy: pro-rata
+  // by CAD value at the buy month, so a buy of the whole pool sells
+  // the whole pool and a partial buy sells that fraction of every
+  // holding. Holdings with no price carry no value and are left
+  // alone. Returns {error} when the pool cannot cover the amount —
+  // the buy is then skipped (flagged in preview, never silent).
+  const sellPoolForCash = (takeNative, buyHolding, monthKey) => {
+    const takeCad = toCad(buyHolding, takeNative);
+    const pool = [];
+    let poolValueCad = 0;
+    for (const hid of poolHoldingIds || []) {
+      const h = holdingsById.get(hid);
+      if (!h) continue;
+      const held = baselineUnitsAt(h, monthKey) + (opUnitsDelta.get(h.id) || []).filter((d) => d.month <= monthKey).reduce((s, d) => s + d.delta, 0);
+      if (!(held > 0)) continue;
+      const pr = priceAt(h, monthKey);
+      if (pr == null) continue;
+      const v = toCad(h, held * pr);
+      if (!(v > 0)) continue;
+      pool.push({ h, held, v });
+      poolValueCad += v;
+    }
+    if (poolValueCad + 1e-9 < takeCad) {
+      return { error: `pool holds only $${round2(poolValueCad).toFixed(2)} at ${monthKey}, but the buy needs $${round2(takeCad).toFixed(2)} from the pool` };
+    }
+    const frac = takeCad / poolValueCad;
+    for (const { h, held } of pool) {
+      const units = round4(frac * held);
+      if (units > 0) pushUnitsDelta(h.id, monthKey, -units);
+    }
+    return { ok: true };
+  };
+
   for (const op of stockOps) {
     const p = op.params || {};
     const monthKey = String(p.date || '').slice(0, 7);
@@ -625,6 +658,22 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
         opDate: p.date, holdingCurrency: holding.currency, fxRate, buySeq: op.seq,
       });
       if (resolved.error) { errors.push(`buy operation ${op.seq}: ${resolved.error}`); continue; }
+      // Pool-funded buys (cash-pool strategies, user 2026-11-05): a
+      // 'cash' leg IS the pool — the buy row already reads it as
+      // "Sell from pool" and the overflow guard caps the buy at the
+      // pool total. Sell pool holdings to raise the leg, so the
+      // strategy does not keep both the pool and the purchase (the
+      // old code treated 'cash' as unlimited external money, so
+      // XQQ.TO was never sold and Value Δ sat flat at +$49,672).
+      // The take is sell-funded (a swap, not new cash) — it joins
+      // buyCashFromSells below. Non-pool runs have no poolHoldingIds,
+      // so their 'cash' legs stay external cash as before.
+      let poolTakeNative = 0;
+      if (poolHoldingIds && poolHoldingIds.length && (resolved.fromCashNative || 0) > 0) {
+        const sale = sellPoolForCash(resolved.fromCashNative, holding, monthKey);
+        if (sale.error) { errors.push(`buy operation ${op.seq}: ${sale.error}`); continue; }
+        poolTakeNative = resolved.fromCashNative;
+      }
       // A pot-funded buy draws the pot down — record it as a pot event
       // so the monthly pot series (below) moves on the buy month, not
       // just on sells. Without this the pot series would miss draws.
@@ -632,8 +681,9 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       pot = resolved.pot;
       buyCash += toCad(holding, amount);
       // Sell-earmarked funding is a swap, not new cash: it must not
-      // count as cash out nor as opportunity-costed principal.
-      buyCashFromSells += toCad(holding, resolved.fromSellsNative || 0);
+      // count as cash out nor as opportunity-costed principal. A
+      // pool-funded take is the same kind of swap.
+      buyCashFromSells += toCad(holding, resolved.fromSellsNative || 0) + toCad(holding, poolTakeNative);
       pushUnitsDelta(holding.id, monthKey, units);
       opOutput.set(op.seq, { amountCad: toCad(holding, amount), note: 'buy' });
       // A bought holding's price path starts at its buy price, then
@@ -909,12 +959,18 @@ function runPlanShim(plan, primeHist, currentPrime, currentMonth) {
 // Buy-leg resolution (amount-driven). legs: the buy op's legs.
 // available: {pot (CAD), opOutputs: Map seq -> amountCad, declaredAssets,
 //   opDate, holdingCurrency, fxRate}. Returns {pot, error?}.
+// fromCashNative reports the buy amount funded by 'cash' legs: on a
+// cash-pool strategy the caller sells pool holdings for that amount
+// (a 'cash' leg IS the pool there — the buy row reads it as
+// "Sell from pool" and the overflow guard caps the buy at the pool
+// total); 'external' stays genuinely-external unlimited cash.
 export function resolveBuyLegs(legs, buyAmountNative, { pot, opOutputs, declaredAssets, opDate, holdingCurrency, fxRate, buySeq = null }) {
   const toCadAmt = (native) => (holdingCurrency === 'USD' ? native * fxRate : native);
   const fromCadAmt = (cad) => (holdingCurrency === 'USD' ? cad / fxRate : cad);
   let remainingNative = buyAmountNative;
   let newPot = pot;
   let fromSellsNative = 0; // buy amount funded by sell earmarks (a swap, not new cash)
+  let fromCashNative = 0; // buy amount funded by 'cash' legs (pool money on pool strategies)
   // Fixed legs first, then 'all', then 'remainder'.
   const ordered = [...(legs || [])].sort((a, b) => {
     const rank = (x) => (x.amount === 'all' ? 1 : x.amount === 'remainder' ? 2 : 0);
@@ -951,6 +1007,7 @@ export function resolveBuyLegs(legs, buyAmountNative, { pot, opOutputs, declared
       return { error: `funding leg from ${src} needs ${takeNative}, but only ${availNative} is available` };
     }
     if (src === 'pot') newPot = round2(newPot - toCadAmt(takeNative));
+    if (src === 'cash') fromCashNative = round2(fromCashNative + takeNative);
     if (src.startsWith('op:')) {
       fromSellsNative = round2(fromSellsNative + takeNative);
       const dep = Number(src.slice(3));
@@ -962,7 +1019,7 @@ export function resolveBuyLegs(legs, buyAmountNative, { pot, opOutputs, declared
     remainingNative = round2(remainingNative - takeNative);
   }
   if (remainingNative > 0.005) return { error: `funding covers only part of the purchase — ${remainingNative} unfunded` };
-  return { pot: newPot, fromSellsNative };
+  return { pot: newPot, fromSellsNative, fromCashNative };
 }
 
 function addYearsDate(dateStr, years) {

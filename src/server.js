@@ -4783,7 +4783,18 @@ async function planProjectionFor(strategy, project, scenarioInput, overrides) {
   // External pool cash seeds the pot in both runs (0 when the pool
   // has none) — it is spendable from the first month.
   const potInitial = poolExternalCash(planProjectEntityOf(project));
-  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth, potInitial };
+  // A buy on a cash-pool project is funded BY the pool: the engine
+  // sells pool holdings to raise the buy's 'cash' leg (user
+  // 2026-11-05 — the old code treated 'cash' as unlimited external
+  // money, so the strategy kept both XQQ.TO and AMZN). The pool is
+  // the mainline's holdings after planPoolMainline; single-holding
+  // or account projects have no pool, so their 'cash' legs stay
+  // external cash as before.
+  const poolEntity = planProjectEntityOf(project);
+  const poolHoldingIds = (project.category === 'investment' && poolEntity && poolEntity.type === 'pool')
+    ? (mainline.holdings || []).map((h) => h.id)
+    : null;
+  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth, potInitial, poolHoldingIds };
   const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
   const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
   baseline.currentRates = currentRates;
