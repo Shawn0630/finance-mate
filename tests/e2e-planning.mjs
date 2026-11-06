@@ -3275,6 +3275,146 @@ export async function run(H, S) {
   H.check('creation-flow: AI-create without a subcategory sends a non-GIC request to the model (stub echoed, no GIC template)',
     r.status === 200 && r.data.proposal && r.data.proposal.project && r.data.proposal.project.name === 'Stub Project',
     JSON.stringify(r.data));
+  // ---- Planning list page: sections by category, project name as the
+  // headline, entity identity as tags (user 2026-11-06) ----
+  // Fresh property: the module's own test property (planPid) was
+  // deleted long before this point, so the pin owns its fixture.
+  r = await H.req('POST', '/api/properties', { address: '1 List Sections Way', purchase_date: '2024-01-15', mortgage_balance: 500000, amortization_years: 25 });
+  H.check('plan-list: fixture property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const listPropPid = r.data.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'List Sections Property', question: 'q', category: 'property', subcategory: 'interest_rate', entity: { type: 'property', propertyId: listPropPid } });
+  H.check('plan-list: fixture property project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const listPropId = r.data.project.id;
+  r = await H.req('POST', '/api/planning/projects', { name: 'List Sections Other', question: 'q' });
+  H.check('plan-list: fixture legacy project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const listOtherId = r.data.project.id;
+  r = await H.req('GET', '/api/planning/projects');
+  const listRows = (r.data.projects || []);
+  const listSecs = (r.data.sections || []);
+  const listSecOf = (name) => (listSecs.find((s) => s.projects.some((p) => p.name === name)) || {}).key;
+  const listRow = (name) => listRows.find((p) => p.name === name) || {};
+  H.check('plan-list: sections are in canonical order with Other last and no Earning section',
+    JSON.stringify(listSecs.map((s) => s.key)) === JSON.stringify(['property', 'investment', 'saving', 'tax_saving', 'other']),
+    JSON.stringify(listSecs.map((s) => s.key)));
+  H.check('plan-list: projects land in their category sections',
+    listSecOf('List Sections Property') === 'property' && listSecOf('Pool Project') === 'investment'
+      && listSecOf('Saving Scope Test') === 'saving' && listSecOf('Tax Scope Test') === 'tax_saving'
+      && listSecOf('List Sections Other') === 'other',
+    JSON.stringify({ prop: listSecOf('List Sections Property'), pool: listSecOf('Pool Project'), sav: listSecOf('Saving Scope Test'), tax: listSecOf('Tax Scope Test'), other: listSecOf('List Sections Other') }));
+  H.check('plan-list: entity tags — property name on a property card, funding sources on a pool card, none on a legacy card',
+    JSON.stringify(listRow('List Sections Property').entityTags) === JSON.stringify(['1 List Sections Way'])
+      && (listRow('Pool Project').entityTags || []).includes('Pool Acct A') && (listRow('Pool Project').entityTags || []).includes('POOL.B')
+      && (listRow('PoolViz Ext').entityTags || []).includes('POOL.A') && (listRow('PoolViz Ext').entityTags || []).includes('External funding')
+      && JSON.stringify(listRow('List Sections Other').entityTags || []) === JSON.stringify([]),
+    JSON.stringify({ prop: listRow('List Sections Property').entityTags, pool: listRow('Pool Project').entityTags, ext: listRow('PoolViz Ext').entityTags, other: listRow('List Sections Other').entityTags }));
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('plan-list browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardList = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResList = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieList = loginResList.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserList = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserList.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardList({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieList, domain: 'ff.local', path: '/', httpOnly: true });
+      const listWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto('http://ff.local/#planning', { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('[data-plan-project]', { timeout: 15000 });
+      await listWait(500);
+      const listView = await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('#planList .section-head h3')].map((h) => {
+          const cardsEl = h.closest('.section-head').nextElementSibling;
+          const cards = cardsEl && cardsEl.classList.contains('cards')
+            ? [...cardsEl.querySelectorAll('[data-plan-project]')].map((c) => ({
+                name: c.querySelector('.v') ? c.querySelector('.v').textContent : '',
+                tags: [...c.querySelectorAll('.plan-list-tags .meta-tag')].map((t) => t.textContent),
+                meta: c.querySelector('.n') ? c.querySelector('.n').textContent : '',
+                hasK: !!c.querySelector('.k'),
+              }))
+            : [];
+          return { heading: h.textContent, cards };
+        });
+        return { sections };
+      });
+      const listLabels = listView.sections.map((s) => s.heading.split(' · ')[0]);
+      const listCardIn = (label, name) => {
+        const s = listView.sections.find((x) => x.heading.split(' · ')[0] === label);
+        return s ? s.cards.find((c) => c.name === name) : null;
+      };
+      const listPropCard = listCardIn('Property', 'List Sections Property');
+      const listPoolCard = listCardIn('Investment', 'Pool Project');
+      const listSavCard = listCardIn('Saving', 'Saving Scope Test');
+      const listTaxCard = listCardIn('Tax saving', 'Tax Scope Test');
+      const listOtherCard = listCardIn('Other', 'List Sections Other');
+      H.check('plan-list: rendered sections in category order (Property → Investment → Saving → Tax saving → Other, no Earning)',
+        JSON.stringify(listLabels) === JSON.stringify(['Property', 'Investment', 'Saving', 'Tax saving', 'Other']),
+        JSON.stringify(listView.sections.map((s) => s.heading)));
+      H.check('plan-list: project name is the card headline, "N strategies" is meta text, entity tag present (property card)',
+        !!listPropCard && listPropCard.name === 'List Sections Property' && !listPropCard.hasK
+          && JSON.stringify(listPropCard.tags) === JSON.stringify(['1 List Sections Way'])
+          && listPropCard.meta.includes('0 strategies'),
+        JSON.stringify(listPropCard));
+      H.check('plan-list: pool card headline is the project name with funding-source tags and strategies in the meta line',
+        !!listPoolCard && listPoolCard.name === 'Pool Project' && !listPoolCard.hasK
+          && listPoolCard.tags.includes('Pool Acct A') && listPoolCard.tags.includes('POOL.B')
+          && /\d+ strateg(y|ies)/.test(listPoolCard.meta),
+        JSON.stringify(listPoolCard));
+      H.check('plan-list: scope cards carry their scope label as a tag under the right sections',
+        !!listSavCard && listSavCard.tags.includes('All spending')
+          && !!listTaxCard && listTaxCard.tags.includes('All earnings'),
+        JSON.stringify({ sav: listSavCard, tax: listTaxCard }));
+      H.check('plan-list: legacy card under Other has no tags and "N strategies" in the meta line',
+        !!listOtherCard && listOtherCard.tags.length === 0 && listOtherCard.meta.includes('0 strategies'),
+        JSON.stringify(listOtherCard));
+      H.check('plan-list: no card headline anywhere is an "N strategies" count',
+        listView.sections.flatMap((s) => s.cards).length > 0
+          && listView.sections.flatMap((s) => s.cards).every((c) => !/strateg(y|ies)/.test(c.name)),
+        JSON.stringify(listView.sections.flatMap((s) => s.cards).map((c) => c.name)));
+    } finally { await browserList.close(); }
+  }
+  r = await H.req('DELETE', `/api/planning/projects/${listPropId}`);
+  H.check('plan-list: fixture property project cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/planning/projects/${listOtherId}`);
+  H.check('plan-list: fixture legacy project cleanup', r.status === 200);
+  r = await H.req('DELETE', `/api/properties/${listPropPid}`);
+  H.check('plan-list: fixture property cleanup', r.status === 200);
   r = await H.req('POST', `/api/planning/projects/${pvProj}/strategies`, { name: 'Buy from external' });
   H.check('poolviz: external-pool strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const pvStrat = r.data.strategy.id;

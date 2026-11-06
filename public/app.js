@@ -11275,7 +11275,7 @@ async function loadPlanning() {
     planReportOutlineClear();
     $('#planStrategy').classList.add('hidden');
     $('#planScenario').classList.add('hidden');
-    $('#planList').innerHTML = planListHtml(data.projects);
+    $('#planList').innerHTML = planListHtml(data.sections || []);
     document.querySelectorAll('[data-plan-project]').forEach((el) => {
       el.addEventListener('click', () => { location.hash = `#planning/project/${el.dataset.planProject}`; });
     });
@@ -11283,17 +11283,36 @@ async function loadPlanning() {
     if (addBtn) addBtn.addEventListener('click', () => openPlanCategoryFlow({ mode: 'create' }));
   });
 }
-function planListHtml(projects) {
-  const cards = projects.map((p) => `
-    <div class="card breakdown-card" data-plan-project="${p.id}" style="cursor:pointer">
-      <div class="k">${esc(p.name)}</div>
-      <div class="v">${p.strategies.length} strateg${p.strategies.length === 1 ? 'y' : 'ies'}</div>
-      <div class="n">${esc(p.question || '')}${p.categoryLabels ? ` · ${[p.categoryLabels.category, p.categoryLabels.subcategory].filter((x) => x).map((x) => esc(x)).join(' · ')}` : ''}${p.stale ? ' · Stale baseline' : ''}</div>
-    </div>`).join('');
+// List page (user 2026-11-06): projects group into sections by
+// category, and the PROJECT NAME is the card headline — "N strategies"
+// is small meta text, never the headline. The entity identity renders
+// as tag pills between the headline and the meta line (property name,
+// or the pool's funding sources).
+function planListHtml(sections) {
+  const total = sections.reduce((n, s) => n + s.projects.length, 0);
+  const body = total ? sections.map((s) => `
+    <div class="section-head"><h3>${esc(s.label)} · ${s.projects.length}</h3></div>
+    <div class="cards">${s.projects.map(planListCardHtml).join('')}</div>`).join('')
+    : '<div class="panel"><div class="note">No projects yet.</div></div>';
   return `
     <div class="section-head"><h2>Planning</h2><div class="toolbar"><button class="primary" id="planAddProjectBtn">+ Add project</button></div></div>
     <div class="msg" id="planListMsg"></div>
-    ${projects.length ? `<div class="cards">${cards}</div>` : '<div class="panel"><div class="note">No projects yet.</div></div>'}`;
+    ${body}`;
+}
+function planListCardHtml(p) {
+  const tags = (p.entityTags || []).map((t) => `<span class="meta-tag">${esc(t)}</span>`).join('');
+  const metaParts = [
+    `${p.strategies.length} strateg${p.strategies.length === 1 ? 'y' : 'ies'}`,
+    p.question || '',
+    p.categoryLabels ? [p.categoryLabels.category, p.categoryLabels.subcategory].filter((x) => x).join(' · ') : '',
+  ];
+  if (p.stale) metaParts.push('Stale baseline');
+  return `
+    <div class="card breakdown-card" data-plan-project="${p.id}" style="cursor:pointer">
+      <div class="v">${esc(p.name)}</div>
+      ${tags ? `<div class="plan-list-tags">${tags}</div>` : ''}
+      <div class="n">${esc(metaParts.filter((x) => x).join(' · '))}</div>
+    </div>`;
 }
 // CREATION FLOW: big category → data entity → project modal.
 // The strategy is defined inside the project (user 2026-11-05) —

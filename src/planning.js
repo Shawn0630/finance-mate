@@ -2015,6 +2015,26 @@ export function planFirstSubcategory(category) {
   const c = planOptCategory(category);
   return (c && Object.keys(c.subcategories)[0]) || null;
 }
+// List-page sections (user 2026-11-06): projects group by category in
+// this order; anything outside the five (null = legacy, unknown) goes
+// to Other last; a category with no projects renders no section.
+export const PLAN_LIST_SECTION_ORDER = ['property', 'investment', 'earning', 'saving', 'tax_saving'];
+export function planListSections(projects) {
+  const groups = new Map();
+  for (const p of projects || []) {
+    const key = PLAN_LIST_SECTION_ORDER.includes(p && p.category) ? p.category : 'other';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+  const out = [];
+  for (const key of PLAN_LIST_SECTION_ORDER) {
+    if (!groups.has(key)) continue;
+    const cat = planOptCategory(key);
+    out.push({ key, label: cat ? cat.label : key, projects: groups.get(key) });
+  }
+  if (groups.has('other')) out.push({ key: 'other', label: 'Other', projects: groups.get('other') });
+  return out;
+}
 export function planProjectSections(key) {
   const t = planProjectTemplate(key);
   return t ? t.sections : null;

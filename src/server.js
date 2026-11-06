@@ -58,6 +58,7 @@ import {
   principalGainSeries, validateAiBaseline, validateAiCreateProposal, paymentScopeFor,
   scopeMainlineToProperty,
   PLAN_OPT_CATEGORIES, planOptCategory, planOptSubcategory, planFirstSubcategory,
+  planListSections,
   validateStrategyFactors, validateScenarioFactors, groupStrategyFactorsForMigration,
   primeFactorToScenario, factorsToAssumptions,
   primeFactorPresetPoints, PLAN_PRIME_PRESETS, PLAN_PRIME_PRESET_LABELS,
@@ -4957,9 +4958,9 @@ app.get('/api/planning/projects', requireApiAuth, (req, res) => {
     const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
     let entity = null;
     try { entity = p.entity ? JSON.parse(p.entity) : null; } catch { entity = null; }
-    return { ...p, strategies, stale: planSnapshotStale(p.snapshot), categoryLabels: planOptCategoryLabels(p.category, p.subcategory, entity) };
+    return { ...p, strategies, stale: planSnapshotStale(p.snapshot), categoryLabels: planOptCategoryLabels(p.category, p.subcategory, entity), entityTags: planEntityTags(p.category, entity) };
   });
-  res.json({ projects: out });
+  res.json({ projects: out, sections: planListSections(out) });
 });
 
 // Template metadata validation: a template's required fields must be
@@ -5085,6 +5086,31 @@ function planOptCategoryLabels(category, subcategory, entity) {
     subcategory: sub ? sub.label : (subcategory || ''),
     entity: planOptEntityLabel(entity),
   };
+}
+// Entity identity as tag pills for the list page (user 2026-11-06):
+// a property project carries its property name; a cash-pool project
+// carries its funding sources (one tag per source: account name,
+// holding symbol, or External funding). Other categories carry their
+// entity label (job employer, rental name, scope label); no entity
+// means no tags.
+function planEntityTags(category, entity) {
+  if (!entity || typeof entity !== 'object') return [];
+  if (entity.type === 'pool') {
+    const tags = [];
+    for (const it of Array.isArray(entity.items) ? entity.items : []) {
+      if (it.source === 'external') tags.push('External funding');
+      else if (it.accountId != null) {
+        const acc = db.prepare('SELECT name FROM invest_accounts WHERE id = ?').get(Number(it.accountId));
+        if (acc && acc.name) tags.push(acc.name);
+      } else if (it.holdingId != null) {
+        const h = db.prepare('SELECT symbol, label FROM invest_holdings WHERE id = ?').get(Number(it.holdingId));
+        if (h && (h.symbol || h.label)) tags.push(h.symbol || h.label);
+      }
+    }
+    return [...new Set(tags)];
+  }
+  const label = planOptEntityLabel(entity);
+  return label ? [label] : [];
 }
 function planValidateOptEntity(category, entity) {
   if (!entity || typeof entity !== 'object') return 'entity is required';

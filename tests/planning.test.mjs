@@ -10,7 +10,7 @@ import {
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
   resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
   holdingVolatilityFromPoints, stockFanSeries,
-  planProjectTemplate, planProjectSections, planStrategyTemplateLabel,
+  planProjectTemplate, planProjectSections, planStrategyTemplateLabel, planListSections,
   buildPlanAiSnapshot, normalizeAiAsk,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
   validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind,
@@ -835,6 +835,24 @@ test('planProjectTemplate: mortgage/refinance show prime scenarios only; buy sho
   assert.equal(planProjectTemplate('buy').fields[0].key, 'account_type');
   assert.equal(planStrategyTemplateLabel('prepay'), 'Prepay');
   assert.equal(planStrategyTemplateLabel('ai-template'), 'AI template');
+});
+
+test('planListSections: groups by category in canonical order, Other last, empty categories omitted', () => {
+  const rows = [
+    { id: 1, category: null, name: 'Legacy' },
+    { id: 2, category: 'investment', name: 'Inv' },
+    { id: 3, category: 'property', name: 'Prop' },
+    { id: 4, category: 'saving', name: 'Sav' },
+    { id: 5, category: 'bogus', name: 'Bogus' },
+    { id: 6, category: 'property', name: 'Prop 2' },
+  ];
+  const secs = planListSections(rows);
+  assert.deepEqual(secs.map((s) => s.key), ['property', 'investment', 'saving', 'other']);
+  assert.deepEqual(secs.map((s) => s.label), ['Property', 'Investment', 'Saving', 'Other']);
+  assert.deepEqual(secs[0].projects.map((p) => p.id), [3, 6]);
+  assert.deepEqual(secs[3].projects.map((p) => p.id), [1, 5]);
+  assert.deepEqual(planListSections([]), []);
+  assert.deepEqual(planListSections(null), []);
 });
 
 test('buildPlanAiSnapshot: carries balances, terms, segments, prime and capped history', () => {
