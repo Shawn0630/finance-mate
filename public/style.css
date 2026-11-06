@@ -712,8 +712,7 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
    section-head titles; picks render as pill chips (checked = blue
    tint, same as wiring Selected). Scoped to the modal only. */
 #planReportAiModal .plan-ai-modal-card { border: 1px solid #e6ecf2; border-radius: 10px; padding: 10px 14px; margin: 12px 0; }
-#planReportFollowUp { margin: 12px 0; }
-/* AI conversation threads (Follow up panel + Create-with-AI modal):
+/* AI conversation threads (report panel + Create-with-AI modal):
    shared turn styles, scoped to the .plan-ai-thread container. */
 .plan-ai-thread { max-height: 340px; overflow-y: auto; margin: 12px 0; }
 .plan-ai-thread .plan-ai-turn { border: 1px solid #e6ecf2; border-radius: 10px; padding: 10px 14px; margin: 10px 0; }

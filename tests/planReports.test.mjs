@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
   validateAiReportBaselineKind, validateAiReportChartSeries, aiReportPrompt, aiReportHistoryLines,
+  aiReportRefinePrompt,
 } from '../src/planning.js';
 
 test('report scenario pin: pinned ids must belong to the project', () => {
@@ -107,4 +108,19 @@ test('AI report prompt: history block present only when history is given', () =>
   assert.doesNotMatch(without, /Conversation so far/);
   const empty = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x', history: [] });
   assert.doesNotMatch(empty, /Conversation so far/);
+});
+
+test('AI refine prompt: history passes through, adds go at the end, other keys preserved', () => {
+  const def = { strategies: [1], variables: { penalty: { 1: 0 } }, engine: {}, charts: [{ template: 'time_line', title: 'Balance path', series: ['mortgage_balance'], method: 'Monthly outstanding principal.' }] };
+  const p = aiReportRefinePrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, baselineKind: 'property', definition: def, text: 'Add a yearly chart', history: ['Charts already in this report: Balance path'] });
+  assert.match(p, /Conversation so far/);
+  assert.match(p, /Charts already in this report: Balance path/);
+  assert.match(p, /COMPLETE revised definition/);
+  assert.match(p, /append the new chart\(s\) at the END of the charts list/);
+  assert.match(p, /never insert a new chart before an existing one/);
+  assert.match(p, /Preserve any other keys in the current definition/);
+  assert.match(p, /"title":"Balance path"/);
+  const noHistory = aiReportRefinePrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, baselineKind: 'property', definition: def, text: 'x' });
+  assert.doesNotMatch(noHistory, /Conversation so far/);
+  assert.match(noHistory, /append the new chart\(s\) at the END of the charts list/);
 });

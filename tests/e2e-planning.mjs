@@ -1531,119 +1531,166 @@ export async function run(H, S) {
         const el = document.querySelector(`[data-plan-report-view="${rid}"]`);
         if (el) el.click();
       }, mbRepId);
-      await page.waitForFunction(() => !!document.querySelector('#planReportTabAiBtn'), { timeout: 30000 });
-      await page.evaluate(() => document.querySelector('#planReportTabAiBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
-      const followUpOpen = await page.evaluate(() => ({
-        modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
-        panelVisible: !!document.querySelector('#planReportFollowUp') && !document.querySelector('#planReportFollowUp').classList.contains('hidden'),
-        send: !!document.querySelector('#planReportFollowUpSendBtn'),
-        head: document.querySelector('#planReportFollowUp .section-head h3')?.textContent || '',
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatText'), { timeout: 30000 });
+      // --- Report AI merged into ONE conversation (user 2026-11-06) ---
+      // The top "Follow up with AI" button/panel is gone; the single
+      // bottom "Refine with AI" panel is a thread. Each turn goes to
+      // ai-refine; the model decides add vs change; new charts land
+      // at the END of the report's charts.
+      const mergedHere = await page.evaluate(() => ({
+        tabAiBtn: !!document.querySelector('#planReportTabAiBtn'),
+        followUpPanel: !!document.querySelector('#planReportFollowUp'),
+        aiText: !!document.querySelector('#planReportAiChatText'),
+        aiSend: !!document.querySelector('#planReportAiChatSendBtn'),
+        head: document.querySelector('[data-plan-report-block="refine"] .section-head h3')?.textContent || '',
       }));
-      H.check('aichat: Follow up with AI expands the inline panel in place (no modal opens)',
-        followUpOpen.modalOpen === false && followUpOpen.panelVisible && followUpOpen.send && followUpOpen.head === 'Follow up with AI',
-        JSON.stringify(followUpOpen));
-      // --- Follow up with AI as a conversation (user 2026-11-06) ---
-      // The inline panel is a thread: each Send is one turn, each
-      // AI turn has its own Apply; nothing writes without Apply.
+      H.check('aichat: top Follow up button/panel is gone; the bottom Refine with AI panel is the single conversation',
+        mergedHere.tabAiBtn === false && mergedHere.followUpPanel === false
+          && mergedHere.aiText && mergedHere.aiSend && mergedHere.head === 'Refine with AI',
+        JSON.stringify(mergedHere));
+      // --- Merged conversation: add turn, refine turn, tab-switch survival ---
       const mbReportCharts = async () => {
         const proj = await H.req('GET', `/api/planning/projects/${metaBuyId}`);
         const rep = (proj.data.reports || []).find((x) => x.id === mbRepId);
         return rep && rep.definition && Array.isArray(rep.definition.charts) ? rep.definition.charts : null;
       };
+      const chartOrder = async () => page.evaluate(() => [...document.querySelectorAll('#planReport [data-plan-report-block]')]
+        .map((el) => ({ block: el.dataset.planReportBlock, title: el.querySelector('.section-head h3')?.textContent || '' }))
+        .filter((x) => /^\d+$/.test(x.block)).map((x) => x.title));
       const followDef1 = { engine: {}, charts: [
         { template: 'time_line', title: 'Follow-up balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
         { template: 'metric_cards', title: 'Follow-up headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain - cost.' },
       ] };
-      const followDef2 = { engine: {}, charts: [
-        { template: 'yearly_bars', title: 'Follow-up yearly', series: ['mortgage_balance'], method: 'Year-end outstanding principal per year from the engine projection.' },
+      const mergedDef2 = { engine: { scalars: { cost: 'cost + 100' } }, charts: [
+        { template: 'time_line', title: 'Follow-up balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal, baseline vs each strategy — revised.' },
+        { template: 'metric_cards', title: 'Follow-up headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain - cost.' },
+        { template: 'yearly_bars', title: 'Refined yearly', series: ['mortgage_balance'], method: 'Year-end outstanding principal per year from the engine projection.' },
       ] };
-      const followDef3 = { engine: {}, charts: [
+      const mergedDef3 = { engine: { scalars: { cost: 'cost + 100' } }, charts: [
+        ...mergedDef2.charts,
         { template: 'time_line', title: 'Unapplied chart', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
       ] };
       const threadState = async () => page.evaluate(() => {
-        const turns = [...document.querySelectorAll('#planReportFollowUpThread .plan-ai-turn')];
+        const turns = [...document.querySelectorAll('#planReportAiChatThread .plan-ai-turn')];
         return {
           userTurns: turns.filter((t) => t.classList.contains('plan-ai-turn-user')).map((t) => t.textContent),
           aiTurns: turns.filter((t) => t.classList.contains('plan-ai-turn-ai')).map((t) => t.textContent),
-          applies: [...document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')].map((b) => ({ disabled: b.disabled, label: b.textContent.trim() })),
+          applies: [...document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]')].map((b) => ({ disabled: b.disabled, label: b.textContent.trim() })),
         };
       });
+      // Turn 1 — ADD: the stub returns the two new charts as the whole
+      // revised definition; the diff must show them as added.
       fs.writeFileSync(H.aiStubFile, JSON.stringify(followDef1));
-      await page.type('#planReportFollowUpText', 'Add a balance chart');
-      await page.evaluate(() => document.querySelector('#planReportFollowUpSendBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUp [data-ai-turn-apply]'), { timeout: 15000 });
+      await page.type('#planReportAiChatText', 'Add a balance chart');
+      await page.evaluate(() => document.querySelector('#planReportAiChatSendBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatThread [data-ai-turn-apply]'), { timeout: 15000 });
       let thread = await threadState();
-      H.check('aichat: turn 1 shows the user message + proposed charts + an Apply button',
+      H.check('aichat: turn 1 (add) shows the user message + proposed charts + an Apply button',
         thread.userTurns.some((t) => t.includes('Add a balance chart'))
-          && thread.aiTurns.some((t) => t.includes('Follow-up balance') && t.includes('Follow-up headlines'))
+          && thread.aiTurns.some((t) => t.includes('+ Chart Follow-up balance') && t.includes('+ Chart Follow-up headlines'))
           && thread.applies.length === 1 && thread.applies[0].disabled === false && thread.applies[0].label === 'Apply',
         JSON.stringify(thread));
       H.check('aichat: nothing writes before Apply',
         JSON.stringify(await mbReportCharts()) === '[]', JSON.stringify(await mbReportCharts()));
-      await page.evaluate(() => document.querySelector('#planReportFollowUp [data-ai-turn-apply]').click());
+      await page.evaluate(() => document.querySelector('#planReportAiChatThread [data-ai-turn-apply]').click());
       await page.waitForFunction(() => {
-        const b = document.querySelector('#planReportFollowUp [data-ai-turn-apply]');
+        const b = document.querySelector('#planReportAiChatThread [data-ai-turn-apply]');
         return b && b.disabled && b.textContent.trim() === 'Applied ✓';
       }, { timeout: 15000 });
-      // Apply reloads the report view; the panel restores from the
-      // per-report thread state — wait for the restored Applied turn
-      // before reading the definition.
       await page.waitForFunction(() => {
-        const b = document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')[0];
+        const b = document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]')[0];
         return b && b.disabled && b.textContent.trim() === 'Applied ✓';
       }, { timeout: 15000 });
       const chartsAfter1 = await mbReportCharts();
-      H.check('aichat: Apply on turn 1 appends exactly that turn charts and the panel stays open',
+      H.check('aichat: Apply on turn 1 appends exactly that turn charts',
         Array.isArray(chartsAfter1) && chartsAfter1.length === 2
           && chartsAfter1.some((c) => c.title === 'Follow-up balance')
           && chartsAfter1.some((c) => c.title === 'Follow-up headlines'),
         JSON.stringify(chartsAfter1));
+      // metric_cards is the headline, never a chart panel — so only
+      // the time_line chart renders as a block. Wait for the
+      // post-Apply reload before reading the DOM (the Applied ✓
+      // button flips before the reload finishes).
+      await page.waitForFunction(() => {
+        const titles = [...document.querySelectorAll('#planReport [data-plan-report-block]')]
+          .map((el) => ({ block: el.dataset.planReportBlock, title: el.querySelector('.section-head h3')?.textContent || '' }))
+          .filter((x) => /^\d+$/.test(x.block)).map((x) => x.title);
+        return JSON.stringify(titles) === JSON.stringify(['Follow-up balance']);
+      }, { timeout: 15000 });
+      H.check('aichat: appended charts land at the END of the report charts (DOM order)',
+        JSON.stringify(await chartOrder()) === JSON.stringify(['Follow-up balance']),
+        JSON.stringify(await chartOrder()));
       // A second Apply on the same turn cannot double-append.
-      await page.evaluate(() => document.querySelector('#planReportFollowUp [data-ai-turn-apply]').click());
+      await page.evaluate(() => document.querySelector('#planReportAiChatThread [data-ai-turn-apply]').click());
       await mbWait(800);
       H.check('aichat: second Apply on the same turn does not double-append',
         JSON.stringify(await mbReportCharts()) === JSON.stringify(chartsAfter1), JSON.stringify(await mbReportCharts()));
-      // Turn 2 in the same thread.
-      fs.writeFileSync(H.aiStubFile, JSON.stringify(followDef2));
-      await page.type('#planReportFollowUpText', 'And a yearly one');
-      await page.evaluate(() => document.querySelector('#planReportFollowUpSendBtn').click());
-      await page.waitForFunction(() => document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]').length === 2, { timeout: 15000 });
+      // Turn 2 — REFINE: change one chart's method, add one at the end,
+      // and set an engine scalar; the diff must show all three.
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(mergedDef2));
+      await page.type('#planReportAiChatText', 'Show the yearly bars instead');
+      await page.evaluate(() => document.querySelector('#planReportAiChatSendBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]').length === 2, { timeout: 15000 });
       thread = await threadState();
-      H.check('aichat: turn 2 in the same thread shows both turns',
+      H.check('aichat: turn 2 (refine) shows the diff — changed chart, added chart, engine scalar',
         thread.userTurns.length === 2 && thread.aiTurns.length === 2
-          && thread.userTurns[1].includes('And a yearly one')
-          && thread.aiTurns[1].includes('Follow-up yearly'),
+          && thread.userTurns[1].includes('Show the yearly bars instead')
+          && thread.aiTurns[1].includes('~ Chart Follow-up balance')
+          && thread.aiTurns[1].includes('+ Chart Refined yearly')
+          && thread.aiTurns[1].includes('+ Engine scalars cost'),
         JSON.stringify(thread));
-      await page.evaluate(() => document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')[1].click());
+      H.check('aichat: refine turn writes nothing before Apply',
+        JSON.stringify(await mbReportCharts()) === JSON.stringify(chartsAfter1), JSON.stringify(await mbReportCharts()));
+      await page.evaluate(() => document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]')[1].click());
       await page.waitForFunction(() => {
-        const b = document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')[1];
+        const b = document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]')[1];
         return b && b.disabled && b.textContent.trim() === 'Applied ✓';
       }, { timeout: 15000 });
       const chartsAfter2 = await mbReportCharts();
-      H.check('aichat: Apply on turn 2 appends only that turn charts',
-        Array.isArray(chartsAfter2) && chartsAfter2.length === 3 && chartsAfter2.some((c) => c.title === 'Follow-up yearly'),
+      H.check('aichat: Apply on turn 2 keeps order and puts the new chart LAST',
+        Array.isArray(chartsAfter2) && chartsAfter2.length === 3
+          && chartsAfter2.map((c) => c.title).join('|') === 'Follow-up balance|Follow-up headlines|Refined yearly'
+          && chartsAfter2[0].method.includes('revised'),
         JSON.stringify(chartsAfter2));
-      // Turn 3 proposed but never Applied: collapsing the panel
-      // writes nothing, and reopening keeps the thread (in-memory
-      // state survives collapse) with the turn still unapplied.
-      fs.writeFileSync(H.aiStubFile, JSON.stringify(followDef3));
-      await page.type('#planReportFollowUpText', 'Add one more');
-      await page.evaluate(() => document.querySelector('#planReportFollowUpSendBtn').click());
-      await page.waitForFunction(() => document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]').length === 3, { timeout: 15000 });
-      await page.evaluate(() => document.querySelector('[data-followup-close]').click());
-      await page.waitForFunction(() => !document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
-      H.check('aichat: collapsing without Apply writes nothing',
-        JSON.stringify(await mbReportCharts()) === JSON.stringify(chartsAfter2), JSON.stringify(await mbReportCharts()));
-      await page.evaluate(() => document.querySelector('#planReportTabAiBtn').click());
-      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
+      const defAfter2 = await (async () => {
+        const proj = await H.req('GET', `/api/planning/projects/${metaBuyId}`);
+        const rep = (proj.data.reports || []).find((x) => x.id === mbRepId);
+        return rep ? rep.definition : null;
+      })();
+      H.check('aichat: refine Apply persists the engine scalar',
+        defAfter2 && defAfter2.engine && defAfter2.engine.scalars && defAfter2.engine.scalars.cost === 'cost + 100',
+        JSON.stringify(defAfter2));
+      await page.waitForFunction(() => {
+        const titles = [...document.querySelectorAll('#planReport [data-plan-report-block]')]
+          .map((el) => ({ block: el.dataset.planReportBlock, title: el.querySelector('.section-head h3')?.textContent || '' }))
+          .filter((x) => /^\d+$/.test(x.block)).map((x) => x.title);
+        return JSON.stringify(titles) === JSON.stringify(['Follow-up balance', 'Refined yearly']);
+      }, { timeout: 15000 });
+      H.check('aichat: appended chart is the last chart panel in the report',
+        JSON.stringify(await chartOrder()) === JSON.stringify(['Follow-up balance', 'Refined yearly']),
+        JSON.stringify(await chartOrder()));
+      // Turn 3 proposed but never Applied: navigating to the project
+      // page and back (same SPA session, no reload) keeps the thread
+      // with the turn still unapplied, and writes nothing.
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(mergedDef3));
+      await page.type('#planReportAiChatText', 'Add one more');
+      await page.evaluate(() => document.querySelector('#planReportAiChatSendBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]').length === 3, { timeout: 15000 });
+      await page.goto(`http://ff.local/#planning/project/${metaBuyId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await mbWait(1500);
+      await page.evaluate((rid) => {
+        const el = document.querySelector(`[data-plan-report-view="${rid}"]`);
+        if (el) el.click();
+      }, mbRepId);
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatText'), { timeout: 30000 });
       thread = await threadState();
-      H.check('aichat: reopening the panel keeps the thread, turn 3 still unapplied',
+      H.check('aichat: tab switch keeps the thread, turn 3 still unapplied',
         thread.userTurns.length === 3 && thread.aiTurns.length === 3 && thread.applies.length === 3
+          && thread.applies[0].disabled === true && thread.applies[1].disabled === true
           && thread.applies[2].disabled === false && thread.applies[2].label === 'Apply',
         JSON.stringify(thread));
-      await page.evaluate(() => document.querySelector('[data-followup-close]').click());
-      await page.waitForFunction(() => !document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
+      H.check('aichat: unapplied turn 3 writes nothing after the tab switch',
+        JSON.stringify(await mbReportCharts()) === JSON.stringify(chartsAfter2), JSON.stringify(await mbReportCharts()));
       // --- tier alignment on the fresh project (flat world first) ---
       await page.goto(`http://ff.local/#planning/project/${taPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await mbWait(1500);
@@ -7265,12 +7312,13 @@ export async function run(H, S) {
         penAfterNeg != null && Math.abs(num(penAfterNeg) - 5000) < 0.01, JSON.stringify({ penAfterNeg }));
       // Section order on the same (single-strategy) report.
       const order = await page.evaluate(() => [...document.querySelectorAll('#planReport h3')].map((h) => h.textContent.trim()));
-      H.check('engine: report sections in order headline → chart → strategy comparison (Difference chart + table inside) → engine, engine last',
+      H.check('engine: report sections in order headline → chart → strategy comparison (Difference chart + table inside) → engine, conversation panel after the engine',
         order.indexOf('Headline') > 0 && order.indexOf('Headline') < order.indexOf('Mortgage balance')
           && order.indexOf('Mortgage balance') < order.indexOf('Strategy comparison')
           && order.indexOf('Strategy comparison') < order.indexOf('Difference vs baseline')
           && order.indexOf('Difference vs baseline') < order.indexOf('Engine')
-          && order[order.length - 1] === 'Engine',
+          && order.indexOf('Engine') < order.indexOf('Refine with AI')
+          && order[order.length - 1] === 'Refine with AI',
         JSON.stringify(order));
       const mergedGone = await page.evaluate(() => !document.querySelector('#planReportMergedTable table'));
       H.check('engine: single-strategy report has no merged table (strategy对比 is multi-strategy only)',
@@ -7368,15 +7416,15 @@ export async function run(H, S) {
       // this project, so reload before opening the new report.
       await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
       await openRepE(dtProj, refRep);
-      const refineHere = await page.evaluate(() => !!document.querySelector('#planReportRefineText'));
-      H.check('engine: AI report shows the Refine with AI block', refineHere, JSON.stringify({ refineHere }));
-      await page.evaluate(() => { document.querySelector('#planReportRefineText').value = 'Add a headlines card and charge $100 of cost'; });
-      await page.click('#planReportRefineSendBtn');
-      await page.waitForFunction(() => !!document.querySelector('#planReportRefineApplyBtn'), { timeout: 15000 });
-      const diffText = await page.evaluate(() => document.querySelector('#planReportRefineOut')?.textContent || '');
+      const refineHere = await page.evaluate(() => !!document.querySelector('#planReportAiChatText'));
+      H.check('engine: AI report shows the Refine with AI conversation panel', refineHere, JSON.stringify({ refineHere }));
+      await page.evaluate(() => { document.querySelector('#planReportAiChatText').value = 'Add a headlines card and charge $100 of cost'; });
+      await page.click('#planReportAiChatSendBtn');
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatThread [data-ai-turn-apply]'), { timeout: 15000 });
+      const diffText = await page.evaluate(() => document.querySelector('#planReportAiChatThread')?.textContent || '');
       H.check('engine: refine Send shows the old→new diff (+ Chart Refined headlines, + Engine scalars cost)',
         diffText.includes('+ Chart Refined headlines') && diffText.includes('+ Engine scalars cost'), JSON.stringify({ diffText }));
-      await page.click('#planReportRefineApplyBtn');
+      await page.click('#planReportAiChatThread [data-ai-turn-apply]');
       await page.waitForFunction(() => {
         const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
         const c = cards.find((x) => x.querySelector('.k')?.textContent === 'Total cost');
@@ -7389,8 +7437,8 @@ export async function run(H, S) {
       const savedRef = (r.data.reports || []).find((x) => x.id === refRep);
       let savedDef = {};
       try { savedDef = typeof savedRef?.definition === 'string' ? JSON.parse(savedRef.definition || '{}') : (savedRef?.definition || {}); } catch { savedDef = {}; }
-      H.check('engine: refined definition persisted (new chart title + engine scalar cost)',
-        (savedDef.charts || []).some((c) => c.title === 'Refined headlines') && savedDef.engine && savedDef.engine.scalars && savedDef.engine.scalars.cost === 'cost + 100', JSON.stringify(savedDef));
+      H.check('engine: refined definition persisted (new chart title + engine scalar cost, strategies key preserved by the merge)',
+        (savedDef.charts || []).some((c) => c.title === 'Refined headlines') && savedDef.engine && savedDef.engine.scalars && savedDef.engine.scalars.cost === 'cost + 100' && JSON.stringify(savedDef.strategies || []) === JSON.stringify([dtStrat]), JSON.stringify(savedDef));
     } finally { await browserE.close(); }
   }
   // ------------------------------------------- item 7 revised: scenario
@@ -9803,14 +9851,14 @@ export async function run(H, S) {
       const outEntries = async () => page.evaluate(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent));
       const entries = await outEntries();
       // Engine round: the outline lists every report section
-      // (Variables, Headline, chart blocks, Engine) with the
-      // comparison appended last by construction; the metric_cards
-      // block is the Headline now, never a separate entry. The
-      // Difference table lives inside the comparison panel, so it
-      // has no outline entry of its own — 'Strategy comparison'
-      // reaches both the chart and the table.
+      // (Variables, Headline, chart blocks, Engine, the Refine with
+      // AI conversation panel) with the comparison appended last by
+      // construction; the metric_cards block is the Headline now,
+      // never a separate entry. The Difference table lives inside
+      // the comparison panel, so it has no outline entry of its own
+      // — 'Strategy comparison' reaches both the chart and the table.
       H.check('reportoutline: OPEN shows one entry per block + comparison',
-        JSON.stringify(entries) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entries) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Engine', 'Refine with AI', 'Strategy comparison']),
         JSON.stringify(entries));
       await page.evaluate(() => { [...document.querySelectorAll('#planReportOutlineList a')].find((a) => a.textContent === 'Strategy comparison').click(); });
       await waitF(1500);
@@ -9837,22 +9885,22 @@ export async function run(H, S) {
       await waitF(1000);
       const entriesGen = await outEntries();
       H.check('reportoutline: tab switch refreshes entries to the new report',
-        JSON.stringify(entriesGen) === JSON.stringify(['Variables', 'Headline', 'Mortgage balance', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entriesGen) === JSON.stringify(['Variables', 'Headline', 'Mortgage balance', 'Engine', 'Refine with AI', 'Strategy comparison']),
         JSON.stringify(entriesGen));
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-tab="${id}"]`).click(); }, stRepId);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Sticky balance'), { timeout: 30000 });
       await waitF(1000);
       const entriesBack = await outEntries();
       H.check('reportoutline: switching back restores the first report entries',
-        JSON.stringify(entriesBack) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entriesBack) === JSON.stringify(['Variables', 'Headline', 'Sticky balance', 'Engine', 'Refine with AI', 'Strategy comparison']),
         JSON.stringify(entriesBack));
       await page.evaluate(() => { document.querySelector('[data-plan-report-block-del="0"]').click(); });
       // Deleting chart block 0 ('Sticky balance') drops only that
-      // entry; Variables/Headline/Engine/comparison stay.
-      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Variables|Headline|Engine|Strategy comparison', { timeout: 30000 });
+      // entry; Variables/Headline/Engine/conversation/comparison stay.
+      await page.waitForFunction(() => [...document.querySelectorAll('#planReportOutlineList a')].map((a) => a.textContent).join('|') === 'Variables|Headline|Engine|Refine with AI|Strategy comparison', { timeout: 30000 });
       const entriesDel = await outEntries();
       H.check('reportoutline: per-block Delete removes that block entry',
-        JSON.stringify(entriesDel) === JSON.stringify(['Variables', 'Headline', 'Engine', 'Strategy comparison']),
+        JSON.stringify(entriesDel) === JSON.stringify(['Variables', 'Headline', 'Engine', 'Refine with AI', 'Strategy comparison']),
         JSON.stringify(entriesDel));
       await page.evaluate(() => { document.querySelector('#planReportBackBtn').click(); });
       await page.waitForFunction(() => !document.querySelector('[data-plan-report-tab]'), { timeout: 15000 });
@@ -10004,11 +10052,10 @@ export async function run(H, S) {
       const tabBtns = await page.evaluate(() => ({
         gen: !!document.querySelector('#planReportTabGenerateBtn'),
         ai: !!document.querySelector('#planReportTabAiBtn'),
-        aiLabel: document.querySelector('#planReportTabAiBtn')?.textContent.trim(),
         save: !!document.querySelector('#planReportTabSaveBtn'),
+        aiPanel: !!document.querySelector('#planReportAiChatText'),
       }));
-      H.check('reporttab: per-tab buttons are Follow up with AI + Save only, no Generate button', !tabBtns.gen && tabBtns.ai && tabBtns.save, JSON.stringify(tabBtns));
-      H.check('reporttab: per-tab AI button reads Follow up with AI (it appends to the open report, not a new one)', tabBtns.aiLabel === 'Follow up with AI', JSON.stringify(tabBtns));
+      H.check('reporttab: per-tab buttons are Save only — no Generate, no Follow up button; the bottom AI conversation panel is present', !tabBtns.gen && !tabBtns.ai && tabBtns.save && tabBtns.aiPanel, JSON.stringify(tabBtns));
       // Highlight: engine tab highlights its own pins on the tiers
       // above (amber); the scenario card — wiring-selected AND
       // report-pinned — shows ONE combined frame: selection border
@@ -10066,9 +10113,10 @@ export async function run(H, S) {
       const tabRoute = await page.evaluate(() => ({
         noGen: !document.querySelector('#planReportTabGenerateBtn'),
         noteEl: !!document.querySelector('#planReportTabNote'),
-        aiEnabled: !document.querySelector('#planReportTabAiBtn')?.disabled,
+        noAiBtn: !document.querySelector('#planReportTabAiBtn'),
+        aiPanel: !!document.querySelector('#planReportAiChatText'),
       }));
-      H.check('engine: AI-pinned tab has no Generate button (routing cancelled), AI stays enabled, no routing note element', tabRoute.noGen && tabRoute.noteEl === false && tabRoute.aiEnabled, JSON.stringify(tabRoute));
+      H.check('engine: AI-pinned tab has no Generate button (routing cancelled), no tab AI button, no routing note element, bottom AI panel present', tabRoute.noGen && tabRoute.noteEl === false && tabRoute.noAiBtn && tabRoute.aiPanel, JSON.stringify(tabRoute));
       const tierAi = await readTier(fAiScenId, fAiBaseId, fAiStratId);
       H.check('reporttab: AI tab highlights its own pins above, not the engine pins',
         JSON.stringify(tierAi.scenPins) === JSON.stringify([fAiScenId]) && JSON.stringify(tierAi.basePins) === JSON.stringify([]) && JSON.stringify(tierAi.stratPins) === JSON.stringify([fAiStratId]), JSON.stringify(tierAi));
@@ -10086,19 +10134,21 @@ export async function run(H, S) {
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab="${rtAiId}"]`);
       await waitF(1000);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'AI balance'), { timeout: 15000 });
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabAiBtn');
-      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
-      const appendUi = await page.evaluate(() => ({
-        modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
-        panelVisible: !!document.querySelector('#planReportFollowUp') && !document.querySelector('#planReportFollowUp').classList.contains('hidden'),
-      }));
-      H.check('reporttab: per-tab AI opens the inline follow-up panel (no modal)', appendUi.modalOpen === false && appendUi.panelVisible, JSON.stringify(appendUi));
-      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', engine: {}, charts: [{ template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
-      await page.evaluate(() => { document.querySelector('#planReportFollowUpText').value = 'Add an extra balance path'; });
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportFollowUpSendBtn');
-      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUp [data-ai-turn-apply]'), { timeout: 15000 });
-      const appendApplyLabel = await page.evaluate(() => document.querySelector('#planReportFollowUp [data-ai-turn-apply]')?.textContent.trim() || '');
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportFollowUp [data-ai-turn-apply]');
+      // The merged conversation panel is already at the bottom of the
+      // AI tab — no button to open it. The stub returns the COMPLETE
+      // revised definition (ai-refine): the current 'AI balance'
+      // chart gains its missing method, and 'Extra balance' is
+      // appended at the end.
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatText'), { timeout: 10000 });
+      fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', engine: {}, charts: [
+        { template: 'time_line', title: 'AI balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
+        { template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' },
+      ] }));
+      await page.evaluate(() => { document.querySelector('#planReportAiChatText').value = 'Add an extra balance path'; });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiChatSendBtn');
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatThread [data-ai-turn-apply]'), { timeout: 15000 });
+      const appendApplyLabel = await page.evaluate(() => document.querySelector('#planReportAiChatThread [data-ai-turn-apply]')?.textContent.trim() || '');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiChatThread [data-ai-turn-apply]');
       // Append Save re-renders after a PUT + comparison fetch: wait for
       // the appended chart to appear instead of a fixed sleep (1500ms
       // was too short under load: the persisted definition already had
@@ -10126,19 +10176,20 @@ export async function run(H, S) {
       // delete; a fixed sleep read the pre-delete DOM). The
       // metric_cards block is the Headline section now, and the
       // Difference table lives inside the comparison panel, so the
-      // remaining blocks are Variables / Headline / Engine.
-      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 3 && !b.includes('Mortgage balance') && b.includes('Headline'); }, { timeout: 15000 });
+      // remaining blocks are Variables / Headline / Engine plus the
+      // Refine with AI conversation panel.
+      await page.waitForFunction(() => { const b = [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent); return b.length === 4 && !b.includes('Mortgage balance') && b.includes('Headline'); }, { timeout: 15000 });
       const blocksAfter = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const genDef = ((r.data.reports || []).find((x) => x.id === genRep.id) || {}).definition || {};
       H.check('reporttab: block delete removes one block and persists',
-        blocksBefore.length === 4 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 3 && !blocksAfter.includes('Mortgage balance') && blocksAfter.includes('Headline') && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
+        blocksBefore.length === 5 && blocksBefore.includes('Mortgage balance') && blocksAfter.length === 4 && !blocksAfter.includes('Mortgage balance') && blocksAfter.includes('Headline') && (genDef.charts || []).length === 1, JSON.stringify({ blocksBefore, blocksAfter, charts: genDef.charts }));
       await page.waitForSelector(`[data-plan-report-tab-close="${genRep.id}"]`, { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${genRep.id}"]`);
       await waitF(1000);
       await openCard(genRep.id, 'Headline');
       const blocksReopen = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
-      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 3 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
+      H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 4 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
       // Polish: quiet defs note + subtitle + metric cards + current tab wrap.
       // The metric_cards block is the Headline section now, so the
       // count is the headline's 9 cards (property project), not the
@@ -10343,11 +10394,11 @@ export async function run(H, S) {
         JSON.stringify({ ubEmpty, pins: ubRow0 && ubRow0.strategy_ids }));
       // Report viewer tab buttons are small (still on the report view).
       const ubViewer = await page.evaluate(() => ({
-        aiSmall: !!document.querySelector('#planReportTabAiBtn.small'),
+        aiGone: !document.querySelector('#planReportTabAiBtn'),
         saveSmall: !!document.querySelector('#planReportTabSaveBtn.small'),
       }));
-      H.check('uibundle: report viewer tab buttons are small',
-        ubViewer.aiSmall && ubViewer.saveSmall, JSON.stringify(ubViewer));
+      H.check('uibundle: report viewer tab buttons are small (Save only, no AI tab button)',
+        ubViewer.aiGone && ubViewer.saveSmall, JSON.stringify(ubViewer));
       // The project-page comparison panel is gone; the tier buttons
       // are small.
       await page.goto(`http://ff.local/#planning/project/${fProjectId}`, { waitUntil: 'networkidle0', timeout: 30000 });

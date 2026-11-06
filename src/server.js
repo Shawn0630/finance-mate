@@ -7927,13 +7927,19 @@ app.post('/api/planning/reports/:id/ai-refine', requireApiAuth, async (req, res)
   if (!llmConfigured()) return res.status(503).json({ error: PLAN_AI_NO_LLM });
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ error: 'text is required' });
+  // Thread history, same bounded handling as ai-report: the merged
+  // report-AI conversation sends the turns so far so the model can
+  // tell an add from a change and not re-propose existing charts.
+  const history = Array.isArray(req.body?.history)
+    ? req.body.history.filter((l) => typeof l === 'string').map((l) => l.slice(0, 500)).slice(0, 20)
+    : [];
   let current = {};
   try { current = JSON.parse(r.definition || '{}'); } catch { current = {}; }
   const strategies = db.prepare('SELECT id, name, letter FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   const mortgagedCount = db.prepare(`SELECT COUNT(*) AS n FROM properties WHERE mortgage_balance IS NOT NULL AND mortgage_balance > 0 AND EXISTS (SELECT 1 FROM rate_segments WHERE rate_segments.property_id = properties.id)`).get().n;
   const holdingCount = db.prepare('SELECT COUNT(*) AS n FROM invest_holdings').get().n;
   const baselineKind = p.category === 'investment' ? 'pool' : p.category === 'property' ? 'property' : 'other';
-  const prompt = aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount, baselineKind, definition: current, text });
+  const prompt = aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount, baselineKind, definition: current, text, history });
   let raw;
   try {
     raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());

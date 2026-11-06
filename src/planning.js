@@ -1866,13 +1866,14 @@ export function validateAiReportChartSeries(charts) {
 // baseline, not the ops — a cash-pool baseline allows pool/stock
 // charts only (mortgage charts are forbidden and rejected server-
 // side), a property baseline allows property charts.
-export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount, baselineKind, definition, text }) {
-  const base = aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind });
+export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount, baselineKind, definition, text, history }) {
+  const base = aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind, history });
   return [
     base,
     'You are REFINING an existing report definition — return the COMPLETE revised definition (charts + engine), never a partial patch.',
     `Current definition: ${JSON.stringify(definition)}`,
     'Keep every chart and engine formula that still fits; change only what the follow-up asks for. The revised definition must satisfy every rule above (templates, series, methods, engine identifiers).',
+    'When the follow-up only asks to ADD something, keep every existing chart and engine formula exactly as-is and append the new chart(s) at the END of the charts list — never insert a new chart before an existing one, and never drop or reorder an existing chart for an add. Preserve any other keys in the current definition (such as variables and strategies) in your reply.',
     `Follow-up: ${text}`,
   ].join('\n');
 }
