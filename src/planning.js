@@ -1877,12 +1877,16 @@ export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount,
   ].join('\n');
 }
 
-export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind }) {
+export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind, history }) {
   const kindLine = baselineKind === 'pool'
     ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; fan_band for a STOCK volatility fan only, series stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band for a mortgage series, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected. A stock fan_band shows the engine-computed per-holding volatility fan (median at the holding\'s history CAGR, P10/P90 bands widening with √t) — you only pick the chart, never the numbers. Method sentences must describe only pool/stock figures — never mention interest saved, mortgage, payoff, or penalty on a cash-pool report: those concepts do not exist here.'
     : baselineKind === 'property'
       ? 'Baseline kind: property. This report covers one property: use property charts (mortgage_balance, total_value for equity, monthly_payment, payoff_month) and the pool/stock charts only where the strategies actually touch stocks.'
       : null;
+  const historyLines = Array.isArray(history) ? history.filter((l) => typeof l === 'string' && l.trim()).slice(0, 20) : [];
+  const historyBlock = historyLines.length
+    ? [`Conversation so far — charts already in the report and earlier requests. Do not propose a chart that is already in the report; answer the latest request with NEW charts:\n${historyLines.map((l) => `- ${l.trim()}`).join('\n')}`]
+    : [];
   return [
     'You compose a report definition as JSON only. No prose outside the JSON object.',
     'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
@@ -1912,8 +1916,29 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text,
     ...(kindLine ? [kindLine] : []),
     `Charts render over the whole snapshot: ${mortgagedCount} ${mortgagedCount === 1 ? 'property carries' : 'properties carry'} a mortgage, ${holdingCount} stock ${holdingCount === 1 ? 'holding exists' : 'holdings exist'}. Do not use mortgage_balance when no property carries a mortgage, and do not use stock_value when no stock holding exists.`,
     `Strategies: ${JSON.stringify(strategies)}`,
+    ...historyBlock,
     `User request: ${text}`,
   ].join('\n');
+}
+
+// Follow-up conversation (append mode): build the history lines the
+// client sends with each turn, from the report's current charts and
+// the turns already in the thread. Pure, so unit tests can pin it.
+// existingTitles = chart titles already in the report definition;
+// turns = [{ userText, addedTitles }] for turns already in the
+// thread. The model must not re-propose a chart that is already in
+// the report.
+export function aiReportHistoryLines({ existingTitles = [], turns = [] } = {}) {
+  const lines = [];
+  const existing = (Array.isArray(existingTitles) ? existingTitles : []).filter((t) => typeof t === 'string' && t.trim());
+  if (existing.length) lines.push(`Charts already in this report: ${existing.map((t) => t.trim()).join(', ')}`);
+  for (const turn of (Array.isArray(turns) ? turns : [])) {
+    if (!turn || typeof turn !== 'object') continue;
+    if (typeof turn.userText === 'string' && turn.userText.trim()) lines.push(`You asked: ${turn.userText.trim()}`);
+    const added = (Array.isArray(turn.addedTitles) ? turn.addedTitles : []).filter((t) => typeof t === 'string' && t.trim());
+    if (added.length) lines.push(`Added charts: ${added.map((t) => t.trim()).join(', ')}`);
+  }
+  return lines.slice(0, 20);
 }
 
 // Baseline-kind chart validation for AI reports ONLY (the preset

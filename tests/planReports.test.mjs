@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
-  validateAiReportBaselineKind, validateAiReportChartSeries, aiReportPrompt,
+  validateAiReportBaselineKind, validateAiReportChartSeries, aiReportPrompt, aiReportHistoryLines,
 } from '../src/planning.js';
 
 test('report scenario pin: pinned ids must belong to the project', () => {
@@ -79,4 +79,32 @@ test('AI report prompt: pool kindLine offers the stock fan and forbids the mortg
   const prop = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x', baselineKind: 'property' });
   assert.doesNotMatch(prop, /never use fan_band/);
   assert.match(prop, /fan_band renders stock_value/);
+});
+
+test('AI report follow-up history: lines built from existing charts + applied turns', () => {
+  assert.deepEqual(aiReportHistoryLines({}), []);
+  assert.deepEqual(aiReportHistoryLines({ existingTitles: ['Balance path'] }), ['Charts already in this report: Balance path']);
+  assert.deepEqual(
+    aiReportHistoryLines({ existingTitles: ['Balance path'], turns: [{ userText: 'Add a yearly chart', addedTitles: ['Year-end balance'] }] }),
+    ['Charts already in this report: Balance path', 'You asked: Add a yearly chart', 'Added charts: Year-end balance'],
+  );
+  // A turn not yet Applied contributes its question only, never
+  // invented added titles.
+  assert.deepEqual(
+    aiReportHistoryLines({ turns: [{ userText: 'Add a fan', addedTitles: [] }] }),
+    ['You asked: Add a fan'],
+  );
+  assert.deepEqual(aiReportHistoryLines({ existingTitles: ['  ', null, 7] }), []);
+});
+
+test('AI report prompt: history block present only when history is given', () => {
+  const withHistory = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'Add a yearly chart', history: ['Charts already in this report: Balance path', 'You asked: Add a yearly chart'] });
+  assert.match(withHistory, /Conversation so far/);
+  assert.match(withHistory, /Charts already in this report: Balance path/);
+  assert.match(withHistory, /Do not propose a chart that is already in the report/);
+  assert.match(withHistory, /User request: Add a yearly chart/);
+  const without = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x' });
+  assert.doesNotMatch(without, /Conversation so far/);
+  const empty = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x', history: [] });
+  assert.doesNotMatch(empty, /Conversation so far/);
 });

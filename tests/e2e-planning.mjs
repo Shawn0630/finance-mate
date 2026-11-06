@@ -873,6 +873,13 @@ export async function run(H, S) {
       await waitR(400);
       const modalOpen = await page.evaluate(() => !document.querySelector('#planReportAiModal').classList.contains('hidden'));
       H.check('planning: Generate with AI opens the modal', modalOpen);
+      const createNameRow = await page.evaluate(() => {
+        // The modal is create-only now (the inline panel has no name
+        // field): the name input is always present and visible here.
+        const input = document.querySelector('#planReportAiName');
+        return !!input && input.offsetParent !== null;
+      });
+      H.check('aichat: create mode still shows the Report name field', createNameRow);
       await page.type('#planReportAiName', 'AI report browser');
       await page.type('#planReportAiText', 'Compare balance paths and headlines');
       await page.click('#planReportAiGenBtn');
@@ -1526,15 +1533,117 @@ export async function run(H, S) {
       }, mbRepId);
       await page.waitForFunction(() => !!document.querySelector('#planReportTabAiBtn'), { timeout: 30000 });
       await page.evaluate(() => document.querySelector('#planReportTabAiBtn').click());
-      await page.waitForFunction(() => !document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
-      const appendState = await page.evaluate(() => ({
-        modelGone: !document.querySelector('#planReportAiModelSection'),
-        note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
+      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
+      const followUpOpen = await page.evaluate(() => ({
+        modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
+        panelVisible: !!document.querySelector('#planReportFollowUp') && !document.querySelector('#planReportFollowUp').classList.contains('hidden'),
+        send: !!document.querySelector('#planReportFollowUpSendBtn'),
+        head: document.querySelector('#planReportFollowUp .section-head h3')?.textContent || '',
       }));
-      H.check('engine: append mode has no Model section at all (gone, not hidden)',
-        appendState.modelGone && appendState.note.includes('pins unchanged'), JSON.stringify(appendState));
-      await page.evaluate(() => document.querySelector('#planReportAiModal [data-close-modal]').click());
-      await page.waitForFunction(() => !!document.querySelector('#planReportAiModal')?.classList.contains('hidden'), { timeout: 10000 });
+      H.check('aichat: Follow up with AI expands the inline panel in place (no modal opens)',
+        followUpOpen.modalOpen === false && followUpOpen.panelVisible && followUpOpen.send && followUpOpen.head === 'Follow up with AI',
+        JSON.stringify(followUpOpen));
+      // --- Follow up with AI as a conversation (user 2026-11-06) ---
+      // The inline panel is a thread: each Send is one turn, each
+      // AI turn has its own Apply; nothing writes without Apply.
+      const mbReportCharts = async () => {
+        const proj = await H.req('GET', `/api/planning/projects/${metaBuyId}`);
+        const rep = (proj.data.reports || []).find((x) => x.id === mbRepId);
+        return rep && rep.definition && Array.isArray(rep.definition.charts) ? rep.definition.charts : null;
+      };
+      const followDef1 = { engine: {}, charts: [
+        { template: 'time_line', title: 'Follow-up balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
+        { template: 'metric_cards', title: 'Follow-up headlines', series: ['cost', 'gain', 'net'], method: 'Cost = fees + penalty + cash out; gain = interest saved vs baseline + asset growth; net = gain - cost.' },
+      ] };
+      const followDef2 = { engine: {}, charts: [
+        { template: 'yearly_bars', title: 'Follow-up yearly', series: ['mortgage_balance'], method: 'Year-end outstanding principal per year from the engine projection.' },
+      ] };
+      const followDef3 = { engine: {}, charts: [
+        { template: 'time_line', title: 'Unapplied chart', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection, baseline vs each strategy.' },
+      ] };
+      const threadState = async () => page.evaluate(() => {
+        const turns = [...document.querySelectorAll('#planReportFollowUpThread .plan-ai-turn')];
+        return {
+          userTurns: turns.filter((t) => t.classList.contains('plan-ai-turn-user')).map((t) => t.textContent),
+          aiTurns: turns.filter((t) => t.classList.contains('plan-ai-turn-ai')).map((t) => t.textContent),
+          applies: [...document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')].map((b) => ({ disabled: b.disabled, label: b.textContent.trim() })),
+        };
+      });
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(followDef1));
+      await page.type('#planReportFollowUpText', 'Add a balance chart');
+      await page.evaluate(() => document.querySelector('#planReportFollowUpSendBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUp [data-ai-turn-apply]'), { timeout: 15000 });
+      let thread = await threadState();
+      H.check('aichat: turn 1 shows the user message + proposed charts + an Apply button',
+        thread.userTurns.some((t) => t.includes('Add a balance chart'))
+          && thread.aiTurns.some((t) => t.includes('Follow-up balance') && t.includes('Follow-up headlines'))
+          && thread.applies.length === 1 && thread.applies[0].disabled === false && thread.applies[0].label === 'Apply',
+        JSON.stringify(thread));
+      H.check('aichat: nothing writes before Apply',
+        JSON.stringify(await mbReportCharts()) === '[]', JSON.stringify(await mbReportCharts()));
+      await page.evaluate(() => document.querySelector('#planReportFollowUp [data-ai-turn-apply]').click());
+      await page.waitForFunction(() => {
+        const b = document.querySelector('#planReportFollowUp [data-ai-turn-apply]');
+        return b && b.disabled && b.textContent.trim() === 'Applied ✓';
+      }, { timeout: 15000 });
+      // Apply reloads the report view; the panel restores from the
+      // per-report thread state — wait for the restored Applied turn
+      // before reading the definition.
+      await page.waitForFunction(() => {
+        const b = document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')[0];
+        return b && b.disabled && b.textContent.trim() === 'Applied ✓';
+      }, { timeout: 15000 });
+      const chartsAfter1 = await mbReportCharts();
+      H.check('aichat: Apply on turn 1 appends exactly that turn charts and the panel stays open',
+        Array.isArray(chartsAfter1) && chartsAfter1.length === 2
+          && chartsAfter1.some((c) => c.title === 'Follow-up balance')
+          && chartsAfter1.some((c) => c.title === 'Follow-up headlines'),
+        JSON.stringify(chartsAfter1));
+      // A second Apply on the same turn cannot double-append.
+      await page.evaluate(() => document.querySelector('#planReportFollowUp [data-ai-turn-apply]').click());
+      await mbWait(800);
+      H.check('aichat: second Apply on the same turn does not double-append',
+        JSON.stringify(await mbReportCharts()) === JSON.stringify(chartsAfter1), JSON.stringify(await mbReportCharts()));
+      // Turn 2 in the same thread.
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(followDef2));
+      await page.type('#planReportFollowUpText', 'And a yearly one');
+      await page.evaluate(() => document.querySelector('#planReportFollowUpSendBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]').length === 2, { timeout: 15000 });
+      thread = await threadState();
+      H.check('aichat: turn 2 in the same thread shows both turns',
+        thread.userTurns.length === 2 && thread.aiTurns.length === 2
+          && thread.userTurns[1].includes('And a yearly one')
+          && thread.aiTurns[1].includes('Follow-up yearly'),
+        JSON.stringify(thread));
+      await page.evaluate(() => document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')[1].click());
+      await page.waitForFunction(() => {
+        const b = document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]')[1];
+        return b && b.disabled && b.textContent.trim() === 'Applied ✓';
+      }, { timeout: 15000 });
+      const chartsAfter2 = await mbReportCharts();
+      H.check('aichat: Apply on turn 2 appends only that turn charts',
+        Array.isArray(chartsAfter2) && chartsAfter2.length === 3 && chartsAfter2.some((c) => c.title === 'Follow-up yearly'),
+        JSON.stringify(chartsAfter2));
+      // Turn 3 proposed but never Applied: collapsing the panel
+      // writes nothing, and reopening keeps the thread (in-memory
+      // state survives collapse) with the turn still unapplied.
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(followDef3));
+      await page.type('#planReportFollowUpText', 'Add one more');
+      await page.evaluate(() => document.querySelector('#planReportFollowUpSendBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planReportFollowUp [data-ai-turn-apply]').length === 3, { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('[data-followup-close]').click());
+      await page.waitForFunction(() => !document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
+      H.check('aichat: collapsing without Apply writes nothing',
+        JSON.stringify(await mbReportCharts()) === JSON.stringify(chartsAfter2), JSON.stringify(await mbReportCharts()));
+      await page.evaluate(() => document.querySelector('#planReportTabAiBtn').click());
+      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
+      thread = await threadState();
+      H.check('aichat: reopening the panel keeps the thread, turn 3 still unapplied',
+        thread.userTurns.length === 3 && thread.aiTurns.length === 3 && thread.applies.length === 3
+          && thread.applies[2].disabled === false && thread.applies[2].label === 'Apply',
+        JSON.stringify(thread));
+      await page.evaluate(() => document.querySelector('[data-followup-close]').click());
+      await page.waitForFunction(() => !document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
       // --- tier alignment on the fresh project (flat world first) ---
       await page.goto(`http://ff.local/#planning/project/${taPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await mbWait(1500);
@@ -9911,23 +10020,18 @@ export async function run(H, S) {
       await waitF(1000);
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'AI balance'), { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabAiBtn');
-      await waitF(1000);
+      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUpSendBtn'), { timeout: 10000 });
       const appendUi = await page.evaluate(() => ({
         modalOpen: !document.querySelector('#planReportAiModal')?.classList.contains('hidden'),
-        // Pickers hide by their .plan-ai-modal-card (modalbeautify
-        // restructure): the picker's closest div is now .plan-ai-picks.
-        pickersHidden: ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies'].every((id) => !!document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.contains('hidden')),
-        modelGone: !document.querySelector('#planReportAiModelSection'),
-        note: document.querySelector('#planReportAiAppendNote')?.textContent || '',
+        panelVisible: !!document.querySelector('#planReportFollowUp') && !document.querySelector('#planReportFollowUp').classList.contains('hidden'),
       }));
-      H.check('reporttab: per-tab AI opens append mode (pickers hidden, pins-unchanged note)', appendUi.modalOpen && appendUi.pickersHidden && appendUi.note.includes('pins unchanged'), JSON.stringify(appendUi));
-      H.check('engine: model-design section is gone from append mode (not hidden)', appendUi.modelGone, JSON.stringify(appendUi));
+      H.check('reporttab: per-tab AI opens the inline follow-up panel (no modal)', appendUi.modalOpen === false && appendUi.panelVisible, JSON.stringify(appendUi));
       fs.writeFileSync(H.aiStubFile, JSON.stringify({ title: 'Reporttab AI extra', engine: {}, charts: [{ template: 'time_line', title: 'Extra balance', series: ['mortgage_balance'], method: 'Monthly outstanding principal from the engine projection.' }] }));
-      await page.evaluate(() => { document.querySelector('#planReportAiText').value = 'Add an extra balance path'; });
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiGenBtn');
-      await waitF(1200);
-      const appendSaveLabel = await page.evaluate(() => document.querySelector('#planReportAiSaveBtn')?.textContent || '');
-      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportAiSaveBtn');
+      await page.evaluate(() => { document.querySelector('#planReportFollowUpText').value = 'Add an extra balance path'; });
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportFollowUpSendBtn');
+      await page.waitForFunction(() => !!document.querySelector('#planReportFollowUp [data-ai-turn-apply]'), { timeout: 15000 });
+      const appendApplyLabel = await page.evaluate(() => document.querySelector('#planReportFollowUp [data-ai-turn-apply]')?.textContent.trim() || '');
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportFollowUp [data-ai-turn-apply]');
       // Append Save re-renders after a PUT + comparison fetch: wait for
       // the appended chart to appear instead of a fixed sleep (1500ms
       // was too short under load: the persisted definition already had
@@ -9937,7 +10041,7 @@ export async function run(H, S) {
       r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
       const rtAiDef = ((r.data.reports || []).find((x) => x.id === rtAiId) || {}).definition || {};
       H.check('reporttab: AI charts append (not replace) and persist',
-        appendSaveLabel === 'Append to this report' && appendTitles.includes('AI balance') && appendTitles.includes('Extra balance') && (rtAiDef.charts || []).length === 2, JSON.stringify({ appendSaveLabel, appendTitles, charts: rtAiDef.charts }));
+        appendApplyLabel === 'Apply' && appendTitles.includes('AI balance') && appendTitles.includes('Extra balance') && (rtAiDef.charts || []).length === 2, JSON.stringify({ appendApplyLabel, appendTitles, charts: rtAiDef.charts }));
       await page.waitForSelector(`[data-plan-report-tab-close="${rtAiId}"]`, { timeout: 15000 });
       await page.evaluate((s) => { document.querySelector(s).click(); }, `[data-plan-report-tab-close="${rtAiId}"]`);
       await waitF(1000);

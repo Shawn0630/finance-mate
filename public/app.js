@@ -12857,30 +12857,157 @@ function planReportAiFallbackName(strategyIds) {
   const first = (strategyIds || []).map((id) => (d.strategies || []).find((s) => s.id === id)).find(Boolean);
   return first ? `Report · ${first.letter} · ${first.name}` : 'AI report';
 }
+// ---- Follow up with AI, inline (user 2026-11-06) ----
+// The per-tab button toggles an inline conversation panel below
+// the tab bar — same pattern as the ✨ Fill with AI panels, no
+// modal. Thread state lives per report in this map, NOT in the
+// DOM: the sticky bar + viewer are rebuilt on every
+// loadPlanReport, so the thread survives Applies and tab switches
+// in memory for the session. No persistence across page reloads
+// (v1): plan_reports has no ai_thread column.
+const planFollowUpThreads = {};
+function planFollowUpState(reportId) {
+  if (!planFollowUpThreads[reportId]) planFollowUpThreads[reportId] = { open: false, turns: [], titles: [], titlesLoaded: false, busy: false };
+  return planFollowUpThreads[reportId];
+}
+function planReportAiChartRowsHtml(charts) {
+  return (charts || []).map((c) => `<div class="plan-row"><span>${esc(c.template)} · ${esc(c.title)}${c.series ? ` · ${(c.series || []).join(', ')}` : ''}${c.method ? ` · Method: ${esc(c.method)}` : ''}</span></div>`).join('') || '<div class="note">No charts proposed.</div>';
+}
+function planReportFollowUpHtml() {
+  return `<div class="panel"><div class="section-head"><h3>Follow up with AI</h3><button class="small" data-followup-close>Close</button></div>
+    <div id="planReportFollowUpThread"></div>
+    <div><textarea id="planReportFollowUpText" rows="3" placeholder="e.g. Add a chart comparing payoff months"></textarea></div>
+    <div class="toolbar"><button class="small primary" id="planReportFollowUpSendBtn">Send</button></div>
+    <div class="msg" id="planReportFollowUpMsg"></div></div>`;
+}
+function planReportFollowUpRender(reportId) {
+  const state = planFollowUpState(reportId);
+  const threadEl = $('#planReportFollowUpThread');
+  if (!threadEl) return;
+  threadEl.innerHTML = state.turns.map((turn, i) => {
+    const user = `<div class="plan-ai-turn plan-ai-turn-user"><div class="plan-ai-turn-who">You</div><div>${esc(turn.userText)}</div></div>`;
+    let ai;
+    if (turn.error) {
+      ai = `<div class="plan-ai-turn plan-ai-turn-ai"><div class="plan-ai-turn-who">AI</div><div class="note">${esc(turn.error)}</div></div>`;
+    } else if (!Array.isArray(turn.charts)) {
+      ai = `<div class="plan-ai-turn plan-ai-turn-ai"><div class="plan-ai-turn-who">AI</div><div class="note">Thinking…</div></div>`;
+    } else {
+      ai = `<div class="plan-ai-turn plan-ai-turn-ai"><div class="plan-ai-turn-who">AI</div>${planReportAiChartRowsHtml(turn.charts)}<div class="toolbar"><button class="small primary" data-ai-turn-apply="${i}"${turn.applied ? ' disabled' : ''}>${turn.applied ? 'Applied ✓' : 'Apply'}</button></div></div>`;
+    }
+    return user + ai;
+  }).join('');
+  threadEl.scrollTop = threadEl.scrollHeight;
+}
+function planReportFollowUpHistory(state) {
+  const lines = [];
+  if (state.titles.length) lines.push(`Charts already in this report: ${state.titles.join(', ')}`);
+  for (const turn of state.turns) {
+    if (turn.userText) lines.push(`You asked: ${turn.userText}`);
+    if (turn.applied && Array.isArray(turn.charts)) {
+      const titles = turn.charts.map((c) => c.title).filter(Boolean);
+      if (titles.length) lines.push(`Added charts: ${titles.join(', ')}`);
+    }
+  }
+  return lines.slice(0, 20);
+}
+function planReportFollowUpWire(projectId, reportId) {
+  const sendBtn = $('#planReportFollowUpSendBtn');
+  if (sendBtn) sendBtn.addEventListener('click', () => planReportFollowUpTurn(projectId, reportId));
+  const closeBtn = document.querySelector('[data-followup-close]');
+  if (closeBtn) closeBtn.addEventListener('click', () => planReportFollowUpToggle(projectId, reportId));
+  const threadEl = $('#planReportFollowUpThread');
+  if (threadEl) threadEl.addEventListener('click', async (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('[data-ai-turn-apply]') : null;
+    if (!btn || btn.disabled) return;
+    const state = planFollowUpState(reportId);
+    const turn = state.turns[Number(btn.dataset.aiTurnApply)];
+    if (!turn || turn.applied || !Array.isArray(turn.charts)) return;
+    btn.disabled = true;
+    try {
+      const d = await api(`/api/planning/projects/${projectId}`);
+      const rep = (d.reports || []).find((x) => x.id === reportId);
+      if (!rep) throw new Error('report not found');
+      const def = rep.definition || {};
+      state.titles = (def.charts || []).map((c) => c.title).filter(Boolean);
+      await api(`/api/planning/reports/${reportId}`, { method: 'PUT', body: { definition: { ...def, charts: [...(def.charts || []), ...turn.charts] } } });
+      turn.applied = true;
+      planReportFollowUpRender(reportId);
+      loadPlanReport(projectId, reportId);
+    } catch (err) {
+      btn.disabled = false;
+      showMsg($('#planReportFollowUpMsg'), 'err', err.message);
+    }
+  });
+}
+async function planReportFollowUpTurn(projectId, reportId) {
+  const state = planFollowUpState(reportId);
+  if (state.busy) return;
+  const textEl = $('#planReportFollowUpText');
+  const text = String(textEl ? textEl.value : '').trim();
+  if (!text) { showMsg($('#planReportFollowUpMsg'), 'err', 'describe the report first'); return; }
+  state.busy = true;
+  const sendBtn = $('#planReportFollowUpSendBtn');
+  if (sendBtn) sendBtn.disabled = true;
+  const history = planReportFollowUpHistory(state);
+  state.turns.push({ userText: text, charts: null, applied: false, error: null });
+  if (textEl) textEl.value = '';
+  planReportFollowUpRender(reportId);
+  try {
+    const r = await api(`/api/planning/projects/${projectId}/ai-report`, { method: 'POST', body: { text, history } });
+    const turn = state.turns[state.turns.length - 1];
+    turn.charts = (r.definition && r.definition.charts) || [];
+    planReportFollowUpRender(reportId);
+  } catch (err) {
+    const turn = state.turns[state.turns.length - 1];
+    turn.error = err.message;
+    planReportFollowUpRender(reportId);
+    showMsg($('#planReportFollowUpMsg'), 'err', err.message);
+  } finally {
+    state.busy = false;
+    const btn = $('#planReportFollowUpSendBtn');
+    if (btn) btn.disabled = false;
+  }
+}
+function planReportFollowUpRestore(projectId, reportId) {
+  const state = planFollowUpState(reportId);
+  const host = $('#planReportFollowUp');
+  if (!host) return;
+  if (!state.open) { host.classList.add('hidden'); host.innerHTML = ''; return; }
+  host.classList.remove('hidden');
+  host.innerHTML = planReportFollowUpHtml();
+  planReportFollowUpWire(projectId, reportId);
+  planReportFollowUpRender(reportId);
+}
+async function planReportFollowUpToggle(projectId, reportId) {
+  const state = planFollowUpState(reportId);
+  state.open = !state.open;
+  planReportFollowUpRestore(projectId, reportId);
+  // Load the report's current chart titles once per session, so
+  // later turns know what is already in the report.
+  if (state.open && !state.titlesLoaded) {
+    try {
+      const d = await api(`/api/planning/projects/${projectId}`);
+      const rep = (d.reports || []).find((x) => x.id === reportId);
+      state.titles = ((rep && rep.definition && rep.definition.charts) || []).map((c) => c.title).filter(Boolean);
+      state.titlesLoaded = true;
+    } catch { /* history falls back to turns-only */ }
+  }
+}
+
+
 function openPlanReportAiModal(projectId, opts = {}) {
-  const appendTo = opts.appendTo || null;
+  // Create-only: this modal makes a NEW report. The follow-up flow
+  // (append to the open report) is an inline conversation panel in
+  // the report view, not a modal (user 2026-11-06).
   $('#planReportAiName').value = '';
   $('#planReportAiText').value = '';
   $('#planReportAiOut').innerHTML = '';
   showMsg($('#planReportAiMsg'), '', '');
   openModal('planReportAiModal');
-  // Append mode (per-tab AI Generate): pin pickers are irrelevant —
-  // the report keeps its pins, only charts are appended. Reset the
-  // picker visibility on every open so a previous append open never
-  // leaks hidden pickers into a fresh-report open. Each picker lives
-  // in its own .plan-ai-modal-card, so hiding the card hides the
-  // whole section (head + picker).
+  // Pin pickers live in their own .plan-ai-modal-card, so hiding the
+  // card hides the whole section (head + picker).
   for (const id of ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
     document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.remove('hidden');
-  }
-  const appendNote = $('#planReportAiAppendNote');
-  appendNote.classList.add('hidden');
-  if (appendTo) {
-    for (const id of ['planReportAiFixedBaseline', 'planReportAiScenarios', 'planReportAiStrategies']) {
-      document.getElementById(id)?.closest('.plan-ai-modal-card')?.classList.add('hidden');
-    }
-    appendNote.textContent = `Appends to ${appendTo.reportName} · pins unchanged.`;
-    appendNote.classList.remove('hidden');
   }
   // Baseline is FIXED, never picked: the modal shows the project's
   // fixed baseline as display text and pins its record (or null =
@@ -12911,12 +13038,9 @@ function openPlanReportAiModal(projectId, opts = {}) {
       const text = $('#planReportAiText').value.trim();
       if (!text) throw new Error('describe the report first');
       // Fail fast on a strategy-less project (a report with no
-      // strategy compares nothing): plain message before the AI
-      // call. Append mode keeps the report's pins, so it is exempt.
-      if (!appendTo) {
-        const preStrategyIds = [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value));
-        if (!preStrategyIds.length) throw new Error('Pin at least one strategy first');
-      }
+      // strategy compares nothing): plain message before the AI call.
+      const preStrategyIds = [...document.querySelectorAll('#planReportAiStrategies input:checked')].map((el) => Number(el.value));
+      if (!preStrategyIds.length) throw new Error('Pin at least one strategy first');
       const r = await api(`/api/planning/projects/${projectId}/ai-report`, { method: 'POST', body: { text } });
       const charts = (r.definition && r.definition.charts) || [];
       // AI title: the model is asked for a short report title; when
@@ -12926,21 +13050,10 @@ function openPlanReportAiModal(projectId, opts = {}) {
         $('#planReportAiName').value = r.definition.title.trim();
       }
       $('#planReportAiOut').innerHTML = `
-        ${charts.map((c) => `<div class="plan-row"><span>${esc(c.template)} · ${esc(c.title)}${c.series ? ` · ${(c.series || []).join(', ')}` : ''}${c.method ? ` · Method: ${esc(c.method)}` : ''}</span></div>`).join('') || '<div class="note">No charts proposed.</div>'}
-        <div class="toolbar"><button class="small primary" id="planReportAiSaveBtn">${appendTo ? 'Append to this report' : 'Save this report'}</button></div>`;
+        ${planReportAiChartRowsHtml(charts)}
+        <div class="toolbar"><button class="small primary" id="planReportAiSaveBtn">Save this report</button></div>`;
       $('#planReportAiSaveBtn').onclick = async () => {
         try {
-          if (appendTo) {
-            const d = await api(`/api/planning/projects/${projectId}`);
-            const rep = (d.reports || []).find((x) => x.id === appendTo.reportId);
-            if (!rep) throw new Error('report not found');
-            const def = rep.definition || {};
-            const newCharts = (r.definition && r.definition.charts) || [];
-            await api(`/api/planning/reports/${appendTo.reportId}`, { method: 'PUT', body: { definition: { ...def, charts: [...(def.charts || []), ...newCharts] } } });
-            closeModalEl($('#planReportAiModal'));
-            loadPlanReport(projectId, appendTo.reportId);
-            return;
-          }
           const baselineId = aiReportFixedBaselineId;
           const scenarioIds = planReportPickedScenarios('#planReportAiScenarios');
           if (aiReportScenarios.length && !scenarioIds.length) throw new Error('Pin at least one scenario first');
@@ -13131,7 +13244,7 @@ function planReportViewSync(projectId, currentId) {
     return;
   }
   if (list) list.classList.add('hidden');
-  host.innerHTML = `<div id="planReportStickyBar"><div class="toolbar plan-report-tabs-host"><button class="small" id="planReportBackBtn">← All reports</button>${planReportTabBarHtml(projectId, currentId)}</div><div id="planReportTabActionsBar"></div></div>`;
+  host.innerHTML = `<div id="planReportStickyBar"><div class="toolbar plan-report-tabs-host"><button class="small" id="planReportBackBtn">← All reports</button>${planReportTabBarHtml(projectId, currentId)}</div><div id="planReportTabActionsBar"></div></div><div id="planReportFollowUp" class="hidden"></div>`;
   $('#planReportBackBtn').addEventListener('click', () => {
     planReportLoadSeq++;
     planReportTabs = [];
@@ -14485,14 +14598,18 @@ async function loadPlanReport(projectId, reportId) {
     // the header panel keeps title/subtitle/definitions only.
     const planTabActions = $('#planReportTabActionsBar');
     if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabAiBtn">Follow up with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="msg" id="planReportMsg"></div>`;
+    // Follow-up conversation restores: the sticky bar is rebuilt on
+    // every load, so an open panel re-renders from the per-report
+    // thread state.
+    planReportFollowUpRestore(projectId, reportId);
     // Per-tab actions. There is no regenerate action: the view
     // always renders live comparison data, so a per-tab Generate
     // only re-pinned the report and cleared the (misleading) stale
     // badge — both are gone (user 2026-11-06). Follow up with AI
-    // opens the append modal; Save exports the tab as PDF via the
-    // browser print path. Block Delete drops one chart from the
-    // saved definition and reloads.
-    $('#planReportTabAiBtn').addEventListener('click', () => openPlanReportAiModal(projectId, { appendTo: { reportId, reportName: report.name } }));
+    // toggles the inline conversation panel below the tab bar;
+    // Save exports the tab as PDF via the browser print path.
+    // Block Delete drops one chart from the saved definition and reloads.
+    $('#planReportTabAiBtn').addEventListener('click', () => planReportFollowUpToggle(projectId, reportId));
     $('#planReportTabSaveBtn').addEventListener('click', () => window.print());
     document.querySelectorAll('[data-plan-report-block-del]').forEach((b) => b.addEventListener('click', async () => {
       const idx = Number(b.dataset.planReportBlockDel);
