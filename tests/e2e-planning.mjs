@@ -2333,6 +2333,65 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/strategies/${gicStratId}/ops`, { op_type: 'buy', params: { accountId: null, symbol: 'Test GIC no rate', currency: 'CAD', date: `${_poolVan.slice(0, 7)}-01`, amount: 1100, price: 100 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
   H.check('gic-caption-rate: custom buy with no expected return is rejected server-side (400 naming the return)',
     r.status === 400 && /expected return/i.test((r.data && r.data.error) || ''), JSON.stringify(r.data));
+  // ---- GIC term / maturity (user 2026-11-05): a custom buy carries
+  // a term in days; at maturity the proceeds return to the pot as
+  // cash and the comparison ends at the maturity month. A separate
+  // term project (not the growth pool above) so the shared horizon
+  // never truncates the 30-year growth pins.
+  r = await H.req('POST', '/api/planning/projects', { name: 'GIC Term Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: poolHoldB, percent: 100 }] }, applyRecommendation: true });
+  H.check('gic-term: term project created (100% of flat holding B, $2,000 pool)', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const termProjId = r.data.project.id;
+  r = await H.req('POST', `/api/planning/projects/${termProjId}/strategies`, { name: 'GIC Term Buy', source: 'manual' });
+  H.check('gic-term: term strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const termStratId = r.data.strategy.id;
+  // Buy 2026-11-01 + 180 days = matures 2027-04-30 (maturity month
+  // 2027-04, 5 whole months of growth at 6%).
+  r = await H.req('POST', `/api/planning/strategies/${termStratId}/ops`, { op_type: 'buy', params: { accountId: null, symbol: 'Test GIC 6% 180d', currency: 'CAD', date: `${_poolVan.slice(0, 7)}-01`, amount: 2000, price: 100, expectedReturnPct: 6, termDays: 180 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('gic-term: 180-day GIC buy posts with the term on the op', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${termStratId}`);
+  const termBuy = (r.data.ops || []).find((o) => o.op_type === 'buy');
+  H.check('gic-term: buy op carries termDays 180 (fillable on edit)',
+    r.status === 200 && !!termBuy && termBuy.params && termBuy.params.termDays === 180, JSON.stringify(termBuy));
+  // A bad term is rejected server-side, like the missing rate.
+  r = await H.req('POST', `/api/planning/strategies/${termStratId}/ops`, { op_type: 'buy', params: { accountId: null, symbol: 'Test GIC bad term', currency: 'CAD', date: `${_poolVan.slice(0, 7)}-01`, amount: 100, price: 100, expectedReturnPct: 6, termDays: 0 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('gic-term: termDays 0 is rejected server-side (400 naming the term)',
+    r.status === 400 && /term/.test((r.data && r.data.error) || ''), JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/projects/${termProjId}/comparison`);
+  const termRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === termStratId);
+  const termProj = termRow && termRow.projection;
+  const termMat = termProj && termProj.maturities && termProj.maturities[0];
+  const termExpected = 2000 * Math.pow(1.06, 5 / 12);
+  H.check('gic-term: maturity record names 2027-04-30 with the matured amount (engine monthly-compounding path)',
+    !!termMat && termMat.maturityMonth === '2027-04' && termMat.maturityDate === '2027-04-30'
+      && Math.abs(termMat.amountCad - termExpected) < 0.01,
+    JSON.stringify(termMat));
+  const termBaseTraj = (r.data.report && r.data.report.trajectories && r.data.report.trajectories[0] && r.data.report.trajectories[0].monthly) || [];
+  const termStratTraj = ((r.data.report && r.data.report.trajectories || []).find((t) => t.key === String(termStratId)) || { monthly: [] }).monthly;
+  H.check('gic-term: report trajectories (baseline + strategy) end at the maturity month 2027-04 — no 2056',
+    termBaseTraj.length > 0 && termBaseTraj[termBaseTraj.length - 1].month === '2027-04'
+      && termStratTraj.length > 0 && termStratTraj[termStratTraj.length - 1].month === '2027-04',
+    JSON.stringify({ baseLast: termBaseTraj[termBaseTraj.length - 1], stratLast: termStratTraj[termStratTraj.length - 1] }));
+  const termPot = termProj && termProj.stocks && termProj.stocks.potSeries;
+  const termStock = termProj && termProj.stocks && termProj.stocks.series;
+  const termPotAt = (m) => { const row = (termPot || []).find((x) => x.month === m); return row ? row.value : null; };
+  const termStockAt = (m) => { const row = (termStock || []).find((x) => x.month === m); return row ? row.value : null; };
+  H.check('gic-term: stock series holds the GIC through 2027-03, drops it at maturity; pot gains the matured value at 2027-04',
+    termStockAt('2027-03') != null && Math.abs(termStockAt('2027-03') - 2000 * Math.pow(1.06, 4 / 12)) < 0.5
+      && termStockAt('2027-04') === 0 && termPotAt('2027-03') === 0
+      && termPotAt('2027-04') != null && Math.abs(termPotAt('2027-04') - termExpected) < 0.01,
+    JSON.stringify({ mar: termStockAt('2027-03'), aprStock: termStockAt('2027-04'), marPot: termPotAt('2027-03'), aprPot: termPotAt('2027-04') }));
+  H.check('gic-term: report carries the maturity for the view line',
+    r.data.report && Array.isArray(r.data.report.maturities) && r.data.report.maturities.length === 1
+      && r.data.report.maturities[0].maturityDate === '2027-04-30',
+    JSON.stringify(r.data.report && r.data.report.maturities));
+  // Control: the termless GIC strategy in the original pool project
+  // still runs the full 360-month horizon (no maturity, no truncation).
+  r = await H.req('GET', `/api/planning/projects/${poolProjId}/comparison`);
+  const termlessRow = (r.data.strategies || []).find((x) => x.strategy && x.strategy.id === gicStratId);
+  H.check('gic-term: a termless custom buy still projects 360 months (no maturity)',
+    termlessRow && termlessRow.projection && termlessRow.projection.stocks && termlessRow.projection.stocks.series.length === 361
+      && (!termlessRow.projection.maturities || termlessRow.projection.maturities.length === 0),
+    JSON.stringify({ len: termlessRow && termlessRow.projection && termlessRow.projection.stocks && termlessRow.projection.stocks.series.length }));
   // ---- New stock (user 2026-11-05): a stock the user does not
   // hold yet (AMZN) is bought as a plain buy op — amount = the pool
   // remainder, price = the current price from the tiers (never 100,

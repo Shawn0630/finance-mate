@@ -43,6 +43,49 @@ const addMonthsYm = (ym, n) => ymOfIdx(monthIdxOf(ym) + n);
 const monthEndOf = (ym) => `${ym}-31`;
 const isYm = (s) => /^\d{4}-\d{2}$/.test(String(s || ''));
 
+// ------------------------------------------------- custom-buy maturity --
+// A custom-product buy (e.g. a GIC) carries a TERM in days on the op
+// params (user 2026-11-05): at maturity the proceeds return to the pot
+// as cash and the comparison ends at the maturity month. The term is
+// stored as days (termDays) — the maturity date is buy date + term,
+// computed in UTC so no timezone drifts the day. Only custom buys
+// (no account) mature; a term on a stock buy is accepted and ignored.
+// customBuyMaturity(op) -> {date: 'YYYY-MM-DD', month: 'YYYY-MM'} or
+// null. latestMaturityMonth(ops) -> the latest maturity month or
+// null. maturityHorizonMonths(ops, currentMonth) -> the projection
+// horizon in months: 360 unless a maturing buy ends the comparison
+// sooner (a maturity already past, or beyond 360 months, changes
+// nothing).
+export function customBuyMaturity(op) {
+  const p = (op && op.params) || {};
+  if (p.accountId != null) return null;
+  const days = num(p.termDays);
+  if (days == null || !Number.isInteger(days) || days <= 0) return null;
+  const d = String(p.date || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  const dt = new Date(`${d}T00:00:00Z`);
+  if (Number.isNaN(dt.getTime())) return null;
+  dt.setUTCDate(dt.getUTCDate() + days);
+  const date = dt.toISOString().slice(0, 10);
+  return { date, month: date.slice(0, 7) };
+}
+export function latestMaturityMonth(ops) {
+  let latest = null;
+  for (const o of ops || []) {
+    if (o.op_type !== 'buy') continue;
+    const m = customBuyMaturity(o);
+    if (m && (!latest || m.month > latest)) latest = m.month;
+  }
+  return latest;
+}
+export function maturityHorizonMonths(ops, currentMonth) {
+  const latest = latestMaturityMonth(ops);
+  if (!latest) return 360;
+  const monthsTo = monthIdxOf(latest) - monthIdxOf(currentMonth);
+  if (monthsTo <= 0 || monthsTo >= 360) return 360;
+  return monthsTo;
+}
+
 // ---------------------------------------------------------------- penalty --
 // kind: 'fixed_closed' | 'variable_closed' | 'open'.
 // breakAmount: the amount being broken early (a prepay's penalized excess
@@ -205,6 +248,10 @@ export function validateOp(op, ctx = {}) {
     // rate is required — a rateless custom buy would project flat.
     if (p.accountId == null && p.expectedReturnPct == null) errs.push('a custom product buy needs an expected return (% / year)');
     else if (p.expectedReturnPct != null && !(num(p.expectedReturnPct) >= -90 && num(p.expectedReturnPct) <= 500)) errs.push('expected return must be -90..500');
+    // A term (days) is optional and only matures a custom buy; when
+    // present it must be a whole number of days > 0. A custom buy
+    // without a term keeps projecting as today (no maturity).
+    if (p.termDays != null && !(Number.isInteger(Number(p.termDays)) && Number(p.termDays) > 0)) errs.push('term must be a whole number of days > 0');
   }
   if (op.op_type === 'sell') {
     if (!Number.isInteger(Number(p.holdingId))) errs.push('sell needs a holding');
@@ -790,6 +837,42 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   }
   const interestSaved = round2(baselineInterest - strategyInterest);
 
+  // Maturing custom products (user 2026-11-05 — a GIC's term): at the
+  // maturity month the holding's value leaves the stock series and
+  // returns to the pot as cash. The matured amount is the held units
+  // × the engine's grown price at the maturity month (the buy's own
+  // rate path — no new compounding rule), so the total value is
+  // continuous across the maturity month: one more month of growth,
+  // then the money is cash in the pot and stops growing as a stock.
+  // Only the units this buy bought mature (capped at what is still
+  // held — a sell before maturity reduces the matured amount); a
+  // maturity past the horizon never fires, and a termless custom buy
+  // keeps projecting as today.
+  const maturities = [];
+  const maturingBuys = stockOps
+    .filter((o) => o.op_type === 'buy')
+    .map((o) => ({ op: o, mat: customBuyMaturity(o) }))
+    .filter((x) => x.mat && x.mat.month <= horizonMonth)
+    .sort((a, b) => (a.mat.month < b.mat.month ? -1 : a.mat.month > b.mat.month ? 1 : 0));
+  for (const { op, mat } of maturingBuys) {
+    const p = op.params || {};
+    let holding = holdingsById.get(`new:${op.seq}`) || null;
+    if (!holding && p.holdingId) holding = holdingsById.get(Number(p.holdingId)) || null;
+    if (!holding && p.symbol) holding = (mainline.holdings || []).find((h) => h.accountId === Number(p.accountId) && String(h.symbol || '').toUpperCase() === String(p.symbol).toUpperCase()) || null;
+    if (!holding) continue;
+    const held = baselineUnitsAt(holding, mat.month) + (opUnitsDelta.get(holding.id) || []).filter((d) => d.month <= mat.month).reduce((s, d) => s + d.delta, 0);
+    const buyUnits = num(p.units) != null ? num(p.units) : (num(p.amount) != null && num(p.price) ? round4(num(p.amount) / num(p.price)) : null);
+    const remove = Math.max(0, Math.min(buyUnits != null ? buyUnits : held, held));
+    if (!(remove > 0)) continue;
+    const pr = priceAt(holding, mat.month);
+    if (pr == null) { errors.push(`buy operation ${op.seq}: no price at maturity ${mat.month} for ${holding.symbol || holding.label}`); continue; }
+    const maturedCad = round2(toCad(holding, remove * pr));
+    pushUnitsDelta(holding.id, mat.month, -remove);
+    potEvents.push({ month: mat.month, delta: maturedCad });
+    pot = round2(pot + maturedCad);
+    maturities.push({ holdingId: holding.id, symbol: holding.symbol || holding.label, maturityMonth: mat.month, maturityDate: mat.date, units: round4(remove), amountCad: maturedCad });
+  }
+
   // Monthly stock value series (holdings only — the cash pot is NOT
   // folded in month by month; it has its own series below. The horizon
   // value adds the pot, so a pot deployment never reads as a loss.)
@@ -862,6 +945,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     cost, valueAtHorizon: projectedTotalAtHorizon, flatValueAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
     paymentDelta: paymentDeltaOf(mortgagePerProperty),
+    maturities,
     errors, warnings,
   };
 }

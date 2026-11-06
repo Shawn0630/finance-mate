@@ -21,6 +21,7 @@ import {
   primeFactorPresetPoints, validateStrategyFactors, primeFactorToScenario,
   validateScenarioFactors, droppedScenarioPrimeSteps, primeStepDroppedMessage,
   factorsToAssumptions, applyStoredCustomSinkRate,
+  customBuyMaturity, latestMaturityMonth, maturityHorizonMonths,
 } from '../src/planning.js';
 import { derivePayment, primeHistoryResolver } from '../src/engine.js';
 
@@ -1214,4 +1215,111 @@ test('validateOp: a custom-product buy needs an expected return (-90..500); a st
   const stockBuy = (ret) => ({ op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, expectedReturnPct: ret } });
   assert.deepEqual(validateOp(stockBuy(undefined)), []);
   assert.ok(validateOp(stockBuy(600)).some((e) => /expected return/.test(e)));
+});
+
+// ---- GIC term / maturity (user 2026-11-05) ---------------------------
+// A custom-product buy carries a term in days (termDays). At maturity
+// the proceeds return to the pot as cash and the comparison ends at
+// the maturity month. The matured amount uses the engine's own growth
+// path — monthly compounding of the buy's annual rate — NOT simple
+// interest: 2027-01-01 + 180 days matures 2027-06-30, 5 whole months
+// of growth, so $49,671.72 at 4.6% matures to $50,611.29 (simple
+// 180/365 interest would be $50,798.52 — that is NOT the convention
+// asserted here; the stock series grows the same way, so the total
+// value is continuous across the maturity month).
+
+test('customBuyMaturity: buy date + term days, UTC, custom buys only', () => {
+  // His GIC: 2027-01-01 + 180 days = 2027-06-30.
+  assert.deepEqual(customBuyMaturity({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01', termDays: 180 } }), { date: '2027-06-30', month: '2027-06' });
+  // A stock buy never matures, even with a term on it.
+  assert.equal(customBuyMaturity({ op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', date: '2027-01-01', termDays: 180 } }), null);
+  // No term, a zero/negative/fractional term, or a missing date: no maturity.
+  assert.equal(customBuyMaturity({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01' } }), null);
+  assert.equal(customBuyMaturity({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01', termDays: 0 } }), null);
+  assert.equal(customBuyMaturity({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01', termDays: -30 } }), null);
+  assert.equal(customBuyMaturity({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01', termDays: 90.5 } }), null);
+  assert.equal(customBuyMaturity({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', termDays: 180 } }), null);
+});
+
+test('latestMaturityMonth / maturityHorizonMonths: latest maturing buy ends the comparison', () => {
+  const ops = [
+    { seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01', termDays: 180 } },
+    { seq: 2, op_type: 'buy', params: { accountId: null, symbol: 'GIC 5%', date: '2027-01-01', termDays: 365 } },
+  ];
+  assert.equal(latestMaturityMonth(ops), '2028-01');
+  assert.equal(maturityHorizonMonths(ops, '2026-11'), 14);
+  assert.equal(latestMaturityMonth([ops[0]]), '2027-06');
+  assert.equal(maturityHorizonMonths([ops[0]], '2026-11'), 7);
+  // No maturing buy, a maturity already past, or one beyond 360
+  // months: the horizon stays 360.
+  assert.equal(latestMaturityMonth([{ seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01' } }]), null);
+  assert.equal(maturityHorizonMonths([{ seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', date: '2027-01-01' } }], '2026-11'), 360);
+  assert.equal(maturityHorizonMonths([ops[0]], '2027-07'), 360);
+  assert.equal(maturityHorizonMonths([{ seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC', date: '2027-01-01', termDays: 365 * 40 } }], '2026-11'), 360);
+});
+
+test('validateOp: a term must be a whole number of days > 0 when present', () => {
+  const buy = (termDays) => ({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, expectedReturnPct: 4.6, termDays } });
+  assert.deepEqual(validateOp(buy(180)), []);
+  assert.deepEqual(validateOp(buy(undefined)), []);
+  assert.ok(validateOp(buy(0)).some((e) => /term/.test(e)));
+  assert.ok(validateOp(buy(-30)).some((e) => /term/.test(e)));
+  assert.ok(validateOp(buy(90.5)).some((e) => /term/.test(e)));
+  assert.ok(validateOp(buy('soon')).some((e) => /term/.test(e)));
+});
+
+test('computeProjection: a 180-day GIC matures to the pot as cash at 2027-06 (his GIC, 4.6%)', () => {
+  const gicBuy = { seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', currency: 'CAD', date: '2027-01-01', amount: 49671.72, price: 100, expectedReturnPct: 4.6, termDays: 180 } };
+  const legs = [{ op_seq: 1, source_ref: 'external', amount: 'all' }];
+  const r = computeProjection(ARGS({ mainline: MAINLINE({ properties: [] }), ops: [gicBuy], legs }));
+  assert.deepEqual(r.errors, []);
+  // The maturity record: 2027-06-30, 496.7172 units, $50,611.29 —
+  // the engine's monthly-compounding path (5 whole months at 4.6%).
+  assert.equal(r.maturities.length, 1);
+  assert.deepEqual(r.maturities[0], { holdingId: 'new:1', symbol: 'GIC 4.6%', maturityMonth: '2027-06', maturityDate: '2027-06-30', units: 496.7172, amountCad: 50611.29 });
+  const byMonth = (series, m) => (series.find((row) => row.month === m) || {}).value;
+  // Stock series holds the GIC through May (4 months of growth) and
+  // drops it at the maturity month; the pot gains the matured value
+  // at the same month — the total is continuous (50,421.96 → 50,611.29).
+  assert.ok(Math.abs(byMonth(r.stocks.series, '2027-05') - 50421.96) < 0.01, `May ${byMonth(r.stocks.series, '2027-05')}`);
+  assert.equal(byMonth(r.stocks.series, '2027-06'), 0);
+  assert.equal(byMonth(r.stocks.potSeries, '2027-05'), 0);
+  assert.ok(Math.abs(byMonth(r.stocks.potSeries, '2027-06') - 50611.29) < 0.01, `pot Jun ${byMonth(r.stocks.potSeries, '2027-06')}`);
+  // At the horizon the money is cash in the pot, not a stock: the
+  // grown and flat horizon values are both the matured amount.
+  assert.ok(Math.abs(r.valueAtHorizon - 50611.29) < 0.01, `horizon ${r.valueAtHorizon}`);
+  assert.ok(Math.abs(r.flatValueAtHorizon - 50611.29) < 0.01, `flat ${r.flatValueAtHorizon}`);
+  assert.ok(Math.abs(r.stocks.potAtHorizon - 50611.29) < 0.01);
+});
+
+test('computeProjection: a maturing buy truncates the series at the maturity month when the horizon is set', () => {
+  const gicBuy = { seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', currency: 'CAD', date: '2027-01-01', amount: 49671.72, price: 100, expectedReturnPct: 4.6, termDays: 180 } };
+  const legs = [{ op_seq: 1, source_ref: 'external', amount: 'all' }];
+  // 2026-11 + 7 months = 2027-06: the series ends at maturity, no 2056.
+  const r = computeProjection(ARGS({ mainline: MAINLINE({ properties: [] }), ops: [gicBuy], legs, horizonMonths: 7 }));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.stocks.series.length, 8);
+  assert.equal(r.stocks.series[r.stocks.series.length - 1].month, '2027-06');
+  assert.equal(r.stocks.potSeries[r.stocks.potSeries.length - 1].month, '2027-06');
+  assert.ok(Math.abs(r.stocks.potSeries[r.stocks.potSeries.length - 1].value - 50611.29) < 0.01);
+});
+
+test('computeProjection: a termless custom buy and a stock buy with a term never mature', () => {
+  // Termless GIC: no maturities, the 360-month horizon stands, and
+  // it keeps growing at its own rate — 358 months of growth (the
+  // horizon is 360 months from the current month 2026-11, the buy
+  // lands 2 months in): $49,671.72 × 1.046^(358/12) ≈ $190,022.25.
+  const termless = { seq: 1, op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.6%', currency: 'CAD', date: '2027-01-01', amount: 49671.72, price: 100, expectedReturnPct: 4.6 } };
+  const legs = [{ op_seq: 1, source_ref: 'external', amount: 'all' }];
+  const r = computeProjection(ARGS({ mainline: MAINLINE({ properties: [] }), ops: [termless], legs }));
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.maturities, []);
+  assert.equal(r.stocks.series.length, 361);
+  assert.ok(Math.abs(r.valueAtHorizon - 190022.25) < 1, `termless horizon ${r.valueAtHorizon}`);
+  // A stock buy carrying a term: the term is ignored, no maturity.
+  const stockBuy = { seq: 1, op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, termDays: 180 } };
+  const r2 = computeProjection(ARGS({ mainline: MAINLINE({ properties: [] }), ops: [stockBuy], legs: [{ op_seq: 1, source_ref: 'external', amount: 'all' }] }));
+  assert.deepEqual(r2.errors, []);
+  assert.deepEqual(r2.maturities, []);
+  assert.equal(r2.stocks.series.length, 361);
 });

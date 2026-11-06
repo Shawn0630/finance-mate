@@ -49,6 +49,7 @@ import {
   calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
+  latestMaturityMonth, maturityHorizonMonths,
   reportMonthlySeries, reportCostBreakdown,
   planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
   planAiEntityCandidates, rewriteAiIdQuestions, dropAnsweredAiQuestions, bindAiNameAnswers,
@@ -4789,7 +4790,16 @@ async function planProjectionFor(strategy, project, scenarioInput, overrides) {
   const poolHoldingIds = (project.category === 'investment' && poolEntity && poolEntity.type === 'pool')
     ? (mainline.holdings || []).map((h) => h.id)
     : null;
-  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth, potInitial, poolHoldingIds };
+  // Maturing custom buys (user 2026-11-05): the comparison ends at
+  // the latest maturity month — report charts/tables/pager stop there,
+  // no more 2056 for a GIC strategy. An explicit horizon override
+  // (the report block's shared window) wins; otherwise the horizon
+  // comes from this strategy's own ops. The baseline runs to the SAME
+  // horizon so the comparison shares one window.
+  const horizonMonths = (overrides && overrides.horizonMonths != null)
+    ? overrides.horizonMonths
+    : maturityHorizonMonths(ops, currentMonth);
+  const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth, potInitial, poolHoldingIds, horizonMonths };
   const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
   const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
   baseline.currentRates = currentRates;
@@ -6049,13 +6059,28 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
   if (opts.factorOverrides) factors = { ...(factors || {}), ...opts.factorOverrides };
   const rows = [];
   let baseline = null;
+  // Shared comparison window (user 2026-11-05): when ANY strategy in
+  // this report holds a maturing custom buy, every trajectory ends at
+  // the latest maturity month — one window, one baseline, so the
+  // charts, table, and year pager all stop there. Op-param overrides
+  // (preview) are applied first, so a previewed term moves the
+  // window the same way a saved one does.
+  const effOpsFor = (st) => {
+    const sops = planOpsOf(st.id);
+    if (!opts.opParamOverrides) return sops;
+    return sops.map((o) => (opts.opParamOverrides[o.id] ? { ...o, params: { ...(o.params || {}), ...opts.opParamOverrides[o.id] } } : o));
+  };
+  const reportAllOps = strategies.flatMap((st) => effOpsFor(st));
+  const reportLatestMat = latestMaturityMonth(reportAllOps);
+  const reportHorizonMonths = reportLatestMat ? maturityHorizonMonths(reportAllOps, currentMonthKey()) : null;
   for (const st of strategies) {
     let r;
     try {
       // No factor overrides: pass the row (appliedScenario stays
       // set). With overrides: pass the merged factors object.
       const scenInput = opts.factorOverrides ? factors : scenarioRow;
-      r = await planProjectionFor(st, p, scenInput, opts.opParamOverrides ? { opParams: opts.opParamOverrides } : undefined);
+      const projOverrides = { ...(opts.opParamOverrides ? { opParams: opts.opParamOverrides } : {}), ...(reportHorizonMonths != null ? { horizonMonths: reportHorizonMonths } : {}) };
+      r = await planProjectionFor(st, p, scenInput, Object.keys(projOverrides).length ? projOverrides : undefined);
     } catch (err) {
       throw new Error(`projection failed: ${err.message}`);
     }
@@ -6139,6 +6164,10 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
     trajectories: reportTrajectories,
     costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
     investmentScope,
+    // Maturing custom buys, for the report view's maturity line:
+    // each names the product, its maturity date, and the matured
+    // amount that returned to the pot as cash.
+    maturities: rows.flatMap((r) => (r.projection.maturities || []).map((m) => ({ ...m, strategyId: r.strategy.id, strategyLetter: r.strategy.letter, strategyName: r.strategy.name }))),
   };
   return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
 }
@@ -7566,7 +7595,7 @@ function planGicTemplateProposal(text, answers, category, subcategory, entity) {
     baseline: { name: 'Do Nothing', description: 'Hold the pool as-is', assumptions: [] },
     strategy: {
       name: 'GIC Purchase Strategy',
-      ops: [{ op_type: 'buy', params: { accountId: null, symbol: name, currency: 'CAD', date, amount, price: 100, expectedReturnPct: rate } }],
+      ops: [{ op_type: 'buy', params: { accountId: null, symbol: name, currency: 'CAD', date, amount, price: 100, expectedReturnPct: rate, ...(termDays ? { termDays } : {}) } }],
     },
   };
   const { proposal: norm, errors: shapeErrors } = validateAiCreateProposal(proposal);
@@ -7633,7 +7662,7 @@ app.post('/api/planning/ai-create/propose', requireApiAuth, async (req, res) => 
     'The scenario holds ONLY world factors: prime (a rate path), stock (an expected annual return %), propertyGrowth, salaryGrowth, rentGrowth. It NEVER holds a sink, an operation, or a price. prime: {"preset": "flat"|"optimistic"|"pessimistic"|"up"|"down"} or {"points": [{"month": "YYYY-MM", "rate": number}]}. Points must be increasing months, rates 0–30. stock/propertyGrowth/salaryGrowth/rentGrowth: {"valuePct": number} between -90 and 500. Only include a factor the user actually asked about — never invent one. Salary and rent growth are stored and labeled only; the projection has no earnings leg yet.',
     'The baseline changes nothing: a pure do-nothing reference (name + one-line description + assumptions only). It carries NO prime path and NO stock reference.',
     'Operation types: prepay, rate_switch, refinance, payment_change, buy, sell, position. A buy REQUIRES a price > 0; when the user does not know a price, use position (units only), never guess a price. Dates are YYYY-MM-DD. Amounts are numbers (no currency symbols, no commas). Use propertyRef (address text), accountRef (account name) and holdingRef (symbol or label) — never invent ids. For a buy, include a "legs" array of {source_ref, amount} where source_ref is pot, cash, external, declared:<name>, op:<seq> or repay:<property address>; amount is a number, "all" or "remainder". Legs must sum to the buy amount.',
-    'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as ONE buy op {"accountId": null, "symbol": "GIC <rate>%", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100, "expectedReturnPct": <rate>} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing.',
+    'A GIC (guaranteed investment certificate) is a custom product, never a fund holding: model it as ONE buy op {"accountId": null, "symbol": "GIC <rate>%", "currency": "CAD", "date": "YYYY-MM-DD", "amount": <funding total>, "price": 100, "expectedReturnPct": <rate>} with no legs (the pool funds it). NEVER a position op on a fund, NEVER a buy with a holdingRef. If the rate or start date is missing, ask for it instead of guessing. When the user gives a term ("180 days", "1 year"), add "termDays": <days> to the buy params — at maturity the proceeds return to the pot as cash and the comparison ends at the maturity month.',
     'Bind ONLY to values in the snapshot below; never cite a number that is not there. This is a NEW project: it has no existing scenarios, baselines, or strategies yet.',
     `Optimization: category ${category}, subcategory ${subcategory || '—'}, entity ${JSON.stringify(entity)}. Fit the trio to this optimization; where the user need touches the picked entity, the strategy's operations must act on it.`,
     `App data snapshot: ${JSON.stringify(snapshot)}`,

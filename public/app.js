@@ -14087,10 +14087,22 @@ async function loadPlanReport(projectId, reportId) {
       </div>`,
       engine: `<div data-plan-report-block="engine"><div id="planReportEngineBody">${planReportEngineHtml(planReportView)}</div></div>`,
     };
+    // Maturing custom buys (user 2026-11-05 — a GIC's term): the
+    // report states the maturity plainly — each product's maturity
+    // date and the amount returning to the pot as cash, plus the
+    // comparison's end month (the latest maturity month).
+    const maturityLines = (() => {
+      const mats = (rep.maturities || []);
+      if (!mats.length) return '';
+      const latest = mats.map((m) => m.maturityMonth).sort().pop();
+      return mats.map((m) => `<div class="note">${esc(m.strategyLetter)} · ${esc(m.symbol)} matures ${esc(m.maturityDate)} — ${money2(m.amountCad)} returns to the pot as cash.</div>`).join('')
+        + `<div class="note">This comparison ends ${formatYM(latest)} — the maturity month.</div>`;
+    })();
     $('#planReport').innerHTML = `
       <div class="panel">
         <div class="section-head"><h3>${esc(report.name)}</h3><span class="toolbar">${report.stale ? '<span class="msg warn" style="margin:0">Stale — regenerate</span>' : ''}</span></div>
         <div class="note plan-report-subtitle">${esc(worldLabel)} · Baseline: ${esc(comp.chosenBaseline ? comp.chosenBaseline.name : 'Do-nothing baseline')} · Strategies: ${esc(comp.strategies.map((r) => `${r.strategy.letter} · ${r.strategy.name}`).join(', ') || 'None')}</div>
+        ${maturityLines}
         ${projErrLines.map((l) => `<div class="msg err">${esc(l)}</div>`).join('')}
         ${projWarnLines.map((l) => `<div class="msg warn">${esc(l)}</div>`).join('')}
         <div class="note plan-report-defs">${template.key === 'pool' ? PLAN_REPORT_DEFS_POOL : PLAN_REPORT_DEFS_PROPERTY}</div>
@@ -14205,6 +14217,15 @@ function planLegLabel(l) {
   const amt = l.amount === 'all' ? 'All' : l.amount === 'remainder' ? 'Remainder' : money2(Number(l.amount));
   return `${srcLabel} · ${amt}`;
 }
+// Add whole days to a YYYY-MM-DD date (UTC math — no timezone
+// drift). Used for a custom buy's maturity date (buy date + term).
+function planAddDays(dateStr, days) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr || '')) return null;
+  const dt = new Date(`${dateStr}T00:00:00Z`);
+  if (Number.isNaN(dt.getTime())) return null;
+  dt.setUTCDate(dt.getUTCDate() + Number(days));
+  return dt.toISOString().slice(0, 10);
+}
 function planStrategyHtml(d) {
   const s = d.strategy;
   const c = d.comparison;
@@ -14221,11 +14242,16 @@ function planStrategyHtml(d) {
   const isPool = !!(d.fixedBaseline && d.fixedBaseline.kind === 'investment' && d.fixedBaseline.figures && d.fixedBaseline.figures.poolValue != null);
   const planOpCardHtml = (o) => {
     const p = o.params || {};
+    // A maturing custom buy (e.g. a 180-day GIC) shows its term and
+    // maturity date on the row, so the user can see it without
+    // opening the edit form.
+    const matDate = (o.op_type === 'buy' && p.accountId == null && p.termDays) ? planAddDays(p.date, p.termDays) : null;
+    const matText = matDate ? ` · ${p.termDays} days · matures ${matDate}` : '';
     const desc = o.op_type === 'prepay' ? `Prepay ${money2(p.amount)} on ${esc(p.date || '')}${p.recurringYears > 1 ? ` yearly × ${p.recurringYears}` : ''}`
       : o.op_type === 'rate_switch' ? `Switch rate on ${esc(p.date || '')} to ${p.rateType === 'fixed' ? `${p.annualRate}% fixed` : `Prime ${p.spread >= 0 ? '+' : ''}${p.spread}`}`
       : o.op_type === 'refinance' ? `Refinance on ${esc(p.date || '')} · ${p.termMonths} months · ${p.amortizationYears}y amortization`
       : o.op_type === 'payment_change' ? `Payment → ${money2(p.payment)} from ${esc(p.date || '')}`
-      : o.op_type === 'buy' ? `Buy ${p.symbol || o.holdingSymbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}`
+      : o.op_type === 'buy' ? `Buy ${p.symbol || o.holdingSymbol || ''} on ${esc(p.date || '')}${p.units ? ` · ${p.units} units` : ''}${p.amount ? ` · ${money2(p.amount)}` : ''}${matText}`
       : o.op_type === 'sell' ? `Sell ${p.units} units on ${esc(p.date || '')}`
       : `Position ${p.units} units on ${esc(p.date || '')}`;
     // A buy's funding legs resolve to money: a 'remainder'/'all' leg
@@ -15434,6 +15460,7 @@ function planOpFormHtml(type, params, ctx, opts) {
     <div id="planOpCustomBox"${isCustomBuy ? '' : ' class="hidden"'}>
       <div><label>Product name *</label><input id="planOpCustomName" value="${isCustomBuy ? esc(p.symbol || '') : ''}"></div>
       <div><label>Expected return (% / year) *</label><input id="planOpCustomReturn" type="text" inputmode="decimal" data-money value="${p.expectedReturnPct != null ? esc(String(p.expectedReturnPct)) : ''}"></div>
+      <div><label>Term (days)</label><input id="planOpCustomTerm" type="text" inputmode="numeric" value="${p.termDays != null ? esc(String(p.termDays)) : ''}"></div>
     </div>` : ''}
     <div id="planOpStockBox"${isCustomBuy ? ' class="hidden"' : ''}>
     <div><label>Account *</label><select id="planOpAccount">${acctOpts}</select></div>
@@ -15835,6 +15862,14 @@ function planRequireCustomBuyRate(params) {
   if (params.expectedReturnPct == null) throw new Error('a custom product buy needs an expected return (% / year)');
   if (!(params.expectedReturnPct >= -90 && params.expectedReturnPct <= 500)) throw new Error('expected return must be -90..500');
 }
+// A term (days) on a custom buy, checked at save time alongside the
+// rate: optional, but when present it must be a whole number of days
+// > 0. The server's validateOp enforces the same rule.
+function planValidateCustomBuyTerm(params) {
+  if (!params || params.accountId != null) return;
+  if (params.termDays == null) return;
+  if (!Number.isInteger(params.termDays) || params.termDays <= 0) throw new Error('term must be a whole number of days > 0');
+}
 function planReadOpForm(type, root) {
   const scope = root || document;
   const v = (id) => { const el = scope.querySelector('#' + id); return el ? el.value : null; };
@@ -15871,6 +15906,12 @@ function planReadOpForm(type, root) {
       params.price = 100;
       const ret = m('planOpCustomReturn');
       if (ret != null) params.expectedReturnPct = ret;
+      // A term in days (e.g. a 180-day GIC): at maturity the proceeds
+      // return to the pot as cash and the comparison ends at the
+      // maturity month. Optional — a termless custom buy keeps
+      // projecting as today.
+      const term = v('planOpCustomTerm');
+      if (term != null && String(term).trim() !== '') params.termDays = Number(term);
       params.units = m('planOpUnits'); params.amount = m('planOpAmount');
     } else {
       params.accountId = Number(v('planOpAccount'));
@@ -16022,6 +16063,7 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
       if (!params.date) throw new Error('date is required');
       if (curType === 'buy') {
         planRequireCustomBuyRate(params);
+        planValidateCustomBuyTerm(params);
         const over = planBuyPoolOverflow($('#planOpModalBody').closest('.modal-card'), params.amount);
         if (over) throw new Error(over);
       }
@@ -16125,6 +16167,7 @@ async function openPlanStrategyModal(projectId) {
         // name-only strategy never saves an op at all.
         if (opType === 'buy') {
           planRequireCustomBuyRate(params);
+          planValidateCustomBuyTerm(params);
           const over = planBuyPoolOverflow($('#planStrategyModalBody').closest('.modal-card'), params.amount);
           if (over) throw new Error(over);
         }
