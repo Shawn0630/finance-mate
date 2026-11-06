@@ -14515,7 +14515,7 @@ async function loadPlanReport(projectId, reportId) {
     // sync above rebuilds the bar, so fill it here before wiring);
     // the header panel keeps title/subtitle/definitions only.
     const planTabActions = $('#planReportTabActionsBar');
-    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Generate with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="msg" id="planReportMsg"></div>`;
+    if (planTabActions) planTabActions.innerHTML = `<div class="toolbar"><button class="small primary" id="planReportTabGenerateBtn">Generate</button><button class="small" id="planReportTabAiBtn">Follow up with AI</button><button class="small" id="planReportTabSaveBtn">Save report</button></div><div class="msg" id="planReportMsg"></div>`;
     // Per-tab actions. Both Generate buttons are always available:
     // the button IS the engine choice (preset vs AI) — no routing
     // rule disables either. Preset Generate re-pins the report,

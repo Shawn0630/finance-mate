@@ -9697,10 +9697,12 @@ export async function run(H, S) {
       const tabBtns = await page.evaluate(() => ({
         gen: !!document.querySelector('#planReportTabGenerateBtn'),
         ai: !!document.querySelector('#planReportTabAiBtn'),
+        aiLabel: document.querySelector('#planReportTabAiBtn')?.textContent.trim(),
         save: !!document.querySelector('#planReportTabSaveBtn'),
         genDisabled: !!document.querySelector('#planReportTabGenerateBtn')?.disabled,
       }));
       H.check('reporttab: per-tab Generate, AI Generate, Save buttons present; preset enabled for engine pins', tabBtns.gen && tabBtns.ai && tabBtns.save && !tabBtns.genDisabled, JSON.stringify(tabBtns));
+      H.check('reporttab: per-tab AI button reads Follow up with AI (it appends to the open report, not a new one)', tabBtns.aiLabel === 'Follow up with AI', JSON.stringify(tabBtns));
       // Highlight: engine tab highlights its own pins on the tiers
       // above (amber); the scenario card — wiring-selected AND
       // report-pinned — shows ONE combined frame: selection border
