@@ -12298,7 +12298,7 @@ async function planFlowGenerate(projectId) {
   const fb = (planProjectData || {}).project && planProjectData.project.fixedBaseline;
   const isPool = !!(fb && fb.kind === 'investment' && fb.figures && fb.figures.poolValue != null);
   const presetCharts = isPool
-    ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
+    ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'fan_band', title: 'Stock volatility fan', series: ['stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
     : [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }];
   try {
     const r = await api(`/api/planning/projects/${projectId}/reports`, { method: 'POST', body: {
@@ -13879,7 +13879,6 @@ async function loadPlanReport(projectId, reportId) {
       // stays — e.g. a stacked_bar with stock_value.
       if (!template.mortgageCharts) {
         const mortOnly = (sids) => sids.length > 0 && sids.every((sid) => sid === 'mortgage_balance');
-        if (c.template === 'fan_band') return;
         if (c.template === 'time_line' && mortOnly(series || ['mortgage_balance'])) return;
         if (c.template === 'yearly_bars' && ((series && series[0]) || 'mortgage_balance') === 'mortgage_balance') return;
         if (c.template === 'stacked_bar' && mortOnly(series || ['mortgage_balance'])) return;
@@ -14013,6 +14012,39 @@ async function loadPlanReport(projectId, reportId) {
           panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: share doughnut needs a property value series (mortgage_balance / total_value) or cost.</div></div>`);
         }
       } else if (c.template === 'fan_band') {
+        // Two fans share this template, split by baseline kind: a
+        // mortgage scenario fan on property reports (existing), a
+        // stock volatility fan on cash-pool reports (user 2026-11-05).
+        // The stock fan is engine-computed (rep.stockFan): one fan
+        // per baseline holding with usable history.
+        if (!template.mortgageCharts) {
+          const stockFan = (rep && rep.stockFan) || { fans: [], noFan: [] };
+          const fanBlocks = (stockFan.fans || []).map((fan) => {
+            const fcid = `${cid}f${fan.holdingId}`;
+            const n = fan.months.length;
+            const end = n ? n - 1 : 0;
+            // Band fill: P90 fills back to P10 (two datasets back),
+            // light so the median line reads through it.
+            draws.push(() => planLineChart(fcid, fan.months, [
+              { label: 'P10', data: fan.p10, borderColor: '#7fb0e8', backgroundColor: '#7fb0e8', fill: false, pointRadius: 0 },
+              { label: 'Median', data: fan.median, borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, borderWidth: 2 },
+              { label: 'P90', data: fan.p90, borderColor: '#7fb0e8', backgroundColor: 'rgba(47,125,225,0.15)', fill: '-2', pointRadius: 0 },
+            ], { endLabels: [`P10 ${money2(fan.p10[end])}`, `Median ${money2(fan.median[end])}`, `P90 ${money2(fan.p90[end])}`] }));
+            const snap = planReportYearRows(fan.months.map((m) => ({ month: m })));
+            const sbody = snap.map((row) => {
+              const idx = fan.months.indexOf(row.month);
+              return `<tr><td>${row.month}</td><td>${money2(fan.median[idx])}</td><td>${money2(fan.p10[idx])}</td><td>${money2(fan.p90[idx])}</td></tr>`;
+            }).join('');
+            const volNote = fan.volPct === 0 ? 'Volatility 0% over this window — P10/P90 coincide with the median.' : '';
+            return `<div class="section-head"><h4>${esc(fan.symbol)}${fan.label && fan.label !== fan.symbol ? ` · ${esc(fan.label)}` : ''}</h4></div>
+            <div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div>
+            <div class="note">Median at the holding's history CAGR ${fan.ratePct}%/yr (${esc(fan.rateBasis || 'Price CAGR')} · ${esc(fan.rateWindow)}). Volatility ${fan.volPct}%/yr from ${fan.volReturns} monthly returns (${esc(fan.volWindow)}), annualized ×√12. Past volatility is an estimate, not a prediction. ${volNote}</div>
+            <table class="tbl"><thead><tr><th>Month</th><th>Median</th><th>P10</th><th>P90</th></tr></thead><tbody>${sbody}</tbody></table>`;
+          }).join('');
+          const noFanNotes = (stockFan.noFan || []).map((nf) => `<div class="note">${esc(nf.symbol)}: no volatility fan — ${nf.reason === 'no usable price history' ? 'not enough price history (needs at least 2 monthly returns)' : esc(nf.reason)}.</div>`).join('');
+          const emptyNote = (!stockFan.fans.length && !stockFan.noFan.length) ? '<div class="note">No volatility fan: this project holds no stocks.</div>' : '';
+          panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${fanBlocks}${noFanNotes}${emptyNote}</div>`);
+        } else {
         const blocks = comp.strategies.map((row) => {
           const table = fanData[row.strategy.id] || [];
           if (!table.length) return `<div class="note">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: no scenario data.</div>`;
@@ -14030,6 +14062,7 @@ async function loadPlanReport(projectId, reportId) {
           return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><div class="note">X: month · Y: mortgage balance (CAD) across scenarios.</div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}</div>`);
+        }
       } else if (c.template === 'funds_flow') {
         panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Funds flow diagram — not rendered yet.</div></div>`);
       } else {
@@ -14515,7 +14548,7 @@ function planStrategyReportsWire(d) {
       // Mortgage balance chart; property/other keep it. The preset
       // POST stays permissive — the viewer enforces at render.
       const presetCharts = d.baselineKind === 'pool'
-        ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
+        ? [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }, { template: 'fan_band', title: 'Stock volatility fan', series: ['stock_value'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }]
         : [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }];
       const r = await api(`/api/planning/projects/${pid}/reports`, { method: 'POST', body: { name: `Report · ${s.letter} · ${s.name}`, definition: { strategies: [s.id], charts: presetCharts }, baseline_id: pickedBaseline(), strategy_ids: [s.id], scenario_ids: scenarioIds } });
       // AI-handler pattern: reload first so the Generate gate opens

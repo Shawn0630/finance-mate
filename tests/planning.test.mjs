@@ -9,6 +9,7 @@ import {
   validateOp, validateLegs, computeProjection, compareProjections,
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
   resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
+  holdingVolatilityFromPoints, stockFanSeries,
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel,
   buildPlanAiSnapshot, normalizeAiAsk,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
@@ -377,6 +378,131 @@ test('returnSuggestionsFromPoints: windows label their actual coverage', () => {
   assert.ok(!short.some((x) => x.label === '3y' || x.label === '5y' || x.label === '1y'));
   assert.ok(short.some((x) => /since first price/.test(x.label)));
   assert.equal(short.find((x) => /since first price/.test(x.label)).annualizedReturn, null);
+});
+
+// ------------------------------------------------------- stock volatility fan
+test('holdingVolatilityFromPoints: sample std dev of monthly returns, annualized ×√12, longest window', () => {
+  // Prices 100 → 110 → 99: monthly returns +10%, −10%.
+  // Sample std dev = √(0.02/1) = 0.141421; annualized ×√12 = 48.9898%.
+  const v = holdingVolatilityFromPoints([
+    { date: '2026-08-15', price: 100 },
+    { date: '2026-09-15', price: 110 },
+    { date: '2026-10-15', price: 99 },
+  ], '2026-11');
+  assert.ok(v);
+  assert.equal(v.volPct, 48.9898);
+  assert.equal(v.window, '2026-08 → 2026-10');
+  assert.equal(v.returns, 2);
+  // A gap wider than a month is skipped, never interpolated: only
+  // the consecutive pair counts, so one return is not enough.
+  assert.equal(holdingVolatilityFromPoints([
+    { date: '2026-01-15', price: 100 },
+    { date: '2026-06-15', price: 110 },
+    { date: '2026-07-15', price: 99 },
+  ], '2026-11'), null);
+  // Fewer than 2 monthly returns → null (a new GIC, a single point).
+  assert.equal(holdingVolatilityFromPoints([{ date: '2026-10-15', price: 20 }], '2026-11'), null);
+  assert.equal(holdingVolatilityFromPoints([], '2026-11'), null);
+  // Flat: identical monthly returns → vol 0 (the band collapses).
+  const flat = holdingVolatilityFromPoints([
+    { date: '2026-08-15', price: 100 },
+    { date: '2026-09-15', price: 105 },
+    { date: '2026-10-15', price: 110.25 },
+  ], '2026-11');
+  assert.equal(flat.volPct, 0);
+  // 12 alternating ±10% monthly returns (2025-11 → 2026-10):
+  // sample std dev 0.104446, annualized ×√12 = 36.1814%.
+  const months12 = [];
+  for (let i = 0; i < 13; i++) {
+    const y = 2025 + Math.floor((10 + i) / 12);
+    const m = ((10 + i) % 12) + 1;
+    months12.push(`${y}-${String(m).padStart(2, '0')}`);
+  }
+  let p = 100;
+  const pts12 = months12.map((m, i) => {
+    if (i > 0) p *= (i % 2 === 1 ? 1.10 : 0.90);
+    return { date: `${m}-15`, price: Number(p.toFixed(6)) };
+  });
+  const v12 = holdingVolatilityFromPoints(pts12, '2026-11');
+  assert.ok(v12);
+  assert.ok(Math.abs(v12.volPct - 36.1814) < 0.01, JSON.stringify(v12));
+  assert.equal(v12.window, '2025-11 → 2026-11');
+  assert.equal(v12.returns, 12);
+});
+
+test('stockFanSeries: median at history CAGR, P10/P90 bands widen with √t', () => {
+  const fan = stockFanSeries({ value0: 1000, ratePct: 12, volPct: 20, months: ['2026-11', '2026-12', '2027-11'] });
+  assert.deepEqual(fan.months, ['2026-11', '2026-12', '2027-11']);
+  // t=0: bands coincide with the median.
+  assert.deepEqual([fan.p10[0], fan.median[0], fan.p90[0]], [1000, 1000, 1000]);
+  // t=1: median 1009.49, P10 937.49, P90 1087.01.
+  assert.ok(Math.abs(fan.median[1] - 1009.49) < 0.01);
+  assert.ok(Math.abs(fan.p10[1] - 937.49) < 0.01);
+  assert.ok(Math.abs(fan.p90[1] - 1087.01) < 0.01);
+  // t=12: median 1120.00, P10 866.77, P90 1447.21.
+  assert.ok(Math.abs(fan.median[2] - 1120) < 0.01);
+  assert.ok(Math.abs(fan.p10[2] - 866.77) < 0.01);
+  assert.ok(Math.abs(fan.p90[2] - 1447.21) < 0.01);
+  // Bands widen with √t: width at t=12 > width at t=1; P10 < median < P90.
+  const w1 = fan.p90[1] - fan.p10[1];
+  const w12 = fan.p90[2] - fan.p10[2];
+  assert.ok(w12 > w1, `${w1} vs ${w12}`);
+  assert.ok(fan.p10[2] < fan.median[2] && fan.median[2] < fan.p90[2]);
+  // Zero vol: the band collapses to the median.
+  const flatFan = stockFanSeries({ value0: 1000, ratePct: 12, volPct: 0, months: ['2026-11', '2027-11'] });
+  assert.deepEqual(flatFan.p10, flatFan.median);
+  assert.deepEqual(flatFan.p90, flatFan.median);
+});
+
+test('computeProjection: stockFan carries one fan per history holding, noFan for a history-less holding', () => {
+  // FAN.A: 100 units, 13 monthly points alternating ±10%
+  // (2025-11 → 2026-11) — vol 36.1814%, 1y CAGR ≈ −5.85%.
+  const months12 = [];
+  for (let i = 0; i < 13; i++) {
+    const y = 2025 + Math.floor((10 + i) / 12);
+    const m = ((10 + i) % 12) + 1;
+    months12.push(`${y}-${String(m).padStart(2, '0')}`);
+  }
+  let p = 100;
+  const pts12 = months12.map((m, i) => {
+    if (i > 0) p *= (i % 2 === 1 ? 1.10 : 0.90);
+    return { date: `${m}-15`, price: Number(p.toFixed(6)) };
+  });
+  const fanHolding = {
+    id: 1, accountId: 1, symbol: 'FAN.A', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 100 }],
+    pricePoints: pts12,
+  };
+  const gicHolding = {
+    id: 2, accountId: 1, symbol: 'GIC 4.6%', currency: 'CAD',
+    events: [{ date: '2026-01-15', type: 'buy', units: 10, price: 100 }],
+    pricePoints: [{ date: '2026-01-15', price: 100 }],
+  };
+  const rate = { 1: -5.852 };
+  const base = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [fanHolding, gicHolding] }), holdingGrowth: rate }));
+  assert.deepEqual(base.errors, []);
+  const fan = base.stockFan;
+  assert.ok(fan, 'projection carries stockFan');
+  assert.equal(fan.fans.length, 1);
+  assert.equal(fan.fans[0].symbol, 'FAN.A');
+  assert.ok(Math.abs(fan.fans[0].volPct - 36.1814) < 0.01, JSON.stringify(fan.fans[0]));
+  assert.ok(fan.fans[0].ratePct < 0, JSON.stringify(fan.fans[0]));
+  assert.equal(fan.fans[0].rateWindow, '2025-11 → 2026-11');
+  assert.equal(fan.fans[0].volWindow, '2025-11 → 2026-11');
+  // The fan starts at the holding's own current-month value: 100
+  // units × the last price (94.148015, in the current month itself,
+  // so no growth) = $9,414.80. (The trajectory total is higher — it
+  // also carries the GIC holding's $1,000.)
+  assert.ok(Math.abs(fan.fans[0].median[0] - 9414.8) < 0.5, JSON.stringify(fan.fans[0].median[0]));
+  // The median grows at the history CAGR over 12 months.
+  const ratio = fan.fans[0].median[12] / fan.fans[0].median[0];
+  assert.ok(Math.abs(ratio - (1 + fan.fans[0].ratePct / 100)) < 0.005, String(ratio));
+  // P10 < median < P90 and the band widens with √t.
+  assert.ok(fan.fans[0].p10[12] < fan.fans[0].median[12] && fan.fans[0].median[12] < fan.fans[0].p90[12]);
+  assert.ok((fan.fans[0].p90[12] - fan.fans[0].p10[12]) > (fan.fans[0].p90[1] - fan.fans[0].p10[1]));
+  // The single-point holding gets no fan — noted, never invented.
+  assert.equal(fan.noFan.length, 1);
+  assert.equal(fan.noFan[0].symbol, 'GIC 4.6%');
 });
 
 // ------------------------------------------------------------- leg solving
@@ -993,11 +1119,13 @@ test('ai-report series validation rejects unrenderable template/series pairs', (
   // to its default series for that template.
   assert.deepEqual(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'S' }]), []);
   assert.deepEqual(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'S', series: [] }]), []);
-  // fan_band / funds_flow ignore series, so they are not validated.
+  // fan_band binds to stock_value / mortgage_balance now (a stock
+  // fan or a mortgage fan); funds_flow still ignores series.
   assert.deepEqual(validateAiReportChartSeries([
-    { template: 'fan_band', title: 'F', series: ['cost'] },
+    { template: 'fan_band', title: 'F', series: ['stock_value'] },
     { template: 'funds_flow', title: 'W', series: ['cost'] },
   ]), []);
+  assert.equal(validateAiReportChartSeries([{ template: 'fan_band', title: 'F', series: ['cost'] }]).length, 1);
   assert.deepEqual(validateAiReportChartSeries('nope'), ['charts must be an array']);
 });
 
@@ -1105,7 +1233,12 @@ test('sink-simplify: a stored custom sink rate is inherited by a rateless accoun
 
 test('validateAiReportBaselineKind: pool baseline rejects every mortgage-family chart', () => {
   const pool = (charts) => validateAiReportBaselineKind(charts, 'pool');
-  assert.equal(pool([{ template: 'fan_band', title: 'Fan', series: [] }]).length, 1);
+  // A stock fan (stock_value, or no series — the viewer renders the
+  // stock fan on a pool template) is allowed; a mortgage-series fan
+  // is rejected.
+  assert.deepEqual(pool([{ template: 'fan_band', title: 'Fan', series: ['stock_value'] }]), []);
+  assert.deepEqual(pool([{ template: 'fan_band', title: 'Fan', series: [] }]), []);
+  assert.equal(pool([{ template: 'fan_band', title: 'Fan', series: ['mortgage_balance'] }]).length, 1);
   assert.ok(pool([{ template: 'time_line', title: 'Mort', series: ['mortgage_balance'] }])[0].includes('mortgage_balance'));
   assert.equal(pool([{ template: 'time_line', title: 'Default', series: [] }]).length, 1);
   assert.equal(pool([{ template: 'yearly_bars', title: 'Y', series: ['mortgage_balance'] }]).length, 1);

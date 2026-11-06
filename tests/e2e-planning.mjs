@@ -10058,6 +10058,132 @@ export async function run(H, S) {
     } finally { await browserAi.close(); }
     }
   }
+
+  // ------------------------------------------- stock volatility fan
+  // (user 2026-11-05): per-holding vol from price history (monthly
+  // returns, annualized ×√12, longest window) + median at history
+  // CAGR with P10/P90 bands widening with √t. The fan is engine
+  // data on the report (rep.stockFan); preset Generate renders it on
+  // a pool project and the AI validator accepts fan_band for a stock
+  // series on a pool baseline.
+  const _fanNow = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit' }).format(new Date());
+  const _fanY = Number(_fanNow.slice(0, 4)); const _fanM = Number(_fanNow.slice(5, 7));
+  const _fanYm = (back) => {
+    const total = _fanY * 12 + (_fanM - 1) - back;
+    return `${Math.floor(total / 12)}-${String((total % 12) + 1).padStart(2, '0')}`;
+  };
+  // 13 monthly NAV points (current month back 12), prices alternating
+  // ±10% from 100 — plus the buy event's own price point (a month
+  // earlier, 100, materialized into invest_prices like every event
+  // price): 14 monthly points, 13 returns (one 0% — the buy price
+  // equals the first NAV), vol 34.641%, 1y CAGR −5.85%.
+  r = await H.req('POST', '/api/investments/accounts', { name: 'Fan Acct', type: 'NonRegistered' });
+  H.check('fan: account created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const fanAcct = r.data.id;
+  r = await H.req('POST', `/api/investments/accounts/${fanAcct}/holdings`, { label: 'Fan Stock', kind: 'exchange', symbol: 'FAN.A', currency: 'CAD', events: [{ date: `${_fanYm(13)}-15`, type: 'buy', units: 100, price: 100 }] });
+  H.check('fan: holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const fanHold = r.data.id;
+  let fanPrice = 100;
+  for (let back = 12; back >= 0; back--) {
+    if (back < 12) fanPrice *= ((12 - back) % 2 === 1 ? 1.10 : 0.90);
+    r = await H.req('POST', `/api/investments/holdings/${fanHold}/nav`, { date: `${_fanYm(back)}-15`, price: Number(fanPrice.toFixed(6)) });
+    H.check(`fan: NAV ${_fanYm(back)} posts`, r.status === 201, JSON.stringify(r.data));
+  }
+  // A history-less holding (one point) rides in the same pool: it
+  // gets no fan, only the note.
+  r = await H.req('POST', `/api/investments/accounts/${fanAcct}/holdings`, { label: 'Fan GIC', kind: 'exchange', symbol: 'FAN.GIC', currency: 'CAD', events: [{ date: `${_fanYm(13)}-15`, type: 'buy', units: 10, price: 100 }] });
+  H.check('fan: history-less holding created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+  const fanGicHold = r.data.id;
+  r = await H.req('POST', `/api/investments/holdings/${fanGicHold}/nav`, { date: `${_fanYm(13)}-15`, price: 100 });
+  H.check('fan: history-less NAV posts', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', '/api/planning/projects', { name: 'Fan Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: fanHold, percent: 100 }, { holdingId: fanGicHold, percent: 100 }] }, applyRecommendation: true });
+  H.check('fan: pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+  const fanProjId = r.data.project.id;
+  r = await H.req('GET', `/api/planning/projects/${fanProjId}/comparison`);
+  const fanRep = r.data.report || {};
+  const fan0 = (fanRep.stockFan && fanRep.stockFan.fans) || [];
+  const fanNo = (fanRep.stockFan && fanRep.stockFan.noFan) || [];
+  const fanA = fan0[0];
+  H.check('fan: comparison carries the stock fan (FAN.A, vol ≈ 34.64%, median starts at the holding value, P10 < median < P90, band widens)',
+    r.status === 200 && fanA && fanA.symbol === 'FAN.A'
+      && Math.abs(fanA.volPct - 34.641) < 0.05
+      && fanA.ratePct < 0 && fanA.volWindow === `${_fanYm(13)} → ${_fanYm(0)}` && fanA.rateWindow === `${_fanYm(12)} → ${_fanYm(0)}`
+      && Math.abs(fanA.median[0] - 9414.8) < 1
+      && fanA.p10[12] < fanA.median[12] && fanA.median[12] < fanA.p90[12]
+      && (fanA.p90[12] - fanA.p10[12]) > (fanA.p90[1] - fanA.p10[1])
+      && Math.abs(fanA.median[12] / fanA.median[0] - (1 + fanA.ratePct / 100)) < 0.005,
+    JSON.stringify({ volPct: fanA && fanA.volPct, ratePct: fanA && fanA.ratePct, median0: fanA && fanA.median[0], p10: fanA && fanA.p10[12], med: fanA && fanA.median[12], p90: fanA && fanA.p90[12] }));
+  H.check('fan: the history-less holding is noted, never given a fan',
+    fanNo.length === 1 && fanNo[0].symbol === 'FAN.GIC', JSON.stringify(fanNo));
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('fan browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardFan = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResFan = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieFan = loginResFan.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserFan = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserFan.newPage();
+      await page.setViewport({ width: 1500, height: 900 });
+      await page.setRequestInterception(true);
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const url = new URL(e.request.url);
+          if (url.host === 'ff.local') {
+            const res = await forwardFan({ url: url.pathname + url.search, method: e.request.method, headers: e.request.headers, postData: e.request.postData });
+            await client.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: res.status, responseHeaders: Object.entries(res.headers).map(([name, value]) => ({ name, value: String(value) })), body: res.body.toString('base64') });
+          } else {
+            try { await client.send('Fetch.continueRequest', { requestId: e.requestId }); } catch {}
+          }
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieFan, domain: 'ff.local', path: '/', httpOnly: true });
+      const fanWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${fanProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForSelector('#planFlowGenerateBtn', { timeout: 15000 });
+      await page.evaluate(() => document.querySelector('#planFlowGenerateBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planReport [data-plan-report-block]').length > 0, { timeout: 20000 });
+      await fanWait(1500);
+      const fanView = await page.evaluate(() => {
+        const heads = [...document.querySelectorAll('#planReport h3')].map((h) => h.textContent);
+        const panel = [...document.querySelectorAll('#planReport .panel')].find((p) => p.textContent.includes('Stock volatility fan'));
+        return {
+          hasFanTitle: heads.some((h) => h.includes('Stock volatility fan')),
+          canvas: !!panel && !!panel.querySelector('canvas'),
+          windowLabel: !!panel && panel.textContent.includes('Volatility') && panel.textContent.includes('monthly returns'),
+          estimateNote: !!panel && panel.textContent.includes('Past volatility is an estimate, not a prediction'),
+          symbol: !!panel && panel.textContent.includes('FAN.A'),
+          noFanNote: !!panel && panel.textContent.includes('FAN.GIC') && panel.textContent.includes('no volatility fan'),
+        };
+      });
+      H.check('fan: preset Generate on a pool project renders the stock volatility fan (median + P10/P90, window + estimate note, history-less holding noted)',
+        fanView.hasFanTitle && fanView.canvas && fanView.windowLabel && fanView.estimateNote && fanView.symbol && fanView.noFanNote, JSON.stringify(fanView));
+    } finally { await browserFan.close(); }
+  }
 }
 
 runModuleMain(import.meta.url, { name: 'planning', deps, depNames: SLIM_PLAN ? [] : ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm', 'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings', 'spending'], run });

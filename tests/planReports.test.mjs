@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
+  validateAiReportBaselineKind, validateAiReportChartSeries, aiReportPrompt,
 } from '../src/planning.js';
 
 test('report scenario pin: pinned ids must belong to the project', () => {
@@ -46,4 +47,36 @@ test('report definition edit: structural validation only', () => {
   // Unknown templates pass structural validation (the renderer
   // tolerates them as "Not rendered") so a delete is never blocked.
   assert.deepEqual(validateReportDefinition({ charts: [{ template: 'nope', title: 'Legacy' }] }), []);
+});
+
+test('baseline kind: a stock fan_band is allowed on a cash-pool baseline, a mortgage fan is not', () => {
+  const stockFan = [{ template: 'fan_band', title: 'Stock volatility fan', series: ['stock_value'] }];
+  assert.deepEqual(validateAiReportBaselineKind(stockFan, 'pool'), []);
+  // No series defaults to the stock fan on a pool template.
+  assert.deepEqual(validateAiReportBaselineKind([{ template: 'fan_band', title: 'Fan' }], 'pool'), []);
+  const mortFan = [{ template: 'fan_band', title: 'Fan', series: ['mortgage_balance'] }];
+  assert.ok(validateAiReportBaselineKind(mortFan, 'pool').some((e) => /mortgage series/.test(e)));
+  // The mortgage fan stays allowed on a property baseline.
+  assert.deepEqual(validateAiReportBaselineKind(mortFan, 'property'), []);
+  // Other pool bans are unchanged.
+  const mortLine = [{ template: 'time_line', title: 'Balance', series: ['mortgage_balance'] }];
+  assert.ok(validateAiReportBaselineKind(mortLine, 'pool').some((e) => /mortgage_balance/.test(e)));
+  const poolLine = [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }];
+  assert.deepEqual(validateAiReportBaselineKind(poolLine, 'pool'), []);
+});
+
+test('report chart series: fan_band binds to stock_value or mortgage_balance only', () => {
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'fan_band', title: 'Fan', series: ['stock_value'] }]), []);
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'fan_band', title: 'Fan', series: ['mortgage_balance'] }]), []);
+  assert.ok(validateAiReportChartSeries([{ template: 'fan_band', title: 'Fan', series: ['cost'] }]).some((e) => /cannot render series/.test(e)));
+});
+
+test('AI report prompt: pool kindLine offers the stock fan and forbids the mortgage fan', () => {
+  const pool = aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 1, text: 'x', baselineKind: 'pool' });
+  assert.match(pool, /fan_band for a STOCK volatility fan only/);
+  assert.match(pool, /never use fan_band for a mortgage series/);
+  assert.match(pool, /you only pick the chart, never the numbers/);
+  const prop = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 0, text: 'x', baselineKind: 'property' });
+  assert.doesNotMatch(prop, /never use fan_band/);
+  assert.match(prop, /fan_band renders stock_value/);
 });

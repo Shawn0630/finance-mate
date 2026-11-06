@@ -901,6 +901,32 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     month: m,
     value: round2(potBase + potEvents.filter((e) => e.month <= m).reduce((s, e) => s + e.delta, 0)),
   }));
+  // Stock volatility fan (user 2026-11-05): one fan per holding with
+  // usable history, from this run's holdings at the current month —
+  // the fan is a property of the holding's price history, not of the
+  // strategy's ops, so the report shows the BASELINE fan (the
+  // do-nothing path for each holding). Median at the holding's
+  // history CAGR (the same rate the scenario already uses —
+  // holdingGrowth, NOT a scenario override: the fan describes the
+  // holding's own history); bands from the holding's own volatility
+  // (longest window). A holding with no usable history (a new GIC, a
+  // single price point) or no history return rate gets no fan — the
+  // viewer notes it, never invents a vol. Holdings worth $0 at the
+  // current month are skipped.
+  const stockFan = { fans: [], noFan: [] };
+  for (const h of mainline.holdings || []) {
+    const u0 = baselineUnitsAt(h, currentMonth) + (opUnitsDelta.get(h.id) || []).filter((d) => d.month <= currentMonth).reduce((s, d) => s + d.delta, 0);
+    const pr0 = priceAt(h, currentMonth);
+    const value0 = pr0 == null || !u0 ? 0 : toCad(h, u0 * pr0);
+    if (!(value0 > 0)) continue;
+    const symbol = h.symbol || h.label || `Holding ${h.id}`;
+    const rate = currentReturnRateFromPoints(h.pricePoints, currentMonth);
+    if (!rate) { stockFan.noFan.push({ holdingId: h.id, symbol, reason: 'no history return rate' }); continue; }
+    const vol = holdingVolatilityFromPoints(h.pricePoints, currentMonth);
+    if (!vol) { stockFan.noFan.push({ holdingId: h.id, symbol, reason: 'no usable price history' }); continue; }
+    const fan = stockFanSeries({ value0: round2(value0), ratePct: rate.ratePct, volPct: vol.volPct, months });
+    stockFan.fans.push({ holdingId: h.id, symbol, label: h.label || h.symbol || '', ratePct: rate.ratePct, rateWindow: rate.window, rateBasis: rate.basis, volPct: vol.volPct, volWindow: vol.window, volReturns: vol.returns, ...fan });
+  }
   // Pot at horizon: final pot value (pot moves only on op dates).
   valueAtHorizon = round2((stockSeries.length ? stockSeries[stockSeries.length - 1].value : 0) + pot);
   // Stock gain vs the STARTING value is informational only. The
@@ -945,7 +971,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     cost, valueAtHorizon: projectedTotalAtHorizon, flatValueAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
     paymentDelta: paymentDeltaOf(mortgagePerProperty),
-    maturities,
+    maturities, stockFan,
     errors, warnings,
   };
 }
@@ -1707,16 +1733,18 @@ export function validateAiChartMethods(charts) {
 // else — stacked_bar totals over the surviving datasets, so a
 // cost-only stacked_bar used to render an all-zero "Total" line
 // (user bug 2026-11-03: "Cost Comparison Across Strategies" with a
-// MONTH | TOTAL table of $0.00). fan_band and funds_flow ignore
-// series entirely, so they are not validated here. Absent or empty
-// series is NOT an error: the renderer falls back to its default
-// series for that template.
+// MONTH | TOTAL table of $0.00). funds_flow ignores series
+// entirely, so it is not validated here; fan_band binds to
+// stock_value (a stock volatility fan) or mortgage_balance (a
+// mortgage scenario fan). Absent or empty series is NOT an error:
+// the renderer falls back to its default series for that template.
 export const PLAN_REPORT_SERIES_BY_TEMPLATE = {
   time_line: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance'],
   yearly_bars: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance'],
   stacked_bar: ['mortgage_balance', 'stock_value'],
   metric_cards: ['cost', 'gain', 'net', 'stock_gain', 'payoff_month', 'monthly_payment'],
   share_doughnut: ['cost', 'mortgage_balance', 'total_value'],
+  fan_band: ['stock_value', 'mortgage_balance'],
 };
 export function validateAiReportChartSeries(charts) {
   const errs = [];
@@ -1754,7 +1782,7 @@ export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount,
 
 export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind }) {
   const kindLine = baselineKind === 'pool'
-    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected. Method sentences must describe only pool/stock figures — never mention interest saved, mortgage, payoff, or penalty on a cash-pool report: those concepts do not exist here.'
+    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; fan_band for a STOCK volatility fan only, series stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band for a mortgage series, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected. A stock fan_band shows the engine-computed per-holding volatility fan (median at the holding\'s history CAGR, P10/P90 bands widening with √t) — you only pick the chart, never the numbers. Method sentences must describe only pool/stock figures — never mention interest saved, mortgage, payoff, or penalty on a cash-pool report: those concepts do not exist here.'
     : baselineKind === 'property'
       ? 'Baseline kind: property. This report covers one property: use property charts (mortgage_balance, total_value for equity, monthly_payment, payoff_month) and the pool/stock charts only where the strategies actually touch stocks.'
       : null;
@@ -1763,7 +1791,7 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text,
     'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
     'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, metric_cards. (funds_flow is not offered: the app cannot render it.)',
     'Series ids are: mortgage_balance, stock_value, total_value, pool_balance, cost, gain, net, payoff_month, monthly_payment.',
-    'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity). Never put a series on a template that cannot render it — the chart would come out empty.',
+    'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity); fan_band renders stock_value (a stock volatility fan, cash-pool reports) or mortgage_balance (a mortgage scenario fan, property reports). Never put a series on a template that cannot render it — the chart would come out empty.',
     'Never invent a number: the app computes every series; you only order and title charts.',
     'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
     // The AI engine: alongside the charts you may define a
@@ -1794,11 +1822,14 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text,
 // Baseline-kind chart validation for AI reports ONLY (the preset
 // POST stays permissive — the viewer enforces at render, and legacy
 // saved definitions are never rewritten). On a cash-pool baseline
-// every mortgage-family chart is rejected: fan_band always; a
-// trajectory/stacked chart whose effective series is mortgage_balance
-// (an empty series defaults to it, matching the viewer); a doughnut
-// carrying mortgage_balance/total_value; metric cards carrying
-// monthly_payment/payoff_month. Other baseline kinds pass untouched.
+// every mortgage-family chart is rejected: a trajectory/stacked
+// chart whose effective series is mortgage_balance (an empty series
+// defaults to it, matching the viewer); a doughnut carrying
+// mortgage_balance/total_value; metric cards carrying
+// monthly_payment/payoff_month; and a fan_band carrying a mortgage
+// series. A fan_band with a stock series (or no series — the viewer
+// renders the stock fan on a pool template) is a stock volatility
+// fan and is ALLOWED. Other baseline kinds pass untouched.
 export function validateAiReportBaselineKind(charts, baselineKind) {
   const errs = [];
   if (baselineKind !== 'pool') return errs;
@@ -1807,7 +1838,10 @@ export function validateAiReportBaselineKind(charts, baselineKind) {
     if (!c || typeof c !== 'object') continue;
     const title = c.title || c.template;
     const series = Array.isArray(c.series) && c.series.length ? c.series : null;
-    if (c.template === 'fan_band') { errs.push(`chart "${title}" (fan_band) is a mortgage chart and is forbidden on a cash-pool baseline`); continue; }
+    if (c.template === 'fan_band') {
+      if (series && (series.includes('mortgage_balance') || series.includes('total_value'))) errs.push(`chart "${title}" (fan_band) uses a mortgage series, forbidden on a cash-pool baseline`);
+      continue;
+    }
     if (c.template === 'time_line' || c.template === 'yearly_bars' || c.template === 'stacked_bar') {
       const eff = series || ['mortgage_balance'];
       if (eff.includes('mortgage_balance')) errs.push(`chart "${title}" (${c.template}) uses mortgage_balance, forbidden on a cash-pool baseline`);
@@ -2515,6 +2549,68 @@ export function currentReturnRateFromPoints(points, todayYm) {
     if (w) return { ratePct: round4(w.annualizedReturn * 100), basis: 'Price CAGR', window: w.window };
   }
   return null;
+}
+
+// A holding's VOLATILITY from its own stored price history only —
+// the standard deviation of monthly returns, annualized ×√12.
+// Monthly returns come from consecutive-month price points (one
+// price per month, the last point in the month); a gap wider than
+// one month is skipped, never interpolated, and a month with no new
+// point contributes no return (carrying a price forward would add a
+// fake 0% return and understate vol). The LONGEST available window
+// is used (unlike the current return rate, which takes the most
+// recent 1y/3y/5y window) — a short window is noisy, so the window
+// is labeled on the chart. Needs ≥2 monthly returns; a holding with
+// fewer (a new GIC, a single price point) has no vol — never
+// invented. Sample std dev (n−1): the returns are a sample of the
+// holding's monthly behavior. Returns null when unusable.
+export function holdingVolatilityFromPoints(points, todayYm) {
+  const pts = (points || []).map((p) => ({ date: String(p.date).slice(0, 10), price: Number(p.price) }))
+    .filter((p) => isFinite(p.price) && String(p.date).slice(0, 7) <= todayYm)
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+  if (pts.length < 2) return null;
+  // One price per month: the last point in the month.
+  const byMonth = new Map();
+  for (const p of pts) byMonth.set(p.date.slice(0, 7), p.price);
+  const months = [...byMonth.keys()].sort();
+  const returns = [];
+  for (let i = 1; i < months.length; i++) {
+    if (monthIdxOf(months[i]) - monthIdxOf(months[i - 1]) !== 1) continue;
+    const prev = byMonth.get(months[i - 1]);
+    const cur = byMonth.get(months[i]);
+    if (!(prev > 0) || !(cur > 0)) continue;
+    returns.push(cur / prev - 1);
+  }
+  if (returns.length < 2) return null;
+  const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+  const variance = returns.reduce((s, r) => s + (r - mean) * (r - mean), 0) / (returns.length - 1);
+  return { volPct: round4(Math.sqrt(variance) * Math.sqrt(12) * 100), window: `${months[0]} → ${months[months.length - 1]}`, returns: returns.length };
+}
+
+// A stock volatility FAN for one holding: the median path at the
+// holding's history CAGR plus P10/P90 bands widening with √t
+// (lognormal: monthly log-returns ~ N(μ, σ²), so the P10/P90
+// factor at t months is exp(±1.2816 · σ_ann · √(t/12)) and the band
+// width grows with √t). At t=0 the bands coincide with the median.
+// value0 is the holding's value at the first month; ratePct is the
+// history CAGR (%/yr); volPct is the annualized vol (%/yr).
+export function stockFanSeries({ value0, ratePct, volPct, months }) {
+  const z = 1.2815515655446004; // P10/P90 of the standard normal
+  const sigma = (num(volPct) || 0) / 100;
+  const g = (num(ratePct) || 0) / 100;
+  const startIdx = (months || []).length ? monthIdxOf(months[0]) : 0;
+  const median = [];
+  const p10 = [];
+  const p90 = [];
+  for (const m of months || []) {
+    const t = monthIdxOf(m) - startIdx;
+    const med = num(value0) * Math.pow(1 + g, t / 12);
+    const f = Math.exp(z * sigma * Math.sqrt(t / 12));
+    median.push(round2(med));
+    p10.push(round2(med / f));
+    p90.push(round2(med * f));
+  }
+  return { months: [...(months || [])], median, p10, p90 };
 }
 
 // Pool item SHAPES only (no database): each item names exactly one

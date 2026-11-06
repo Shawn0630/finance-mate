@@ -6168,6 +6168,11 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
     // each names the product, its maturity date, and the matured
     // amount that returned to the pot as cash.
     maturities: rows.flatMap((r) => (r.projection.maturities || []).map((m) => ({ ...m, strategyId: r.strategy.id, strategyLetter: r.strategy.letter, strategyName: r.strategy.name }))),
+    // Stock volatility fan, for the report view's fan_band chart:
+    // one fan per baseline holding with usable history (median at
+    // the holding's history CAGR, P10/P90 bands widening with √t),
+    // plus the holdings with no fan and why.
+    stockFan: baseline.stockFan || { fans: [], noFan: [] },
   };
   return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
 }
