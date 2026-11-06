@@ -4722,7 +4722,10 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Fix E', source: 'template' });
   H.check('propscope: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const psStrat = r.data.strategy.id;
-  r = await H.req('POST', `/api/planning/strategies/${psStrat}/ops`, { op_type: 'rate_switch', params: { propertyId: psE, date: psOpDate, rateType: 'fixed', annualRate: 4.5 } });
+  // Switch rate ABOVE the baseline fixed 5% on purpose (see the
+  // diffchart note below): the strategy owes more than doing
+  // nothing, so its balance line sits above the baseline.
+  r = await H.req('POST', `/api/planning/strategies/${psStrat}/ops`, { op_type: 'rate_switch', params: { propertyId: psE, date: psOpDate, rateType: 'fixed', annualRate: 6 } });
   H.check('propscope: rate_switch op on E created', r.status === 201, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/projects/${psProj}/comparison`);
   H.check('propscope: comparison loads', r.status === 200 && !!r.data.report, JSON.stringify({ status: r.status }));
@@ -4784,6 +4787,38 @@ export async function run(H, S) {
   r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope report', definition: { strategies: [psStrat], charts: [{ template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'] }, { template: 'stacked_bar', title: 'Stacked balance', series: ['mortgage_balance'] }] }, strategy_ids: [psStrat], scenario_ids: [] });
   H.check('propscope: report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   const psRep = r.data.report.id;
+  // Second real rate-switch strategy on the same entity property
+  // (later switch, slightly higher fixed rate) + a two-strategy
+  // report, for the balance-chart pins (the user's A/B shape: Jan
+  // to Fix vs Jun to Fix under a rising prime). Both switch rates
+  // sit ABOVE the baseline fixed 5% on purpose, so the strategies
+  // owe MORE than doing nothing (fixed above the current variable
+  // rate) — the balance lines sit above the baseline after the
+  // switch, and the strategy finals at the baseline payoff are > $0.
+  // NOTE (diff-chart puzzle, 2026-11-06): Fix E itself is NOT a pure
+  // switch by the time the pins read it — the (opform) check below
+  // adds a $5,000 prepay to it via the Add Operation form, so its
+  // line sits BELOW the baseline. The pins therefore use a dedicated
+  // pure-switch strategy ('Fix E pure', switch only, created first
+  // so its id — and hence its chart order — precedes Fix E late).
+  r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Fix E pure', source: 'template' });
+  H.check('diffchart: pure rate-switch strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const psPure = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${psPure}/ops`, { op_type: 'rate_switch', params: { propertyId: psE, date: psOpDate, rateType: 'fixed', annualRate: 6 } });
+  H.check('diffchart: pure rate_switch op on E created', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${psProj}/strategies`, { name: 'Fix E late', source: 'template' });
+  H.check('diffchart: second rate-switch strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const psLate = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${psLate}/ops`, { op_type: 'rate_switch', params: { propertyId: psE, date: '2027-06-01', rateType: 'fixed', annualRate: 6.5 } });
+  H.check('diffchart: late rate_switch op on E created', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope two-switch report', definition: { strategies: [psPure, psLate], charts: [] }, strategy_ids: [psPure, psLate], scenario_ids: [] });
+  H.check('diffchart: two-strategy report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const psRep2 = r.data.report.id;
+  // Single-strategy report on the pure switch, for the invcomp pin
+  // (psRep pins Fix E, which carries the opform prepay by pin time).
+  r = await H.req('POST', `/api/planning/projects/${psProj}/reports`, { name: 'PropScope pure-switch report', definition: { strategies: [psPure], charts: [] }, strategy_ids: [psPure], scenario_ids: [] });
+  H.check('diffchart: pure-switch report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  const psRepPure = r.data.report.id;
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('propscope browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
@@ -5625,31 +5660,103 @@ export async function run(H, S) {
         !gatePropOpen.headline && !gatePropOpen.mort && !gatePropOpen.eq && !gatePropOpen.diffTable,
         JSON.stringify(gatePropOpen));
       // (d) Property strategy panels still render: open the payscope
-      // report and confirm the breakdown block + Balance Δ line exist.
+      // report and confirm the breakdown block + balance chart exist.
+      // The pin opens the pure-switch report (psRepPure), not psRep:
+      // psRep pins Fix E, which carries the opform $5,000 prepay by
+      // now, so its line sits below the baseline.
       await page.goto(`http://ff.local/#planning/project/${psProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
-      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep);
-      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRepPure);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRepPure);
       // The cross-project open can silently miss while the freshly
       // loaded LIST is still settling (run 4 read the previous
       // report's chart instead of the payscope one): wait for this
       // report's tab, retrying the click once, before reading any
       // chart state.
       try {
-        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, psRep);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, psRepPure);
       } catch {
-        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep);
-        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, psRep);
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRepPure);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, psRepPure);
       }
       await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
-      const propState = await page.evaluate(() => ({
-        deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
-        breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
-        breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
-      }));
-      H.check('invcomp: property strategy comparison still renders breakdown + Balance Δ',
-        propState.deltaLabels && propState.deltaLabels.some((l) => /Balance Δ/.test(l))
-          && propState.breakdownNull === false && propState.breakdownWrapHidden === false,
+      // Baseline payoff label (the balance chart's X axis must end
+      // there, not at the Nov 2056 horizon).
+      const psMonName = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const psPayoffLabel = `${psMonName[Number(psEBase.payoffMonth.slice(5, 7)) - 1]} ${psEBase.payoffMonth.slice(0, 4)}`;
+      const propState = await page.evaluate(() => {
+        const ch = (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryChart : null;
+        if (!ch) return null;
+        return {
+          labels: ch.data.datasets.map((d) => d.label),
+          lastLabel: ch.data.labels[ch.data.labels.length - 1],
+          endLabels: ch.$endLabels || null,
+          finals: ch.data.datasets.map((d) => { let v = null; for (let k = d.data.length - 1; k >= 0; k--) { if (d.data[k] != null) { v = d.data[k]; break; } } return v; }),
+          breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
+          breakdownWrapHidden: document.querySelector('#planReportComparePanel .plan-traj-breakdown-wrap')?.style.display === 'none',
+          caption: document.querySelector('#planReportTrajCaption')?.textContent || '',
+          note: document.querySelector('#planReportTrajectoryEmpty')?.textContent || '',
+        };
+      });
+      H.check('invcomp: property strategy comparison renders the balance chart (Baseline + strategy, no Δ lines) + breakdown, X ends at the baseline payoff',
+        propState && propState.labels.length === 2 && propState.labels[0] === 'Baseline' && propState.labels[1].includes('Fix E')
+          && !propState.labels.some((l) => /Δ/.test(l))
+          && propState.breakdownNull === false && propState.breakdownWrapHidden === false
+          && propState.caption.includes('outstanding mortgage balance')
+          && propState.note.includes('Value Δ is $0')
+          && Array.isArray(propState.endLabels) && propState.endLabels.length === 2 && propState.endLabels[0] === 'Baseline · $0'
+          && propState.finals[0] === 0 && (propState.finals[1] || 0) > 0
+          && propState.lastLabel === psPayoffLabel,
         JSON.stringify(propState));
+      // Two-switch report (the user's A/B shape): 3 balance lines;
+      // after both switches both strategy lines sit above the
+      // baseline; X ends at the baseline payoff; end labels read the
+      // finals without hover (strategy finals > baseline final $0).
+      await page.goto(`http://ff.local/#planning/project/${psProj}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-view="${id}"]`), { timeout: 15000 }, psRep2);
+      await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep2);
+      try {
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 5000 }, psRep2);
+      } catch {
+        await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, psRep2);
+        await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 15000 }, psRep2);
+      }
+      await page.waitForFunction(() => !!document.querySelector('#planReportTableBody table'), { timeout: 15000 });
+      await page.waitForFunction(() => { const ch = (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryChart : null; return !!ch && ch.data.datasets.length === 3; }, { timeout: 15000 });
+      const twoState = await page.evaluate(() => {
+        const ch = (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryChart : null;
+        if (!ch) return null;
+        const idx28 = ch.data.labels.indexOf('Jul 2028');
+        const idx27 = ch.data.labels.indexOf('Jan 2027');
+        return {
+          labels: ch.data.datasets.map((d) => d.label),
+          lastLabel: ch.data.labels[ch.data.labels.length - 1],
+          endLabels: ch.$endLabels || null,
+          jul2028: ch.data.datasets.map((d) => (idx28 < 0 ? null : d.data[idx28])),
+          jan2027: ch.data.datasets.map((d) => (idx27 < 0 ? null : d.data[idx27])),
+          finals: ch.data.datasets.map((d) => { let v = null; for (let k = d.data.length - 1; k >= 0; k--) { if (d.data[k] != null) { v = d.data[k]; break; } } return v; }),
+          caption: document.querySelector('#planReportTrajCaption')?.textContent || '',
+          note: document.querySelector('#planReportTrajectoryEmpty')?.textContent || '',
+        };
+      });
+      const twoEndVal = (s) => { const n = Number(String(s || '').replace(/[^0-9.]/g, '')); return Number.isFinite(n) ? n : null; };
+      H.check('diffchart: two-switch property report shows 3 balance lines, both strategies above the baseline after both switches, X ends at the baseline payoff, end labels read strategy finals > baseline $0',
+        twoState && twoState.labels.length === 3 && twoState.labels[0] === 'Baseline'
+          && twoState.labels[1].includes('Fix E') && twoState.labels[2].includes('Fix E late')
+          && !twoState.labels.some((l) => /Δ/.test(l))
+          && twoState.jul2028.every((v) => v != null) && twoState.jul2028[1] > twoState.jul2028[0] && twoState.jul2028[2] > twoState.jul2028[0]
+          && twoState.jan2027.every((v) => v != null) && twoState.jan2027[1] > twoState.jan2027[0]
+          && twoState.lastLabel === psPayoffLabel
+          && Array.isArray(twoState.endLabels) && twoState.endLabels.length === 3 && twoState.endLabels[0] === 'Baseline · $0'
+          // A pure switch pays off within a month of the baseline, so
+          // its final at the baseline payoff is cents ($0.08) and the
+          // label correctly rounds to $0 — pin the label EQUALS the
+          // rounded final (accuracy), while finals > 0 below pins the
+          // strategy really owes more.
+          && twoEndVal(twoState.endLabels[1]) === Math.round(twoState.finals[1] || 0) && twoEndVal(twoState.endLabels[2]) === Math.round(twoState.finals[2] || 0)
+          && twoState.finals[0] === 0 && (twoState.finals[1] || 0) > 0 && (twoState.finals[2] || 0) > 0
+          && twoState.caption.includes('outstanding mortgage balance')
+          && twoState.note.includes('Value Δ is $0'),
+        JSON.stringify(twoState));
     } finally { await browserI.close(); }
   }
   // (reporterr browser): the dropped-buy notice renders in the

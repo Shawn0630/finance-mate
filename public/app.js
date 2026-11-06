@@ -11063,22 +11063,88 @@ const planCharts = {};
 function planDestroyChart(id) {
   if (planCharts[id]) { planCharts[id].destroy(); planCharts[id] = null; }
 }
-function planLineChart(id, labels, datasets) {
+function planLineChart(id, labels, datasets, opts = {}) {
   planDestroyChart(id);
   const el = document.getElementById(id);
   if (!el) return null;
+  const chartOpts = {
+    responsive: true, maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    scales: { y: { ticks: { callback: (v) => moneyTick(v) } } },
+    plugins: { tooltip: { callbacks: { label: (it) => ` ${it.dataset.label}: ${money2(it.parsed.y)}` } } },
+  };
+  // End-point labels reserve a right-hand label column; without
+  // them the chart keeps its full width (no dead padding). The
+  // labels travel as plugin options (available during the
+  // constructor's first draw); $endLabels mirrors them for readers.
+  if (opts.endLabels) {
+    chartOpts.layout = { padding: { right: 135 } };
+    chartOpts.plugins.planEndLabels = { labels: opts.endLabels };
+  }
   planCharts[id] = new Chart(el, {
     type: 'line',
     data: { labels, datasets },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      scales: { y: { ticks: { callback: (v) => moneyTick(v) } } },
-      plugins: { tooltip: { callbacks: { label: (it) => ` ${it.dataset.label}: ${money2(it.parsed.y)}` } } },
-    },
+    options: chartOpts,
+    ...(opts.endLabels ? { plugins: [planEndLabelsPlugin] } : {}),
   });
+  if (opts.endLabels) planCharts[id].$endLabels = opts.endLabels;
   return planCharts[id];
 }
+// End-point labels for a line chart: each visible dataset's last
+// plotted value, drawn just right of its last point (the chart
+// reserves the right padding for the label column). Finals that land
+// within a few dollars of each other on a $1M scale are staggered
+// vertically (min 14px) with a short leader line back to the point,
+// so two lines ending $5k apart stay readable instead of colliding.
+const planEndLabelsPlugin = {
+  id: 'planEndLabels',
+  afterDatasetsDraw(chart) {
+    const texts = (chart.options && chart.options.plugins && chart.options.plugins.planEndLabels && chart.options.plugins.planEndLabels.labels) || chart.$endLabels;
+    if (!texts || !texts.length) return;
+    const entries = [];
+    chart.data.datasets.forEach((ds, i) => {
+      const text = texts[i];
+      if (!text) return;
+      if (typeof chart.isDatasetVisible === 'function' && !chart.isDatasetVisible(i)) return;
+      const pts = (chart.getDatasetMeta(i) || {}).data || [];
+      let last = -1;
+      for (let k = ds.data.length - 1; k >= 0; k--) { if (ds.data[k] != null) { last = k; break; } }
+      if (last < 0 || !pts[last] || !Number.isFinite(pts[last].x) || !Number.isFinite(pts[last].y)) return;
+      entries.push({ text, color: ds.borderColor || '#333', x: pts[last].x, py: pts[last].y, y: pts[last].y });
+    });
+    if (!entries.length) return;
+    entries.sort((a, b) => a.y - b.y);
+    const GAP = 14;
+    for (let i = 1; i < entries.length; i++) {
+      if (entries[i].y - entries[i - 1].y < GAP) entries[i].y = entries[i - 1].y + GAP;
+    }
+    // Keep the stack inside the chart area: if staggering pushed the
+    // bottom label past it, shift the whole stack up.
+    const bottom = chart.chartArea.bottom - 4;
+    if (entries[entries.length - 1].y > bottom) {
+      const over = entries[entries.length - 1].y - bottom;
+      entries.forEach((e) => { e.y -= over; });
+    }
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.font = '11px sans-serif';
+    ctx.textBaseline = 'middle';
+    entries.forEach((e) => {
+      const lx = e.x + 8;
+      ctx.strokeStyle = e.color;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(e.x + 2, e.py);
+      ctx.lineTo(lx - 2, e.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = e.color;
+      ctx.fillText(e.text, lx, e.y);
+    });
+    ctx.restore();
+  },
+};
 function planBarChart(id, labels, datasets) {
   planDestroyChart(id);
   const el = document.getElementById(id);
@@ -13958,7 +14024,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="note" id="planReportTrajectoryNote"></div>
         <div id="planReportComparePicker" class="toolbar"></div>
         <div class="section-head"><h3>Difference vs baseline</h3></div>
-        <div class="note">X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.</div>
+        <div class="note" id="planReportTrajCaption">X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.</div>
         <div id="planReportTrajRange"></div>
         <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
@@ -13992,6 +14058,7 @@ async function loadPlanReport(projectId, reportId) {
       planCompareNewRender({ scenario: comp.scenario, baseline: comp.baseline, strategies: comp.strategies, report: comp.report }, {
         template,
         note: '#planReportTrajectoryNote', chart: 'planReportTrajectoryChart', empty: '#planReportTrajectoryEmpty',
+        caption: '#planReportTrajCaption',
         wrapSel: '#planReportComparePanel .plan-traj-wrap',
         range: '#planReportTrajRange', breakdown: 'planReportTrajectoryBreakdownChart', breakdownEmpty: '#planReportTrajectoryBreakdownEmpty',
         breakdownWrapSel: '#planReportComparePanel .plan-traj-breakdown-wrap',
@@ -14567,25 +14634,76 @@ function planCompareNewRender(block, ids) {
   if (trajs.length && effMonths.length) {
     if (wrap) wrap.style.display = '';
     if (empty) empty.innerHTML = '';
-    // Difference chart: Balance Δ / Value Δ advantage lines per
-    // picked strategy, the same series the strategy-detail diff
-    // panel plots (baseline balance − strategy balance; strategy
-    // value − baseline value). A pure rate switch moves no holdings,
-    // so the old total-value lines overlapped perfectly; the Δ lines
-    // show the actual difference. Balance Δ renders only for
-    // mortgage-touching strategies — a pure stock strategy's Balance
-    // Δ would be a flat $0 line over the untouched mainline mortgage,
-    // which says nothing about the strategy.
+    // Difference chart. Property reports draw a BALANCE trajectory
+    // (baseline + each mortgage-touching strategy, actual $) instead
+    // of the Δ lines: the Δ chart hid the story — Value Δ sat flat
+    // at $0 for a mortgage-only strategy, the Balance Δ lines
+    // overlapped, the axis ran dead to the horizon year, and a line
+    // going DOWN meant "worse off". After the switch month a strategy
+    // line above the baseline reads at a glance as owing more. Pool
+    // reports keep the Δ chart (their Value Δ is meaningful). The X
+    // axis ends at the baseline's last month (its payoff): the
+    // comparison only exists while the baseline exists, and the
+    // series themselves end at payoff with balance 0, so running to
+    // the latest strategy payoff would make every end label $0.
+    // A Value Δ line is drawn only when it moves (nonzero
+    // somewhere); an all-$0 Value Δ is a one-line note instead, in
+    // either chart mode.
+    const noStockMoveNote = '<div class="note">This comparison moves no stocks — Value Δ is $0.</div>';
     if (picked.length) {
-      const dDatasets = [];
-      picked.forEach((r, i) => {
-        const monthly = planDiffMonthly({ baseline: block.baseline, projection: r.projection });
-        const byMo = new Map(monthly.map((m) => [m.month, m]));
-        if (r.touchesMortgage && monthly.some((m) => m.balDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Balance Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.balDiff; }), borderColor: planColor(2 * i), backgroundColor: planColor(2 * i), spanGaps: true });
-        if (monthly.some((m) => m.valDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Value Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valDiff; }), borderColor: planColor(2 * i + 1), backgroundColor: planColor(2 * i + 1), spanGaps: true });
-      });
-      if (dDatasets.length) planLineChart(t.chart, effMonths.map(formatYM), dDatasets);
-      else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
+      const diffRows = picked.map((r) => ({ r, monthly: planDiffMonthly({ baseline: block.baseline, projection: r.projection }) }));
+      const hasStockMove = diffRows.some(({ monthly }) => monthly.some((m) => m.valDiff != null && m.valDiff !== 0));
+      const isPool = !!(t.template && t.template.key === 'pool');
+      let drewBalance = false;
+      if (!isPool) {
+        // Baseline's last month: the last row carrying a balance
+        // (balBase is the same for every strategy — it comes from
+        // the shared baseline — so the first picked row suffices).
+        let baseLastMonth = null;
+        for (const m of diffRows[0].monthly) if (m.balBase != null) baseLastMonth = m.month;
+        const balMonths = baseLastMonth == null ? [] : effMonths.filter((mo) => mo <= baseLastMonth);
+        if (balMonths.length) {
+          const baseByMo = new Map(diffRows[0].monthly.map((m) => [m.month, m]));
+          const balDatasets = [{ label: 'Baseline', data: balMonths.map((mo) => { const m = baseByMo.get(mo); return m == null ? null : m.balBase; }), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true }];
+          const balShorts = ['Baseline'];
+          diffRows.forEach(({ r, monthly }) => {
+            if (!r.touchesMortgage || !monthly.some((m) => m.balStrat != null)) return;
+            const byMo = new Map(monthly.map((m) => [m.month, m]));
+            // Compact color index (baseline 0, then strategies in
+            // order) — the same mapping the payment breakdown uses,
+            // so a strategy keeps its color across both charts.
+            const ci = balDatasets.length;
+            balDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data: balMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.balStrat; }), borderColor: planColor(ci), backgroundColor: planColor(ci), spanGaps: true });
+            balShorts.push(r.strategy.letter);
+          });
+          if (balDatasets.length > 1) {
+            const endLabels = balDatasets.map((ds, i) => {
+              let v = null;
+              for (let k = ds.data.length - 1; k >= 0; k--) { if (ds.data[k] != null) { v = ds.data[k]; break; } }
+              return v == null ? null : `${balShorts[i]} · $${moneyTick(Math.round(v))}`;
+            });
+            planLineChart(t.chart, balMonths.map(formatYM), balDatasets, { endLabels });
+            drewBalance = true;
+            if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
+            const caption = t.caption ? $(t.caption) : null;
+            if (caption) caption.textContent = 'X: month · Y: CAD — outstanding mortgage balance. A strategy line above the baseline means it owes more.';
+          }
+        }
+      }
+      if (!drewBalance) {
+        const dDatasets = [];
+        diffRows.forEach(({ r, monthly }, i) => {
+          const byMo = new Map(monthly.map((m) => [m.month, m]));
+          if (r.touchesMortgage && monthly.some((m) => m.balDiff != null)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Balance Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.balDiff; }), borderColor: planColor(2 * i), backgroundColor: planColor(2 * i), spanGaps: true });
+          if (monthly.some((m) => m.valDiff != null && m.valDiff !== 0)) dDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name} · Value Δ`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valDiff; }), borderColor: planColor(2 * i + 1), backgroundColor: planColor(2 * i + 1), spanGaps: true });
+        });
+        if (dDatasets.length) {
+          planLineChart(t.chart, effMonths.map(formatYM), dDatasets);
+          if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
+          const caption = t.caption ? $(t.caption) : null;
+          if (caption) caption.textContent = 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
+        } else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
+      }
     } else {
       planDestroyChart(t.chart);
       if (empty) empty.innerHTML = '<div class="note">Pick a strategy to compare.</div>';
