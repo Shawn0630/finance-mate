@@ -8851,13 +8851,20 @@ const ymLabel = (ym) => {
   const [y, m] = ym.split('-').map(Number);
   return `${MONTH_NAMES[m - 1]} ${y}`;
 };
-function earnEntryBlock(r, e) {
-  const bits = [`${ymLabel(e.start_ym)} – ${ymLabel(e.end_ym)}`, `${money2(e.monthly_rent)}/mo`, `paid on day ${e.pay_day}`];
-  if (e.cash_amount !== null && e.cash_amount !== undefined) bits.push(`cash ${money2(e.cash_amount)}`);
-  if (e.tenant_name) bits.push(esc(e.tenant_name));
-  return `<div class="note">${bits.join(' · ')}
-    <button class="small" onclick="earnEditEntry(${r.id}, ${e.id})">Edit</button>
-    <button class="small danger" onclick="earnDeleteEntry(${r.id}, ${e.id})">Delete</button></div>`;
+// Rent entries as a table (Period | Monthly rent | Paid on day |
+// Cash | actions), styled like the other tables on the page. The
+// entry covering the current month carries an Ongoing tag; a tenant
+// name, when set, shows under the period.
+function earnEntryTableHtml(r) {
+  const entries = [...(r.entries || [])].sort((a, b) => (a.start_ym || '').localeCompare(b.start_ym || ''));
+  if (!entries.length) return '<div class="note">No rent entries yet.</div>';
+  const nowYm = monthStrOf(new Date());
+  const rows = entries.map((e) => {
+    const ongoing = e.start_ym <= nowYm && (e.end_ym == null || e.end_ym === '' || e.end_ym >= nowYm);
+    const period = `${ymLabel(e.start_ym)} – ${ymLabel(e.end_ym)}${ongoing ? ' <span class="meta-tag">Ongoing</span>' : ''}${e.tenant_name ? `<div class="note" style="margin:0">${esc(e.tenant_name)}</div>` : ''}`;
+    return `<tr><td>${period}</td><td class="num">${money2(e.monthly_rent)}</td><td class="num">${e.pay_day}</td><td class="num">${e.cash_amount !== null && e.cash_amount !== undefined ? money2(e.cash_amount) : '—'}</td><td class="num"><button class="small" onclick="earnEditEntry(${r.id}, ${e.id})">Edit</button> <button class="small danger" onclick="earnDeleteEntry(${r.id}, ${e.id})">Delete</button></td></tr>`;
+  }).join('');
+  return `<table class="costs-table"><thead><tr><th>Period</th><th class="num">Monthly rent</th><th class="num">Paid on day</th><th class="num">Cash</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function earnRentalCard(r) {
@@ -9854,12 +9861,39 @@ function earnRentalLatestYear(r) {
   return years.length ? years[years.length - 1] : null;
 }
 
+// One shared year state for the rental detail page: the header
+// dropdown, the deductible section's select and the year records
+// selector all set/read the same year and stay in sync. Null means
+// "latest year" — the default when first opening a rental.
+let earnRentalYearSel = null;
+function earnRentalSelectedYear(r) {
+  const latest = earnRentalLatestYear(r);
+  if (!latest) return null;
+  if (earnRentalYearSel != null && (r.years || []).some((y) => y.tax_year === earnRentalYearSel)) return earnRentalYearSel;
+  return latest.tax_year;
+}
+function earnRentalYearSelectHtml(r, id) {
+  const years = [...(r.years || [])].sort((a, b) => a.tax_year - b.tax_year);
+  if (years.length < 2) return '';
+  const sel = earnRentalSelectedYear(r);
+  return `<select id="${id}" aria-label="Year" onchange="earnRentalSetYear(Number(this.value))">${years.map((y) => `<option value="${y.tax_year}"${y.tax_year === sel ? ' selected' : ''}>${y.tax_year}</option>`).join('')}</select>`;
+}
+window.earnRentalSetYear = (year) => {
+  earnRentalYearSel = Number(year);
+  const r = earnData.rentals.find((x) => x.id === currentEarnRentalId);
+  const wrap = document.querySelector('#earnRentalDetail');
+  if (r && wrap) {
+    wrap.innerHTML = earnRentalDetailHtml(r);
+    drawEarnRentalDetailChart(r);
+  }
+};
+
 function earnRentalDetailSummaryHtml(r) {
-  const y = earnRentalLatestYear(r);
+  const selYear = earnRentalSelectedYear(r);
+  const y = (r.years || []).find((v) => v.tax_year === selYear);
   if (y && y.calc) {
     const c = y.calc;
-    return `<div class="note" id="earnRentalSummaryYear">Tax year ${y.tax_year}</div>
-    <div class="summary-strip">
+    return `<div class="summary-strip">
       <div class="summary-card"><div class="k">Gross rents</div><div class="v">${money2(c.grossWhole)}</div></div>
       <div class="summary-card"><div class="k">Deductible expenses</div><div class="v">${money2(c.deductibleExpenses)}</div></div>
       <div class="summary-card"><div class="k">Net, whole property (9946)</div><div class="v">${money2(c.netWhole9946)}</div></div>
@@ -9879,64 +9913,57 @@ function earnRentalDetailSummaryHtml(r) {
   </div>`;
 }
 
-// Deductible expenses, item by item (same year-pager pattern as the
-// per-pay tax benefit table, styled like the Property costs panel:
-// a year select in the panel header, a bold year heading, the
-// costs-table with a shaded tfoot Sum row): the property-derived
-// costs — each category plus that year's mortgage interest, scaled
-// by the rented share — plus any manual T776 lines, with a Sum row
-// equal to the year record's Deductible expenses. One page per year
-// with derived items, defaulting to the latest; no select for a
-// single year. Each row shows the Total (the item's amount for the
-// rented period), the Tenant % (the rental portion), and the
-// Deductible = Total x portion; rows the portion does not scale
+// Deductible expenses, item by item, in the Property costs panel
+// shape: a panel-head with the selected year's deductible total at
+// the top-right, a compact year select in a toolbar row, then the
+// costs-table with a shaded tfoot Sum row. No charts — just the
+// table. The year follows the shared detail-page state (the header
+// dropdown sets it); a year with no derived items falls back to the
+// latest derived year. Each row shows the Total (the item's amount
+// for the rented period), the Tenant % (the rental portion), and
+// the Deductible = Total x portion; rows the portion does not scale
 // show '—' for the %.
-let earnRentalExpenseYearSel = null;
 function earnRentalExpenseTableHtml(r) {
   const years = [...(r.years || [])]
     .filter((y) => y.calc && y.calc.expenseTable && y.calc.expenseTable.hasDerived)
     .sort((a, b) => a.tax_year - b.tax_year);
   if (!years.length) return '';
-  const latest = years[years.length - 1].tax_year;
-  const year = years.some((y) => y.tax_year === earnRentalExpenseYearSel) ? earnRentalExpenseYearSel : latest;
+  const shared = earnRentalSelectedYear(r);
+  const year = years.some((y) => y.tax_year === shared) ? shared : years[years.length - 1].tax_year;
   const y = years.find((v) => v.tax_year === year);
   const sel = years.length > 1
-    ? `<div class="spacer"></div><select id="earnRentalExpenseYearSel" aria-label="Year" onchange="earnRentalExpenseYear(Number(this.value))">${years.map((v) => `<option value="${v.tax_year}"${v.tax_year === year ? ' selected' : ''}>${v.tax_year}</option>`).join('')}</select>`
+    ? `<select id="earnRentalExpenseYearSel" aria-label="Year" onchange="earnRentalSetYear(Number(this.value))">${years.map((v) => `<option value="${v.tax_year}"${v.tax_year === year ? ' selected' : ''}>${v.tax_year}</option>`).join('')}</select>`
     : '';
   const rows = y.calc.expenseTable.rows.map((row) => `<tr><td>${esc(row.label)}</td><td class="num">${money2(row.total)}</td><td class="num">${row.pct == null ? '—' : `${row.pct}%`}</td><td class="num">${money2(row.deductible)}</td></tr>`).join('');
-  return `<div class="panel"><div class="section-head"><h3>Deductible expenses</h3>${sel}</div>
+  return `<div class="panel"><div class="panel-head"><h3>Deductible expenses</h3><div class="spacer"></div><span class="note" style="margin:0">${year} total: ${money2(y.calc.expenseTable.sum)}</span></div>
+    ${sel ? `<div class="toolbar" style="margin:0 0 8px">${sel}</div>` : ''}
     <div class="cost-year-head"><span>${year}</span></div>
     <table class="costs-table" id="earnRentalExpenseTable"><thead><tr><th>Item</th><th class="num">Total</th><th class="num">Tenant %</th><th class="num">Deductible</th></tr></thead><tbody>
         ${rows}
       </tbody><tfoot><tr class="cost-year-total"><td>Sum</td><td class="num">${money2(y.calc.expenseTable.totalSum)}</td><td class="num"></td><td class="num">${money2(y.calc.expenseTable.sum)}</td></tr></tfoot></table></div>`;
 }
-window.earnRentalExpenseYear = (year) => {
-  earnRentalExpenseYearSel = Number(year);
-  const r = earnData.rentals.find((x) => x.id === currentEarnRentalId);
-  const wrap = document.querySelector('#earnRentalExpenseWrap');
-  if (r && wrap) wrap.innerHTML = earnRentalExpenseTableHtml(r);
-};
 
 function earnRentalDetailHtml(r) {
   const years = [...(r.years || [])].sort((a, b) => a.tax_year - b.tax_year);
+  const selYearRec = years.find((v) => v.tax_year === earnRentalSelectedYear(r));
   return `<div class="toolbar"><a id="earnRentalBackLink" href="#earnings/rentals">← Back to Rentals</a><div class="spacer"></div></div>
     <div class="msg" id="earnRentalDetailMsg"></div>
-    <div class="panel">
-      <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span><div class="spacer"></div><button class="small" id="earnRentalDetailEditBtn" onclick="earnEditRental(${r.id})">Edit</button><button class="small danger" id="earnRentalDetailDeleteBtn" onclick="earnDeleteRental(${r.id})">Delete</button></div>
+    <div class="panel" id="earnRentalDetailHeadPanel">
+      <div class="section-head"><h3>${esc(r.label)}</h3><span class="meta-tag">${esc(r.rental_type)}</span><span class="meta-tag">${esc(r.services_level)}</span>${earnRentalYearSelectHtml(r, 'earnRentalYearSel')}<div class="spacer"></div><button class="small" id="earnRentalDetailEditBtn" onclick="earnEditRental(${r.id})">Edit</button><button class="small danger" id="earnRentalDetailDeleteBtn" onclick="earnDeleteRental(${r.id})">Delete</button></div>
       ${r.address ? `<div class="note">${esc(r.address)}</div>` : ''}
       ${earnRentalDetailSummaryHtml(r)}
+    </div>
+    <div class="panel" id="earnRentalEntriesPanel">
+      <div class="section-head"><h3>Rent entries</h3><div class="spacer"></div><button class="small" id="earnRentalDetailAddEntry" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
+      ${earnEntryTableHtml(r)}
     </div>
     <div class="panel" id="earnRentalDetailChartPanel">
       <div class="section-head"><h3>Annual income</h3></div>
       <div><canvas id="earnRentalDetailChart"></canvas></div>
     </div>
-    <div class="panel">
-      <div class="section-head"><h3>Year records</h3></div>
-      ${years.length ? years.map((y) => earnYearBlock(r, y)).join('') : '<div class="note">No year records yet.</div>'}
-    </div>
-    <div class="panel">
-      <div class="section-head"><h3>Rent entries</h3><div class="spacer"></div><button class="small" id="earnRentalDetailAddEntry" onclick="earnAddEntry(${r.id})">+ Rent entry</button></div>
-      ${(r.entries || []).length ? r.entries.map((e) => earnEntryBlock(r, e)).join('') : '<div class="note">No rent entries yet.</div>'}
+    <div class="panel" id="earnRentalYearRecordsPanel">
+      <div class="section-head"><h3>Year records</h3><div class="spacer"></div>${earnRentalYearSelectHtml(r, 'earnRentalYearRecordsSel')}</div>
+      ${selYearRec ? earnYearBlock(r, selYearRec) : '<div class="note">No year records yet.</div>'}
     </div>
     <div id="earnRentalExpenseWrap">${earnRentalExpenseTableHtml(r)}</div>`;
 }
@@ -9971,6 +9998,9 @@ async function loadEarnRentalDetail(id) {
     await loadEarnings();
     const r = earnData.rentals.find((x) => x.id === id);
     if (!r) { location.hash = '#earnings/rentals'; return; }
+    // A fresh rental defaults to its latest year; re-renders of the
+    // same rental (after an edit) keep the year the user is on.
+    if (currentEarnRentalId !== id) earnRentalYearSel = null;
     currentEarnRentalId = id;
     $('#earnRentalDetail').innerHTML = earnRentalDetailHtml(r);
     drawEarnRentalDetailChart(r);

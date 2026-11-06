@@ -338,6 +338,11 @@ td.num, th.num { text-align: right; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: #f2f7fc; }
 .owner-chip { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: #eef4ea; color: #43602c; white-space: nowrap; }
+/* Rental detail header metadata (rental_type / services_level) and
+   the Ongoing marker on rent entries: neutral pill tags. The rental
+   detail page's year selects are compact, not full-width. */
+.meta-tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #eef3f9; color: #33506e; border: 1px solid #d5e0ec; white-space: nowrap; }
+#earnRentalDetail select { width: auto; }
 /* Owner multi-picker: selected people as removable chips, the remaining
    candidates as dashed "+ Name" buttons underneath. */
 .owner-picker { border: 1px solid #c9d2dc; border-radius: 6px; padding: 6px 8px; background: #fff; }

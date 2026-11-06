@@ -782,7 +782,8 @@ export async function run(H, S) {
           hasYearPanel: !!([...d.querySelectorAll('.panel .section-head h3')].find((h) => h.textContent.trim() === 'Year records')),
           hasEntryPanel: !!([...d.querySelectorAll('.panel .section-head h3')].find((h) => h.textContent.trim() === 'Rent entries')),
           yearText: d.textContent.includes('2024') && d.textContent.includes('2025'),
-          entryText: d.textContent.includes('$1,000.00/mo') && d.textContent.includes('$2,000.00/mo'),
+          entryText: [...document.querySelectorAll('#earnRentalEntriesPanel tbody td')].some((td) => td.textContent.trim() === '$1,000.00')
+            && [...document.querySelectorAll('#earnRentalEntriesPanel tbody td')].some((td) => td.textContent.trim() === '$2,000.00'),
           detailAddEntry: !!document.querySelector('#earnRentalDetailAddEntry'),
           noBottomRow: !document.querySelector('#earnRentalDetailActions'),
           headerEdit: !!document.querySelector('#earnRentalDetailEditBtn'),
@@ -795,9 +796,9 @@ export async function run(H, S) {
         detailInfo.backTag === 'A' && detailInfo.backText === '← Back to Rentals' && detailInfo.backHref === '#earnings/rentals'
           && detailInfo.backClass === '' && detailInfo.headButtons === 0 && detailInfo.headIsToolbar,
         JSON.stringify(detailInfo));
-      H.check('rental detail header shows label + type and ownership',
+      H.check('rental detail header shows label + type tags, no ownership text',
         detailInfo.header && detailInfo.header.includes('Detail rental') && detailInfo.header.includes('long_term')
-          && detailInfo.header.includes('basic') && detailInfo.header.includes('100% owned'),
+          && detailInfo.header.includes('basic') && !detailInfo.header.includes('owned'),
         JSON.stringify(detailInfo.header));
       const wantDetailCards = [
         ['Gross rents', cad(latestDetailYear.calc.grossWhole)],
@@ -1806,43 +1807,103 @@ export async function run(H, S) {
       const derDetail = await page.evaluate(() => {
         const d = document.querySelector('#earnRentalDetail');
         const strip = [...d.querySelectorAll('.summary-card')].map((c) => [c.querySelector('.k')?.textContent.trim(), c.querySelector('.v')?.textContent.trim()]);
-        const yearLabel = document.querySelector('#earnRentalSummaryYear')?.textContent.trim() || null;
+        const headSel = document.querySelector('#earnRentalYearSel');
         const sel = document.querySelector('#earnRentalExpenseYearSel');
         const head = document.querySelector('#earnRentalDetail .cost-year-head')?.textContent.trim() || null;
         const rows = [...document.querySelectorAll('#earnRentalExpenseTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
         const sumRow = [...document.querySelectorAll('#earnRentalExpenseTable tfoot tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
-        return { strip, yearLabel, selValue: sel ? sel.value : null, selOptions: sel ? [...sel.options].map((o) => o.value) : null, head, rows, sumRow, hasTable: !!document.querySelector('#earnRentalExpenseTable') };
+        const deductHead = document.querySelector('#earnRentalExpenseWrap .panel-head');
+        const order = [...d.children].map((el) => el.id).filter((id) => id);
+        const entryHead = [...document.querySelectorAll('#earnRentalEntriesPanel thead th')].map((th) => th.textContent.trim());
+        const entryRows = [...document.querySelectorAll('#earnRentalEntriesPanel tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
+        const tags = [...document.querySelectorAll('#earnRentalDetailHeadPanel .meta-tag')].map((t) => t.textContent.trim());
+        return {
+          strip,
+          headSelValue: headSel ? headSel.value : null,
+          headSelOptions: headSel ? [...headSel.options].map((o) => o.value) : null,
+          headText: document.querySelector('#earnRentalDetailHeadPanel .section-head')?.textContent || '',
+          tags,
+          selValue: sel ? sel.value : null, selOptions: sel ? [...sel.options].map((o) => o.value) : null,
+          selWidth: sel ? sel.offsetWidth : null,
+          deductTotal: deductHead?.querySelector('.note')?.textContent.trim() || null,
+          deductHasCanvas: !!document.querySelector('#earnRentalExpenseWrap canvas'),
+          head, rows, sumRow, hasTable: !!document.querySelector('#earnRentalExpenseTable'),
+          order, entryHead, entryRows,
+        };
       });
       const want26Str = want26.toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const want26TotalFmt = (Math.round((7200 + interestByYear[2026]) * 100) / 100).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const int26Fmt = (Math.round(interestByYear[2026] * 100) / 100).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const int26DedFmt = (Math.round(interestByYear[2026] * 0.33 * 100) / 100).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      H.check('derived expenses: detail shows the restyled table (2026 default, 4 columns) + strip year label + summary card matches',
+      const net26Str = (24000 - want26).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      H.check('derived expenses: detail shows the restyled table (2026 default, 4 columns) + header tags + shared year select + compact deductible select + top-right total + no charts + entries table after the header',
         derDetail.hasTable
-          && derDetail.yearLabel === 'Tax year 2026'
+          && derDetail.headSelValue === '2026' && JSON.stringify(derDetail.headSelOptions) === JSON.stringify(['2025', '2026'])
+          && derDetail.tags.includes('long_term') && derDetail.tags.includes('basic') && !derDetail.headText.includes('owned')
           && derDetail.selValue === '2026' && JSON.stringify(derDetail.selOptions) === JSON.stringify(['2025', '2026'])
+          && derDetail.selWidth != null && derDetail.selWidth < 300
+          && derDetail.deductTotal === `2026 total: ${want26Str}`
+          && derDetail.deductHasCanvas === false
           && derDetail.head === '2026'
           && derDetail.rows.some((row) => row[0] === 'Property tax' && row[1] === '$6,000.00' && row[2] === '33%' && row[3] === '$1,980.00')
           && derDetail.rows.some((row) => row[0] === 'Gas' && row[1] === '$1,200.00' && row[2] === '33%' && row[3] === '$396.00')
           && derDetail.rows.some((row) => row[0] === 'Mortgage interest' && row[1] === int26Fmt && row[2] === '33%' && row[3] === int26DedFmt)
           && derDetail.sumRow.length === 1 && derDetail.sumRow[0][0] === 'Sum'
           && derDetail.sumRow[0][1] === want26TotalFmt && derDetail.sumRow[0][3] === want26Str
-          && derDetail.strip.find((c) => c[0] === 'Deductible expenses')?.[1] === want26Str,
-        JSON.stringify({ ...derDetail, want26Str, want26TotalFmt, int26Fmt, int26DedFmt }));
-      await page.select('#earnRentalExpenseYearSel', '2025');
+          && derDetail.strip.find((c) => c[0] === 'Deductible expenses')?.[1] === want26Str
+          && derDetail.strip.find((c) => c[0] === 'Owner share')?.[1] === net26Str
+          && JSON.stringify(derDetail.order) === JSON.stringify(['earnRentalDetailMsg', 'earnRentalDetailHeadPanel', 'earnRentalEntriesPanel', 'earnRentalDetailChartPanel', 'earnRentalYearRecordsPanel', 'earnRentalExpenseWrap'])
+          && JSON.stringify(derDetail.entryHead) === JSON.stringify(['Period', 'Monthly rent', 'Paid on day', 'Cash', ''])
+          && derDetail.entryRows.some((row) => row[0].startsWith('Jan 2025 – Dec 2026') && row[1] === '$2,000.00' && row[2] === '15' && row[3] === '—'),
+        JSON.stringify({ ...derDetail, want26Str, net26Str, want26TotalFmt, int26Fmt, int26DedFmt }));
+      // The Ongoing tag sits exactly on the entry covering the
+      // current month (computed in-page, so the pin holds whenever
+      // the suite runs).
+      const entryOngoing = await page.evaluate(() => {
+        const months = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
+        const now = new Date();
+        const nowKey = now.getFullYear() * 12 + now.getMonth();
+        return [...document.querySelectorAll('#earnRentalEntriesPanel tbody tr')].map((tr) => {
+          const tds = [...tr.querySelectorAll('td')];
+          const txt = tds[0]?.textContent.trim() || '';
+          const m = txt.match(/^([A-Z][a-z]{2}) (\d{4}) – (?:([A-Z][a-z]{2}) (\d{4})|Ongoing)/);
+          if (!m) return { txt, tagged: false, covers: false, skip: true };
+          const startKey = Number(m[2]) * 12 + (months[m[1]] - 1);
+          const endKey = m[3] ? Number(m[4]) * 12 + (months[m[3]] - 1) : Infinity;
+          const tagged = tds[0]?.querySelector('.meta-tag')?.textContent.trim() === 'Ongoing';
+          return { txt, tagged, covers: startKey <= nowKey && nowKey <= endKey };
+        });
+      });
+      H.check('rent entries: the Ongoing tag sits exactly on the entry covering the current month',
+        entryOngoing.length > 0 && entryOngoing.every((r) => r.skip || r.tagged === r.covers),
+        JSON.stringify(entryOngoing));
+      await page.select('#earnRentalYearSel', '2025');
       await waitE(500);
       const derDetail25 = await page.evaluate(() => {
+        const d = document.querySelector('#earnRentalDetail');
+        const strip = [...d.querySelectorAll('.summary-card')].map((c) => [c.querySelector('.k')?.textContent.trim(), c.querySelector('.v')?.textContent.trim()]);
+        const headSel = document.querySelector('#earnRentalYearSel');
         const sel = document.querySelector('#earnRentalExpenseYearSel');
+        const recSel = document.querySelector('#earnRentalYearRecordsSel');
         const head = document.querySelector('#earnRentalDetail .cost-year-head')?.textContent.trim() || null;
         const rows = [...document.querySelectorAll('#earnRentalExpenseTable tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
         const sumRow = [...document.querySelectorAll('#earnRentalExpenseTable tfoot tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
-        return { selValue: sel ? sel.value : null, head, rows, sumRow };
+        const recHeads = [...document.querySelectorAll('#earnRentalYearRecordsPanel .panel .section-head h3')].map((h) => h.textContent.trim());
+        return { strip, headSelValue: headSel ? headSel.value : null, selValue: sel ? sel.value : null, recSelValue: recSel ? recSel.value : null, head, rows, sumRow, recHeads };
       });
-      H.check('derived expenses: year select flips to 2025 with that year\'s rows + sum',
-        derDetail25.selValue === '2025' && derDetail25.head === '2025'
+      const want25Str = want25.toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const net25Str = (24000 - want25).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      H.check('shared year: header dropdown flips to 2025 — summary cards, deductible table and year records all follow',
+        derDetail25.headSelValue === '2025' && derDetail25.selValue === '2025' && derDetail25.recSelValue === '2025'
+          && derDetail25.head === '2025'
+          && derDetail25.strip.find((c) => c[0] === 'Gross rents')?.[1] === '$24,000.00'
+          && derDetail25.strip.find((c) => c[0] === 'Deductible expenses')?.[1] === want25Str
+          && derDetail25.strip.find((c) => c[0] === 'Net, whole property (9946)')?.[1] === net25Str
+          && derDetail25.strip.find((c) => c[0] === 'Owner share')?.[1] === net25Str
           && derDetail25.rows.some((row) => row[0] === 'Property tax' && row[1] === '$5,000.00' && row[2] === '33%' && row[3] === '$1,650.00')
-          && derDetail25.sumRow.length === 1 && derDetail25.sumRow[0][0] === 'Sum',
-        JSON.stringify(derDetail25));
+          && derDetail25.sumRow.length === 1 && derDetail25.sumRow[0][0] === 'Sum'
+          && JSON.stringify(derDetail25.recHeads) === JSON.stringify(['2025']),
+        JSON.stringify({ ...derDetail25, want25Str, net25Str }));
       // Live derivation: adding a property cost updates the table on
       // the next read — no re-entry on the rental side.
       r = await H.req('POST', `/api/properties/${derPropId}/costs`, { year: 2026, category: 'Electricity', amount: 1200 });
@@ -1864,8 +1925,11 @@ export async function run(H, S) {
           && Math.abs(derY26Back.calc.deductibleExpenses - want26) < 0.01,
         JSON.stringify(derY26Back && derY26Back.calc.expenseTable));
 
-      // Item 2: the owner share is derived — two owners is 50/50,
-      // and the rental saves with no ownership value at all.
+      // Item 2: the owner share is always 100% — a rental linked
+      // to an existing property is 100% even when jointly owned
+      // (the household's share; the 50/50 co-owner split is a Tax
+      // module concern), and the rental saves with no ownership
+      // value at all.
       r = await H.req('POST', '/api/properties', {
         address: '2 Owners Way, Coquitlam, BC', region: 'CA', purchase_date: '2024-12-01',
         owners: ['Shawn', 'Jiaying'],
@@ -1877,7 +1941,7 @@ export async function run(H, S) {
         property_id: twoPropId,
       });
       H.check('derived ownership: rental linked to the two-owner property, saved with no ownership value',
-        r.status === 201 && r.data.ownership_pct === 50, JSON.stringify(r.data));
+        r.status === 201 && r.data.ownership_pct === 100, JSON.stringify(r.data));
       const twoRentalId = r.data.id;
       r = await H.req('POST', `/api/earnings/rentals/${twoRentalId}/years`, {
         tax_year: 2026, other_income: 0, area_share_pct: 100,
@@ -1891,9 +1955,9 @@ export async function run(H, S) {
       H.check('derived ownership: entry created', r.status === 201, JSON.stringify(r.data));
       const twoEarn = (await H.req('GET', '/api/earnings')).data.rentals.find((x) => x.id === twoRentalId);
       const twoY26 = twoEarn.years.find((y) => y.tax_year === 2026);
-      // Gross 24,000 − deductible 4,000 = net 20,000; owner share 50% = 10,000.
-      H.check('derived ownership: two owners -> Owner share = net x 50%',
-        twoEarn && twoEarn.ownership_pct === 50 && twoY26 && twoY26.calc.netWhole9946 === 20000 && twoY26.calc.ownerShareNet === 10000,
+      // Gross 24,000 − deductible 4,000 = net 20,000; owner share is the full net (100%).
+      H.check('derived ownership: two owners -> Owner share = full net (100%)',
+        twoEarn && twoEarn.ownership_pct === 100 && twoY26 && twoY26.calc.netWhole9946 === 20000 && twoY26.calc.ownerShareNet === 20000,
         JSON.stringify({ pct: twoEarn && twoEarn.ownership_pct, calc: twoY26 && twoY26.calc }));
       await page.goto(`http://ff.local/#earnings/rental/${twoRentalId}`, { waitUntil: 'networkidle0', timeout: 30000 });
       // Same-hash detail navigation does not reload the panel: the
@@ -1901,9 +1965,20 @@ export async function run(H, S) {
       // finishes, so wait for this rental's heading, not just the
       // back link (which already exists from the stale render).
       await page.waitForFunction(() => document.querySelector('#earnRentalDetail .panel .section-head h3')?.textContent.includes('Two-owner rental'), { timeout: 10000 });
-      const twoHeader = await page.evaluate(() => document.querySelector('#earnRentalDetail .panel .section-head')?.textContent || null);
-      H.check('derived ownership: detail header shows 50% owned',
-        twoHeader && twoHeader.includes('50% owned'), JSON.stringify(twoHeader));
+      const twoHeader = await page.evaluate(() => {
+        const head = document.querySelector('#earnRentalDetailHeadPanel .section-head');
+        const yr = document.querySelector('#earnRentalYearRecordsPanel');
+        return {
+          tags: [...(head?.querySelectorAll('.meta-tag') || [])].map((t) => t.textContent.trim()),
+          text: head?.textContent || '',
+          yearBlock: yr?.textContent || '',
+        };
+      });
+      H.check('derived ownership: detail header shows long_term + basic tags, no % owned text; year block shows Owner share (100%)',
+        twoHeader.tags.includes('long_term') && twoHeader.tags.includes('basic')
+          && !twoHeader.text.includes('% owned') && !twoHeader.text.includes('owned')
+          && twoHeader.yearBlock.includes('Owner share (100%)') && twoHeader.yearBlock.includes('$20,000.00'),
+        JSON.stringify(twoHeader));
       // The rental form carries no ownership % field — the only
       // percentage on the form is the Rental portion.
       await page.goto('http://ff.local/#earnings/rentals', { waitUntil: 'networkidle0', timeout: 30000 });
