@@ -14024,7 +14024,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="note" id="planReportTrajectoryNote"></div>
         <div id="planReportComparePicker" class="toolbar"></div>
         <div class="section-head"><h3>Difference vs baseline</h3></div>
-        <div class="note" id="planReportTrajCaption">X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.</div>
+        <div class="note" id="planReportTrajCaption">${template.key === 'pool' ? 'X: month · Y: CAD — Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.'}</div>
         <div id="planReportTrajRange"></div>
         <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
@@ -14701,7 +14701,14 @@ function planCompareNewRender(block, ids) {
           planLineChart(t.chart, effMonths.map(formatYM), dDatasets);
           if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
           const caption = t.caption ? $(t.caption) : null;
-          if (caption) caption.textContent = 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.';
+          if (caption) {
+            // The caption names only what is actually drawn: a
+            // Balance Δ line exists only when a picked strategy
+            // touches a mortgage, so a pool report (Value Δ only)
+            // never carries the mortgage text.
+            const drewBalDelta = dDatasets.some((d) => /Balance Δ/.test(d.label));
+            caption.textContent = drewBalDelta ? 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.' : 'X: month · Y: CAD — Value Δ = strategy value − baseline value.';
+          }
         } else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
       }
     } else {
@@ -15768,6 +15775,16 @@ function planLegsWire(type, ctx, root) {
     box.querySelectorAll('input[data-money]').forEach(wireMoneyInput);
   });
 }
+// A custom-product buy (no account) has no price history to fall
+// back on, so its expected return is required — a rateless custom
+// buy would project flat. Checked at save time, not inside
+// planReadOpForm: the template form's blank-date name-only path
+// must not be blocked by a half-filled op form.
+function planRequireCustomBuyRate(params) {
+  if (!params || params.accountId != null) return;
+  if (params.expectedReturnPct == null) throw new Error('a custom product buy needs an expected return (% / year)');
+  if (!(params.expectedReturnPct >= -90 && params.expectedReturnPct <= 500)) throw new Error('expected return must be -90..500');
+}
 function planReadOpForm(type, root) {
   const scope = root || document;
   const v = (id) => { const el = scope.querySelector('#' + id); return el ? el.value : null; };
@@ -15954,6 +15971,7 @@ async function openPlanOpModal(strategyId, existing, presetType, opts) {
       const { params, legs } = planReadOpForm(curType, $('#planOpModalBody').closest('.modal-card'));
       if (!params.date) throw new Error('date is required');
       if (curType === 'buy') {
+        planRequireCustomBuyRate(params);
         const over = planBuyPoolOverflow($('#planOpModalBody').closest('.modal-card'), params.amount);
         if (over) throw new Error(over);
       }
@@ -16056,6 +16074,7 @@ async function openPlanStrategyModal(projectId) {
         // Only a real first op is overflow-checked: a blank-date
         // name-only strategy never saves an op at all.
         if (opType === 'buy') {
+          planRequireCustomBuyRate(params);
           const over = planBuyPoolOverflow($('#planStrategyModalBody').closest('.modal-card'), params.amount);
           if (over) throw new Error(over);
         }

@@ -2293,6 +2293,12 @@ export async function run(H, S) {
   H.check('sink-simplify: GIC buy grows the pool at its own 6% return',
     gicRow && gicRow.projection && gicRow.projection.stocks && gicRow.projection.stocks.valueAtHorizon > gicRow.projection.stocks.buyCash * 5 && gicRow.comparison && gicRow.comparison.stockGain > 0,
     JSON.stringify({ value: gicRow && gicRow.projection.stocks.valueAtHorizon, buyCash: gicRow && gicRow.projection.stocks.buyCash, gain: gicRow && gicRow.comparison.stockGain }));
+  // A custom-product buy with no rate is rejected server-side: the
+  // rate is required for a custom buy (a rateless GIC would project
+  // flat), even though the client is the usual gate.
+  r = await H.req('POST', `/api/planning/strategies/${gicStratId}/ops`, { op_type: 'buy', params: { accountId: null, symbol: 'Test GIC no rate', currency: 'CAD', date: `${_poolVan.slice(0, 7)}-01`, amount: 1100, price: 100 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('gic-caption-rate: custom buy with no expected return is rejected server-side (400 naming the return)',
+    r.status === 400 && /expected return/i.test((r.data && r.data.error) || ''), JSON.stringify(r.data));
   // ---- New stock (user 2026-11-05): a stock the user does not
   // hold yet (AMZN) is bought as a plain buy op — amount = the pool
   // remainder, price = the current price from the tiers (never 100,
@@ -2677,6 +2683,34 @@ export async function run(H, S) {
           && gicAfter.doughnutTable.includes('100.00') && gicAfter.buyText.includes('Sell from pool · $100.00')
           && gicAfter.buyText.includes('1 units'),
         JSON.stringify(gicAfter));
+      // A custom-product buy with a BLANK expected return is blocked
+      // client-side: the modal stays open with a visible error naming
+      // the return, and no fourth buy is added.
+      await page.click('#planSinkAddBuyBtn');
+      await waitQ(500);
+      await page.waitForSelector('#planOpSymbol', { timeout: 15000 });
+      await page.evaluate(() => { document.querySelector('#planOpCustom').click(); });
+      await waitQ(500);
+      await page.evaluate((ym) => {
+        document.querySelector('#planOpCustomName').value = 'GIC no rate';
+        document.querySelector('#planOpCustomName').dispatchEvent(new Event('input', { bubbles: true }));
+        const a = document.querySelector('#planOpAmount');
+        a.value = '100.00';
+        a.dispatchEvent(new Event('input', { bubbles: true }));
+        document.querySelector('#planOpDateVal').value = `${ym}-01`;
+      }, _poolVan.slice(0, 7));
+      await page.evaluate(() => { document.querySelector('#planOpSaveBtn').click(); });
+      await waitQ(500);
+      const blankRate = await page.evaluate(() => ({
+        msg: document.querySelector('#planOpModalMsg')?.textContent || '',
+        stillOpen: !!document.querySelector('#planOpSaveBtn'),
+        buyCount: document.querySelectorAll('#planSinkBuyList [data-plan-op-card]').length,
+      }));
+      H.check('gic-caption-rate: custom buy with a blank Expected return is blocked client-side with a visible error (no op added)',
+        /expected return/i.test(blankRate.msg) && blankRate.stillOpen && blankRate.buyCount === 3,
+        JSON.stringify(blankRate));
+      await page.evaluate(() => { document.querySelector('#planOpModal [data-close-modal]')?.click(); });
+      await waitQ(300);
       // One buy = one slice: the flat pool's single AMZN buy is the
       // whole doughnut, AMZN 100% $2,000.00.
       await page.goto(`http://ff.local/#planning/strategy/${flatStrat.id}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -5489,6 +5523,7 @@ export async function run(H, S) {
           headline: [...document.querySelectorAll('#planReportHeadlineCards .k')].map((k) => k.textContent),
           tableHead: document.querySelector('#planReportTableBody thead')?.textContent || '',
           tableCap: document.querySelector('#planReportTableCaption')?.textContent || '',
+          trajCap: document.querySelector('#planReportTrajCaption')?.textContent || '',
           deltaLabels: (typeof planCharts !== 'undefined' && planCharts.planReportTrajectoryChart) ? planCharts.planReportTrajectoryChart.data.datasets.map((d) => d.label) : null,
           breakdownNull: (typeof planCharts !== 'undefined') ? planCharts.planReportTrajectoryBreakdownChart == null : null,
           // The pool template has no breakdown section at all — the
@@ -5510,6 +5545,9 @@ export async function run(H, S) {
         repPool.deltaLabels && !repPool.deltaLabels.some((l) => /Balance Δ/.test(l)) && repPool.deltaLabels.some((l) => /Value Δ/.test(l))
           && repPool.breakdownNull === true && repPool.breakdownAbsent === true,
         JSON.stringify(repPool));
+      H.check('gic-caption-rate: pool report Difference chart caption names Value Δ only (no Balance Δ)',
+        repPool.trajCap.includes('Value Δ') && !repPool.trajCap.includes('Balance Δ'),
+        JSON.stringify({ trajCap: repPool.trajCap }));
       H.check('invcomp: report table has Value Δ only, no mortgage columns',
         repPool.tableHead.includes('Value Δ') && !repPool.tableHead.includes('Balance Δ') && !repPool.tableHead.includes('Baseline balance')
           && repPool.tableCap.includes('Value Δ') && !repPool.tableCap.includes('Balance Δ'),
@@ -6070,7 +6108,7 @@ export async function run(H, S) {
         const headCells = [...document.querySelectorAll('#planReportTableBody thead th')].map((th) => th.textContent.trim());
         const col = (name) => headCells.indexOf(name);
         const rows = [...document.querySelectorAll('#planReportTableBody tbody tr:not(.plan-year-head):not(.plan-year-total)')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()));
-        return { head: headCells, months: rows.map((m) => m[0]), bals: rows.map((m) => parse(m[col('Baseline balance')])) };
+        return { head: headCells, cap: document.querySelector('#planReportTableCaption')?.textContent || '', months: rows.map((m) => m[0]), bals: rows.map((m) => parse(m[col('Baseline balance')])) };
       });
       const psApiByMonth = new Map(psEBaseSeries.map((pt) => [pt.month, pt.balance]));
       const psFirstYear = psEBaseSeries[0]?.month?.slice(0, 4);
@@ -6084,6 +6122,9 @@ export async function run(H, S) {
           && psTable.bals.length === psExpectedRows && psTable.months[0] === psFirstLabel && psMaxJump < 5000 && (psJunBal || 0) < 450000
           && psTable.bals.every((v, i) => v != null && Math.abs(v - (psApiByMonth.get(ymOfLabel(psTable.months[i])) || 0)) < 0.01),
         JSON.stringify({ head: psTable.head, bals: psTable.bals, months: psTable.months, maxJump: psMaxJump, junBal: psJunBal, expectedRows: psExpectedRows, expectedFirst: psFirstLabel }));
+      H.check('gic-caption-rate: property report table caption keeps Balance Δ + Value Δ',
+        psTable.cap.includes('Balance Δ') && psTable.cap.includes('Value Δ'),
+        JSON.stringify({ cap: psTable.cap }));
       // (reptpl) Property template: the Monthly payment breakdown
       // section is present (h3 + canvas) and the headline carries
       // the mortgage cards. psRep is still open from the table

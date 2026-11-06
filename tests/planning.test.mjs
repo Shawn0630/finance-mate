@@ -1159,10 +1159,17 @@ test('computeProjection: a buy carrying expectedReturnPct grows at that rate (GI
   assert.ok(Math.abs(vsOverride.stocks.series[12].value - 12000) < 0.5, `got ${vsOverride.stocks.series[12].value}`);
 });
 
-test('validateOp: a buy expectedReturnPct must be -90..500 when present', () => {
-  const buy = (ret) => ({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12%', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, expectedReturnPct: ret } });
-  assert.deepEqual(validateOp(buy(4.12)), []);
-  assert.deepEqual(validateOp(buy(undefined)), []);
-  assert.ok(validateOp(buy(600)).some((e) => /expected return/.test(e)));
-  assert.ok(validateOp(buy(-100)).some((e) => /expected return/.test(e)));
+test('validateOp: a custom-product buy needs an expected return (-90..500); a stock buy does not', () => {
+  const customBuy = (ret) => ({ op_type: 'buy', params: { accountId: null, symbol: 'GIC 4.12%', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, expectedReturnPct: ret } });
+  assert.deepEqual(validateOp(customBuy(4.12)), []);
+  // A rateless custom buy has no history to fall back on — it would
+  // project flat — so the rate is required, not merely bounded.
+  assert.ok(validateOp(customBuy(undefined)).some((e) => /expected return/.test(e)));
+  assert.ok(validateOp(customBuy(600)).some((e) => /expected return/.test(e)));
+  assert.ok(validateOp(customBuy(-100)).some((e) => /expected return/.test(e)));
+  // A stock buy grows at its own history / the scenario return, so no
+  // rate is required — but a rate, when carried, is still bounded.
+  const stockBuy = (ret) => ({ op_type: 'buy', params: { accountId: 1, symbol: 'XQQ.TO', currency: 'CAD', date: '2027-01-01', amount: 1000, price: 100, expectedReturnPct: ret } });
+  assert.deepEqual(validateOp(stockBuy(undefined)), []);
+  assert.ok(validateOp(stockBuy(600)).some((e) => /expected return/.test(e)));
 });

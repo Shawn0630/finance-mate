@@ -200,8 +200,11 @@ export function validateOp(op, ctx = {}) {
     if (p.amount != null) pos(p.amount, 'amount');
     if (p.price != null) pos(p.price, 'price');
     // A rate carried on the buy (a custom product's own rate, e.g. a
-    // GIC): same bounds as a scenario stock factor.
-    if (p.expectedReturnPct != null && !(num(p.expectedReturnPct) >= -90 && num(p.expectedReturnPct) <= 500)) errs.push('expected return must be -90..500');
+    // GIC): same bounds as a scenario stock factor. A custom-product
+    // buy (no account) has no price history to fall back on, so its
+    // rate is required — a rateless custom buy would project flat.
+    if (p.accountId == null && p.expectedReturnPct == null) errs.push('a custom product buy needs an expected return (% / year)');
+    else if (p.expectedReturnPct != null && !(num(p.expectedReturnPct) >= -90 && num(p.expectedReturnPct) <= 500)) errs.push('expected return must be -90..500');
   }
   if (op.op_type === 'sell') {
     if (!Number.isInteger(Number(p.holdingId))) errs.push('sell needs a holding');
