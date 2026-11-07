@@ -61,6 +61,12 @@
 // and FX_API_URL replaces the Valet URL; the suites point all
 // four at local stubs and never touch the network.
 
+// The pool history pull (user 2026-11-06) gates on the planning
+// engine's own history helpers, so a pull happens only when the
+// projection would otherwise use a flat rate or no band.
+import { currentReturnRateFromPoints, holdingVolatilityFromPoints } from './planning.js';
+import { listPricePoints } from './investments.js';
+
 const READ_TIMEOUT_MS = 4000;
 const FAIL_BACKOFF_MS = 15 * 60 * 1000;
 
@@ -514,6 +520,67 @@ export async function refreshAllPrices(db, holdings) {
   const results = await Promise.all(jobs);
   await fxJob;
   return results;
+}
+
+// Forced single-holding refresh (the pool history pull's default
+// fetcher): same as a manual refresh for one holding — clears both
+// stamps so ensure* fetches even after a good day, with the longer
+// timeout and one timeout retry.
+export function forceHoldingPrices(db, holding, opts = {}) {
+  if (!holding || holding.kind !== 'exchange' || !holding.symbol) {
+    return Promise.resolve({ ok: false, source: null, error: null });
+  }
+  setMeta(db, `invest_px_${holding.id}_ok`, '0');
+  setMeta(db, `invest_px_${holding.id}_try`, '0');
+  return ensureHoldingPricesDetailed(db, holding, { timeoutMs: MANUAL_REFRESH_TIMEOUT_MS, retries: 1, ...opts });
+}
+
+// Pool history pull (user 2026-11-06): at Generate, a cash-pool
+// holding with no usable history rate or σ must not stay flat —
+// pull its full price history through the existing pricing chain
+// (Stooq → Yahoo chart → Nasdaq) and store it in invest_prices,
+// so the projection's median (growthFor's history rate) and the
+// pool band use real history from then on. The gate is the
+// projection's own: a holding that already has BOTH a current
+// return rate (1y → 3y → 5y CAGR) and a σ is never pulled. Fund
+// holdings and symbol-less holdings are skipped (their prices are
+// manual). Never throws and never fails the caller: a failed fetch
+// falls back to the stored points and is reported in the returned
+// notes (the viewer names the holding). A dedicated backoff meta
+// key (invest_poolhist_<id>_try) keeps a failing holding from
+// being re-attempted on every render — a successful pull clears
+// it. fetchHolding is injectable so tests drive the pull without
+// the live network; the default is a forced market refresh.
+export async function ensurePoolHistory(db, holdings, opts = {}) {
+  const currentMonth = opts.currentMonth;
+  const backoffMs = opts.backoffMs ?? FAIL_BACKOFF_MS;
+  const fetchHolding = opts.fetchHolding || ((h) => forceHoldingPrices(db, h));
+  const jobs = [];
+  for (const h of holdings || []) {
+    if (!h || h.kind !== 'exchange' || !h.symbol) continue;
+    const points = listPricePoints(db, h.id);
+    const rate = currentReturnRateFromPoints(points, currentMonth);
+    const vol = holdingVolatilityFromPoints(points, currentMonth);
+    if (rate && vol) continue; // already usable — never pull
+    const tryKey = `invest_poolhist_${h.id}_try`;
+    const lastTry = Number(getMeta(db, tryKey) || 0);
+    if (lastTry && Date.now() - lastTry < backoffMs) continue; // failing holding: back off
+    jobs.push((async () => {
+      setMeta(db, tryKey, String(Date.now()));
+      let res;
+      try { res = await fetchHolding(h); } catch (err) { res = { ok: false, error: err && err.message ? err.message : String(err) }; }
+      if (res && res.ok) {
+        clearMeta(db, tryKey);
+        const after = listPricePoints(db, h.id);
+        const rateAfter = currentReturnRateFromPoints(after, currentMonth);
+        const volAfter = holdingVolatilityFromPoints(after, currentMonth);
+        return { holdingId: h.id, symbol: h.symbol, pulled: true, ok: true, ratePct: rateAfter ? rateAfter.ratePct : null, volPct: volAfter ? volAfter.volPct : null, points: after.length };
+      }
+      return { holdingId: h.id, symbol: h.symbol, pulled: true, ok: false, error: (res && res.error) || 'history fetch failed' };
+    })());
+  }
+  const results = await Promise.all(jobs);
+  return { results, notes: results.filter((r) => !r.ok).map((r) => ({ holdingId: r.holdingId, symbol: r.symbol, error: r.error })) };
 }
 
 // How a holding is currently priced, for the UI's honesty

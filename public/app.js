@@ -13777,9 +13777,27 @@ function planReportApplyOverlay(comp, report) {
     if (eng && !(eng.errors && eng.errors.length) && eng.series) {
       const traj = trajs.find((t) => t.key === String(row.strategy.id));
       if (traj && traj.monthly) {
+        const origStock = traj.monthly.map((r) => r.stock_value);
         for (const [sid, arr] of Object.entries(eng.series)) {
           if (!Array.isArray(arr)) continue;
           traj.monthly.forEach((r, i) => { if (i < arr.length && arr[i] != null) r[sid] = arr[i]; });
+        }
+        // Pool volatility band (user 2026-11-06): the engine can
+        // override stock_value — the band is a relative spread
+        // around the median, so it scales by the same per-month
+        // ratio and stays centered on the engine's median with the
+        // preset width. Without this the preset band would sit
+        // detached from the AI median. Idempotent: a second overlay
+        // pass sees the engine value as the original, ratio 1.
+        if (Array.isArray(eng.series.stock_value)) {
+          traj.monthly.forEach((r, i) => {
+            const nv = eng.series.stock_value[i];
+            const ov = origStock[i];
+            if (nv == null || ov == null || ov === 0 || r.stock_p10 == null || r.stock_p90 == null) return;
+            const ratio = nv / ov;
+            r.stock_p10 = planRound2(r.stock_p10 * ratio);
+            r.stock_p90 = planRound2(r.stock_p90 * ratio);
+          });
         }
       }
     }
@@ -13989,7 +14007,13 @@ function planHeadlineWindowNote(view) {
     : 'Interest saved and cost are summed over the window; Value at horizon is the value at the window end. Drag both handles to set the window.';
   const w = planHeadlineWindowed(view);
   const payoffNote = w && w.payoffBeyondWindow ? ' Payoff is beyond this window.' : '';
-  return `${def} ${defs}${payoffNote}`;
+  // Pool volatility band (user 2026-11-06): when the headline shows
+  // P10–P90 ranges, the method line states the range formula — and
+  // that the range is the grown projection while the full-horizon
+  // headline figures stay flat, so the range need not contain them.
+  const band = isPool && view.comp.report && view.comp.report.poolBand && view.comp.report.poolBand.banded;
+  const bandNote = band ? ' P10–P90 ranges are the grown projection over the window; Value Δ band at a month = strategy P10 − baseline P90 to strategy P90 − baseline P10 (widest honest range); Net benefit range = stock-gain range less window cost. At the full horizon the headline figures stay the flat value at horizon / opportunity-costed gain, so the grown range need not contain them; inside a narrowed window the figures are the grown windowed values. Holdings’ bands combine with no correlation; the cash balance has no volatility.' : '';
+  return `${def} ${defs}${payoffNote}${bandNote}`;
 }
 // Dual-thumb range slider (user 2026-11-06: "拉动条是可以前后拉动
 // 的设置范围的"): two overlaid range inputs, one per handle, so
@@ -14044,6 +14068,46 @@ function planReportStockInvolved(comp) {
 // reports show eight, pool baselines five (no mortgage figures).
 // Values come from the LIVE variables, so typing a penalty updates
 // cost and net here before Apply.
+// Pool volatility ranges (user 2026-11-06): P10–P90 of the grown
+// projection over the headline window, read off the trajectory
+// stock_p10 / stock_p90 rows. The pot has no volatility, so a total
+// at month m is stock band + pot. The Value Δ band at a month is the
+// widest honest range — [strategy P10 − baseline P90, strategy P90
+// − baseline P10]. Stock gain range = Δ band(end) − Δ band(start);
+// net benefit range = stock-gain range less the window cost (cost is
+// deterministic). Returns null when either trajectory carries no
+// band rows at the window ends.
+function planHeadlinePoolRanges(view, row) {
+  const trajs = (view.comp.report && view.comp.report.trajectories) || [];
+  const base = trajs[0] || { monthly: [] };
+  const strat = trajs.find((t) => t.key === String(row.strategy.id)) || { monthly: [] };
+  const months = planHeadlineWindowMonths(view);
+  if (!months.length) return null;
+  const startMonth = months[planHeadlineWindowStartIdx(view)];
+  const endMonth = months[planHeadlineWindowEndIdx(view)];
+  const baseByMonth = new Map((base.monthly || []).map((r) => [r.month, r]));
+  const stratByMonth = new Map((strat.monthly || []).map((r) => [r.month, r]));
+  const bandTotalAt = (byMonth, m) => {
+    const r = byMonth.get(m) || {};
+    if (r.stock_p10 == null || r.stock_p90 == null) return null;
+    return { p10: planRound2(r.stock_p10 + (r.pool_balance || 0)), p90: planRound2(r.stock_p90 + (r.pool_balance || 0)) };
+  };
+  const sEnd = bandTotalAt(stratByMonth, endMonth);
+  const sStart = bandTotalAt(stratByMonth, startMonth);
+  const bEnd = bandTotalAt(baseByMonth, endMonth);
+  const bStart = bandTotalAt(baseByMonth, startMonth);
+  if (!sEnd || !sStart || !bEnd || !bStart) return null;
+  const dEnd = [planRound2(sEnd.p10 - bEnd.p90), planRound2(sEnd.p90 - bEnd.p10)];
+  const dStart = [planRound2(sStart.p10 - bStart.p90), planRound2(sStart.p90 - bStart.p10)];
+  const w = planHeadlineWindowed(view);
+  const cost = w ? w.cost : 0;
+  return {
+    valueAtHorizon: [sEnd.p10, sEnd.p90],
+    stockGain: [planRound2(dEnd[0] - dStart[1]), planRound2(dEnd[1] - dStart[0])],
+    netBenefit: [planRound2(dEnd[0] - dStart[1] - cost), planRound2(dEnd[1] - dStart[0] - cost)],
+  };
+}
+
 function planReportHeadlineCardsHtml(view) {
   const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
   if (!row) return '<div class="note">No strategies yet.</div>';
@@ -14057,6 +14121,17 @@ function planReportHeadlineCardsHtml(view) {
   // per-month / one-off and never move with the slider.
   const w = planHeadlineWindowed(view);
   const windowed = !!(w && !planHeadlineWindowIsFull(view));
+  // Pool volatility band (user 2026-11-06): on a cash-pool report
+  // with a band, the three value cards carry a P10–P90 range
+  // sub-line alongside the median. The medians stay the settled
+  // figures (flat value at horizon / opportunity-costed gain at the
+  // full window, grown windowed figures inside a narrowed window);
+  // the range is always the GROWN projection over the selected
+  // window, so at the full horizon it need not contain the flat
+  // median — the method line states this outright.
+  const poolBand = view.templateKey === 'pool' && view.comp.report && view.comp.report.poolBand && view.comp.report.poolBand.banded;
+  const ranges = poolBand ? planHeadlinePoolRanges(view, row) : null;
+  const showRanges = !!(poolBand && ranges);
   const net = windowed ? w.net : c.net;
   const cost = windowed ? w.cost : c.cost;
   const gain = windowed ? w.gain : c.gain;
@@ -14068,15 +14143,15 @@ function planReportHeadlineCardsHtml(view) {
   // local investmentScope check.
   const template = view.template || planReportTemplateFor('property');
   const showMortCards = template.mortgageHeadlineCards;
-  const card = (k, v) => `<div class="card breakdown-card plan-metric-card"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`;
+  const card = (k, v, range) => `<div class="card breakdown-card plan-metric-card"><div class="k">${k}</div><div class="v">${v}</div>${range ? `<div class="n">P10–P90 ${planMoney(range[0])} – ${planMoney(range[1])}</div>` : ''}<div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`;
   const cards = [
-    card('Net benefit', planMoney(net)),
+    card('Net benefit', planMoney(net), showRanges ? ranges.netBenefit : null),
     card('Total cost', planMoney(cost)),
     card('Total gain', planMoney(gain)),
-    card('Value at horizon', planMoney(valueAtHorizon)),
+    card('Value at horizon', planMoney(valueAtHorizon), showRanges ? ranges.valueAtHorizon : null),
   ];
   if (showMortCards) cards.push(card('Interest saved', planSigned(interestSaved)));
-  if (planReportStockInvolved(view.comp)) cards.push(card('Stock gain', planSigned(stockGain)));
+  if (planReportStockInvolved(view.comp)) cards.push(card('Stock gain', planSigned(stockGain), showRanges ? ranges.stockGain : null));
   if (showMortCards) {
     cards.push(card('Payoff shift', payoffShiftMonths == null ? '—' : `${payoffShiftMonths >= 0 ? '+' : ''}${payoffShiftMonths} months`));
     cards.push(card('Monthly payment Δ', planSigned(c.paymentDelta)));
@@ -14473,12 +14548,16 @@ function planAiBlockTableParts(view, blockIdx) {
   if (spec.tableKind !== 'monthly' && spec.tableKind !== 'yearly') return { tableHtml: '', pagerHtml: '' };
   const { startIdx, endIdx } = planAiBlockWin(spec);
   const labels = spec.labels || [];
+  // Band datasets (a time_line pool band's P10/P90 fills) are chart
+  // visuals, not table columns — the table keeps the median columns
+  // only, so the band values never widen it.
+  const tableDatasets = (spec.datasets || []).filter((d) => !d.tableSkip);
   const rows = [];
   for (let i = startIdx; i <= endIdx; i++) {
-    rows.push({ label: labels[i], values: (spec.datasets || []).map((d) => (d.data || [])[i] ?? null) });
+    rows.push({ label: labels[i], values: tableDatasets.map((d) => (d.data || [])[i] ?? null) });
   }
   if (!rows.length) return { tableHtml: '<div class="note">No months in this range.</div>', pagerHtml: '' };
-  const head = `<tr><th>${spec.tableKind === 'yearly' ? 'Year' : 'Month'}</th>${(spec.datasets || []).map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
+  const head = `<tr><th>${spec.tableKind === 'yearly' ? 'Year' : 'Month'}</th>${tableDatasets.map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
   const cell = (v) => `<td>${v == null ? '—' : money2(v)}</td>`;
   if (spec.tableKind === 'yearly') {
     return {
@@ -14491,7 +14570,7 @@ function planAiBlockTableParts(view, blockIdx) {
   if (!view.aiBlockTableYear[blockIdx] || !years.includes(view.aiBlockTableYear[blockIdx])) view.aiBlockTableYear[blockIdx] = years[0];
   const year = view.aiBlockTableYear[blockIdx];
   const pageRows = rows.filter((r) => String(r.label).slice(0, 4) === year);
-  const totalCells = (spec.datasets || []).map((d, di) => {
+  const totalCells = tableDatasets.map((d, di) => {
     const vals = pageRows.map((r) => r.values[di]).filter((v) => v != null);
     if (!vals.length) return '—';
     if (AI_BLOCK_FLOW_SERIES.includes(d.sid)) return money2(vals.reduce((a, v) => a + v, 0));
@@ -14553,9 +14632,12 @@ function planAiBlockRedraw(view, blockIdx) {
     const { startIdx, endIdx } = planAiBlockWin(spec);
     const labels = (spec.labels || []).slice(startIdx, endIdx + 1);
     const sliced = (spec.datasets || []).map((d) => ({ ...d, data: (d.data || []).slice(startIdx, endIdx + 1) }));
-    let opts;
-    if (spec.endLabels) opts = { endLabels: sliced.map((d) => `${d.label} ${money2(d.data[d.data.length - 1])}`) };
-    if (spec.kind === 'line') planLineChart(spec.cid, labels, sliced, opts || {});
+    // Line options travel on the spec (a time_line band's legend /
+    // tooltip filters): a redraw rebuilds the chart, so options
+    // passed only at first draw would be lost on the first drag.
+    const opts = { ...(spec.lineOpts || {}) };
+    if (spec.endLabels) opts.endLabels = sliced.map((d) => `${d.label} ${money2(d.data[d.data.length - 1])}`);
+    if (spec.kind === 'line') planLineChart(spec.cid, labels, sliced, opts);
     else if (spec.kind === 'bar') planBarChart(spec.cid, labels, sliced);
     else if (spec.kind === 'groupedBar') planGroupedBarChart(spec.cid, labels, sliced);
   }
@@ -14870,13 +14952,48 @@ async function loadPlanReport(projectId, reportId) {
         const datasets = [];
         for (const sid of sids) {
           trajs.forEach((t, ti) => {
-            datasets.push({ label: `${t.label} · ${PLAN_REPORT_SERIES_LABEL[sid] || sid}`, data: seriesAt(t, sid), borderColor: ti === 0 ? '#888' : planColor(ti - 1), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1), fill: false, pointRadius: 0, spanGaps: true, trajKey: t.key, sid });
+            const color = ti === 0 ? '#888' : planColor(ti - 1);
+            datasets.push({ label: `${t.label} · ${PLAN_REPORT_SERIES_LABEL[sid] || sid}`, data: seriesAt(t, sid), borderColor: color, backgroundColor: color, fill: false, pointRadius: 0, spanGaps: true, trajKey: t.key, sid });
+            // Pool volatility band (user 2026-11-06): on a cash-pool
+            // report the stock-value trajectory carries a P10–P90
+            // fill around its median line, from the trajectory's
+            // stock_p10 / stock_p90 rows (the pot has no volatility,
+            // so pool_balance gets no band). The median line is the
+            // current point estimate, unchanged. Band datasets carry
+            // no sid (the AI-block headline finder matches on sid),
+            // are hidden from the legend and tooltip, and are
+            // skipped by the block's monthly table (the table keeps
+            // the median columns only). The P90 dataset fills back
+            // to P10; the filters travel on the spec so a slider
+            // redraw keeps them hidden.
+            if (sid === 'stock_value' && template.key === 'pool') {
+              const p10 = seriesAt(t, 'stock_p10');
+              const p90 = seriesAt(t, 'stock_p90');
+              if (p10.some((v) => v != null) && p90.some((v) => v != null)) {
+                datasets.push({ label: `${t.label} · P10`, data: p10, borderColor: color, borderWidth: 0, pointRadius: 0, spanGaps: true, band: true, bandSid: sid, tableSkip: true });
+                datasets.push({ label: `${t.label} · P90`, data: p90, borderColor: color, borderWidth: 0, pointRadius: 0, spanGaps: true, fill: '-1', backgroundColor: planColorAlpha(color, 0.12), band: true, bandSid: sid, tableSkip: true });
+              }
+            }
           });
         }
-        const spec = { cid, kind: 'line', labels: months, datasets, blockIdx: i, win: { startIdx: 0, endIdx: months.length - 1 }, headlineMode: 'strategy', headlineSids: sids, tableKind: 'monthly' };
+        const lineOpts = { tooltipFilter: (it) => !it.dataset.band, legendFilter: (item, data) => !data.datasets[item.datasetIndex].band };
+        const spec = { cid, kind: 'line', labels: months, datasets, blockIdx: i, win: { startIdx: 0, endIdx: months.length - 1 }, headlineMode: 'strategy', headlineSids: sids, tableKind: 'monthly', lineOpts };
         planReportView.aiCharts.push(spec);
-        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><div class="note">${esc(how)}</div></div>`);
-        draws.push(() => planLineChart(cid, months, datasets));
+        // Pool band notes (user 2026-11-06): the Cash pool panel
+        // names the holdings with no band and the history pulls that
+        // failed (stored points used instead), plus the band's
+        // method line when a band drew.
+        const poolBandNotes = (() => {
+          if (template.key !== 'pool' || c.title !== 'Cash pool') return '';
+          const pb = (rep && rep.poolBand) || {};
+          const parts = [];
+          for (const nb of pb.noBand || []) parts.push(`<div class="note">${esc(nb.symbol)}: no volatility band — ${nb.reason === 'no usable price history' ? 'not enough price history (needs at least 2 monthly returns)' : esc(nb.reason)}.</div>`);
+          for (const hn of pb.historyNotes || []) parts.push(`<div class="note">Price history pull failed for ${esc(hn.symbol || 'a holding')}: ${esc(hn.error || 'fetch failed')} — using stored points.</div>`);
+          if (datasets.some((d) => d.band)) parts.push('<div class="note">P10–P90 band: each holding’s history volatility (longest window) around its median projection; holdings combined with no correlation; the cash balance has no volatility.</div>');
+          return parts.join('');
+        })();
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><div class="note">${esc(how)}</div>${poolBandNotes}</div>`);
+        draws.push(() => planLineChart(cid, months, datasets, lineOpts));
       } else if (c.template === 'metric_cards') {
         const sids = series || ['cost', 'gain', 'net'];
         const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'stock_gain' ? row.comparison.stockGain : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
@@ -15078,7 +15195,7 @@ async function loadPlanReport(projectId, reportId) {
         <div class="note" id="planReportTrajectoryNote"></div>
         <div id="planReportComparePicker" class="toolbar"></div>
         <div class="section-head"><h3>Difference vs baseline</h3></div>
-        <div class="note" id="planReportTrajCaption">${template.key === 'pool' ? 'X: month · Y: CAD — Baseline and strategy lines show absolute value; the shaded band between them is the Value Δ (strategy value − baseline value).' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.'}</div>
+        <div class="note" id="planReportTrajCaption">${template.key === 'pool' ? 'X: month · Y: CAD — Δ = strategy value − baseline value; the shaded band is the P10–P90 range of the Δ (strategy band minus baseline band: P10 = strategy P10 − baseline P90, P90 = strategy P90 − baseline P10).' : 'X: month · Y: CAD — Balance Δ = baseline balance − strategy balance (positive = strategy owes less); Value Δ = strategy value − baseline value.'}</div>
         <div id="planReportTrajRange"></div>
         <div class="chart-wrap plan-traj-wrap" style="height:280px"><canvas id="planReportTrajectoryChart"></canvas></div>
         <div id="planReportTrajectoryEmpty"></div>
@@ -15709,12 +15826,34 @@ function planDiffMonthly(d) {
   }
   for (const pt of (((d.baseline.stocks) || {}).series || [])) { const r = row(pt.month); r.valBase = (r.valBase || 0) + pt.value; }
   for (const pt of (((d.projection.stocks) || {}).series || [])) { const r = row(pt.month); r.valStrat = (r.valStrat || 0) + pt.value; }
-  return [...rows.values()].sort((a, b) => (a.month < b.month ? -1 : 1)).map((r) => ({
-    ...r,
-    balDiff: (r.balBase != null && r.balStrat != null) ? r.balBase - r.balStrat : null,
-    intSaved: (r.intBase != null && r.intStrat != null) ? r.intBase - r.intStrat : null,
-    valDiff: (r.valBase != null && r.valStrat != null) ? r.valStrat - r.valBase : null,
-  }));
+  // Pool volatility band (user 2026-11-06): the Δ band bounds at
+  // each month, from each side's poolBand (same source as the
+  // trajectory band rows). The widest honest Δ range: [strategy P10
+  // − baseline P90, strategy P90 − baseline P10]. A side with no
+  // band counts as a point (its median) — so a banded strategy
+  // against a flat baseline still gets a Δ band. Null when neither
+  // side has a value at that month.
+  const bandSide = (band, idx, med) => {
+    if (band && band.banded && idx != null) return { lo: band.p10[idx], hi: band.p90[idx] };
+    if (med != null) return { lo: med, hi: med };
+    return null;
+  };
+  const baseBand = (d.baseline.stocks && d.baseline.stocks.poolBand) || null;
+  const stratBand = (d.projection.stocks && d.projection.stocks.poolBand) || null;
+  const baseBandIdx = new Map((baseBand ? baseBand.months : []).map((m, i) => [m, i]));
+  const stratBandIdx = new Map((stratBand ? stratBand.months : []).map((m, i) => [m, i]));
+  return [...rows.values()].sort((a, b) => (a.month < b.month ? -1 : 1)).map((r) => {
+    const bSide = bandSide(baseBand, baseBandIdx.get(r.month), r.valBase);
+    const sSide = bandSide(stratBand, stratBandIdx.get(r.month), r.valStrat);
+    return {
+      ...r,
+      balDiff: (r.balBase != null && r.balStrat != null) ? r.balBase - r.balStrat : null,
+      intSaved: (r.intBase != null && r.intStrat != null) ? r.intBase - r.intStrat : null,
+      valDiff: (r.valBase != null && r.valStrat != null) ? r.valStrat - r.valBase : null,
+      valP10: (bSide && sSide) ? planRound2(sSide.lo - bSide.hi) : null,
+      valP90: (bSide && sSide) ? planRound2(sSide.hi - bSide.lo) : null,
+    };
+  });
 }
 
 // The shared report window's month list for a comparison block, or
@@ -15850,50 +15989,52 @@ function planTrajChartDraw(t, block, effMonths) {
       }
       if (!drewBalance) {
         if (isPool) {
-          // Pool Difference chart (user 2026-11-06): absolute
-          // trajectories — the baseline line + each picked strategy
-          // line — with a translucent band between the baseline and
-          // each strategy; the band IS the diff. The Δ line is gone
-          // (the Δ numbers live in the table below the chart). A
-          // strategy that moves no stocks coincides with the
-          // baseline, so with no move at all only the baseline line
-          // is drawn, plus the one-line note. The band fills to
-          // dataset 0 (the baseline) and is hidden from the tooltip,
-          // the legend, and the end labels.
+          // Pool Difference chart (user 2026-11-06): a Δ band chart
+          // — the median Δ (strategy value − baseline value) line
+          // per picked strategy, with a P10–P90 fill around it from
+          // the Δ band (strategy band minus baseline band, widest
+          // honest range). Both sides now carry bands (the Cash pool
+          // chart), so the old absolute-trajectory drawing — baseline
+          // + strategy lines with the band between them — is replaced
+          // by the Δ itself. A strategy with no band data draws its
+          // median Δ line only. The X axis ends at the baseline's
+          // last month (the trajectory months end there); the monthly
+          // table below is unchanged.
           const baseHas = diffRows[0].monthly.some((m) => m.valBase != null);
           const stratLines = diffRows.filter(({ monthly }) => monthly.some((m) => m.valStrat != null));
           if (baseHas && stratLines.length) {
-            const baseByMo = new Map(diffRows[0].monthly.map((m) => [m.month, m]));
-            const valDatasets = [{ label: 'Baseline', data: effMonths.map((mo) => { const m = baseByMo.get(mo); return m == null ? null : m.valBase; }), borderColor: planColor(0), backgroundColor: planColor(0), spanGaps: true }];
-            const valShorts = ['Baseline'];
-            if (hasStockMove) {
-              let ci = 1;
-              stratLines.forEach(({ r, monthly }) => {
-                const byMo = new Map(monthly.map((m) => [m.month, m]));
-                const data = effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valStrat; });
-                valDatasets.push({ label: `${r.strategy.letter} · ${r.strategy.name}`, data, borderColor: planColor(ci), backgroundColor: planColor(ci), spanGaps: true });
-                valShorts.push(r.strategy.letter);
-                valDatasets.push({ label: '', band: true, data, fill: 0, borderColor: planColor(ci), backgroundColor: planColorAlpha(planColor(ci), 0.12), borderWidth: 0, pointRadius: 0, spanGaps: true });
-                valShorts.push('');
-                ci += 1;
-              });
-            }
+            const valDatasets = [];
+            const valShorts = [];
+            const noBandNotes = [];
+            let ci = 0;
+            stratLines.forEach(({ r, monthly }) => {
+              const byMo = new Map(monthly.map((m) => [m.month, m]));
+              const color = planColor(ci);
+              const medData = effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valDiff; });
+              const hasBand = monthly.some((m) => m.valP10 != null && m.valP90 != null && m.valP10 !== m.valP90);
+              if (hasBand) {
+                valDatasets.push({ label: `${r.strategy.letter} · Δ P10`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valP10; }), borderColor: color, backgroundColor: color, borderWidth: 1, pointRadius: 0, spanGaps: true });
+                valShorts.push(`${r.strategy.letter} · Δ P10`);
+                valDatasets.push({ label: `${r.strategy.letter} · Δ`, data: medData, borderColor: color, backgroundColor: color, borderWidth: 2, pointRadius: 0, spanGaps: true });
+                valShorts.push(`${r.strategy.letter} · Δ`);
+                valDatasets.push({ label: `${r.strategy.letter} · Δ P90`, data: effMonths.map((mo) => { const m = byMo.get(mo); return m == null ? null : m.valP90; }), borderColor: color, backgroundColor: planColorAlpha(color, 0.12), borderWidth: 1, pointRadius: 0, spanGaps: true, fill: '-2' });
+                valShorts.push(`${r.strategy.letter} · Δ P90`);
+              } else {
+                valDatasets.push({ label: `${r.strategy.letter} · Δ`, data: medData, borderColor: color, backgroundColor: color, borderWidth: 2, pointRadius: 0, spanGaps: true });
+                valShorts.push(`${r.strategy.letter} · Δ`);
+                if (monthly.some((m) => m.valDiff != null && m.valDiff !== 0)) noBandNotes.push(`${r.strategy.letter} · ${r.strategy.name}: no Δ band — not enough price history.`);
+              }
+              ci += 1;
+            });
             const endLabels = valDatasets.map((ds, i) => {
-              if (ds.band) return null;
               let v = null;
               for (let k = ds.data.length - 1; k >= 0; k--) { if (ds.data[k] != null) { v = ds.data[k]; break; } }
-              return v == null ? null : `${valShorts[i]} · $${moneyTick(Math.round(v))}`;
+              return v == null ? null : `${valShorts[i]} $${moneyTick(Math.round(v))}`;
             });
-            planLineChart(t.chart, effMonths.map(formatYM), valDatasets, {
-              endLabels,
-              tooltipFilter: (it) => !it.dataset.band,
-              legendFilter: (item, data) => !data.datasets[item.datasetIndex].band,
-            });
-            if (empty) empty.innerHTML = hasStockMove ? '' : noStockMoveNote;
+            planLineChart(t.chart, effMonths.map(formatYM), valDatasets, { endLabels });
+            if (empty) empty.innerHTML = [hasStockMove ? '' : noStockMoveNote, ...noBandNotes.map((n) => `<div class="note">${esc(n)}</div>`)].filter(Boolean).join('');
             const caption = t.caption ? $(t.caption) : null;
-            if (caption) caption.textContent = hasStockMove
-              ? 'X: month · Y: CAD — Baseline and strategy lines show absolute value; the shaded band between them is the Value Δ (strategy value − baseline value).'
-              : 'X: month · Y: CAD — Baseline value; the strategy moves no stocks, so it tracks the baseline exactly (Value Δ is $0).';
+            if (caption) caption.textContent = 'X: month · Y: CAD — Δ = strategy value − baseline value; the shaded band is the P10–P90 range of the Δ (strategy band minus baseline band: P10 = strategy P10 − baseline P90, P90 = strategy P90 − baseline P10).';
           } else { planDestroyChart(t.chart); if (empty) empty.innerHTML = '<div class="note">No difference data.</div>'; }
         } else {
           const dDatasets = [];

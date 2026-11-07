@@ -22,7 +22,7 @@ import {
 } from '../src/investments.js';
 import {
   parseStooqCsv, stooqSymbolFor, parseYahooChart, parseNasdaqHistorical, ensureHoldingPrices, ensureHoldingPricesDetailed,
-  refreshAllPrices, priceStatusFor, clearHoldingPriceMeta,
+  refreshAllPrices, priceStatusFor, clearHoldingPriceMeta, ensurePoolHistory,
   parseYahooSearch, searchSecurities, fetchYahooHistory, fetchStooqHistory, latestPrice,
   fetchFxRates, FX_SERIES,
 } from '../src/prices.js';
@@ -552,6 +552,94 @@ test('ensureHoldingPrices: Stooq empty falls back to Yahoo; Stooq data never con
     if (savedEnv.y === undefined) delete process.env.YAHOO_BASE_URL; else process.env.YAHOO_BASE_URL = savedEnv.y;
     db.close();
   }
+});
+
+test('ensurePoolHistory: pulls only history-less holdings, stores points, never throws', async () => {
+  // Pool history pull (user 2026-11-06): at Generate, a holding
+  // with no usable rate or σ gets its full history pulled and
+  // stored, so the projection (and the band) use real history.
+  // A holding that already has both is never pulled; a failed fetch
+  // falls back to stored points with a note and never fails the
+  // caller; a failing holding is backed off, not re-attempted.
+  const poolDb = () => {
+    const d = new Database(':memory:');
+    d.exec(`
+      CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE invest_prices (id INTEGER PRIMARY KEY, holding_id INTEGER, date TEXT, price REAL, source TEXT, created_at TEXT, UNIQUE (holding_id, date, source));
+    `);
+    return d;
+  };
+  const db = poolDb();
+  const ins = db.prepare('INSERT INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, ?, ?)');
+  // Holding 1: AMZN-like — one stored point only (no rate, no σ).
+  ins.run(1, '2026-10-30', 266.03, 'nasdaq', '2026-10-30T00:00:00Z');
+  // Holding 2: FAN-like — 13 monthly points alternating ±10%
+  // (2025-11 → 2026-11), already has a rate + σ.
+  const months12 = [];
+  for (let i = 0; i < 13; i++) {
+    const y = 2025 + Math.floor((10 + i) / 12);
+    const m = ((10 + i) % 12) + 1;
+    months12.push(`${y}-${String(m).padStart(2, '0')}`);
+  }
+  let p = 100;
+  months12.forEach((m, i) => {
+    if (i > 0) p *= (i % 2 === 1 ? 1.10 : 0.90);
+    ins.run(2, `${m}-15`, Number(p.toFixed(6)), 'stooq', '2026-01-01T00:00:00Z');
+  });
+  const holdings = [
+    { id: 1, kind: 'exchange', symbol: 'AMZN' },
+    { id: 2, kind: 'exchange', symbol: 'FAN.A' },
+    { id: 3, kind: 'fund', symbol: 'CIBC FUND' },
+    { id: 4, kind: 'exchange', symbol: '' },
+  ];
+  // Stubbed fetcher: inserts a year of monthly points for AMZN,
+  // like a successful Stooq/Yahoo pull would.
+  const fetched = [];
+  const fetchHolding = async (h) => {
+    fetched.push(h.symbol);
+    let q = 200;
+    const pts = months12.map((m, i) => {
+      if (i > 0) q *= (i % 2 === 1 ? 1.10 : 0.90);
+      return [`${m}-15`, Number(q.toFixed(6))];
+    });
+    db.transaction(() => {
+      for (const [date, price] of pts) ins.run(h.id, date, price, 'stooq', '2026-11-07T00:00:00Z');
+    })();
+    return { ok: true, source: 'stooq' };
+  };
+  const out = await ensurePoolHistory(db, holdings, { currentMonth: '2026-11', fetchHolding });
+  assert.deepEqual(fetched, ['AMZN'], 'only the history-less holding is pulled');
+  assert.equal(out.notes.length, 0);
+  assert.equal(out.results.length, 1);
+  assert.equal(out.results[0].symbol, 'AMZN');
+  assert.equal(out.results[0].ok, true);
+  assert.ok(out.results[0].ratePct != null, 'the pulled history yields a rate');
+  assert.ok(out.results[0].volPct != null, 'the pulled history yields a σ');
+  assert.ok(listPricePoints(db, 1).length >= 13, 'points land in invest_prices');
+  // Second call: AMZN now has a rate + σ — no pull at all.
+  fetched.length = 0;
+  const out2 = await ensurePoolHistory(db, holdings, { currentMonth: '2026-11', fetchHolding });
+  assert.deepEqual(fetched, []);
+  assert.deepEqual(out2.results, []);
+  db.close();
+  // A failing fetch falls back to stored points with a note and
+  // never throws — and the backoff key keeps it from retrying.
+  const db2 = poolDb();
+  const ins2 = db2.prepare('INSERT INTO invest_prices (holding_id, date, price, source, created_at) VALUES (?, ?, ?, ?, ?)');
+  ins2.run(9, '2026-10-30', 100, 'nasdaq', '2026-10-30T00:00:00Z');
+  const failing = async () => { throw new Error('network down'); };
+  const out3 = await ensurePoolHistory(db2, [{ id: 9, kind: 'exchange', symbol: 'BROKEN' }], { currentMonth: '2026-11', fetchHolding: failing });
+  assert.equal(out3.results.length, 1);
+  assert.equal(out3.results[0].ok, false);
+  assert.equal(out3.notes.length, 1);
+  assert.equal(out3.notes[0].symbol, 'BROKEN');
+  assert.ok(/network down/.test(out3.notes[0].error));
+  assert.deepEqual(listPricePoints(db2, 9).map((q) => q.price), [100], 'stored points untouched');
+  let tries = 0;
+  const counting = async () => { tries += 1; throw new Error('still down'); };
+  await ensurePoolHistory(db2, [{ id: 9, kind: 'exchange', symbol: 'BROKEN' }], { currentMonth: '2026-11', fetchHolding: counting });
+  assert.equal(tries, 0, 'backed off — no re-attempt inside the window');
+  db2.close();
 });
 
 test('parseNasdaqHistorical: real tradesTable shape → ascending closes, $ prefix stripped, junk dropped', () => {

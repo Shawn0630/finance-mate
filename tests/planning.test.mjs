@@ -9,7 +9,7 @@ import {
   validateOp, validateLegs, computeProjection, compareProjections,
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
   resolveBuyLegs, reportMonthlySeries, reportCostBreakdown, monthlyNetCashflowSeries,
-  holdingVolatilityFromPoints, stockFanSeries,
+  holdingVolatilityFromPoints, stockFanSeries, aggregatePoolStockBand,
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel, planListSections,
   buildPlanAiSnapshot, normalizeAiAsk,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
@@ -504,6 +504,106 @@ test('computeProjection: stockFan carries one fan per history holding, noFan for
   // The single-point holding gets no fan — noted, never invented.
   assert.equal(fan.noFan.length, 1);
   assert.equal(fan.noFan[0].symbol, 'GIC 4.6%');
+});
+
+test('aggregatePoolStockBand: value-weighted no-correlation band centered on the median', () => {
+  const z = 1.2815515655446004; // P10/P90 of the standard normal
+  const months = ['2026-11', '2026-12', '2027-11'];
+  // Single holding, σ 20%: t=0 the band coincides with the median;
+  // t=1mo f = exp(z·0.2·√(1/12)); t=12mo f = exp(z·0.2·1).
+  const single = aggregatePoolStockBand(
+    [{ holdingId: 1, symbol: 'A', sigma: 0.2, median: [1000, 1100, 1210] }], months, '2026-11');
+  assert.equal(single.banded, true);
+  assert.deepEqual(single.noBand, []);
+  assert.deepEqual(single.median, [1000, 1100, 1210]);
+  assert.deepEqual([single.p10[0], single.p90[0]], [1000, 1000]);
+  const f1 = Math.exp(z * 0.2 * Math.sqrt(1 / 12));
+  assert.ok(Math.abs(single.p10[1] - 1100 / f1) < 0.01);
+  assert.ok(Math.abs(single.p90[1] - 1100 * f1) < 0.01);
+  const f12 = Math.exp(z * 0.2);
+  assert.ok(Math.abs(single.p10[2] - 1210 / f12) < 0.01);
+  assert.ok(Math.abs(single.p90[2] - 1210 * f12) < 0.01);
+  // Multi-holding: value-weighted, no correlation — σ_pool² =
+  // Σ(w·σ)². A: σ 0.2, median 100→110→121; B: no σ, median 50→55→60.
+  // At t=1mo w_A = 110/165 = 2/3, σ_pool = 0.1333, f ≈ 1.05057.
+  const multi = aggregatePoolStockBand([
+    { holdingId: 1, symbol: 'A', sigma: 0.2, median: [100, 110, 121] },
+    { holdingId: 2, symbol: 'B', sigma: null, median: [50, 55, 60] },
+  ], months, '2026-11');
+  assert.equal(multi.banded, true);
+  assert.deepEqual(multi.median, [150, 165, 181]);
+  assert.deepEqual(multi.noBand, [{ holdingId: 2, symbol: 'B', reason: 'no usable price history' }]);
+  const fm = Math.exp(z * (2 / 3 * 0.2) * Math.sqrt(1 / 12));
+  assert.ok(Math.abs(multi.p10[1] - 165 / fm) < 0.01, JSON.stringify(multi.p10));
+  assert.ok(Math.abs(multi.p90[1] - 165 * fm) < 0.01, JSON.stringify(multi.p90));
+  // The σ-less holding dilutes the pool vol: the multi band is
+  // narrower than the single-holding band at the same month.
+  assert.ok((multi.p90[1] - multi.p10[1]) < (single.p90[1] - single.p10[1]));
+  // Zero vol: the band collapses to the median (still banded — the
+  // holding HAS a σ, it is 0), never listed as no-band.
+  const flat = aggregatePoolStockBand(
+    [{ holdingId: 1, symbol: 'A', sigma: 0, median: [100, 110] }], ['2026-11', '2026-12'], '2026-11');
+  assert.equal(flat.banded, true);
+  assert.deepEqual(flat.noBand, []);
+  assert.deepEqual(flat.p10, flat.median);
+  assert.deepEqual(flat.p90, flat.median);
+  // No σ anywhere: no band, p10/p90 equal the median, all listed.
+  const none = aggregatePoolStockBand([
+    { holdingId: 1, symbol: 'A', sigma: null, median: [100, 110] },
+  ], ['2026-11', '2026-12'], '2026-11');
+  assert.equal(none.banded, false);
+  assert.deepEqual(none.p10, none.median);
+  assert.deepEqual(none.p90, none.median);
+  assert.equal(none.noBand.length, 1);
+  // aggregateMedian override: the band centers on the caller's
+  // exact series (the projection's stock series), not the sum.
+  const over = aggregatePoolStockBand(
+    [{ holdingId: 1, symbol: 'A', sigma: 0.2, median: [100, 110] }],
+    ['2026-11', '2026-12'], '2026-11', [100.01, 110.02]);
+  assert.deepEqual(over.median, [100.01, 110.02]);
+  assert.ok(Math.abs(over.p10[1] - 110.02 / f1) < 0.01);
+});
+
+test('computeProjection: poolBand carries the aggregate band, centered on the stock series', () => {
+  // Same FAN.A fixture as the fan test: 100 units, 13 monthly
+  // points alternating ±10% — vol 36.1814%, 1y CAGR ≈ −5.85%.
+  const months12 = [];
+  for (let i = 0; i < 13; i++) {
+    const y = 2025 + Math.floor((10 + i) / 12);
+    const m = ((10 + i) % 12) + 1;
+    months12.push(`${y}-${String(m).padStart(2, '0')}`);
+  }
+  let p = 100;
+  const pts12 = months12.map((m, i) => {
+    if (i > 0) p *= (i % 2 === 1 ? 1.10 : 0.90);
+    return { date: `${m}-15`, price: Number(p.toFixed(6)) };
+  });
+  const fanHolding = {
+    id: 1, accountId: 1, symbol: 'FAN.A', currency: 'CAD',
+    events: [{ date: '2025-01-15', type: 'buy', units: 100, price: 100 }],
+    pricePoints: pts12,
+  };
+  const gicHolding = {
+    id: 2, accountId: 1, symbol: 'GIC 4.6%', currency: 'CAD',
+    events: [{ date: '2026-01-15', type: 'buy', units: 10, price: 100 }],
+    pricePoints: [{ date: '2026-01-15', price: 100 }],
+  };
+  const rate = { 1: -5.852 };
+  const base = computeProjection(ARGS({ mainline: MAINLINE({ holdings: [fanHolding, gicHolding] }), holdingGrowth: rate }));
+  assert.deepEqual(base.errors, []);
+  const band = base.stocks.poolBand;
+  assert.ok(band, 'projection carries poolBand');
+  assert.equal(band.banded, true);
+  // The median IS the stock series (to the cent): 100 units ×
+  // 94.148015 + GIC $1,000 = $10,414.80 at the current month.
+  assert.deepEqual(band.median, base.stocks.series.map((r) => r.value));
+  assert.ok(Math.abs(band.median[0] - 10414.8) < 0.5, JSON.stringify(band.median[0]));
+  assert.deepEqual([band.p10[0], band.p90[0]], [band.median[0], band.median[0]]);
+  assert.ok(band.p10[12] < band.median[12] && band.median[12] < band.p90[12]);
+  assert.ok((band.p90[12] - band.p10[12]) > (band.p90[1] - band.p10[1]));
+  // The single-point GIC holding contributes median only — listed.
+  assert.equal(band.noBand.length, 1);
+  assert.equal(band.noBand[0].symbol, 'GIC 4.6%');
 });
 
 // ------------------------------------------------------------- leg solving

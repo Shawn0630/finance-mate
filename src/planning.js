@@ -947,6 +947,25 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
     const fan = stockFanSeries({ value0: round2(value0), ratePct: rate.ratePct, volPct: vol.volPct, months });
     stockFan.fans.push({ holdingId: h.id, symbol, label: h.label || h.symbol || '', ratePct: rate.ratePct, rateWindow: rate.window, rateBasis: rate.basis, volPct: vol.volPct, volWindow: vol.window, volReturns: vol.returns, ...fan });
   }
+  // Pool stock-value band (user 2026-11-06): the aggregate P10–P90
+  // range of THIS projection's stock value — baseline and strategy
+  // each get their own, from their own holdings and ops. Per-holding
+  // medians are the same units × priceAt the stock series uses, so
+  // the band centers on the displayed median; the aggregate median
+  // passed in is the stock series itself (to the cent). Holdings
+  // without a usable σ contribute median only (listed in noBand).
+  const poolBand = aggregatePoolStockBand(
+    (mainline.holdings || []).map((h) => {
+      const median = months.map((m) => {
+        const u = baselineUnitsAt(h, m) + (opUnitsDelta.get(h.id) || []).filter((d) => d.month <= m).reduce((s, d) => s + d.delta, 0);
+        const pr = priceAt(h, m);
+        return pr == null || u === 0 ? 0 : round2(toCad(h, u * pr));
+      });
+      const vol = holdingVolatilityFromPoints(h.pricePoints, currentMonth);
+      return { holdingId: h.id, symbol: h.symbol || h.label || `Holding ${h.id}`, sigma: vol ? vol.volPct / 100 : null, median };
+    }),
+    months, currentMonth, stockSeries.map((r) => r.value),
+  );
   // Pot at horizon: final pot value (pot moves only on op dates).
   valueAtHorizon = round2((stockSeries.length ? stockSeries[stockSeries.length - 1].value : 0) + pot);
   // Stock gain vs the STARTING value is informational only. The
@@ -993,7 +1012,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
 
   return {
     mortgage: { perProperty: mortgagePerProperty, baselineInterest: round2(baselineInterest), strategyInterest: round2(strategyInterest), interestSaved },
-    stocks: { series: stockSeries, potSeries, startingValue: round2(startingValue), valueAtHorizon, flatValueAtHorizon: round2(flatStockAtHorizon + pot), buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart },
+    stocks: { series: stockSeries, potSeries, startingValue: round2(startingValue), valueAtHorizon, flatValueAtHorizon: round2(flatStockAtHorizon + pot), buyCash: round2(buyCash), buyCashFromSells: round2(buyCashFromSells), sellExternalOut: round2(sellExternalOut), potAtHorizon: round2(pot), gainVsStart: stockGainVsStart, poolBand },
     fees: round2(fees), penalties, penaltyTotal,
     cost, valueAtHorizon: projectedTotalAtHorizon, flatValueAtHorizon,
     payoffShiftMonths: payoffShiftOf(mortgagePerProperty),
@@ -2817,6 +2836,50 @@ export function stockFanSeries({ value0, ratePct, volPct, months }) {
     p90.push(round2(med * f));
   }
   return { months: [...(months || [])], median, p10, p90 };
+}
+
+// Pool stock-value band (user 2026-11-06): the AGGREGATE P10–P90
+// range of a projection's stock value — the per-holding detail is
+// the fan; this is the pool as a whole. Each holding contributes its
+// own median series (the effective growthFor rate — the band CENTERS
+// on the existing point estimate, it never re-centers it) and its own
+// history σ (holdingVolatilityFromPoints, longest window; null when
+// no usable history). Multi-holding pools combine with NO
+// correlation: σ_pool² = Σ (w·σ)² with w the holding's value share
+// at that month — a simplification the viewer states. A holding with
+// no σ contributes its median only and is listed in noBand; a
+// zero-vol holding dilutes the pool σ (its w·0 term) rather than
+// being dropped. The cash pot has no volatility and is NOT in the
+// band — the viewer adds it to the median only. aggregateMedian
+// overrides the summed median when the caller has an exact series
+// (computeProjection passes the stock series so the band centers on
+// the displayed median to the cent); otherwise the median is the
+// per-holding sum. banded is false when no holding carries a σ (or
+// the pool is empty) — then p10/p90 equal the median and the viewer
+// draws no range.
+export function aggregatePoolStockBand(perHolding, months, currentMonth, aggregateMedian = null) {
+  const z = 1.2815515655446004; // P10/P90 of the standard normal
+  const ms = [...(months || [])];
+  const median = ms.map((_, i) => round2(aggregateMedian ? (aggregateMedian[i] ?? 0) : perHolding.reduce((s, h) => s + ((h.median || [])[i] || 0), 0)));
+  const noBand = (perHolding || []).filter((h) => h.sigma == null).map((h) => ({ holdingId: h.holdingId, symbol: h.symbol, reason: 'no usable price history' }));
+  const banded = (perHolding || []).some((h) => h.sigma != null) && median.some((v) => v > 0);
+  const p10 = [];
+  const p90 = [];
+  for (let i = 0; i < ms.length; i++) {
+    const med = median[i];
+    if (!banded || !(med > 0)) { p10.push(med); p90.push(med); continue; }
+    const t = (monthIdxOf(ms[i]) - monthIdxOf(currentMonth)) / 12;
+    let varSum = 0;
+    for (const h of perHolding || []) {
+      if (h.sigma == null) continue;
+      const w = ((h.median || [])[i] || 0) / med;
+      varSum += (w * h.sigma) * (w * h.sigma);
+    }
+    const f = Math.exp(z * Math.sqrt(varSum) * Math.sqrt(t));
+    p10.push(round2(med / f));
+    p90.push(round2(med * f));
+  }
+  return { months: ms, median, p10, p90, banded, noBand };
 }
 
 // Pool item SHAPES only (no database): each item names exactly one

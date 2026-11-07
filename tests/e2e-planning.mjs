@@ -6709,36 +6709,38 @@ export async function run(H, S) {
           && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Stock gain'].every((k) => repPool.headline.includes(k))
           && !repPool.headline.some((k) => ['Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].includes(k)),
         JSON.stringify({ headline: repPool.headline }));
-      // Diff-band (user 2026-11-06): the pool Difference chart draws
-      // absolute baseline + strategy lines with a translucent band
-      // between them — the band IS the Value Δ. Fixture numbers:
+      // Diff-band (user 2026-11-06, pool volatility round): the
+      // pool Difference chart is a Δ band chart — the median Δ
+      // (strategy value − baseline value) line per strategy, with a
+      // P10–P90 fill around it when the sides carry bands. This
+      // fixture's holdings have no price history, so no band draws
+      // and the chart is the median Δ line only. Fixture numbers:
       // baseline flat $10,000; at the sell month the strategy holds
-      // $7,600 of stock (band $2,400 wide); from the buy month on it
-      // holds $8,800 (band $1,200 wide). The table's Value Δ at the
-      // sell month must agree (−$2,400).
-      H.check('diff-band: pool Difference chart draws absolute baseline + strategy lines with a band, no Δ line, no breakdown section',
-        repPool.diffSets && repPool.diffSets.length === 3
-          && repPool.diffSets[0].label === 'Baseline' && repPool.diffSets[1].label.includes('Sell then buy')
-          && repPool.diffSets[2].label === '' && repPool.diffSets[2].band === true && repPool.diffSets[2].fill === 0
-          && !repPool.diffSets.some((d) => /Δ/.test(d.label || ''))
-          && Array.isArray(repPool.diffEndLabels) && repPool.diffEndLabels.length === 3
-          && repPool.diffEndLabels[0] === 'Baseline · $10,000' && repPool.diffEndLabels[1] === 'A · $8,800' && repPool.diffEndLabels[2] === null
+      // $7,600 of stock (Δ −$2,400); from the buy month on it holds
+      // $8,800 (Δ −$1,200). The table's Value Δ at the sell month
+      // must agree (−$2,400).
+      H.check('diff-band: pool Difference chart draws a median Δ line (no absolute baseline/strategy lines, no breakdown section)',
+        repPool.diffSets && repPool.diffSets.length === 1
+          && repPool.diffSets[0].label === 'A · Δ' && repPool.diffSets[0].band === false
+          && !repPool.diffSets.some((d) => d.label === 'Baseline' || /P10|P90/.test(d.label || ''))
+          && Array.isArray(repPool.diffEndLabels) && repPool.diffEndLabels.length === 1
+          && repPool.diffEndLabels[0] === 'A · Δ $-1,200'
           && repPool.diffLastLabel === icLastLabel
           && repPool.breakdownNull === true && repPool.breakdownAbsent === true,
         JSON.stringify({ diffSets: repPool.diffSets, endLabels: repPool.diffEndLabels, lastLabel: repPool.diffLastLabel, expectedLast: icLastLabel }));
-      H.check('diff-band: band width equals |Value Δ| at the sell month ($2,400) and the buy month ($1,200), and matches the table',
+      H.check('diff-band: Δ line equals Value Δ at the sell month (−$2,400) and the buy month (−$1,200), and matches the table',
         repPool.diffSellIdx >= 0 && repPool.diffBuyIdx >= 0
-          && repPool.diffAtSell && repPool.diffAtSell[0] === 10000 && repPool.diffAtSell[1] === 7600 && repPool.diffAtSell[2] === 7600
-          && Math.abs(repPool.diffAtSell[1] - repPool.diffAtSell[0]) === 2400
-          && repPool.diffAtBuy && repPool.diffAtBuy[0] === 10000 && repPool.diffAtBuy[1] === 8800 && repPool.diffAtBuy[2] === 8800
-          && Math.abs(repPool.diffAtBuy[1] - repPool.diffAtBuy[0]) === 1200
+          && repPool.diffAtSell && repPool.diffAtSell.length === 1 && repPool.diffAtSell[0] === -2400
+          && repPool.diffAtBuy && repPool.diffAtBuy.length === 1 && repPool.diffAtBuy[0] === -1200
           && repPool.sellRow && repPool.sellRow.base === 10000 && repPool.sellRow.strat === 7600 && repPool.sellRow.diff === -2400,
         JSON.stringify({ atSell: repPool.diffAtSell, atBuy: repPool.diffAtBuy, sellRow: repPool.sellRow }));
       H.check('diff-band: Difference table renders inside the comparison panel, below the chart',
         repPool.tableInComparePanel === true && repPool.chartBeforeTable === true,
         JSON.stringify({ inPanel: repPool.tableInComparePanel, before: repPool.chartBeforeTable }));
-      H.check('gic-caption-rate: pool report Difference chart caption names Value Δ only (no Balance Δ)',
-        repPool.trajCap.includes('Value Δ') && !repPool.trajCap.includes('Balance Δ'),
+      H.check('diff-band: pool report Difference chart caption names the Δ band (no Balance Δ)',
+        repPool.trajCap.includes('Δ = strategy value − baseline value')
+          && repPool.trajCap.includes('P10–P90 range of the Δ')
+          && !repPool.trajCap.includes('Balance Δ'),
         JSON.stringify({ trajCap: repPool.trajCap }));
       // (reportaudit) The Penalty variable is mortgage-only: a
       // cash-pool report has no Penalty input and no Variables
@@ -11609,6 +11611,17 @@ export async function run(H, S) {
   r = await H.req('POST', '/api/planning/projects', { name: 'Fan Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: fanHold, percent: 100 }, { holdingId: fanGicHold, percent: 100 }] }, applyRecommendation: true });
   H.check('fan: pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const fanProjId = r.data.project.id;
+  // Pool band strategy (user 2026-11-06): buy 10 more FAN.A
+  // (pool-funded) so the strategy trajectory differs from the
+  // baseline and the Δ band is non-degenerate. The buy price is the
+  // last NAV (94.148015).
+  r = await H.req('POST', `/api/planning/projects/${fanProjId}/strategies`, { name: 'Buy more FAN.A', source: 'manual' });
+  H.check('poolband: strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const fanStratId = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${fanStratId}/ops`, {
+    op_type: 'buy', params: { accountId: fanAcct, holdingId: fanHold, symbol: 'FAN.A', date: `${_fanYm(0)}-01`, units: 10, price: Number(fanPrice.toFixed(6)) },
+  });
+  H.check('poolband: buy op created', r.status === 201, JSON.stringify(r.data));
   r = await H.req('GET', `/api/planning/projects/${fanProjId}/comparison`);
   const fanRep = r.data.report || {};
   const fan0 = (fanRep.stockFan && fanRep.stockFan.fans) || [];
@@ -11625,6 +11638,39 @@ export async function run(H, S) {
     JSON.stringify({ volPct: fanA && fanA.volPct, ratePct: fanA && fanA.ratePct, median0: fanA && fanA.median[0], p10: fanA && fanA.p10[12], med: fanA && fanA.median[12], p90: fanA && fanA.p90[12] }));
   H.check('fan: the history-less holding is noted, never given a fan',
     fanNo.length === 1 && fanNo[0].symbol === 'FAN.GIC', JSON.stringify(fanNo));
+  // Pool volatility band (user 2026-11-06): the aggregate P10–P90
+  // range of the pool's stock value. The baseline trajectory carries
+  // stock_p10/stock_p90 rows (median = the stock series, degenerate
+  // at t=0, widening with √t); the report carries poolBand meta
+  // (banded, noBand names FAN.GIC); the failed pull against the
+  // stubs is noted, never a failed comparison. The Δ band inputs
+  // hand-check: at month 12 the strategy-vs-baseline Δ sits inside
+  // [strategy P10 − baseline P90, strategy P90 − baseline P10].
+  const fanBand = fanRep.poolBand || {};
+  const fanTrajs = fanRep.trajectories || [];
+  const fanBaseTraj = fanTrajs[0] || { monthly: [] };
+  const fanStratTraj = fanTrajs.find((t) => t.key === String(fanStratId)) || { monthly: [] };
+  const fb0 = fanBaseTraj.monthly[0] || {};
+  const fb1 = fanBaseTraj.monthly[1] || {};
+  const fb12 = fanBaseTraj.monthly[12] || {};
+  const fs12 = fanStratTraj.monthly[12] || {};
+  H.check('poolband: comparison carries the aggregate pool band (banded; median = stock series; P10 < median < P90; widens; history-less holding in noBand)',
+    fanBand.banded === true
+      && (fanBand.noBand || []).some((nb) => nb.symbol === 'FAN.GIC')
+      && fb0.stock_p10 != null && fb0.stock_p90 != null
+      && fb0.stock_p10 === fb0.stock_value && fb0.stock_p90 === fb0.stock_value
+      && Math.abs(fb0.stock_value - 10414.8) < 1
+      && fb12.stock_p10 < fb12.stock_value && fb12.stock_value < fb12.stock_p90
+      && (fb12.stock_p90 - fb12.stock_p10) > (fb1.stock_p90 - fb1.stock_p10),
+    JSON.stringify({ banded: fanBand.banded, noBand: fanBand.noBand, m0: fb0, m1: fb1, m12: fb12 }));
+  H.check('poolband: the history-less holding\'s failed pull is noted, never a failed comparison',
+    (fanBand.historyNotes || []).some((n) => n.symbol === 'FAN.GIC'), JSON.stringify(fanBand.historyNotes));
+  H.check('poolband: Δ band inputs hand-check at month 12 (median Δ inside [strategy P10 − baseline P90, strategy P90 − baseline P10], non-degenerate)',
+    fs12.stock_p10 != null && fs12.stock_p90 != null
+      && (fs12.stock_p10 - fb12.stock_p90) < (fs12.stock_value - fb12.stock_value)
+      && (fs12.stock_value - fb12.stock_value) < (fs12.stock_p90 - fb12.stock_p10)
+      && (fs12.stock_p10 - fb12.stock_p90) < (fs12.stock_p90 - fb12.stock_p10),
+    JSON.stringify({ strat12: fs12, base12: fb12 }));
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('fan browser checks skipped (puppeteer-core / probe Chrome not available)');
   } else {
@@ -11681,6 +11727,31 @@ export async function run(H, S) {
       const fanView = await page.evaluate(() => {
         const heads = [...document.querySelectorAll('#planReport h3')].map((h) => h.textContent);
         const panel = [...document.querySelectorAll('#planReport .panel')].find((p) => p.textContent.includes('Stock volatility fan'));
+        // Pool band surfaces (user 2026-11-06): the Cash pool panel
+        // names the band method + the holding with no band; the
+        // headline's Value at horizon card carries a P10–P90 range
+        // bracketing its median; the Difference chart caption names
+        // the Δ band and the monthly table still renders below it.
+        const cashPanel = [...document.querySelectorAll('#planReport .panel')].find((p) => (p.querySelector('h3')?.textContent || '') === 'Cash pool');
+        const parseMoney = (t) => { const v = (t || '').replace(/[$,+\s]/g, ''); return v === '—' || v === '' ? null : Number(v); };
+        const valCard = [...document.querySelectorAll('#planReportHeadlineCards .card')].find((c) => (c.querySelector('.k')?.textContent || '').trim() === 'Value at horizon');
+        const valRange = valCard ? [...valCard.querySelectorAll('.n')].map((n) => n.textContent).find((t) => t.includes('P10–P90')) : null;
+        const valMed = valCard ? parseMoney(valCard.querySelector('.v')?.textContent) : null;
+        // The range is the GROWN projection; the median stays the
+        // settled flat figure, so the range need not bracket it —
+        // the pin is that the range renders, non-degenerate, with a
+        // numeric median beside it.
+        let rangeOk = false;
+        if (valRange) {
+          const m = valRange.match(/P10–P90\s*\$?(-?[\d,]+\.\d+)\s*[–-]\s*\$?(-?[\d,]+\.\d+)/);
+          if (m && valMed != null) {
+            const lo = Number(m[1].replace(/,/g, ''));
+            const hi = Number(m[2].replace(/,/g, ''));
+            rangeOk = lo < hi;
+          }
+        }
+        const trajCap = document.querySelector('#planReportTrajCaption')?.textContent || '';
+        const comparePanel = document.querySelector('#planReportComparePanel');
         return {
           hasFanTitle: heads.some((h) => h.includes('Stock volatility fan')),
           canvas: !!panel && !!panel.querySelector('canvas'),
@@ -11688,10 +11759,20 @@ export async function run(H, S) {
           estimateNote: !!panel && panel.textContent.includes('Past volatility is an estimate, not a prediction'),
           symbol: !!panel && panel.textContent.includes('FAN.A'),
           noFanNote: !!panel && panel.textContent.includes('FAN.GIC') && panel.textContent.includes('no volatility fan'),
+          cashBandNote: !!cashPanel && cashPanel.textContent.includes('P10–P90 band:'),
+          cashNoBandNote: !!cashPanel && cashPanel.textContent.includes('FAN.GIC') && cashPanel.textContent.includes('no volatility band'),
+          cashCanvas: !!cashPanel && !!cashPanel.querySelector('canvas'),
+          headlineRange: rangeOk,
+          headlineRangeText: valRange,
+          diffCaption: trajCap.includes('P10–P90 range of the Δ'),
+          diffCanvas: !!comparePanel && !!comparePanel.querySelector('canvas'),
+          diffTable: !!document.querySelector('#planReportTableBody table'),
         };
       });
       H.check('fan: preset Generate on a pool project renders the stock volatility fan (median + P10/P90, window + estimate note, history-less holding noted)',
         fanView.hasFanTitle && fanView.canvas && fanView.windowLabel && fanView.estimateNote && fanView.symbol && fanView.noFanNote, JSON.stringify(fanView));
+      H.check('poolband: preset Generate renders the Cash pool band (method + no-band notes, canvas), headline P10–P90 ranges, and the Δ band Difference chart (caption + canvas + table)',
+        fanView.cashBandNote && fanView.cashNoBandNote && fanView.cashCanvas && fanView.headlineRange && fanView.diffCaption && fanView.diffCanvas && fanView.diffTable, JSON.stringify(fanView));
     } finally { await browserFan.close(); }
   }
 }

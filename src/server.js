@@ -24,7 +24,7 @@ import {
   computeHolding, computeAccount, computePortfolio, computeFillPreview, unitsOn,
   effectiveAccountDefaultCurrency, pinCadReturnPct,
 } from './investments.js';
-import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, latestPrice, clearHoldingPriceMeta } from './prices.js';
+import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, latestPrice, clearHoldingPriceMeta, ensurePoolHistory } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
@@ -6196,8 +6196,48 @@ app.get('/api/planning/strategies/:id/projection', requireApiAuth, async (req, r
 // only; the GET passes none. Factor overrides merge onto the
 // scenario's factors; op overrides patch op params (validated by the
 // caller via planValidateStrategyOps).
+// Pool history pull set (user 2026-11-06): the holdings the pool
+// projection actually uses — the pool entity's holdings plus every
+// buy op's target holding across the project's strategies (a buy of
+// a holding outside the pool is injected into the strategy run, so
+// it needs history too). Custom buys (accountId null, no holding)
+// and symbol-only buys have no holding to pull. Resolved against
+// the project's mainline holdings (id/kind/symbol rows).
+function planPoolHistoryHoldings(p, strategies) {
+  const mainline = planAssembleMainline(p.id);
+  const byId = new Map((mainline.holdings || []).map((h) => [h.id, h]));
+  const ids = new Set();
+  const entity = planProjectEntityOf(p);
+  for (const it of (entity && entity.items) || []) {
+    if (it.accountId != null) {
+      for (const h of mainline.holdings || []) if (Number(h.accountId) === Number(it.accountId)) ids.add(h.id);
+    } else if (it.holdingId != null) ids.add(Number(it.holdingId));
+  }
+  for (const s of strategies || []) {
+    for (const o of planOpsOf(s.id)) {
+      if (o.op_type === 'buy' && o.params && o.params.holdingId != null) ids.add(Number(o.params.holdingId));
+    }
+  }
+  return [...ids].map((id) => byId.get(id)).filter(Boolean);
+}
 async function planComparisonBlock(p, scenarioRow, opts = {}) {
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
+  // Pool history pull (user 2026-11-06): at Generate, pull full
+  // price history for the pool's holdings that lack a usable rate or
+  // σ, so the projection (and the band) use real history instead of
+  // flat. Runs once per comparison render, BEFORE any projection
+  // reads the points; a failed fetch falls back to stored points and
+  // is noted on the report (never fails the report).
+  let poolHistoryNotes = [];
+  if (p.category === 'investment') {
+    try {
+      const pull = await ensurePoolHistory(db, planPoolHistoryHoldings(p, strategies), { currentMonth: currentMonthKey() });
+      poolHistoryNotes = pull.notes;
+    } catch (err) {
+      console.warn(`[planning] pool history pull failed, using stored points: ${err.message}`);
+      poolHistoryNotes = [{ holdingId: null, symbol: '', error: err.message }];
+    }
+  }
   const entityProp = planEntityProperty(p);
   let factors = planScenarioFactorsOfRow(scenarioRow);
   if (opts.factorOverrides) factors = { ...(factors || {}), ...opts.factorOverrides };
@@ -6303,6 +6343,37 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
   for (const r of rows) {
     reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope, cashOutSeries: r.projection.cashOutSeries || [] }) });
   }
+  // Pool stock-value band on the trajectories (user 2026-11-06): the
+  // Cash pool chart draws the P10–P90 fill from these rows, and the
+  // headline ranges read them too. The pot has no volatility — only
+  // the stock leg carries p10/p90.
+  const attachPoolBand = (traj, proj) => {
+    const band = proj && proj.stocks && proj.stocks.poolBand;
+    if (!traj || !band || !band.banded) return;
+    const idx = new Map(band.months.map((m, i) => [m, i]));
+    for (const row of traj.monthly) {
+      const i = idx.get(row.month);
+      if (i == null) continue;
+      row.stock_p10 = band.p10[i];
+      row.stock_p90 = band.p90[i];
+    }
+  };
+  attachPoolBand(reportTrajectories[0], baseline);
+  for (const r of rows) attachPoolBand(reportTrajectories.find((t) => t.key === String(r.strategy.id)), r.projection);
+  // Pool band summary for the viewer: whether any trajectory carries
+  // a band, the holdings with no band (union across baseline +
+  // strategies, deduped), and the history-pull failures to name.
+  // (A plain loop, not .some — short-circuiting would drop the
+  // strategies' noBand entries once the baseline is banded.)
+  const poolBandNoBand = [];
+  const poolBandSeen = new Set();
+  let poolBandBanded = false;
+  for (const proj of [baseline, ...rows.map((r) => r.projection)]) {
+    const band = proj && proj.stocks && proj.stocks.poolBand;
+    if (!band) continue;
+    if (band.banded) poolBandBanded = true;
+    for (const nb of band.noBand || []) if (!poolBandSeen.has(nb.holdingId)) { poolBandSeen.add(nb.holdingId); poolBandNoBand.push(nb); }
+  }
   // Monthly net cash flow (property reports only, user 2026-11-06):
   // per strategy vs the baseline — payment saved minus new cash out
   // minus the engine penalty in its month. The baseline carries 0.
@@ -6341,6 +6412,12 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
     // the holding's history CAGR, P10/P90 bands widening with √t),
     // plus the holdings with no fan and why.
     stockFan: baseline.stockFan || { fans: [], noFan: [] },
+    // Pool stock-value band (user 2026-11-06): the aggregate P10–P90
+    // range of the pool's stock value — banded when any trajectory
+    // carries one; noBand names the holdings with no usable σ; the
+    // history notes name the holdings whose pull failed (stored
+    // points used instead, never a failed report).
+    poolBand: { banded: poolBandBanded, noBand: poolBandNoBand, historyNotes: poolHistoryNotes },
   };
   return { scenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, factors, baseline, strategies: rows, report };
 }
