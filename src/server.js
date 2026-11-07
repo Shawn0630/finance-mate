@@ -41,6 +41,10 @@ import {
   spendMonthly, spendTotal, spendBalance,
 } from './spending.js';
 import {
+  buildStandardInsights, homeHighlightRows, buildHomeMetricLibrary, resolveHomeMetric, homeAiPrompt,
+  nextMonth as homeNextMonth,
+} from './home.js';
+import {
   snapshotByAggregate, emptySnapshot, recordCommit, listCommits, getCommit, getCommitFull,
   undoCommit, restoreCommit, findDependents, mergeEventFromEntries, eventFromRowStates, readRow,
 } from './history.js';
@@ -4626,6 +4630,356 @@ app.get('/api/overview/chart', requireApiAuth, async (req, res) => {
     fxMissing: fx.missing,
     hasUsdHoldings: holdings.some((h) => h.currency === 'USD'),
   });
+});
+
+// ------------------------------------------------------------ Home page --
+// The Home page (#home) is insight cards + a payment highlight. It
+// reuses the series the app already builds: the overview chart's
+// property equity series, the portfolio series, the earnings monthly
+// chart and the spending monthly totals. Nothing here writes to any
+// other module; marks and generated cards live in their own tables
+// (home_insights, income_marks) and generation is a recompute, not
+// a Global History commit.
+const homeR2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// Assemble every series buildStandardInsights needs, plus the
+// per-entity series resolveHomeMetric needs and the job/rental lists
+// homeHighlightRows needs.
+async function collectHomeData() {
+  const today = vancouverToday();
+  const cur = currentMonthKey();
+  await ensureFreshPrime();
+
+  // Property: monthly totals + per-property series, same
+  // construction as GET /api/overview/chart (assessed in force −
+  // outstanding at month-end).
+  const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
+  const perProperty = props.map((p) => {
+    let points = historyPoints(p.id).map((pt) => ({ year: pt.year, value: pt.value }));
+    if (!points.length && p.assessed_value != null && p.assessed_year) {
+      points = [{ year: p.assessed_year, value: p.assessed_value }];
+    }
+    if (!points.length) return null;
+    const proj = projectionFor(p);
+    return {
+      id: p.id,
+      label: p.address,
+      firstYear: points[0].year,
+      assessedInForce: (year) => {
+        let v = null;
+        for (const pt of points) { if (pt.year <= year) v = pt.value; else break; }
+        return v;
+      },
+      outstandingAt: (month) => {
+        if (!proj) return p.mortgage_balance ?? 0;
+        return remainingBalanceAt(proj.series, month, p.mortgage_balance ?? null, proj.payoffMonth).balance ?? 0;
+      },
+    };
+  }).filter(Boolean);
+  const propertyMonths = [];
+  const propertyById = {};
+  const propertyLabels = {};
+  if (perProperty.length) {
+    let m = `${Math.min(...perProperty.map((x) => x.firstYear))}-01`;
+    let guard = 0;
+    while (m <= cur && guard < 1200) {
+      const y = Number(m.slice(0, 4));
+      let equity = 0; let assessed = 0; let outstanding = 0;
+      for (const pp of perProperty) {
+        if (pp.firstYear > y) continue;
+        const av = pp.assessedInForce(y);
+        if (av === null) continue;
+        const ob = pp.outstandingAt(m);
+        assessed += av; outstanding += ob; equity += av - ob;
+      }
+      propertyMonths.push({ month: m, equity: homeR2(equity), assessed: homeR2(assessed), outstanding: homeR2(outstanding) });
+      m = homeNextMonth(m); guard++;
+    }
+    for (const pp of perProperty) {
+      const series = [];
+      let m2 = `${pp.firstYear}-01`;
+      let g2 = 0;
+      while (m2 <= cur && g2 < 1200) {
+        const y2 = Number(m2.slice(0, 4));
+        const av = pp.assessedInForce(y2);
+        if (av !== null) {
+          const ob = pp.outstandingAt(m2);
+          series.push({ month: m2, equity: homeR2(av - ob), assessed: homeR2(av), outstanding: homeR2(ob) });
+        }
+        m2 = homeNextMonth(m2); g2++;
+      }
+      propertyById[pp.id] = series;
+      propertyLabels[pp.id] = String(pp.label).split(',')[0];
+    }
+  }
+
+  // Stocks: portfolio series (value + cumulative gain) and the top
+  // gainer by trailing-12-month return among holdings with value.
+  const holdings = listHoldings(db);
+  const fx = await prepareInvestScope(holdings, 'CAD');
+  const pf = computePortfolio(db, fx, today, 'CAD');
+  const stockMonths = pf.series.map((s) => ({ month: s.month, value: s.value, gain: s.returnAmount }));
+  let topGainer = null;
+  const holdingById = {};
+  for (const h of holdings) {
+    const computed = computeHolding(db, h, fx, today, 'CAD');
+    const months = computed.series.map((s) => ({ month: s.month, value: s.value, gain: s.returnAmount }));
+    holdingById[h.id] = { label: h.symbol || h.name || `#${h.id}`, months };
+    const value = computed.summary.value;
+    if (!(value > 0)) continue;
+    const pts = listPricePoints(db, h.id);
+    const rate = currentReturnRateFromPoints(pts, cur);
+    if (!rate) continue;
+    if (!topGainer || rate.ratePct > topGainer.returnPct) {
+      topGainer = {
+        label: h.symbol || h.name || `#${h.id}`, returnPct: rate.ratePct,
+        points: pts.map((p) => ({ date: String(p.date).slice(0, 10), price: Number(p.price) })),
+        valueSeries: months,
+      };
+    }
+  }
+
+  // Earnings: salary take-home (cash) per month from the job
+  // monthly chart, rental income per month from entries.
+  const salaryByMonth = new Map();
+  const jobsForHighlight = [];
+  for (const row of db.prepare('SELECT * FROM earn_jobs ORDER BY id').all()) {
+    const job = earnJobRow(row);
+    const gross = job.calc.perPeriod.gross;
+    const plans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id)
+      .map((p) => ({ start_date: p.start_date, own_amount: planPeriodAmounts(p, gross).own, employer_amount: planPeriodAmounts(p, gross).employer }));
+    const series = jobMonthlySeries({
+      frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
+      calc: job.calc, plans, today, job, payroll: earnRegion().payroll,
+    });
+    if (series) {
+      series.months.forEach((m, i) => {
+        salaryByMonth.set(m, homeR2((salaryByMonth.get(m) || 0) + (series.net[i] || 0)));
+      });
+    }
+    jobsForHighlight.push({
+      id: row.id, label: row.employer, frequency: row.frequency,
+      startDate: row.start_date, recentDate: row.recent_pay_date,
+      cashNet: job.calc.perPeriod.cashNet,
+    });
+  }
+  const rentalByMonth = new Map();
+  const rentalsForHighlight = [];
+  for (const r of db.prepare('SELECT * FROM earn_rentals ORDER BY id').all()) {
+    const entries = db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(r.id);
+    rentalsForHighlight.push({
+      id: r.id, label: r.label,
+      entries: entries.map((e) => ({ id: e.id, start_ym: e.start_ym, end_ym: e.end_ym, monthly_rent: e.monthly_rent, pay_day: e.pay_day })),
+    });
+    for (const e of entries) {
+      let m = e.start_ym;
+      const end = e.end_ym && e.end_ym !== '' ? e.end_ym : cur;
+      let guard = 0;
+      while (m <= end && m <= cur && guard < 1200) {
+        rentalByMonth.set(m, homeR2((rentalByMonth.get(m) || 0) + Number(e.monthly_rent || 0)));
+        m = homeNextMonth(m); guard++;
+      }
+    }
+  }
+  const earningMonths = [];
+  {
+    const all = new Set([...salaryByMonth.keys(), ...rentalByMonth.keys()]);
+    if (all.size) {
+      let m = [...all].sort()[0];
+      let guard = 0;
+      while (m <= cur && guard < 1200) {
+        const salary = salaryByMonth.get(m) || 0;
+        const rental = rentalByMonth.get(m) || 0;
+        earningMonths.push({ month: m, salary: homeR2(salary), rental: homeR2(rental), total: homeR2(salary + rental) });
+        m = homeNextMonth(m); guard++;
+      }
+    }
+  }
+
+  // Spending: monthly charge totals + per-category monthly totals.
+  // Charges only: payments and balance adjustments never count.
+  const txs = db.prepare('SELECT * FROM spend_transactions').all();
+  const byCatMonth = new Map();
+  for (const t of txs) {
+    if (t.kind === 'adjustment' || !(Number(t.amount) < 0)) continue;
+    const m = String(t.date || '').slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(m)) continue;
+    const map = byCatMonth.get(m) || {};
+    const cat = t.category || 'Other';
+    map[cat] = homeR2((map[cat] || 0) + -Number(t.amount));
+    byCatMonth.set(m, map);
+  }
+  const spendingMonths = [];
+  const categorySeries = {};
+  {
+    const totals = spendMonthly(txs);
+    const all = totals.map((r) => r.month);
+    if (all.length) {
+      let m = all.sort()[0];
+      let guard = 0;
+      while (m <= cur && guard < 1200) {
+        const total = (totals.find((r) => r.month === m) || {}).total || 0;
+        spendingMonths.push({ month: m, total: homeR2(total), byCategory: byCatMonth.get(m) || {} });
+        m = homeNextMonth(m); guard++;
+      }
+      for (const cat of SPEND_CATEGORIES) {
+        categorySeries[cat] = spendingMonths.map((r) => ({ month: r.month, total: (r.byCategory[cat] || 0) }));
+      }
+    }
+  }
+
+  return {
+    currentYm: cur,
+    property: propertyMonths, propertyById, propertyLabels,
+    stocks: { months: stockMonths, topGainer },
+    earnings: earningMonths,
+    spending: spendingMonths, categorySeries, holdingById,
+    jobsForHighlight, rentalsForHighlight,
+    entities: {
+      properties: props.filter((p) => propertyById[p.id]).map((p) => ({ id: p.id, label: String(p.address).split(',')[0] })),
+      holdings: holdings.map((h) => ({ id: h.id, label: h.symbol || h.name || `#${h.id}` })),
+      categories: SPEND_CATEGORIES,
+    },
+  };
+}
+
+const parseHomeInsight = (row) => {
+  let payload = {};
+  try { payload = JSON.parse(row.payload || '{}'); } catch { payload = {}; }
+  return { id: row.id, kind: row.kind, section: row.section, title: row.title, metric: row.metric, generated_at: row.generated_at, ...payload };
+};
+const readHomeInsights = (userId) => db.prepare('SELECT * FROM home_insights WHERE user_id = ? ORDER BY id').all(userId).map(parseHomeInsight);
+
+// Recompute the standard set only; AI cards are untouched.
+function generateStandardInsights(userId, data) {
+  const cards = buildStandardInsights(data);
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM home_insights WHERE user_id = ? AND kind = ?').run(userId, 'system');
+    const ins = db.prepare('INSERT INTO home_insights (user_id, kind, section, title, metric, payload, generated_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const c of cards) ins.run(userId, 'system', c.section, c.title, c.metric, JSON.stringify(c), now, now, now);
+  });
+  tx();
+  return readHomeInsights(userId);
+}
+
+app.get('/api/home', requireApiAuth, async (req, res) => {
+  const userId = req.user.id;
+  const marks = new Map(db.prepare('SELECT kind, source_id, pay_date, received FROM income_marks WHERE user_id = ?').all(userId)
+    .map((m) => [`${m.kind}:${m.source_id}:${m.pay_date}`, m.received]));
+  const data = await collectHomeData();
+  const highlights = homeHighlightRows({ jobs: data.jobsForHighlight, rentals: data.rentalsForHighlight, marks, today: vancouverToday() });
+  let insights = readHomeInsights(userId);
+  const sys = insights.filter((r) => r.kind === 'system');
+  const staleMs = 7 * 24 * 3600 * 1000;
+  const stale = !sys.length || sys.some((r) => Date.now() - new Date(r.generated_at).getTime() > staleMs);
+  if (stale) insights = generateStandardInsights(userId, data);
+  res.json({ highlights, insights, generatedAt: sys.length ? sys[0].generated_at : null });
+});
+
+app.post('/api/home/insights/generate', requireApiAuth, async (req, res) => {
+  const data = await collectHomeData();
+  res.json({ insights: generateStandardInsights(req.user.id, data) });
+});
+
+app.post('/api/home/marks', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  const kind = b.kind === 'salary' || b.kind === 'rental' ? b.kind : null;
+  const sourceId = Number(b.source_id);
+  const date = String(b.date || '');
+  const received = b.received === 1 || b.received === true ? 1 : (b.received === 0 || b.received === false ? 0 : null);
+  if (!kind || !Number.isInteger(sourceId) || sourceId <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(date) || received == null) {
+    return res.status(400).json({ error: 'kind, source_id, date and received (0/1) are required.' });
+  }
+  const exists = kind === 'salary'
+    ? db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(sourceId)
+    : db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(sourceId);
+  if (!exists) return res.status(404).json({ error: 'source not found' });
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO income_marks (user_id, kind, source_id, pay_date, received, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, kind, source_id, pay_date)
+    DO UPDATE SET received = excluded.received, updated_at = excluded.updated_at`)
+    .run(req.user.id, kind, sourceId, date, received, now);
+  res.json({ ok: true, kind, source_id: sourceId, date, received });
+});
+
+// AI-append: propose only. The AI returns a card DEFINITION (metric
+// from the computable library); the app computes the numbers, and
+// nothing writes until the client Applies the proposal.
+app.post('/api/home/insights/ai-append', requireApiAuth, async (req, res) => {
+  if (!llmConfigured()) return res.status(503).json({ error: 'AI is not configured.' });
+  const text = String((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required.' });
+  const history = Array.isArray((req.body || {}).history)
+    ? (req.body.history || []).slice(-20).map((h) => ({ role: h.role === 'user' ? 'user' : 'assistant', text: String(h.text || '').slice(0, 500) }))
+    : [];
+  const data = await collectHomeData();
+  const library = buildHomeMetricLibrary(data.entities);
+  const existingTitles = readHomeInsights(req.user.id).map((r) => r.title);
+  const prompt = homeAiPrompt({ text, history, library, existingTitles });
+  let raw;
+  try {
+    raw = await callLlm([{ role: 'user', content: prompt }], process.env, getAiFillModel());
+  } catch {
+    return res.status(502).json({ error: 'AI call failed.' });
+  }
+  const parsed = parseModelJson(typeof raw === 'string' ? raw : JSON.stringify(raw || ''));
+  if (!parsed || typeof parsed !== 'object') {
+    return res.json({ note: 'The AI did not return a usable proposal. Try rephrasing the request.' });
+  }
+  if (parsed.ask) return res.json({ ask: String(parsed.ask).slice(0, 500) });
+  if (parsed.decline) return res.json({ decline: String(parsed.decline).slice(0, 500) });
+  if (parsed.card && typeof parsed.card === 'object') {
+    const metric = String(parsed.card.metric || '');
+    const libEntry = library.find((m) => m.metric === metric);
+    if (!libEntry) return res.json({ decline: 'That metric is not one the home page can compute.' });
+    const section = String(parsed.card.section || libEntry.section);
+    if (section !== libEntry.section) return res.json({ decline: 'That metric belongs to a different section.' });
+    const title = String(parsed.card.title || libEntry.title).slice(0, 80);
+    const computed = resolveHomeMetric(metric, data);
+    if (computed && computed.error) return res.json({ decline: computed.message || 'That metric has no data yet.' });
+    return res.json({ proposal: { section, title, metric, preview: { ...computed, title } } });
+  }
+  return res.json({ note: 'The AI did not return a usable proposal. Try rephrasing the request.' });
+});
+
+// Apply an AI proposal: compute the card deterministically and append
+// it at the end of its section. A second Apply on the same turn does
+// not double-append (same metric + title dedupes).
+app.post('/api/home/insights/ai-apply', requireApiAuth, async (req, res) => {
+  const def = (req.body || {}).definition || req.body || {};
+  const metric = String(def.metric || '');
+  const section = String(def.section || '');
+  const title = String(def.title || '').slice(0, 80);
+  if (!metric || !section || !title) {
+    return res.status(400).json({ error: 'definition.metric, definition.section and definition.title are required.' });
+  }
+  const data = await collectHomeData();
+  const library = buildHomeMetricLibrary(data.entities);
+  const libEntry = library.find((m) => m.metric === metric);
+  if (!libEntry || libEntry.section !== section) {
+    return res.status(400).json({ error: 'Unknown metric or section mismatch.' });
+  }
+  const computed = resolveHomeMetric(metric, data);
+  if (computed && computed.error) return res.status(400).json({ error: computed.message });
+  const card = { ...computed, title, section };
+  const existing = db.prepare('SELECT * FROM home_insights WHERE user_id = ? AND kind = ? AND metric = ? AND title = ?')
+    .get(req.user.id, 'ai', metric, title);
+  if (existing) return res.json({ insight: parseHomeInsight(existing), duplicate: true });
+  const now = new Date().toISOString();
+  const info = db.prepare('INSERT INTO home_insights (user_id, kind, section, title, metric, payload, generated_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(req.user.id, 'ai', section, title, metric, JSON.stringify(card), now, now, now);
+  const row = db.prepare('SELECT * FROM home_insights WHERE id = ?').get(info.lastInsertRowid);
+  res.status(201).json({ insight: parseHomeInsight(row) });
+});
+
+// Only AI cards are deletable; system cards are never deletable.
+app.delete('/api/home/insights/:id', requireApiAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM home_insights WHERE id = ? AND user_id = ?').get(Number(req.params.id), req.user.id);
+  if (!row) return res.status(404).json({ error: 'insight not found' });
+  if (row.kind !== 'ai') return res.status(400).json({ error: 'System cards cannot be deleted.' });
+  db.prepare('DELETE FROM home_insights WHERE id = ?').run(row.id);
+  res.json({ ok: true });
 });
 
 app.get('/api/summary', requireApiAuth, (req, res) => {

@@ -11,6 +11,7 @@
 <header class="topbar">
   <div class="brand">Finance Mate</div>
   <nav id="mainNav">
+    <a href="#home" data-nav="home">Home</a>
     <a href="#assets" data-nav="assets" class="active">Assets</a>
     <a href="#earnings" data-nav="earnings">Earnings</a>
     <a href="#spending" data-nav="spending">Spending</a>
@@ -26,6 +27,30 @@
 </header>
 <main>
   <div id="globalError" class="msg err hidden" role="alert"></div>
+  <!-- ============================== Home ============================== -->
+  <!-- Instagram creator-insight style: clean white, light headings,
+       strip cards in peek carousels. Overview (#assets/overview) is untouched. -->
+  <section id="view-home" class="hidden home-view">
+    <div class="home-head">
+      <div>
+        <h2 class="home-title">Home</h2>
+        <div class="home-sub" id="homeSummary"></div>
+      </div>
+      <button class="btn" id="homeRegenBtn">Re-generate</button>
+    </div>
+    <h3 class="home-section-head">Upcoming payments</h3>
+    <div class="home-carousel" id="homeHighlightCarousel"></div>
+    <div id="homeHighlightEmpty" class="home-empty hidden">No upcoming payments</div>
+    <div id="homeSections"></div>
+    <div class="home-ai">
+      <h3 class="home-section-head">Ask AI for another insight</h3>
+      <div id="homeAiThread" class="home-ai-thread"></div>
+      <div class="home-ai-row">
+        <input id="homeAiText" type="text" placeholder="e.g. Show me this property's equity" autocomplete="off" />
+        <button class="btn primary" id="homeAiSend">Send</button>
+      </div>
+    </div>
+  </section>
   <!-- ============================== Assets ============================== -->
   <section id="view-assets" class="hidden">
     <nav class="subnav" id="assetsNav">

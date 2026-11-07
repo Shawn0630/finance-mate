@@ -342,7 +342,7 @@ let currentAssetId = null;
 let currentSection = 'overview';
 
 function showView(name) {
-  for (const v of ['assets', 'property', 'asset', 'invest-account', 'invest-holding', 'earnings', 'spending', 'planning', 'history', 'tax', 'admin']) {
+  for (const v of ['home', 'assets', 'property', 'asset', 'invest-account', 'invest-holding', 'earnings', 'spending', 'planning', 'history', 'tax', 'admin']) {
     $('#view-' + v).classList.toggle('hidden', v !== name);
   }
   document.querySelectorAll('#mainNav a').forEach((a) =>
@@ -364,8 +364,11 @@ function showSection(key) {
 let planCompareScenarioIds = null; // null = not yet initialized for this project load
 let planStrategyScenarioId; // undefined = server default (base scenario); 0 = explicit flat world; N = scenario N
 function route() {
-  const hash = location.hash || '#assets/overview';
-  if (hash.startsWith('#property/')) {
+  const hash = location.hash || '#home';
+  if (hash === '#home') {
+    showView('home');
+    loadHome();
+  } else if (hash.startsWith('#property/')) {
     currentPropertyId = Number(hash.split('/')[1]);
     showView('property');
     loadPropertyDetail(currentPropertyId);
@@ -17721,4 +17724,245 @@ document.addEventListener('click', (e) => {
   if (monthPopFor === 'planOp' && planMonthBtn === b) { closeMonthPop(); return; }
   planMonthBtn = b;
   openMonthPop('planOp');
+});
+
+// ------------------------------------------------------------ Home page --
+// Instagram creator-insight style: strip cards in peek carousels.
+// Big number first, delta chips second, sparkline trend on the right.
+// The AI thread is per-session in memory (resets on reload), same v1
+// limit as the report Refine panel.
+let homeData = null;
+let homeAiHistory = []; // [{role, text}]
+let homeAiPending = null; // {section, title, metric, preview} awaiting Apply
+let homeCharts = [];
+
+function homeShiftYm(ym, n) {
+  let [y, m] = String(ym).split('-').map(Number);
+  m += n;
+  while (m < 1) { m += 12; y--; }
+  while (m > 12) { m -= 12; y++; }
+  return `${y}-${String(m).padStart(2, '0')}`;
+}
+
+function homePayDateLabel(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  return `${days[dt.getDay()]}, ${MONTH_NAMES[m - 1]} ${d}, ${y}`;
+}
+
+function homeFormatValue(c) {
+  if (c.value == null) return '—';
+  if (c.valueKind === 'pct') return `${c.value >= 0 ? '+' : '−'}${Math.abs(c.value).toFixed(1)}%`;
+  if (c.valueKind === 'money2') return money2(c.value);
+  return money(c.value);
+}
+
+function homeCompactValue(v, kind) {
+  if (v == null) return '—';
+  if (kind === 'pct') return `${v >= 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const a = Math.abs(v);
+  if (a >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
+  return money2(v);
+}
+
+// MoM chip: colored pill (green = good, red = bad; downIsGood flips
+// the sense, e.g. outstanding principal). YoY is plain gray text.
+function homeDeltaHtml(d, kind, downIsGood, vsLabel) {
+  if (!d) return '';
+  const up = d.delta > 0;
+  const down = d.delta < 0;
+  if (!up && !down) return `<span class="delta flat">± 0 vs ${esc(vsLabel)}</span>`;
+  const good = downIsGood ? down : up;
+  const arrow = up ? '↑' : '↓';
+  const amt = kind === 'pct' ? `${Math.abs(d.delta).toFixed(1)} pts` : money(Math.abs(d.delta));
+  const pct = d.pct != null ? ` (${up ? '+' : '−'}${Math.abs(d.pct).toFixed(1)}%)` : '';
+  return `<span class="delta ${good ? 'good' : 'bad'}">${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
+}
+function homeYoyHtml(d, kind, downIsGood, vsLabel) {
+  if (!d) return '';
+  const up = d.delta > 0;
+  const down = d.delta < 0;
+  if (!up && !down) return `<span class="delta-yoy">YoY ± 0</span>`;
+  const arrow = up ? '↑' : '↓';
+  const amt = kind === 'pct' ? `${Math.abs(d.delta).toFixed(1)} pts` : money(Math.abs(d.delta));
+  const pct = d.pct != null ? ` (${up ? '+' : '−'}${Math.abs(d.pct).toFixed(1)}%)` : '';
+  return `<span class="delta-yoy">YoY ${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
+}
+
+function homeInsightCardHtml(c) {
+  const delBtn = c.kind === 'ai'
+    ? `<button class="home-card-del" data-home-del="${c.id}" aria-label="Delete card">×</button>` : '';
+  if (!c.hasData) {
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}">${delBtn}
+      <div class="insight-text">
+        <div class="insight-label">${esc(c.title)}</div>
+        <div class="insight-empty">No data yet</div>
+        <div class="insight-period">${esc(c.periodLabel)}</div>
+      </div></div>`;
+  }
+  const sparkVals = (c.spark || []).filter((v) => v != null);
+  const sparkHtml = sparkVals.length ? `<div class="insight-spark">
+      <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}'></canvas>
+      <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
+    </div>` : '';
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}">${delBtn}
+    <div class="insight-text">
+      <div class="insight-label">${esc(c.title)}</div>
+      <div class="insight-value">${homeFormatValue(c)}</div>
+      ${c.sublabel ? `<div class="insight-sub">${esc(c.sublabel)}</div>` : ''}
+      <div class="insight-period">${esc(c.periodLabel)}</div>
+      <div class="insight-deltas">${homeDeltaHtml(c.mom, c.valueKind, c.downIsGood, monthLabel(homeShiftYm(c.period, -1)))}${homeYoyHtml(c.yoy, c.valueKind, c.downIsGood, monthLabel(homeShiftYm(c.period, -12)))}</div>
+    </div>
+    ${sparkHtml}</div>`;
+}
+
+function homePayCardHtml(h) {
+  const state = h.received === 1 ? 'Received' : h.received === 0 ? 'Not received' : 'Pending';
+  const label = h.kind === 'salary' ? 'Salary' : 'Rent';
+  return `<div class="insight-card home-pay-card" data-pay-kind="${h.kind}" data-pay-source="${h.sourceId}" data-pay-date="${h.date}">
+    <div class="insight-text">
+      <div class="insight-label">${esc(h.sourceLabel)} · ${label}</div>
+      <div class="insight-value">${money2(h.amount)}</div>
+      <div class="insight-period">${homePayDateLabel(h.date)}${h.isCurrent ? '' : ' · Overdue'}</div>
+      <div class="insight-deltas"><span class="pay-state ${h.received === 1 ? 'got' : ''}">${state}</span></div>
+    </div>
+    <div class="insight-toggle">
+      <button class="recv-toggle ${h.received === 1 ? 'on' : ''}" role="switch" aria-checked="${h.received === 1 ? 'true' : 'false'}" data-mark-kind="${h.kind}" data-mark-source="${h.sourceId}" data-mark-date="${h.date}" data-mark-received="${h.received === 1 ? 1 : 0}">${h.received === 1 ? '✓ Received' : 'Mark received'}</button>
+    </div>
+  </div>`;
+}
+
+function homeDrawSparklines(root) {
+  for (const ch of homeCharts) { try { ch.destroy(); } catch { /* already gone */ } }
+  homeCharts = [];
+  root.querySelectorAll('canvas[data-spark]').forEach((canvas) => {
+    let vals = [];
+    let labels = [];
+    try { vals = JSON.parse(canvas.dataset.spark || '[]'); labels = JSON.parse(canvas.dataset.sparkMonths || '[]'); } catch { return; }
+    if (!vals.some((v) => v != null)) return;
+    const ch = new Chart(canvas, {
+      type: 'line',
+      data: { labels, datasets: [{ data: vals, borderColor: '#1668c4', backgroundColor: 'rgba(22,104,196,0.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5, spanGaps: true }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: { x: { display: false }, y: { display: false } },
+      },
+    });
+    homeCharts.push(ch);
+  });
+}
+
+const HOME_SECTION_TITLES = { property: 'Property', stock: 'Stocks', earning: 'Earning', spending: 'Spending' };
+
+function renderHome() {
+  if (!homeData) return;
+  const { highlights, insights } = homeData;
+  const received = highlights.filter((h) => h.received === 1).length;
+  $('#homeSummary').textContent = highlights.length
+    ? `${received} of ${highlights.length} received`
+    : 'No upcoming payments';
+  $('#homeHighlightCarousel').innerHTML = highlights.map(homePayCardHtml).join('');
+  $('#homeHighlightEmpty').classList.toggle('hidden', highlights.length > 0);
+  $('#homeSections').innerHTML = ['property', 'stock', 'earning', 'spending'].map((section) => {
+    const cards = insights.filter((c) => c.section === section);
+    return `<h3 class="home-section-head">${HOME_SECTION_TITLES[section]}</h3>
+      <div class="home-carousel" data-home-section="${section}">${cards.map(homeInsightCardHtml).join('')}</div>`;
+  }).join('');
+  homeDrawSparklines($('#view-home'));
+  renderHomeAiThread();
+}
+
+async function loadHome() {
+  try {
+    homeData = await api('/api/home');
+    renderHome();
+  } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+}
+
+function renderHomeAiThread() {
+  const thread = $('#homeAiThread');
+  if (!thread) return;
+  thread.innerHTML = homeAiHistory.map((m) => `<div class="home-ai-msg ${m.role}">${esc(m.text)}</div>`).join('')
+    + (homeAiPending ? `<div class="home-ai-proposal">
+        <div class="home-ai-msg assistant">Proposed card: <b>${esc(homeAiPending.title)}</b> (${esc(homeAiPending.section)}${homeAiPending.preview && homeAiPending.preview.value != null ? ` — ${homeFormatValue(homeAiPending.preview)}` : ''})</div>
+        <button class="btn primary" id="homeAiApplyBtn">Apply</button>
+      </div>` : '');
+  const applyBtn = $('#homeAiApplyBtn');
+  if (applyBtn) applyBtn.addEventListener('click', applyHomeAiProposal);
+}
+
+async function sendHomeAi() {
+  const input = $('#homeAiText');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  const history = [...homeAiHistory];
+  homeAiHistory.push({ role: 'user', text });
+  homeAiPending = null;
+  renderHomeAiThread();
+  try {
+    const res = await api('/api/home/insights/ai-append', { method: 'POST', body: { text, history } });
+    if (res.proposal) {
+      homeAiPending = res.proposal;
+      homeAiHistory.push({ role: 'assistant', text: `Proposed: ${res.proposal.title} (${res.proposal.section}). Apply to add it.` });
+    } else if (res.ask) {
+      homeAiHistory.push({ role: 'assistant', text: res.ask });
+    } else if (res.decline) {
+      homeAiHistory.push({ role: 'assistant', text: res.decline });
+    } else if (res.note) {
+      homeAiHistory.push({ role: 'assistant', text: res.note });
+    }
+  } catch (err) {
+    homeAiHistory.push({ role: 'assistant', text: err.message });
+  }
+  renderHomeAiThread();
+}
+
+async function applyHomeAiProposal() {
+  if (!homeAiPending) return;
+  const def = { section: homeAiPending.section, title: homeAiPending.title, metric: homeAiPending.metric };
+  homeAiPending = null;
+  try {
+    const res = await api('/api/home/insights/ai-apply', { method: 'POST', body: { definition: def } });
+    homeAiHistory.push({ role: 'assistant', text: res.duplicate ? 'That card is already on the page.' : `Added “${res.insight.title}”.` });
+    await loadHome();
+  } catch (err) {
+    homeAiHistory.push({ role: 'assistant', text: err.message });
+    renderHomeAiThread();
+  }
+}
+
+$('#homeRegenBtn').addEventListener('click', async () => {
+  const btn = $('#homeRegenBtn');
+  btn.disabled = true;
+  try {
+    await api('/api/home/insights/generate', { method: 'POST' });
+    await loadHome();
+  } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+  btn.disabled = false;
+});
+$('#homeAiSend').addEventListener('click', sendHomeAi);
+$('#homeAiText').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendHomeAi(); });
+$('#view-home').addEventListener('click', async (e) => {
+  const t = e.target.closest('[data-mark-kind]');
+  if (t) {
+    const next = t.dataset.markReceived === '1' ? 0 : 1;
+    t.disabled = true;
+    try {
+      await api('/api/home/marks', { method: 'POST', body: { kind: t.dataset.markKind, source_id: Number(t.dataset.markSource), date: t.dataset.markDate, received: next } });
+      await loadHome();
+    } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+    return;
+  }
+  const del = e.target.closest('[data-home-del]');
+  if (del) {
+    if (!confirm('Delete this insight card?')) return;
+    try {
+      await api(`/api/home/insights/${del.dataset.homeDel}`, { method: 'DELETE' });
+      await loadHome();
+    } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+  }
 });

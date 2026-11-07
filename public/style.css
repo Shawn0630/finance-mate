@@ -746,3 +746,63 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 /* Planning project title tags: category/subcategory/entity as pills on the title row. */
 .plan-title-tags { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .plan-title-tag { display: inline-block; font-size: 11px; line-height: 1.4; padding: 2px 8px; border-radius: 999px; background: #eef2f7; color: #33424f; border: 1px solid #dde4ec; white-space: nowrap; }
+
+/* ------------------------------------------------------------ Home page -- */
+/* Instagram creator-insight style end to end: clean white surface,
+   rounded cards with light borders and a whisper of shadow, generous
+   whitespace, small gray secondary labels, bold black numbers,
+   minimal chrome, thin dividers, restrained accents (green/red
+   deltas, blue for links/actions). Section headings are simple and
+   light, not heavy panels. */
+.home-view { background: #fff; border-radius: 14px; padding: 24px 26px 28px; }
+.home-head { display: flex; align-items: flex-start; gap: 12px; }
+.home-head .btn { margin-left: auto; }
+.home-title { margin: 0; font-size: 22px; font-weight: 700; color: #111; }
+.home-sub { color: #71808f; font-size: 13px; margin-top: 4px; }
+.home-section-head { font-size: 13px; font-weight: 600; color: #5a6a7a; letter-spacing: .02em; margin: 26px 0 10px; padding-bottom: 8px; border-bottom: 1px solid #eef1f4; }
+.home-empty { color: #98a4b0; font-size: 13px; padding: 4px 2px 8px; }
+
+/* Peek carousel: one card dominates (~84% of the viewport, capped
+   for wide screens) so the next card's edge shows; scroll-padding
+   pulls the snapped card in from the left so the previous card's
+   edge shows too. */
+.home-carousel { display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: x mandatory; scroll-padding-left: 8%; padding: 2px 2px 10px; scrollbar-width: thin; }
+.home-carousel::-webkit-scrollbar { height: 6px; }
+.home-carousel::-webkit-scrollbar-thumb { background: #dbe2ea; border-radius: 3px; }
+
+/* Long horizontal strip card: text left, big number, sparkline right. */
+.insight-card { position: relative; flex: 0 0 min(860px, 84%); scroll-snap-align: start; display: flex; gap: 16px; align-items: center; background: #fff; border: 1px solid #e6ebf0; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); padding: 16px 18px; }
+.insight-text { flex: 1 1 auto; min-width: 0; }
+.insight-label { font-size: 12px; color: #71808f; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.insight-value { font-size: 30px; font-weight: 700; color: #111; line-height: 1.15; margin-top: 4px; letter-spacing: -0.01em; }
+.insight-sub { font-size: 13px; color: #5a6a7a; margin-top: 2px; }
+.insight-period { font-size: 12px; color: #98a4b0; margin-top: 2px; }
+.insight-deltas { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+.delta { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.delta.good { color: #14632f; background: #e7f6ec; }
+.delta.bad { color: #b3261e; background: #fdeceb; }
+.delta.flat { color: #5a6a7a; background: #f0f3f6; }
+.delta-yoy { font-size: 12px; color: #98a4b0; white-space: nowrap; }
+.insight-empty { font-size: 20px; font-weight: 600; color: #98a4b0; margin-top: 6px; }
+.insight-spark { flex: 0 0 160px; height: 72px; }
+.insight-spark canvas { width: 100% !important; height: 56px !important; }
+.spark-ends { display: flex; justify-content: space-between; font-size: 10px; color: #98a4b0; margin-top: 2px; }
+.home-card-del { position: absolute; top: 8px; right: 10px; border: none; background: none; color: #98a4b0; font-size: 18px; line-height: 1; padding: 2px 6px; }
+.home-card-del:hover { color: #b3261e; background: none; }
+
+/* Payment cards: same strip, toggle on the right instead of a chart. */
+.home-pay-card .insight-toggle { flex: 0 0 auto; }
+.recv-toggle { border: 1px solid #c9d2dc; background: #fff; color: #1668c4; border-radius: 999px; padding: 7px 14px; font-weight: 600; font-size: 13px; white-space: nowrap; }
+.recv-toggle.on { background: #e7f6ec; border-color: #bfe3c9; color: #14632f; }
+.pay-state { font-size: 12px; color: #98a4b0; }
+.pay-state.got { color: #14632f; }
+
+/* AI append panel: light, minimal. */
+.home-ai { margin-top: 26px; padding-top: 8px; border-top: 1px solid #eef1f4; }
+.home-ai-thread { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.home-ai-msg { font-size: 13px; line-height: 1.5; padding: 8px 12px; border-radius: 10px; max-width: 85%; }
+.home-ai-msg.user { background: #eef4fb; color: #1c2733; align-self: flex-end; }
+.home-ai-msg.assistant { background: #f6f8fa; color: #3c4a59; align-self: flex-start; }
+.home-ai-proposal { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.home-ai-row { display: flex; gap: 8px; }
+.home-ai-row input { flex: 1; }

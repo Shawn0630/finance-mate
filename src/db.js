@@ -888,6 +888,40 @@ CREATE TABLE IF NOT EXISTS app_commits (
   snapshot TEXT NOT NULL,              -- JSON envelope {aggregate, tables, ...}
   created_at TEXT NOT NULL
 );
+-- Home page (2026-11-07): stored insight cards. kind 'system' =
+-- the deterministic standard set (recomputed weekly); 'ai' = cards
+-- the user asked the AI to append (deletable). payload is the full
+-- card JSON (value, deltas, sparkline) so the page renders from
+-- storage; metric lets Apply dedupe. Generation is a recompute,
+-- not a Global History commit.
+CREATE TABLE IF NOT EXISTS home_insights (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                  -- 'system' | 'ai'
+  section TEXT NOT NULL,               -- property | stock | earning | spending
+  title TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  payload TEXT NOT NULL,               -- JSON card
+  generated_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- Home highlight marks (2026-11-07): one row per (user, source,
+-- occurrence date). received 1 = received, 0 = explicitly marked
+-- not-received; both count as "marked" for the highlight rollover
+-- (a marked row leaves the highlight only when the next occurrence
+-- of the same source has arrived). Absence of a row = unmarked:
+-- the row keeps showing, however old. Marks never change Earnings
+-- figures — highlight only.
+CREATE TABLE IF NOT EXISTS income_marks (
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                  -- 'salary' | 'rental'
+  source_id INTEGER NOT NULL,
+  pay_date TEXT NOT NULL,              -- 'YYYY-MM-DD'
+  received INTEGER NOT NULL,           -- 0 | 1
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, kind, source_id, pay_date)
+);
 CREATE INDEX IF NOT EXISTS idx_app_commits_module ON app_commits(module);
 CREATE INDEX IF NOT EXISTS idx_app_commits_project ON app_commits(project_id);
 CREATE INDEX IF NOT EXISTS idx_app_commits_entity ON app_commits(entity_type, entity_id);

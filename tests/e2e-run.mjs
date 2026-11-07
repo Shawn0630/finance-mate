@@ -44,7 +44,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const TESTS = path.join(ROOT, 'tests');
 const MODULES = ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm',
   'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings',
-  'spending', 'planning', 'epilogue'];
+  'spending', 'planning', 'epilogue', 'home'];
 const MAX_ATTEMPTS = 3;
 
 const args = process.argv.slice(2);
