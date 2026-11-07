@@ -10330,6 +10330,9 @@ let spendTxModalCtx = null; // { cardId, txId } — txId null = add
 // (an empty Set = Select none). '__uncat__' stands for rows with
 // no category, mirroring the old single-select's option values.
 let spendCatSel = null;
+// A home-page category card navigates here with one category
+// pre-selected (set by homeNavigateCard before the hash change).
+let spendPendingCat = null;
 let spendDetailCatSel = null;
 // Whether the multi-select panel is open per table: the panel
 // is rebuilt on every render, so open state lives here and the
@@ -10815,6 +10818,7 @@ async function loadSpending() {
   spendCatPanelOpen.spending = false;
   const data = await api('/api/spending');
   spendData = data;
+  if (spendPendingCat) { spendCatSel = new Set([spendPendingCat]); spendPendingCat = null; }
   renderSpendCategoryList(data.categories);
   investViewData.spending = { series: data.monthly, monthly: data.monthly, transactions: data.transactions, cards: data.cards };
   // List cards show ONLY the current balance: the name line, then
@@ -17794,10 +17798,13 @@ function homeYoyHtml(d, kind, downIsGood, vsLabel) {
 function homeInsightCardHtml(c) {
   const delBtn = c.kind === 'ai'
     ? `<button class="home-card-del" data-home-del="${c.id}" aria-label="Delete card">×</button>` : '';
+  const aiTag = c.kind === 'ai' ? ' <span class="home-ai-tag">AI</span>' : '';
+  const link = homeCardLink(c);
+  const linkAttrs = ` data-home-link="${link.href}"${link.category ? ` data-home-category="${esc(link.category)}"` : ''} role="link" tabindex="0"`;
   if (!c.hasData) {
-    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}">${delBtn}
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}>${delBtn}
       <div class="insight-text">
-        <div class="insight-label">${esc(c.title)}</div>
+        <div class="insight-label">${esc(c.title)}${aiTag}</div>
         <div class="insight-empty">No data yet</div>
         <div class="insight-period">${esc(c.periodLabel)}</div>
       </div></div>`;
@@ -17807,9 +17814,9 @@ function homeInsightCardHtml(c) {
       <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}'></canvas>
       <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
     </div>` : '';
-  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}">${delBtn}
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}>${delBtn}
     <div class="insight-text">
-      <div class="insight-label">${esc(c.title)}</div>
+      <div class="insight-label">${esc(c.title)}${aiTag}</div>
       <div class="insight-value">${homeFormatValue(c)}</div>
       ${c.sublabel ? `<div class="insight-sub">${esc(c.sublabel)}</div>` : ''}
       <div class="insight-period">${esc(c.periodLabel)}</div>
@@ -17856,6 +17863,58 @@ function homeDrawSparklines(root) {
 }
 
 const HOME_SECTION_TITLES = { property: 'Property', stock: 'Stocks', earning: 'Earning', spending: 'Spending' };
+const HOME_SECTION_ROUTES = { property: '#assets/properties', stock: '#assets/investments', earning: '#earnings', spending: '#spending' };
+
+// Card links: per-entity cards go to that entity's detail page;
+// standard cards (no entity ref — including cards stored before
+// entity refs existed) fall back to the section summary page.
+// A category card goes to Spending with that category pre-selected
+// (spendPendingCat, applied by loadSpending).
+function homeCardLink(c) {
+  const e = c.entity;
+  if (e && e.kind === 'property') return { href: `#property/${e.id}` };
+  if (e && e.kind === 'holding') return { href: `#invest-holding/${e.id}` };
+  if (e && e.kind === 'job') return { href: `#earnings/job/${e.id}` };
+  if (e && e.kind === 'rental') return { href: `#earnings/rental/${e.id}` };
+  if (e && e.kind === 'category') return { href: '#spending', category: e.id };
+  return { href: HOME_SECTION_ROUTES[c.section] };
+}
+function homeNavigateCard(card) {
+  if (!card) return;
+  if (card.dataset.homeCategory) {
+    spendPendingCat = card.dataset.homeCategory;
+    location.hash = '#spending';
+  } else if (card.dataset.homeLink) {
+    location.hash = card.dataset.homeLink;
+  }
+}
+
+// Folded-deck carousels: the snapped card sits on top (full size,
+// stronger shadow); neighbours tuck underneath at a touch of scale.
+// The snapped card is the one whose start is nearest scrollLeft +
+// scroll-padding-left. Scroll events don't bubble, so one
+// capture-phase listener on #view-home covers every carousel
+// (renderHome replaces the section carousels outright).
+function homeMarkActiveCarousel(car) {
+  if (!car) return;
+  const pad = parseFloat(getComputedStyle(car).scrollPaddingLeft) || 0;
+  const target = car.scrollLeft + pad;
+  let best = null; let bestDist = Infinity;
+  for (const card of car.querySelectorAll('.insight-card')) {
+    const d = Math.abs(card.offsetLeft - target);
+    if (d < bestDist) { bestDist = d; best = card; }
+  }
+  for (const card of car.querySelectorAll('.insight-card')) card.classList.toggle('is-active', card === best);
+}
+function homeMarkActiveCarousels(root) {
+  (root || document).querySelectorAll('.home-carousel').forEach(homeMarkActiveCarousel);
+}
+let homeScrollRaf = 0;
+$('#view-home').addEventListener('scroll', (e) => {
+  const car = e.target && e.target.classList && e.target.classList.contains('home-carousel') ? e.target : null;
+  if (!car || homeScrollRaf) return;
+  homeScrollRaf = requestAnimationFrame(() => { homeScrollRaf = 0; homeMarkActiveCarousel(car); });
+}, true);
 
 function renderHome() {
   if (!homeData) return;
@@ -17868,10 +17927,11 @@ function renderHome() {
   $('#homeHighlightEmpty').classList.toggle('hidden', highlights.length > 0);
   $('#homeSections').innerHTML = ['property', 'stock', 'earning', 'spending'].map((section) => {
     const cards = insights.filter((c) => c.section === section);
-    return `<h3 class="home-section-head">${HOME_SECTION_TITLES[section]}</h3>
+    return `<h3 class="home-section-head"><a class="home-section-link" href="${HOME_SECTION_ROUTES[section]}">${HOME_SECTION_TITLES[section]}</a><a class="home-section-all" href="${HOME_SECTION_ROUTES[section]}">View all →</a></h3>
       <div class="home-carousel" data-home-section="${section}">${cards.map(homeInsightCardHtml).join('')}</div>`;
   }).join('');
   homeDrawSparklines($('#view-home'));
+  homeMarkActiveCarousels($('#view-home'));
   renderHomeAiThread();
 }
 
@@ -17964,5 +18024,18 @@ $('#view-home').addEventListener('click', async (e) => {
       await api(`/api/home/insights/${del.dataset.homeDel}`, { method: 'DELETE' });
       await loadHome();
     } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+    return;
   }
+  // Card links (the toggle + delete above return first, so they
+  // never navigate): the whole insight card goes to its entity's
+  // detail page, or the section summary for standard cards.
+  const card = e.target.closest('.insight-card[data-home-link]');
+  if (card) homeNavigateCard(card);
+});
+$('#view-home').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const card = e.target.closest && e.target.closest('.insight-card[data-home-link]');
+  if (!card) return;
+  e.preventDefault();
+  homeNavigateCard(card);
 });

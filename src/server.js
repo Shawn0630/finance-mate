@@ -42,6 +42,7 @@ import {
 } from './spending.js';
 import {
   buildStandardInsights, homeHighlightRows, buildHomeMetricLibrary, resolveHomeMetric, homeAiPrompt,
+  displayedSalaryMonths,
   nextMonth as homeNextMonth,
 } from './home.js';
 import {
@@ -4743,6 +4744,7 @@ async function collectHomeData() {
   // monthly chart, rental income per month from entries.
   const salaryByMonth = new Map();
   const jobsForHighlight = [];
+  const jobById = {};
   for (const row of db.prepare('SELECT * FROM earn_jobs ORDER BY id').all()) {
     const job = earnJobRow(row);
     const gross = job.calc.perPeriod.gross;
@@ -4753,32 +4755,53 @@ async function collectHomeData() {
       calc: job.calc, plans, today, job, payroll: earnRegion().payroll,
     });
     if (series) {
-      series.months.forEach((m, i) => {
-        salaryByMonth.set(m, homeR2((salaryByMonth.get(m) || 0) + (series.net[i] || 0)));
-      });
+      // Displayed cash, not engine net: the series' net still
+      // carries the deferred RRSP tax benefit (see
+      // displayedSalaryMonths). This feeds both the earnings series
+      // 'salary' field and the per-job jobById series, so the
+      // Salary take-home card and the job_takehome:<id> AI card both
+      // show cash. The monthly chart's Net segment is untouched.
+      const months = displayedSalaryMonths(series, job.taxBenefit ? job.taxBenefit.perPeriod : 0);
+      for (const { month, salary } of months) {
+        salaryByMonth.set(month, homeR2((salaryByMonth.get(month) || 0) + salary));
+      }
+      jobById[row.id] = { label: row.employer, months };
     }
+    // Displayed per-period take-home: the job page shows cashNet
+    // minus the per-period RRSP tax benefit (the benefit is on its
+    // own sub-line — see earnNextPayHtml and the detail summary
+    // cards), so the highlight must use the same figure.
+    const displayedCash = homeR2(
+      (job.calc.perPeriod.cashNet ?? job.calc.perPeriod.net)
+      - (job.taxBenefit ? job.taxBenefit.perPeriod : 0));
     jobsForHighlight.push({
       id: row.id, label: row.employer, frequency: row.frequency,
       startDate: row.start_date, recentDate: row.recent_pay_date,
-      cashNet: job.calc.perPeriod.cashNet,
+      cashNet: displayedCash,
     });
   }
   const rentalByMonth = new Map();
   const rentalsForHighlight = [];
+  const rentalById = {};
   for (const r of db.prepare('SELECT * FROM earn_rentals ORDER BY id').all()) {
     const entries = db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(r.id);
     rentalsForHighlight.push({
       id: r.id, label: r.label,
       entries: entries.map((e) => ({ id: e.id, start_ym: e.start_ym, end_ym: e.end_ym, monthly_rent: e.monthly_rent, pay_day: e.pay_day })),
     });
+    const perRental = new Map();
     for (const e of entries) {
       let m = e.start_ym;
       const end = e.end_ym && e.end_ym !== '' ? e.end_ym : cur;
       let guard = 0;
       while (m <= end && m <= cur && guard < 1200) {
         rentalByMonth.set(m, homeR2((rentalByMonth.get(m) || 0) + Number(e.monthly_rent || 0)));
+        perRental.set(m, homeR2((perRental.get(m) || 0) + Number(e.monthly_rent || 0)));
         m = homeNextMonth(m); guard++;
       }
+    }
+    if (perRental.size) {
+      rentalById[r.id] = { label: r.label, months: [...perRental.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([month, rental]) => ({ month, rental })) };
     }
   }
   const earningMonths = [];
@@ -4832,13 +4855,15 @@ async function collectHomeData() {
     currentYm: cur,
     property: propertyMonths, propertyById, propertyLabels,
     stocks: { months: stockMonths, topGainer },
-    earnings: earningMonths,
+    earnings: earningMonths, jobById, rentalById,
     spending: spendingMonths, categorySeries, holdingById,
     jobsForHighlight, rentalsForHighlight,
     entities: {
       properties: props.filter((p) => propertyById[p.id]).map((p) => ({ id: p.id, label: String(p.address).split(',')[0] })),
       holdings: holdings.map((h) => ({ id: h.id, label: h.symbol || h.name || `#${h.id}` })),
       categories: SPEND_CATEGORIES,
+      jobs: Object.entries(jobById).map(([id, j]) => ({ id: Number(id), label: j.label })),
+      rentals: Object.entries(rentalById).map(([id, r]) => ({ id: Number(id), label: r.label })),
     },
   };
 }

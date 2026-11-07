@@ -20,6 +20,7 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="file"]), select { he
 label { display: block; font-size: 12px; color: #5a6a7a; margin: 8px 0 3px; }
 header.topbar { background: #16222e; color: #e8eef4; display: flex; align-items: center; gap: 18px; padding: 0 18px; height: 52px; position: sticky; top: 0; z-index: 10; }
 header.topbar .brand { font-size: 17px; font-weight: 600; }
+header.topbar a.brand { color: #e8eef4; }
 header.topbar nav { display: flex; gap: 4px; }
 header.topbar nav a { color: #b9c7d4; padding: 6px 12px; border-radius: 6px; }
 header.topbar nav a.active { background: #24384c; color: #fff; }
@@ -759,22 +760,35 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .home-head .btn { margin-left: auto; }
 .home-title { margin: 0; font-size: 22px; font-weight: 700; color: #111; }
 .home-sub { color: #71808f; font-size: 13px; margin-top: 4px; }
-.home-section-head { font-size: 13px; font-weight: 600; color: #5a6a7a; letter-spacing: .02em; margin: 26px 0 10px; padding-bottom: 8px; border-bottom: 1px solid #eef1f4; }
+.home-section-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; font-weight: 600; color: #5a6a7a; letter-spacing: .02em; margin: 26px 0 10px; padding-bottom: 8px; border-bottom: 1px solid #eef1f4; }
+.home-section-link { color: inherit; }
+.home-section-link:hover { color: #1668c4; }
+.home-section-all { font-size: 12px; font-weight: 600; color: #1668c4; white-space: nowrap; }
 .home-empty { color: #98a4b0; font-size: 13px; padding: 4px 2px 8px; }
 
-/* Peek carousel: one card dominates (~84% of the viewport, capped
-   for wide screens) so the next card's edge shows; scroll-padding
-   pulls the snapped card in from the left so the previous card's
-   edge shows too. */
-.home-carousel { display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: x mandatory; scroll-padding-left: 8%; padding: 2px 2px 10px; scrollbar-width: thin; }
+/* Folded-deck peek carousel: about two full cards in the viewport
+   with a sliver of the previous card on the left and the next on
+   the right (scroll-padding insets the snapped card). Cards
+   overlap — each tucks 20px under the previous one; the snapped
+   card sits on top at full size, neighbours sit underneath at a
+   touch of scale (see .is-active + homeMarkActiveCarousel). */
+.home-carousel { display: flex; gap: 0; overflow-x: auto; scroll-snap-type: x mandatory; scroll-padding-left: 5%; padding: 6px 2px 12px; scrollbar-width: thin; }
 .home-carousel::-webkit-scrollbar { height: 6px; }
 .home-carousel::-webkit-scrollbar-thumb { background: #dbe2ea; border-radius: 3px; }
 
-/* Long horizontal strip card: text left, big number, sparkline right. */
-.insight-card { position: relative; flex: 0 0 min(860px, 84%); scroll-snap-align: start; display: flex; gap: 16px; align-items: center; background: #fff; border: 1px solid #e6ebf0; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); padding: 16px 18px; }
+/* Big card: a self-contained card with presence — about half the
+   content width, so roughly two show at once in the carousel with
+   a peek on each side — taller, roomier padding, a clearly bigger
+   headline number, and a larger sparkline. */
+.insight-card { position: relative; flex: 0 0 clamp(340px, 46%, 540px); min-height: 168px; scroll-snap-align: start; display: flex; gap: 16px; align-items: center; background: #fff; border: 1px solid #e6ebf0; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); padding: 22px 24px; z-index: 1; transform: scale(.97); transition: transform .18s ease, box-shadow .18s ease; }
+.insight-card + .insight-card { margin-left: -20px; }
+.insight-card.is-active { z-index: 3; transform: scale(1); box-shadow: 0 8px 22px rgba(16, 24, 40, .14); }
+.insight-card[data-home-link] { cursor: pointer; }
+.insight-card[data-home-link]:hover { border-color: #c9d2dc; }
+.insight-card[data-home-link]:focus-visible { outline: 2px solid #1668c4; outline-offset: 2px; }
 .insight-text { flex: 1 1 auto; min-width: 0; }
 .insight-label { font-size: 12px; color: #71808f; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
-.insight-value { font-size: 30px; font-weight: 700; color: #111; line-height: 1.15; margin-top: 4px; letter-spacing: -0.01em; }
+.insight-value { font-size: 40px; font-weight: 700; color: #111; line-height: 1.15; margin-top: 4px; letter-spacing: -0.01em; }
 .insight-sub { font-size: 13px; color: #5a6a7a; margin-top: 2px; }
 .insight-period { font-size: 12px; color: #98a4b0; margin-top: 2px; }
 .insight-deltas { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
@@ -784,11 +798,14 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .delta.flat { color: #5a6a7a; background: #f0f3f6; }
 .delta-yoy { font-size: 12px; color: #98a4b0; white-space: nowrap; }
 .insight-empty { font-size: 20px; font-weight: 600; color: #98a4b0; margin-top: 6px; }
-.insight-spark { flex: 0 0 160px; height: 72px; }
-.insight-spark canvas { width: 100% !important; height: 56px !important; }
+.insight-spark { flex: 0 0 200px; height: 96px; }
+.insight-spark canvas { width: 100% !important; height: 80px !important; }
 .spark-ends { display: flex; justify-content: space-between; font-size: 10px; color: #98a4b0; margin-top: 2px; }
 .home-card-del { position: absolute; top: 8px; right: 10px; border: none; background: none; color: #98a4b0; font-size: 18px; line-height: 1; padding: 2px 6px; }
 .home-card-del:hover { color: #b3261e; background: none; }
+/* AI-appended cards carry a small AI tag by the title so they read
+   as AI-made at a glance; system cards have none. */
+.home-ai-tag { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .05em; color: #1668c4; background: #eef4fb; border: 1px solid #cfe0f2; border-radius: 999px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px; }
 
 /* Payment cards: same strip, toggle on the right instead of a chart. */
 .home-pay-card .insight-toggle { flex: 0 0 auto; }

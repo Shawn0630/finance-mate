@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
+  displayedSalaryMonths,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
 
@@ -61,6 +62,47 @@ test('home: flow cards use the last completed month', () => {
   assert.deepEqual(rental.mom, { delta: 0, pct: 0 });
 });
 
+test('home: displayedSalaryMonths subtracts the month tax benefit (displayed cash, not engine net)', () => {
+  // October: no plan yet, benefit $0 — unchanged. November: plan
+  // active, benefit $180 for the month — the displayed cash is
+  // net − benefit. This is the fallback path (no per-payday rows):
+  // the series the cards are built from is the same jobMonthlySeries
+  // the monthly-chart endpoint returns (pinned in e2e).
+  assert.deepEqual(displayedSalaryMonths({
+    months: ['2026-10', '2026-11'],
+    net: [6000, 6000],
+    taxBenefit: [0, 180],
+  }), [
+    { month: '2026-10', salary: 6000 },
+    { month: '2026-11', salary: 5820 },
+  ]);
+  // A series without a taxBenefit array (bare jobMonthlySeries call
+  // without job/payroll) keeps net as-is.
+  assert.deepEqual(displayedSalaryMonths({ months: ['2026-10'], net: [6000], taxBenefit: null }),
+    [{ month: '2026-10', salary: 6000 }]);
+  assert.deepEqual(displayedSalaryMonths(null), []);
+  assert.deepEqual(displayedSalaryMonths({ months: [], net: [], taxBenefit: [] }), []);
+});
+
+test('home: displayedSalaryMonths prices the benefit like the job page (annual-first per-period benefit)', () => {
+  // Fixture rounding case: the per-payday benefit is $62.06 but the
+  // job page's annual-first per-period benefit is $62.05 — the
+  // displayed cash must match the job page (2 × $2,257.78 =
+  // $4,515.56), not the per-payday sum (2 × $2,257.77 = $4,515.54).
+  assert.deepEqual(displayedSalaryMonths({
+    months: ['2026-10', '2026-11'],
+    net: [4955.64, 4639.66],
+    taxBenefit: [0, 124.12],
+    taxBenefitPays: [
+      { date: '2026-11-06', benefit: 62.06 },
+      { date: '2026-11-20', benefit: 62.06 },
+    ],
+  }, 62.05), [
+    { month: '2026-10', salary: 4955.64 },
+    { month: '2026-11', salary: 4515.56 },
+  ]);
+});
+
 test('home: spending top category + biggest mover', () => {
   const mk = (month, total, byCategory) => ({ month, total, byCategory });
   const spending = [
@@ -116,15 +158,14 @@ test('home: empty sections render No data yet, never invented numbers', () => {
   }
 });
 
-test('home: highlight — current occurrence per source, unmarked rows never roll off', () => {
+test('home: highlight — window is the current + previous month only', () => {
   // Bi-weekly job, recent payday 2026-10-23 → paydays … Oct 9, Oct 23, Nov 6, Nov 20.
-  // Today is 2026-11-07: current occurrence is Nov 6.
+  // Today is 2026-11-07: window is Oct + Nov 2026.
   const jobs = [{ id: 1, label: 'Acme', frequency: 'biweekly', startDate: '2026-01-02', recentDate: '2026-10-23', cashNet: 2000 }];
   const marks = new Map();
   const rows = homeHighlightRows({ jobs, rentals: [], marks, today: '2026-11-07' });
-  // No marks: every occurrence from the job start shows (unmarked rows accumulate).
-  assert.ok(rows.length > 10, `expected many unmarked rows, got ${rows.length}`);
-  assert.equal(rows[0].date, '2026-11-06');
+  // No marks: only the window's occurrences show — not the whole history back to Jan.
+  assert.deepEqual(rows.map((r) => r.date), ['2026-11-06', '2026-10-23', '2026-10-09']);
   assert.equal(rows[0].isCurrent, true);
   assert.equal(rows[0].amount, 2000);
   assert.equal(rows[0].received, null);
@@ -135,13 +176,15 @@ test('home: highlight — current occurrence per source, unmarked rows never rol
   const rows2 = homeHighlightRows({ jobs, rentals: [], marks, today: '2026-11-07' });
   assert.deepEqual(rows2.map((r) => r.date), ['2026-11-06']);
   // When the next occurrence arrives (Nov 20), the marked Nov 6 row is
-  // replaced by Nov 20 — but an unmarked Oct row would still show.
+  // replaced by Nov 20 — but an unmarked Oct row in the window still shows.
   marks.set('salary:1:2026-11-06', 1);
   marks.delete('salary:1:2026-10-23');
   const rows3 = homeHighlightRows({ jobs, rentals: [], marks, today: '2026-11-21' });
-  assert.equal(rows3[0].date, '2026-11-20');
-  assert.ok(rows3.some((r) => r.date === '2026-10-23'), 'unmarked Oct 23 still shows');
+  assert.deepEqual(rows3.map((r) => r.date), ['2026-11-20', '2026-10-23']);
   assert.ok(!rows3.some((r) => r.date === '2026-11-06'), 'marked Nov 6 rolled off');
+  // An unmarked row older than the window drops off even unmarked.
+  const rows4 = homeHighlightRows({ jobs, rentals: [], marks: new Map(), today: '2026-11-07' });
+  assert.ok(!rows4.some((r) => r.date < '2026-10-01'), 'no September rows in the window');
 });
 
 test('home: highlight — a job without dates is skipped, never a guessed row', () => {
@@ -172,17 +215,20 @@ test('home: highlight — rental due day clamps to month length, most recent fir
     id: 7, label: 'Basement',
     entries: [{ id: 1, start_ym: '2026-01', end_ym: null, monthly_rent: 2000, pay_day: 31 }],
   }];
-  const rows = homeHighlightRows({ jobs: [], rentals, marks: new Map(), today: '2026-11-07' });
-  // Current occurrence: Nov 2026, pay day 31 → Nov has 30 days, but
-  // today is Nov 7 so the Nov due date (Nov 30) is still in the future;
-  // the current occurrence is Oct 31.
-  assert.equal(rows[0].date, '2026-10-31');
+  // Today 2026-03-07, window Feb + Mar 2026: Mar 31 is still in the
+  // future, so the current occurrence is Feb 28 (pay day 31 clamps).
+  // Jan 31 is outside the window and never shows.
+  const rows = homeHighlightRows({ jobs: [], rentals, marks: new Map(), today: '2026-03-07' });
+  assert.deepEqual(rows.map((r) => r.date), ['2026-02-28']);
   assert.equal(rows[0].amount, 2000);
-  // Feb 2026 has 28 days: pay day 31 clamps to Feb 28.
-  assert.ok(rows.some((r) => r.date === '2026-02-28'));
   assert.ok(!rows.some((r) => r.date === '2026-02-31'));
-  // Most recent first.
-  for (let i = 1; i < rows.length; i++) assert.ok(rows[i - 1].date >= rows[i].date);
+  // Most recent first, window-bounded: pay day 15, today Nov 20.
+  const rows2 = homeHighlightRows({
+    jobs: [],
+    rentals: [{ id: 7, label: 'Basement', entries: [{ id: 1, start_ym: '2026-01', end_ym: null, monthly_rent: 2000, pay_day: 15 }] }],
+    marks: new Map(), today: '2026-11-20',
+  });
+  assert.deepEqual(rows2.map((r) => r.date), ['2026-11-15', '2026-10-15']);
 });
 
 test('home: resolveHomeMetric — per-entity variants + unknown metric', () => {
@@ -212,4 +258,47 @@ test('home: resolveHomeMetric — per-entity variants + unknown metric', () => {
   assert.ok(lib.some((m) => m.metric === 'holding_gain:9'));
   assert.ok(lib.some((m) => m.metric === 'category_spend:Groceries'));
   assert.equal(lib.filter((m) => m.metric === 'property_equity').length, 1);
+});
+
+test('home: resolveHomeMetric — per-entity cards carry the entity ref; standard cards do not', () => {
+  const data = {
+    currentYm: '2026-11',
+    property: months('2026-10', [500000, 510000], 'equity').map((r) => ({ ...r, assessed: 900000, outstanding: 390000 })),
+    propertyById: { 5: months('2026-10', [300000, 310000], 'equity').map((r) => ({ ...r, assessed: 500000, outstanding: 190000 })) },
+    propertyLabels: { 5: '77 Riverbend' },
+    stocks: { months: [], topGainer: null },
+    holdingById: { 9: { label: 'XQQ.TO', months: months('2026-10', [10000, 11000], 'value').map((r) => ({ ...r, gain: 1000 })) } },
+    earnings: [], spending: [],
+    categorySeries: { Groceries: months('2026-09', [400, 500], 'total') },
+    jobById: { 3: { label: 'Acme', months: months('2026-09', [2000, 2100], 'salary') } },
+    rentalById: { 7: { label: 'Basement', months: months('2026-09', [2000, 2000], 'rental') } },
+  };
+  const prop = resolveHomeMetric('property_equity:5', data);
+  assert.equal(prop.value, 310000);
+  assert.deepEqual(prop.entity, { kind: 'property', id: 5 });
+  const hold = resolveHomeMetric('holding_value:9', data);
+  assert.equal(hold.value, 11000);
+  assert.deepEqual(hold.entity, { kind: 'holding', id: 9 });
+  const cat = resolveHomeMetric('category_spend:Groceries', data);
+  assert.equal(cat.value, 500);
+  assert.deepEqual(cat.entity, { kind: 'category', id: 'Groceries' });
+  const job = resolveHomeMetric('job_takehome:3', data);
+  assert.equal(job.value, 2100);
+  assert.equal(job.period, '2026-10');
+  assert.deepEqual(job.entity, { kind: 'job', id: 3 });
+  const rent = resolveHomeMetric('rental_income:7', data);
+  assert.equal(rent.value, 2000);
+  assert.equal(rent.period, '2026-10');
+  assert.deepEqual(rent.entity, { kind: 'rental', id: 7 });
+  // A standard card carries no entity ref — the client falls back
+  // to the section summary link.
+  assert.equal(resolveHomeMetric('property_equity', data).entity, undefined);
+  const lib = buildHomeMetricLibrary({
+    properties: [{ id: 5, label: '77 Riverbend' }], holdings: [{ id: 9, label: 'XQQ.TO' }],
+    categories: ['Groceries'], jobs: [{ id: 3, label: 'Acme' }], rentals: [{ id: 7, label: 'Basement' }],
+  });
+  assert.ok(lib.some((m) => m.metric === 'job_takehome:3' && m.section === 'earning'));
+  assert.ok(lib.some((m) => m.metric === 'rental_income:7' && m.section === 'earning'));
+  // Per-entity metrics never leak into the plain standard set.
+  assert.equal(lib.filter((m) => m.metric === 'job_takehome').length, 0);
 });

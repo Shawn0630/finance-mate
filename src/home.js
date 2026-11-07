@@ -9,13 +9,13 @@
 //      COMPLETED month. Primary delta is MoM, second is YoY;
 //      sparkline is the trailing 12 months of the metric.
 //   2. The highlight rows: recent salary + rental occurrences.
-//      Rollover rule (user, 2026-11-07): a row leaves the highlight
-//      only when it was MARKED (received or not-received) AND the
-//      next occurrence of the same source has arrived. An UNMARKED
-//      row is NEVER replaced — it keeps showing until marked, even
-//      past its date, so overdue payments accumulate visibly. No
-//      arbitrary time cutoff. The query is therefore: the current
-//      occurrence per source + all unmarked occurrences.
+//      Window (user, 2026-11-07): the current month and the previous
+//      month only. Within the window, the rollover rule: a row leaves
+//      the highlight only when it was MARKED (received or
+//      not-received) AND the next occurrence of the same source has
+//      arrived. An UNMARKED row in the window keeps showing until
+//      marked. The query is therefore: the current occurrence per
+//      source + all unmarked occurrences, all inside the window.
 import { payDatesInWindow, nominalRecentDate, normJobDate, PAY_FREQUENCIES } from './earnings.js';
 import { adjustPayday } from './holidays.js';
 
@@ -58,6 +58,36 @@ export function daysInMonth(ym) {
   const y = Number(String(ym).slice(0, 4));
   const m = Number(String(ym).slice(5, 7));
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
+}
+
+// Displayed cash take-home by month from a jobMonthlySeries result.
+// The series' net is the engine net (paycheque + the deferred RRSP
+// tax benefit — the benefit is not on the paycheque, it arrives at
+// the T1), so each month's displayed cash is net minus that month's
+// benefit. The benefit is priced like the job page does: the
+// annual-first per-period benefit, once per payday that saved tax
+// (the series' taxBenefitPays rows) — NOT the per-payday benefit,
+// which can sit a cent per payday off the job page's figure (the
+// fixture: $62.06 per payday vs $62.05 annual-first). Months before
+// any plan started have no such payday and are unchanged. Without
+// per-payday rows it falls back to the month's taxBenefit array, and
+// without that to net as-is.
+export function displayedSalaryMonths(series, benefitPerPeriod = 0) {
+  if (!series || !series.months) return [];
+  const paysByMonth = new Map();
+  for (const p of (series.taxBenefitPays || [])) {
+    const m = String(p.date).slice(0, 7);
+    paysByMonth.set(m, (paysByMonth.get(m) || 0) + 1);
+  }
+  return series.months.map((m, i) => {
+    let ben = 0;
+    if (series.taxBenefitPays && benefitPerPeriod > 0) {
+      ben = r2((paysByMonth.get(m) || 0) * benefitPerPeriod);
+    } else if (series.taxBenefit) {
+      ben = series.taxBenefit[i] || 0;
+    }
+    return { month: m, salary: r2((series.net[i] || 0) - ben) };
+  });
 }
 
 // ------------------------------------------------------------ deltas --
@@ -291,12 +321,15 @@ export function buildStandardInsights(data) {
 // rentals: [{id, label, entries: [{start_ym, end_ym, monthly_rent, pay_day}]}]
 // marks: Map keyed `${kind}:${sourceId}:${date}` -> 0 | 1
 // today: 'YYYY-MM-DD' (Vancouver date).
-// Returns rows, most recent first. Per source: the current occurrence
-// (latest occurrence on or before today) is always shown; every
-// unmarked occurrence is shown too, however old. A marked occurrence
-// that is not the current one has rolled off.
+// Returns rows, most recent first. Window (user, 2026-11-07): the
+// CURRENT month and the PREVIOUS month only — older rows drop off
+// even when unmarked. Within the window, per source: the current
+// occurrence (latest on or before today) is always shown; every
+// unmarked occurrence in the window is shown too. A marked
+// occurrence that is not the current one has rolled off.
 export function homeHighlightRows({ jobs, rentals, marks, today }) {
   const cur = String(today).slice(0, 7);
+  const windowStart = prevMonth(cur);
   const rows = [];
   const isMarked = (kind, sourceId, date) => marks.has(`${kind}:${sourceId}:${date}`);
 
@@ -323,9 +356,10 @@ export function homeHighlightRows({ jobs, rentals, marks, today }) {
     }
     // Two nominal dates can adjust onto the same day; one row.
     const dates = [...new Set(nominal.map((d) => adjustPayday(d)))].sort();
-    if (!dates.length) continue;
-    const current = dates[dates.length - 1];
-    for (const d of dates) {
+    const inWindow = dates.filter((d) => d.slice(0, 7) >= windowStart);
+    if (!inWindow.length) continue;
+    const current = inWindow[inWindow.length - 1];
+    for (const d of inWindow) {
       if (d === current || !isMarked('salary', job.id, d)) {
         rows.push({
           kind: 'salary', sourceId: job.id, sourceLabel: job.label, date: d,
@@ -339,10 +373,11 @@ export function homeHighlightRows({ jobs, rentals, marks, today }) {
   for (const rental of rentals || []) {
     const entries = rental.entries || [];
     if (!entries.length) continue;
-    // Months from the earliest entry start through the current month.
+    // Months from the earliest entry start through the current month,
+    // bounded below by the window start.
     const startYm = entries.map((e) => e.start_ym).sort()[0];
     const months = [];
-    let m = startYm;
+    let m = startYm < windowStart ? windowStart : startYm;
     while (m <= cur) { months.push(m); m = nextMonth(m); }
     // One occurrence per (rental, month): amounts sum across
     // covering entries, due day from the latest-starting entry.
@@ -399,6 +434,7 @@ export const HOME_STANDARD_METRICS = [
 
 // Build the full library from live entities. entities:
 //   properties: [{id, label}], holdings: [{id, label}], categories: [name]
+//   jobs: [{id, label}], rentals: [{id, label}]
 export function buildHomeMetricLibrary(entities) {
   const lib = [...HOME_STANDARD_METRICS];
   for (const p of entities.properties || []) {
@@ -413,6 +449,12 @@ export function buildHomeMetricLibrary(entities) {
   for (const c of entities.categories || []) {
     lib.push({ metric: `category_spend:${c}`, section: 'spending', title: `${c} spend` });
   }
+  for (const j of entities.jobs || []) {
+    lib.push({ metric: `job_takehome:${j.id}`, section: 'earning', title: `${j.label} take-home` });
+  }
+  for (const r of entities.rentals || []) {
+    lib.push({ metric: `rental_income:${r.id}`, section: 'earning', title: `${r.label} income` });
+  }
   return lib;
 }
 
@@ -422,8 +464,12 @@ export function buildHomeMetricLibrary(entities) {
 //   propertyById: {id: [{month, equity, assessed, outstanding}]}
 //   holdingById: {id: {months: [{month, value, gain}], label}}
 //   categorySeries: {name: [{month, total}]}
+//   jobById: {id: {label, months: [{month, salary}]}}
+//   rentalById: {id: {label, months: [{month, rental}]}}
 // Returns a card payload, or {error} when the metric is unknown or
-// has no data.
+// has no data. Per-entity cards carry `entity` {kind, id} so the
+// card can link to that entity's detail page; standard cards carry
+// none and fall back to the section summary link.
 export function resolveHomeMetric(metric, data) {
   const standard = buildStandardInsights(data).find((c) => c.metric === metric);
   if (standard) {
@@ -439,24 +485,53 @@ export function resolveHomeMetric(metric, data) {
     if (!series || !series.length) return { error: 'no_data', message: 'That property has no data yet.' };
     const field = base === 'property_equity' ? 'equity' : base === 'property_assessed' ? 'assessed' : 'outstanding';
     const label = (data.propertyLabels || {})[entityId] || 'Property';
-    return pointCard({ section: 'property', title: `${label} ${field === 'equity' ? 'equity' : field === 'assessed' ? 'assessed' : 'outstanding'}`,
-      metric, currentYm, series, field, downIsGood: base === 'property_outstanding',
-      method: `One property's ${field} at month-end.` });
+    return {
+      ...pointCard({ section: 'property', title: `${label} ${field === 'equity' ? 'equity' : field === 'assessed' ? 'assessed' : 'outstanding'}`,
+        metric, currentYm, series, field, downIsGood: base === 'property_outstanding',
+        method: `One property's ${field} at month-end.` }),
+      entity: { kind: 'property', id: Number(entityId) },
+    };
   }
   if (base === 'holding_value' || base === 'holding_gain') {
     const h = (data.holdingById || {})[entityId];
     if (!h || !h.months || !h.months.length) return { error: 'no_data', message: 'That holding has no data yet.' };
     const field = base === 'holding_value' ? 'value' : 'gain';
-    return pointCard({ section: 'stock', title: `${h.label} ${field === 'value' ? 'value' : 'gain'}`,
-      metric, currentYm, series: h.months, field,
-      method: `One holding's ${field} at month-end, CAD.` });
+    return {
+      ...pointCard({ section: 'stock', title: `${h.label} ${field === 'value' ? 'value' : 'gain'}`,
+        metric, currentYm, series: h.months, field,
+        method: `One holding's ${field} at month-end, CAD.` }),
+      entity: { kind: 'holding', id: Number(entityId) },
+    };
   }
   if (base === 'category_spend') {
     const series = (data.categorySeries || {})[entityId];
     if (!series || !series.length) return { error: 'no_data', message: 'That category has no spending yet.' };
-    return flowCard({ section: 'spending', title: `${entityId} spend`, metric,
-      currentYm, series, field: 'total',
-      method: `One category's spend in the last completed month.` });
+    return {
+      ...flowCard({ section: 'spending', title: `${entityId} spend`, metric,
+        currentYm, series, field: 'total',
+        method: `One category's spend in the last completed month.` }),
+      entity: { kind: 'category', id: entityId },
+    };
+  }
+  if (base === 'job_takehome') {
+    const s = (data.jobById || {})[entityId];
+    if (!s || !s.months || !s.months.length) return { error: 'no_data', message: 'That job has no pay history yet.' };
+    return {
+      ...flowCard({ section: 'earning', title: `${s.label} take-home`, metric,
+        currentYm, series: s.months, field: 'salary',
+        method: `One salary job's take-home in the last completed month.` }),
+      entity: { kind: 'job', id: Number(entityId) },
+    };
+  }
+  if (base === 'rental_income') {
+    const s = (data.rentalById || {})[entityId];
+    if (!s || !s.months || !s.months.length) return { error: 'no_data', message: 'That rental has no rent history yet.' };
+    return {
+      ...flowCard({ section: 'earning', title: `${s.label} income`, metric,
+        currentYm, series: s.months, field: 'rental',
+        method: `One rental's rent due in the last completed month.` }),
+      entity: { kind: 'rental', id: Number(entityId) },
+    };
   }
   return { error: 'unknown_metric', message: 'That metric is not computable.' };
 }
