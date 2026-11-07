@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { simulate as engineSimulate, derivePayment as engineDerive, monthlyRate as engineMonthlyRate, buildSchedule as engineSchedule } from '../src/engine.js';
+import { simulate as engineSimulate, derivePayment as engineDerive, monthlyRate as engineMonthlyRate, buildSchedule as engineSchedule, primeAtDateResolver as enginePrimeAtDate, remainingBalanceAt as engineRemainingBalance } from '../src/engine.js';
 import { runModuleMain } from './e2e-child.mjs';
 import { run as runCore } from './e2e-core.mjs';
 export const deps = [runCore];
@@ -5592,6 +5592,96 @@ export async function run(H, S) {
     }
     } finally {
       await browser.close();
+    }
+  }
+
+  // ---------------------------------------------------------- multi-term
+  // mortgage chaining (Riverbend): a property with two terms whose
+  // anchor is the FIRST term's opening balance dated at the SECOND
+  // term's start must chain — the second term's opening reconciles
+  // the balance, the first term's payment still derives from its
+  // own opening, and the current principal reflects the chained
+  // repayments instead of the anchor balance. API-level pins (the
+  // projection never reaches Term 1, so no pre-anchor history is
+  // asserted — only the current principal and both triples).
+  {
+    let riverbendId = null;
+    try {
+      // The live prime history (stub) prices the locked variable
+      // rate: prime on 2026-04-01 (4.45%) − 0.80 = 3.65%.
+      const prime = await H.req('GET', '/api/prime');
+      const history = Array.isArray(prime.data.history) ? prime.data.history : [];
+      const fallbackRate = prime.data.current ? prime.data.current.rate : null;
+      const primeOn = enginePrimeAtDate(history, fallbackRate);
+      const lockedRate = primeOn ? primeOn('2026-04-01') - 0.8 : null;
+      H.check('Riverbend pin: live prime history resolves the locked rate',
+        lockedRate != null && Math.abs(lockedRate - 3.65) < 0.01,
+        JSON.stringify({ lockedRate, history }));
+
+      let r = await H.req('POST', '/api/properties', { address: '77-3010 Riverbend Dr, Coquitlam, BC', purchase_date: '2024-04-16' });
+      riverbendId = r.data && r.data.id;
+      H.check('Riverbend pin: property created', riverbendId != null, JSON.stringify(r.data));
+      const t1 = await H.req('POST', `/api/properties/${riverbendId}/terms`, { lender: 'Royal Bank of Canada', start_date: '2024-04-16', term_months: 25, amortization_years: 24, opening_balance: 489429.67, payment_frequency: 'weekly', repayment_method: 'equal_payment' });
+      const t1Id = t1.data && t1.data.id;
+      H.check('Riverbend pin: Term 1 created', t1Id != null, JSON.stringify(t1.data));
+      await H.req('POST', `/api/properties/${riverbendId}/rates`, { term_id: t1Id, start_date: '2024-04-16', rate_type: 'fixed', annual_rate: 4.79, compounding: 'semi_annual', accrual: 'monthly' });
+      // Opening passed explicitly: the renewal prefill must not
+      // overwrite the term's own opening balance.
+      const t2 = await H.req('POST', `/api/properties/${riverbendId}/terms`, { lender: 'Royal Bank of Canada', start_date: '2026-04-27', term_months: 60, amortization_years: 22, opening_balance: 465439.31, payment_frequency: 'weekly', repayment_method: 'equal_payment' });
+      const t2Id = t2.data && t2.data.id;
+      H.check('Riverbend pin: Term 2 created with its own opening', t2Id != null && Number(t2.data.opening_balance) === 465439.31, JSON.stringify(t2.data));
+      // The variable segment starts 2026-04-16 (before Term 2's
+      // start), so it must be tied to Term 2 explicitly — the
+      // span lookup would otherwise assign it to Term 1.
+      await H.req('POST', `/api/properties/${riverbendId}/rates`, { term_id: t2Id, start_date: '2026-04-16', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.8, compounding: 'semi_annual', accrual: 'monthly', locked_on: '2026-04-01' });
+      // Reproduce the user's anchor state: Term 1's opening
+      // balance carried to Term 2's start date.
+      await H.req('PUT', `/api/properties/${riverbendId}`, { mortgage_balance: 489429.67, mortgage_balance_date: '2026-04-27' });
+
+      const detail = await H.req('GET', `/api/properties/${riverbendId}`);
+      const terms = (detail.data && detail.data.terms) || [];
+      const term1 = terms.find((t) => t.id === t1Id) || {};
+      const term2 = terms.find((t) => t.id === t2Id) || {};
+      // Term 1's triple derives from its own opening — the
+      // projection never reaches it, so the server fills it in.
+      H.check('Riverbend pin: Term 1 payment derives from its own opening (≈ $2,849.29/mo)',
+        Math.abs(term1.paymentDerived - engineDerive(489429.67, 4.79, 24)) < 0.5 && term1.paymentUsed === term1.paymentDerived,
+        JSON.stringify({ derived: term1.paymentDerived, used: term1.paymentUsed }));
+      // Term 2's payment derives from ITS opening at the locked
+      // rate — not from the anchor balance.
+      const term2Derived = lockedRate != null ? engineDerive(465439.31, lockedRate, 22) : null;
+      H.check('Riverbend pin: Term 2 payment derives from its opening at the locked rate (≈ $2,560.43/mo)',
+        term2Derived != null && Math.abs(term2.paymentDerived - term2Derived) < 0.5,
+        JSON.stringify({ derived: term2.paymentDerived, expected: term2Derived, lockedRate }));
+      H.check('Riverbend pin: property payment follows the current term',
+        term2Derived != null && Math.abs(detail.data.paymentUsed - term2Derived) < 0.5,
+        JSON.stringify({ used: detail.data.paymentUsed }));
+
+      // The current principal must agree with an independent
+      // engine run on the same inputs and live prime history, and
+      // must sit far from the buggy anchor-derived $480,756.
+      const engineProj = engineSchedule({
+        balance: 489429.67, balanceDate: '2026-04-27',
+        terms: [
+          { id: t1Id, start_date: '2024-04-16', term_months: 25, amortization_years: 24, opening_balance: 489429.67, repayment_method: 'equal_payment' },
+          { id: t2Id, start_date: '2026-04-27', term_months: 60, amortization_years: 22, opening_balance: 465439.31, repayment_method: 'equal_payment' },
+        ],
+        segments: [
+          { start_date: '2024-04-16', rate_type: 'fixed', annual_rate: 4.79, compounding: 'semi_annual', accrual: 'monthly' },
+          { start_date: '2026-04-16', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.8, compounding: 'semi_annual', accrual: 'monthly', locked_on: '2026-04-01' },
+        ],
+        lumpSums: [], paymentDay: null, frequency: 'weekly',
+        primeRate: fallbackRate, primeHistory: history, region: 'CA',
+      });
+      const expectedBalance = engineRemainingBalance(engineProj.series, detail.data.remainingBalanceMonth, 489429.67, engineProj.payoffMonth).balance;
+      H.check('Riverbend pin: current principal agrees with the engine (chained, not anchor)',
+        Math.abs(detail.data.remainingBalance - expectedBalance) <= 1,
+        JSON.stringify({ api: detail.data.remainingBalance, engine: expectedBalance, month: detail.data.remainingBalanceMonth }));
+      H.check('Riverbend pin: current principal is far from the buggy $480,756',
+        Math.abs(detail.data.remainingBalance - 480756) > 10000 && detail.data.remainingBalance > 440000 && detail.data.remainingBalance < 470000,
+        JSON.stringify({ api: detail.data.remainingBalance }));
+    } finally {
+      if (riverbendId != null) await H.req('DELETE', `/api/properties/${riverbendId}`);
     }
   }
 }

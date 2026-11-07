@@ -676,6 +676,52 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
     if (L > A) anchorByState.set(L - 1, round2(ab));
   }
 
+  // A term's opening balance is a reconciliation point at its
+  // start — but ONLY when the anchor starts mid-history. The
+  // opening repairs the history the projection cannot replay:
+  // when the anchor month is after the first term's start month,
+  // the terms before the anchor never run, so the balance at a
+  // renewal is the new term's opening, not whatever the replay
+  // from the stale anchor carried there. When the anchor is at
+  // or before the first term's start, the projection replays the
+  // whole history from the anchor — the replay is authoritative
+  // and the opening carries no reconciliation. That matters for
+  // lump sums: a lump sum recorded after a renewal was created
+  // lowers the replayed balance at the renewal, and the renewal
+  // re-derives off it; resetting to the (stale, pre-lump)
+  // opening would erase the lump sum's effect. A term starting
+  // after the anchor month resets the running balance at the
+  // state point just before its first payment month (the same
+  // convention as the anchor columns above, and it wins over an
+  // anchor column at the same state point — the opening is the
+  // contract's figure for that month). A term starting IN the
+  // anchor month has its opening in force from the anchor state
+  // on (handled below at the opening balance); the property
+  // anchor remains the starting point before any term start at
+  // or after it. Terms starting before the anchor month are
+  // untouched — pre-anchor history is never rebuilt. An opening
+  // that is not a positive number carries no reconciliation (a
+  // missing opening must never zero the balance).
+  const firstTermStart = sortedTerms.length
+    ? Math.min(...sortedTerms.map((t) => monthIdxOf(t.start_date))) : null;
+  const openingReconciles = firstTermStart != null && A > firstTermStart;
+  for (const t of sortedTerms) {
+    if (!openingReconciles) break;
+    const ob = Number(t.opening_balance);
+    if (!isFinite(ob) || ob <= 0) continue;
+    const M = monthIdxOf(t.start_date);
+    if (M > A) anchorByState.set(M - 1, round2(ob));
+  }
+  let openingAtAnchor = null; // the term opening in force at S = A
+  for (const t of sortedTerms) {
+    if (!openingReconciles) break;
+    if (monthIdxOf(t.start_date) !== A) continue;
+    const ob = Number(t.opening_balance);
+    if (!isFinite(ob) || ob <= 0) continue;
+    if (!openingAtAnchor || t.start_date > openingAtAnchor.start_date
+      || (t.start_date === openingAtAnchor.start_date && t.id > openingAtAnchor.id)) openingAtAnchor = t;
+  }
+
   // The derivation rate of a prime-spread segment carrying a
   // locked_on date: the prime in effect on that date plus the
   // segment's spread. undefined when the segment carries no lock
@@ -864,7 +910,12 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   const boundaries = [...eventStates].sort((a, b) => a - b);
   boundaries.push(A + maxMonths);
 
-  let bal = round2(Number(balance));
+  // A term starting in the anchor month opens with its own
+  // opening balance (see above): the anchor-state derivation
+  // prices off the renewal balance, not the property anchor.
+  let bal = openingAtAnchor
+    ? round2(Number(openingAtAnchor.opening_balance))
+    : round2(Number(balance));
   const series = [];
   let totalInterest = 0;
   let negativeAmortization = false;
@@ -872,9 +923,11 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   let paymentUsed = null;
 
   if (initialLump) {
+    const preLumpBal = bal; // the anchor-state balance (the term
+    // opening when one starts in the anchor month)
     bal = round2(bal - initialLump.total);
     if (bal <= 0) {
-      const derived = computePayment(A, round2(Number(balance)));
+      const derived = computePayment(A, preLumpBal);
       const ovA = overrideAt(A);
       const usedFigure = ovA !== null ? ovA : (derived.error ? null : (derived.payment ?? null));
       const anchorT = termAtMonth(A + 1);

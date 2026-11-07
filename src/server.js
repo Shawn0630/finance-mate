@@ -8,7 +8,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
-import { buildSchedule, segmentForMonth, segmentAnnualRate, remainingBalanceAt, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
+import { buildSchedule, segmentForMonth, segmentAnnualRate, segmentRateForMonth, derivePayment, primeAtDateResolver, primeHistoryResolver, remainingBalanceAt, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { getRegion, REGION_CODES } from './regions/index.js';
 import { getCurrentPrime, getPrimeHistory, ensureFreshPrime, refreshPrime, primeInfo, primeStatus, vancouverToday } from './prime.js';
 import {
@@ -938,11 +938,73 @@ function termView(t, segments, lumpSums, payMap) {
   };
 }
 
+// A term's opening payment triple, derived directly from its own
+// opening balance, its first segment's rate and its amortization —
+// the payment the term opened with. Used for a term the projection
+// never reaches (it starts before the balance anchor, so no span is
+// governed by it): without this its card shows "—" and the term's
+// own history is invisible. A prime-spread segment prices at its
+// locked_on rate when one is present, else at the rate in the
+// term's start month; a fixed segment prices at its nominal rate.
+// An override, when present, is the used figure. Null when the
+// triple cannot be derived (no segment, no opening, no
+// amortization, or no prime for a prime-spread segment) — the
+// term keeps showing "—" then, exactly as before.
+function termOpeningTriple(t, segments, primeHistory, primeRate) {
+  const segs = (segments || [])
+    .filter((s) => s.term_id === t.id)
+    .sort((a, b) => (a.start_date < b.start_date ? -1 : a.start_date > b.start_date ? 1 : a.id - b.id));
+  const seg = segs[0] || null;
+  const opening = Number(t.opening_balance);
+  const amort = Number(t.amortization_years);
+  if (!seg || !isFinite(opening) || !(opening > 0) || !isFinite(amort) || !(amort > 0)) return null;
+  let rate = null;
+  if (seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread' && seg.locked_on) {
+    const atDate = primeAtDateResolver(primeHistory, primeRate);
+    if (!atDate) return null;
+    const prime = atDate(String(seg.locked_on));
+    if (prime === null || prime === undefined || !isFinite(Number(prime))) return null;
+    rate = Math.max(0, Math.round((Number(prime) + Number(seg.spread || 0)) * 100) / 100);
+  } else if (seg.rate_type === 'variable' && seg.rate_mode === 'prime_spread') {
+    const forMonth = primeHistoryResolver(primeHistory, primeRate);
+    if (!forMonth) return null;
+    rate = segmentRateForMonth(seg, String(t.start_date).slice(0, 7), forMonth);
+  } else {
+    rate = segmentAnnualRate(seg, primeRate);
+  }
+  if (rate === null || rate === undefined || !isFinite(Number(rate))) return null;
+  const derived = derivePayment(opening, Number(rate), amort, seg.compounding || undefined);
+  if (!isFinite(derived) || !(derived > 0)) return null;
+  const ov = Number(t.payment_override);
+  const overridden = isFinite(ov) && ov > 0;
+  return {
+    paymentUsed: overridden ? Math.round(ov * 100) / 100 : derived,
+    paymentDerived: derived,
+    paymentOverridden: overridden,
+  };
+}
+
 // The term payment map of a property's projection, for term views
-// served outside a full property view.
+// served outside a full property view. Terms the projection never
+// reaches keep their opening triple (see termOpeningTriple) instead
+// of nulls — a past term's payment is its own history, not a gap.
+function fillTermPayMap(p, proj) {
+  const map = proj ? { ...proj.termPayments } : {};
+  const terms = termsOf(p.id);
+  if (!terms.some((t) => !map[t.id])) return Object.keys(map).length ? map : null;
+  const segments = segmentsOf(p.id);
+  const primeHistory = getPrimeHistory();
+  const prime = getCurrentPrime();
+  for (const t of terms) {
+    if (map[t.id]) continue;
+    const triple = termOpeningTriple(t, segments, primeHistory, prime ? prime.rate : null);
+    if (triple) map[t.id] = triple;
+  }
+  return Object.keys(map).length ? map : null;
+}
+
 function termPayMapFor(p) {
-  const r = projectionFor(p);
-  return r ? r.termPayments : null;
+  return fillTermPayMap(p, projectionFor(p));
 }
 
 function propertyView(p) {
@@ -961,6 +1023,9 @@ function propertyView(p) {
   const remaining = proj
     ? remainingBalanceAt(proj.series, currentMonthKey(), p.mortgage_balance ?? null, proj.payoffMonth)
     : { balance: p.mortgage_balance ?? null, month: null };
+  // One payment map for every term card: the projection's triples
+  // plus the opening triple for any term it never reaches.
+  const payMap = fillTermPayMap(p, proj);
   return {
     ...p,
     ai_fields: parseAiFields(p.ai_fields),
@@ -985,7 +1050,7 @@ function propertyView(p) {
     owners: parseOwners(p.owners),
     photos: photosView(p),
     segments,
-    terms: terms.map((t) => termView(t, segments, lumpSums, proj ? proj.termPayments : null)),
+    terms: terms.map((t) => termView(t, segments, lumpSums, payMap)),
     lumpSums,
     remainingBalance: remaining.balance,
     remainingBalanceMonth: remaining.month,

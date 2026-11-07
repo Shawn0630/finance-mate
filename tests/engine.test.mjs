@@ -280,6 +280,120 @@ test('buildSchedule: two terms — payment recomputed at the renewal on the new 
   assert.ok(close(first2.balance, b59 + first2.interest - first2.payment), first2.balance);
 });
 
+test('buildSchedule: a term starting in the anchor month opens with its own opening balance (Riverbend chaining)', () => {
+  // The user's Riverbend mortgage (77-3010 Riverbend Dr, RBC): the
+  // property anchor is Term 1's opening balance ($489,429.67) dated
+  // Apr 2026 — Term 2's start — so the projection starts there and
+  // Term 1's payments never run. Term 2 must open with ITS opening
+  // ($465,439.31): Term 1's 25 months at $2,849.29/mo chain exactly
+  // into it ($489,429.67 -> $465,439.70, 39¢ off), so the opening
+  // is the contract's figure for the renewal month.
+  const primeHistory = [
+    { date: '2024-12-11', rate: 5.95 },
+    { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-02-05', rate: 5.20 },
+    { date: '2025-03-19', rate: 4.95 },
+    { date: '2025-09-24', rate: 4.70 },
+    { date: '2025-11-05', rate: 4.45 },
+    { date: '2026-10-14', rate: 4.70 },
+    { date: '2026-10-21', rate: 4.95 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2024-04-16', amortization_years: 24, opening_balance: 489429.67, payment_frequency: 'weekly', repayment_method: 'equal_payment' },
+    { id: 2, start_date: '2026-04-27', amortization_years: 22, opening_balance: 465439.31, payment_frequency: 'weekly', repayment_method: 'equal_payment' },
+  ];
+  const segments = [
+    { start_date: '2024-04-16', rate_type: 'fixed', annual_rate: 4.79, compounding: 'semi_annual', accrual: 'monthly' },
+    { start_date: '2026-04-16', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.8, compounding: 'semi_annual', accrual: 'monthly', locked_on: '2026-04-01' },
+  ];
+  const r = buildSchedule({ balance: 489429.67, balanceDate: '2026-04-27', terms, segments, frequency: 'weekly', primeRate: 4.95, primeHistory });
+  assert.equal(r.state, 'projected');
+  // Term 2's payment prices off its own opening at the locked rate
+  // (prime 4.45 on 2026-04-01 - 0.80 = 3.65%), not off the anchor:
+  // $2,560.43/mo, not the pre-fix $2,692.40/mo.
+  assert.equal(r.paymentUsed, 2560.43);
+  assert.equal(r.paymentDerived, 2560.43);
+  assert.equal(r.termPayments[2].paymentDerived, 2560.43);
+  // The projection starts at the anchor month: no pre-anchor rows,
+  // and Term 1 is never reached — no triple from the projection
+  // itself (the server fills its opening triple separately).
+  assert.equal(r.series[0].month, '2026-05');
+  assert.equal(r.termPayments[1], undefined);
+  // November 2026: $457,465.96 — cross-checked by independent
+  // monthly stepping ($457,466.11; the $0.15 is weekly stepping).
+  // The pre-fix figure was $481,045.53: the ~$23,990 of principal
+  // Term 1 repaid was missing. (The $456,390 figure in the bug
+  // report mixed the correct opening with the pre-fix payment
+  // $2,699.48/mo; with the corrected payment the chained value is
+  // $457,466 on this prime history, $457,372 on the live one.)
+  const rem = remainingBalanceAt(r.series, '2026-11', 489429.67, r.payoffMonth);
+  assert.ok(close(rem.balance, 457466, 1), rem.balance);
+  assert.ok(rem.balance < 480756 - 20000, rem.balance);
+});
+
+test('buildSchedule: a term starting after a mid-history anchor resets the balance to its opening', () => {
+  // Anchor Jan 2026 $100,000 — mid-history: Term 1 started Jan
+  // 2025, before the anchor, so its pre-anchor payments never
+  // run. Term 2 from 2031-01-01 opens at $70,000 (deliberately
+  // below the replayed balance) at fixed 4% over 30y: the renewal
+  // payment must derive from the opening, and January 2031's
+  // interest must charge on the opening.
+  const segments = [
+    { start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 },
+    { start_date: '2031-01-01', rate_type: 'fixed', annual_rate: 4 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2025-01-01', amortization_years: 25 },
+    { id: 2, start_date: '2031-01-01', amortization_years: 30, opening_balance: 70000 },
+  ];
+  const r = buildSchedule({ balance: 100000, balanceDate: '2026-01-01', terms, segments });
+  assert.equal(r.state, 'projected');
+  assert.equal(r.termPayments[2].paymentDerived, derivePayment(70000, 4, 30));
+  const jan31 = r.series.find((row) => row.month === '2031-01');
+  assert.ok(jan31, 'term 2 opens at 2031-01');
+  assert.ok(close(jan31.interest, 70000 * monthlyRate(4)), jan31.interest);
+  assert.ok(close(jan31.payment, derivePayment(70000, 4, 30), 0.02), jan31.payment);
+  // The balance just before the reset is the replayed Term 1 figure,
+  // not the opening: the reset is a jump, not a rewrite of history.
+  const dec30 = r.series.find((row) => row.month === '2030-12');
+  assert.ok(dec30.balance > 70000, dec30.balance);
+});
+
+test('buildSchedule: a lump sum flows through to a renewal re-derived off the replayed balance', () => {
+  // Anchor AT the mortgage start (Jan 2026, Term 1's opening):
+  // the projection replays the whole history, so a lump sum
+  // recorded after the renewal was created must lower the
+  // renewal's re-derived payment — the renewal's recorded
+  // opening (the pre-lump projected balance) is stale and must
+  // NOT reset the balance. Regression guard for the Riverbend
+  // chaining fix: the opening reconciles only mid-history
+  // anchors, never a fully-replayed history.
+  const segments = [
+    { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 },
+    { start_date: '2031-01-01', rate_type: 'fixed', annual_rate: 5 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2026-01-01', amortization_years: 25, opening_balance: 500000 },
+    { id: 2, start_date: '2031-01-01', amortization_years: 25 },
+  ];
+  const base = { balance: 500000, balanceDate: '2026-01-01', terms, segments };
+  const plain = buildSchedule(base);
+  // The renewal opening is the pre-lump projected balance at the
+  // end of the month before the renewal — exactly the renewal
+  // prefill the API computes.
+  const dec30Plain = plain.series.find((row) => row.month === '2030-12');
+  terms[1].opening_balance = dec30Plain.balance;
+  const prefilled = buildSchedule(base);
+  const jan31Plain = prefilled.series.find((row) => row.month === '2031-01');
+  assert.ok(close(jan31Plain.payment, derivePayment(dec30Plain.balance, 5, 25), 0.02), jan31Plain.payment);
+  const withLump = buildSchedule({ ...base, lumpSums: [{ date: '2026-06-15', amount: 50000 }] });
+  const dec30Lump = withLump.series.find((row) => row.month === '2030-12');
+  const jan31Lump = withLump.series.find((row) => row.month === '2031-01');
+  assert.ok(dec30Lump.balance < dec30Plain.balance - 50000, `${dec30Lump.balance} vs ${dec30Plain.balance}`);
+  assert.ok(jan31Lump.payment < jan31Plain.payment - 100, `${jan31Lump.payment} vs ${jan31Plain.payment}`);
+  assert.ok(close(jan31Lump.payment, derivePayment(dec30Lump.balance, 5, 25), 0.02), jan31Lump.payment);
+});
+
 test('buildSchedule: a lump sum deducts first and the payment stays the same (bank standard)', () => {
   const segments = [{ start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 }];
   const terms = [{ id: 1, start_date: '2026-01-01', amortization_years: 25 }];

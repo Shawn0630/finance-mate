@@ -473,14 +473,19 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       // amortization counted from its start.
       if (p.rateType === 'fixed' && num(p.amortizationYears) != null) {
         const gov = termCovering(plan, p.date);
-        const bal = balanceAt(plan, p.date.slice(0, 7));
+        // The split term opens with the balance at its start — the
+        // end of the previous month, not the end of the switch
+        // month: buildSchedule treats a term's opening as a
+        // reconciliation point at its start, so an end-of-month
+        // figure here would rewind one month's payment.
+        const openingBal = balanceAt(plan, addMonthsYm(p.date.slice(0, 7), -1));
         const endIdx = termEndMonthIdx(gov);
         const switchIdx = monthIdxOf(p.date.slice(0, 7));
         plan.terms.push({
           property_id: plan.property.id, start_date: p.date,
           term_months: endIdx >= 0 ? Math.max(1, endIdx - switchIdx) : 60,
           amortization_years: Number(p.amortizationYears),
-          opening_balance: bal, repayment_method: (gov && gov.repayment_method) || 'equal_payment',
+          opening_balance: openingBal, repayment_method: (gov && gov.repayment_method) || 'equal_payment',
           payment_override: null,
           lender: (gov && gov.lender) || null, payment_frequency: null, payment_day: null,
         });
@@ -504,10 +509,14 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       if (pen && pen.penalty > 0) penalties.push({ ...pen, opSeq: op.seq, reason: 'refinance break' });
       fees += num(p.fees) || 0;
       if (num(p.fees) > 0) cashOutEvents.push({ month: String(p.date || '').slice(0, 7), amount: num(p.fees) });
+      // The new term opens with the balance at its start — the end
+      // of the previous month (see the switch split above): the
+      // break penalty above still prices off the op-month balance.
+      const openingBal = balanceAt(plan, addMonthsYm(p.date.slice(0, 7), -1));
       plan.terms.push({
         property_id: plan.property.id, start_date: p.date,
         term_months: Number(p.termMonths), amortization_years: Number(p.amortizationYears),
-        opening_balance: bal, repayment_method: p.repaymentMethod || 'equal_payment',
+        opening_balance: openingBal, repayment_method: p.repaymentMethod || 'equal_payment',
         payment_override: num(p.paymentOverride) ?? null,
         lender: p.lender || null, payment_frequency: null, payment_day: null,
       });
