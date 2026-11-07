@@ -16,7 +16,9 @@
 //      arrived. An UNMARKED row in the window keeps showing until
 //      marked. The query is therefore: the current occurrence per
 //      source + all unmarked occurrences, all inside the window.
-import { payDatesInWindow, nominalRecentDate, normJobDate, PAY_FREQUENCIES } from './earnings.js';
+import { payDatesInWindow, nominalRecentDate, normJobDate, PAY_FREQUENCIES, calcSalary } from './earnings.js';
+import { planPeriodAmounts } from './plans.js';
+import { FREQUENCIES } from './engine.js';
 import { adjustPayday } from './holidays.js';
 
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -59,6 +61,92 @@ export function daysInMonth(ym) {
   const m = Number(String(ym).slice(5, 7));
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
 }
+// 'YYYY-MM-DD' + n days (n may be negative), UTC arithmetic.
+export function addDaysStr(dateStr, n) {
+  const d = new Date(`${String(dateStr).slice(0, 10)}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+// ------------------------------------------------------------ card order --
+// Stable identity of an insight card, for the stored drag order:
+// section + metric + title. The metric already encodes the entity
+// (property_equity:5, account_value:2, …); the title disambiguates
+// AI cards that share a metric (the AI-apply dedupe is metric +
+// title, so no two cards in a section share both). Row ids are NOT
+// stable: generateStandardInsights deletes + re-inserts the system
+// rows on every regeneration, so an order keyed by id would be
+// wiped weekly.
+export function homeOrderKey(card) {
+  return `${card.section}|${card.metric}|${card.title}`;
+}
+// Apply a stored per-section order to a card list: cards listed in
+// the stored order come first in that order; cards missing from it
+// (newly generated or AI-appended) append at the end in their
+// natural order. Pure — the server stores the order, this only sorts.
+export function applyHomeInsightOrder(insights, orders) {
+  const list = insights || [];
+  const sections = [];
+  const bySection = new Map();
+  for (const c of list) {
+    if (!bySection.has(c.section)) { bySection.set(c.section, []); sections.push(c.section); }
+    bySection.get(c.section).push(c);
+  }
+  const out = [];
+  for (const s of sections) {
+    const cards = bySection.get(s);
+    const order = (orders && orders[s]) || [];
+    const pos = new Map(order.map((k, i) => [k, i]));
+    const listed = cards.filter((c) => pos.has(homeOrderKey(c)))
+      .sort((a, b) => pos.get(homeOrderKey(a)) - pos.get(homeOrderKey(b)));
+    const unlisted = cards.filter((c) => !pos.has(homeOrderKey(c)));
+    out.push(...listed, ...unlisted);
+  }
+  return out;
+}
+
+// ------------------------------------------------------------ mortgage dates --
+// Payment dates of ONE mortgage in ONE month, on the projection's
+// own grid. rowDate is that month's last payment date from the
+// projection series (the engine's row.date); frequency is the term
+// governing the month; anchorDay is that term's payment day
+// (monthly / semi-monthly only). Day-stepped frequencies step back
+// from the row date by the engine's stepDays; calendar frequencies
+// land on the anchor day (semi-monthly: the anchor day and its
+// half-month partner, exactly as simulate() places them). Dates are
+// capped to [from, to]; calendar dates must fall after the balance
+// month (the engine's first payment is the month after the balance
+// date) and day-stepped dates after the balance date itself
+// (earliest) — a mortgage's first payment is strictly after its
+// anchor.
+export function mortgageMonthPaymentDates({ frequency, anchorDay, rowDate, month, from, to, earliest }) {
+  const out = [];
+  const dim = daysInMonth(month);
+  const day = anchorDay != null && Number.isFinite(Number(anchorDay)) ? Number(anchorDay)
+    : (rowDate ? Number(String(rowDate).slice(8, 10)) : 1);
+  if (frequency === 'semi_monthly') {
+    const a = Math.min(day, dim);
+    const b = day <= 15 ? Math.min(day + 15, dim) : Math.max(day - 15, 1);
+    for (const dNum of [Math.min(a, b), Math.max(a, b)]) {
+      const d = `${month}-${String(dNum).padStart(2, '0')}`;
+      if (d >= from && d <= to && (!earliest || d.slice(0, 7) > String(earliest).slice(0, 7))) out.push(d);
+    }
+    return out.sort();
+  }
+  const step = (FREQUENCIES[frequency] || {}).stepDays;
+  if (step) {
+    let d = rowDate;
+    while (d && String(d).slice(0, 7) === month) {
+      if (d >= from && d <= to && (!earliest || d > earliest)) out.push(d);
+      d = addDaysStr(d, -step);
+    }
+    return out.sort();
+  }
+  // Monthly (default): the payment lands on the anchor day.
+  const d = `${month}-${String(Math.min(day, dim)).padStart(2, '0')}`;
+  if (d >= from && d <= to && (!earliest || d.slice(0, 7) > String(earliest).slice(0, 7))) out.push(d);
+  return out;
+}
 
 // Displayed cash take-home by month from a jobMonthlySeries result.
 // The series' net is the engine net (paycheque + the deferred RRSP
@@ -90,6 +178,65 @@ export function displayedSalaryMonths(series, benefitPerPeriod = 0) {
   });
 }
 
+// Per-period DISPLAYED cash take-home over the last 12 paydays.
+// job: the earnJobRow shape (frequency, start_date, recent_pay_date,
+// gross_amount, gross_basis, opening_value, pay_changes, bonus_total,
+// ytd_*, td1_*, cpp/ei exempt flags, province). plans: raw
+// invest_plans rows ({start_date, own_amount, own_pct,
+// employer_amount, employer_pct}). Each payday prices the pay and
+// RRSP deduction IN FORCE THEN: the gross is the latest pay change
+// effective on or before that payday (the opening value before the
+// first change); a plan's own amount counts iff its start is on or
+// before that payday (the per-payday rule the job page uses), and a
+// percent plan derives from the gross in force that day. The benefit
+// is the job page's annual-first per-period figure — total tax
+// without the deduction minus total tax with it, over the pay
+// frequency — so the latest payday matches the job page / highlight
+// figure to the cent. YTD offsets and bonuses follow the monthly
+// series' convention (the job's stored values for every payday).
+// Returns [{date, value}] oldest first, or [] when the job has no
+// payday grid. Never invents a payday: no dates, no rows.
+export function jobTakehomePeriods({ job, plans, payroll, today }) {
+  if (!job || !PAY_FREQUENCIES[job.frequency] || !normJobDate(job.start_date)
+    || !normJobDate(job.recent_pay_date) || !normJobDate(today)) return [];
+  const periods = PAY_FREQUENCIES[job.frequency].periods;
+  let nominal;
+  if (job.frequency === 'annual') {
+    const anchor = nominalRecentDate(job.recent_pay_date);
+    const [, am, ad] = anchor.split('-').map(Number);
+    nominal = [];
+    for (let y = Number(job.start_date.slice(0, 4)); y <= Number(today.slice(0, 4)); y++) {
+      const ym = `${y}-${String(am).padStart(2, '0')}`;
+      const d = `${ym}-${String(Math.min(ad, daysInMonth(ym))).padStart(2, '0')}`;
+      if (d >= job.start_date && d <= today) nominal.push(d);
+    }
+  } else {
+    nominal = payDatesInWindow(job.frequency, job.start_date, today, nominalRecentDate(job.recent_pay_date));
+  }
+  const dates = [...new Set(nominal.map((d) => adjustPayday(d)))].sort().slice(-12);
+  const changes = [...(job.pay_changes || [])]
+    .sort((a, b) => String(a.effective_date).localeCompare(String(b.effective_date)));
+  const grossInForce = (d) => {
+    let g = null;
+    for (const c of changes) {
+      if (c.effective_date > d) break;
+      g = c.value != null ? Number(c.value)
+        : (c.scope === 'annual' ? Number(c.amount) / periods : Number(c.amount));
+    }
+    if (g != null && Number.isFinite(g)) return g;
+    return job.opening_value != null ? Number(job.opening_value) : Number(job.gross_amount);
+  };
+  const base = { ...job, bonus_total: job.bonus_total || 0 };
+  return dates.map((d) => {
+    const gross = grossInForce(d);
+    const ded = (plans || []).reduce((s, p) => s + (p.start_date <= d ? planPeriodAmounts(p, gross).own : 0), 0);
+    const calc0 = calcSalary({ ...base, gross_amount: gross, gross_basis: 'period', rrspDeduction: 0 }, payroll);
+    const calcD = calcSalary({ ...base, gross_amount: gross, gross_basis: 'period', rrspDeduction: ded }, payroll);
+    const benefit = ded > 0 ? r2((calc0.totalTax - calcD.totalTax) / periods) : 0;
+    return { date: d, value: r2((calcD.perPeriod.cashNet ?? calcD.perPeriod.net) - benefit) };
+  });
+}
+
 // ------------------------------------------------------------ deltas --
 function deltaPair(current, prev, prevYear) {
   const one = (c, p) => {
@@ -111,11 +258,11 @@ export const HOME_SECTIONS = SECTIONS;
 
 function baseCard({ section, title, metric, period, value, valueKind = 'money', sublabel = null,
   mom = null, yoy = null, spark = [], sparkMonths = [], downIsGood = false,
-  hasData = true, method = '' }) {
+  hasData = true, method = '', periodLabel = null, momVs = null, yoyVs = null }) {
   return {
-    section, title, metric, period, periodLabel: monthLabel(period),
+    section, title, metric, period, periodLabel: periodLabel || monthLabel(period),
     value: value == null ? null : r2(value), valueKind, sublabel,
-    mom, yoy, spark: (spark || []).map((v) => (v == null ? null : r2(v))), sparkMonths,
+    mom, yoy, momVs, yoyVs, spark: (spark || []).map((v) => (v == null ? null : r2(v))), sparkMonths,
     downIsGood, hasData, method,
   };
 }
@@ -319,6 +466,10 @@ export function buildStandardInsights(data) {
 // jobs: [{id, label, frequency, startDate, recentDate, cashNet}]
 //   cashNet = the displayed per-period take-home (cash).
 // rentals: [{id, label, entries: [{start_ym, end_ym, monthly_rent, pay_day}]}]
+// mortgages: [{id, label, occurrences: [{date, amount}]}] — the
+//   property's payment dates in the window, precomputed by the
+//   server from the projection's own grid (same window + rollover
+//   rule as income; a mortgage row is "paid", not "received").
 // marks: Map keyed `${kind}:${sourceId}:${date}` -> 0 | 1
 // today: 'YYYY-MM-DD' (Vancouver date).
 // Returns rows, most recent first. Window (user, 2026-11-07): the
@@ -327,11 +478,29 @@ export function buildStandardInsights(data) {
 // occurrence (latest on or before today) is always shown; every
 // unmarked occurrence in the window is shown too. A marked
 // occurrence that is not the current one has rolled off.
-export function homeHighlightRows({ jobs, rentals, marks, today }) {
+export function homeHighlightRows({ jobs, rentals, mortgages, marks, today }) {
   const cur = String(today).slice(0, 7);
   const windowStart = prevMonth(cur);
   const rows = [];
   const isMarked = (kind, sourceId, date) => marks.has(`${kind}:${sourceId}:${date}`);
+  const pushOccurrences = (kind, sourceId, label, occs) => {
+    // Window-bounded AND capped at today: a future occurrence in the
+    // current month is not shown yet (same rule as the job grid and
+    // the rental `d > today` skip).
+    const inWindow = (occs || []).filter((o) => String(o.date).slice(0, 7) >= windowStart && String(o.date) <= today);
+    if (!inWindow.length) return;
+    const current = inWindow[inWindow.length - 1].date;
+    for (const o of inWindow) {
+      if (o.date === current || !isMarked(kind, sourceId, o.date)) {
+        rows.push({
+          kind, sourceId, sourceLabel: label, date: o.date,
+          month: String(o.date).slice(0, 7), amount: r2(o.amount),
+          received: marks.get(`${kind}:${sourceId}:${o.date}`) ?? null,
+          isCurrent: o.date === current,
+        });
+      }
+    }
+  };
 
   for (const job of jobs || []) {
     // Jobs without dates (legacy) have no grid — never a guessed date.
@@ -405,9 +574,13 @@ export function homeHighlightRows({ jobs, rentals, marks, today }) {
       }
     }
   }
-  // Most recent first; ties: salary before rental, then label.
+  for (const m of mortgages || []) {
+    pushOccurrences('mortgage', m.id, m.label, m.occurrences);
+  }
+  // Most recent first; ties: salary before rental before mortgage, then label.
+  const kindRank = { salary: 0, rental: 1, mortgage: 2 };
   rows.sort((a, b) => b.date.localeCompare(a.date)
-    || (a.kind === b.kind ? 0 : a.kind === 'salary' ? -1 : 1)
+    || (kindRank[a.kind] ?? 9) - (kindRank[b.kind] ?? 9)
     || String(a.sourceLabel).localeCompare(String(b.sourceLabel)));
   return rows;
 }
@@ -435,6 +608,7 @@ export const HOME_STANDARD_METRICS = [
 // Build the full library from live entities. entities:
 //   properties: [{id, label}], holdings: [{id, label}], categories: [name]
 //   jobs: [{id, label}], rentals: [{id, label}]
+//   accounts: [{id, label, type}], accountTypes: [type]
 export function buildHomeMetricLibrary(entities) {
   const lib = [...HOME_STANDARD_METRICS];
   for (const p of entities.properties || []) {
@@ -446,11 +620,20 @@ export function buildHomeMetricLibrary(entities) {
     lib.push({ metric: `holding_value:${h.id}`, section: 'stock', title: `${h.label} value` });
     lib.push({ metric: `holding_gain:${h.id}`, section: 'stock', title: `${h.label} gain` });
   }
+  for (const a of entities.accounts || []) {
+    lib.push({ metric: `account_value:${a.id}`, section: 'stock', title: `${a.label} value` });
+    lib.push({ metric: `account_gain:${a.id}`, section: 'stock', title: `${a.label} gain` });
+  }
+  for (const t of entities.accountTypes || []) {
+    lib.push({ metric: `account_type_value:${t}`, section: 'stock', title: `${t} accounts value` });
+    lib.push({ metric: `account_type_gain:${t}`, section: 'stock', title: `${t} accounts gain` });
+  }
   for (const c of entities.categories || []) {
     lib.push({ metric: `category_spend:${c}`, section: 'spending', title: `${c} spend` });
   }
   for (const j of entities.jobs || []) {
     lib.push({ metric: `job_takehome:${j.id}`, section: 'earning', title: `${j.label} take-home` });
+    lib.push({ metric: `job_takehome_period:${j.id}`, section: 'earning', title: `${j.label} per-period take-home` });
   }
   for (const r of entities.rentals || []) {
     lib.push({ metric: `rental_income:${r.id}`, section: 'earning', title: `${r.label} income` });
@@ -463,8 +646,11 @@ export function buildHomeMetricLibrary(entities) {
 // buildStandardInsights, plus:
 //   propertyById: {id: [{month, equity, assessed, outstanding}]}
 //   holdingById: {id: {months: [{month, value, gain}], label}}
+//   accountById: {id: {months: [{month, value, gain}], label}}
+//   accountTypeById: {type: {months: [{month, value, gain}], label}}
 //   categorySeries: {name: [{month, total}]}
 //   jobById: {id: {label, months: [{month, salary}]}}
+//   jobPeriodById: {id: {label, periods: [{date, value}]}} (oldest first)
 //   rentalById: {id: {label, months: [{month, rental}]}}
 // Returns a card payload, or {error} when the metric is unknown or
 // has no data. Per-entity cards carry `entity` {kind, id} so the
@@ -503,6 +689,28 @@ export function resolveHomeMetric(metric, data) {
       entity: { kind: 'holding', id: Number(entityId) },
     };
   }
+  if (base === 'account_value' || base === 'account_gain') {
+    const a = (data.accountById || {})[entityId];
+    if (!a || !a.months || !a.months.length) return { error: 'no_data', message: 'That account has no data yet.' };
+    const field = base === 'account_value' ? 'value' : 'gain';
+    return {
+      ...pointCard({ section: 'stock', title: `${a.label} ${field}`,
+        metric, currentYm, series: a.months, field,
+        method: `One account's ${field} at month-end, CAD.` }),
+      entity: { kind: 'account', id: Number(entityId) },
+    };
+  }
+  if (base === 'account_type_value' || base === 'account_type_gain') {
+    const t = (data.accountTypeById || {})[entityId];
+    if (!t || !t.months || !t.months.length) return { error: 'no_data', message: 'No accounts of that type yet.' };
+    const field = base === 'account_type_value' ? 'value' : 'gain';
+    return {
+      ...pointCard({ section: 'stock', title: `${t.label} ${field}`,
+        metric, currentYm, series: t.months, field,
+        method: `All ${entityId} accounts summed, ${field} at month-end, CAD.` }),
+      entity: { kind: 'account_type', id: entityId },
+    };
+  }
   if (base === 'category_spend') {
     const series = (data.categorySeries || {})[entityId];
     if (!series || !series.length) return { error: 'no_data', message: 'That category has no spending yet.' };
@@ -520,6 +728,29 @@ export function resolveHomeMetric(metric, data) {
       ...flowCard({ section: 'earning', title: `${s.label} take-home`, metric,
         currentYm, series: s.months, field: 'salary',
         method: `One salary job's take-home in the last completed month.` }),
+      entity: { kind: 'job', id: Number(entityId) },
+    };
+  }
+  if (base === 'job_takehome_period') {
+    const s = (data.jobPeriodById || {})[entityId];
+    if (!s || !s.periods || !s.periods.length) return { error: 'no_data', message: 'That job has no pay history yet.' };
+    const periods = s.periods; // oldest first
+    const latest = periods[periods.length - 1];
+    const prev = periods.length > 1 ? periods[periods.length - 2] : null;
+    const mom = prev
+      ? { delta: r2(latest.value - prev.value), pct: prev.value !== 0 ? r2(((latest.value - prev.value) / Math.abs(prev.value)) * 100) : null }
+      : null;
+    const dayLabel = (d) => {
+      const [y, m, day] = String(d).split('-').map(Number);
+      return `${MONTH_NAMES[(m || 1) - 1]} ${day}, ${y}`;
+    };
+    return {
+      ...baseCard({ section: 'earning', title: `${s.label} per-period take-home`, metric,
+        period: latest.date.slice(0, 7), periodLabel: dayLabel(latest.date),
+        value: latest.value, valueKind: 'money', mom, yoy: null,
+        spark: periods.map((p) => p.value), sparkMonths: periods.map((p) => p.date),
+        momVs: prev ? dayLabel(prev.date) : null,
+        method: 'Displayed per-period cash take-home over the last 12 paydays. Each payday prices the pay and RRSP deduction in force then; the latest payday matches the job page to the cent.' }),
       entity: { kind: 'job', id: Number(entityId) },
     };
   }

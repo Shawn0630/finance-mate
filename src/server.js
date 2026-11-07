@@ -42,8 +42,8 @@ import {
 } from './spending.js';
 import {
   buildStandardInsights, homeHighlightRows, buildHomeMetricLibrary, resolveHomeMetric, homeAiPrompt,
-  displayedSalaryMonths,
-  nextMonth as homeNextMonth,
+  displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates, jobTakehomePeriods,
+  nextMonth as homeNextMonth, prevMonth as homePrevMonth,
 } from './home.js';
 import {
   snapshotByAggregate, emptySnapshot, recordCommit, listCommits, getCommit, getCommitFull,
@@ -4655,6 +4655,7 @@ async function collectHomeData() {
   // construction as GET /api/overview/chart (assessed in force −
   // outstanding at month-end).
   const props = db.prepare('SELECT * FROM properties ORDER BY id').all();
+  const projById = new Map(); // property id -> projectionFor result (shared by the equity series + the mortgage highlight)
   const perProperty = props.map((p) => {
     let points = historyPoints(p.id).map((pt) => ({ year: pt.year, value: pt.value }));
     if (!points.length && p.assessed_value != null && p.assessed_year) {
@@ -4662,6 +4663,7 @@ async function collectHomeData() {
     }
     if (!points.length) return null;
     const proj = projectionFor(p);
+    projById.set(p.id, proj);
     return {
       id: p.id,
       label: p.address,
@@ -4740,15 +4742,54 @@ async function collectHomeData() {
     }
   }
 
+  // Accounts: per-account + per-type monthly series, from the same
+  // account-level engine the account pages use (computePortfolio
+  // already computes every account — no extra engine work). An
+  // account with no priced holdings has an empty series; its value
+  // is honestly $0, so it anchors a single current-month $0 row
+  // instead of reading as "no data" — the account exists, it just
+  // holds nothing valued yet. The same $0 anchor covers a type whose
+  // accounts are all empty.
+  const accountById = {};
+  const accountTypeById = {};
+  const accountLabels = [];
+  {
+    const byType = new Map();
+    for (const a of pf.accounts) {
+      const row = a.account;
+      const name = String(row.name || '').trim();
+      const inst = String(row.institution || '').trim();
+      const label = (inst && !name.toLowerCase().includes(inst.toLowerCase())) ? `${inst} ${name}` : (name || `#${row.id}`);
+      let months = (a.series || []).map((s) => ({ month: s.month, value: homeR2(s.value), gain: homeR2(s.returnAmount) }));
+      if (!months.length) months = [{ month: cur, value: 0, gain: 0 }];
+      accountById[row.id] = { label, type: row.type, months };
+      accountLabels.push({ id: row.id, label, type: row.type });
+      const agg = byType.get(row.type) || new Map();
+      for (const m of months) {
+        const slot = agg.get(m.month) || { month: m.month, value: 0, gain: 0 };
+        slot.value = homeR2(slot.value + m.value);
+        slot.gain = homeR2(slot.gain + m.gain);
+        agg.set(m.month, slot);
+      }
+      byType.set(row.type, agg);
+    }
+    for (const [type, agg] of byType) {
+      const months = [...agg.values()].sort((x, y) => x.month.localeCompare(y.month));
+      accountTypeById[type] = { label: `${type} accounts`, months: months.length ? months : [{ month: cur, value: 0, gain: 0 }] };
+    }
+  }
+
   // Earnings: salary take-home (cash) per month from the job
   // monthly chart, rental income per month from entries.
   const salaryByMonth = new Map();
   const jobsForHighlight = [];
   const jobById = {};
+  const jobPeriodById = {};
   for (const row of db.prepare('SELECT * FROM earn_jobs ORDER BY id').all()) {
     const job = earnJobRow(row);
     const gross = job.calc.perPeriod.gross;
-    const plans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id)
+    const rawPlans = db.prepare('SELECT * FROM invest_plans WHERE job_id = ?').all(row.id);
+    const plans = rawPlans
       .map((p) => ({ start_date: p.start_date, own_amount: planPeriodAmounts(p, gross).own, employer_amount: planPeriodAmounts(p, gross).employer }));
     const series = jobMonthlySeries({
       frequency: row.frequency, startDate: row.start_date, recentDate: row.recent_pay_date,
@@ -4767,6 +4808,10 @@ async function collectHomeData() {
       }
       jobById[row.id] = { label: row.employer, months };
     }
+    // Per-period take-home: the last 12 paydays' displayed cash, each
+    // priced from the job's own records (see jobTakehomePeriods).
+    const periods = jobTakehomePeriods({ job, plans: rawPlans, payroll: earnRegion().payroll, today });
+    if (periods.length) jobPeriodById[row.id] = { label: row.employer, periods };
     // Displayed per-period take-home: the job page shows cashNet
     // minus the per-period RRSP tax benefit (the benefit is on its
     // own sub-line — see earnNextPayHtml and the detail summary
@@ -4851,16 +4896,71 @@ async function collectHomeData() {
     }
   }
 
+  // Mortgages: one highlight source per property with a live
+  // mortgage. Occurrences come from the projection's own grid (see
+  // mortgageMonthPaymentDates): the term governing each window month
+  // sets the frequency + day, and its opening plan (termPayments)
+  // sets the monthly payment — the per-period amount follows
+  // periodPaymentFor, and a term override is already inside the plan
+  // (an override replaces the derivation for the whole term).
+  // Equal-principal terms decline month to month, so their amount is
+  // that month's row total over its payment count instead.
+  const mortgagesForHighlight = [];
+  {
+    const windowStart = homePrevMonth(cur);
+    const fromDate = `${windowStart}-01`;
+    for (const p of props) {
+      if (!(p.mortgage_balance > 0)) continue;
+      let proj = projById.has(p.id) ? projById.get(p.id) : undefined;
+      if (proj === undefined) { proj = projectionFor(p); projById.set(p.id, proj); }
+      if (!proj || !proj.series.length) continue;
+      const terms = termsOf(p.id);
+      const occurrences = [];
+      for (const m of [windowStart, cur]) {
+        const row = proj.series.find((r) => r.month === m);
+        if (!row) continue;
+        let gov = null;
+        for (const t of terms) { if (String(t.start_date).slice(0, 7) <= m) gov = t; }
+        gov = gov || terms[0] || null;
+        const freq = gov && FREQUENCY_KEYS.includes(gov.payment_frequency) ? gov.payment_frequency
+          : (FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly');
+        const anchorDay = gov && gov.payment_day != null ? gov.payment_day : (p.payment_day ?? null);
+        let perPeriod = null;
+        if (!gov || gov.repayment_method !== 'equal_principal') {
+          const monthly = (gov && proj.termPayments && proj.termPayments[gov.id]
+            && proj.termPayments[gov.id].paymentUsed != null)
+            ? proj.termPayments[gov.id].paymentUsed : proj.paymentUsed;
+          if (monthly == null) continue;
+          perPeriod = periodPaymentFor(monthly, freq);
+        }
+        const dates = mortgageMonthPaymentDates({
+          frequency: freq, anchorDay, rowDate: row.date, month: m,
+          from: fromDate, to: today, earliest: p.mortgage_balance_date,
+        });
+        if (!dates.length) continue;
+        if (perPeriod == null) perPeriod = homeR2(row.payment / dates.length);
+        for (const d of dates) occurrences.push({ date: d, amount: perPeriod });
+      }
+      if (occurrences.length) {
+        occurrences.sort((a, b) => a.date.localeCompare(b.date));
+        mortgagesForHighlight.push({ id: p.id, label: String(p.address).split(',')[0], occurrences });
+      }
+    }
+  }
+
   return {
     currentYm: cur,
     property: propertyMonths, propertyById, propertyLabels,
     stocks: { months: stockMonths, topGainer },
-    earnings: earningMonths, jobById, rentalById,
+    accountById, accountTypeById,
+    earnings: earningMonths, jobById, jobPeriodById, rentalById,
     spending: spendingMonths, categorySeries, holdingById,
-    jobsForHighlight, rentalsForHighlight,
+    jobsForHighlight, rentalsForHighlight, mortgagesForHighlight,
     entities: {
       properties: props.filter((p) => propertyById[p.id]).map((p) => ({ id: p.id, label: String(p.address).split(',')[0] })),
       holdings: holdings.map((h) => ({ id: h.id, label: h.symbol || h.name || `#${h.id}` })),
+      accounts: accountLabels,
+      accountTypes: [...new Set(accountLabels.map((a) => a.type))],
       categories: SPEND_CATEGORIES,
       jobs: Object.entries(jobById).map(([id, j]) => ({ id: Number(id), label: j.label })),
       rentals: Object.entries(rentalById).map(([id, r]) => ({ id: Number(id), label: r.label })),
@@ -4873,7 +4973,16 @@ const parseHomeInsight = (row) => {
   try { payload = JSON.parse(row.payload || '{}'); } catch { payload = {}; }
   return { id: row.id, kind: row.kind, section: row.section, title: row.title, metric: row.metric, generated_at: row.generated_at, ...payload };
 };
-const readHomeInsights = (userId) => db.prepare('SELECT * FROM home_insights WHERE user_id = ? ORDER BY id').all(userId).map(parseHomeInsight);
+const readHomeInsights = (userId) => {
+  const rows = db.prepare('SELECT * FROM home_insights WHERE user_id = ? ORDER BY id').all(userId).map(parseHomeInsight);
+  // The stored drag order (home_insight_order) re-applies after every
+  // read, so a regeneration — which deletes + re-inserts the system
+  // rows with new ids — keeps the user's order.
+  const orderRows = db.prepare('SELECT section, card_key, position FROM home_insight_order WHERE user_id = ? ORDER BY position').all(userId);
+  const orders = {};
+  for (const o of orderRows) (orders[o.section] = orders[o.section] || []).push(o.card_key);
+  return applyHomeInsightOrder(rows, orders);
+};
 
 // Recompute the standard set only; AI cards are untouched.
 function generateStandardInsights(userId, data) {
@@ -4893,7 +5002,7 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   const marks = new Map(db.prepare('SELECT kind, source_id, pay_date, received FROM income_marks WHERE user_id = ?').all(userId)
     .map((m) => [`${m.kind}:${m.source_id}:${m.pay_date}`, m.received]));
   const data = await collectHomeData();
-  const highlights = homeHighlightRows({ jobs: data.jobsForHighlight, rentals: data.rentalsForHighlight, marks, today: vancouverToday() });
+  const highlights = homeHighlightRows({ jobs: data.jobsForHighlight, rentals: data.rentalsForHighlight, mortgages: data.mortgagesForHighlight, marks, today: vancouverToday() });
   let insights = readHomeInsights(userId);
   const sys = insights.filter((r) => r.kind === 'system');
   const staleMs = 7 * 24 * 3600 * 1000;
@@ -4909,7 +5018,7 @@ app.post('/api/home/insights/generate', requireApiAuth, async (req, res) => {
 
 app.post('/api/home/marks', requireApiAuth, (req, res) => {
   const b = req.body || {};
-  const kind = b.kind === 'salary' || b.kind === 'rental' ? b.kind : null;
+  const kind = b.kind === 'salary' || b.kind === 'rental' || b.kind === 'mortgage' ? b.kind : null;
   const sourceId = Number(b.source_id);
   const date = String(b.date || '');
   const received = b.received === 1 || b.received === true ? 1 : (b.received === 0 || b.received === false ? 0 : null);
@@ -4918,7 +5027,9 @@ app.post('/api/home/marks', requireApiAuth, (req, res) => {
   }
   const exists = kind === 'salary'
     ? db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(sourceId)
-    : db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(sourceId);
+    : kind === 'rental'
+      ? db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(sourceId)
+      : db.prepare('SELECT id FROM properties WHERE id = ?').get(sourceId);
   if (!exists) return res.status(404).json({ error: 'source not found' });
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO income_marks (user_id, kind, source_id, pay_date, received, updated_at)
@@ -5005,6 +5116,32 @@ app.delete('/api/home/insights/:id', requireApiAuth, (req, res) => {
   if (row.kind !== 'ai') return res.status(400).json({ error: 'System cards cannot be deleted.' });
   db.prepare('DELETE FROM home_insights WHERE id = ?').run(row.id);
   res.json({ ok: true });
+});
+
+// Reorder insight cards within a section (drag-and-drop). The order
+// is keyed by the card's stable identity (section + metric + title),
+// NOT by row id — regeneration deletes + re-inserts system rows, so
+// an id-keyed order would be wiped. A lightweight UI-state write,
+// like marks: not a Global History commit. Cards missing from the
+// posted order (newly generated or AI-appended) append at the end.
+app.post('/api/home/insights/reorder', requireApiAuth, (req, res) => {
+  const userId = req.user.id;
+  const b = req.body || {};
+  const section = String(b.section || '');
+  const order = Array.isArray(b.order) ? b.order : null;
+  if (!['property', 'stock', 'earning', 'spending'].includes(section) || !order
+    || order.some((k) => typeof k !== 'string' || !k)) {
+    return res.status(400).json({ error: 'section and order (array of card keys) are required.' });
+  }
+  const known = new Set(readHomeInsights(userId).filter((c) => c.section === section).map((c) => homeOrderKey(c)));
+  const keys = order.filter((k) => known.has(k));
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare('DELETE FROM home_insight_order WHERE user_id = ? AND section = ?').run(userId, section);
+    const ins = db.prepare('INSERT INTO home_insight_order (user_id, section, card_key, position, updated_at) VALUES (?, ?, ?, ?, ?)');
+    keys.forEach((k, i) => ins.run(userId, section, k, i, now));
+  })();
+  res.json({ ok: true, section, order: keys });
 });
 
 app.get('/api/summary', requireApiAuth, (req, res) => {

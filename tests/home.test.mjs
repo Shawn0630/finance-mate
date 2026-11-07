@@ -4,9 +4,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
-  displayedSalaryMonths,
+  displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates,
+  jobTakehomePeriods,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
+import { calcSalary } from '../src/earnings.js';
+import { payroll } from '../src/regions/ca.js';
 
 const months = (start, values, field) => {
   const out = [];
@@ -301,4 +304,200 @@ test('home: resolveHomeMetric — per-entity cards carry the entity ref; standar
   assert.ok(lib.some((m) => m.metric === 'rental_income:7' && m.section === 'earning'));
   // Per-entity metrics never leak into the plain standard set.
   assert.equal(lib.filter((m) => m.metric === 'job_takehome').length, 0);
+});
+
+test('home: drag order — stored order re-applies, unlisted cards append at the end', () => {
+  const cards = [
+    { section: 'property', metric: 'property_equity', title: 'Total equity' },
+    { section: 'property', metric: 'property_assessed', title: 'Assessed total' },
+    { section: 'property', metric: 'property_outstanding', title: 'Outstanding principal' },
+    { section: 'stock', metric: 'stock_value', title: 'Portfolio value' },
+  ];
+  assert.equal(homeOrderKey(cards[0]), 'property|property_equity|Total equity');
+  // A drag that moved Assessed total first: the stored order wins.
+  const ordered = applyHomeInsightOrder(cards, {
+    property: ['property|property_assessed|Assessed total', 'property|property_equity|Total equity'],
+  });
+  assert.deepEqual(ordered.map((c) => c.metric),
+    ['property_assessed', 'property_equity', 'property_outstanding', 'stock_value']);
+  // A newly AI-appended card (not in the stored order) appends at the
+  // end of its section; a regeneration (same metric + title, new row
+  // id) keeps the order because the key never mentions the id.
+  const withNew = [...cards, { section: 'property', metric: 'property_equity:9', title: 'Test home equity' }];
+  const ordered2 = applyHomeInsightOrder(withNew, {
+    property: ['property|property_assessed|Assessed total', 'property|property_equity|Total equity'],
+  });
+  assert.deepEqual(ordered2.map((c) => c.metric),
+    ['property_assessed', 'property_equity', 'property_outstanding', 'property_equity:9', 'stock_value']);
+  // No stored order at all: natural order, untouched.
+  assert.deepEqual(applyHomeInsightOrder(cards, {}).map((c) => c.metric),
+    ['property_equity', 'property_assessed', 'property_outstanding', 'stock_value']);
+});
+
+test('home: mortgageMonthPaymentDates — monthly / semi-monthly / weekly grids on the projection grid', () => {
+  // Monthly, day 15: Oct 15 shows; the Nov 15 payment is still in
+  // the future on Nov 7 and stays out of the window.
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'monthly', anchorDay: 15, rowDate: '2026-10-15', month: '2026-10', from: '2026-10-01', to: '2026-11-07', earliest: '2025-01-15' }),
+    ['2026-10-15']);
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'monthly', anchorDay: 15, rowDate: '2026-11-15', month: '2026-11', from: '2026-10-01', to: '2026-11-07', earliest: '2025-01-15' }),
+    []);
+  // Monthly day 31 clamps into short months; a payment in the
+  // balance month itself never happens (first payment is next month).
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'monthly', anchorDay: 31, rowDate: '2026-02-28', month: '2026-02', from: '2026-02-01', to: '2026-02-28', earliest: '2026-01-15' }),
+    ['2026-02-28']);
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'monthly', anchorDay: 20, rowDate: '2026-01-20', month: '2026-01', from: '2026-01-01', to: '2026-01-31', earliest: '2026-01-15' }),
+    []);
+  // Semi-monthly anchor 15: the 15th and the 30th.
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'semi_monthly', anchorDay: 15, rowDate: '2026-10-30', month: '2026-10', from: '2026-10-01', to: '2026-10-31', earliest: '2025-01-15' }),
+    ['2026-10-15', '2026-10-30']);
+  // Weekly: step back from the month's last payment date; only dates
+  // on or before today show (Nov 2026: Nov 6 only, on Nov 7).
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'weekly', anchorDay: null, rowDate: '2026-11-27', month: '2026-11', from: '2026-10-01', to: '2026-11-07', earliest: '2024-04-16' }),
+    ['2026-11-06']);
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'weekly', anchorDay: null, rowDate: '2026-10-30', month: '2026-10', from: '2026-10-01', to: '2026-11-07', earliest: '2024-04-16' }),
+    ['2026-10-02', '2026-10-09', '2026-10-16', '2026-10-23', '2026-10-30']);
+  // Bi-weekly steps 14 days from the same anchor.
+  assert.deepEqual(
+    mortgageMonthPaymentDates({ frequency: 'bi_weekly', anchorDay: null, rowDate: '2026-10-30', month: '2026-10', from: '2026-10-01', to: '2026-11-07', earliest: '2024-04-16' }),
+    ['2026-10-02', '2026-10-16', '2026-10-30']);
+});
+
+test('home: highlight — mortgage rows use the same window + rollover rule, paid not received', () => {
+  const mortgages = [{
+    id: 5, label: '2 Home Test Way',
+    occurrences: [{ date: '2026-10-15', amount: 1744.81 }, { date: '2026-11-15', amount: 1744.81 }],
+  }];
+  const jobs = [{ id: 1, label: 'Acme', frequency: 'biweekly', startDate: '2026-01-02', recentDate: '2026-10-23', cashNet: 2000 }];
+  const rentals = [{ id: 7, label: 'Basement', entries: [{ id: 1, start_ym: '2026-01', end_ym: null, monthly_rent: 2000, pay_day: 15 }] }];
+  // Today Nov 7: only the Oct 15 mortgage payment has arrived.
+  const rows = homeHighlightRows({ jobs, rentals, mortgages, marks: new Map(), today: '2026-11-07' });
+  const mort = rows.filter((r) => r.kind === 'mortgage');
+  assert.deepEqual(mort.map((r) => r.date), ['2026-10-15']);
+  assert.equal(mort[0].amount, 1744.81);
+  assert.equal(mort[0].isCurrent, true);
+  assert.equal(mort[0].received, null);
+  // Same-date ties: salary before rental before mortgage (Oct 15 has both rent and mortgage).
+  assert.ok(rows.findIndex((r) => r.kind === 'rental' && r.date === '2026-10-15')
+    < rows.findIndex((r) => r.kind === 'mortgage' && r.date === '2026-10-15'),
+    JSON.stringify(rows.map((r) => `${r.kind} ${r.date}`)));
+  // Mark the Oct 15 mortgage paid: it stays (it is the current one).
+  const marks = new Map([['mortgage:5:2026-10-15', 1]]);
+  const rows2 = homeHighlightRows({ jobs, rentals: [], mortgages, marks, today: '2026-11-07' });
+  assert.ok(rows2.some((r) => r.kind === 'mortgage' && r.date === '2026-10-15' && r.received === 1));
+  // When the Nov 15 payment arrives, the marked Oct 15 row rolls off.
+  const rows3 = homeHighlightRows({ jobs, rentals: [], mortgages, marks, today: '2026-11-16' });
+  assert.deepEqual(rows3.filter((r) => r.kind === 'mortgage').map((r) => r.date), ['2026-11-15']);
+  // An unmarked Oct row in the window keeps showing after Nov 15 arrives.
+  const rows4 = homeHighlightRows({ jobs, rentals: [], mortgages, marks: new Map(), today: '2026-11-16' });
+  assert.deepEqual(rows4.filter((r) => r.kind === 'mortgage').map((r) => r.date), ['2026-11-15', '2026-10-15']);
+  // A mortgage with no occurrences in the window contributes nothing.
+  assert.deepEqual(
+    homeHighlightRows({ jobs: [], rentals: [], mortgages: [{ id: 9, label: 'Future', occurrences: [{ date: '2026-12-15', amount: 100 }] }], marks: new Map(), today: '2026-11-07' }),
+    []);
+});
+
+test('home: jobTakehomePeriods — latest payday matches the job page to the cent; pay changes + plan starts move later paydays only', () => {
+  const job = {
+    frequency: 'biweekly', start_date: '2026-01-02', recent_pay_date: '2026-10-23',
+    gross_amount: 3000, gross_basis: 'period', opening_value: 3000, province: 'BC',
+    tax_year: 2026, td1_federal: null, td1_provincial: null,
+    ytd_cpp: 0, ytd_cpp2: 0, ytd_ei: 0, cpp_exempt: false, ei_exempt: false,
+    bonus_total: 0, pay_changes: [],
+  };
+  const plans = [{ start_date: '2026-11-06', own_amount: 220.05, employer_amount: 0 }];
+  const periods = jobTakehomePeriods({ job, plans, payroll, today: '2026-11-07' });
+  assert.equal(periods.length, 12);
+  assert.equal(periods[periods.length - 1].date, '2026-11-06');
+  // The job page's own figure for the same payday: cashNet with the
+  // deduction in force, minus the annual-first per-period benefit.
+  const calc0 = calcSalary({ ...job, rrspDeduction: 0 }, payroll);
+  const calcD = calcSalary({ ...job, rrspDeduction: 220.05 }, payroll);
+  const benefit = Math.round(((calc0.totalTax - calcD.totalTax) / 26) * 100) / 100;
+  const displayed = Math.round((calcD.perPeriod.cashNet - benefit) * 100) / 100;
+  assert.equal(periods[periods.length - 1].value, displayed);
+  // Before the plan starts there is no benefit to subtract: the Oct
+  // 23 payday is the plain no-deduction cashNet.
+  assert.equal(periods[periods.length - 2].date, '2026-10-23');
+  assert.equal(periods[periods.length - 2].value, calc0.perPeriod.cashNet);
+  // A pay change effective Oct 23 moves Oct 23 + Nov 6, never Oct 9.
+  const job2 = { ...job, pay_changes: [{ effective_date: '2026-10-23', value: 3500, amount: 3500, basis: 'gross', scope: 'period' }] };
+  const p2 = jobTakehomePeriods({ job: job2, plans, payroll, today: '2026-11-07' });
+  assert.equal(p2[p2.length - 3].date, '2026-10-09');
+  assert.equal(p2[p2.length - 3].value, periods[periods.length - 3].value);
+  assert.ok(p2[p2.length - 2].value > periods[periods.length - 2].value);
+  assert.ok(p2[p2.length - 1].value > periods[periods.length - 1].value);
+  // No dates, no rows — never a guessed payday.
+  assert.deepEqual(jobTakehomePeriods({ job: { ...job, start_date: null }, plans, payroll, today: '2026-11-07' }), []);
+});
+
+test('home: resolveHomeMetric — account + account-type + per-period take-home cards', () => {
+  const data = {
+    currentYm: '2026-11',
+    property: [], propertyById: {}, propertyLabels: {},
+    stocks: { months: [], topGainer: null },
+    holdingById: {},
+    accountById: {
+      2: { label: 'TFSA', months: months('2026-10', [5000, 6000], 'value').map((r) => ({ ...r, gain: r.value - 5000 })) },
+      3: { label: 'RRSP', months: [{ month: '2026-11', value: 0, gain: 0 }] },
+    },
+    accountTypeById: {
+      TFSA: { label: 'TFSA accounts', months: months('2026-10', [5000, 6000], 'value').map((r) => ({ ...r, gain: r.value - 5000 })) },
+      RRSP: { label: 'RRSP accounts', months: [{ month: '2026-11', value: 0, gain: 0 }] },
+    },
+    earnings: [], spending: [],
+    categorySeries: {},
+    jobById: { 4: { label: 'Acme', months: months('2026-09', [2000, 2100], 'salary') } },
+    jobPeriodById: {
+      4: {
+        label: 'Acme',
+        periods: [
+          { date: '2026-10-09', value: 2299.17 }, { date: '2026-10-23', value: 2299.17 },
+          { date: '2026-11-06', value: 2079.12 },
+        ],
+      },
+    },
+    rentalById: {},
+  };
+  const acct = resolveHomeMetric('account_value:2', data);
+  assert.equal(acct.value, 6000);
+  assert.deepEqual(acct.entity, { kind: 'account', id: 2 });
+  const gain = resolveHomeMetric('account_gain:2', data);
+  assert.equal(gain.value, 1000);
+  assert.deepEqual(gain.entity, { kind: 'account', id: 2 });
+  // An existing account with nothing valued resolves to $0, not "no data".
+  assert.equal(resolveHomeMetric('account_value:3', data).value, 0);
+  const type = resolveHomeMetric('account_type_value:TFSA', data);
+  assert.equal(type.value, 6000);
+  assert.deepEqual(type.entity, { kind: 'account_type', id: 'TFSA' });
+  assert.equal(resolveHomeMetric('account_type_value:RRSP', data).value, 0);
+  assert.deepEqual(resolveHomeMetric('account_value:999', data), { error: 'no_data', message: 'That account has no data yet.' });
+  assert.deepEqual(resolveHomeMetric('account_type_value:RSU', data), { error: 'no_data', message: 'No accounts of that type yet.' });
+  const period = resolveHomeMetric('job_takehome_period:4', data);
+  assert.equal(period.value, 2079.12);
+  assert.equal(period.period, '2026-11');
+  assert.equal(period.periodLabel, 'Nov 6, 2026');
+  assert.deepEqual(period.mom, { delta: -220.05, pct: -9.57 });
+  assert.equal(period.momVs, 'Oct 23, 2026');
+  assert.deepEqual(period.spark, [2299.17, 2299.17, 2079.12]);
+  assert.deepEqual(period.entity, { kind: 'job', id: 4 });
+  assert.deepEqual(resolveHomeMetric('job_takehome_period:999', data), { error: 'no_data', message: 'That job has no pay history yet.' });
+  const lib = buildHomeMetricLibrary({
+    properties: [], holdings: [],
+    accounts: [{ id: 2, label: 'TFSA', type: 'TFSA' }, { id: 3, label: 'RRSP', type: 'RRSP' }],
+    accountTypes: ['TFSA', 'RRSP'],
+    categories: [], jobs: [{ id: 4, label: 'Acme' }], rentals: [],
+  });
+  assert.ok(lib.some((m) => m.metric === 'account_value:2' && m.section === 'stock'));
+  assert.ok(lib.some((m) => m.metric === 'account_gain:2' && m.section === 'stock'));
+  assert.ok(lib.some((m) => m.metric === 'account_type_value:TFSA' && m.section === 'stock'));
+  assert.ok(lib.some((m) => m.metric === 'account_type_gain:RRSP' && m.section === 'stock'));
+  assert.ok(lib.some((m) => m.metric === 'job_takehome_period:4' && m.section === 'earning'));
+  assert.equal(lib.filter((m) => m.metric === 'account_value').length, 0);
 });

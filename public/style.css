@@ -803,6 +803,14 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .spark-ends { display: flex; justify-content: space-between; font-size: 10px; color: #98a4b0; margin-top: 2px; }
 .home-card-del { position: absolute; top: 8px; right: 10px; border: none; background: none; color: #98a4b0; font-size: 18px; line-height: 1; padding: 2px 6px; }
 .home-card-del:hover { color: #b3261e; background: none; }
+/* Drag handle: a small grip rail on the card's left edge. Dragging
+   starts ONLY here — the card body keeps click-to-navigate and the
+   carousel keeps its horizontal scroll/swipe. touch-action: none so
+   a touch drag never becomes a scroll. */
+.home-drag-handle { flex: 0 0 auto; align-self: stretch; display: flex; align-items: center; cursor: grab; color: #c3ccd6; font-size: 14px; letter-spacing: 1px; padding: 0 2px; margin-left: -8px; touch-action: none; user-select: none; -webkit-user-select: none; }
+.home-drag-handle:hover { color: #5a6a7a; }
+.home-drag-handle:active { cursor: grabbing; }
+.insight-card.dragging { opacity: 0.75; box-shadow: 0 12px 28px rgba(16, 24, 40, .2); z-index: 5; }
 /* AI-appended cards carry a small AI tag by the title so they read
    as AI-made at a glance; system cards have none. */
 .home-ai-tag { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .05em; color: #1668c4; background: #eef4fb; border: 1px solid #cfe0f2; border-radius: 999px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px; }
@@ -823,3 +831,7 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .home-ai-proposal { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .home-ai-row { display: flex; gap: 8px; }
 .home-ai-row input { flex: 1; }
+/* Clear session: a quiet link-style button in the panel header —
+   it resets only the conversation, never cards or stored data. */
+.home-ai-clear { border: none; background: none; color: #6b7a89; font-size: 12px; font-weight: 400; letter-spacing: 0; padding: 2px 0; cursor: pointer; }
+.home-ai-clear:hover { color: #1c2733; text-decoration: underline; }

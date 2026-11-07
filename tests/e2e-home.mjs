@@ -112,19 +112,34 @@ export async function run(H, S) {
   const home = r.data;
   const card = (metric) => home.insights.find((c) => c.metric === metric);
 
-  // Highlight: most recent first — Nov 6 salary (current), then Oct 23 salary, Oct 15 rent, Oct 9 salary.
+  // Highlight: most recent first — Nov 6 salary (current), then Oct 23 salary, Oct 15 rent, Oct 9 salary,
+  // plus the mortgaged property's monthly payment (Oct 15, and Nov 15 once it arrives).
+  // "Today" is the real run date, so whether the Nov 15 row exists is read off the data itself.
   const hl = home.highlights;
-  H.check('home API: highlight starts with the current salary payday Nov 6 at the DISPLAYED take-home (cashNet − benefit)',
-    hl[0].kind === 'salary' && hl[0].date === '2026-11-06' && hl[0].amount === displayedCash && hl[0].isCurrent === true,
+  const nov15Arrived = hl.some((x) => x.kind === 'mortgage' && x.date === '2026-11-15');
+  const salaryNov6 = hl.find((x) => x.kind === 'salary' && x.date === '2026-11-06');
+  H.check('home API: current salary payday Nov 6 at the DISPLAYED take-home (cashNet − benefit)',
+    salaryNov6 && salaryNov6.amount === displayedCash && salaryNov6.isCurrent === true,
     JSON.stringify(hl.slice(0, 3)));
   const rentCur = hl.find((x) => x.kind === 'rental' && x.isCurrent);
   H.check('home API: current rental occurrence is Oct 15 at $2,000',
     rentCur && rentCur.date === '2026-10-15' && rentCur.amount === 2000, JSON.stringify(rentCur));
-  H.check('home API: highlight window is Oct + Nov only — 4 rows, no September rows',
-    hl.length === 4
+  H.check('home API: highlight window is Oct + Nov only — 4 income rows + mortgage rows, no September rows',
+    hl.length === 4 + (nov15Arrived ? 2 : 1)
     && hl.some((x) => x.kind === 'salary' && x.date === '2026-10-23' && x.received == null)
     && !hl.some((x) => x.date < '2026-10-01'),
     JSON.stringify(hl.map((x) => `${x.kind} ${x.date}`)));
+  // The mortgaged property pays monthly on the 15th: $1,744.81 =
+  // derivePayment(300000 @ 5% fixed, 25y, semi-annual).
+  const mortOct = hl.find((x) => x.kind === 'mortgage' && x.date === '2026-10-15');
+  H.check('home API: mortgage row Oct 15 at the per-period payment $1,744.81 (monthly)',
+    mortOct && mortOct.amount === 1744.81 && mortOct.sourceId === pidB && mortOct.isCurrent === !nov15Arrived,
+    JSON.stringify(mortOct));
+  if (nov15Arrived) {
+    const mortNov = hl.find((x) => x.kind === 'mortgage' && x.date === '2026-11-15');
+    H.check('home API: mortgage row Nov 15 once it arrives',
+      mortNov && mortNov.amount === 1744.81 && mortNov.isCurrent === true, JSON.stringify(mortNov));
+  }
 
   // Standard cards: hand-computed from the fixture.
   H.check('home API: assessed total is $1,500,000 (Nov 2026)',
@@ -193,6 +208,24 @@ export async function run(H, S) {
   H.check('home marks: marking the CURRENT row keeps it, marked received',
     r.data.highlights.some((x) => x.kind === 'rental' && x.date === '2026-10-15' && x.received === 1),
     JSON.stringify(r.data.highlights.filter((x) => x.kind === 'rental')));
+  // Mortgage marks: "Mark paid", same window + rollover rule. The Oct 15
+  // mortgage payment is the current one until Nov 15 arrives, so marking
+  // it keeps it (paid); once Nov 15 arrives it rolls off instead.
+  r = await H.req('POST', '/api/home/marks', { kind: 'mortgage', source_id: pidB, date: '2026-10-15', received: 1 });
+  H.check('home marks: marking a mortgage payment paid succeeds', r.status === 200 && r.data.received === 1, JSON.stringify(r.data));
+  r = await H.req('GET', '/api/home');
+  if (nov15Arrived) {
+    H.check('home marks: marked Oct 15 mortgage rolled off once Nov 15 arrived',
+      !r.data.highlights.some((x) => x.kind === 'mortgage' && x.date === '2026-10-15')
+      && r.data.highlights.some((x) => x.kind === 'mortgage' && x.date === '2026-11-15'),
+      JSON.stringify(r.data.highlights.filter((x) => x.kind === 'mortgage')));
+  } else {
+    H.check('home marks: marking the CURRENT mortgage row keeps it, marked paid',
+      r.data.highlights.some((x) => x.kind === 'mortgage' && x.date === '2026-10-15' && x.received === 1),
+      JSON.stringify(r.data.highlights.filter((x) => x.kind === 'mortgage')));
+  }
+  r = await H.req('POST', '/api/home/marks', { kind: 'mortgage', source_id: 999999, date: '2026-10-15', received: 1 });
+  H.check('home marks: mortgage mark on an unknown property is a 404', r.status === 404, JSON.stringify(r.data));
   r = await H.req('POST', '/api/home/marks', { kind: 'salary', source_id: jobId, date: '2026-11-06' });
   H.check('home marks: missing received is a 400', r.status === 400, JSON.stringify(r.data));
   r = await H.req('POST', '/api/home/marks', { kind: 'salary', source_id: 999999, date: '2026-11-06', received: 1 });
@@ -208,6 +241,40 @@ export async function run(H, S) {
   H.check('home generate: re-generate returns the 12 system cards',
     r.status === 200 && r.data.insights.filter((c) => c.kind === 'system').length === 12,
     JSON.stringify(r.data.insights && r.data.insights.length));
+
+  // ---- reorder: drag order persists across reload + re-generate ----
+  const orderKey = (c) => `${c.section}|${c.metric}|${c.title}`;
+  r = await H.req('GET', '/api/home');
+  const propOrder0 = r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric);
+  H.check('home reorder: property section starts in natural order',
+    JSON.stringify(propOrder0) === JSON.stringify(['property_equity', 'property_assessed', 'property_outstanding']),
+    JSON.stringify(propOrder0));
+  const propCards = r.data.insights.filter((c) => c.section === 'property');
+  const draggedOrder = [propCards[1], propCards[0], propCards[2]].map(orderKey);
+  r = await H.req('POST', '/api/home/insights/reorder', { section: 'property', order: draggedOrder });
+  H.check('home reorder: posting a new order succeeds and echoes it',
+    r.status === 200 && JSON.stringify(r.data.order) === JSON.stringify(draggedOrder), JSON.stringify(r.data));
+  r = await H.req('GET', '/api/home');
+  H.check('home reorder: the dragged order persists across reload',
+    JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric))
+    === JSON.stringify(['property_assessed', 'property_equity', 'property_outstanding']),
+    JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric)));
+  r = await H.req('POST', '/api/home/insights/generate', {});
+  r = await H.req('GET', '/api/home');
+  H.check('home reorder: re-generate refreshes values but keeps the custom order',
+    JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric))
+    === JSON.stringify(['property_assessed', 'property_equity', 'property_outstanding']),
+    JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric)));
+  r = await H.req('POST', '/api/home/insights/reorder', { section: 'property', order: ['bogus|key', ...draggedOrder] });
+  H.check('home reorder: unknown keys are filtered out, known order kept',
+    r.status === 200 && JSON.stringify(r.data.order) === JSON.stringify(draggedOrder), JSON.stringify(r.data));
+  r = await H.req('POST', '/api/home/insights/reorder', { section: 'nope', order: draggedOrder });
+  H.check('home reorder: unknown section is a 400', r.status === 400, JSON.stringify(r.data));
+  r = await H.req('POST', '/api/home/insights/reorder', { section: 'property', order: 'not-an-array' });
+  H.check('home reorder: non-array order is a 400', r.status === 400, JSON.stringify(r.data));
+  // Restore the natural order so the browser pins below start from it.
+  r = await H.req('POST', '/api/home/insights/reorder', { section: 'property', order: propCards.map(orderKey) });
+  H.check('home reorder: restoring the natural order succeeds', r.status === 200, JSON.stringify(r.data));
 
   // ---- AI-append: propose → Apply → exactly one → Delete; system cards protected ----
   fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'property', title: 'Test home equity', metric: `property_equity:${pidA}` } }));
@@ -258,6 +325,74 @@ export async function run(H, S) {
   H.check('home API: standard cards carry no entity ref (they fall back to the section link)',
     r.data.insights.filter((c) => c.kind === 'system').every((c) => c.entity === undefined),
     JSON.stringify(r.data.insights.filter((c) => c.kind === 'system').map((c) => c.entity)));
+
+  // ---- AI-append: account-level stock metrics (the Wealthsimple / RRSP / TFSA gap) ----
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'stock', title: 'TFSA value', metric: `account_value:${acctId}` } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Show me the Wealthsimple account value', history: [] });
+  H.check('home AI: append proposes the per-account value card',
+    r.status === 200 && r.data.proposal && r.data.proposal.metric === `account_value:${acctId}`,
+    JSON.stringify(r.data));
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: r.data.proposal });
+  H.check('home AI: per-account card carries the account ref and its real value ($6,000)',
+    r.status === 201 && r.data.insight && r.data.insight.value === 6000
+      && JSON.stringify(r.data.insight.entity) === JSON.stringify({ kind: 'account', id: acctId }),
+    JSON.stringify(r.data));
+  const acctAiId = r.data.insight.id;
+  r = await H.req('DELETE', `/api/home/insights/${acctAiId}`);
+  H.check('home AI: per-account AI card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'stock', title: 'TFSA gain', metric: `account_gain:${acctId}` } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Show me the TFSA gain', history: [] });
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: r.data.proposal });
+  H.check('home AI: per-account gain card is $1,000 ($6,000 − $5,000 contributed)',
+    r.status === 201 && r.data.insight && r.data.insight.value === 1000, JSON.stringify(r.data));
+  const gainAiId = r.data.insight.id;
+  r = await H.req('DELETE', `/api/home/insights/${gainAiId}`);
+  H.check('home AI: per-account gain card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'stock', title: 'TFSA accounts value', metric: 'account_type_value:TFSA' } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Show me all TFSA value', history: [] });
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: r.data.proposal });
+  H.check('home AI: all-TFSA card sums the TFSA accounts ($6,000) and links to the Stocks page',
+    r.status === 201 && r.data.insight && r.data.insight.value === 6000
+      && JSON.stringify(r.data.insight.entity) === JSON.stringify({ kind: 'account_type', id: 'TFSA' }),
+    JSON.stringify(r.data));
+  const typeAiId = r.data.insight.id;
+  r = await H.req('DELETE', `/api/home/insights/${typeAiId}`);
+  H.check('home AI: all-TFSA AI card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+  // The RRSP account holds only the unpriced plan-target fund: the
+  // summed RRSP value is honestly $0, not "no data".
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'stock', title: 'RRSP accounts value', metric: 'account_type_value:RRSP' } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Show me all RRSP value', history: [] });
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: r.data.proposal });
+  H.check('home AI: all-RRSP card is $0 (the RRSP account holds only the unpriced fund)',
+    r.status === 201 && r.data.insight && r.data.insight.value === 0, JSON.stringify(r.data));
+  const rrspAiId = r.data.insight.id;
+  r = await H.req('DELETE', `/api/home/insights/${rrspAiId}`);
+  H.check('home AI: all-RRSP AI card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+
+  // ---- AI-append: per-period take-home ("meta bi-weekly pay") ----
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'earning', title: 'Acme per-period take-home', metric: `job_takehome_period:${jobId}` } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Show me the meta bi-weekly pay', history: [] });
+  H.check('home AI: append proposes the per-period take-home card',
+    r.status === 200 && r.data.proposal && r.data.proposal.metric === `job_takehome_period:${jobId}`,
+    JSON.stringify(r.data));
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: r.data.proposal });
+  H.check('home AI: per-period card shows the latest payday (Nov 6) at the DISPLAYED per-period cash',
+    r.status === 201 && r.data.insight && r.data.insight.value === displayedCash && r.data.insight.period === '2026-11'
+      && JSON.stringify(r.data.insight.entity) === JSON.stringify({ kind: 'job', id: jobId }),
+    JSON.stringify(r.data));
+  H.check('home AI: per-period card deltas vs the previous payday (Oct 23, no plan yet)',
+    r.data.insight && r.data.insight.mom && r.data.insight.mom.delta === Math.round((displayedCash - cashNet) * 100) / 100
+      && r.data.insight.momVs === 'Oct 23, 2026' && r.data.insight.periodLabel === 'Nov 6, 2026',
+    JSON.stringify(r.data.insight && { mom: r.data.insight.mom, momVs: r.data.insight.momVs, periodLabel: r.data.insight.periodLabel }));
+  const periodAiId = r.data.insight.id;
+  r = await H.req('DELETE', `/api/home/insights/${periodAiId}`);
+  H.check('home AI: per-period AI card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+
+  // ---- AI-append: the decline path still works for uncomputable requests ----
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ decline: 'I cannot forecast next year.' }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Forecast next year', history: [] });
+  H.check('home AI: a genuinely uncomputable request still declines',
+    r.status === 200 && r.data.decline === 'I cannot forecast next year.', JSON.stringify(r.data));
 
   // ---- browser: default landing, carousels with peek, toggle persists ----
   if (!H.chromeAvailable) {
@@ -348,14 +483,35 @@ export async function run(H, S) {
     H.check('home UI: clicking the Finance Mate brand navigates to Home', !!brandHome,
       await page.evaluate(() => location.hash));
 
-    // Highlight carousel: first card is the Nov 6 payday with the displayed take-home.
+    // Highlight carousel: the Nov 6 payday card shows the displayed
+    // take-home; the FIRST card is the most recent occurrence (a
+    // mortgage payment once Nov 15 has arrived, else the Nov 6 salary).
     const cashFmt = displayedCash.toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const firstPay = await page.evaluate(() => {
-      const c = document.querySelector('#homeHighlightCarousel .insight-card');
+    const nov6Pay = await page.evaluate(() => {
+      const c = [...document.querySelectorAll('#homeHighlightCarousel .insight-card')].find((el) => el.textContent.includes('Nov 6'));
       return c ? c.textContent : '';
     });
-    H.check('home UI: first highlight card shows Nov 6 + displayed take-home',
-      firstPay.includes('Nov 6') && firstPay.includes(`$${cashFmt}`), firstPay.slice(0, 200));
+    H.check('home UI: the Nov 6 highlight card shows the displayed take-home',
+      nov6Pay.includes('Nov 6') && nov6Pay.includes(`$${cashFmt}`), nov6Pay.slice(0, 200));
+    r = await H.req('GET', '/api/home');
+    const firstHl = r.data.highlights[0];
+    const firstCard = await page.evaluate(() => {
+      const c = document.querySelector('#homeHighlightCarousel .insight-card');
+      return c ? { kind: c.dataset.payKind, date: c.dataset.payDate } : null;
+    });
+    H.check('home UI: the first highlight card is the most recent occurrence',
+      firstCard && firstCard.kind === firstHl.kind && firstCard.date === firstHl.date,
+      JSON.stringify({ firstCard, firstHl }));
+    // Header summary shows both counts: received (salary + rental)
+    // and paid (mortgage).
+    const incomeHl = r.data.highlights.filter((h) => h.kind !== 'mortgage');
+    const mortHl = r.data.highlights.filter((h) => h.kind === 'mortgage');
+    const recvCount = incomeHl.filter((h) => h.received === 1).length;
+    const paidCount = mortHl.filter((h) => h.received === 1).length;
+    const summaryText = await page.evaluate(() => document.querySelector('#homeSummary').textContent);
+    H.check('home UI: header summary shows received and paid counts',
+      summaryText === `${recvCount} of ${incomeHl.length} received · ${paidCount} of ${mortHl.length} paid`,
+      JSON.stringify(summaryText));
 
     // Big cards, folded deck: about two full cards in the viewport
     // with a peek of the next card; the snapped card sits on top.
@@ -451,10 +607,11 @@ export async function run(H, S) {
       assessedText.assessed.includes('$1,500,000') && /vs Oct 2026/.test(assessedText.equity),
       JSON.stringify(assessedText));
 
-    // Toggle persists across reload.
-    await page.evaluate(() => { document.querySelector('#homeHighlightCarousel .insight-card [data-mark-kind]').click(); });
+    // Toggle persists across reload (scoped to the salary card: the
+    // first highlight card may be a mortgage payment).
+    await page.evaluate(() => { document.querySelector('#homeHighlightCarousel .insight-card[data-pay-kind="salary"] [data-mark-kind]').click(); });
     const toggled = await until(() => {
-      const b = document.querySelector('#homeHighlightCarousel .insight-card [data-mark-kind]');
+      const b = document.querySelector('#homeHighlightCarousel .insight-card[data-pay-kind="salary"] [data-mark-kind]');
       return b && b.textContent.includes('Received') ? b.textContent : null;
     });
     H.check('home UI: marking the Nov 6 payday shows Received', !!toggled, String(toggled));
@@ -462,10 +619,130 @@ export async function run(H, S) {
       await page.evaluate(() => ['', '#home'].includes(location.hash)), await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
     const persisted = await until(() => {
-      const b = document.querySelector('#homeHighlightCarousel .insight-card [data-mark-kind]');
+      const b = document.querySelector('#homeHighlightCarousel .insight-card[data-pay-kind="salary"] [data-mark-kind]');
       return b && b.textContent.includes('Received') ? b.textContent : null;
     });
     H.check('home UI: Received toggle persists across reload', !!persisted, String(persisted));
+
+    // Mortgage highlight card: "Mark paid" / "Paid", and a link to the property.
+    const mortCard = await page.evaluate(() => {
+      const c = [...document.querySelectorAll('#homeHighlightCarousel .insight-card')].find((el) => el.dataset.payKind === 'mortgage');
+      if (!c) return null;
+      return { text: c.textContent, link: c.dataset.homeLink || null, toggle: c.querySelector('[data-mark-kind]').textContent };
+    });
+    H.check('home UI: mortgage highlight card shows Mortgage + the $1,744.81 payment + a Paid toggle',
+      mortCard && mortCard.text.includes('Mortgage') && mortCard.text.includes('$1,744.81') && mortCard.toggle.includes('Paid'),
+      JSON.stringify(mortCard));
+    H.check('home UI: mortgage highlight card links to its property page',
+      mortCard && mortCard.link === `#property/${pidB}`, JSON.stringify(mortCard));
+    await page.evaluate(() => {
+      const c = [...document.querySelectorAll('#homeHighlightCarousel .insight-card')].find((el) => el.dataset.payKind === 'mortgage');
+      c.querySelector('.insight-value').click();
+    });
+    const mortDetail = await until(() => {
+      const v = document.querySelector('#view-property');
+      return location.hash.startsWith('#property/') && v && !v.classList.contains('hidden') && v.textContent.includes('2 Home Test Way') ? v.textContent : null;
+    });
+    H.check('home UI: clicking the mortgage card opens that property detail page',
+      !!mortDetail, String(mortDetail && mortDetail.slice(0, 200)));
+    await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+
+    // Drag-and-drop: every insight card has a handle; the highlight carousel has none.
+    const handles = await page.evaluate(() => ({
+      insight: document.querySelectorAll('#homeSections [data-drag-handle]').length,
+      highlight: document.querySelectorAll('#homeHighlightCarousel [data-drag-handle]').length,
+      cards: document.querySelectorAll('#homeSections .insight-card').length,
+    }));
+    H.check('home UI: every insight card has a drag handle; the highlight carousel has none',
+      handles.insight === handles.cards && handles.cards === 12 && handles.highlight === 0, JSON.stringify(handles));
+    // Drag the property section's third card (Outstanding principal)
+    // onto the second (Assessed total): the order becomes Total
+    // equity, Outstanding principal, Assessed total — and the drag
+    // does not navigate. The viewport is only 800px wide, so the
+    // third card starts off-screen: scroll the carousel to the second
+    // card's start (a snap point) so the third card's handle sits in
+    // view and the second card is droppable.
+    // Wait for the home DOM to settle before touching the
+    // carousel: goto(#home) re-fetches /api/home and renderHome
+    // replaces the section nodes, but the until() above can pass on
+    // the STALE DOM (the old cards are still there, hidden). If we
+    // scroll the stale carousel, the fresh render replaces it and
+    // the scroll is lost — that was the intermittent drag failure.
+    // The node surviving 800ms unchanged means no render is
+    // pending.
+    const homeSettled = await page.evaluate(async () => {
+      for (let i = 0; i < 20; i++) {
+        const car = document.querySelector('[data-home-section="property"]');
+        if (!car) { await new Promise((r) => setTimeout(r, 250)); continue; }
+        await new Promise((r) => setTimeout(r, 800));
+        if (document.querySelector('[data-home-section="property"]') === car) return 'settled';
+      }
+      return null;
+    });
+    H.check('home UI: home DOM settled after navigating back (no pending re-render)',
+      !!homeSettled, String(homeSettled));
+    // The property section sits near the bottom of the 600px
+    // viewport, so scroll the PAGE down first (the carousel's own
+    // horizontal scroll does not move it vertically), then scroll
+    // the carousel to the second card's start (a snap point) so the
+    // third card's handle sits in view and the second card is
+    // droppable.
+    await page.evaluate(() => {
+      const sec = document.querySelector('[data-home-section="property"]');
+      window.scrollTo({ top: sec.getBoundingClientRect().top + window.scrollY - 80, behavior: 'instant' });
+      const car = sec;
+      car.scrollTo({ left: car.querySelectorAll('.insight-card')[1].offsetLeft, behavior: 'instant' });
+    });
+    // Wait for the third card's handle to be hittable inside the
+    // viewport before starting the drag.
+    const handleReady = await until(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
+      if (cards.length !== 3) return null;
+      const h = cards[2].querySelector('[data-drag-handle]').getBoundingClientRect();
+      const cx = h.left + h.width / 2, cy = h.top + h.height / 2;
+      if (cx <= 0 || cx >= innerWidth || cy <= 0 || cy >= innerHeight) return null;
+      const at = document.elementFromPoint(cx, cy);
+      return at === cards[2].querySelector('[data-drag-handle]') ? 'ready' : null;
+    });
+    H.check('home UI: drag precondition — third card handle is hittable after scrolling',
+      !!handleReady, String(handleReady));
+    const dragPts = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
+      const h = cards[2].querySelector('[data-drag-handle]').getBoundingClientRect();
+      const second = cards[1].getBoundingClientRect();
+      return {
+        from: { x: h.left + h.width / 2, y: h.top + h.height / 2 },
+        to: { x: second.left + 30, y: second.top + second.height / 2 },
+      };
+    });
+    await page.mouse.move(dragPts.from.x, dragPts.from.y);
+    await page.mouse.down();
+    await page.mouse.move(dragPts.to.x, dragPts.to.y, { steps: 12 });
+    await page.mouse.up();
+    const propOrderAfterDrag = await page.evaluate(() => [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent));
+    H.check('home UI: dragging a card by its handle reorders the section',
+      JSON.stringify(propOrderAfterDrag) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']),
+      JSON.stringify(propOrderAfterDrag));
+    H.check('home UI: dragging a card does not navigate away from Home',
+      await page.evaluate(() => ['', '#home'].includes(location.hash)), await page.evaluate(() => location.hash));
+    r = await H.req('GET', '/api/home');
+    H.check('home UI: the dragged order reached the server',
+      JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric))
+      === JSON.stringify(['property_equity', 'property_outstanding', 'property_assessed']),
+      JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric)));
+    await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    const propOrderReload = await until(() => {
+      const labels = [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent);
+      return labels.length === 3 && JSON.stringify(labels) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']) ? labels : null;
+    });
+    H.check('home UI: the dragged order persists across reload', !!propOrderReload, JSON.stringify(propOrderReload));
+    await page.evaluate(() => document.querySelector('#homeRegenBtn').click());
+    const propOrderRegen = await until(() => {
+      const labels = [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent);
+      return labels.length === 3 && JSON.stringify(labels) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']) ? labels : null;
+    });
+    H.check('home UI: Re-generate keeps the dragged order', !!propOrderRegen, JSON.stringify(propOrderRegen));
 
     // AI-append in the browser: propose → Apply appends one → Delete removes it.
     fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'spending', title: 'Groceries spend', metric: 'category_spend:Groceries' } }));
@@ -516,6 +793,38 @@ export async function run(H, S) {
     H.check('home UI: AI tag is gone with the deleted AI card', aiTagsAfter === 0, String(aiTagsAfter));
     H.check('home UI: deleting the AI card does not navigate away from Home',
       await page.evaluate(() => ['', '#home'].includes(location.hash)), await page.evaluate(() => location.hash));
+
+    // Clear session: the thread empties, cards are untouched, and a
+    // new message starts a fresh thread (no trace of the old one).
+    const clearBtn = await page.evaluate(() => {
+      const b = document.querySelector('#homeAiClear');
+      return b ? b.textContent : null;
+    });
+    H.check('home UI: the AI panel has a Clear session control', clearBtn === 'Clear session', String(clearBtn));
+    await page.evaluate(() => document.querySelector('#homeAiClear').click());
+    const cleared = await until(() => {
+      const msgs = document.querySelectorAll('#homeAiThread .home-ai-msg').length;
+      return msgs === 0 && !document.querySelector('#homeAiApplyBtn') ? 'empty' : null;
+    });
+    H.check('home UI: Clear session empties the thread and drops the pending proposal', !!cleared, String(cleared));
+    const spendAfterClear = await page.evaluate(() => document.querySelectorAll('[data-home-section="spending"] .insight-card').length);
+    H.check('home UI: Clear session deletes no insight cards', spendAfterClear === 3, String(spendAfterClear));
+    H.check('home UI: Clear session does not navigate away from Home',
+      await page.evaluate(() => ['', '#home'].includes(location.hash)), await page.evaluate(() => location.hash));
+    // A new message after clearing starts a fresh thread: the old
+    // "Added" line is gone, only the new exchange shows.
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'spending', title: 'Groceries spend', metric: 'category_spend:Groceries' } }));
+    await page.evaluate(() => {
+      const input = document.querySelector('#homeAiText');
+      input.value = 'Show me groceries spending';
+      document.querySelector('#homeAiSend').click();
+    });
+    const fresh = await until(() => {
+      const b = document.querySelector('#homeAiApplyBtn');
+      return b ? document.querySelector('#homeAiThread').textContent : null;
+    });
+    H.check('home UI: a message after Clear session proposes again from a fresh thread',
+      !!fresh && fresh.includes('Groceries spend') && !fresh.includes('Added'), String(fresh && fresh.slice(0, 200)));
 
     // A per-entity card with a numeric id links to that entity's
     // detail page: append the property equity card, click it, land

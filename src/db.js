@@ -906,6 +906,21 @@ CREATE TABLE IF NOT EXISTS home_insights (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- Home insight drag order (2026-11-07): one row per (user, section,
+-- card) with the card's position in that section. The key is the
+-- card's STABLE identity (section + metric + title, see
+-- homeOrderKey), never the row id: regeneration deletes + re-inserts
+-- the system rows, so an id-keyed order would be wiped. Cards
+-- missing from the order (newly generated or AI-appended) append at
+-- the end of their section.
+CREATE TABLE IF NOT EXISTS home_insight_order (
+  user_id INTEGER NOT NULL,
+  section TEXT NOT NULL,               -- property | stock | earning | spending
+  card_key TEXT NOT NULL,              -- '<section>|<metric>|<title>'
+  position INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, section, card_key)
+);
 -- Home highlight marks (2026-11-07): one row per (user, source,
 -- occurrence date). received 1 = received, 0 = explicitly marked
 -- not-received; both count as "marked" for the highlight rollover
@@ -915,7 +930,7 @@ CREATE TABLE IF NOT EXISTS home_insights (
 -- figures — highlight only.
 CREATE TABLE IF NOT EXISTS income_marks (
   user_id INTEGER NOT NULL,
-  kind TEXT NOT NULL,                  -- 'salary' | 'rental'
+  kind TEXT NOT NULL,                  -- 'salary' | 'rental' | 'mortgage'
   source_id INTEGER NOT NULL,
   pay_date TEXT NOT NULL,              -- 'YYYY-MM-DD'
   received INTEGER NOT NULL,           -- 0 | 1

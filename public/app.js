@@ -17738,7 +17738,18 @@ document.addEventListener('click', (e) => {
 let homeData = null;
 let homeAiHistory = []; // [{role, text}]
 let homeAiPending = null; // {section, title, metric, preview} awaiting Apply
+let homeAiEpoch = 0; // bumped by Clear session; a reply from an earlier epoch is dropped
 let homeCharts = [];
+
+// Clear session resets only the conversation (in-memory thread +
+// pending proposal). Appended insight cards and stored data are
+// untouched; the next message starts a fresh thread.
+function clearHomeAiSession() {
+  homeAiHistory = [];
+  homeAiPending = null;
+  homeAiEpoch++;
+  renderHomeAiThread();
+}
 
 function homeShiftYm(ym, n) {
   let [y, m] = String(ym).split('-').map(Number);
@@ -17801,8 +17812,13 @@ function homeInsightCardHtml(c) {
   const aiTag = c.kind === 'ai' ? ' <span class="home-ai-tag">AI</span>' : '';
   const link = homeCardLink(c);
   const linkAttrs = ` data-home-link="${link.href}"${link.category ? ` data-home-category="${esc(link.category)}"` : ''} role="link" tabindex="0"`;
+  // Drag handle: reordering starts ONLY here (see the pointer
+  // handlers below) — the card body keeps click-to-navigate and the
+  // carousel keeps its horizontal scroll/swipe.
+  const dragHandle = `<span class="home-drag-handle" data-drag-handle title="Drag to reorder" aria-label="Drag to reorder">⋮⋮</span>`;
+  const keyAttr = ` data-home-key="${esc(homeCardKey(c))}"`;
   if (!c.hasData) {
-    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}>${delBtn}
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${dragHandle}
       <div class="insight-text">
         <div class="insight-label">${esc(c.title)}${aiTag}</div>
         <div class="insight-empty">No data yet</div>
@@ -17814,21 +17830,28 @@ function homeInsightCardHtml(c) {
       <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}'></canvas>
       <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
     </div>` : '';
-  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}>${delBtn}
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${dragHandle}
     <div class="insight-text">
       <div class="insight-label">${esc(c.title)}${aiTag}</div>
       <div class="insight-value">${homeFormatValue(c)}</div>
       ${c.sublabel ? `<div class="insight-sub">${esc(c.sublabel)}</div>` : ''}
       <div class="insight-period">${esc(c.periodLabel)}</div>
-      <div class="insight-deltas">${homeDeltaHtml(c.mom, c.valueKind, c.downIsGood, monthLabel(homeShiftYm(c.period, -1)))}${homeYoyHtml(c.yoy, c.valueKind, c.downIsGood, monthLabel(homeShiftYm(c.period, -12)))}</div>
+      <div class="insight-deltas">${homeDeltaHtml(c.mom, c.valueKind, c.downIsGood, c.momVs || monthLabel(homeShiftYm(c.period, -1)))}${homeYoyHtml(c.yoy, c.valueKind, c.downIsGood, c.yoyVs || monthLabel(homeShiftYm(c.period, -12)))}</div>
     </div>
     ${sparkHtml}</div>`;
 }
 
 function homePayCardHtml(h) {
-  const state = h.received === 1 ? 'Received' : h.received === 0 ? 'Not received' : 'Pending';
-  const label = h.kind === 'salary' ? 'Salary' : 'Rent';
-  return `<div class="insight-card home-pay-card" data-pay-kind="${h.kind}" data-pay-source="${h.sourceId}" data-pay-date="${h.date}">
+  const isMortgage = h.kind === 'mortgage';
+  const state = h.received === 1 ? (isMortgage ? 'Paid' : 'Received')
+    : h.received === 0 ? (isMortgage ? 'Not paid' : 'Not received') : 'Pending';
+  const label = h.kind === 'salary' ? 'Salary' : h.kind === 'rental' ? 'Rent' : 'Mortgage';
+  const toggleLabel = h.received === 1 ? (isMortgage ? '✓ Paid' : '✓ Received')
+    : (isMortgage ? 'Mark paid' : 'Mark received');
+  // Mortgage rows link to their property's detail page (same
+  // card-linking pattern as insight cards); salary/rental rows do not link.
+  const linkAttrs = isMortgage ? ` data-home-link="#property/${h.sourceId}" role="link" tabindex="0"` : '';
+  return `<div class="insight-card home-pay-card" data-pay-kind="${h.kind}" data-pay-source="${h.sourceId}" data-pay-date="${h.date}"${linkAttrs}>
     <div class="insight-text">
       <div class="insight-label">${esc(h.sourceLabel)} · ${label}</div>
       <div class="insight-value">${money2(h.amount)}</div>
@@ -17836,7 +17859,7 @@ function homePayCardHtml(h) {
       <div class="insight-deltas"><span class="pay-state ${h.received === 1 ? 'got' : ''}">${state}</span></div>
     </div>
     <div class="insight-toggle">
-      <button class="recv-toggle ${h.received === 1 ? 'on' : ''}" role="switch" aria-checked="${h.received === 1 ? 'true' : 'false'}" data-mark-kind="${h.kind}" data-mark-source="${h.sourceId}" data-mark-date="${h.date}" data-mark-received="${h.received === 1 ? 1 : 0}">${h.received === 1 ? '✓ Received' : 'Mark received'}</button>
+      <button class="recv-toggle ${h.received === 1 ? 'on' : ''}" role="switch" aria-checked="${h.received === 1 ? 'true' : 'false'}" data-mark-kind="${h.kind}" data-mark-source="${h.sourceId}" data-mark-date="${h.date}" data-mark-received="${h.received === 1 ? 1 : 0}">${toggleLabel}</button>
     </div>
   </div>`;
 }
@@ -17874,11 +17897,17 @@ function homeCardLink(c) {
   const e = c.entity;
   if (e && e.kind === 'property') return { href: `#property/${e.id}` };
   if (e && e.kind === 'holding') return { href: `#invest-holding/${e.id}` };
+  if (e && e.kind === 'account') return { href: `#invest-account/${e.id}` };
+  if (e && e.kind === 'account_type') return { href: '#assets/investments' };
   if (e && e.kind === 'job') return { href: `#earnings/job/${e.id}` };
   if (e && e.kind === 'rental') return { href: `#earnings/rental/${e.id}` };
   if (e && e.kind === 'category') return { href: '#spending', category: e.id };
   return { href: HOME_SECTION_ROUTES[c.section] };
 }
+// Stable identity of an insight card, for the stored drag order —
+// must match homeOrderKey in src/home.js exactly: section + metric
+// + title (never the row id — regeneration re-inserts system rows).
+function homeCardKey(c) { return `${c.section}|${c.metric}|${c.title}`; }
 function homeNavigateCard(card) {
   if (!card) return;
   if (card.dataset.homeCategory) {
@@ -17919,10 +17948,16 @@ $('#view-home').addEventListener('scroll', (e) => {
 function renderHome() {
   if (!homeData) return;
   const { highlights, insights } = homeData;
-  const received = highlights.filter((h) => h.received === 1).length;
-  $('#homeSummary').textContent = highlights.length
-    ? `${received} of ${highlights.length} received`
-    : 'No upcoming payments';
+  // Header summary: received counts income (salary + rental), paid
+  // counts mortgages — shown side by side when both kinds exist.
+  const income = highlights.filter((h) => h.kind !== 'mortgage');
+  const morts = highlights.filter((h) => h.kind === 'mortgage');
+  const received = income.filter((h) => h.received === 1).length;
+  const paid = morts.filter((h) => h.received === 1).length;
+  const parts = [];
+  if (income.length) parts.push(`${received} of ${income.length} received`);
+  if (morts.length) parts.push(`${paid} of ${morts.length} paid`);
+  $('#homeSummary').textContent = parts.length ? parts.join(' · ') : 'No upcoming payments';
   $('#homeHighlightCarousel').innerHTML = highlights.map(homePayCardHtml).join('');
   $('#homeHighlightEmpty').classList.toggle('hidden', highlights.length > 0);
   $('#homeSections').innerHTML = ['property', 'stock', 'earning', 'spending'].map((section) => {
@@ -17959,12 +17994,14 @@ async function sendHomeAi() {
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
+  const epoch = homeAiEpoch;
   const history = [...homeAiHistory];
   homeAiHistory.push({ role: 'user', text });
   homeAiPending = null;
   renderHomeAiThread();
   try {
     const res = await api('/api/home/insights/ai-append', { method: 'POST', body: { text, history } });
+    if (epoch !== homeAiEpoch) return; // cleared while this was in flight — drop the stale reply
     if (res.proposal) {
       homeAiPending = res.proposal;
       homeAiHistory.push({ role: 'assistant', text: `Proposed: ${res.proposal.title} (${res.proposal.section}). Apply to add it.` });
@@ -18005,6 +18042,7 @@ $('#homeRegenBtn').addEventListener('click', async () => {
   btn.disabled = false;
 });
 $('#homeAiSend').addEventListener('click', sendHomeAi);
+$('#homeAiClear').addEventListener('click', clearHomeAiSession);
 $('#homeAiText').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendHomeAi(); });
 $('#view-home').addEventListener('click', async (e) => {
   const t = e.target.closest('[data-mark-kind]');
@@ -18039,3 +18077,69 @@ $('#view-home').addEventListener('keydown', (e) => {
   e.preventDefault();
   homeNavigateCard(card);
 });
+
+// Drag-and-drop reorder of insight cards within a section. The drag
+// starts ONLY from a card's handle (⋮⋮) — the card body keeps
+// click-to-navigate and the carousel keeps its horizontal
+// scroll/swipe. While dragging, the card under the pointer becomes
+// the drop target and the DOM reorders live; on release the
+// section's order persists via the reorder endpoint. A drag past the
+// threshold suppresses the click that follows pointerup, so a drag
+// never navigates. The highlight carousel has no handles and never
+// drags.
+let homeDrag = null; // {section, card, carousel, moved, startX, startY}
+let homeSuppressClick = false;
+$('#view-home').addEventListener('pointerdown', (e) => {
+  homeSuppressClick = false; // a fresh gesture is never the last drag's trailing click
+  const handle = e.target.closest && e.target.closest('[data-drag-handle]');
+  if (!handle) return;
+  const card = handle.closest('.insight-card');
+  const carousel = card && card.closest('.home-carousel[data-home-section]');
+  if (!card || !carousel) return;
+  e.preventDefault();
+  try { handle.setPointerCapture(e.pointerId); } catch { /* no capture on this input */ }
+  homeDrag = { section: carousel.dataset.homeSection, card, carousel, moved: false, startX: e.clientX, startY: e.clientY };
+});
+$('#view-home').addEventListener('pointermove', (e) => {
+  if (!homeDrag) return;
+  if (!homeDrag.moved && Math.hypot(e.clientX - homeDrag.startX, e.clientY - homeDrag.startY) < 6) return;
+  if (!homeDrag.moved) { homeDrag.moved = true; homeDrag.card.classList.add('dragging'); }
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const over = el && el.closest ? el.closest('.insight-card') : null;
+  if (!over || over === homeDrag.card || !homeDrag.carousel.contains(over)) return;
+  const rect = over.getBoundingClientRect();
+  if (e.clientX > rect.left + rect.width / 2) homeDrag.carousel.insertBefore(homeDrag.card, over.nextSibling);
+  else homeDrag.carousel.insertBefore(homeDrag.card, over);
+});
+const homeEndDrag = async () => {
+  if (!homeDrag) return;
+  const drag = homeDrag; homeDrag = null;
+  drag.card.classList.remove('dragging');
+  if (!drag.moved) return;
+  homeSuppressClick = true;
+  const keys = [...drag.carousel.querySelectorAll('.insight-card')].map((el) => el.dataset.homeKey).filter(Boolean);
+  try {
+    await api('/api/home/insights/reorder', { method: 'POST', body: { section: drag.section, order: keys } });
+    // Keep the in-memory list in step so a later re-render without a
+    // reload cannot flash the old order back.
+    if (homeData && homeData.insights) {
+      const orderIdx = new Map(keys.map((k, i) => [k, i]));
+      const sorted = homeData.insights.filter((c) => c.section === drag.section)
+        .sort((a, b) => (orderIdx.get(homeCardKey(a)) ?? 1e9) - (orderIdx.get(homeCardKey(b)) ?? 1e9));
+      homeData.insights = homeData.insights.map((c) => (c.section === drag.section ? sorted.shift() : c));
+    }
+  } catch (err) {
+    showMsg($('#globalError'), 'err', err.message);
+    await loadHome(); // revert the visible order to the stored one
+  }
+};
+$('#view-home').addEventListener('pointerup', homeEndDrag);
+$('#view-home').addEventListener('pointercancel', homeEndDrag);
+// Capture-phase: a drag's trailing click never reaches the
+// card-navigation handler above.
+$('#view-home').addEventListener('click', (e) => {
+  if (!homeSuppressClick) return;
+  homeSuppressClick = false;
+  e.stopPropagation();
+  e.preventDefault();
+}, true);
