@@ -3129,6 +3129,206 @@ export async function run(H, S) {
         JSON.stringify({ u: ovUiReset.paymentUsed, o: ovUiReset.paymentOverridden }));
       await H.req('DELETE', `/api/properties/${ovUiPid}`);
 
+      // ---- Payment override on a WEEKLY term: per-period input ----
+      // The Riverbend case: $477,885.10 at 3.90% fixed over 22y
+      // derives $2,691.22/month = $621.05/week. The override
+      // editor on a weekly term takes the WEEKLY amount: typing
+      // 592.68 must store the monthly equivalent 2,568.28 (never
+      // 592.68 as a monthly override), the row shows the weekly
+      // figures with the monthly equivalent beside them, and the
+      // monthly surfaces (modal metadata, detail stat) keep
+      // showing the monthly figures. Typing the weekly equivalent
+      // of the derived payment (621.05) clears the override.
+      // Fixture dates sit at 2025-06-01 and selectors are scoped
+      // to this term's id. The new property reuses the deleted
+      // 777 fixture's id (no AUTOINCREMENT), so the first hash
+      // assignment below may be a no-op — the navigation guard
+      // after it steps away and back so the route always runs
+      // for this property instead of showing the deleted
+      // fixture's stale state.
+      r = await H.req('POST', '/api/properties', {
+        address: '999 Weekly Override Lane, Victoria, BC',
+        mortgage_balance: 477885.10, mortgage_balance_date: '2025-06-01', purchase_date: '2025-06-01', amortization_years: 22,
+      });
+      const wkPid = r.data.id;
+      const wkTermId = r.data.terms[0].id;
+      await H.req('POST', `/api/properties/${wkPid}/rates`, { start_date: '2025-06-01', rate_type: 'fixed', annual_rate: 3.90 });
+      r = await H.req('PUT', `/api/properties/${wkPid}/terms/${wkTermId}`, { payment_frequency: 'weekly' });
+      H.check('weekly override fixture: the term takes the weekly frequency',
+        r.status === 200 && r.data.payment_frequency === 'weekly',
+        JSON.stringify({ s: r.status, f: r.data && r.data.payment_frequency }));
+      const wkAmort = (await H.req('GET', `/api/properties/${wkPid}/amortization`)).data;
+      H.check('weekly override fixture: the API derives $2,691.22/month ($621.05/week)',
+        wkAmort.paymentDerived === 2691.22 && wkAmort.periodPayment === 621.05,
+        JSON.stringify({ d: wkAmort.paymentDerived, p: wkAmort.periodPayment }));
+      await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, wkPid);
+      await wait(1500);
+      // The new property reuses the deleted 777 fixture's id
+      // (no AUTOINCREMENT), so the hash above may already have
+      // been this property's — a no-op assignment fires no
+      // hashchange and the page keeps showing the deleted
+      // fixture's stale state. Step away and back so the route
+      // always runs for this property.
+      const wkOnPage = await page.evaluate(() => {
+        const v = document.querySelector('[data-term-payment]');
+        return !!v && v.textContent.includes('621.05');
+      });
+      if (!wkOnPage) {
+        await page.evaluate(() => { location.hash = '#assets/properties'; });
+        await wait(800);
+        await page.evaluate((pid) => { location.hash = `#property/${pid}`; }, wkPid);
+        await wait(1500);
+      }
+      await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+      await wait(800);
+      const wkPaySel = `[data-pay-block="${wkTermId}"]`;
+      const wkTermSel = `[data-term-form="${wkTermId}"]`;
+      const wkPayRowState = () => page.evaluate((sel) => {
+        const row = document.querySelector(sel);
+        const input = row.querySelector('[name=payment_override]');
+        const view = row.querySelector('[data-term-payment]');
+        const ref = row.querySelector('[data-pay-derived-ref]');
+        const struck = ref ? ref.querySelector('s') : null;
+        return {
+          inputHidden: input.classList.contains('hidden'),
+          inputValue: input.value,
+          viewHidden: view.classList.contains('hidden'),
+          editHidden: row.querySelector('[data-pay-edit]').classList.contains('hidden'),
+          resetHidden: row.querySelector('[data-pay-reset]').classList.contains('hidden'),
+          refText: ref ? ref.textContent : null,
+          refStruck: struck ? struck.textContent : null,
+        };
+      }, wkPaySel);
+      const payLabel = () => page.evaluate((sel) => {
+        const l = document.querySelector(`${sel} [data-pay-label]`);
+        return l ? l.textContent : null;
+      }, wkPaySel);
+      H.check('the weekly term\'s pay row is labeled "Weekly payment ($)"',
+        (await payLabel()) === 'Weekly payment ($)',
+        await payLabel());
+      H.check('the weekly term\'s pay row shows the weekly derived figure with the monthly equivalent, no strikethrough',
+        await untilNode(async () => {
+          const t = await tripleOf(`${wkPaySel} [data-term-payment]`);
+          return !!t && t.text.includes('621.05') && t.text.includes('2,691.22') && t.struckText === null;
+        }));
+      await page.evaluate((sel) => document.querySelector(`${sel} [data-pay-edit]`).click(), wkPaySel);
+      await wait(200);
+      const editingWk = await wkPayRowState();
+      H.check('Edit on a weekly term prefills the WEEKLY used payment with the weekly derived figure as reference',
+        !editingWk.inputHidden && editingWk.inputValue === '621.05' && editingWk.refText.includes('621.05') && editingWk.refStruck === null,
+        JSON.stringify(editingWk));
+      await page.keyboard.type('592.68');
+      await page.evaluate((sel) => document.querySelector(sel).requestSubmit(), wkTermSel);
+      // The row poll below is the readiness signal — the submit
+      // handler is async, so a GET read straight after it can
+      // still see the pre-save state.
+      H.check('the weekly pay row shows $592.68/week used with $621.05/week struck through and the monthly equivalent',
+        await untilNode(async () => {
+          const t = await tripleOf(`${wkPaySel} [data-term-payment]`);
+          return !!t && t.used === '$592.68' && t.struckText === '$621.05' && t.text.includes('2,568.28');
+        }));
+      const wkTerm = (await H.req('GET', `/api/properties/${wkPid}`)).data.terms.find((t) => t.id === wkTermId);
+      H.check('entering 592.68 on the weekly term stores the monthly equivalent 2,568.28 as the override',
+        wkTerm.payment_override === 2568.28,
+        JSON.stringify({ o: wkTerm.payment_override }));
+      const wkMeta = await tripleOf('#metaCurrentPayment');
+      H.check('the modal metadata still shows the MONTHLY override figures',
+        !!wkMeta && wkMeta.used === '$2,568.28' && wkMeta.struckText === '$2,691.22',
+        JSON.stringify(wkMeta));
+      const wkStat = await tripleOf('#estPaymentValue');
+      H.check('the detail stat still shows the MONTHLY override figures',
+        !!wkStat && wkStat.used === '$2,568.28' && wkStat.struckText === '$2,691.22',
+        JSON.stringify(wkStat));
+      // The live plan preview inside the weekly term: the
+      // previewed payment is the override — as the MONTH's total
+      // of weekly payments, not the $592.68 typed in the box. The
+      // draft is a variable Prime − 1 switch on 2027-01-01 (a
+      // variable switch never recasts the payment, so the override
+      // survives it); January 2027 holds five weekly paydays, so
+      // the month totals 5 × $592.68 = $2,963.40, with the derived
+      // 5 × $621.05 = $3,105.25 struck through.
+      await page.evaluate((id) => document.querySelector(`[data-term-block="${id}"] [data-toggle-seg]`).click(), wkTermId);
+      await wait(400);
+      await page.evaluate((id) => {
+        const form = document.querySelector(`[data-term-block="${id}"] [data-seg-form]`);
+        const set = (name, value, evt) => {
+          const el = form.querySelector(`[name=${name}]`);
+          el.value = value;
+          el.dispatchEvent(new Event(evt, { bubbles: true }));
+        };
+        set('rate_type', 'variable', 'change');
+        set('rate_mode', 'prime_spread', 'change');
+        set('spread', '-1', 'input');
+        form.start_date.value = '2027-01-01';
+        form.start_date.dispatchEvent(new Event('input', { bubbles: true }));
+      }, wkTermId);
+      H.check('the live plan preview inside the weekly term shows the override month total with the derived struck through',
+        await untilNode(() => page.evaluate((id) => {
+          const out = document.querySelector(`[data-term-block="${id}"] [data-plan-preview]`);
+          const struck = out && out.querySelector('s');
+          return !!out && out.textContent.includes('2,963.40')
+            && !!struck && struck.textContent.includes('3,105.25');
+        }, wkTermId)));
+      // Edit on the overridden weekly term: prefill is the
+      // weekly used figure, the reference is the weekly derived
+      // figure struck through, and Reset puts the weekly derived
+      // figure back in the box — saving then clears the override.
+      await page.evaluate((sel) => document.querySelector(`${sel} [data-pay-edit]`).click(), wkPaySel);
+      await wait(200);
+      const editingWkOv = await wkPayRowState();
+      H.check('on the overridden weekly term the editor prefills the weekly used payment with the weekly derived struck through',
+        !editingWkOv.inputHidden && editingWkOv.inputValue === '592.68' && editingWkOv.refStruck === '$621.05' && !editingWkOv.resetHidden,
+        JSON.stringify(editingWkOv));
+      await page.evaluate((sel) => document.querySelector(`${sel} [data-pay-reset]`).click(), wkPaySel);
+      await wait(200);
+      const afterWkReset = await wkPayRowState();
+      H.check('Reset on a weekly term puts the WEEKLY calculated figure back in the editor box',
+        afterWkReset.inputValue === '621.05' && !afterWkReset.inputHidden,
+        JSON.stringify(afterWkReset));
+      await page.evaluate((sel) => document.querySelector(sel).requestSubmit(), wkTermSel);
+      H.check('saving the weekly derived figure clears the override (row plain again, editor back at rest)',
+        await untilNode(async () => {
+          const t = await tripleOf(`${wkPaySel} [data-term-payment]`);
+          const st = await wkPayRowState();
+          return !!t && t.text.includes('621.05') && t.struckText === null && st.inputHidden && st.inputValue === '';
+        }));
+      const wkCleared = (await H.req('GET', `/api/properties/${wkPid}/amortization`)).data;
+      H.check('after the weekly clear, the API projection is the derived one again',
+        wkCleared.paymentUsed === 2691.22 && wkCleared.paymentOverridden === false,
+        JSON.stringify({ u: wkCleared.paymentUsed, o: wkCleared.paymentOverridden }));
+      // Changing the frequency mid-edit re-expresses the box:
+      // with the editor open on 621.05/week, switching to
+      // monthly turns the box into 2,691.22 (the same money) —
+      // saving then clears the override instead of mis-saving
+      // 621.05 as a monthly override.
+      await page.evaluate((sel) => document.querySelector(`${sel} [data-pay-edit]`).click(), wkPaySel);
+      await wait(200);
+      await page.evaluate((sel) => {
+        const form = document.querySelector(sel);
+        const s = form.querySelector('[name=payment_frequency]');
+        s.value = 'monthly';
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      }, wkTermSel);
+      await wait(200);
+      const afterFreqChange = await wkPayRowState();
+      H.check('switching frequency mid-edit re-expresses the editor box in the new frequency and renames its label',
+        afterFreqChange.inputValue === '2,691.22' && (await payLabel()) === 'Monthly payment ($)',
+        JSON.stringify(afterFreqChange));
+      await page.evaluate((sel) => document.querySelector(sel).requestSubmit(), wkTermSel);
+      // Poll the row to the post-save plain monthly state first —
+      // the submit handler is async, so a GET read straight
+      // after it can still see the pre-save frequency.
+      await untilNode(async () => {
+        const t = await tripleOf(`${wkPaySel} [data-term-payment]`);
+        const st = await wkPayRowState();
+        return !!t && t.text.includes('2,691.22') && t.struckText === null && st.inputHidden;
+      });
+      const wkMonthly = (await H.req('GET', `/api/properties/${wkPid}`)).data.terms.find((t) => t.id === wkTermId);
+      H.check('saving after the mid-edit frequency switch keeps the term monthly with no override',
+        wkMonthly.payment_frequency === 'monthly' && wkMonthly.payment_override === null,
+        JSON.stringify({ f: wkMonthly.payment_frequency, o: wkMonthly.payment_override }));
+      await H.req('DELETE', `/api/properties/${wkPid}`);
+
       // ---- Segment compounding, driven through the UI ----
       // A Prime - 1 segment on $1,350,000 (balance dated
       // 2025-12-01, so the first projected months price at the

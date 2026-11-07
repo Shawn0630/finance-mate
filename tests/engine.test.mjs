@@ -13,7 +13,7 @@
 //     Canadian mortgage tables for $300k / 5% / 25 years)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, primeHistoryResolver, primeAtDateResolver, primeDailyResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
+import { monthlyRate, derivePayment, simulate, buildSchedule, segmentForMonth, segmentAnnualRate, periodicRate, periodPaymentFor, monthlyPaymentFromPerPeriod, primeHistoryResolver, primeAtDateResolver, primeDailyResolver, primeStepMonths, remainingBalanceAt } from '../src/engine.js';
 
 const close = (a, b, tol = 0.02) => Math.abs(a - b) <= tol;
 
@@ -117,6 +117,25 @@ test('periodPaymentFor: Canadian conversion of a $600 monthly payment', () => {
   // payments a year — that is the whole point of accelerating).
   assert.equal(periodPaymentFor(600, 'accelerated_bi_weekly'), 300);
   assert.equal(periodPaymentFor(600, 'accelerated_weekly'), 150);
+});
+
+test('monthlyPaymentFromPerPeriod: the inverse of periodPaymentFor', () => {
+  assert.equal(monthlyPaymentFromPerPeriod(600, 'monthly'), 600);
+  assert.equal(monthlyPaymentFromPerPeriod(300, 'semi_monthly'), 600);
+  assert.equal(monthlyPaymentFromPerPeriod(300, 'accelerated_bi_weekly'), 600);
+  assert.equal(monthlyPaymentFromPerPeriod(150, 'accelerated_weekly'), 600);
+  // The per-period figure is itself cent-rounded, so the inverse
+  // lands within a cent of the original monthly figure — never
+  // further — on the day-stepped frequencies.
+  assert.equal(monthlyPaymentFromPerPeriod(276.92, 'bi_weekly'), 599.99);
+  assert.equal(monthlyPaymentFromPerPeriod(138.46, 'weekly'), 599.99);
+  // The Riverbend case: $592.68/week is $2,568.28/month, and the
+  // round trip through the derived weekly figure is exact.
+  assert.equal(monthlyPaymentFromPerPeriod(592.68, 'weekly'), 2568.28);
+  assert.equal(monthlyPaymentFromPerPeriod(periodPaymentFor(2691.22, 'weekly'), 'weekly'), 2691.22);
+  for (const f of ['monthly', 'semi_monthly', 'bi_weekly', 'accelerated_bi_weekly', 'weekly', 'accelerated_weekly']) {
+    assert.ok(Math.abs(monthlyPaymentFromPerPeriod(periodPaymentFor(600, f), f) - 600) <= 0.01);
+  }
 });
 
 // Frequency anchors for one loan: $100,000 at 5%, $600 monthly payment,

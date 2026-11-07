@@ -1186,8 +1186,14 @@ function fillOneInput(form, name, value) {
   set.add(name);
   // An extracted payment lands in the Monthly payment row's
   // inline editor: reveal it in edit state (the ✨ flag renders
-  // on that row's label via renderAiFlags below).
-  if (name === 'payment_override') enterPayEdit(form, 'keep');
+  // on that row's label via renderAiFlags below). The draft value
+  // is the stored monthly figure; the editor takes the
+  // per-period amount, so re-express it before revealing.
+  if (name === 'payment_override') {
+    const raw = parseMoneyInput(input.value);
+    if (raw !== '') input.value = formatMoneyInput(perPeriodPaymentFor(Number(raw), payEditFreqKey(form)));
+    enterPayEdit(form, 'keep');
+  }
   return 'filled';
 }
 
@@ -1336,10 +1342,19 @@ function captureFormDrafts() {
     const fields = {};
     form.querySelectorAll('input[name], select[name], textarea[name]').forEach((i) => { fields[i.name] = i.value; });
     // The payment editor's input lives in the pay block below
-    // the form, not inside it: fold its value in by name.
+    // the form, not inside it: fold its value in by name. Also
+    // record whether the editor was open: its box holds a
+    // per-period figure then, the stored monthly override at
+    // rest — the restore judges the save outcome in monthly
+    // units either way.
     const pb = payBlockOfForm(form);
-    if (pb) pb.querySelectorAll('input[name]').forEach((i) => { fields[i.name] = i.value; });
-    return { fields, flags: [...(aiFlagSets.get(form) || [])] };
+    let payOpen = false;
+    if (pb) {
+      pb.querySelectorAll('input[name]').forEach((i) => { fields[i.name] = i.value; });
+      const payInput = pb.querySelector('[data-pay-edit-input]');
+      payOpen = !!payInput && !payInput.classList.contains('hidden');
+    }
+    return { fields, flags: [...(aiFlagSets.get(form) || [])], payOpen };
   };
   const terms = {};
   const segs = {};
@@ -1388,10 +1403,24 @@ function restoreFormDrafts(stash) {
       const term = termOfForm(form);
       const derived = cents(term ? term.paymentDerived : null);
       const stored = cents(parseMoneyInput(freshPayText));
-      const v = cents(parseMoneyInput(payInput.value));
+      // The stashed box value is per-period when the editor was
+      // open at capture, the stored monthly override at rest:
+      // judge the save outcome in monthly units either way.
+      const freqKey = payEditFreqKey(form);
+      const raw = parseMoneyInput(payInput.value);
+      const monthlyValue = raw === '' ? ''
+        : (draft.payOpen ? monthlyPaymentFromPerPeriod(Number(raw), freqKey) : Number(raw));
+      const v = cents(monthlyValue);
       const draftOutcome = (v === null || v === derived) ? null : v;
-      if (draftOutcome !== stored) enterPayEdit(form, 'keep');
-      else payInput.value = freshPayText;
+      if (draftOutcome !== stored) {
+        // Restore the edit state with the box in the per-period
+        // unit it takes (an at-rest monthly stash is re-expressed;
+        // an open-editor stash already is per-period).
+        if (!draft.payOpen && monthlyValue !== '') {
+          payInput.value = formatMoneyInput(perPeriodPaymentFor(monthlyValue, freqKey));
+        }
+        enterPayEdit(form, 'keep');
+      } else payInput.value = freshPayText;
     }
   };
   document.querySelectorAll('[data-term-form]').forEach((f) => put(f, stash.terms[f.dataset.termForm]));
@@ -2567,17 +2596,22 @@ function termLengthLabel(months) {
 }
 
 // ------------------------------------------------ payment editor ---
-// The term's Monthly payment is a read-only figure with an Edit
-// button: Edit swaps the figure for an input in place, prefilled
-// with the used payment, the calculated figure kept beside it as
-// the reference (struck through while an override stands, muted
+// The term's payment is a read-only figure with an Edit button:
+// Edit swaps the figure for an input in place, prefilled with
+// the used payment, the calculated figure kept beside it as the
+// reference (struck through while an override stands, muted
 // otherwise). There is NO separate override field — the input
 // lives in the payment row, named payment_override, and at rest
-// it simply mirrors the stored override. On Save, a blank input,
-// or one equal to the calculated figure, clears the override; any
-// other positive figure becomes it. Reset (shown only while an
-// override stands) puts the calculated figure back in the box, so
-// saving after Reset clears the override too.
+// it simply mirrors the stored override. The input takes the
+// PER-PERIOD amount in the term's payment frequency ("Weekly
+// payment ($)" on a weekly term): what the borrower actually
+// pays each period — the stored override stays a MONTHLY amount,
+// and the editor converts on save (weekly 592.68 stores as
+// 2,568.28 monthly). On Save, a blank input, or one equal to the
+// calculated figure (compared AFTER conversion), clears the
+// override; any other positive figure becomes it. Reset (shown
+// only while an override stands) puts the calculated figure back
+// in the box, so saving after Reset clears the override too.
 // The payment row CLOSES the term card — below the rate segments
 // and the lump sums, because the figure is the RESULT of those
 // inputs — so it is not a descendant of the term <form>: its
@@ -2624,13 +2658,22 @@ function termOfForm(form) {
 // The term form's submitted payment_override: the inline editor's
 // parsed value, mapped by the rule above (blank or equal to the
 // term's calculated payment → null; anything else passes through
-// for the server to validate).
+// for the server to validate). The editor's box holds the
+// PER-PERIOD amount while open and the stored monthly override at
+// rest: convert to monthly only in the open state, and compare
+// against the derived monthly figure AFTER that conversion — a
+// per-period figure equal to the derived payment clears the
+// override, exactly as the monthly figure did.
 function paymentOverrideOut(form, parsed) {
   if (parsed === '' || parsed == null) return null;
   const term = termOfForm(form);
   const derived = term ? term.paymentDerived : null;
-  if (derived != null && Math.round(Number(parsed) * 100) === Math.round(Number(derived) * 100)) return null;
-  return parsed;
+  const els = payEditEls(form);
+  const monthly = els.input && !els.input.classList.contains('hidden')
+    ? monthlyPaymentFromPerPeriod(Number(parsed), payEditFreqKey(form))
+    : Number(parsed);
+  if (derived != null && Math.round(monthly * 100) === Math.round(Number(derived) * 100)) return null;
+  return monthly;
 }
 
 // mode 'used': prefill from the term's current used payment (the
@@ -2640,21 +2683,30 @@ function enterPayEdit(form, mode = 'used') {
   const els = payEditEls(form);
   if (!els.input || !els.view) return;
   const term = termOfForm(form);
+  const freqKey = payEditFreqKey(form);
   if (mode === 'used' && term) {
     // Programmatic prefill, no input/change events: opening the
     // editor is not an edit — it must neither clear an AI flag
-    // nor re-price anything.
-    els.input.value = formatMoneyInput(term.paymentUsed ?? term.payment_override ?? '');
+    // nor re-price anything. The prefill is the PER-PERIOD used
+    // payment in the term's frequency (the stored monthly figure
+    // re-expressed); a monthly term prefills exactly as before.
+    const prefillMonthly = term.paymentUsed ?? term.payment_override ?? null;
+    els.input.value = prefillMonthly != null
+      ? formatMoneyInput(perPeriodPaymentFor(prefillMonthly, freqKey)) : '';
   }
   els.input.classList.remove('hidden');
   els.view.classList.add('hidden');
   if (els.editBtn) els.editBtn.classList.add('hidden');
   if (els.resetBtn) els.resetBtn.classList.toggle('hidden', !(term && term.paymentOverridden));
   if (els.ref) {
-    els.ref.innerHTML = term && term.paymentDerived != null
+    // The reference is the calculated figure in the same
+    // per-period unit as the box, so the two compare directly.
+    const derivedPerPeriod = term && term.paymentDerived != null
+      ? perPeriodPaymentFor(term.paymentDerived, freqKey) : null;
+    els.ref.innerHTML = derivedPerPeriod != null
       ? (term.paymentOverridden
-        ? `<s class="pay-derived">${money2(term.paymentDerived)}</s>`
-        : `<span class="pay-derived">${money2(term.paymentDerived)}</span>`)
+        ? `<s class="pay-derived">${money2(derivedPerPeriod)}</s>`
+        : `<span class="pay-derived">${money2(derivedPerPeriod)}</span>`)
       : '';
   }
 }
@@ -2682,15 +2734,18 @@ function renderMortgageMeta() {
     p.remainingBalance != null ? money2(p.remainingBalance)
       : (p.mortgage_balance != null ? money2(p.mortgage_balance) : '—');
   $('#metaCurrentPayment').innerHTML = paymentHtml(chartMeta);
-  // Each term card also shows its own monthly payment read-only,
-  // in the payment row closing the card: the payment its span opens with,
+  // Each term card also shows its own payment read-only, in the
+  // payment row closing the card: the payment its span opens with,
   // from the term's own triple in the property payload (for an
-  // equal-principal term, its first — highest — month). A term
-  // the projection does not reach, or no projection at all (no
-  // rate plan / no amortization yet), shows '—'.
+  // equal-principal term, its first — highest — month). The row
+  // shows the per-period amount in the term's frequency, with the
+  // monthly equivalent beside it (termPayRowHtml); the modal
+  // metadata above stays monthly. A term the projection does not
+  // reach, or no projection at all (no rate plan / no amortization
+  // yet), shows '—'.
   document.querySelectorAll('[data-term-payment]').forEach((el) => {
     const term = terms.find((t) => String(t.id) === el.dataset.termPaymentFor);
-    el.innerHTML = paymentHtml(term);
+    el.innerHTML = termPayRowHtml(term, termFreqKey(term, p));
   });
   // The engine counts the current term's amortization down from
   // the balance anchor (its epoch), so at the anchor the remaining
@@ -2849,11 +2904,11 @@ function renderTerms(p) {
     const segs = t.id === p.currentTermId ? [...t.segments, ...orphans] : t.segments;
     // Every term card carries the same field set: its contract
     // fields, its principal pair, its payment schedule — and,
-    // below the rate segments and the lump sums, its monthly
-    // payment figure (rendered from the
-    // term's payment triple, with an Edit button that turns the
-    // figure itself into the override input — there is no
-    // separate override field). The card's one Save button
+    // below the rate segments and the lump sums, its payment
+    // figure in the term's frequency (rendered from the term's
+    // payment triple, with an Edit button that turns the figure
+    // itself into the override input — there is no separate
+    // override field). The card's one Save button
     // closes the card below the payment row: it sits outside
     // the term <form> and submits it through the HTML form
     // attribute, like the payment row's own inputs.
@@ -2866,8 +2921,7 @@ function renderTerms(p) {
     const anchored = !!(t.anchor_date && t.anchor_balance != null);
     const principalName = anchored ? 'anchor_balance' : 'opening_balance';
     const principalDateName = anchored ? 'anchor_date' : 'start_date';
-    const freqKey = FREQUENCY_LABELS[t.payment_frequency] ? t.payment_frequency
-      : (FREQUENCY_LABELS[p.payment_frequency] ? p.payment_frequency : 'monthly');
+    const freqKey = termFreqKey(t, p);
     const stepped = DAY_STEPPED_FREQUENCIES.includes(freqKey);
     return `<div class="term-block" data-term-block="${t.id}">
       <button type="button" class="term-head" data-term-toggle="${t.id}">
@@ -2920,8 +2974,8 @@ function renderTerms(p) {
           <div><label>Note</label><input type="text" name="note"></div>
           <button class="primary" type="submit">Add lump sum</button>
         </form>
-        <div class="grid3" data-pay-block="${t.id}" style="margin-top:12px">
-          <div><label>Monthly payment ($)</label><div class="term-pay-row">
+        <div class="grid3" data-pay-block="${t.id}" data-pay-freq="${freqKey}" style="margin-top:12px">
+          <div><label data-pay-label>${FREQUENCY_LABELS[freqKey]} payment ($)</label><div class="term-pay-row">
             <span class="term-pay-v" data-term-payment="${esc(String(t.start_date).slice(0, 7))}" data-term-payment-end="${esc(String(t.end_date || t.start_date).slice(0, 7))}" data-term-payment-for="${t.id}">—</span>
             <input name="payment_override" form="termForm${t.id}" type="text" inputmode="decimal" data-money class="pay-edit-input hidden" data-pay-edit-input value="${esc(formatMoneyInput(t.payment_override ?? ''))}">
             <span data-pay-derived-ref></span>
@@ -2995,7 +3049,10 @@ $('#termsWrap').addEventListener('click', async (e) => {
     const term = form && termOfForm(form);
     const input = form && payEditEls(form).input;
     if (input && term) {
-      input.value = formatMoneyInput(term.paymentDerived ?? '');
+      // Reset puts the calculated figure back in the box — in
+      // the same per-period unit the box takes.
+      input.value = term.paymentDerived != null
+        ? formatMoneyInput(perPeriodPaymentFor(term.paymentDerived, payEditFreqKey(form))) : '';
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
     }
@@ -3084,6 +3141,28 @@ $('#termsWrap').addEventListener('change', (e) => {
     const block = termFormEl.closest('[data-term-block]');
     const saveBtn = block && block.querySelector('[data-save-term]');
     if (saveBtn) saveBtn.textContent = saveTermLabel(e.target.value);
+    // The pay row follows the newly picked frequency live: its
+    // label names the new unit, and an open editor's box is
+    // re-expressed in it (the same monthly money, a new
+    // per-period figure) so saving never silently re-reads the
+    // old unit as the new one. At rest the box still mirrors the
+    // stored monthly override, so only the view figure is
+    // re-rendered then.
+    const newFreq = e.target.value;
+    const oldFreq = (block && block.dataset.payFreq) || payEditFreqKey(termFormEl);
+    const payLabel = block && block.querySelector('[data-pay-label]');
+    if (payLabel) payLabel.textContent = `${FREQUENCY_LABELS[newFreq] || 'Monthly'} payment ($)`;
+    const els = payEditEls(termFormEl);
+    if (els.input && !els.input.classList.contains('hidden')) {
+      const raw = parseMoneyInput(els.input.value);
+      if (raw !== '') {
+        els.input.value = formatMoneyInput(perPeriodPaymentFor(
+          monthlyPaymentFromPerPeriod(Number(raw), oldFreq), newFreq));
+      }
+    }
+    const term = termOfForm(termFormEl);
+    if (els.view && term) els.view.innerHTML = termPayRowHtml(term, newFreq);
+    if (block) block.dataset.payFreq = newFreq;
     return;
   }
   const form = e.target.closest('[data-seg-form]');
@@ -3125,7 +3204,10 @@ $('#termsWrap').addEventListener('submit', async (e) => {
         // calculated payment rules again); a figure equal to the
         // calculated payment IS the calculated payment, so it
         // clears it too; any other figure is sent as the override
-        // (the server still refuses a non-positive one).
+        // (the server still refuses a non-positive one). The box
+        // holds the per-period amount while open, so
+        // paymentOverrideOut converts it to the stored monthly
+        // figure first — at rest it already is monthly.
         payment_override: paymentOverrideOut(form, f.payment_override),
         ai_fields: [...aiFlagSet(form)],
       };
@@ -3479,10 +3561,15 @@ function refreshPlanPreview(form) {
         ? Number(termForm.amortization_years.value) : null,
     };
     // The term form's override field as currently edited (blank =
-    // no override in the draft).
+    // no override in the draft). The editor's box is per-period
+    // while open and the stored monthly override at rest — the
+    // preview endpoint takes the monthly figure either way.
     if (termForm && termForm.payment_override) {
-      const po = parseMoneyInput(termForm.payment_override.value);
-      body.payment_override = po === '' ? null : po;
+      const payEls = payEditEls(termForm);
+      const raw = parseMoneyInput(payEls.input ? payEls.input.value : termForm.payment_override.value);
+      if (raw === '') body.payment_override = null;
+      else body.payment_override = payEls.input && !payEls.input.classList.contains('hidden')
+        ? monthlyPaymentFromPerPeriod(Number(raw), payEditFreqKey(termForm)) : Number(raw);
     }
     if (f.rate_type === 'variable' && f.rate_mode === 'prime_spread') {
       body.rate_mode = 'prime_spread';
@@ -3526,6 +3613,72 @@ const FREQUENCY_LABELS = {
   accelerated_bi_weekly: 'Accelerated bi-weekly', weekly: 'Weekly', accelerated_weekly: 'Accelerated weekly',
 };
 const DAY_STEPPED_FREQUENCIES = ['bi_weekly', 'accelerated_bi_weekly', 'weekly', 'accelerated_weekly'];
+
+// The client-side mirror of src/engine.js FREQUENCIES +
+// periodPaymentFor and its inverse: the stored payment is a
+// MONTHLY amount, the per-period amount follows the term's
+// frequency. The server module cannot be imported here, so this
+// table and the two functions below are the single client-side
+// copy — keep them in step with FREQUENCIES / periodPaymentFor /
+// monthlyPaymentFromPerPeriod in src/engine.js.
+const FREQUENCY_PERIODS_PER_YEAR = {
+  monthly: 12, semi_monthly: 24, bi_weekly: 26,
+  accelerated_bi_weekly: 26, weekly: 52, accelerated_weekly: 52,
+};
+const round2c = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+function perPeriodPaymentFor(monthlyPayment, frequencyKey) {
+  const m = Number(monthlyPayment);
+  if (frequencyKey === 'accelerated_bi_weekly') return round2c(m / 2);
+  if (frequencyKey === 'accelerated_weekly') return round2c(m / 4);
+  const n = FREQUENCY_PERIODS_PER_YEAR[frequencyKey] || 12;
+  return round2c((m * 12) / n);
+}
+function monthlyPaymentFromPerPeriod(perPeriod, frequencyKey) {
+  const p = Number(perPeriod);
+  if (frequencyKey === 'accelerated_bi_weekly') return round2c(p * 2);
+  if (frequencyKey === 'accelerated_weekly') return round2c(p * 4);
+  const n = FREQUENCY_PERIODS_PER_YEAR[frequencyKey] || 12;
+  return round2c((p * n) / 12);
+}
+
+// A term's payment frequency: its own field, falling back to the
+// property's when the term carries none.
+function termFreqKey(t, p) {
+  if (t && FREQUENCY_LABELS[t.payment_frequency]) return t.payment_frequency;
+  if (p && FREQUENCY_LABELS[p.payment_frequency]) return p.payment_frequency;
+  return 'monthly';
+}
+
+// The frequency the pay editor converts in: the term form's
+// payment-frequency select as currently picked, falling back to
+// the stored term frequency.
+function payEditFreqKey(form) {
+  const sel = form && form.payment_frequency;
+  if (sel && FREQUENCY_LABELS[sel.value]) return sel.value;
+  const term = termOfForm(form);
+  if (term && FREQUENCY_LABELS[term.payment_frequency]) return term.payment_frequency;
+  return 'monthly';
+}
+
+// The term card's payment row is the one place a payment is shown
+// in the term's own frequency: the used figure is the per-period
+// amount (what the borrower actually pays each week / fortnight),
+// the derived figure beside it is per-period too, and the monthly
+// equivalent rides muted after it. Monthly terms render exactly
+// as paymentHtml — per-period IS monthly there — so every other
+// surface (modal metadata, detail stat, property card) keeps
+// rendering through paymentHtml, monthly, untouched.
+function termPayRowHtml(t, freqKey) {
+  if (!t || t.paymentUsed === null || t.paymentUsed === undefined) return '—';
+  if (!freqKey || freqKey === 'monthly' || !FREQUENCY_LABELS[freqKey]) return paymentHtml(t);
+  const used = perPeriodPaymentFor(t.paymentUsed, freqKey);
+  const adj = FREQUENCY_LABELS[freqKey].toLowerCase();
+  const usedHtml = t.paymentOverridden
+    ? `<span class="pay-used">${money2(used)}</span>` : money2(used);
+  const derivedHtml = (t.paymentOverridden && t.paymentDerived !== null && t.paymentDerived !== undefined)
+    ? ` <s class="pay-derived">${money2(perPeriodPaymentFor(t.paymentDerived, freqKey))}</s>` : '';
+  return `${usedHtml} <span class="pay-freq">/${adj}</span>${derivedHtml} <span class="pay-monthly-equiv">(${money2(t.paymentUsed)}/mo)</span>`;
+}
 
 // The region rides beside the address as a flag tag — rendered
 // FROM the property's region field (a lookup, like FREQUENCY_LABELS

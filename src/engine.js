@@ -61,6 +61,19 @@ export function periodPaymentFor(monthlyPayment, frequencyKey) {
   return round2((m * 12) / f.periodsPerYear);
 }
 
+// The inverse of periodPaymentFor: a per-period amount back to
+// the stored monthly figure. The term form's override editor
+// takes the per-period amount (what the borrower actually pays
+// each week / fortnight) and converts on save — the stored
+// override stays monthly, exactly as the engine derives it.
+export function monthlyPaymentFromPerPeriod(perPeriod, frequencyKey) {
+  const p = Number(perPeriod);
+  if (frequencyKey === 'accelerated_bi_weekly') return round2(p * 2);
+  if (frequencyKey === 'accelerated_weekly') return round2(p * 4);
+  const f = FREQUENCIES[frequencyKey] || FREQUENCIES.monthly;
+  return round2((p * f.periodsPerYear) / 12);
+}
+
 // 'YYYY-MM-DD' -> { y, m } with m 1..12
 function parseYM(dateStr) {
   const [y, m] = String(dateStr).split('-').map(Number);
