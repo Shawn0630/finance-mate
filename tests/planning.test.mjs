@@ -13,7 +13,7 @@ import {
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel, planListSections,
   buildPlanAiSnapshot, normalizeAiAsk,
   expandScenarioPrimePreset, planProjectAiSummaries, aiRepairPrompt,
-  validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind,
+  validateAiReportChartSeries, aiReportPrompt, aiReportRefinePrompt, validateAiReportBaselineKind,
   aiSuggestNamePrompt, cleanAiSuggestedName,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
   equityDeltaPeak, principalDeltaVsBaseline,
@@ -1421,6 +1421,18 @@ test('ai-report prompt names monthly_net_cashflow for a cash-flow time series (u
   assert.match(prompt, /User request: i need the cashflow in time series/);
   const pool = aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 1, text: 'x', baselineKind: 'pool' });
   assert.match(pool, /never use the monthly_net_cashflow series/);
+});
+
+test('ai-report prompt defaults time-varying amounts to time_line, metric_cards only for explicit single figures (user 2026-11-06)', () => {
+  const prompt = aiReportPrompt({ strategies: [{ id: 1, name: 'A', letter: 'A' }], mortgagedCount: 1, holdingCount: 0, text: 'show me the savings over time', baselineKind: 'property' });
+  assert.match(prompt, /Time-series default \(standing rule\)/);
+  assert.match(prompt, /MUST use a trajectory template \(time_line first/);
+  assert.match(prompt, /metric_cards is ONLY for a single summary figure the request names explicitly/);
+  assert.match(prompt, /A metric_cards chart for a time-varying amount is wrong — use time_line instead/);
+  // The refine prompt wraps the base prompt, so the rule travels with every follow-up turn too.
+  const refine = aiReportRefinePrompt({ strategies: [{ id: 1, name: 'A', letter: 'A' }], mortgagedCount: 1, holdingCount: 0, baselineKind: 'property', definition: { engine: {}, charts: [] }, text: 'show me the savings over time', history: [] });
+  assert.match(refine, /Time-series default \(standing rule\)/);
+  assert.match(refine, /metric_cards is ONLY for a single summary figure the request names explicitly/);
 });
 
 // Pure-AI project creation: trio shape validation (user spec

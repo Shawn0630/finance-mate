@@ -14207,12 +14207,13 @@ function planReportEngineHtml(view) {
   const months = ((trajs[0] || {}).monthly || []).map((r) => r.month);
   const horizonLine = months.length ? `Horizon: ${formatYM(months[0])} – ${formatYM(months[months.length - 1])} (${months.length} months).` : '';
   // Headline window: when the window is shorter than the full horizon
-  // the headline cards cover the window only; the comparison table,
-  // the payment breakdown and the AI charts follow the same window,
-  // while the Difference chart keeps its own range slider.
+  // the headline cards cover the window only; the comparison table and
+  // the payment breakdown follow the same window, while each AI chart
+  // block has its own range slider and the Difference chart keeps its
+  // own range slider (user 2026-11-06).
   const win = planHeadlineWindowed(view);
   const windowLine = win && !planHeadlineWindowIsFull(view)
-    ? `Headline window: ${planHeadlineWindowLabel(view)} — the headline, comparison table, payment breakdown and AI charts cover this window only; the Difference chart keeps its own range slider.`
+    ? `Headline window: ${planHeadlineWindowLabel(view)} — the headline, comparison table and payment breakdown cover this window only; each AI chart has its own range slider, and the Difference chart keeps its own range slider.`
     : '';
   const bd = row && view.costBreakdown ? view.costBreakdown[row.strategy.id] : null;
   // Pool reports measure no mortgage: no penalty, no interest saved
@@ -14290,42 +14291,16 @@ function planReportRefineDiffHtml(diff) {
   return lines.length ? `<div class="note">${lines.map((l) => esc(l)).join('<br>')}</div>` : '<div class="note">No changes.</div>';
 }
 
-// AI charts follow the headline window (user 2026-11-06): each
-// time-series chart recorded in the charts loop is redrawn with its
-// series sliced to [startMonth, endMonth]. Snapshots (share
-// doughnut) are not time series and are left alone; the tables under
-// the charts keep their full-range snapshots, like the Difference
-// table under its own range picker. AI scalar overrides
-// (metric_cards = the headline) stay full-horizon: the engine has no
-// series reduction (no sum/last/first — only element-wise min/max),
-// so a scalar cannot be re-derived over a sliced series without
-// rebuilding the evaluator; the windowed headline instead reads the
-// AI-overridden trajectories (round 1).
-function planReportAiChartsSlice(view) {
-  const specs = view.aiCharts || [];
-  if (!specs.length) return;
-  const months = planHeadlineWindowMonths(view);
-  if (!months.length) return;
-  const startMonth = months[planHeadlineWindowStartIdx(view)];
-  const endMonth = months[planHeadlineWindowEndIdx(view)];
-  for (const spec of specs) {
-    const labels = spec.labels || [];
-    const labelMonths = spec.labelMonths || labels;
-    const idxs = labels.map((_, i) => i).filter((i) => labelMonths[i] >= startMonth && labelMonths[i] <= endMonth);
-    if (!idxs.length) { planDestroyChart(spec.cid); continue; }
-    const slicedLabels = idxs.map((i) => labels[i]);
-    const sliced = (spec.datasets || []).map((d) => ({ ...d, data: idxs.map((i) => (d.data || [])[i] ?? null) }));
-    let opts;
-    if (spec.endLabels) opts = { endLabels: sliced.map((d) => `${d.label} ${money2(d.data[d.data.length - 1])}`) };
-    if (spec.kind === 'line') planLineChart(spec.cid, slicedLabels, sliced, opts || {});
-    else if (spec.kind === 'bar') planBarChart(spec.cid, slicedLabels, sliced);
-    else if (spec.kind === 'groupedBar') planGroupedBarChart(spec.cid, slicedLabels, sliced);
-  }
-}
-
 // One slider, one window: re-render every section the window drives.
 // Called on either handle's input. The Difference chart + table keep
-// their own range pickers and are never touched here.
+// their own range pickers and are never touched here — and neither
+// are the AI chart blocks: each time-series block has its own range
+// slider (user 2026-11-06), so the global window no longer slices
+// them. AI scalar overrides (metric_cards = the headline) stay
+// full-horizon: the engine has no series reduction (no sum/last/first
+// — only element-wise min/max), so a scalar cannot be re-derived over
+// a sliced series without rebuilding the evaluator; the windowed
+// headline instead reads the AI-overridden trajectories (round 1).
 function planReportWindowRefresh(view) {
   const cards = $('#planReportHeadlineCards');
   if (cards) cards.innerHTML = planReportHeadlineCardsHtml(view);
@@ -14341,7 +14316,278 @@ function planReportWindowRefresh(view) {
     if (winMonths) planCompareBreakdownDraw(view.compareT, winMonths);
     planMergedRender(view.compareT);
   }
-  planReportAiChartsSlice(view);
+}
+
+// ---- Per-AI-chart-block headline + range slider (user 2026-11-06) ----
+// Every time-series AI chart block (time_line, yearly_bars,
+// stacked_bar, fan_band) renders, above its chart, a headline row of
+// windowed summary numbers for the selected strategy plus its own
+// dual-thumb slider — the same component as the headline window and
+// the Difference range. The block's slider is INDEPENDENT (like the
+// Difference chart's): it drives only that block's chart, table and
+// headline, defaults to the block's full label range, and the global
+// headline slider never touches it. metric_cards (scalars) and
+// share_doughnut (snapshots) get no headline and no slider — they
+// cannot be windowed. Window state lives on the block's aiCharts
+// specs ({ startIdx, endIdx }); a panel with several canvases
+// (fan_band) shares one window across its specs.
+const AI_BLOCK_FLOW_SERIES = ['monthly_net_cashflow'];
+function planAiBlockWin(spec) {
+  const n = (spec.labels || []).length;
+  if (!n) return { startIdx: 0, endIdx: -1 };
+  const w = spec.win || {};
+  const end = Math.min(Math.max(w.endIdx ?? n - 1, 0), n - 1);
+  const start = Math.min(Math.max(w.startIdx ?? 0, 0), end);
+  return { startIdx: start, endIdx: end };
+}
+function planAiBlockSpecs(view, blockIdx) {
+  return (view.aiCharts || []).filter((s) => s.blockIdx === blockIdx);
+}
+function planAiBlockLabelText(spec, i) {
+  const labels = spec.labels || [];
+  if (!labels.length) return '';
+  return spec.kind === 'groupedBar' ? String(labels[i]) : formatYM(labels[i]);
+}
+function planAiBlockWindowLabel(spec) {
+  const labels = spec.labels || [];
+  if (!labels.length) return '';
+  const { startIdx, endIdx } = planAiBlockWin(spec);
+  const count = endIdx - startIdx + 1;
+  const all = startIdx === 0 && endIdx === labels.length - 1;
+  const unit = spec.kind === 'groupedBar' ? 'years' : 'months';
+  return `${planAiBlockLabelText(spec, startIdx)} – ${planAiBlockLabelText(spec, endIdx)} · ${count} ${unit}${all ? ' · All' : ''}`;
+}
+// Windowed summary for one dataset's values over the block window.
+// Flow series (monthly amounts): TOTAL = sum, AVG = total / months.
+// Stock series (balances/values): END = value at window end,
+// Δ = end − value at window start.
+function planAiBlockFigures(values, startIdx, endIdx, isFlow) {
+  const arr = values || [];
+  if (isFlow) {
+    let total = 0; let n = 0;
+    for (let i = startIdx; i <= endIdx; i++) { if (arr[i] != null) { total += arr[i]; n++; } }
+    return { total, avg: n ? total / n : null, end: null, delta: null };
+  }
+  const end = arr[endIdx] ?? null;
+  const start = arr[startIdx] ?? null;
+  return { total: null, avg: null, end, delta: (end != null && start != null) ? end - start : null };
+}
+// Headline row for one block: the selected strategy's windowed
+// numbers, one line per series in the block. The baseline dataset
+// shows alongside as 0 (flow series) or its own END (stock series).
+function planAiBlockHeadlineHtml(view, blockIdx) {
+  const specs = planAiBlockSpecs(view, blockIdx);
+  if (!specs.length) return '';
+  const selRow = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId);
+  const selName = selRow ? `${selRow.strategy.letter} · ${selRow.strategy.name}` : '—';
+  const lines = [];
+  const mode = specs[0].headlineMode;
+  if (mode === 'strategy') {
+    const spec = specs[0];
+    const { startIdx, endIdx } = planAiBlockWin(spec);
+    for (const sid of (spec.headlineSids || [])) {
+      const label = PLAN_REPORT_SERIES_LABEL[sid] || sid;
+      const stratDs = (spec.datasets || []).find((d) => d.sid === sid && String(d.trajKey) === String(view.selectedStrategyId));
+      const baseDs = (spec.datasets || []).find((d) => d.sid === sid && String(d.trajKey) === 'baseline');
+      const isFlow = AI_BLOCK_FLOW_SERIES.includes(sid);
+      const f = stratDs ? planAiBlockFigures(stratDs.data, startIdx, endIdx, isFlow) : null;
+      const b = baseDs ? planAiBlockFigures(baseDs.data, startIdx, endIdx, isFlow) : null;
+      if (!f) { lines.push(`<div>${esc(label)}: ${esc(selName)} — —</div>`); continue; }
+      if (isFlow) lines.push(`<div>${esc(label)}: ${esc(selName)} — TOTAL ${planMoney(f.total)} · AVG ${f.avg == null ? '—' : planMoney(f.avg)}/mo · Baseline ${b ? planMoney(b.total) : '—'}</div>`);
+      else lines.push(`<div>${esc(label)}: ${esc(selName)} — END ${planMoney(f.end)} · Δ ${f.delta == null ? '—' : planSigned(f.delta)} · Baseline END ${b ? planMoney(b.end) : '—'}</div>`);
+    }
+  } else if (mode === 'total') {
+    // stacked_bar is baseline-only: the headline is the Total line.
+    const spec = specs[0];
+    const { startIdx, endIdx } = planAiBlockWin(spec);
+    const ds = (spec.datasets || []).find((d) => d.headlineRole === 'total');
+    const f = ds ? planAiBlockFigures(ds.data, startIdx, endIdx, false) : null;
+    lines.push(`<div>Baseline total — END ${f ? planMoney(f.end) : '—'} · Δ ${f && f.delta != null ? planSigned(f.delta) : '—'}</div>`);
+  } else if (mode === 'median') {
+    // Stock volatility fan: one line per holding (its Median).
+    for (const spec of specs) {
+      const { startIdx, endIdx } = planAiBlockWin(spec);
+      const ds = (spec.datasets || []).find((d) => d.headlineRole === 'median');
+      const f = ds ? planAiBlockFigures(ds.data, startIdx, endIdx, false) : null;
+      lines.push(`<div>${esc(ds ? (ds.holdingLabel || ds.label) : spec.cid)} Median — END ${f ? planMoney(f.end) : '—'} · Δ ${f && f.delta != null ? planSigned(f.delta) : '—'}</div>`);
+    }
+  } else if (mode === 'base') {
+    // Mortgage scenario fan: the selected strategy's Base line.
+    const spec = specs.find((s) => String(s.strategyId) === String(view.selectedStrategyId)) || specs[0];
+    if (spec) {
+      const { startIdx, endIdx } = planAiBlockWin(spec);
+      const ds = (spec.datasets || []).find((d) => d.headlineRole === 'base');
+      const f = ds ? planAiBlockFigures(ds.data, startIdx, endIdx, false) : null;
+      lines.push(`<div>${esc(selName)} Base — END ${f ? planMoney(f.end) : '—'} · Δ ${f && f.delta != null ? planSigned(f.delta) : '—'}</div>`);
+    }
+  }
+  return lines.join('');
+}
+function planAiBlockRangeHtml(view, blockIdx) {
+  const spec = planAiBlockSpecs(view, blockIdx)[0];
+  if (!spec) return '';
+  const labels = spec.labels || [];
+  if (!labels.length) return '';
+  const { startIdx, endIdx } = planAiBlockWin(spec);
+  const maxIdx = labels.length - 1;
+  return `<div class="plan-headline-window" data-ai-block-range="${blockIdx}">
+    <label>Range</label>
+    <div class="plan-range-dual">
+      <div class="plan-range-track" data-ai-block-track></div>
+      <input type="range" data-ai-block-start min="0" max="${maxIdx}" step="1" value="${startIdx}" aria-label="Block range start">
+      <input type="range" data-ai-block-end min="0" max="${maxIdx}" step="1" value="${endIdx}" aria-label="Block range end">
+    </div>
+    <span data-ai-block-label>${esc(planAiBlockWindowLabel(spec))}</span>
+  </div>`;
+}
+function planAiBlockTrackFill(view, blockIdx) {
+  const range = document.querySelector(`[data-ai-block-range="${blockIdx}"]`);
+  const spec = planAiBlockSpecs(view, blockIdx)[0];
+  if (!range || !spec) return;
+  const track = range.querySelector('[data-ai-block-track]');
+  const labels = spec.labels || [];
+  if (!track || !labels.length) return;
+  const maxIdx = labels.length - 1;
+  const { startIdx, endIdx } = planAiBlockWin(spec);
+  const lo = maxIdx ? (startIdx / maxIdx) * 100 : 0;
+  const hi = maxIdx ? (endIdx / maxIdx) * 100 : 100;
+  track.style.background = `linear-gradient(to right, #d7dee6 0%, #d7dee6 ${lo}%, #2f7de1 ${lo}%, #2f7de1 ${hi}%, #d7dee6 ${hi}%, #d7dee6 100%)`;
+}
+// The block's table follows its own window. Monthly tables
+// (time_line, stacked_bar) show one row per month in the window,
+// paged by year — the year pager derives from the filtered rows, as
+// the Difference table does, and each page ends in a year-total row
+// (flow columns sum, stock columns show the year's last value).
+// Yearly tables (yearly_bars) show one row per year in the window.
+// Fan stock tables show the yearly snapshot rows whose month falls
+// in the window. The mortgage fan's scenario table is not monthly
+// and is never filtered.
+function planAiBlockTableParts(view, blockIdx) {
+  const specs = planAiBlockSpecs(view, blockIdx);
+  if (!specs.length) return { tableHtml: '', pagerHtml: '' };
+  const spec = specs[0];
+  if (spec.tableKind !== 'monthly' && spec.tableKind !== 'yearly') return { tableHtml: '', pagerHtml: '' };
+  const { startIdx, endIdx } = planAiBlockWin(spec);
+  const labels = spec.labels || [];
+  const rows = [];
+  for (let i = startIdx; i <= endIdx; i++) {
+    rows.push({ label: labels[i], values: (spec.datasets || []).map((d) => (d.data || [])[i] ?? null) });
+  }
+  if (!rows.length) return { tableHtml: '<div class="note">No months in this range.</div>', pagerHtml: '' };
+  const head = `<tr><th>${spec.tableKind === 'yearly' ? 'Year' : 'Month'}</th>${(spec.datasets || []).map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
+  const cell = (v) => `<td>${v == null ? '—' : money2(v)}</td>`;
+  if (spec.tableKind === 'yearly') {
+    return {
+      tableHtml: `<table class="tbl"><thead>${head}</thead><tbody>${rows.map((r) => `<tr><td>${r.label}</td>${r.values.map(cell).join('')}</tr>`).join('')}</tbody></table>`,
+      pagerHtml: '',
+    };
+  }
+  const years = [...new Set(rows.map((r) => String(r.label).slice(0, 4)))];
+  if (!view.aiBlockTableYear) view.aiBlockTableYear = {};
+  if (!view.aiBlockTableYear[blockIdx] || !years.includes(view.aiBlockTableYear[blockIdx])) view.aiBlockTableYear[blockIdx] = years[0];
+  const year = view.aiBlockTableYear[blockIdx];
+  const pageRows = rows.filter((r) => String(r.label).slice(0, 4) === year);
+  const totalCells = (spec.datasets || []).map((d, di) => {
+    const vals = pageRows.map((r) => r.values[di]).filter((v) => v != null);
+    if (!vals.length) return '—';
+    if (AI_BLOCK_FLOW_SERIES.includes(d.sid)) return money2(vals.reduce((a, v) => a + v, 0));
+    return money2(vals[vals.length - 1]);
+  });
+  return {
+    tableHtml: `<table class="tbl"><thead>${head}</thead><tbody>${pageRows.map((r) => `<tr><td>${formatYM(r.label)}</td>${r.values.map(cell).join('')}</tr>`).join('')}<tr class="plan-year-total"><td>${year} total</td>${totalCells.map((c) => `<td>${c}</td>`).join('')}</tr></tbody></table>`,
+    pagerHtml: years.length > 1 ? years.map((y) => `<button class="small${y === year ? ' active' : ''}" data-ai-block-year="${y}">${y}</button>`).join('') : '',
+  };
+}
+function planAiBlockTableRender(view, blockIdx) {
+  const specs = planAiBlockSpecs(view, blockIdx);
+  if (!specs.length) return;
+  const spec = specs[0];
+  if (spec.tableKind === 'fanStock') {
+    for (const s of specs) {
+      const host = document.querySelector(`[data-ai-block-table="${s.cid}"]`);
+      if (!host) continue;
+      const { startIdx, endIdx } = planAiBlockWin(s);
+      const rows = (s.tableRows || []).filter((r) => {
+        const mi = (s.labels || []).indexOf(r.month);
+        return mi >= startIdx && mi <= endIdx;
+      });
+      host.innerHTML = rows.length
+        ? `<table class="tbl"><thead><tr><th>Month</th><th>Median</th><th>P10</th><th>P90</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${r.month}</td><td>${money2(r.median)}</td><td>${money2(r.p10)}</td><td>${money2(r.p90)}</td></tr>`).join('')}</tbody></table>`
+        : '<div class="note">No months in this range.</div>';
+    }
+    return;
+  }
+  if (spec.tableKind !== 'monthly' && spec.tableKind !== 'yearly') return;
+  const host = document.querySelector(`[data-ai-block-table="${spec.cid}"]`);
+  const pager = document.querySelector(`[data-ai-block-pager="${spec.cid}"]`);
+  if (!host) return;
+  const parts = planAiBlockTableParts(view, blockIdx);
+  host.innerHTML = parts.tableHtml;
+  if (pager) {
+    pager.innerHTML = parts.pagerHtml;
+    pager.querySelectorAll('[data-ai-block-year]').forEach((b) => b.addEventListener('click', () => {
+      if (!view.aiBlockTableYear) view.aiBlockTableYear = {};
+      view.aiBlockTableYear[blockIdx] = b.dataset.aiBlockYear;
+      planAiBlockTableRender(view, blockIdx);
+    }));
+  }
+}
+// Re-slice one block's charts + headline + table to its own window.
+// Never rebuilds the slider inputs (that would kill a drag).
+function planAiBlockRedraw(view, blockIdx) {
+  const specs = planAiBlockSpecs(view, blockIdx);
+  if (!specs.length) return;
+  const head = document.querySelector(`[data-ai-block-head="${blockIdx}"]`);
+  if (head) head.innerHTML = planAiBlockHeadlineHtml(view, blockIdx);
+  const range = document.querySelector(`[data-ai-block-range="${blockIdx}"]`);
+  if (range) {
+    const lab = range.querySelector('[data-ai-block-label]');
+    if (lab) lab.textContent = planAiBlockWindowLabel(specs[0]);
+  }
+  planAiBlockTrackFill(view, blockIdx);
+  for (const spec of specs) {
+    const { startIdx, endIdx } = planAiBlockWin(spec);
+    const labels = (spec.labels || []).slice(startIdx, endIdx + 1);
+    const sliced = (spec.datasets || []).map((d) => ({ ...d, data: (d.data || []).slice(startIdx, endIdx + 1) }));
+    let opts;
+    if (spec.endLabels) opts = { endLabels: sliced.map((d) => `${d.label} ${money2(d.data[d.data.length - 1])}`) };
+    if (spec.kind === 'line') planLineChart(spec.cid, labels, sliced, opts || {});
+    else if (spec.kind === 'bar') planBarChart(spec.cid, labels, sliced);
+    else if (spec.kind === 'groupedBar') planGroupedBarChart(spec.cid, labels, sliced);
+  }
+  planAiBlockTableRender(view, blockIdx);
+}
+function planAiBlockHeadlinesRefresh(view) {
+  for (const blockIdx of [...new Set((view.aiCharts || []).map((s) => s.blockIdx))]) {
+    const head = document.querySelector(`[data-ai-block-head="${blockIdx}"]`);
+    if (head) head.innerHTML = planAiBlockHeadlineHtml(view, blockIdx);
+  }
+}
+function planAiBlockWire(view) {
+  for (const blockIdx of [...new Set((view.aiCharts || []).map((s) => s.blockIdx))]) {
+    const range = document.querySelector(`[data-ai-block-range="${blockIdx}"]`);
+    if (!range) continue;
+    const specs = planAiBlockSpecs(view, blockIdx);
+    const spec = specs[0];
+    const start = range.querySelector('[data-ai-block-start]');
+    const end = range.querySelector('[data-ai-block-end]');
+    if (start) start.addEventListener('input', () => {
+      const { endIdx } = planAiBlockWin(spec);
+      const startIdx = Math.min(Number(start.value), endIdx);
+      for (const s of specs) s.win = { startIdx, endIdx };
+      start.value = String(startIdx);
+      planAiBlockRedraw(view, blockIdx);
+    });
+    if (end) end.addEventListener('input', () => {
+      const { startIdx } = planAiBlockWin(spec);
+      const endIdx = Math.max(Number(end.value), startIdx);
+      for (const s of specs) s.win = { startIdx, endIdx };
+      end.value = String(endIdx);
+      planAiBlockRedraw(view, blockIdx);
+    });
+    planAiBlockTrackFill(view, blockIdx);
+    planAiBlockTableRender(view, blockIdx);
+  }
 }
 
 // Wiring for the report sections: headline chip picker, variable
@@ -14355,16 +14601,18 @@ function planReportViewWire(view) {
     const winNote = $('#planReportHeadlineWindowNote');
     if (winNote) winNote.textContent = planHeadlineWindowNote(view);
     planReportTableRender(view);
+    planAiBlockHeadlinesRefresh(view);
     const eng = $('#planReportEngineBody');
     if (eng) eng.innerHTML = planReportEngineHtml(view);
   }));
   // Headline time window (user 2026-11-06): dragging either handle
   // re-renders everything the window drives — headline cards, window
-  // label/note, engine note, merged comparison table, payment
-  // breakdown chart and AI charts — from the trajectories already in
-  // view, no refetch. The Difference chart keeps its own range
-  // picker and is never touched here. The handles cannot cross:
-  // each input clamps to the other handle.
+  // label/note, engine note, merged comparison table and payment
+  // breakdown chart — from the trajectories already in view, no
+  // refetch. The Difference chart keeps its own range picker and is
+  // never touched here; neither are the AI chart blocks, which keep
+  // their own range sliders. The handles cannot cross: each input
+  // clamps to the other handle.
   const winStart = $('#planReportHeadlineWindowStart');
   const winEnd = $('#planReportHeadlineWindowEnd');
   if (winStart) winStart.addEventListener('input', () => {
@@ -14415,6 +14663,11 @@ function planReportViewWire(view) {
   // a per-turn Apply. The thread re-renders from the per-report
   // in-memory state on every view load.
   planReportAiWire(view, view.projectId, view.reportId);
+  // Per-AI-chart-block headline + range slider (user 2026-11-06):
+  // wires each time-series block's own slider and fills its table
+  // from the block's own window. The global headline slider never
+  // touches these blocks.
+  planAiBlockWire(view);
 }
 
 async function loadPlanReport(projectId, reportId) {
@@ -14527,6 +14780,7 @@ async function loadPlanReport(projectId, reportId) {
       template, templateKey: template.key,
       vars: JSON.parse(JSON.stringify((report.definition && report.definition.variables) || {})),
       tableYear: prevView ? prevView.tableYear : null,
+      aiBlockTableYear: prevView ? prevView.aiBlockTableYear : null,
       headlineStartIdx: prevView ? prevView.headlineStartIdx : null,
       headlineEndIdx: prevView ? prevView.headlineEndIdx : null,
       aiCharts: [],
@@ -14568,7 +14822,6 @@ async function loadPlanReport(projectId, reportId) {
     const trajs = rep.trajectories || [];
     const baseTraj = trajs[0] || { monthly: [] };
     const months = baseTraj.monthly.map((r) => r.month);
-    const monthIndex = new Map(months.map((m, i) => [m, i]));
     const seriesAt = (traj, sid) => (traj.monthly || []).map((r) => r[sid] ?? null);
     const panels = [];
     const panelChartIdx = []; // rendered panel i shows definition chart panelChartIdx[i]
@@ -14613,22 +14866,13 @@ async function loadPlanReport(projectId, reportId) {
         const datasets = [];
         for (const sid of sids) {
           trajs.forEach((t, ti) => {
-            datasets.push({ label: `${t.label} · ${PLAN_REPORT_SERIES_LABEL[sid] || sid}`, data: seriesAt(t, sid), borderColor: ti === 0 ? '#888' : planColor(ti - 1), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1), fill: false, pointRadius: 0, spanGaps: true });
+            datasets.push({ label: `${t.label} · ${PLAN_REPORT_SERIES_LABEL[sid] || sid}`, data: seriesAt(t, sid), borderColor: ti === 0 ? '#888' : planColor(ti - 1), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1), fill: false, pointRadius: 0, spanGaps: true, trajKey: t.key, sid });
           });
         }
-        const snap = planReportYearRows(baseTraj.monthly);
-        const head = `<tr><th>Month</th>${datasets.map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
-        const body = snap.map((row) => {
-          const idx = monthIndex.get(row.month);
-          return `<tr><td>${row.month}</td>${datasets.map((d, di) => {
-            const t = trajs[di % trajs.length];
-            const v = (t.monthly[idx] || {})[sids[Math.floor(di / trajs.length)]];
-            return `<td>${v == null ? '—' : money2(v)}</td>`;
-          }).join('')}</tr>`;
-        }).join('');
-        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
+        const spec = { cid, kind: 'line', labels: months, datasets, blockIdx: i, win: { startIdx: 0, endIdx: months.length - 1 }, headlineMode: 'strategy', headlineSids: sids, tableKind: 'monthly' };
+        planReportView.aiCharts.push(spec);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><div class="note">${esc(how)}</div></div>`);
         draws.push(() => planLineChart(cid, months, datasets));
-        planReportView.aiCharts.push({ cid, kind: 'line', labels: months, datasets });
       } else if (c.template === 'metric_cards') {
         const sids = series || ['cost', 'gain', 'net'];
         const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'stock_gain' ? row.comparison.stockGain : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
@@ -14646,12 +14890,11 @@ async function loadPlanReport(projectId, reportId) {
           for (const r of traj.monthly) byYear.set(yearOf(r.month), r[sid] ?? null);
           return years.map((y) => byYear.get(y) ?? null);
         };
-        const datasets = trajs.map((t, ti) => ({ label: t.label, data: yearEnd(t), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1) }));
-        const head = `<tr><th>Year</th>${trajs.map((t) => `<th>${esc(t.label)}</th>`).join('')}</tr>`;
-        const body = years.map((y, yi) => `<tr><td>${y}</td>${datasets.map((d) => `<td>${d.data[yi] == null ? '—' : money2(d.data[yi])}</td>`).join('')}</tr>`).join('');
-        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: year · Y: year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} (CAD), baseline vs each strategy. ${esc(how)}</div></div>`);
+        const datasets = trajs.map((t, ti) => ({ label: t.label, data: yearEnd(t), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1), trajKey: t.key, sid }));
+        const spec = { cid, kind: 'groupedBar', labels: years, labelMonths: years.map((y) => months.filter((m) => m.startsWith(`${y}-`)).pop() || `${y}-12`), datasets, blockIdx: i, win: { startIdx: 0, endIdx: years.length - 1 }, headlineMode: 'strategy', headlineSids: [sid], tableKind: 'yearly' };
+        planReportView.aiCharts.push(spec);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div><div class="note">X: year · Y: year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} (CAD), baseline vs each strategy. ${esc(how)}</div></div>`);
         draws.push(() => planGroupedBarChart(cid, years, datasets));
-        planReportView.aiCharts.push({ cid, kind: 'groupedBar', labels: years, labelMonths: years.map((y) => months.filter((m) => m.startsWith(`${y}-`)).pop() || `${y}-12`), datasets });
       } else if (c.template === 'stacked_bar') {
         const sids = series || ['mortgage_balance'];
         const base = comp.baseline;
@@ -14681,13 +14924,11 @@ async function loadPlanReport(projectId, reportId) {
           pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no data for this chart in this project.</div></div>`);
         } else {
         const totals = months.map((m, mi) => datasets.reduce((s, d) => s + (d.data[mi] || 0), 0));
-        datasets.push({ label: 'Total', data: totals, type: 'line', borderColor: '#22303c', backgroundColor: '#22303c', fill: false, pointRadius: 0 });
-        const snapIdx = planReportYearRows(baseTraj.monthly).map((r) => monthIndex.get(r.month));
-        const head = `<tr><th>Month</th>${datasets.map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
-        const body = snapIdx.map((mi) => `<tr><td>${months[mi]}</td>${datasets.map((d) => `<td>${d.data[mi] == null ? '—' : money2(d.data[mi])}</td>`).join('')}</tr>`).join('');
-        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline and strategies share the same prime history. ${esc(how)}</div></div>`);
+        datasets.push({ label: 'Total', data: totals, type: 'line', borderColor: '#22303c', backgroundColor: '#22303c', fill: false, pointRadius: 0, headlineRole: 'total' });
+        const spec = { cid, kind: 'bar', labels: months, datasets, blockIdx: i, win: { startIdx: 0, endIdx: months.length - 1 }, headlineMode: 'total', tableKind: 'monthly' };
+        planReportView.aiCharts.push(spec);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline and strategies share the same prime history. ${esc(how)}</div></div>`);
         draws.push(() => planBarChart(cid, months, datasets));
-        planReportView.aiCharts.push({ cid, kind: 'bar', labels: months, datasets });
         }
       } else if (c.template === 'share_doughnut') {
         if (sidsHas(series, 'cost') && !sidsHas(series, 'mortgage_balance') && !sidsHas(series, 'total_value')) {
@@ -14750,25 +14991,25 @@ async function loadPlanReport(projectId, reportId) {
             // light so the median line reads through it.
             const fanDatasets = [
               { label: 'P10', data: fan.p10, borderColor: '#7fb0e8', backgroundColor: '#7fb0e8', fill: false, pointRadius: 0 },
-              { label: 'Median', data: fan.median, borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, borderWidth: 2 },
+              { label: 'Median', data: fan.median, borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, borderWidth: 2, headlineRole: 'median', holdingLabel: fan.symbol },
               { label: 'P90', data: fan.p90, borderColor: '#7fb0e8', backgroundColor: 'rgba(47,125,225,0.15)', fill: '-2', pointRadius: 0 },
             ];
             draws.push(() => planLineChart(fcid, fan.months, fanDatasets, { endLabels: [`P10 ${money2(fan.p10[end])}`, `Median ${money2(fan.median[end])}`, `P90 ${money2(fan.p90[end])}`] }));
-            planReportView.aiCharts.push({ cid: fcid, kind: 'line', labels: fan.months, datasets: fanDatasets, endLabels: true });
             const snap = planReportYearRows(fan.months.map((m) => ({ month: m })));
-            const sbody = snap.map((row) => {
+            const tableRows = snap.map((row) => {
               const idx = fan.months.indexOf(row.month);
-              return `<tr><td>${row.month}</td><td>${money2(fan.median[idx])}</td><td>${money2(fan.p10[idx])}</td><td>${money2(fan.p90[idx])}</td></tr>`;
-            }).join('');
+              return { month: row.month, median: fan.median[idx], p10: fan.p10[idx], p90: fan.p90[idx] };
+            });
+            planReportView.aiCharts.push({ cid: fcid, kind: 'line', labels: fan.months, datasets: fanDatasets, endLabels: true, blockIdx: i, win: { startIdx: 0, endIdx: fan.months.length - 1 }, headlineMode: 'median', tableKind: 'fanStock', tableRows });
             const volNote = fan.volPct === 0 ? 'Volatility 0% over this window — P10/P90 coincide with the median.' : '';
             return `<div class="section-head"><h4>${esc(fan.symbol)}${fan.label && fan.label !== fan.symbol ? ` · ${esc(fan.label)}` : ''}</h4></div>
             <div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div>
             <div class="note">Median at the holding's history CAGR ${fan.ratePct}%/yr (${esc(fan.rateBasis || 'Price CAGR')} · ${esc(fan.rateWindow)}). Volatility ${fan.volPct}%/yr from ${fan.volReturns} monthly returns (${esc(fan.volWindow)}), annualized ×√12. Past volatility is an estimate, not a prediction. ${volNote}</div>
-            <table class="tbl"><thead><tr><th>Month</th><th>Median</th><th>P10</th><th>P90</th></tr></thead><tbody>${sbody}</tbody></table>`;
+            <div data-ai-block-table="${fcid}"></div>`;
           }).join('');
           const noFanNotes = (stockFan.noFan || []).map((nf) => `<div class="note">${esc(nf.symbol)}: no volatility fan — ${nf.reason === 'no usable price history' ? 'not enough price history (needs at least 2 monthly returns)' : esc(nf.reason)}.</div>`).join('');
           const emptyNote = (!stockFan.fans.length && !stockFan.noFan.length) ? '<div class="note">No volatility fan: this project holds no stocks.</div>' : '';
-          pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${fanBlocks}${noFanNotes}${emptyNote}</div>`);
+          pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}${fanBlocks}${noFanNotes}${emptyNote}</div>`);
         } else {
         const blocks = comp.strategies.map((row) => {
           const table = fanData[row.strategy.id] || [];
@@ -14780,15 +15021,15 @@ async function loadPlanReport(projectId, reportId) {
           const fcid = `${cid}f${row.strategy.id}`;
           const mortFanDatasets = [
             { label: 'Best', data: min, borderColor: '#2f7de1', backgroundColor: '#2f7de1', fill: false, pointRadius: 0 },
-            { label: 'Base', data: baseRow.balanceByMonth.map((r) => r.balance), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0 },
+            { label: 'Base', data: baseRow.balanceByMonth.map((r) => r.balance), borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, headlineRole: 'base' },
             { label: 'Worst', data: max, borderColor: '#b03a3a', backgroundColor: '#b03a3a', fill: false, pointRadius: 0 },
           ];
           draws.push(() => planLineChart(fcid, fmonths, mortFanDatasets));
-          planReportView.aiCharts.push({ cid: fcid, kind: 'line', labels: fmonths, datasets: mortFanDatasets });
+          planReportView.aiCharts.push({ cid: fcid, kind: 'line', labels: fmonths, datasets: mortFanDatasets, blockIdx: i, win: { startIdx: 0, endIdx: fmonths.length - 1 }, headlineMode: 'base', strategyId: row.strategy.id, tableKind: 'none' });
           const sbody = table.map((r) => `<tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
           return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><div class="note">X: month · Y: mortgage balance (CAD) across scenarios.</div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
-        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}</div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}${blocks}</div>`);
         }
       } else if (c.template === 'funds_flow') {
         pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Funds flow diagram — not rendered yet.</div></div>`);

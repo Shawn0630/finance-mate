@@ -649,6 +649,11 @@ table.seg-table td:last-child { text-align: right; }
 .plan-headline-window { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; }
 .plan-headline-window label { white-space: nowrap; font-size: 12px; color: #5a6a7a; }
 .plan-headline-window span { white-space: nowrap; font-size: 12px; }
+/* Per-AI-chart-block headline (user 2026-11-06): the windowed
+   summary numbers above each time-series AI chart, one line per
+   series, above the block's own range slider. */
+.plan-ai-block-head { margin: 6px 0 2px; font-size: 14px; }
+.plan-ai-block-head div { margin: 2px 0; }
 /* Dual-thumb range (user 2026-11-06): two range inputs stacked over
 one track bar. The inputs themselves ignore pointer events — only
 their thumbs are draggable — so either handle can be grabbed where

@@ -1887,6 +1887,15 @@ export async function run(H, S) {
       });
       H.check('netcashflow: starting report renders the scalar metric_cards chart (2 strategies)',
         ncfMetricPanel && ncfMetricPanel.cards === 2 && ncfMetricPanel.rows === 2, JSON.stringify(ncfMetricPanel));
+      // Per-AI-chart-block headline + slider (user 2026-11-06):
+      // a scalar metric_cards block gets NO headline and NO slider —
+      // it cannot be windowed. It still renders its cards.
+      const ncfMetricBlock = await page.evaluate(() => {
+        const blk = [...document.querySelectorAll('#planReport [data-plan-report-block]')].find((el) => (el.querySelector('.section-head h3')?.textContent || '') === 'Net Cash Flow Difference');
+        return blk ? { hasHead: !!blk.querySelector('[data-ai-block-head]'), hasRange: !!blk.querySelector('[data-ai-block-range]'), cards: blk.querySelectorAll('.plan-metric-card').length } : null;
+      });
+      H.check('aiblock: a metric_cards block renders with no headline and no slider',
+        ncfMetricBlock && !ncfMetricBlock.hasHead && !ncfMetricBlock.hasRange && ncfMetricBlock.cards === 2, JSON.stringify(ncfMetricBlock));
       const ncfThread = async () => page.evaluate(() => {
         const turns = [...document.querySelectorAll('#planReportAiChatThread .plan-ai-turn')];
         return {
@@ -1970,12 +1979,82 @@ export async function run(H, S) {
           && ncfClose(ncfChartValue(ncfChartAfter, 'pre pay 50000', '2027-02'), 0)
           && ncfClose(ncfChartValue(ncfChartAfter, 'Baseline', '2027-01'), 0),
         JSON.stringify({ chart: ncfChartAfter ? { labels: (ncfChartAfter.labels || []).slice(0, 5), datasets: (ncfChartAfter.datasets || []).map((d) => ({ label: d.label, jan27: d.data[(ncfChartAfter.labels || []).indexOf('2027-01')], feb27: d.data[(ncfChartAfter.labels || []).indexOf('2027-02')] })) } : null, api: { aJan: g1.at(String(ncfStratA), '2027-01'), aFeb: g1.at(String(ncfStratA), '2027-02') } }));
-      // --- The headline slider slices it: dragging the start handle
-      // to Jan 2028 re-renders the chart to the window's months.
+      // --- Per-AI-chart-block headline + slider (user 2026-11-06).
+      // The appended time_line block renders, above the chart, a
+      // headline row (selected strategy's windowed TOTAL + AVG) plus
+      // its own dual-thumb slider, and a monthly table that follows
+      // the block's own window.
+      const ncfBlock = async () => page.evaluate(() => {
+        const blk = [...document.querySelectorAll('#planReport [data-plan-report-block]')].find((el) => (el.querySelector('.section-head h3')?.textContent || '') === 'Cash Flow Time Series');
+        if (!blk) return null;
+        const cv = blk.querySelector('canvas');
+        const ch = cv && typeof planCharts !== 'undefined' ? planCharts[cv.id] : null;
+        const head = blk.querySelector('[data-ai-block-head]');
+        const range = blk.querySelector('[data-ai-block-range]');
+        const table = blk.querySelector('[data-ai-block-table] table.tbl');
+        const rows = table ? [...table.querySelectorAll('tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => td.textContent.trim())) : [];
+        const parseMoney = (s) => (s == null ? null : Number(String(s).replace(/[$,]/g, '')));
+        const m = head ? /TOTAL (-?\$[\d,]+\.\d{2}) · AVG (-?\$[\d,]+\.\d{2})\/mo · Baseline (-?\$[\d,]+\.\d{2})/.exec(head.textContent) : null;
+        return {
+          chart: ch ? { labels: ch.data.labels, datasets: ch.data.datasets.map((d) => ({ label: d.label, data: d.data })) } : null,
+          headText: head ? head.textContent.trim() : null,
+          total: m ? parseMoney(m[1]) : null, avg: m ? parseMoney(m[2]) : null, baseTotal: m ? parseMoney(m[3]) : null,
+          hasRange: !!range,
+          rangeInputs: range ? range.querySelectorAll('input[type="range"]').length : 0,
+          rangeLabel: range ? range.querySelector('[data-ai-block-label]')?.textContent.trim() : null,
+          tableRows: rows,
+          pagerYears: [...(blk.querySelectorAll('[data-ai-block-pager] button') || [])].map((b) => b.textContent.trim()),
+        };
+      });
+      // Hand-computed windowed values from the comparison API: the
+      // headline TOTAL is the sum of A's monthly net cash flow over
+      // the window, AVG is TOTAL / months with a value.
+      const ncfWindowValues = (g, startMonth, endMonth) => {
+        const months = g.baseMonths.filter((m) => m >= startMonth && m <= endMonth);
+        const vals = months.map((m) => g.at(String(ncfStratA), m)).filter((v) => v != null);
+        const total = vals.reduce((a, v) => a + v, 0);
+        return { total, avg: vals.length ? total / vals.length : null, n: months.length };
+      };
+      const ncfClose2 = (a, b) => a != null && b != null && Math.abs(a - b) < 0.01;
+      const ncfFull = ncfWindowValues(g1, g1.baseMonths[0], g1.baseMonths[g1.baseMonths.length - 1]);
+      const blk0 = await ncfBlock();
+      H.check('aiblock: the appended time_line block renders a headline row + a dual-thumb slider + a monthly table',
+        blk0 && blk0.chart && blk0.hasRange && blk0.rangeInputs === 2
+          && blk0.headText && blk0.headText.includes('Net cash flow') && blk0.headText.includes('A · Jan to Fix')
+          && blk0.tableRows.length > 0 && blk0.tableRows[0][0].includes('2026'),
+        JSON.stringify(blk0 ? { headText: blk0.headText, rangeInputs: blk0.rangeInputs, rows: blk0.tableRows.length, firstRow: blk0.tableRows[0] } : null));
+      H.check('aiblock: the headline TOTAL + AVG match hand-computed full-range values (selected strategy A)',
+        blk0 && ncfClose2(blk0.total, ncfFull.total) && ncfClose2(blk0.avg, ncfFull.avg) && ncfClose2(blk0.baseTotal, 0),
+        JSON.stringify({ head: blk0 && { total: blk0.total, avg: blk0.avg, baseTotal: blk0.baseTotal }, hand: ncfFull }));
+      // --- Independence (user 2026-11-06): the global headline
+      // slider no longer slices AI chart blocks — each block has its
+      // own slider. Dragging the headline start handle to Jan 2028
+      // must leave the block's chart on the full range while still
+      // driving the headline cards.
       const jan28Idx = g1.baseMonths.indexOf('2028-01');
       const labelsBefore = (ncfChartAfter.labels || []).length;
+      const headlineBefore = await page.evaluate(() => document.querySelector('#planReportHeadlineCards')?.textContent || '');
       await page.evaluate((i) => {
         const s = document.querySelector('#planReportHeadlineWindowStart');
+        s.value = String(i);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, jan28Idx);
+      await ncfWait(300);
+      const ncfChartAfterHeadlineDrag = await ncfChart();
+      const headlineAfter = await page.evaluate(() => document.querySelector('#planReportHeadlineCards')?.textContent || '');
+      H.check('aiblock: the global headline slider does NOT move the block\'s chart, but still drives the headline cards',
+        ncfChartAfterHeadlineDrag && ncfChartAfterHeadlineDrag.chart
+          && ncfChartAfterHeadlineDrag.labels[0] === g1.baseMonths[0]
+          && ncfChartAfterHeadlineDrag.labels.length === labelsBefore
+          && headlineBefore !== headlineAfter,
+        JSON.stringify({ first: ncfChartAfterHeadlineDrag && ncfChartAfterHeadlineDrag.labels[0], len: ncfChartAfterHeadlineDrag && ncfChartAfterHeadlineDrag.labels.length, before: labelsBefore, headlineChanged: headlineBefore !== headlineAfter }));
+      // --- The block's own slider slices it: dragging its start
+      // handle to Jan 2028 re-slices the chart, filters the table
+      // to the window, and recomputes the headline numbers.
+      await page.evaluate((i) => {
+        const blk = [...document.querySelectorAll('#planReport [data-plan-report-block]')].find((el) => (el.querySelector('.section-head h3')?.textContent || '') === 'Cash Flow Time Series');
+        const s = blk && blk.querySelector('[data-ai-block-start]');
         s.value = String(i);
         s.dispatchEvent(new Event('input', { bubbles: true }));
         return true;
@@ -1986,14 +2065,18 @@ export async function run(H, S) {
         const ch = cv && typeof planCharts !== 'undefined' ? planCharts[cv.id] : null;
         return ch && ch.data.labels[0] === '2028-01';
       }, { timeout: 15000 });
-      const ncfChartSliced = await ncfChart();
-      H.check('netcashflow: dragging the headline start handle to Jan 2028 slices the chart to the window',
-        ncfChartSliced && ncfChartSliced.chart
-          && ncfChartSliced.labels[0] === '2028-01'
-          && ncfChartSliced.labels.length < labelsBefore
-          && ncfChartSliced.labels.length === (ncfChartSliced.datasets[0] || { data: [] }).data.length
-          && ncfClose(ncfChartValue(ncfChartSliced, 'Jan to Fix', '2028-01'), g1.at(String(ncfStratA), '2028-01')),
-        JSON.stringify({ first: ncfChartSliced && ncfChartSliced.labels[0], len: ncfChartSliced && ncfChartSliced.labels.length, before: labelsBefore }));
+      const blk1 = await ncfBlock();
+      const ncfWin = ncfWindowValues(g1, '2028-01', g1.baseMonths[g1.baseMonths.length - 1]);
+      H.check('aiblock: dragging the block\'s start handle to Jan 2028 slices the chart, filters the table, and recomputes the headline',
+        blk1 && blk1.chart
+          && blk1.chart.labels[0] === '2028-01'
+          && blk1.chart.labels.length < labelsBefore
+          && blk1.chart.labels.length === (blk1.chart.datasets[0] || { data: [] }).data.length
+          && ncfClose2(blk1.total, ncfWin.total) && ncfClose2(blk1.avg, ncfWin.avg)
+          && blk1.tableRows.length > 0 && blk1.tableRows[0][0] === 'Jan 2028'
+          && blk1.tableRows.every((row) => !/^\w{3} 202[67]$/.test(row[0]))
+          && (blk1.rangeLabel || '').includes('Jan 2028'),
+        JSON.stringify({ first: blk1 && blk1.chart && blk1.chart.labels[0], len: blk1 && blk1.chart && blk1.chart.labels.length, head: blk1 && { total: blk1.total, avg: blk1.avg }, hand: ncfWin, firstRow: blk1 && blk1.tableRows[0], rangeLabel: blk1 && blk1.rangeLabel }));
     } finally { await ncfBrowser.close(); }
   }
   // ---- Unified AI panel (browser) -------------------------------------
@@ -7630,7 +7713,9 @@ export async function run(H, S) {
       H.check('engine: AI engine series execute in the report table (strategy stock ×1.1 → $11,000, Value Δ $1,000)',
         engTable.firstStratVal === 11000 && engTable.firstValDiff === 1000, JSON.stringify(engTable));
       // Headline window on an AI report (user 2026-11-06): the AI
-      // time-series chart slices to the window, and the headline
+      // time-series chart NO LONGER slices to the window — each
+      // time-series AI block has its own range slider, and the
+      // global headline slider never touches it. The headline still
       // switches from the AI scalar override (full horizon) to the
       // windowed trajectory figures. The override cannot be
       // re-derived over a sliced series — the engine has no
@@ -7652,14 +7737,17 @@ export async function run(H, S) {
         e.value = String(i);
         e.dispatchEvent(new Event('input', { bubbles: true }));
       }, engStartIdx + 11);
+      // The block's chart stays on the full horizon while the
+      // headline drops the AI scalar override over the window.
       await page.waitForFunction(() => {
-        const cv = document.getElementById('planReportChart0');
-        try { const ch = window.Chart && Chart.getChart ? Chart.getChart(cv) : null; return ch && ch.data.labels.length === 12; } catch { return false; }
+        const cards = [...document.querySelectorAll('#planReportHeadlineCards .breakdown-card')];
+        const c = cards.find((x) => x.querySelector('.k')?.textContent === 'Total cost');
+        return c && c.querySelector('.v')?.textContent === '$0.00';
       }, { timeout: 15000 });
       const engHeadWin = await headVals();
-      H.check('headline-window: AI chart slices to the 12-month window and the headline drops the AI scalar override (cost $0, net $0 from the trajectories)',
-        (await engChartLen()) === 12 && Math.abs(num(engHeadWin.cost) - 0) < 0.01 && Math.abs(num(engHeadWin.net) - 0) < 0.01,
-        JSON.stringify({ labels: await engChartLen(), head: engHeadWin }));
+      H.check('headline-window: the AI chart does NOT slice with the headline window, and the headline drops the AI scalar override (cost $0, net $0 from the trajectories)',
+        (await engChartLen()) === engMonths.length && Math.abs(num(engHeadWin.cost) - 0) < 0.01 && Math.abs(num(engHeadWin.net) - 0) < 0.01,
+        JSON.stringify({ labels: await engChartLen(), months: engMonths.length, head: engHeadWin }));
       // Restore the full horizon: the AI scalar override applies
       // again (cost $100, net −$100).
       await page.evaluate(() => {
