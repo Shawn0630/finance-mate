@@ -13798,11 +13798,25 @@ function planHeadlineWindowTrackFill(view) {
   track.style.background = `linear-gradient(to right, #d7dee6 0%, #d7dee6 ${lo}%, #2f7de1 ${lo}%, #2f7de1 ${hi}%, #d7dee6 ${hi}%, #d7dee6 100%)`;
 }
 
-// Headline cards for the selected strategy (items 6 + 9): the nine
-// metric cards that used to live on the strategy page. Pool
-// baselines show five (no mortgage figures). Values come from the
-// LIVE variables, so typing a penalty updates cost and net here
-// before Apply.
+// Stock gain headline gate (user 2026-11-06): the Stock gain card
+// shows only when stock is actually involved in THIS report — a
+// cash-pool baseline, or any pinned strategy with a stock op
+// (buy/sell/position; the buy list IS the sink now, the stored sink
+// column is dormant). A pure mortgage report drops the always-$0.00
+// card. The baseline holding stocks alone is not a condition: a
+// strategy that does not touch stocks holds the same stocks as the
+// baseline, so its stock gain is $0 by definition.
+function planReportStockInvolved(comp) {
+  if (!comp) return false;
+  if (comp.report && comp.report.investmentScope) return true;
+  return (comp.strategies || []).some((r) => r.touchesStocks);
+}
+
+// Headline cards for the selected strategy (items 6 + 9): the
+// metric cards that used to live on the strategy page. Pure-mortgage
+// reports show eight, pool baselines five (no mortgage figures).
+// Values come from the LIVE variables, so typing a penalty updates
+// cost and net here before Apply.
 function planReportHeadlineCardsHtml(view) {
   const row = (view.comp.strategies || []).find((r) => r.strategy.id === view.selectedStrategyId) || view.comp.strategies[0];
   if (!row) return '<div class="note">No strategies yet.</div>';
@@ -13824,8 +13838,7 @@ function planReportHeadlineCardsHtml(view) {
   const stockGain = windowed ? w.stockGain : c.stockGain;
   const payoffShiftMonths = windowed ? w.payoffShiftMonths : c.payoffShiftMonths;
   // Which mortgage cards show follows the report TEMPLATE, not a
-  // local investmentScope check. Stock gain stays for pool reports:
-  // it is a stock figure, not a mortgage figure.
+  // local investmentScope check.
   const template = view.template || planReportTemplateFor('property');
   const showMortCards = template.mortgageHeadlineCards;
   const card = (k, v) => `<div class="card breakdown-card plan-metric-card"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`;
@@ -13836,7 +13849,7 @@ function planReportHeadlineCardsHtml(view) {
     card('Value at horizon', planMoney(valueAtHorizon)),
   ];
   if (showMortCards) cards.push(card('Interest saved', planSigned(interestSaved)));
-  cards.push(card('Stock gain', planSigned(stockGain)));
+  if (planReportStockInvolved(view.comp)) cards.push(card('Stock gain', planSigned(stockGain)));
   if (showMortCards) {
     cards.push(card('Payoff shift', payoffShiftMonths == null ? '—' : `${payoffShiftMonths >= 0 ? '+' : ''}${payoffShiftMonths} months`));
     cards.push(card('Monthly payment Δ', planSigned(c.paymentDelta)));

@@ -5463,10 +5463,25 @@ export async function run(H, S) {
       H.check('stratpanels: report shows the Mortgage balance chart (baseline + strategy, both with data)',
         Array.isArray(repState.mortData) && repState.mortData.length === 2 && repState.mortData.every((n) => n > 0),
         JSON.stringify(repState));
-      H.check('stratpanels: report headline shows all 9 metric cards',
-        repState.headline.length === 9
-          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Interest saved', 'Stock gain', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((k) => repState.headline.includes(k)),
+      H.check('stratpanels: pure-mortgage report headline shows 8 metric cards (no Stock gain — no stock involved)',
+        repState.headline.length === 8
+          && ['Net benefit', 'Total cost', 'Total gain', 'Value at horizon', 'Interest saved', 'Payoff shift', 'Monthly payment Δ', 'Penalty'].every((k) => repState.headline.includes(k))
+          && !repState.headline.includes('Stock gain'),
         JSON.stringify({ headline: repState.headline }));
+      H.check('stockgain-headline: pure-mortgage report headline has no Stock gain card',
+        !repState.headline.includes('Stock gain'), JSON.stringify({ headline: repState.headline }));
+      // Helper (pure, global): pool comp / stock-touching comp show,
+      // pure-mortgage / empty comp hide.
+      const sgHelper = await page.evaluate(() => ({
+        pool: planReportStockInvolved({ report: { investmentScope: true }, strategies: [] }),
+        mixed: planReportStockInvolved({ report: { investmentScope: false }, strategies: [{ touchesStocks: false }, { touchesStocks: true }] }),
+        pure: planReportStockInvolved({ report: { investmentScope: false }, strategies: [{ touchesStocks: false }] }),
+        empty: planReportStockInvolved({ report: {}, strategies: [] }),
+        none: planReportStockInvolved(null),
+      }));
+      H.check('stockgain-headline: helper — pool / stock-touching comps show, pure-mortgage / empty comps hide',
+        sgHelper.pool === true && sgHelper.mixed === true && sgHelper.pure === false && sgHelper.empty === false && sgHelper.none === false,
+        JSON.stringify(sgHelper));
       H.check('propscope: report Mortgage balance how-line names the entity property, not summed across properties',
         repState.how.includes('Mortgage balance = outstanding principal') && repState.how.includes('777 PropScope Entity Lane') && !repState.how.includes('summed across properties'), JSON.stringify({ how: repState.how }));
       H.check('primestep: report how-line states the shared prime history, not the stale baseline-only caption',
@@ -6406,6 +6421,8 @@ export async function run(H, S) {
       // pool-funded, so the loss is the swap itself, not new cash.
       H.check('headline-window: pool report at the full horizon shows the settled Stock gain −$1,200',
         poolParse(await poolCard('Stock gain')) === -1200, JSON.stringify({ gain: await poolCard('Stock gain') }));
+      H.check('stockgain-headline: pool report headline still shows the Stock gain card',
+        (await poolCard('Stock gain')) !== null, JSON.stringify({ gain: await poolCard('Stock gain') }));
       // Sell month = the month after the current month (psOpDate):
       // end handle to start + 1. Stock gain over the sell-month window
       // is the Value Δ change: (7,600 − 10,000) − 0 = −$2,400.
@@ -6651,8 +6668,9 @@ export async function run(H, S) {
       await page.evaluate(() => { document.querySelector('#planStrategyGenerateBtn')?.click(); });
       await page.waitForFunction(() => !!document.querySelector('#planReportTabsBar'), { timeout: 15000 });
       // The generated report tab shows the Mortgage balance chart +
-      // the all-9 headline with the entity-named how-line; the
-      // strategy page itself still shows none of it after a reload.
+      // the 8-card headline (no Stock gain — pure mortgage) with the
+      // entity-named how-line; the strategy page itself still shows
+      // none of it after a reload.
       await page.waitForFunction(() => [...document.querySelectorAll('[data-plan-report-block] h3')].some((h) => h.textContent === 'Mortgage balance'), { timeout: 15000 });
       const gatePropRep = await page.evaluate(() => {
         const block = [...document.querySelectorAll('[data-plan-report-block]')].find((w) => w.querySelector('h3')?.textContent === 'Mortgage balance');
@@ -6661,8 +6679,8 @@ export async function run(H, S) {
           how: block ? [...block.querySelectorAll('.note')].map((n) => n.textContent).join(' ') : '',
         };
       });
-      H.check('gating: after Generate, the report shows the Mortgage balance chart + all-9 headline, entity named',
-        gatePropRep.headline.length === 9 && gatePropRep.how.includes('777 PropScope Entity Lane') && !gatePropRep.how.includes('summed across properties'),
+      H.check('gating: after Generate, the report shows the Mortgage balance chart + 8-card headline (no Stock gain), entity named',
+        gatePropRep.headline.length === 8 && !gatePropRep.headline.includes('Stock gain') && gatePropRep.how.includes('777 PropScope Entity Lane') && !gatePropRep.how.includes('summed across properties'),
         JSON.stringify(gatePropRep));
       await page.goto(`http://ff.local/#planning/strategy/${gatePropStrat}`, { waitUntil: 'networkidle0', timeout: 30000 });
       await page.waitForFunction(() => (document.querySelector('#planStrategyTitle')?.textContent || '').includes('Gate property'), { timeout: 15000 });
@@ -10192,8 +10210,8 @@ export async function run(H, S) {
       H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 4 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
       // Polish: quiet defs note + subtitle + metric cards + current tab wrap.
       // The metric_cards block is the Headline section now, so the
-      // count is the headline's 9 cards (property project), not the
-      // old block's 3 series cards.
+      // count is the headline's 8 cards (property project, no Stock
+      // gain — no stock involved), not the old block's 3 series cards.
       const polish = await page.evaluate(() => ({
         defs: !!document.querySelector('#planReport .plan-report-defs'),
         subtitle: !!document.querySelector('#planReport .plan-report-subtitle'),
@@ -10201,7 +10219,7 @@ export async function run(H, S) {
         currentWrap: !!document.querySelector('.plan-report-tabwrap-current'),
       }));
       H.check('reporttab: polished elements render (quiet defs note, subtitle, metric cards, current tab wrap)',
-        polish.defs && polish.subtitle && polish.metric === 9 && polish.currentWrap, JSON.stringify(polish));
+        polish.defs && polish.subtitle && polish.metric === 8 && polish.currentWrap, JSON.stringify(polish));
       // Per-tab Save triggers the browser print/export path.
       await page.evaluate(() => { window.__printCalled = false; window.print = () => { window.__printCalled = true; }; });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabSaveBtn');
