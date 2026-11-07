@@ -8293,8 +8293,19 @@ function drawCombinedChart() {
     });
   }
   if (chartMeta && fullSeries.length) {
-    const allPts = [{ x: ymDecimal(chartMeta.balanceDate), y: chartMeta.balance },
-      ...fullSeries.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance }))];
+    // The anchor point is the balance at the anchor date — the
+    // anchor-state balance the projection starts from, not the raw
+    // recorded anchor (which can be a stale earlier term's opening:
+    // Riverbend's recorded anchor is Term 1's $489,429.67, the
+    // anchor-state balance is Term 2's $465,439.31). It is inserted
+    // in x order among the series points: once pre-anchor months
+    // exist, prepending it would draw the line backwards from the
+    // anchor month to the earliest month. On an x tie (a series row
+    // in the anchor month) the anchor — the pre-payment state —
+    // sorts first.
+    const anchorPt = { x: ymDecimal(chartMeta.balanceDate), y: chartMeta.anchorBalance ?? chartMeta.balance };
+    const allPts = [...fullSeries.map((r) => ({ x: ymDecimal(r.date || r.month), y: r.balance })), anchorPt]
+      .sort((a, b) => (a.x - b.x) || (a === anchorPt ? -1 : b === anchorPt ? 1 : 0));
     // The projection is clipped to the same month range as the
     // axis: months outside the selected pair are not drawn here.
     const pts = win0 ? allPts.filter((p) => p.x >= win0.min && p.x < win0.max) : allPts;

@@ -946,6 +946,7 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
         paymentDerived: derived.error ? null : (derived.payment ?? null),
         paymentOverridden: ovA !== null,
         termPayments: tp,
+        anchorBalance: preLumpBal,
       };
     }
   }
@@ -1098,6 +1099,14 @@ export function buildSchedule({ balance, balanceDate, terms = [], segments = [],
   return {
     state: 'projected', series, totalInterest,
     payoffMonth: payoffMonth || (series.length && bal <= 0 ? series[series.length - 1].month : null),
+    // The balance the projection starts from at the anchor state:
+    // after any lump sum at the anchor and after any term opening
+    // in the anchor month reconciles it. The chart's anchor point
+    // plots this — not the raw recorded anchor, which can be a
+    // stale earlier term's opening (Riverbend: the recorded anchor
+    // is Term 1's $489,429.67, the anchor-state balance is Term 2's
+    // $465,439.31).
+    anchorBalance: anchorBal,
     negativeAmortization, paymentUsed, paymentDerived,
     paymentOverridden: anchorOverridden, termPayments,
   };

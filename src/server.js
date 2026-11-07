@@ -2601,9 +2601,49 @@ app.post('/api/properties/:id/preview', requireApiAuth, async (req, res) => {
 // plan's payment is set when the plan starts; prime only reprices
 // each month's interest split, against the tracked prime history).
 // The derived payment only ever comes out of this calculation; a
-// term may carry a payment override that replaces it for that
-// term's span — paymentUsed reports what actually runs,
-// paymentDerived the calculated figure beside it.
+// Display-only pre-anchor history for the mortgage chart + monthly
+// table: a second buildSchedule run anchored at the earliest term's
+// opening balance (the contract's balance when the loan started),
+// whose rows strictly before the anchor month are prepended to the
+// main projection's series. The main projection (projectionFor /
+// the amortization run below) is untouched — every figure still
+// comes from it, and the user's anchor never moves.
+//
+// Rules: no terms, or the earliest opening at/after the anchor
+// month, or a replay that cannot project (no_payment / no_prime)
+// all mean no replay — the chart is exactly as before. A term with
+// a missing or non-positive opening carries no replay start (a
+// missing opening must never zero a balance); the replay starts at
+// the earliest term WITH a positive opening. Lump sums dated before
+// the anchor are dated events inside the replay, so they lower the
+// replayed balance from their month on — with one display-only
+// caveat: when the replay itself starts mid-history (the earliest
+// term has no opening), a later term's opening resets the replayed
+// balance at its start, erasing a lump recorded after that renewal
+// was created; pre-anchor months after that renewal would then read
+// high. Post-anchor figures are unaffected — they come from the
+// main run, never the replay. The anchor month itself has no series
+// row when no payment falls in it (the anchor month is a state
+// point, not a payment month), so the combined series jumps from
+// the last replay month to the main run's first payment month and
+// the chart's anchor point bridges the gap.
+function preAnchorReplaySeries({ balanceDate, terms, segments, lumpSums, frequency, paymentDay, primeRate, primeHistory, region }) {
+  const anchorMonth = monthIdxOf(balanceDate);
+  const withOpening = [...terms]
+    .filter((t) => isFinite(Number(t.opening_balance)) && Number(t.opening_balance) > 0)
+    .sort((a, b) => (a.start_date < b.start_date ? -1 : a.start_date > b.start_date ? 1 : a.id - b.id));
+  const first = withOpening[0];
+  if (!first) return [];
+  if (monthIdxOf(first.start_date) >= anchorMonth) return [];
+  const replay = buildSchedule({
+    balance: Number(first.opening_balance), balanceDate: first.start_date,
+    terms, segments, lumpSums, paymentDay, frequency,
+    primeRate, primeHistory, region,
+  });
+  if (replay.state !== 'projected' || !replay.series.length) return [];
+  const anchorYM = ymOfIdx(anchorMonth);
+  return replay.series.filter((row) => row.month < anchorYM);
+}
 app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => {
   const p = getProperty(req.params.id);
   if (!p) return res.status(404).json({ error: 'property not found' });
@@ -2650,10 +2690,23 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
   // modal's Current Principal and the equity readout use the
   // matching server-side figure, so all three agree by construction).
   const remaining = remainingBalanceAt(r.series, currentMonthKey(), p.mortgage_balance, r.payoffMonth);
+  // The chart + monthly table show the full history from the
+  // earliest term's start: the display-only replay's pre-anchor
+  // months prepended to the main run's series. Every figure in
+  // this response (remaining balance, payments, payoff, total
+  // interest) still comes from the main run above.
+  const displaySeries = [...preAnchorReplaySeries({
+    balanceDate, terms: termsOf(p.id), segments, lumpSums: lumpSumsOf(p.id),
+    paymentDay, frequency, primeRate, primeHistory: getPrimeHistory(), region: p.region || 'CA',
+  }), ...r.series];
   res.json({
     ok: true,
     balance: p.mortgage_balance,
     balanceDate,
+    // The balance the projection starts from at the anchor date —
+    // the chart's anchor point plots this, not the raw recorded
+    // anchor (which can be a stale earlier term's opening).
+    anchorBalance: r.anchorBalance ?? p.mortgage_balance,
     remainingBalance: remaining.balance,
     remainingBalanceMonth: remaining.month,
     paymentUsed: payment,
@@ -2668,7 +2721,7 @@ app.get('/api/properties/:id/amortization', requireApiAuth, async (req, res) => 
     frequencyLabel: FREQUENCIES[frequency].label,
     periodsPerYear: FREQUENCIES[frequency].periodsPerYear,
     periodPayment: periodPaymentFor(payment, frequency),
-    series: r.series,
+    series: displaySeries,
     totalInterest: r.totalInterest,
     payoffMonth: r.payoffMonth,
     negativeAmortization: r.negativeAmortization,

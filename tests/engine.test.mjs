@@ -331,6 +331,44 @@ test('buildSchedule: a term starting in the anchor month opens with its own open
   assert.ok(rem.balance < 480756 - 20000, rem.balance);
 });
 
+test('buildSchedule: anchorBalance is the balance the projection starts from (anchor-state, not the raw anchor)', () => {
+  // Riverbend again: the recorded anchor is Term 1's opening
+  // ($489,429.67) dated at Term 2's start, but the projection
+  // starts from Term 2's opening ($465,439.31) — the chart's
+  // anchor point must plot the latter, or the line drops ~$24k
+  // into the first payment month.
+  const primeHistory = [
+    { date: '2024-12-11', rate: 5.95 },
+    { date: '2024-12-18', rate: 5.45 },
+    { date: '2025-02-05', rate: 5.20 },
+    { date: '2025-03-19', rate: 4.95 },
+    { date: '2025-09-24', rate: 4.70 },
+    { date: '2025-11-05', rate: 4.45 },
+    { date: '2026-10-14', rate: 4.70 },
+    { date: '2026-10-21', rate: 4.95 },
+  ];
+  const terms = [
+    { id: 1, start_date: '2024-04-16', amortization_years: 24, opening_balance: 489429.67, payment_frequency: 'weekly', repayment_method: 'equal_payment' },
+    { id: 2, start_date: '2026-04-27', amortization_years: 22, opening_balance: 465439.31, payment_frequency: 'weekly', repayment_method: 'equal_payment' },
+  ];
+  const segments = [
+    { start_date: '2024-04-16', rate_type: 'fixed', annual_rate: 4.79, compounding: 'semi_annual', accrual: 'monthly' },
+    { start_date: '2026-04-16', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.8, compounding: 'semi_annual', accrual: 'monthly', locked_on: '2026-04-01' },
+  ];
+  const r = buildSchedule({ balance: 489429.67, balanceDate: '2026-04-27', terms, segments, frequency: 'weekly', primeRate: 4.95, primeHistory });
+  assert.equal(r.state, 'projected');
+  assert.equal(r.anchorBalance, 465439.31);
+  // No term in the anchor month: the anchor-state balance IS the
+  // recorded anchor.
+  const r2 = buildSchedule({
+    balance: 100000, balanceDate: '2026-01-01',
+    terms: [{ id: 1, start_date: '2025-01-01', amortization_years: 25 }],
+    segments: [{ start_date: '2025-01-01', rate_type: 'fixed', annual_rate: 5 }],
+  });
+  assert.equal(r2.state, 'projected');
+  assert.equal(r2.anchorBalance, 100000);
+});
+
 test('buildSchedule: a term starting after a mid-history anchor resets the balance to its opening', () => {
   // Anchor Jan 2026 $100,000 — mid-history: Term 1 started Jan
   // 2025, before the anchor, so its pre-anchor payments never

@@ -5757,6 +5757,78 @@ export async function run(H, S) {
         fs.writeFileSync(H.aiStubFile, JSON.stringify({ fields: {} }));
         if (aiFillPid != null) await H.req('DELETE', `/api/properties/${aiFillPid}`);
       }
+      // Riverbend pre-anchor history on the chart itself (browser
+      // scope — the API-only Riverbend block below has no `page`):
+      // the same two-term fixture, the default 1-year range
+      // (Dec 2025–Nov 2026). The Outstanding principal line draws
+      // the pre-anchor months in month order from Dec 2025, and the
+      // anchor point plots the anchor-state balance — the raw
+      // $489,429.67 appears nowhere.
+      {
+        let rbChartId = null;
+        try {
+          let r = await H.req('POST', '/api/properties', { address: '77-3010 Riverbend Dr, Coquitlam, BC', purchase_date: '2024-04-16' });
+          rbChartId = r.data && r.data.id;
+          const t1 = await H.req('POST', `/api/properties/${rbChartId}/terms`, { lender: 'Royal Bank of Canada', start_date: '2024-04-16', term_months: 25, amortization_years: 24, opening_balance: 489429.67, payment_frequency: 'weekly', repayment_method: 'equal_payment' });
+          const t1Id = t1.data && t1.data.id;
+          await H.req('POST', `/api/properties/${rbChartId}/rates`, { term_id: t1Id, start_date: '2024-04-16', rate_type: 'fixed', annual_rate: 4.79, compounding: 'semi_annual', accrual: 'monthly' });
+          const t2 = await H.req('POST', `/api/properties/${rbChartId}/terms`, { lender: 'Royal Bank of Canada', start_date: '2026-04-27', term_months: 60, amortization_years: 22, opening_balance: 465439.31, payment_frequency: 'weekly', repayment_method: 'equal_payment' });
+          const t2Id = t2.data && t2.data.id;
+          await H.req('POST', `/api/properties/${rbChartId}/rates`, { term_id: t2Id, start_date: '2026-04-16', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.8, compounding: 'semi_annual', accrual: 'monthly', locked_on: '2026-04-01' });
+          await H.req('PUT', `/api/properties/${rbChartId}`, { mortgage_balance: 489429.67, mortgage_balance_date: '2026-04-27' });
+          const rbAmort = await H.req('GET', `/api/properties/${rbChartId}/amortization`);
+          // The page sits on another property's detail hash — a
+          // same-route goto would not fire the router — so step away
+          // first to force a fresh render of this property.
+          await page.goto('http://ff.local/#assets/properties', { waitUntil: 'networkidle0', timeout: 30000 });
+          await wait(500);
+          await page.goto(`http://ff.local/#property/${rbChartId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+          await wait(1600);
+          const ymDec = (s) => { const [y, m] = s.split('-').map(Number); return y + (m - 1) / 12; };
+          const outDs = await page.evaluate(() => {
+            const c = window.__fmCharts.a;
+            if (!c) return null;
+            const ds = c.data.datasets.find((d) => d.label === 'Outstanding principal');
+            return ds ? ds.data.map((p) => ({ x: p.x, y: p.y })) : null;
+          });
+          const xs = outDs ? outDs.map((p) => p.x) : [];
+          const sorted = xs.every((x, i) => i === 0 || x >= xs[i - 1]);
+          const anchorPt = outDs ? outDs.find((p) => Math.abs(p.x - ymDec('2026-04')) < 1e-9) : null;
+          H.check('Riverbend pre-anchor: the hero chart draws Term 1 history in the 1-year range — points in month order from Dec 2025, anchor point at the anchor-state balance',
+            !!outDs && sorted && Math.abs(xs[0] - ymDec('2025-12')) < 1e-9
+              && !!anchorPt && Math.abs(anchorPt.y - 465439.31) < 0.01
+              && !outDs.some((p) => Math.abs(p.y - 489429.67) < 0.01),
+            JSON.stringify({ n: outDs && outDs.length, firstX: xs[0], anchorPt }));
+          // The monthly table pages back to 2025: in the 1-year window
+          // the 2025 page holds exactly the Dec 2025 pre-anchor row,
+          // with the API's balance.
+          const schedYears = await page.evaluate(() => [...document.querySelectorAll('#scheduleYearSelect option')].map((o) => o.value));
+          H.check('Riverbend pre-anchor: the monthly table pages back to 2025 (pre-anchor months listed)',
+            schedYears.includes('2025') && schedYears.includes('2026'),
+            JSON.stringify(schedYears));
+          await page.evaluate(() => {
+            const s = document.querySelector('#scheduleYearSelect');
+            s.value = '2025';
+            s.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+          await wait(300);
+          const dec25Api = rbAmort.data.series.find((row) => row.month === '2025-12');
+          const dec25Row = await page.evaluate(() => {
+            const rows = [...document.querySelectorAll('#scheduleRows tr')];
+            const tr = rows.find((r) => r.children[0].textContent.trim().startsWith('Dec'));
+            if (!tr) return null;
+            const nums = [...tr.children].map((td) => Number(td.textContent.replace(/[^0-9.\-]/g, '')));
+            return { label: tr.children[0].textContent.trim(), n: rows.length, nums };
+          });
+          H.check('Riverbend pre-anchor: the 2025 table page holds exactly the Dec 2025 pre-anchor row, with the API balance',
+            !!dec25Api && !!dec25Row && dec25Row.label === 'Dec 2025' && dec25Row.n === 1
+              && dec25Row.nums.some((n) => Math.abs(n - dec25Api.balance) < 0.01),
+            JSON.stringify({ dec25Row, api: dec25Api && dec25Api.balance }));
+        } finally {
+          if (rbChartId != null) await H.req('DELETE', `/api/properties/${rbChartId}`);
+        }
+      }
+
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       H.check('money UI browser flow runs to completion', false, String((err && err.message) || err));
@@ -5772,9 +5844,11 @@ export async function run(H, S) {
   // term's start must chain — the second term's opening reconciles
   // the balance, the first term's payment still derives from its
   // own opening, and the current principal reflects the chained
-  // repayments instead of the anchor balance. API-level pins (the
-  // projection never reaches Term 1, so no pre-anchor history is
-  // asserted — only the current principal and both triples).
+  // repayments instead of the anchor balance. The hero chart +
+  // monthly table ALSO show Term 1's history (a display-only replay
+  // anchored at Term 1's opening, prepended before the anchor
+  // month) while every figure still comes from the anchor-based
+  // main run — the anchor itself never moves.
   {
     let riverbendId = null;
     try {
@@ -5851,6 +5925,83 @@ export async function run(H, S) {
       H.check('Riverbend pin: current principal is far from the buggy $480,756',
         Math.abs(detail.data.remainingBalance - 480756) > 10000 && detail.data.remainingBalance > 440000 && detail.data.remainingBalance < 470000,
         JSON.stringify({ api: detail.data.remainingBalance }));
+
+      // ---- Pre-anchor history: the hero chart + monthly table show
+      // Term 1's months from its start (2024-04), while every figure
+      // still comes from the anchor-based main run. ----
+      const amort = await H.req('GET', `/api/properties/${riverbendId}/amortization`);
+      H.check('Riverbend pre-anchor: amortization series starts at the earliest term\'s start month (2024-04)',
+        amort.data && Array.isArray(amort.data.series) && amort.data.series[0] && amort.data.series[0].month === '2024-04',
+        JSON.stringify(amort.data && amort.data.series && amort.data.series.slice(0, 2)));
+      // The prepended months are exactly the display-only replay:
+      // an independent engine run anchored at Term 1's opening.
+      const engineReplay = engineSchedule({
+        balance: 489429.67, balanceDate: '2024-04-16',
+        terms: [
+          { id: t1Id, start_date: '2024-04-16', term_months: 25, amortization_years: 24, opening_balance: 489429.67, repayment_method: 'equal_payment' },
+          { id: t2Id, start_date: '2026-04-27', term_months: 60, amortization_years: 22, opening_balance: 465439.31, repayment_method: 'equal_payment' },
+        ],
+        segments: [
+          { start_date: '2024-04-16', rate_type: 'fixed', annual_rate: 4.79, compounding: 'semi_annual', accrual: 'monthly' },
+          { start_date: '2026-04-16', rate_type: 'variable', rate_mode: 'prime_spread', spread: -0.8, compounding: 'semi_annual', accrual: 'monthly', locked_on: '2026-04-01' },
+        ],
+        lumpSums: [], paymentDay: null, frequency: 'weekly',
+        primeRate: fallbackRate, primeHistory: history, region: 'CA',
+      });
+      const preAnchor = amort.data.series.filter((row) => row.month < '2026-04');
+      const replayPre = engineReplay.series.filter((row) => row.month < '2026-04');
+      H.check('Riverbend pre-anchor: prepended months match the independent replay anchored at Term 1\'s opening',
+        preAnchor.length === replayPre.length && preAnchor.length > 0
+          && preAnchor.every((row, i) => row.month === replayPre[i].month
+            && Math.abs(row.balance - replayPre[i].balance) < 0.01
+            && Math.abs(row.payment - replayPre[i].payment) < 0.01),
+        JSON.stringify({ pre: preAnchor.length, replay: replayPre.length, first: preAnchor[0], last: preAnchor[preAnchor.length - 1] }));
+      const dec24 = amort.data.series.find((row) => row.month === '2024-12');
+      H.check('Riverbend pre-anchor: Dec 2024 row balance ≈ $481,463 (Term 1 fixed-rate replay)',
+        !!dec24 && Math.abs(dec24.balance - 481463.18) < 1,
+        JSON.stringify(dec24));
+      // The anchor month has no series row (no payment falls in
+      // it): the table jumps Mar -> May, and the chart's anchor
+      // point bridges the gap.
+      const months = amort.data.series.map((row) => row.month);
+      H.check('Riverbend pre-anchor: no Apr 2026 row — the series jumps Mar 2026 -> May 2026',
+        !months.includes('2026-04') && months.indexOf('2026-05') === months.indexOf('2026-03') + 1,
+        JSON.stringify(months.filter((m) => m >= '2026-01' && m <= '2026-07')));
+      // The anchor point plots the anchor-state balance, not the
+      // raw recorded anchor — and the recorded anchor is preserved.
+      H.check('Riverbend pre-anchor: anchorBalance is Term 2\'s opening ($465,439.31), balance stays the recorded anchor ($489,429.67)',
+        amort.data.anchorBalance === 465439.31 && amort.data.balance === 489429.67,
+        JSON.stringify({ anchorBalance: amort.data.anchorBalance, balance: amort.data.balance }));
+      // Figures unchanged vs the anchor-only run: remaining balance
+      // and payments agree with the detail API + the main engine run.
+      H.check('Riverbend pre-anchor: figures unchanged — remaining balance, payment, payoff and total interest still come from the main run',
+        Math.abs(amort.data.remainingBalance - detail.data.remainingBalance) < 0.01
+          && Math.abs(amort.data.paymentUsed - term2Derived) < 0.5
+          && amort.data.payoffMonth === engineProj.payoffMonth
+          && Math.abs(amort.data.totalInterest - engineProj.totalInterest) < 0.01,
+        JSON.stringify({ amortRem: amort.data.remainingBalance, detailRem: detail.data.remainingBalance, pay: amort.data.paymentUsed, payoff: amort.data.payoffMonth, interest: amort.data.totalInterest }));
+
+      // A property with no pre-anchor terms is unchanged: no
+      // replay, no rows before the anchor, and the anchor point is
+      // the recorded anchor itself.
+      let singleId = null;
+      try {
+        const s = await H.req('POST', '/api/properties', { address: '1 Single Term Way, Coquitlam, BC', purchase_date: '2026-04-27' });
+        singleId = s.data && s.data.id;
+        const st = await H.req('POST', `/api/properties/${singleId}/terms`, { lender: 'Royal Bank of Canada', start_date: '2026-04-27', term_months: 60, amortization_years: 25, opening_balance: 100000, payment_frequency: 'monthly', repayment_method: 'equal_payment' });
+        const stId = st.data && st.data.id;
+        await H.req('POST', `/api/properties/${singleId}/rates`, { term_id: stId, start_date: '2026-04-27', rate_type: 'fixed', annual_rate: 5, compounding: 'semi_annual', accrual: 'monthly' });
+        await H.req('PUT', `/api/properties/${singleId}`, { mortgage_balance: 100000, mortgage_balance_date: '2026-04-27' });
+        const single = await H.req('GET', `/api/properties/${singleId}/amortization`);
+        H.check('Riverbend pre-anchor: a property with no pre-anchor terms is unchanged (no rows before the anchor; anchorBalance is the anchor)',
+          single.data && Array.isArray(single.data.series) && single.data.series.length > 0
+            && single.data.series.every((row) => row.month >= '2026-04')
+            && single.data.anchorBalance === 100000 && single.data.balance === 100000,
+          JSON.stringify({ first: single.data.series && single.data.series[0], anchorBalance: single.data && single.data.anchorBalance }));
+      } finally {
+        if (singleId != null) await H.req('DELETE', `/api/properties/${singleId}`);
+      }
+
     } finally {
       if (riverbendId != null) await H.req('DELETE', `/api/properties/${riverbendId}`);
     }
