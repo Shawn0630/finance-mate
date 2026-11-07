@@ -28,6 +28,7 @@ export const TERM_FIELDS = [
   'payment_frequency', 'repayment_method', 'payment_override',
   'segment_start_date', 'segment_rate_type', 'segment_rate_mode',
   'segment_annual_rate', 'segment_spread', 'segment_compounding',
+  'segment_accrual', 'segment_locked_on',
 ];
 export const JOB_FIELDS = [
   'employer', 'owner', 'currency', 'province', 'frequency',
@@ -81,7 +82,11 @@ const FORM_SPECS = {
     'First rate segment keys: segment_start_date, segment_rate_type (fixed | variable),',
     'segment_rate_mode (absolute | prime_spread), segment_annual_rate (fixed or absolute segments),',
     'segment_spread (prime_spread segments), segment_compounding (semi_annual | monthly — use monthly',
-    'when the document says interest is calculated at the same frequency as the payments, or compounded monthly).',
+    'when the document says interest is calculated at the same frequency as the payments, or compounded monthly),',
+    'segment_accrual (monthly | daily — how interest accrues on the balance; use daily when the document',
+    'says interest is calculated daily or on actual days),',
+    'segment_locked_on (YYYY-MM-DD — only for variable prime_spread segments: the date the variable rate',
+    'was locked, e.g. "Locked Apr 1, 2026"; omit for fixed or absolute segments).',
   ].join('\n'),
   job: [
     'Form: salary job (simplified form).',
@@ -308,6 +313,18 @@ function normCompounding(v) {
   return null;
 }
 
+// Accrual: the same document-phrasing tolerance as compounding
+// ("interest calculated daily", "on actual days").
+function normAccrual(v) {
+  const g = normEnum(v, ['monthly', 'daily']);
+  if (g) return g;
+  if (typeof v !== 'string') return null;
+  const s = v.toLowerCase();
+  if (s.includes('actual day') || s.includes('daily')) return 'daily';
+  if (s.includes('monthly')) return 'monthly';
+  return null;
+}
+
 function normSpread(v) {
   if (typeof v === 'number') return Number.isFinite(v) && Math.abs(v) <= 10 ? v : null;
   if (typeof v !== 'string') return null;
@@ -398,6 +415,16 @@ export function normalizeAiFields(context, raw) {
     put('segment_spread', normSpread(raw.segment_spread ?? raw.spread));
   }
   put('segment_compounding', normCompounding(raw.segment_compounding ?? raw.compounding));
+  // Accrual applies to every segment kind — the form always
+  // renders and saves it.
+  put('segment_accrual', normAccrual(raw.segment_accrual));
+  // Locked on only prices a variable prime_spread segment: the
+  // segment form only shows (and only saves) it there — a lock on
+  // a fixed or absolute segment would be filled but never saved,
+  // so drop it here instead of letting it look filled.
+  if (segType === 'variable' && segMode === 'prime_spread') {
+    put('segment_locked_on', normDate(raw.segment_locked_on ?? raw.locked_on));
+  }
   return out;
 }
 

@@ -759,7 +759,7 @@ function currentSegment(segments) {
 // real fields (unknown names dropped). Display metadata only.
 const PROPERTY_AI_FIELDS = ['address', 'notes', 'assessed_value', 'assessed_year', 'purchase_date', 'mortgage_balance', 'owners'];
 const TERM_AI_FIELDS = ['lender', 'start_date', 'term_months', 'amortization_years', 'opening_balance', 'payment_frequency', 'repayment_method', 'payment_override'];
-const SEGMENT_AI_FIELDS = ['start_date', 'rate_type', 'rate_mode', 'annual_rate', 'spread', 'compounding'];
+const SEGMENT_AI_FIELDS = ['start_date', 'rate_type', 'rate_mode', 'annual_rate', 'spread', 'compounding', 'accrual', 'locked_on'];
 
 function parseAiFields(v) {
   try {

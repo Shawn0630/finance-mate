@@ -5608,6 +5608,8 @@ export async function run(H, S) {
             annual_rate: seg.annual_rate.value,
             spread: seg.spread.value,
             compounding: seg.compounding.value,
+            accrual: seg.accrual.value,
+            locked_on: seg.locked_on.value,
             modeVisible: !seg.querySelector('[data-seg-mode]').classList.contains('hidden'),
             spreadVisible: !seg.querySelector('[data-seg-spread]').classList.contains('hidden'),
             rateVisible: !seg.querySelector('[data-seg-rate]').classList.contains('hidden'),
@@ -5694,6 +5696,63 @@ export async function run(H, S) {
         r = await H.req('GET', `/api/properties/${aiFillPid}`);
         H.check('ai-fill segment: Extract wrote nothing (no segments until Save)',
           Array.isArray(r.data.segments) && r.data.segments.length === 0, JSON.stringify(r.data.segments));
+        // Order 3: a fixed segment's lock is dropped server-side —
+        // the form never shows it, and the saved segment has none.
+        // (Before the first save here, so the form holds no
+        // carried-over draft lock from an earlier segment.)
+        aiSetStub({
+          segment_start_date: '2026-01-15', segment_rate_type: 'fixed',
+          segment_rate_mode: 'absolute', segment_annual_rate: 4.79,
+          segment_accrual: 'daily', segment_locked_on: '2026-04-01',
+        });
+        await aiExtract('RBC fixed 4.79% from Jan 2026, interest accrues daily, locked Apr 1 2026');
+        const seg3 = await aiSegState();
+        H.check('ai-fill segment: a fixed fill takes accrual daily but leaves Locked on blank (lock dropped)',
+          !!seg3 && seg3.visible && seg3.rate_type === 'fixed' && seg3.rate_mode === 'absolute'
+            && seg3.annual_rate === '4.79' && seg3.accrual === 'daily' && seg3.locked_on === ''
+            && seg3.spread === '-1.25' && seg3.rateVisible && !seg3.spreadVisible && seg3.flags === 6,
+          JSON.stringify(seg3));
+        H.check('ai-fill segment: the fixed summary counts the five placed fields, no lock',
+          (await aiSummary()) === 'Filled 5 fields', JSON.stringify(await aiSummary()));
+        await page.evaluate(() => document.querySelector('[data-seg-form] [data-seg-submit]').click());
+        await wait(1700);
+        r = await H.req('GET', `/api/properties/${aiFillPid}`);
+        const fixedSeg = (r.data.segments || []).find((s) => s.rate_mode === 'absolute') || {};
+        H.check('ai-fill segment: the saved fixed segment has accrual daily and no lock',
+          fixedSeg.accrual === 'daily' && fixedSeg.locked_on == null && fixedSeg.annual_rate === 4.79
+            && (fixedSeg.ai_fields || []).includes('accrual'),
+          JSON.stringify(fixedSeg));
+        // Order 4: a prime_spread fill now carries accrual + the
+        // pricing lock — both land in the open form, and Save
+        // persists them on the segment.
+        aiSetStub({
+          segment_start_date: '2026-04-27', segment_rate_type: 'variable',
+          segment_rate_mode: 'prime_spread', segment_spread: -0.8,
+          segment_compounding: 'monthly', segment_accrual: 'daily', segment_locked_on: '2026-04-01',
+        });
+        await aiExtract('RBC variable Prime minus 0.80, locked Apr 1 2026, interest accrues daily');
+        const seg4 = await aiSegState();
+        H.check('ai-fill segment: Extract fills accrual daily + Locked on 2026-04-01 on a prime_spread segment',
+          !!seg4 && seg4.visible && seg4.rate_type === 'variable' && seg4.rate_mode === 'prime_spread'
+            && seg4.spread === '-1.25' && seg4.accrual === 'daily' && seg4.locked_on === '2026-04-01'
+            && seg4.spreadVisible && seg4.flags === 7,
+          JSON.stringify(seg4));
+        H.check('ai-fill segment: the lock + accrual summary counts 6 filled · 1 kept (hand-edited spread)',
+          (await aiSummary()) === 'Filled 6 fields · 1 kept', JSON.stringify(await aiSummary()));
+        await page.evaluate(() => document.querySelector('[data-seg-form] [data-seg-submit]').click());
+        await wait(1700);
+        r = await H.req('GET', `/api/properties/${aiFillPid}`);
+        const savedSeg = (r.data.segments || []).find((s) => s.rate_mode === 'prime_spread') || {};
+        H.check('ai-fill segment: Save persists accrual daily + locked_on on the segment',
+          savedSeg.accrual === 'daily' && savedSeg.locked_on === '2026-04-01'
+            && savedSeg.rate_mode === 'prime_spread' && savedSeg.spread === -1.25
+            && (savedSeg.ai_fields || []).includes('accrual') && (savedSeg.ai_fields || []).includes('locked_on'),
+          JSON.stringify(savedSeg));
+        H.check('ai-fill segment: the saved row shows the Locked badge with a ✨ flag',
+          await page.evaluate(() => {
+            const row = [...document.querySelectorAll('tr')].find((tr) => tr.textContent.includes('Locked 2026-04-01'));
+            return !!row && !!row.querySelector('.badge.lock + .ai-flag');
+          }));
       } finally {
         fs.writeFileSync(H.aiStubFile, JSON.stringify({ fields: {} }));
         if (aiFillPid != null) await H.req('DELETE', `/api/properties/${aiFillPid}`);

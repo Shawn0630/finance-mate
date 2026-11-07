@@ -79,6 +79,50 @@ test('normalizeAiFields: the segment kind vocabulary expands to the form fields,
     { address: '1 Main St', mortgage_balance: 250000, owners: ['Shawn'] });
 });
 
+test('normalizeAiFields: segment accrual and locked_on', () => {
+  // Accrual: monthly/daily accepted, document phrasing mapped,
+  // garbage dropped. Accrual applies to every segment kind.
+  assert.equal(normalizeAiFields('term', { segment_accrual: 'daily' }).segment_accrual, 'daily');
+  assert.equal(normalizeAiFields('term', { segment_accrual: 'Monthly' }).segment_accrual, 'monthly');
+  assert.equal(
+    normalizeAiFields('term', { segment_accrual: 'interest calculated daily on actual days' }).segment_accrual,
+    'daily');
+  assert.equal(normalizeAiFields('term', { segment_accrual: 'weekly' }).segment_accrual, undefined);
+  assert.equal(
+    normalizeAiFields('term', { segment_rate_type: 'fixed', segment_annual_rate: 4.79, segment_accrual: 'daily' }).segment_accrual,
+    'daily');
+  // Locked on: kept only for a variable prime_spread segment —
+  // the form only shows (and only saves) it there.
+  assert.deepEqual(
+    normalizeAiFields('term', {
+      segment_rate_type: 'variable', segment_rate_mode: 'prime_spread', segment_spread: -0.8,
+      segment_locked_on: 'Apr 1, 2026', segment_accrual: 'monthly',
+    }),
+    {
+      segment_rate_type: 'variable', segment_rate_mode: 'prime_spread', segment_spread: -0.8,
+      segment_accrual: 'monthly', segment_locked_on: '2026-04-01',
+    });
+  // The kind vocabulary expands first, so a prime_spread kind
+  // keeps the lock too; the locked_on alias key is accepted.
+  assert.deepEqual(
+    normalizeAiFields('term', { segment_kind: 'prime_spread', spread: -0.8, locked_on: '2026-04-01' }),
+    { segment_rate_type: 'variable', segment_rate_mode: 'prime_spread', segment_spread: -0.8, segment_locked_on: '2026-04-01' });
+  // Fixed, absolute and type-less segments drop the lock; an
+  // invalid lock date drops too.
+  assert.equal(
+    normalizeAiFields('term', { segment_rate_type: 'fixed', segment_annual_rate: 4.79, segment_locked_on: '2026-04-01' }).segment_locked_on,
+    undefined);
+  assert.equal(
+    normalizeAiFields('term', { segment_rate_type: 'variable', segment_rate_mode: 'absolute', segment_annual_rate: 4.5, segment_locked_on: '2026-04-01' }).segment_locked_on,
+    undefined);
+  assert.equal(
+    normalizeAiFields('term', { segment_locked_on: '2026-04-01' }).segment_locked_on,
+    undefined);
+  assert.equal(
+    normalizeAiFields('term', { segment_rate_type: 'variable', segment_rate_mode: 'prime_spread', segment_spread: -0.8, segment_locked_on: 'not a date' }).segment_locked_on,
+    undefined);
+});
+
 test('parseModelJson: plain, fenced and prose-wrapped JSON', () => {
   assert.deepEqual(parseModelJson('{"fields":{}}'), { fields: {} });
   assert.deepEqual(parseModelJson('```json\n{"fields":{"a":1}}\n```'), { fields: { a: 1 } });
