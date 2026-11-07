@@ -474,17 +474,20 @@ export async function run(H, S) {
           noApplyBtn: !document.querySelector('#planProjectApplyRecBtn'),
           cancelVisible: !!document.querySelector('#planProjectModal [data-close-modal]'),
           sameStyle: !!(s && a && s.height === a.height && s.paddingTop === a.paddingTop && s.paddingBottom === a.paddingBottom && s.fontWeight === a.fontWeight),
-          question: document.querySelector('#planProjectForm [name=question]').value,
+          // Creation asks for a name only (user 2026-11-06): the
+          // Question field is hidden here, kept only in edit mode.
+          questionRowHidden: document.querySelector('#planProjectQuestionRow').classList.contains('hidden'),
+          nameVisible: !!(document.querySelector('#planProjectForm [name=name]') && getComputedStyle(document.querySelector('#planProjectForm [name=name]')).display !== 'none'),
         };
       });
       H.check('planning entity pick opens the project modal directly with no subcategory cards',
         intake.modalOpen && intake.catModalClosed && intake.noSubCards,
         JSON.stringify(intake));
-      H.check('planning category intake shows exactly two creation buttons + Cancel, AI button in primary style',
+      H.check('planning category intake shows exactly two creation buttons + Cancel, AI button in primary style, name only (no Question field)',
         intake.modalOpen && intake.saveLabel === 'Create project' && intake.aiVisible && intake.aiLabel.includes('Create with AI')
           && intake.noApplyBtn && intake.cancelVisible && intake.sameStyle
           && intake.catNote.includes('property') && !intake.catNote.includes('Baseline:') && !intake.catNote.includes('Strategy:')
-          && intake.question.length === 0,
+          && intake.questionRowHidden && intake.nameVisible,
         JSON.stringify(intake));
       await page.type('#planProjectForm [name=name]', 'Category Flow Test');
       await page.click('#planProjectSaveBtn');
@@ -538,10 +541,34 @@ export async function run(H, S) {
         catRowHidden: document.querySelector('#planProjectCategoryRow').classList.contains('hidden'),
         aiBtnHidden: document.querySelector('#planAiCreateBtn').classList.contains('hidden'),
         saveLabel: document.querySelector('#planProjectSaveBtn').textContent,
+        // Edit mode keeps the Question field (creation hides it).
+        questionRowVisible: !document.querySelector('#planProjectQuestionRow').classList.contains('hidden'),
+        questionValue: document.querySelector('#planProjectForm [name=question]').value,
       }));
-      H.check('planning edit modal has no category control',
-        editModal.open && editModal.catRowHidden && editModal.aiBtnHidden && editModal.saveLabel === 'Save',
+      H.check('planning edit modal has no category control and keeps the Question field',
+        editModal.open && editModal.catRowHidden && editModal.aiBtnHidden && editModal.saveLabel === 'Save'
+          && editModal.questionRowVisible && editModal.questionValue === '',
         JSON.stringify(editModal));
+      await page.evaluate(() => { document.querySelector('#planProjectModal [data-close-modal]').click(); });
+      await waitT(300);
+      // Edit mode shows the Question field with the STORED value:
+      // a project created with a question has it prefilled.
+      r = await H.req('POST', '/api/planning/projects', { name: 'Edit Question Test', question: 'Stored question value' });
+      H.check('planning: create project with a question', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+      const editQId = r.data.project.id;
+      await page.goto(`http://ff.local/#planning/project/${editQId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitT(1500);
+      await page.evaluate(() => { document.querySelector('#planProjectEditBtn').click(); });
+      await waitT(500);
+      const editQ = await page.evaluate(() => ({
+        open: !document.querySelector('#planProjectModal').classList.contains('hidden'),
+        questionRowVisible: !document.querySelector('#planProjectQuestionRow').classList.contains('hidden'),
+        questionValue: document.querySelector('#planProjectForm [name=question]').value,
+        saveLabel: document.querySelector('#planProjectSaveBtn').textContent,
+      }));
+      H.check('planning edit modal shows the Question field with the stored value',
+        editQ.open && editQ.questionRowVisible && editQ.questionValue === 'Stored question value' && editQ.saveLabel === 'Save',
+        JSON.stringify(editQ));
       await page.evaluate(() => { document.querySelector('#planProjectModal [data-close-modal]').click(); });
       await waitT(300);
       r = await H.req('PUT', `/api/planning/projects/${catProjectId}`, { name: 'Category Flow Test', category: 'investment' });
@@ -571,9 +598,9 @@ export async function run(H, S) {
         JSON.stringify(bareLanded));
       const bareProjectId = bareLanded.hash.split('/').pop();
       r = await H.req('GET', `/api/planning/projects/${bareProjectId}`);
-      H.check('planning create-project creates baseline-only (fixed baseline present, zero strategies)',
-        (r.data.project.baselines || []).length === 1 && (r.data.strategies || []).length === 0,
-        JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length }));
+      H.check('planning create-project creates baseline-only (fixed baseline present, zero strategies) with no question stored',
+        (r.data.project.baselines || []).length === 1 && (r.data.strategies || []).length === 0 && r.data.project.question == null,
+        JSON.stringify({ baselines: (r.data.project.baselines || []).length, strategies: (r.data.strategies || []).length, question: r.data.project.question }));
       // Baseline-only project page: empty Strategies section, the
       // preset Generate button disabled with a plain note, and
       // + Add strategy opens the chooser.

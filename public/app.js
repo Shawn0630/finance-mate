@@ -11748,6 +11748,9 @@ function openPlanProjectModal(existing, catCtx) {
   $('#planProjectModalTitle').textContent = existing ? 'Edit project' : 'Add project';
   $('#planProjectPropertyRow').classList.add('hidden');
   $('#planProjectAccountRow').classList.add('hidden');
+  // Creation asks for a name only (user 2026-11-06): the Question
+  // field is hidden here and shown only in edit mode below.
+  $('#planProjectQuestionRow').classList.add('hidden');
   const catRow = $('#planProjectCategoryRow');
   const aiBtn = $('#planAiCreateBtn');
   catRow.classList.add('hidden');
@@ -11768,6 +11771,7 @@ function openPlanProjectModal(existing, catCtx) {
   if (existing) {
     form.name.value = existing.name;
     form.question.value = existing.question || '';
+    $('#planProjectQuestionRow').classList.remove('hidden');
     $('#planProjectSaveBtn').textContent = 'Save';
   } else if (catCtx) {
     form.dataset.planCategory = catCtx.category;
