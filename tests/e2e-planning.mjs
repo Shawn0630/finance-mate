@@ -1607,19 +1607,37 @@ export async function run(H, S) {
           && chartsAfter1.some((c) => c.title === 'Follow-up balance')
           && chartsAfter1.some((c) => c.title === 'Follow-up headlines'),
         JSON.stringify(chartsAfter1));
-      // metric_cards is the headline, never a chart panel — so only
-      // the time_line chart renders as a block. Wait for the
-      // post-Apply reload before reading the DOM (the Applied ✓
-      // button flips before the reload finishes).
+      // The appended metric_cards chart renders as a chart panel
+      // (user 2026-11-06): only the definition's 'Headlines' block
+      // is skipped. Wait for the post-Apply reload before reading
+      // the DOM (the Applied ✓ button flips before the reload
+      // finishes).
       await page.waitForFunction(() => {
         const titles = [...document.querySelectorAll('#planReport [data-plan-report-block]')]
           .map((el) => ({ block: el.dataset.planReportBlock, title: el.querySelector('.section-head h3')?.textContent || '' }))
           .filter((x) => /^\d+$/.test(x.block)).map((x) => x.title);
-        return JSON.stringify(titles) === JSON.stringify(['Follow-up balance']);
+        return JSON.stringify(titles) === JSON.stringify(['Follow-up balance', 'Follow-up headlines']);
       }, { timeout: 15000 });
       H.check('aichat: appended charts land at the END of the report charts (DOM order)',
-        JSON.stringify(await chartOrder()) === JSON.stringify(['Follow-up balance']),
+        JSON.stringify(await chartOrder()) === JSON.stringify(['Follow-up balance', 'Follow-up headlines']),
         JSON.stringify(await chartOrder()));
+      // The appended metric_cards panel draws its cards + table:
+      // one pinned strategy × three series (cost/gain/net) = three
+      // cards, one table row.
+      const mcPanel = await page.evaluate(() => {
+        const blocks = [...document.querySelectorAll('#planReport [data-plan-report-block]')].filter((el) => /^\d+$/.test(el.dataset.planReportBlock));
+        const blk = blocks.find((el) => el.querySelector('.section-head h3')?.textContent === 'Follow-up headlines');
+        if (!blk) return null;
+        return {
+          cards: blk.querySelectorAll('.plan-metric-card').length,
+          rows: blk.querySelectorAll('table.tbl tbody tr').length,
+          head: [...blk.querySelectorAll('table.tbl thead th')].map((th) => th.textContent.trim()),
+        };
+      });
+      H.check('aichat: appended metric_cards chart renders cards + table (user 2026-11-06)',
+        mcPanel && mcPanel.cards === 3 && mcPanel.rows === 1
+          && JSON.stringify(mcPanel.head) === JSON.stringify(['Strategy', 'Total cost', 'Total gain', 'Net benefit']),
+        JSON.stringify(mcPanel));
       // A second Apply on the same turn cannot double-append.
       await page.evaluate(() => document.querySelector('#planReportAiChatThread [data-ai-turn-apply]').click());
       await mbWait(800);
@@ -1664,10 +1682,10 @@ export async function run(H, S) {
         const titles = [...document.querySelectorAll('#planReport [data-plan-report-block]')]
           .map((el) => ({ block: el.dataset.planReportBlock, title: el.querySelector('.section-head h3')?.textContent || '' }))
           .filter((x) => /^\d+$/.test(x.block)).map((x) => x.title);
-        return JSON.stringify(titles) === JSON.stringify(['Follow-up balance', 'Refined yearly']);
+        return JSON.stringify(titles) === JSON.stringify(['Follow-up balance', 'Follow-up headlines', 'Refined yearly']);
       }, { timeout: 15000 });
       H.check('aichat: appended chart is the last chart panel in the report',
-        JSON.stringify(await chartOrder()) === JSON.stringify(['Follow-up balance', 'Refined yearly']),
+        JSON.stringify(await chartOrder()) === JSON.stringify(['Follow-up balance', 'Follow-up headlines', 'Refined yearly']),
         JSON.stringify(await chartOrder()));
       // Turn 3 proposed but never Applied: navigating to the project
       // page and back (same SPA session, no reload) keeps the thread
@@ -9831,7 +9849,7 @@ export async function run(H, S) {
       // Sticky tab bar + floating report outline (user 13:57/13:59):
       // a fresh report so the block-delete pin below mutates nothing
       // any other check depends on.
-      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Sticky outline report', definition: { strategies: [fStratId], charts: [{ template: 'time_line', title: 'Sticky balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Sticky headlines', series: ['cost', 'gain', 'net'] }] }, strategy_ids: [fStratId], baseline_id: fBaseId, scenario_ids: [fScenId] });
+      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Sticky outline report', definition: { strategies: [fStratId], charts: [{ template: 'time_line', title: 'Sticky balance', series: ['mortgage_balance'] }, { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'] }] }, strategy_ids: [fStratId], baseline_id: fBaseId, scenario_ids: [fScenId] });
       H.check('reportsticky: fresh report created for sticky/outline pins', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
       const stRepId = r.data.report.id;
       await page.goto(`http://ff.local/#planning/report/${fProjectId}/${stRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
@@ -9950,7 +9968,7 @@ export async function run(H, S) {
       await page.setViewport({ width: 1500, height: 900 });
       await waitF(800);
       await page.evaluate((id) => { document.querySelector(`[data-plan-report-view="${id}"]`).click(); }, stRepId);
-      // The metric_cards block ('Sticky headlines') never renders as
+      // The metric_cards block ('Headlines') never renders as
       // a block — it IS the Headline section now — so wait for the
       // tab itself, which is what this pin asserts.
       await page.waitForFunction((id) => !!document.querySelector(`[data-plan-report-tab="${id}"]`), { timeout: 30000 }, stRepId);
@@ -10208,6 +10226,59 @@ export async function run(H, S) {
       await openCard(genRep.id, 'Headline');
       const blocksReopen = await page.evaluate(() => [...document.querySelectorAll('[data-plan-report-block] h3')].map((h) => h.textContent));
       H.check('reporttab: deleted block stays gone after close + reopen', blocksReopen.length === 4 && !blocksReopen.includes('Mortgage balance') && blocksReopen.includes('Headline'), JSON.stringify(blocksReopen));
+      // Headline metric_cards skip + delete index (user 2026-11-06):
+      // the definition's 'Headlines' block never renders as a chart
+      // panel, an appended metric_cards block does, and Block Delete
+      // removes the chart the panel shows (chart index, not panel
+      // position). The flow page already accepts confirm dialogs
+      // (registered at the top of this section), so no new handler.
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const genDefBefore = ((r.data.reports || []).find((x) => x.id === genRep.id) || {}).definition || {};
+      const skipCharts = [
+        { template: 'time_line', title: 'Mortgage balance', series: ['mortgage_balance'], method: 'Outstanding principal by month from the engine projection.' },
+        { template: 'metric_cards', title: 'Headlines', series: ['cost', 'gain', 'net'], method: 'Headline figures for the selected strategy.' },
+        { template: 'metric_cards', title: 'Appended cards', series: ['net', 'monthly_payment'], method: 'Net benefit and monthly payment change vs baseline, per strategy.' },
+      ];
+      r = await H.req('PUT', `/api/planning/reports/${genRep.id}`, { definition: { ...genDefBefore, charts: skipCharts } });
+      H.check('reporttab: seed a Headlines + appended metric_cards definition',
+        r.status === 200, JSON.stringify(r.data));
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await waitF(1500);
+      await openCard(genRep.id, 'Mortgage balance');
+      const skipState = await page.evaluate(() => {
+        const blocks = [...document.querySelectorAll('#planReport [data-plan-report-block]')].filter((el) => /^\d+$/.test(el.dataset.planReportBlock));
+        const titles = blocks.map((el) => el.querySelector('.section-head h3')?.textContent || '');
+        const app = blocks.find((el) => el.querySelector('.section-head h3')?.textContent === 'Appended cards');
+        return {
+          titles,
+          headlineBlocks: document.querySelectorAll('[data-plan-report-block="headline"]').length,
+          hasHeadlinesH3: [...document.querySelectorAll('#planReport [data-plan-report-block] h3')].some((h) => h.textContent === 'Headlines'),
+          appCards: app ? app.querySelectorAll('.plan-metric-card').length : -1,
+          appRows: app ? app.querySelectorAll('table.tbl tbody tr').length : -1,
+          appDel: app ? app.querySelector('[data-plan-report-block-del]')?.dataset.planReportBlockDel : null,
+          appBlock: app ? app.dataset.planReportBlock : null,
+        };
+      });
+      H.check('reporttab: Headlines block stays hidden, appended metric_cards renders with chart-index delete (user 2026-11-06)',
+        JSON.stringify(skipState.titles) === JSON.stringify(['Mortgage balance', 'Appended cards'])
+          && skipState.headlineBlocks === 1 && skipState.hasHeadlinesH3 === false
+          && skipState.appCards === 2 && skipState.appRows === 1
+          && skipState.appDel === '2' && skipState.appBlock === '2',
+        JSON.stringify(skipState));
+      // Deleting the appended panel removes THAT chart: the saved
+      // definition goes back to [Mortgage balance, Headlines].
+      await page.evaluate((s) => { document.querySelector(s).click(); }, '[data-plan-report-block-del="2"]');
+      await page.waitForFunction(() => {
+        const titles = [...document.querySelectorAll('#planReport [data-plan-report-block]')]
+          .map((el) => ({ block: el.dataset.planReportBlock, title: el.querySelector('.section-head h3')?.textContent || '' }))
+          .filter((x) => /^\d+$/.test(x.block)).map((x) => x.title);
+        return JSON.stringify(titles) === JSON.stringify(['Mortgage balance']);
+      }, { timeout: 15000 });
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const genDefAfter = ((r.data.reports || []).find((x) => x.id === genRep.id) || {}).definition || {};
+      H.check('reporttab: deleting the appended metric_cards panel removes the appended chart only',
+        JSON.stringify((genDefAfter.charts || []).map((c) => c.title)) === JSON.stringify(['Mortgage balance', 'Headlines']),
+        JSON.stringify(genDefAfter.charts));
       // Polish: quiet defs note + subtitle + metric cards + current tab wrap.
       // The metric_cards block is the Headline section now, so the
       // count is the headline's 8 cards (property project, no Stock
@@ -10220,6 +10291,60 @@ export async function run(H, S) {
       }));
       H.check('reporttab: polished elements render (quiet defs note, subtitle, metric cards, current tab wrap)',
         polish.defs && polish.subtitle && polish.metric === 8 && polish.currentWrap, JSON.stringify(polish));
+      // Headline strategy-chip highlight (user 2026-11-06): the
+      // selected chip carries the active blue; clicking another chip
+      // moves the highlight and re-renders the headline cards for
+      // that strategy. Needs a report pinning TWO strategies, so a
+      // fresh one is created (reusing genRep's charts + scenario
+      // pins — a scenario-less pin would 400 on this project).
+      r = await H.req('GET', `/api/planning/projects/${fProjectId}`);
+      const chipSrc = (r.data.reports || []).find((x) => x.id === genRep.id) || {};
+      const chipDef = chipSrc.definition || {};
+      let chipScens = [];
+      try { chipScens = typeof chipSrc.scenario_ids === 'string' ? JSON.parse(chipSrc.scenario_ids) : (chipSrc.scenario_ids || []); } catch { chipScens = []; }
+      r = await H.req('POST', `/api/planning/projects/${fProjectId}/reports`, { name: 'Chip highlight report', definition: { ...(chipDef || {}), strategies: [fStratId, fAiStratId], charts: (chipDef.charts || []) }, strategy_ids: [fStratId, fAiStratId], scenario_ids: chipScens });
+      const chipRepId = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+      H.check('reporttab: chip-highlight fixture report created',
+        r.status === 201 && chipRepId > 0, JSON.stringify(r.data));
+      await page.goto(`http://ff.local/#planning/report/${fProjectId}/${chipRepId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await page.waitForFunction(() => document.querySelectorAll('[data-plan-report-headline-strategy]').length === 2, { timeout: 15000 });
+      const chipBefore = await page.evaluate(() => {
+        const chips = [...document.querySelectorAll('[data-plan-report-headline-strategy]')];
+        const bg = (el) => getComputedStyle(el).backgroundColor;
+        return {
+          texts: chips.map((c) => c.textContent.trim()),
+          active: chips.map((c) => c.classList.contains('active')),
+          bgs: chips.map(bg),
+          firstCardN: document.querySelector('#planReportHeadlineCards .plan-metric-card .n')?.textContent.trim() || '',
+        };
+      });
+      H.check('reporttab: selected headline chip is highlighted blue, the other is not (user 2026-11-06)',
+        chipBefore.texts.length === 2 && chipBefore.active[0] === true && chipBefore.active[1] === false
+          && chipBefore.bgs[0] === 'rgb(22, 104, 196)' && chipBefore.bgs[1] !== 'rgb(22, 104, 196)'
+          && chipBefore.firstCardN === chipBefore.texts[0],
+        JSON.stringify(chipBefore));
+      // Click the second chip: the highlight moves and the headline
+      // cards re-render for that strategy.
+      await page.evaluate(() => { document.querySelectorAll('[data-plan-report-headline-strategy]')[1].click(); });
+      await page.waitForFunction(() => {
+        const chips = [...document.querySelectorAll('[data-plan-report-headline-strategy]')];
+        return chips.length === 2 && !chips[0].classList.contains('active') && chips[1].classList.contains('active');
+      }, { timeout: 15000 });
+      const chipAfter = await page.evaluate(() => {
+        const chips = [...document.querySelectorAll('[data-plan-report-headline-strategy]')];
+        const bg = (el) => getComputedStyle(el).backgroundColor;
+        return {
+          active: chips.map((c) => c.classList.contains('active')),
+          bgs: chips.map(bg),
+          firstCardN: document.querySelector('#planReportHeadlineCards .plan-metric-card .n')?.textContent.trim() || '',
+          secondText: chips[1].textContent.trim(),
+        };
+      });
+      H.check('reporttab: clicking another headline chip moves the highlight and re-renders the cards for that strategy',
+        chipAfter.active[0] === false && chipAfter.active[1] === true
+          && chipAfter.bgs[1] === 'rgb(22, 104, 196)' && chipAfter.bgs[0] !== 'rgb(22, 104, 196)'
+          && chipAfter.firstCardN === chipAfter.secondText,
+        JSON.stringify(chipAfter));
       // Per-tab Save triggers the browser print/export path.
       await page.evaluate(() => { window.__printCalled = false; window.print = () => { window.__printCalled = true; }; });
       await page.evaluate((s) => { document.querySelector(s).click(); }, '#planReportTabSaveBtn');

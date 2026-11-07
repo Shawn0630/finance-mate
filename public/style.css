@@ -585,6 +585,10 @@ table.seg-table td:last-child { text-align: right; }
 .plan-cell-delta { font-size: 0.85em; opacity: 0.75; }
 /* Comparison picker chips: checked = highlighted. */
 .plan-pick-chip.active { background: #1668c4; color: #fff; border-color: #1668c4; }
+/* Headline strategy chips: the selected chip is highlighted
+   (user 2026-11-06). Scoped to the headline chips only, so no
+   other small button changes appearance. */
+[data-plan-report-headline-strategy].active { background: #1668c4; color: #fff; border-color: #1668c4; }
 .plan-year-head td { font-weight: 700; background: #f2f2f2; }
 .plan-year-total td { font-weight: 700; border-top: 2px solid #ccc; }
 

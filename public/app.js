@@ -14501,13 +14501,28 @@ async function loadPlanReport(projectId, reportId) {
     const monthIndex = new Map(months.map((m, i) => [m, i]));
     const seriesAt = (traj, sid) => (traj.monthly || []).map((r) => r[sid] ?? null);
     const panels = [];
+    const panelChartIdx = []; // rendered panel i shows definition chart panelChartIdx[i]
     const draws = [];
+    // The headline block of a report definition (user 2026-11-06):
+    // the preset signature { template: 'metric_cards', title:
+    // 'Headlines', series: ['cost', 'gain', 'net'] }. The headline
+    // section renders the fixed card set for the selected strategy,
+    // so this block never renders as a chart panel. Any OTHER
+    // metric_cards block is a real chart — an AI add / refine — and
+    // renders via the metric_cards branch below. Series order does
+    // not matter; a block with this title and a different series
+    // is a distinct chart and renders.
+    const isHeadlineCards = (c) => c.template === 'metric_cards' && c.title === 'Headlines'
+      && Array.isArray(c.series) && c.series.length === 3
+      && ['cost', 'gain', 'net'].every((s) => c.series.includes(s));
     charts.forEach((c, i) => {
-      // metric_cards blocks are the headline now (item 9) — the
-      // headline section renders the fixed card set for the selected
-      // strategy, so the definition's metric_cards block never
-      // renders twice.
-      if (c.template === 'metric_cards') return;
+      // A rendered panel keeps its definition chart index, so Block
+      // Delete removes the chart it shows: skipped blocks (the
+      // headline above, mortgage-only blocks under a pool template)
+      // leave gaps in the panel sequence, and a panel index would
+      // point at the wrong chart.
+      const pushPanel = (html) => { panels.push(html); panelChartIdx.push(i); };
+      if (isHeadlineCards(c)) return;
       const series = (c.series && c.series.length ? c.series : null);
       // Mortgage-only blocks hide under a template without mortgage
       // charts (the pool template). A block with any non-mortgage series
@@ -14541,7 +14556,7 @@ async function loadPlanReport(projectId, reportId) {
             return `<td>${v == null ? '—' : money2(v)}</td>`;
           }).join('')}</tr>`;
         }).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
         draws.push(() => planLineChart(cid, months, datasets));
         planReportView.aiCharts.push({ cid, kind: 'line', labels: months, datasets });
       } else if (c.template === 'metric_cards') {
@@ -14551,7 +14566,7 @@ async function loadPlanReport(projectId, reportId) {
         const cards = comp.strategies.map((row) => `<div class="cards">${sids.map((sid) => `<div class="card breakdown-card plan-metric-card"><div class="k">${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</div><div class="v">${fmt(sid, valOf(row, sid))}</div><div class="n">${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</div></div>`).join('')}</div>`).join('') || '<div class="note">No strategies yet.</div>';
         const head = `<tr><th>Strategy</th>${sids.map((sid) => `<th>${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)}</th>`).join('')}</tr>`;
         const body = comp.strategies.map((row) => `<tr><td>${esc(row.strategy.letter)} · ${esc(row.strategy.name)}</td>${sids.map((sid) => `<td>${fmt(sid, valOf(row, sid))}</td>`).join('')}</tr>`).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${cards}<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${cards}<table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">${esc(how)}</div></div>`);
       } else if (c.template === 'yearly_bars') {
         const sid = (series && series[0]) || 'mortgage_balance';
         const yearOf = (m) => m.slice(0, 4);
@@ -14564,7 +14579,7 @@ async function loadPlanReport(projectId, reportId) {
         const datasets = trajs.map((t, ti) => ({ label: t.label, data: yearEnd(t), backgroundColor: ti === 0 ? '#888' : planColor(ti - 1) }));
         const head = `<tr><th>Year</th>${trajs.map((t) => `<th>${esc(t.label)}</th>`).join('')}</tr>`;
         const body = years.map((y, yi) => `<tr><td>${y}</td>${datasets.map((d) => `<td>${d.data[yi] == null ? '—' : money2(d.data[yi])}</td>`).join('')}</tr>`).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: year · Y: year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} (CAD), baseline vs each strategy. ${esc(how)}</div></div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: year · Y: year-end ${esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)} (CAD), baseline vs each strategy. ${esc(how)}</div></div>`);
         draws.push(() => planGroupedBarChart(cid, years, datasets));
         planReportView.aiCharts.push({ cid, kind: 'groupedBar', labels: years, labelMonths: years.map((y) => months.filter((m) => m.startsWith(`${y}-`)).pop() || `${y}-12`), datasets });
       } else if (c.template === 'stacked_bar') {
@@ -14593,14 +14608,14 @@ async function loadPlanReport(projectId, reportId) {
         // (that used to draw as all-$0.00). Genuine zeros still render:
         // only all-null counts as absent, a present 0 stays a 0.
         if (!datasets.some((d) => d.data.some((v) => v != null))) {
-          panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no data for this chart in this project.</div></div>`);
+          pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no data for this chart in this project.</div></div>`);
         } else {
         const totals = months.map((m, mi) => datasets.reduce((s, d) => s + (d.data[mi] || 0), 0));
         datasets.push({ label: 'Total', data: totals, type: 'line', borderColor: '#22303c', backgroundColor: '#22303c', fill: false, pointRadius: 0 });
         const snapIdx = planReportYearRows(baseTraj.monthly).map((r) => monthIndex.get(r.month));
         const head = `<tr><th>Month</th>${datasets.map((d) => `<th>${esc(d.label)}</th>`).join('')}</tr>`;
         const body = snapIdx.map((mi) => `<tr><td>${months[mi]}</td>${datasets.map((d) => `<td>${d.data[mi] == null ? '—' : money2(d.data[mi])}</td>`).join('')}</tr>`).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline and strategies share the same prime history. ${esc(how)}</div></div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead>${head}</thead><tbody>${body}</tbody></table><div class="note">X: month · Y: CAD (stacked). Baseline outstanding principal stacked by property${sids.includes('stock_value') ? ' plus stock value' : ''}; total line = stack sum. Baseline and strategies share the same prime history. ${esc(how)}</div></div>`);
         draws.push(() => planBarChart(cid, months, datasets));
         planReportView.aiCharts.push({ cid, kind: 'bar', labels: months, datasets });
         }
@@ -14622,10 +14637,10 @@ async function loadPlanReport(projectId, reportId) {
             const total = (bd.fees || 0) + (hasPenaltyVar ? (penVar || 0) : 0) + (bd.cashOut || 0);
             const body = planReportCostBodyHtml(bd.fees, penVar, bd.cashOut, hasPenaltyVar);
             planReportView.costDoughnut = { strategyId: row.strategy.id, fees: bd.fees, cashOut: bd.cashOut };
-            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Component</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planReportCostBody">${body}</tbody></table><div class="note">Cost breakdown for ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost = fees + ${hasPenaltyVar ? 'penalty + ' : ''}cash out (prepay cash + buy cash).${hasPenaltyVar ? ' Penalty is a report variable (default $0) — it changes cost and net only.' : ''}</div></div>`);
+            pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Component</th><th>Amount</th><th>Share</th></tr></thead><tbody id="planReportCostBody">${body}</tbody></table><div class="note">Cost breakdown for ${esc(row.strategy.letter)} · ${esc(row.strategy.name)}: cost = fees + ${hasPenaltyVar ? 'penalty + ' : ''}cash out (prepay cash + buy cash).${hasPenaltyVar ? ' Penalty is a report variable (default $0) — it changes cost and net only.' : ''}</div></div>`);
             draws.push(() => planDoughnutChart(cid, labels, data, 'Total cost', total));
           } else {
-            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no strategy cost breakdown available.</div></div>`);
+            pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no strategy cost breakdown available.</div></div>`);
           }
         } else if (series && (series.includes('mortgage_balance') || series.includes('total_value'))) {
           const base = comp.baseline;
@@ -14641,13 +14656,13 @@ async function loadPlanReport(projectId, reportId) {
           if (segs.length) {
             const total = segs.reduce((s, x) => s + x.value, 0);
             const body = segs.map((x) => `<tr><td>${esc(x.label)}</td><td>${money2(x.value)}</td><td>${total ? `${((x.value / total) * 100).toFixed(1)}%` : '—'}</td></tr>`).join('');
-            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Property</th><th>Equity at horizon</th><th>Share</th></tr></thead><tbody>${body}</tbody></table><div class="note">Each property's equity at the horizon month (assessed value − outstanding principal, baseline trajectory); center = total equity. Assessed value is the current roll, held flat across months.</div></div>`);
+            pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><table class="tbl"><thead><tr><th>Property</th><th>Equity at horizon</th><th>Share</th></tr></thead><tbody>${body}</tbody></table><div class="note">Each property's equity at the horizon month (assessed value − outstanding principal, baseline trajectory); center = total equity. Assessed value is the current roll, held flat across months.</div></div>`);
             draws.push(() => planDoughnutChart(cid, segs.map((x) => x.label), segs.map((x) => x.value), 'Total equity', total));
           } else {
-            panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no positive property equity at the horizon month.</div></div>`);
+            pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: no positive property equity at the horizon month.</div></div>`);
           }
         } else {
-          panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: share doughnut needs a property value series (mortgage_balance / total_value) or cost.</div></div>`);
+          pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: share doughnut needs a property value series (mortgage_balance / total_value) or cost.</div></div>`);
         }
       } else if (c.template === 'fan_band') {
         // Two fans share this template, split by baseline kind: a
@@ -14683,7 +14698,7 @@ async function loadPlanReport(projectId, reportId) {
           }).join('');
           const noFanNotes = (stockFan.noFan || []).map((nf) => `<div class="note">${esc(nf.symbol)}: no volatility fan — ${nf.reason === 'no usable price history' ? 'not enough price history (needs at least 2 monthly returns)' : esc(nf.reason)}.</div>`).join('');
           const emptyNote = (!stockFan.fans.length && !stockFan.noFan.length) ? '<div class="note">No volatility fan: this project holds no stocks.</div>' : '';
-          panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${fanBlocks}${noFanNotes}${emptyNote}</div>`);
+          pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${fanBlocks}${noFanNotes}${emptyNote}</div>`);
         } else {
         const blocks = comp.strategies.map((row) => {
           const table = fanData[row.strategy.id] || [];
@@ -14703,12 +14718,12 @@ async function loadPlanReport(projectId, reportId) {
           const sbody = table.map((r) => `<tr><td>${esc(r.name)}</td><td>${planSigned(r.net)}</td><td>${r.payoffShiftMonths != null ? r.payoffShiftMonths : '—'}</td><td>${planSigned(r.paymentDelta)}</td></tr>`).join('');
           return `<div class="chart-wrap" style="height:240px"><canvas id="${fcid}"></canvas></div><div class="note">X: month · Y: mortgage balance (CAD) across scenarios.</div><table class="tbl"><thead><tr><th>Scenario</th><th>Net</th><th>Payoff shift</th><th>Payment Δ</th></tr></thead><tbody>${sbody}</tbody></table>`;
         }).join('');
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}</div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div>${blocks}</div>`);
         }
       } else if (c.template === 'funds_flow') {
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Funds flow diagram — not rendered yet.</div></div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Funds flow diagram — not rendered yet.</div></div>`);
       } else {
-        panels.push(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: unknown template ${esc(c.template)}.</div></div>`);
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: unknown template ${esc(c.template)}.</div></div>`);
       }
     });
     // World label for the header: every pinned scenario by name, or
@@ -14739,7 +14754,10 @@ async function loadPlanReport(projectId, reportId) {
         ${planHeadlineWindowHtml(planReportView)}
         <div id="planReportHeadlineCards">${planReportHeadlineCardsHtml(planReportView)}</div>
       </div></div>`,
-      charts: panels.map((p, i) => `<div data-plan-report-block="${i}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${i}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>',
+      // Block identity is the definition chart index, not the
+      // panel position: a skipped block leaves a gap, and Block
+      // Delete splices definition.charts by this index.
+      charts: panels.map((p, i) => `<div data-plan-report-block="${panelChartIdx[i]}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${panelChartIdx[i]}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>',
       comparison: `<div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
