@@ -1119,12 +1119,30 @@ $('#addPropForm').addEventListener('submit', async (e) => {
 // editing a flagged field by hand removes its flag at once. The
 // flags ride along on the form's own Save (ai_fields) and are
 // re-rendered from the server on load. A term form's panel also
-// fills the term's segment form (segment_* keys).
+// fills the term's segment form (segment_* keys): when the fill
+// returns rate fields, the segment form opens with them — a hidden
+// form made the fill look as if it had done nothing — and on a
+// fresh (add-mode) segment form the render defaults do not count
+// as hand-filled, so the fill can set the rate type and mode; a
+// field the user typed by hand is still never overwritten.
 const aiFlagSets = new WeakMap();
 
 function aiFlagSet(form) {
   let s = aiFlagSets.get(form);
   if (!s) { s = new Set(); aiFlagSets.set(form, s); }
+  return s;
+}
+
+// Fields the user has typed into by hand (not by an AI fill, not
+// by a draft restore): the kept rule needs this for the segment
+// form, whose add-mode values are render prefill, not user input
+// — its start date is the term's start, its selects sit on their
+// first options. Without it an AI fill could never switch a fresh
+// segment to variable, because the select already holds a value.
+const aiTouchedSets = new WeakMap();
+function aiTouchedSet(form) {
+  let s = aiTouchedSets.get(form);
+  if (!s) { s = new Set(); aiTouchedSets.set(form, s); }
   return s;
 }
 
@@ -1167,6 +1185,7 @@ function clearAiFlagOnEdit(e) {
   if (!t || !t.name) return;
   const form = t.form || t.closest('form');
   if (!form || form._aiFilling) return;
+  aiTouchedSet(form).add(t.name);
   const set = aiFlagSets.get(form);
   if (set && set.delete(t.name)) renderAiFlags(form);
 }
@@ -1177,7 +1196,14 @@ function fillOneInput(form, name, value) {
   const input = fieldInputOf(form, name);
   if (!input) return 'missing';
   const set = aiFlagSet(form);
-  if (input.value !== '' && input.value != null && !set.has(name)) return 'kept';
+  // A segment form in add mode holds render defaults, not user
+  // input — an AI fill may overwrite a default the user never
+  // touched, but never a field typed by hand (or restored from a
+  // hand-typed draft). In edit mode, and on every other form, the
+  // values are saved data, so the kept rule stands as-is.
+  const segAddMode = form.dataset.segForm != null && !form.dataset.editSeg;
+  if (input.value !== '' && input.value != null && !set.has(name)
+    && !(segAddMode && !aiTouchedSet(form).has(name))) return 'kept';
   form._aiFilling = true;
   input.value = value;
   input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1200,6 +1226,8 @@ function fillOneInput(form, name, value) {
 function applyAiFields(form, fields, extras = {}) {
   let filled = 0;
   let kept = 0;
+  let dropped = 0;
+  let segFormSeen = null;
   const tally = (r) => { if (r === 'filled') filled += 1; else if (r === 'kept') kept += 1; };
   for (const [key, value] of Object.entries(fields || {})) {
     if (key === 'owners' && extras.ownersPicker) {
@@ -1212,15 +1240,41 @@ function applyAiFields(form, fields, extras = {}) {
       filled += 1;
       continue;
     }
-    if (key.startsWith('segment_') && extras.segForm) {
-      tally(fillOneInput(extras.segForm, key.slice('segment_'.length), value));
+    if (key.startsWith('segment_')) {
+      // The segment form is re-resolved at fill time, not only
+      // from the wiring snapshot: the term block re-renders on
+      // every load, and the form on screen now is the one to fill.
+      // Every term block renders its segment form (hidden until
+      // opened), so a missing form means the block itself is gone
+      // — that field is counted as dropped, never silently lost.
+      const segForm = (extras.segForm && extras.segForm.isConnected)
+        ? extras.segForm
+        : form.closest('.term-block')?.querySelector('[data-seg-form]');
+      if (segForm) {
+        if (!segFormSeen) segFormSeen = segForm;
+        tally(fillOneInput(segForm, key.slice('segment_'.length), value));
+      } else {
+        dropped += 1;
+      }
       continue;
     }
     tally(fillOneInput(form, key, value));
   }
+  // A fill that carried rate fields opens the term's segment form
+  // with them — the rate is the point of the fill, and a hidden
+  // form made it look as if nothing had been filled. The form
+  // opens as the add draft unless it is already editing a saved
+  // segment; its visibility follows the fill, not the toggle.
+  if (segFormSeen) {
+    segFormSeen.classList.remove('hidden');
+    syncSegForm(segFormSeen);
+    refreshPlanPreview(segFormSeen);
+    renderAiFlags(segFormSeen);
+  } else if (extras.segForm) {
+    renderAiFlags(extras.segForm);
+  }
   renderAiFlags(form);
-  if (extras.segForm) renderAiFlags(extras.segForm);
-  return { filled, kept };
+  return { filled, kept, dropped };
 }
 
 // The server's AI configuration (configured models + the
@@ -1307,8 +1361,8 @@ function attachAiFill(form, context, extras = {}) {
       }
       const r = await api('/api/ai/fill', { method: 'POST', body });
       if (body.model && aiConfigCache) aiConfigCache.model = body.model;
-      const { filled, kept } = applyAiFields(form, r.fields || {}, extras);
-      summary.textContent = `Filled ${filled} field${filled === 1 ? '' : 's'}${kept ? ` · ${kept} kept` : ''}`;
+      const { filled, kept, dropped } = applyAiFields(form, r.fields || {}, extras);
+      summary.textContent = `Filled ${filled} field${filled === 1 ? '' : 's'}${kept ? ` · ${kept} kept` : ''}${dropped ? ` · ${dropped} not placed` : ''}`;
       summary.classList.remove('hidden');
       panel.classList.add('hidden');
     } catch (err) {
@@ -1354,7 +1408,10 @@ function captureFormDrafts() {
       const payInput = pb.querySelector('[data-pay-edit-input]');
       payOpen = !!payInput && !payInput.classList.contains('hidden');
     }
-    return { fields, flags: [...(aiFlagSets.get(form) || [])], payOpen };
+    // The fields the user typed by hand travel with the draft, so
+    // a restore does not turn hand input back into a render
+    // default the next AI fill may overwrite (see fillOneInput).
+    return { fields, flags: [...(aiFlagSets.get(form) || [])], touched: [...(aiTouchedSets.get(form) || [])], payOpen };
   };
   const terms = {};
   const segs = {};
@@ -1397,6 +1454,7 @@ function restoreFormDrafts(stash) {
     const set = aiFlagSet(form);
     set.clear();
     draft.flags.forEach((n) => set.add(n));
+    (draft.touched || []).forEach((n) => aiTouchedSet(form).add(n));
     renderAiFlags(form);
     if (payInput && draft.fields && 'payment_override' in draft.fields) {
       const cents = (x) => (x === '' || x == null ? null : Math.round(Number(x) * 100));

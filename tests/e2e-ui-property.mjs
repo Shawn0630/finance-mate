@@ -5586,6 +5586,118 @@ export async function run(H, S) {
         if (pretaxRrspId) await H.req('DELETE', `/api/investments/accounts/${pretaxRrspId}`);
         if (pretaxJobId) await H.req('DELETE', `/api/earnings/jobs/${pretaxJobId}`);
       }
+      // ---- Term AI Fill: rate fields land in the segment form ----
+      // A term with no rate segment yet: Extract must open the
+      // segment form with the returned rate filled in (before this
+      // fix the form stayed hidden, and its render defaults —
+      // Fixed, the term's start date, Semi-annual — counted as
+      // hand-filled, so a variable segment could never be set up
+      // by the fill at all). A hand-edited field is still kept,
+      // and the summary counts the segment fields filled.
+      let aiFillPid = null;
+      try {
+        const aiSetStub = (fields) => fs.writeFileSync(H.aiStubFile, JSON.stringify({ fields }));
+        const aiSegState = () => page.evaluate(() => {
+          const seg = document.querySelector('[data-seg-form]');
+          if (!seg) return null;
+          return {
+            visible: !seg.classList.contains('hidden'),
+            start_date: seg.start_date.value,
+            rate_type: seg.rate_type.value,
+            rate_mode: seg.rate_mode.value,
+            annual_rate: seg.annual_rate.value,
+            spread: seg.spread.value,
+            compounding: seg.compounding.value,
+            modeVisible: !seg.querySelector('[data-seg-mode]').classList.contains('hidden'),
+            spreadVisible: !seg.querySelector('[data-seg-spread]').classList.contains('hidden'),
+            rateVisible: !seg.querySelector('[data-seg-rate]').classList.contains('hidden'),
+            flags: seg.querySelectorAll('.ai-flag').length,
+          };
+        });
+        const aiSummary = () => page.evaluate(() => {
+          const s = document.querySelector('[data-term-form] [data-ai-summary]');
+          return s ? s.textContent : null;
+        });
+        const aiExtract = async (text) => {
+          await page.evaluate(() => {
+            const panel = document.querySelector('[data-term-form] [data-ai-panel]');
+            if (panel && panel.classList.contains('hidden')) document.querySelector('[data-term-form] [data-ai-toggle]').click();
+            const s = document.querySelector('[data-term-form] [data-ai-summary]');
+            if (s) { s.textContent = ''; s.classList.add('hidden'); }
+          });
+          await wait(200);
+          await page.evaluate((t) => { document.querySelector('[data-term-form] [data-ai-text]').value = t; }, text);
+          await page.evaluate(() => document.querySelector('[data-term-form] [data-ai-extract]').click());
+          await until(() => {
+            const s = document.querySelector('[data-term-form] [data-ai-summary]');
+            return s && !s.classList.contains('hidden') && s.textContent.includes('Filled');
+          });
+        };
+        r = await H.req('POST', '/api/properties', { address: '9 AI Fill Segment Close, Victoria, BC', purchase_date: '2026-01-15' });
+        aiFillPid = r.data && r.data.id;
+        H.check('ai-fill segment: fixture property created', aiFillPid != null, JSON.stringify(r.data));
+        r = await H.req('POST', `/api/properties/${aiFillPid}/terms`, {
+          lender: 'RBC', start_date: '2026-01-15', term_months: 60, amortization_years: 25,
+          opening_balance: 500000, payment_frequency: 'monthly', repayment_method: 'equal_payment',
+        });
+        H.check('ai-fill segment: term with no segments created', !!(r.data && r.data.id), JSON.stringify(r.data));
+        await page.goto(`http://ff.local/#property/${aiFillPid}`, { waitUntil: 'networkidle0', timeout: 30000 });
+        await wait(1600);
+        await page.evaluate(() => document.querySelector('#openMortgageBtn').click());
+        await wait(500);
+        await page.evaluate(() => {
+          const body = document.querySelector('.term-body');
+          if (body && body.classList.contains('hidden')) document.querySelector('[data-term-toggle]').click();
+        });
+        await wait(300);
+        H.check('ai-fill segment: the term carries an AI Fill panel and its segment form starts hidden',
+          await page.evaluate(() => !!document.querySelector('[data-term-form] [data-ai-toggle]')
+            && !!document.querySelector('[data-seg-form]')
+            && document.querySelector('[data-seg-form]').classList.contains('hidden')));
+        // Order 1: Extract with the segment form still closed — the
+        // fill opens it with the variable prime-spread rate filled.
+        aiSetStub({
+          segment_start_date: '2026-04-27', segment_rate_type: 'variable',
+          segment_rate_mode: 'prime_spread', segment_spread: -0.8, segment_compounding: 'monthly',
+        });
+        await aiExtract('RBC variable Prime minus 0.80 from April 2026, monthly compounding');
+        const seg1 = await aiSegState();
+        H.check('ai-fill segment: Extract opens the segment form with the variable rate filled (type/mode/spread/start/compounding)',
+          !!seg1 && seg1.visible && seg1.rate_type === 'variable' && seg1.rate_mode === 'prime_spread'
+            && seg1.spread === '-0.8' && seg1.start_date === '2026-04-27' && seg1.compounding === 'monthly'
+            && seg1.modeVisible && seg1.spreadVisible && !seg1.rateVisible,
+          JSON.stringify(seg1));
+        H.check('ai-fill segment: the filled rate fields carry ✨ flags',
+          !!seg1 && seg1.flags >= 4, JSON.stringify(seg1));
+        H.check('ai-fill segment: the summary counts all five segment fields filled',
+          (await aiSummary()) === 'Filled 5 fields', JSON.stringify(await aiSummary()));
+        // Order 2: the form is already open — a hand-edited spread
+        // is kept, the AI-flagged fields still re-fill.
+        await page.evaluate(() => {
+          const seg = document.querySelector('[data-seg-form]');
+          seg.spread.value = '-1.25';
+          seg.spread.dispatchEvent(new Event('input', { bubbles: true }));
+          seg.spread.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        aiSetStub({
+          segment_spread: -0.5, segment_start_date: '2026-05-01', segment_compounding: 'semi_annual',
+        });
+        await aiExtract('RBC variable Prime minus 0.50 from May 2026, semi-annual compounding');
+        const seg2 = await aiSegState();
+        H.check('ai-fill segment: a hand-edited spread is kept while the flagged fields re-fill',
+          !!seg2 && seg2.spread === '-1.25' && seg2.start_date === '2026-05-01' && seg2.compounding === 'semi_annual',
+          JSON.stringify(seg2));
+        H.check('ai-fill segment: the second summary counts the kept field (2 filled · 1 kept)',
+          (await aiSummary()) === 'Filled 2 fields · 1 kept', JSON.stringify(await aiSummary()));
+        // Nothing was saved by either Extract: the property still
+        // has no rate segments until the segment form is submitted.
+        r = await H.req('GET', `/api/properties/${aiFillPid}`);
+        H.check('ai-fill segment: Extract wrote nothing (no segments until Save)',
+          Array.isArray(r.data.segments) && r.data.segments.length === 0, JSON.stringify(r.data.segments));
+      } finally {
+        fs.writeFileSync(H.aiStubFile, JSON.stringify({ fields: {} }));
+        if (aiFillPid != null) await H.req('DELETE', `/api/properties/${aiFillPid}`);
+      }
     } catch (err) {
       // A UI hiccup must surface as failed checks, not crash the suite.
       H.check('money UI browser flow runs to completion', false, String((err && err.message) || err));
