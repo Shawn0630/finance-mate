@@ -13389,7 +13389,7 @@ function openPlanReportAiModal(projectId, opts = {}) {
 const PLAN_REPORT_SERIES_LABEL = {
   mortgage_balance: 'Mortgage balance', stock_value: 'Stock value', total_value: 'Total value', pool_balance: 'Cash pool balance',
   cost: 'Total cost', gain: 'Total gain', net: 'Net benefit', stock_gain: 'Stock gain',
-  payoff_month: 'Payoff shift (months)', monthly_payment: 'Monthly payment Δ',
+  payoff_month: 'Payoff shift (months)', monthly_payment: 'Monthly payment Δ', monthly_net_cashflow: 'Net cash flow',
 };
 const PLAN_REPORT_DEFS_PROPERTY = 'Cost = fees + penalty + cash out. Gain = interest saved vs baseline + asset growth under assumptions. Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
 const PLAN_REPORT_DEFS_POOL = 'Cost = fees + cash out (new cash only — a buy funded by selling the pool is a swap, not new cash). Gain = asset growth vs the baseline trajectory (same return assumption, no ops). Net = gain − cost. New cash put in is cost; the growth it earns is gain — no double count. Baseline is the same project with no operations; every strategy is measured against it.';
@@ -13403,6 +13403,7 @@ const PLAN_REPORT_HOW = {
   net: 'Net = gain − cost. Extra cash is cost; the interest it saves is gain — no double count.',
   payoff_month: 'Payoff shift = baseline payoff month − strategy payoff month, in months (positive = earlier).',
   monthly_payment: 'Monthly payment Δ = strategy payment at effect − baseline payment at effect, summed across properties.',
+  monthly_net_cashflow: 'Net cash flow = baseline monthly payment − strategy monthly payment, minus new cash paid that month (prepay, lump sum, buy) and any penalty in its month. Stock gain is a value change, not cash, and never enters.',
 };
 const PLAN_REPORT_HOW_POOL = {
   cost: 'Cost = fees + cash out (new cash only — a buy funded by selling the pool is a swap, not new cash).',

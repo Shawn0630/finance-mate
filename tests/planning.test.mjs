@@ -8,7 +8,7 @@ import {
   calcPenalty, scenarioPrimeHistory,
   validateOp, validateLegs, computeProjection, compareProjections,
   returnSuggestionsFromPoints, buildMergeWrites, buildRevertInverse,
-  resolveBuyLegs, reportMonthlySeries, reportCostBreakdown,
+  resolveBuyLegs, reportMonthlySeries, reportCostBreakdown, monthlyNetCashflowSeries,
   holdingVolatilityFromPoints, stockFanSeries,
   planProjectTemplate, planProjectSections, planStrategyTemplateLabel, planListSections,
   buildPlanAiSnapshot, normalizeAiAsk,
@@ -923,6 +923,59 @@ test('reportMonthlySeries: cash_out rows ride the trajectory (0 on the baseline,
   assert.equal(noSeries[1].cash_out, 0);
 });
 
+test('reportMonthlySeries: payment sums the engine monthly payment per month', () => {
+  const perProperty = {
+    1: { baseline: { series: [
+      { month: '2026-11', balance: 100000, interest: 400, principal: 600, payment: 1000 },
+      { month: '2026-12', balance: 99000, interest: 395, principal: 605, payment: 1000 },
+    ] } },
+    2: { baseline: { series: [{ month: '2026-11', balance: 50000, interest: 200, principal: 300, payment: 500 }] } },
+  };
+  const rows = reportMonthlySeries(perProperty, 'baseline', [], 500000);
+  assert.equal(rows[0].payment, 1500);
+  assert.equal(rows[1].payment, 1000);
+  // A row without a payment field reads 0, never NaN.
+  const bare = reportMonthlySeries({ 1: { baseline: { series: [{ month: '2026-11', balance: 100000, interest: 400 }] } } }, 'baseline', [], 500000);
+  assert.equal(bare[0].payment, 0);
+});
+
+// Monthly net cash flow (user 2026-11-06): the AI "Net Cash Flow
+// Difference" chart could only be a metric_cards scalar because no
+// monthly cash-flow series existed. Hand-computed rows: baseline
+// pays $7,205.89/mo; a switch to fixed pays $6,722.44/mo from Jan
+// 2027; a $50,000 prepay in Jan 2027 leaves the payment unchanged.
+const ncfRows = () => {
+  const months = ['2026-11', '2026-12', '2027-01', '2027-02', '2027-03'];
+  const base = months.map((m) => ({ month: m, payment: 7205.89, cash_out: 0 }));
+  const fix = months.map((m) => ({ month: m, payment: m >= '2027-01' ? 6722.44 : 7205.89, cash_out: 0 }));
+  const prepay = months.map((m) => ({ month: m, payment: 7205.89, cash_out: m === '2027-01' ? 50000 : 0 }));
+  return { base, fix, prepay };
+};
+test('monthlyNetCashflowSeries: payment saved minus cash out minus penalty month', () => {
+  const { base, fix, prepay } = ncfRows();
+  // Switch to fixed: $0 before the switch, +$483.45/mo from Jan 2027.
+  const a = monthlyNetCashflowSeries(base, fix, []);
+  assert.deepEqual(a.map((r) => r.value), [0, 0, 483.45, 483.45, 483.45]);
+  // Prepay: −$50,000 in the prepay month, $0 after (a prepay never
+  // changes the payment — the savings show up as earlier payoff).
+  const d = monthlyNetCashflowSeries(base, prepay, []);
+  assert.deepEqual(d.map((r) => r.value), [0, 0, -50000, 0, 0]);
+  // Penalty lands in its month only: an $11,601.89 switch penalty in
+  // Jan 2027 turns that month's +$483.45 into −$11,118.44.
+  const p = monthlyNetCashflowSeries(base, fix, [{ date: '2027-01-15', penalty: 11601.89 }]);
+  assert.deepEqual(p.map((r) => r.value), [0, 0, -11118.44, 483.45, 483.45]);
+  // A zero/negative penalty entry is not cash — it never moves a month.
+  const z = monthlyNetCashflowSeries(base, fix, [{ date: '2027-01-15', penalty: 0 }, { date: '2027-02-01', penalty: -5 }]);
+  assert.deepEqual(z.map((r) => r.value), [0, 0, 483.45, 483.45, 483.45]);
+});
+test('monthlyNetCashflowSeries: after the baseline pays off, a strategy still paying reads negative', () => {
+  const { base, fix } = ncfRows();
+  // Baseline rows end Feb 2027 (paid off); the strategy keeps paying
+  // $6,722.44 in Mar 2027.
+  const s = monthlyNetCashflowSeries(base.slice(0, 4), fix, []);
+  assert.deepEqual(s.map((r) => r.value), [0, 0, 483.45, 483.45, -6722.44]);
+});
+
 test('validateAiReportChartSeries: pool_balance allowed on trajectory templates only', () => {
   assert.deepEqual(validateAiReportChartSeries([{ template: 'time_line', title: 'Pool', series: ['pool_balance'] }]), []);
   assert.deepEqual(validateAiReportChartSeries([{ template: 'yearly_bars', title: 'Pool', series: ['pool_balance'] }]), []);
@@ -1323,6 +1376,31 @@ test('ai-report series validation rejects unrenderable template/series pairs', (
   assert.deepEqual(validateAiReportChartSeries('nope'), ['charts must be an array']);
 });
 
+test('ai-report series validation: monthly_net_cashflow is time_line-only (user 2026-11-06)', () => {
+  // The reported 502: a time_line with the scalar "net" is still
+  // rejected — the scalar never becomes a trajectory.
+  const netErrs = validateAiReportChartSeries([{ template: 'time_line', title: 'Cash Flow Time Series', series: ['net'] }]);
+  assert.equal(netErrs.length, 1);
+  assert.match(netErrs[0], /cannot render series "net"/);
+  // The fix: the same chart with the monthly series passes.
+  assert.deepEqual(validateAiReportChartSeries([{ template: 'time_line', title: 'Cash Flow Time Series', series: ['monthly_net_cashflow'] }]), []);
+  // A monthly flow has no year-end point and no stack: rejected elsewhere.
+  assert.equal(validateAiReportChartSeries([{ template: 'yearly_bars', title: 'Y', series: ['monthly_net_cashflow'] }]).length, 1);
+  assert.equal(validateAiReportChartSeries([{ template: 'stacked_bar', title: 'S', series: ['monthly_net_cashflow'] }]).length, 1);
+  assert.equal(validateAiReportChartSeries([{ template: 'metric_cards', title: 'M', series: ['monthly_net_cashflow'] }]).length, 1);
+  assert.equal(validateAiReportChartSeries([{ template: 'fan_band', title: 'F', series: ['monthly_net_cashflow'] }]).length, 1);
+});
+
+test('ai-report baseline kind: monthly_net_cashflow is mortgage-family, forbidden on a pool baseline', () => {
+  const chart = [{ template: 'time_line', title: 'Cash Flow Time Series', series: ['monthly_net_cashflow'] }];
+  assert.equal(validateAiReportBaselineKind(chart, 'pool').length, 1);
+  assert.match(validateAiReportBaselineKind(chart, 'pool')[0], /monthly_net_cashflow/);
+  assert.deepEqual(validateAiReportBaselineKind(chart, 'property'), []);
+  assert.deepEqual(validateAiReportBaselineKind(chart, 'other'), []);
+  // A pool time_line with a stock series still passes.
+  assert.deepEqual(validateAiReportBaselineKind([{ template: 'time_line', title: 'P', series: ['stock_value'] }], 'pool'), []);
+});
+
 test('ai-report prompt grounds the model in template/series support and snapshot availability', () => {
   const prompt = aiReportPrompt({ strategies: [{ id: 1, name: 'A', letter: 'A' }], mortgagedCount: 2, holdingCount: 0, text: 'Compare costs' });
   assert.match(prompt, /stacked_bar renders only mortgage_balance \(stacked by property\) and stock_value/);
@@ -1333,6 +1411,16 @@ test('ai-report prompt grounds the model in template/series support and snapshot
   assert.match(prompt, /User request: Compare costs/);
   const singular = aiReportPrompt({ strategies: [], mortgagedCount: 1, holdingCount: 1, text: 'x' });
   assert.match(singular, /1 property carries a mortgage, 1 stock holding exists/);
+});
+
+test('ai-report prompt names monthly_net_cashflow for a cash-flow time series (user 2026-11-06)', () => {
+  const prompt = aiReportPrompt({ strategies: [{ id: 1, name: 'A', letter: 'A' }], mortgagedCount: 1, holdingCount: 0, text: 'i need the cashflow in time series', baselineKind: 'property' });
+  assert.match(prompt, /time_line with series monthly_net_cashflow/);
+  assert.match(prompt, /monthly net cash flow vs the baseline/);
+  assert.match(prompt, /Never put the scalar series cost, gain, net, stock_gain, payoff_month or monthly_payment on time_line/);
+  assert.match(prompt, /User request: i need the cashflow in time series/);
+  const pool = aiReportPrompt({ strategies: [], mortgagedCount: 0, holdingCount: 1, text: 'x', baselineKind: 'pool' });
+  assert.match(pool, /never use the monthly_net_cashflow series/);
 });
 
 // Pure-AI project creation: trio shape validation (user spec

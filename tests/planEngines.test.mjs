@@ -119,6 +119,11 @@ test('validateAiEngine accepts empty/null, rejects unknown ids and identifiers',
   // Inputs are valid identifiers for both maps.
   assert.deepEqual(validateAiEngine({ inputs: [{ key: 'bonus', label: 'Bonus', default: 50 }], scalars: { gain: 'gain + bonus' } }), []);
   assert.equal(validateAiEngine({ inputs: [{ key: 'bonus', label: 'Bonus', default: 50 }, { key: 'bonus', label: 'Dup', default: 1 }] }).length, 1);
+  // monthly_net_cashflow is a base series (user 2026-11-06): an
+  // engine formula may reference the preset series, and may override
+  // it with a monthly formula of its own.
+  assert.deepEqual(validateAiEngine({ series: { monthly_net_cashflow: 'monthly_net_cashflow' } }), []);
+  assert.deepEqual(validateAiEngine({ series: { stock_value: 'stock_value + monthly_net_cashflow' } }), []);
 });
 
 test('evaluateAiEngine executes series element-wise and scalars, empty engine = preset figures', () => {

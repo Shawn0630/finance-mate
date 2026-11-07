@@ -1304,7 +1304,7 @@ export function applyReportVariables(comparison, vars, strategyId) {
 // scalar ids (scalars broadcast across months); a scalar formula
 // may use scalar ids + inputs only (a monthly series has no single
 // value to reduce to).
-export const AI_ENGINE_SERIES = ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance', 'interest', 'principal'];
+export const AI_ENGINE_SERIES = ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance', 'interest', 'principal', 'monthly_net_cashflow'];
 export const AI_ENGINE_SCALARS = ['cost', 'gain', 'net', 'interestSaved', 'stockGain', 'valueAtHorizon', 'payoffShiftMonths', 'paymentDelta', 'fees', 'penaltyTotal'];
 function aiExprTokens(src) {
   const toks = [];
@@ -1673,24 +1673,29 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
     for (const per of Object.values(perProperty || {})) {
       const s = per[side] && per[side].series ? per[side].series : [];
       for (const row of s) {
-        const cur = byMonth.get(row.month) || { balance: 0, interest: 0, principal: 0 };
+        const cur = byMonth.get(row.month) || { balance: 0, interest: 0, principal: 0, payment: 0 };
         cur.balance += row.balance || 0;
         cur.interest += row.interest || 0;
         cur.principal += row.principal || 0;
+        // The engine's own monthly payment figure (interest +
+        // principal by construction in every simulate branch) —
+        // carried so the net-cash-flow series can difference it
+        // without re-deriving it.
+        cur.payment += row.payment || 0;
         byMonth.set(row.month, cur);
       }
     }
   }
   const stockByMonth = new Map((stockSeries || []).map((r) => [r.month, r.value || 0]));
-  for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
+  for (const m of stockByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0, payment: 0 });
   const poolByMonth = new Map(((opts.poolSeries) || []).map((r) => [r.month, r.value || 0]));
-  if (opts.investmentScope) for (const m of poolByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
+  if (opts.investmentScope) for (const m of poolByMonth.keys()) if (!byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0, payment: 0 });
   // New cash out by month (fees + prepay cash + external buy cash —
   // the headline window sums this over the window). A cash-out month
   // with no other series still seeds a row (from the current month
   // on; earlier months are outside every window anyway).
   const cashOutByMonth = new Map(((opts.cashOutSeries) || []).map((r) => [r.month, r.amount || 0]));
-  if (currentMonth) for (const m of cashOutByMonth.keys()) if (m >= currentMonth && !byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0 });
+  if (currentMonth) for (const m of cashOutByMonth.keys()) if (m >= currentMonth && !byMonth.has(m)) byMonth.set(m, { balance: 0, interest: 0, principal: 0, payment: 0 });
   const g = num(growthPct);
   return [...byMonth.keys()].sort().map((m) => {
     const b = byMonth.get(m);
@@ -1720,6 +1725,46 @@ export function reportMonthlySeries(perProperty, side, stockSeries, assessedTota
       // balance directly and never flow into this field, so the
       // breakdown caption says "scheduled".
       principal: round2(b.principal),
+      // Scheduled monthly payment (interest + principal), the
+      // engine's own figure — the net-cash-flow series differences
+      // this field, never a re-derived payment.
+      payment: round2(b.payment),
+    };
+  });
+}
+
+// Monthly net cash flow for one strategy vs its baseline (user
+// 2026-11-06: the AI "Net Cash Flow Difference" chart could only be
+// a metric_cards scalar because no monthly cash-flow series
+// existed). Per month: (baseline payment − strategy payment) −
+// strategy new cash out − engine penalty in its month. Stock gain
+// is a value change, not cash, and never enters. Months align on
+// the STRATEGY rows (the client renders each trajectory's own
+// months); a side with no row that month pays nothing that month —
+// so after the baseline pays off, a strategy still paying reads
+// negative, and after the strategy pays off it reads the baseline
+// payment. penalties: the strategy projection's penalties array
+// ({date, penalty}); the baseline carries none. Pure — the report
+// trajectories attach this so the AI time_line chart and any table
+// use one definition. NOTE: cash_out rides the existing series,
+// which includes refinance fees alongside prepay/lump-sum/buy cash
+// (a fee IS new cash paid that month); on a no-refinance strategy
+// the two agree exactly. NOTE: the engine penalty estimate is used,
+// not the report's penalty variable (the variable has no month) —
+// a typed penalty moves the metric_cards net, not this series.
+export function monthlyNetCashflowSeries(baseRows, stratRows, penalties) {
+  const base = new Map((baseRows || []).map((r) => [r.month, r]));
+  const penByMonth = new Map();
+  for (const p of (penalties || [])) {
+    const m = String((p && p.date) || '').slice(0, 7);
+    if (!m || !(num(p && p.penalty) > 0)) continue;
+    penByMonth.set(m, round2((penByMonth.get(m) || 0) + num(p.penalty)));
+  }
+  return (stratRows || []).map((s) => {
+    const b = base.get(s.month) || {};
+    return {
+      month: s.month,
+      value: round2(((b.payment || 0) - (s.payment || 0)) - (s.cash_out || 0) - (penByMonth.get(s.month) || 0)),
     };
   });
 }
@@ -1844,8 +1889,12 @@ export function validateAiChartMethods(charts) {
 // stock_value (a stock volatility fan) or mortgage_balance (a
 // mortgage scenario fan). Absent or empty series is NOT an error:
 // the renderer falls back to its default series for that template.
+// monthly_net_cashflow is time_line-only (user 2026-11-06): it is a
+// monthly FLOW, so a year-end point (yearly_bars) or a stack
+// (stacked_bar) is meaningless for it, and it is a difference series
+// the AI engine never invents — the app computes it per strategy.
 export const PLAN_REPORT_SERIES_BY_TEMPLATE = {
-  time_line: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance'],
+  time_line: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance', 'monthly_net_cashflow'],
   yearly_bars: ['mortgage_balance', 'stock_value', 'total_value', 'pool_balance'],
   stacked_bar: ['mortgage_balance', 'stock_value'],
   metric_cards: ['cost', 'gain', 'net', 'stock_gain', 'payoff_month', 'monthly_payment'],
@@ -1889,9 +1938,9 @@ export function aiReportRefinePrompt({ strategies, mortgagedCount, holdingCount,
 
 export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text, baselineKind, history }) {
   const kindLine = baselineKind === 'pool'
-    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; fan_band for a STOCK volatility fan only, series stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band for a mortgage series, never use the mortgage_balance or total_value series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected. A stock fan_band shows the engine-computed per-holding volatility fan (median at the holding\'s history CAGR, P10/P90 bands widening with √t) — you only pick the chart, never the numbers. Method sentences must describe only pool/stock figures — never mention interest saved, mortgage, payoff, or penalty on a cash-pool report: those concepts do not exist here.'
+    ? 'Baseline kind: cash pool. This report covers a cash pool, not a property: use ONLY pool/stock charts (time_line, yearly_bars, stacked_bar with pool_balance and/or stock_value; fan_band for a STOCK volatility fan only, series stock_value; metric_cards with cost, gain, net, stock_gain only). Mortgage charts are FORBIDDEN here: never use fan_band for a mortgage series, never use the mortgage_balance or total_value series, never use the monthly_net_cashflow series, and never use the monthly_payment or payoff_month metric series — such a chart is rejected. A stock fan_band shows the engine-computed per-holding volatility fan (median at the holding\'s history CAGR, P10/P90 bands widening with √t) — you only pick the chart, never the numbers. Method sentences must describe only pool/stock figures — never mention interest saved, mortgage, payoff, or penalty on a cash-pool report: those concepts do not exist here.'
     : baselineKind === 'property'
-      ? 'Baseline kind: property. This report covers one property: use property charts (mortgage_balance, total_value for equity, monthly_payment, payoff_month) and the pool/stock charts only where the strategies actually touch stocks.'
+      ? 'Baseline kind: property. This report covers one property: use property charts (mortgage_balance, total_value for equity, monthly_payment, payoff_month, monthly_net_cashflow for a cash-flow-over-time chart) and the pool/stock charts only where the strategies actually touch stocks.'
       : null;
   const historyLines = Array.isArray(history) ? history.filter((l) => typeof l === 'string' && l.trim()).slice(0, 20) : [];
   const historyBlock = historyLines.length
@@ -1901,8 +1950,9 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text,
     'You compose a report definition as JSON only. No prose outside the JSON object.',
     'A report is an ordered list of charts over already-computed results: {"title": "short report title", "charts": [{"template": "...", "title": "...", "series": ["..."], "method": "..."}]}.',
     'Template is one of time_line, stacked_bar, share_doughnut, yearly_bars, fan_band, metric_cards. (funds_flow is not offered: the app cannot render it.)',
-    'Series ids are: mortgage_balance, stock_value, total_value, pool_balance, cost, gain, net, payoff_month, monthly_payment.',
-    'Each template renders only its own series: time_line and yearly_bars render trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity); fan_band renders stock_value (a stock volatility fan, cash-pool reports) or mortgage_balance (a mortgage scenario fan, property reports). Never put a series on a template that cannot render it — the chart would come out empty.',
+    'Series ids are: mortgage_balance, stock_value, total_value, pool_balance, monthly_net_cashflow, cost, gain, net, stock_gain, payoff_month, monthly_payment.',
+    'Each template renders only its own series: time_line renders trajectory series (mortgage_balance, stock_value, total_value, pool_balance, monthly_net_cashflow on property reports); yearly_bars renders trajectory series (mortgage_balance, stock_value, total_value, pool_balance); stacked_bar renders only mortgage_balance (stacked by property) and stock_value; metric_cards renders only cost, gain, net, stock_gain, payoff_month, monthly_payment; share_doughnut renders cost (a cost breakdown) or mortgage_balance/total_value (equity); fan_band renders stock_value (a stock volatility fan, cash-pool reports) or mortgage_balance (a mortgage scenario fan, property reports). Never put a series on a template that cannot render it — the chart would come out empty.',
+    'For a cash-flow / net-benefit chart OVER TIME, use time_line with series monthly_net_cashflow (property reports only): monthly net cash flow vs the baseline — the monthly mortgage payment saved, minus new cash paid that month (prepay, lump sum, buy), minus any penalty in its month. Never put the scalar series cost, gain, net, stock_gain, payoff_month or monthly_payment on time_line or yearly_bars — those are metric_cards scalars, not trajectories; a time_line with "net" is rejected.',
     'Never invent a number: the app computes every series; you only order and title charts.',
     'Each chart carries "method": one plain-language sentence stating how its figures are calculated (which series, measured against what baseline). A chart without a method is rejected.',
     // The AI engine: alongside the charts you may define a
@@ -1913,8 +1963,8 @@ export function aiReportPrompt({ strategies, mortgagedCount, holdingCount, text,
     // Formulas use numbers, identifiers, + - * / ( ) and min/max only.
     // Series formulas are monthly: they may use the monthly series
     // mortgage_balance, stock_value, total_value, pool_balance,
-    // interest, principal, the scalars below (broadcast), and your
-    // declared inputs. Scalar formulas may use only the scalars
+    // interest, principal, monthly_net_cashflow (property reports
+    // only), the scalars below (broadcast), and your declared inputs. Scalar formulas may use only the scalars
     // cost, gain, net, interestSaved, stockGain, valueAtHorizon,
     // payoffShiftMonths, paymentDelta, fees, penaltyTotal and your
     // inputs. Anything you do not override keeps the preset engine\'s
@@ -1961,7 +2011,9 @@ export function aiReportHistoryLines({ existingTitles = [], turns = [] } = {}) {
 // monthly_payment/payoff_month; and a fan_band carrying a mortgage
 // series. A fan_band with a stock series (or no series — the viewer
 // renders the stock fan on a pool template) is a stock volatility
-// fan and is ALLOWED. Other baseline kinds pass untouched.
+// fan and is ALLOWED. monthly_net_cashflow is mortgage-family too
+// (it differences monthly mortgage payments) and is rejected on a
+// pool baseline the same way. Other baseline kinds pass untouched.
 export function validateAiReportBaselineKind(charts, baselineKind) {
   const errs = [];
   if (baselineKind !== 'pool') return errs;
@@ -1977,6 +2029,7 @@ export function validateAiReportBaselineKind(charts, baselineKind) {
     if (c.template === 'time_line' || c.template === 'yearly_bars' || c.template === 'stacked_bar') {
       const eff = series || ['mortgage_balance'];
       if (eff.includes('mortgage_balance')) errs.push(`chart "${title}" (${c.template}) uses mortgage_balance, forbidden on a cash-pool baseline`);
+      if (eff.includes('monthly_net_cashflow')) errs.push(`chart "${title}" (${c.template}) uses monthly_net_cashflow, forbidden on a cash-pool baseline`);
       continue;
     }
     if (c.template === 'share_doughnut') {

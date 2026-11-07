@@ -1757,6 +1757,245 @@ export async function run(H, S) {
       !appJs.includes('planStrategyCardsWorld') && !indexHtml.includes('planStrategyCardsWorld'),
       JSON.stringify({ appJs: appJs.includes('planStrategyCardsWorld'), indexHtml: indexHtml.includes('planStrategyCardsWorld') }));
   }
+  // ---- AI net cash flow time series (browser) ---------------------
+  // User 2026-11-06 22:02 + 22:41: the AI "Net Cash Flow Difference"
+  // chart is metric_cards (net per strategy) — it cannot show a time
+  // series or be dragged. His live refine turn "i need the cashflow
+  // in time series" got the AI proposing time_line "Cash Flow Time
+  // Series" with series "net", and the server rejected it with
+  // chart "Cash Flow Time Series" (time_line) cannot render series
+  // "net". After the monthly_net_cashflow series lands, the same
+  // turn must produce a rendering time_line chart, not the 502.
+  let ncfPptr = null;
+  try {
+    const { createRequire } = await import('node:module');
+    const ncfReqmod = createRequire(import.meta.url);
+    try { ncfPptr = ncfReqmod('puppeteer-core'); } catch { ncfPptr = ncfReqmod('/tmp/pptr/node_modules/puppeteer-core'); }
+  } catch { ncfPptr = null; }
+  if (!ncfPptr || !H.chromeAvailable) {
+    console.log('netcashflow browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const ncfForward = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const ncfLogin = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const ncfCookie = ncfLogin.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const ncfBrowser = await ncfPptr.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await ncfBrowser.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await ncfForward({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: ncfCookie, domain: 'ff.local', path: '/', httpOnly: true });
+      const ncfWait = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      // Fixture: fixed 5% mortgage, $600,000 @ 2026-10-01, 25y amort
+      // (fixed rate keeps every payment deterministic — no prime in
+      // the pin). Strategy A switches to fixed 4.6% in Jan 2027;
+      // strategy D prepays $50,000 in Jan 2027. Both ops are
+      // openClosed 'open', so no penalty month muddies the values —
+      // the penalty month is pinned in unit tests instead.
+      r = await H.req('POST', '/api/properties', {
+        address: '77 Net Cashflow Way, Victoria, BC', mortgage_balance: 600000,
+        mortgage_balance_date: '2026-10-01', amortization_years: 25, purchase_date: '2020-03-15',
+      });
+      H.check('netcashflow: fixture property created', r.status === 201 && r.data.id > 0, JSON.stringify(r.data));
+      const ncfPropId = r.data.id;
+      r = await H.req('POST', `/api/properties/${ncfPropId}/rates`, { start_date: '2026-01-01', rate_type: 'fixed', annual_rate: 5 });
+      H.check('netcashflow: fixed 5% segment added', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', '/api/planning/projects', { name: 'Net Cashflow Time Series', question: 'Cash flow over time', category: 'property', entity: { type: 'property', propertyId: ncfPropId } });
+      H.check('netcashflow: property project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
+      const ncfProjId = r.data.project.id;
+      r = await H.req('POST', `/api/planning/projects/${ncfProjId}/strategies`, { name: 'A · Jan to Fix', source: 'manual' });
+      H.check('netcashflow: strategy A created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const ncfStratA = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/projects/${ncfProjId}/strategies`, { name: 'D · pre pay 50000', source: 'manual' });
+      H.check('netcashflow: strategy D created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+      const ncfStratD = r.data.strategy.id;
+      r = await H.req('POST', `/api/planning/strategies/${ncfStratA}/ops`, { op_type: 'rate_switch', params: { propertyId: ncfPropId, date: '2027-01-01', rateType: 'fixed', annualRate: 4.6, openClosed: 'open' } });
+      H.check('netcashflow: switch-to-fixed op on A', r.status === 201, JSON.stringify(r.data));
+      r = await H.req('POST', `/api/planning/strategies/${ncfStratD}/ops`, { op_type: 'prepay', params: { propertyId: ncfPropId, date: '2027-01-01', amount: 50000, openClosed: 'open' } });
+      H.check('netcashflow: prepay op on D', r.status === 201, JSON.stringify(r.data));
+      // The user's starting report: the metric_cards "Net Cash Flow
+      // Difference" chart (net per strategy, scalar).
+      const ncfMetricDef = { engine: {}, charts: [{ template: 'metric_cards', title: 'Net Cash Flow Difference', series: ['net'], method: 'Net benefit per strategy vs the baseline (full horizon): gain minus cost.' }] };
+      r = await H.req('POST', `/api/planning/projects/${ncfProjId}/reports`, { name: 'Cashflow Report', definition: ncfMetricDef, strategy_ids: [ncfStratA, ncfStratD] });
+      const ncfRepId = (r.data.report && r.data.report.id) || (r.data.value && r.data.value.report && r.data.value.report.id) || 0;
+      H.check('netcashflow: fixture report created', r.status === 201 && ncfRepId > 0, JSON.stringify(r.data));
+      // Ground truth from the comparison API: the trajectories now
+      // carry monthly_net_cashflow per strategy.
+      const ncfGround = async () => {
+        const c = await H.req('GET', `/api/planning/projects/${ncfProjId}/comparison?reportId=${ncfRepId}`);
+        const trajs = (c.data.report && c.data.report.trajectories) || [];
+        const at = (key, month) => {
+          const t = trajs.find((x) => x.key === key);
+          const row = t && t.monthly.find((x) => x.month === month);
+          return row ? row.monthly_net_cashflow : null;
+        };
+        return { trajs, at, baseMonths: (trajs[0] || { monthly: [] }).monthly.map((x) => x.month) };
+      };
+      const g0 = await ncfGround();
+      H.check('netcashflow: trajectories carry monthly_net_cashflow (A saves from Jan 2027, D −$50,000 in Jan 2027)',
+        g0.at('baseline', '2027-01') === 0
+          && g0.at(String(ncfStratA), '2027-01') > 0
+          && g0.at(String(ncfStratA), '2027-02') === g0.at(String(ncfStratA), '2027-01')
+          && g0.at(String(ncfStratD), '2027-01') === -50000
+          && g0.at(String(ncfStratD), '2027-02') === 0,
+        JSON.stringify({ aJan: g0.at(String(ncfStratA), '2027-01'), aFeb: g0.at(String(ncfStratA), '2027-02'), dJan: g0.at(String(ncfStratD), '2027-01'), dFeb: g0.at(String(ncfStratD), '2027-02') }));
+      await page.goto(`http://ff.local/#planning/project/${ncfProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await ncfWait(1500);
+      await page.waitForFunction((rid) => !!document.querySelector(`[data-plan-report-view="${rid}"]`), { timeout: 15000 }, ncfRepId);
+      await page.evaluate((rid) => { document.querySelector(`[data-plan-report-view="${rid}"]`).click(); }, ncfRepId);
+      await page.waitForFunction(() => !!document.querySelector('#planReportAiChatText'), { timeout: 30000 });
+      const ncfMetricPanel = await page.evaluate(() => {
+        const blk = [...document.querySelectorAll('#planReport [data-plan-report-block]')].find((el) => (el.querySelector('.section-head h3')?.textContent || '') === 'Net Cash Flow Difference');
+        return blk ? { cards: blk.querySelectorAll('.plan-metric-card').length, rows: blk.querySelectorAll('table.tbl tbody tr').length } : null;
+      });
+      H.check('netcashflow: starting report renders the scalar metric_cards chart (2 strategies)',
+        ncfMetricPanel && ncfMetricPanel.cards === 2 && ncfMetricPanel.rows === 2, JSON.stringify(ncfMetricPanel));
+      const ncfThread = async () => page.evaluate(() => {
+        const turns = [...document.querySelectorAll('#planReportAiChatThread .plan-ai-turn')];
+        return {
+          userTurns: turns.filter((t) => t.classList.contains('plan-ai-turn-user')).map((t) => t.textContent),
+          aiTurns: turns.filter((t) => t.classList.contains('plan-ai-turn-ai')).map((t) => t.textContent),
+          applies: [...document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]')].map((b) => ({ disabled: b.disabled, label: b.textContent.trim() })),
+          msg: document.querySelector('#planReportAiChatMsg')?.textContent || '',
+        };
+      });
+      const ncfChart = async () => page.evaluate(() => {
+        const blk = [...document.querySelectorAll('#planReport [data-plan-report-block]')].find((el) => (el.querySelector('.section-head h3')?.textContent || '') === 'Cash Flow Time Series');
+        if (!blk) return null;
+        const cv = blk.querySelector('canvas');
+        if (!cv || typeof planCharts === 'undefined' || !planCharts[cv.id]) return { panel: true, canvas: !!cv, chart: false };
+        const ch = planCharts[cv.id];
+        return { panel: true, canvas: true, chart: true, labels: ch.data.labels, datasets: ch.data.datasets.map((d) => ({ label: d.label, data: d.data })) };
+      });
+      const ncfChartValue = (chart, stratName, month) => {
+        if (!chart || !chart.chart) return null;
+        const i = chart.labels.indexOf(month);
+        if (i < 0) return null;
+        const ds = chart.datasets.find((d) => d.label.includes(stratName) && d.label.includes('Net cash flow'));
+        return ds ? ds.data[i] : null;
+      };
+      // --- The user's exact 502, as a negative control: the OLD
+      // proposal (time_line with the scalar "net") must still be
+      // rejected — the scalar never becomes a trajectory.
+      const ncfOldDef = { engine: {}, charts: [
+        { template: 'metric_cards', title: 'Net Cash Flow Difference', series: ['net'], method: 'Net benefit per strategy vs the baseline (full horizon): gain minus cost.' },
+        { template: 'time_line', title: 'Cash Flow Time Series', series: ['net'], method: 'Monthly net cash flow vs the baseline.' },
+      ] };
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(ncfOldDef));
+      await page.type('#planReportAiChatText', 'i need the cashflow in time series');
+      await page.evaluate(() => document.querySelector('#planReportAiChatSendBtn').click());
+      await page.waitForFunction(() => {
+        const turns = [...document.querySelectorAll('#planReportAiChatThread .plan-ai-turn-ai')];
+        return turns.length >= 1 && /cannot render series "net"/.test(turns[turns.length - 1].textContent || '');
+      }, { timeout: 15000 });
+      const ncfThread1 = await ncfThread();
+      H.check('netcashflow: the old proposal (time_line + "net") still 502s with the user\'s exact error',
+        ncfThread1.userTurns.some((t) => t.includes('i need the cashflow in time series'))
+          && ncfThread1.aiTurns.some((t) => t.includes('cannot render series "net"'))
+          && ncfThread1.applies.length === 0,
+        JSON.stringify(ncfThread1));
+      H.check('netcashflow: the rejected turn writes nothing',
+        (await H.req('GET', `/api/planning/projects/${ncfProjId}`)).data.reports.find((x) => x.id === ncfRepId).definition.charts.length === 1,
+        'report charts changed on a rejected turn');
+      // --- The same turn, with the monthly series: it must produce a
+      // rendering time_line chart, not the 502.
+      const ncfNewDef = { engine: {}, charts: [
+        { template: 'metric_cards', title: 'Net Cash Flow Difference', series: ['net'], method: 'Net benefit per strategy vs the baseline (full horizon): gain minus cost.' },
+        { template: 'time_line', title: 'Cash Flow Time Series', series: ['monthly_net_cashflow'], method: 'Monthly net cash flow vs the baseline: the monthly mortgage payment saved, minus new cash paid that month (prepay, lump sum, buy), minus any penalty in its month.' },
+      ] };
+      fs.writeFileSync(H.aiStubFile, JSON.stringify(ncfNewDef));
+      await page.type('#planReportAiChatText', 'i need the cashflow in time series');
+      await page.evaluate(() => document.querySelector('#planReportAiChatSendBtn').click());
+      await page.waitForFunction(() => document.querySelectorAll('#planReportAiChatThread [data-ai-turn-apply]').length === 1, { timeout: 15000 });
+      const ncfThread2 = await ncfThread();
+      H.check('netcashflow: the same turn with monthly_net_cashflow proposes the chart with an Apply button',
+        ncfThread2.aiTurns.some((t) => t.includes('+ Chart Cash Flow Time Series'))
+          && ncfThread2.applies.length === 1 && ncfThread2.applies[0].disabled === false && ncfThread2.applies[0].label === 'Apply',
+        JSON.stringify(ncfThread2));
+      await page.evaluate(() => document.querySelector('#planReportAiChatThread [data-ai-turn-apply]').click());
+      await page.waitForFunction(() => {
+        const b = document.querySelector('#planReportAiChatThread [data-ai-turn-apply]');
+        return b && b.disabled && b.textContent.trim() === 'Applied ✓';
+      }, { timeout: 15000 });
+      await page.waitForFunction(() => {
+        const titles = [...document.querySelectorAll('#planReport [data-plan-report-block]')]
+          .map((el) => el.querySelector('.section-head h3')?.textContent || '').filter(Boolean);
+        return titles.includes('Cash Flow Time Series');
+      }, { timeout: 15000 });
+      const ncfChartAfter = await ncfChart();
+      const g1 = await ncfGround();
+      const ncfClose = (a, b) => a != null && b != null && Math.abs(a - b) < 0.01;
+      H.check('netcashflow: the applied time_line chart renders with per-strategy monthly values matching the projection to the cent',
+        ncfChartAfter && ncfChartAfter.chart
+          && ncfClose(ncfChartValue(ncfChartAfter, 'Jan to Fix', '2027-01'), g1.at(String(ncfStratA), '2027-01'))
+          && ncfClose(ncfChartValue(ncfChartAfter, 'Jan to Fix', '2027-02'), g1.at(String(ncfStratA), '2027-02'))
+          && ncfClose(ncfChartValue(ncfChartAfter, 'pre pay 50000', '2027-01'), -50000)
+          && ncfClose(ncfChartValue(ncfChartAfter, 'pre pay 50000', '2027-02'), 0)
+          && ncfClose(ncfChartValue(ncfChartAfter, 'Baseline', '2027-01'), 0),
+        JSON.stringify({ chart: ncfChartAfter ? { labels: (ncfChartAfter.labels || []).slice(0, 5), datasets: (ncfChartAfter.datasets || []).map((d) => ({ label: d.label, jan27: d.data[(ncfChartAfter.labels || []).indexOf('2027-01')], feb27: d.data[(ncfChartAfter.labels || []).indexOf('2027-02')] })) } : null, api: { aJan: g1.at(String(ncfStratA), '2027-01'), aFeb: g1.at(String(ncfStratA), '2027-02') } }));
+      // --- The headline slider slices it: dragging the start handle
+      // to Jan 2028 re-renders the chart to the window's months.
+      const jan28Idx = g1.baseMonths.indexOf('2028-01');
+      const labelsBefore = (ncfChartAfter.labels || []).length;
+      await page.evaluate((i) => {
+        const s = document.querySelector('#planReportHeadlineWindowStart');
+        s.value = String(i);
+        s.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }, jan28Idx);
+      await page.waitForFunction(() => {
+        const blk = [...document.querySelectorAll('#planReport [data-plan-report-block]')].find((el) => (el.querySelector('.section-head h3')?.textContent || '') === 'Cash Flow Time Series');
+        const cv = blk && blk.querySelector('canvas');
+        const ch = cv && typeof planCharts !== 'undefined' ? planCharts[cv.id] : null;
+        return ch && ch.data.labels[0] === '2028-01';
+      }, { timeout: 15000 });
+      const ncfChartSliced = await ncfChart();
+      H.check('netcashflow: dragging the headline start handle to Jan 2028 slices the chart to the window',
+        ncfChartSliced && ncfChartSliced.chart
+          && ncfChartSliced.labels[0] === '2028-01'
+          && ncfChartSliced.labels.length < labelsBefore
+          && ncfChartSliced.labels.length === (ncfChartSliced.datasets[0] || { data: [] }).data.length
+          && ncfClose(ncfChartValue(ncfChartSliced, 'Jan to Fix', '2028-01'), g1.at(String(ncfStratA), '2028-01')),
+        JSON.stringify({ first: ncfChartSliced && ncfChartSliced.labels[0], len: ncfChartSliced && ncfChartSliced.labels.length, before: labelsBefore }));
+    } finally { await ncfBrowser.close(); }
+  }
   // ---- Unified AI panel (browser) -------------------------------------
   // Panel toggle/targets, scattered entries gone, scenario + baseline
   // design through the panel, Describe panel gone from strategy page.

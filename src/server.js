@@ -50,7 +50,7 @@ import {
   computeProjection, compareProjections, returnSuggestionsFromPoints,
   buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
   latestMaturityMonth, maturityHorizonMonths, activeTermEndMonth,
-  reportMonthlySeries, reportCostBreakdown,
+  reportMonthlySeries, reportCostBreakdown, monthlyNetCashflowSeries,
   planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
   planAiEntityCandidates, rewriteAiIdQuestions, dropAnsweredAiQuestions, bindAiNameAnswers,
   sanitizeAiThread, appendAiThread, renderAiThreadText,
@@ -6302,6 +6302,22 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
   const reportTrajectories = [{ key: 'baseline', label: 'Baseline', monthly: reportMonthlySeries(baseline.mortgage.perProperty, 'baseline', baseline.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: baseline.stocks.potSeries, investmentScope, cashOutSeries: baseline.cashOutSeries || [] }) }];
   for (const r of rows) {
     reportTrajectories.push({ key: String(r.strategy.id), label: `${r.strategy.letter} · ${r.strategy.name}`, monthly: reportMonthlySeries(r.projection.mortgage.perProperty, 'strategy', r.projection.stocks.series, assessedTotal, growth, currentMonthKey(), { poolSeries: r.projection.stocks.potSeries, investmentScope, cashOutSeries: r.projection.cashOutSeries || [] }) });
+  }
+  // Monthly net cash flow (property reports only, user 2026-11-06):
+  // per strategy vs the baseline — payment saved minus new cash out
+  // minus the engine penalty in its month. The baseline carries 0.
+  // A cash-pool report has no mortgage payment, so the series does
+  // not exist there (the prompt + validation forbid it on pool
+  // baselines); the AI engine then sees 0 for it, never a value.
+  if (!investmentScope) {
+    const baseMonthly = reportTrajectories[0].monthly;
+    for (const row of baseMonthly) row.monthly_net_cashflow = 0;
+    for (const r of rows) {
+      const traj = reportTrajectories.find((t) => t.key === String(r.strategy.id));
+      if (!traj) continue;
+      const ncf = new Map(monthlyNetCashflowSeries(baseMonthly, traj.monthly, (r.projection && r.projection.penalties) || []).map((x) => [x.month, x.value]));
+      for (const mrow of traj.monthly) mrow.monthly_net_cashflow = ncf.get(mrow.month) || 0;
+    }
   }
   const report = {
     assessedTotal, assessedByProperty,
