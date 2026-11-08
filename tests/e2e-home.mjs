@@ -543,6 +543,23 @@ export async function run(H, S) {
       && reportSections.map((s) => s.title.replace(/\d+ \/ 5$/, '')).join('|') === 'Upcoming payments|Property|Stocks|Earning|Spending'
       && reportSections[0].active && reportSections[0].slots > 0,
       JSON.stringify(reportSections));
+    // The section name is a big title in report mode (not the old
+    // small gray label) and sits clear of the viewport's top edge.
+    const reportTitle = await page.evaluate(() => {
+      const t = document.querySelector('.report-section.is-active .report-section-title');
+      if (!t) return null;
+      const r = t.getBoundingClientRect();
+      const cs = getComputedStyle(t);
+      return {
+        px: parseFloat(cs.fontSize), weight: cs.fontWeight, top: r.top, left: r.left,
+        bottom: r.bottom, inView: r.top >= 0 && r.bottom <= window.innerHeight,
+        pos: t.querySelector('.report-section-pos') ? t.querySelector('.report-section-pos').textContent : null,
+      };
+    });
+    H.check('home UI: report-mode section title is a large title, fully inside the viewport with room at the top',
+      reportTitle && reportTitle.px >= 26 && reportTitle.top >= 16 && reportTitle.inView
+      && reportTitle.pos && reportTitle.pos.includes('1 / 5'),
+      JSON.stringify(reportTitle));
     const reportStyle = await page.evaluate(() => {
       const v = document.querySelector('#view-home');
       const slot = document.querySelector('.report-section.is-active .report-slot.is-active');
@@ -602,6 +619,40 @@ export async function run(H, S) {
       return s && s.querySelector('.insight-label').textContent === 'Total equity' ? 'Total equity' : null;
     });
     H.check('home UI: scrolling left in report mode moves back to the previous card', !!afterLeft, String(afterLeft));
+    // Entering a section resets its carousel to the first card: step
+    // to Property's second card, move down to Stocks, and Stocks must
+    // open on its first card (Portfolio value) with the first dot
+    // active — not on the card index carried over from Property.
+    // Moving back up resets Property to its first card too.
+    await page.mouse.wheel({ deltaX: 120 });
+    await wait(700); // the 600ms navigation lock
+    const resetCard = await until(() => {
+      const s = document.querySelector('.report-section.is-active .report-slot.is-active');
+      return s && s.querySelector('.insight-label').textContent === 'Assessed total' ? 'Assessed total' : null;
+    });
+    H.check('home UI: scrolling right again reaches the second Property card (setup for the reset pin)', !!resetCard, String(resetCard));
+    await page.keyboard.press('ArrowDown');
+    await wait(700); // the 600ms navigation lock
+    const resetDown = await until(() => {
+      const sec = document.querySelector('.report-section.is-active');
+      if (!sec || sec.dataset.reportSection !== 'stock') return null;
+      const slot = sec.querySelector('.report-slot.is-active');
+      const dot = sec.querySelector('.report-dot.is-active');
+      return slot && slot.querySelector('.insight-label').textContent === 'Portfolio value'
+        && dot && dot.dataset.reportDot === '0' ? 'Portfolio value · dot 0' : null;
+    });
+    H.check('home UI: moving down to a new section resets its carousel to the first card with the first dot active', !!resetDown, String(resetDown));
+    await page.keyboard.press('ArrowUp');
+    await wait(700); // the 600ms navigation lock
+    const resetUp = await until(() => {
+      const sec = document.querySelector('.report-section.is-active');
+      if (!sec || sec.dataset.reportSection !== 'property') return null;
+      const slot = sec.querySelector('.report-slot.is-active');
+      const dot = sec.querySelector('.report-dot.is-active');
+      return slot && slot.querySelector('.insight-label').textContent === 'Total equity'
+        && dot && dot.dataset.reportDot === '0' ? 'Total equity · dot 0' : null;
+    });
+    H.check('home UI: moving back up resets the previous section to its first card too', !!resetUp, String(resetUp));
     // Arrow keys navigate too.
     await page.keyboard.press('ArrowDown');
     await wait(700); // the 600ms navigation lock

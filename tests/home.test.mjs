@@ -668,7 +668,7 @@ test('home: report mode sections — highlight first, empty insight sections ski
   assert.equal(empty[0].cards[0].empty, true);
 });
 
-test('home: report mode move — left/right clamp, up/down clamp the card index', () => {
+test('home: report mode move — left/right clamp, up/down reset to the first card', () => {
   const secs = [
     { key: 'highlight', cards: [{}, {}] },
     { key: 'property', cards: [{}] },
@@ -677,9 +677,18 @@ test('home: report mode move — left/right clamp, up/down clamp the card index'
   assert.deepEqual(homeReportMove({ section: 0, card: 0 }, secs, 'left'), { section: 0, card: 0 });
   assert.deepEqual(homeReportMove({ section: 0, card: 1 }, secs, 'right'), { section: 0, card: 1 });
   assert.deepEqual(homeReportMove({ section: 0, card: 0 }, secs, 'right'), { section: 0, card: 1 });
-  assert.deepEqual(homeReportMove({ section: 0, card: 1 }, secs, 'down'), { section: 1, card: 0 }); // clamps to the 1-card section
+  assert.deepEqual(homeReportMove({ section: 0, card: 1 }, secs, 'down'), { section: 1, card: 0 }); // resets to the first card
   assert.deepEqual(homeReportMove({ section: 2, card: 2 }, secs, 'up'), { section: 1, card: 0 });
   assert.deepEqual(homeReportMove({ section: 1, card: 0 }, secs, 'up'), { section: 0, card: 0 });
   assert.deepEqual(homeReportMove({ section: 2, card: 2 }, secs, 'down'), { section: 2, card: 2 }); // already last
   assert.deepEqual(homeReportMove({ section: 0, card: 0 }, secs, 'up'), { section: 0, card: 0 }); // already first
+  assert.deepEqual(homeReportMove({ section: 0, card: 1 }, secs, 'up'), { section: 0, card: 1 }); // already first: no section change, card kept
+  // The reset, not a clamp: the target section has 3 cards and the
+  // old carry-over would have kept card 1 / card 2.
+  const wide = [
+    { key: 'highlight', cards: [{}, {}] },
+    { key: 'property', cards: [{}, {}, {}] },
+  ];
+  assert.deepEqual(homeReportMove({ section: 0, card: 1 }, wide, 'down'), { section: 1, card: 0 });
+  assert.deepEqual(homeReportMove({ section: 1, card: 2 }, wide, 'up'), { section: 0, card: 0 });
 });

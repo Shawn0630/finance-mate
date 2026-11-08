@@ -18480,8 +18480,8 @@ function homeReportMoveClient(state, sections, dir) {
   const count = (i) => (sections[i] && sections[i].cards.length) || 0;
   if (dir === 'left') s.card = Math.max(0, s.card - 1);
   else if (dir === 'right') s.card = Math.min(count(s.section) - 1, s.card + 1);
-  else if (dir === 'up') { s.section = Math.max(0, s.section - 1); s.card = Math.min(s.card, count(s.section) - 1); }
-  else if (dir === 'down') { s.section = Math.min(sections.length - 1, s.section + 1); s.card = Math.min(s.card, count(s.section) - 1); }
+  else if (dir === 'up') { const ns = Math.max(0, s.section - 1); if (ns !== s.section) s.card = 0; s.section = ns; }
+  else if (dir === 'down') { const ns = Math.min(sections.length - 1, s.section + 1); if (ns !== s.section) s.card = 0; s.section = ns; }
   return s;
 }
 let homeReportSecs = []; // sections for the current homeData

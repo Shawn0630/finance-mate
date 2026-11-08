@@ -945,12 +945,16 @@ body.report-full #view-home.home-report #homeReport { height: 100%; margin-top: 
 #view-home.home-report #homeSections,
 #view-home.home-report .home-ai,
 #view-home.home-report > .home-section-head { display: none; }
-.report-section { position: absolute; inset: 0; display: flex; flex-direction: column; visibility: hidden; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease, visibility 0s linear .55s; }
+.report-section { position: absolute; inset: 0; display: flex; flex-direction: column; padding: 28px 40px 8px; visibility: hidden; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease, visibility 0s linear .55s; }
 .report-section.is-active { transform: translateY(0); opacity: 1; z-index: 2; visibility: visible; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease, visibility 0s; }
 .report-section.is-before { transform: translateY(-102%); opacity: .5; }
 .report-section.is-after { transform: translateY(102%); opacity: .5; }
-.report-section-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; font-weight: 600; color: #5a6a7a; letter-spacing: .02em; padding-bottom: 8px; border-bottom: 1px solid rgba(90,106,122,.18); margin-bottom: 10px; }
-.report-section-pos { font-size: 12px; color: #98a4b0; }
+/* The section name is a big title in report mode, not a small label:
+   large bold dark type at the top of the fullscreen view, with the
+   section counter alongside it. The section's top padding keeps the
+   title clear of the viewport edge. */
+.report-section-title { display: flex; justify-content: space-between; align-items: baseline; font-size: clamp(26px, 4vw, 36px); font-weight: 800; color: #101828; letter-spacing: -0.01em; margin-bottom: 14px; }
+.report-section-pos { font-size: 15px; font-weight: 600; color: #667085; }
 .report-stage { position: relative; flex: 1 1 auto; min-height: 0; perspective: 1400px; }
 .report-ground { position: absolute; left: 50%; bottom: 4%; width: 360px; max-width: 70%; height: 28px; transform: translateX(-50%); background: radial-gradient(ellipse at center, rgba(16,24,40,.30), transparent 70%); filter: blur(4px); pointer-events: none; }
 .report-slot { position: absolute; left: 50%; top: 44%; width: min(430px, 86%); height: min(540px, 80%); transform: translate(-50%, -50%) translateX(0) rotateY(0deg) scale(1); opacity: 1; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease; will-change: transform; }

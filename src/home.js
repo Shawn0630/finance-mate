@@ -134,16 +134,16 @@ export function homeReportSections(homeData) {
   return out;
 }
 // Move the report-mode focus: left/right step within the section,
-// up/down step between sections (the card index is kept when the
-// new section has that many cards, otherwise clamped to its last
-// card). Pure — the client applies the returned state.
+// up/down step between sections and always land on the new section's
+// FIRST card (index 0), so entering a section never lands mid-way
+// through its carousel. Pure — the client applies the returned state.
 export function homeReportMove(state, sections, dir) {
   const s = { section: state.section, card: state.card };
   const count = (i) => (sections[i] && sections[i].cards.length) || 0;
   if (dir === 'left') s.card = Math.max(0, s.card - 1);
   else if (dir === 'right') s.card = Math.min(count(s.section) - 1, s.card + 1);
-  else if (dir === 'up') { s.section = Math.max(0, s.section - 1); s.card = Math.min(s.card, count(s.section) - 1); }
-  else if (dir === 'down') { s.section = Math.min(sections.length - 1, s.section + 1); s.card = Math.min(s.card, count(s.section) - 1); }
+  else if (dir === 'up') { const ns = Math.max(0, s.section - 1); if (ns !== s.section) s.card = 0; s.section = ns; }
+  else if (dir === 'down') { const ns = Math.min(sections.length - 1, s.section + 1); if (ns !== s.section) s.card = 0; s.section = ns; }
   return s;
 }
 
