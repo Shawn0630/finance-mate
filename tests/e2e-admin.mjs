@@ -206,6 +206,18 @@ export async function run(H, S) {
       await until(() => document.querySelector('#adminExportBtn') && document.querySelector('#adminImportFile')
         && document.querySelector('#adminSyncForm') && document.querySelector('#adminSyncStatus')),
       'Data panel controls missing');
+    // Export and Import sit in the same row at the same size.
+    const dataBtns = await page.evaluate(() => {
+      const ex = document.querySelector('#adminExportBtn');
+      const im = document.querySelector('#adminImportFile').closest('label');
+      const er = ex.getBoundingClientRect();
+      const ir = im.getBoundingClientRect();
+      const cs = (el) => { const s = getComputedStyle(el); return { pad: s.padding, font: s.fontSize }; };
+      return { exH: er.height, imH: ir.height, ex: cs(ex), im: cs(im) };
+    });
+    H.check('admin UI: Export and Import buttons are the same size (height, padding, font)',
+      dataBtns.exH === dataBtns.imH && dataBtns.ex.pad === dataBtns.im.pad && dataBtns.ex.font === dataBtns.im.font,
+      JSON.stringify(dataBtns));
     H.check('admin UI: backups list renders the backup made by the import',
       await until(() => document.querySelectorAll('#adminBackupList [data-restore]').length >= 1),
       'no backup row in the list');

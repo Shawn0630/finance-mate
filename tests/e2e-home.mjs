@@ -19,6 +19,18 @@ export async function run(H, S) {
     mortgage_balance: 300000, assessed_value: 500000, assessed_year: 2026,
   });
   const pidB = r.data.id;
+  // A 2025 assessment point for each property, so YoY deltas compute:
+  // A was assessed higher in 2025 ($1.3M) than 2026 ($1.0M), so Total
+  // equity's YoY is negative (a down move on a normal metric). The
+  // 2026 points restate the create values (the create writes no
+  // history rows), so the Nov 2026 totals are unchanged.
+  for (const [pid, year, value] of [
+    [pidA, 2025, 1300000], [pidA, 2026, 1000000],
+    [pidB, 2025, 500000], [pidB, 2026, 500000],
+  ]) {
+    r = await H.req('POST', `/api/properties/${pid}/value-history`, { year, value });
+    if (r.status !== 201) H.check(`home fixture: assessment ${year} $${value} for property ${pid}`, false, JSON.stringify(r.data));
+  }
   await H.req('PUT', `/api/properties/${pidB}`, { mortgage_balance_date: '2025-01-15', amortization_years: 25 });
   r = await H.req('GET', `/api/properties/${pidB}`);
   await H.req('PUT', `/api/properties/${pidB}/terms/${r.data.terms[0].id}`, { term_months: 60, amortization_years: 25 });
@@ -650,9 +662,151 @@ export async function run(H, S) {
       && document.querySelectorAll('.report-section').length === 5);
     H.check('home UI: a fresh #home entry always lands in report mode', !!freshReport,
       await page.evaluate(() => document.querySelector('#view-home').className));
+    // Report-mode charts: on a FRESH load every insight card's canvas
+    // has a drawn chart. The report draw used to run before the
+    // report DOM was built and #homeReport was visible, so the fresh
+    // load showed blank cards — only toggling away and back fixed it.
+    const freshCharts = await until(() => {
+      const cs = [...document.querySelectorAll('#homeReport canvas[data-spark]')];
+      if (!cs.length) return null;
+      const withChart = cs.filter((c) => !!Chart.getChart(c)).length;
+      return withChart === cs.length ? { total: cs.length, withChart } : null;
+    });
+    H.check('home UI: report-mode cards draw their charts on a fresh load (no blank canvases)',
+      !!freshCharts, JSON.stringify(freshCharts));
+    // The big report cards carry a DETAILED chart: month labels on
+    // the x-axis, value gridlines/labels on the y-axis, the same blue
+    // curve as the insight mini sparkline. A flat series (assessed
+    // total) repeats one y label — only moving series must show
+    // distinct labels.
+    const reportDetail = await until(() => {
+      const cs = [...document.querySelectorAll('#homeReport canvas[data-spark]')];
+      if (!cs.length) return null;
+      const out = [];
+      for (const canvas of cs) {
+        const ch = Chart.getChart(canvas);
+        if (!ch) return null;
+        const ctx = canvas.getContext('2d');
+        const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let blue = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          if (Math.abs(d[i] - 22) < 45 && Math.abs(d[i + 1] - 104) < 45 && Math.abs(d[i + 2] - 196) < 45 && d[i + 3] > 100) blue++;
+        }
+        const vals = JSON.parse(canvas.dataset.spark || '[]').filter((v) => v != null);
+        out.push({
+          xShown: ch.options.scales.x.display, yShown: ch.options.scales.y.display,
+          yGrid: ch.options.scales.y.grid.display !== false,
+          xLabels: ch.scales.x.ticks.map((t) => t.label),
+          yLabels: ch.scales.y.ticks.map((t) => t.label),
+          blue, range: vals.length ? Math.max(...vals) - Math.min(...vals) : 0,
+        });
+      }
+      return out;
+    });
+    H.check('home UI: the report-mode chart is detailed — month labels on the x-axis, value gridlines/labels on the y-axis, blue curve drawn',
+      reportDetail && reportDetail.every((c) => c.xShown && c.yShown && c.yGrid && c.blue > 50
+        && c.xLabels.some((l) => /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2}$/.test(l))
+        && (c.range === 0 || new Set(c.yLabels).size > 1)),
+      JSON.stringify(reportDetail && reportDetail.map((c) => ({ x: c.xLabels.slice(0, 2), y: c.yLabels.slice(0, 2), blue: c.blue, range: c.range }))));
+    // Fullscreen report mode: the top bar hides and the gradient
+    // view covers the whole viewport, no page margins.
+    const full = await page.evaluate(() => {
+      const v = document.querySelector('#view-home');
+      const r = v.getBoundingClientRect();
+      return { topbar: getComputedStyle(document.querySelector('.topbar')).display,
+        bodyFull: document.body.classList.contains('report-full'),
+        rect: { x: r.x, y: r.y, w: r.width, h: r.height, vw: innerWidth, vh: innerHeight } };
+    });
+    H.check('home UI: report mode is fullscreen — top bar hidden, gradient view covers the viewport',
+      full.topbar === 'none' && full.bodyFull
+      && full.rect.x === 0 && full.rect.y === 0 && full.rect.w === full.rect.vw && full.rect.h === full.rect.vh,
+      JSON.stringify(full));
+    // The Report / Insight toggle switch works both ways (knob +
+    // active label follow the mode); the floating toggle stays
+    // reachable in fullscreen.
+    const toggleToInsight = await page.evaluate(() => {
+      document.querySelector('#homeModeBtn').click();
+      return null;
+    });
+    const inInsightByToggle = await until(() => !document.querySelector('#view-home').classList.contains('home-report')
+      && document.querySelector('#homeModeBtn').getAttribute('aria-checked') === 'false'
+      && document.querySelector('.home-mode-label[data-mode-label="insight"]').classList.contains('is-active')
+      && getComputedStyle(document.querySelector('.topbar')).display !== 'none');
+    H.check('home UI: the toggle switch flips report mode to insight mode (top bar back, Insight label active)',
+      !!inInsightByToggle, JSON.stringify(inInsightByToggle));
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    const backInReportByToggle = await until(() => document.querySelector('#view-home').classList.contains('home-report')
+      && document.querySelector('#homeModeBtn').getAttribute('aria-checked') === 'true'
+      && document.querySelector('.home-mode-label[data-mode-label="report"]').classList.contains('is-active'));
+    H.check('home UI: the toggle switch flips back to report mode (Report label active)',
+      !!backInReportByToggle, JSON.stringify(backInReportByToggle));
+    // Every report chart stays inside its own card — the curve and
+    // its axis labels never spill below the card's bottom edge.
+    const chartBounds = await page.evaluate(() => {
+      const bad = [];
+      for (const canvas of document.querySelectorAll('#homeReport canvas[data-spark]')) {
+        const card = canvas.closest('.insight-card');
+        const cr = canvas.getBoundingClientRect();
+        const kr = card.getBoundingClientRect();
+        if (cr.top < kr.top - 1 || cr.bottom > kr.bottom + 1 || cr.left < kr.left - 1 || cr.right > kr.right + 1) {
+          bad.push({ card: card.querySelector('.insight-label').textContent, canvas: cr.bottom, cardBottom: kr.bottom });
+        }
+      }
+      return bad;
+    });
+    H.check('home UI: every report-mode chart stays inside its card bounds', chartBounds.length === 0, JSON.stringify(chartBounds));
+    // Report-mode deltas read at a glance: MoM/YoY text renders
+    // larger than the small insight-mode chips (measured again below
+    // in insight mode). The Total equity YoY is negative here, so its
+    // YoY line is the down color.
+    const reportDeltaPx = await page.evaluate(() => {
+      const el = document.querySelector('#homeReport .insight-card .delta');
+      const yoy = [...document.querySelectorAll('.report-section[data-report-section="property"] .insight-card')]
+        .find((c) => c.querySelector('.insight-label').textContent.includes('Total equity'))
+        .querySelector('.delta-yoy');
+      return { deltaPx: parseFloat(getComputedStyle(el).fontSize),
+        yoyColor: getComputedStyle(yoy).color, yoyClass: yoy.className };
+    });
+    H.check('home UI: report-mode YoY on Total equity (negative YoY) renders in the down color',
+      reportDeltaPx.yoyColor === 'rgb(179, 38, 30)' && reportDeltaPx.yoyClass.includes('bad'),
+      JSON.stringify(reportDeltaPx));
+    // Esc exits fullscreen report mode back to insight mode.
+    await page.keyboard.press('Escape');
+    const escOut = await until(() => !document.querySelector('#view-home').classList.contains('home-report')
+      && !document.body.classList.contains('report-full')
+      && getComputedStyle(document.querySelector('.topbar')).display !== 'none'
+      && document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    H.check('home UI: Esc exits fullscreen report mode to insight mode (top bar back)', !!escOut,
+      await page.evaluate(() => document.querySelector('#view-home').className));
     // Insight mode from here on: every pin below needs the insight
     // carousels.
     await toInsight();
+    const insightCharts = await until(() => {
+      const cs = [...document.querySelectorAll('#homeSections canvas[data-spark]')];
+      if (!cs.length) return null;
+      const withChart = cs.filter((c) => !!Chart.getChart(c)).length;
+      if (withChart !== cs.length) return null;
+      return { total: cs.length, withChart,
+        bare: cs.every((c) => { const ch = Chart.getChart(c); return ch.options.scales.x.display === false && ch.options.scales.y.display === false; }) };
+    });
+    H.check('home UI: switching back to insight mode still shows the bare mini sparklines (axes hidden)',
+      !!insightCharts && insightCharts.bare, JSON.stringify(insightCharts));
+    // Deltas: the insight chips stay small (12px) while the report
+    // cards render them larger (17px, measured above) — and the YoY
+    // line is color-coded in insight mode too, not plain gray.
+    const insightDelta = await page.evaluate(() => {
+      const el = document.querySelector('#homeSections .insight-card .delta');
+      const yoy = [...document.querySelectorAll('[data-home-section="property"] .insight-card')]
+        .find((c) => c.querySelector('.insight-label').textContent.includes('Total equity'))
+        .querySelector('.delta-yoy');
+      return { deltaPx: parseFloat(getComputedStyle(el).fontSize),
+        yoyColor: getComputedStyle(yoy).color, yoyClass: yoy.className };
+    });
+    H.check('home UI: report-mode delta text is larger than the insight-mode chip (17px vs 12px)',
+      reportDeltaPx.deltaPx === 17 && insightDelta.deltaPx === 12, JSON.stringify({ report: reportDeltaPx, insight: insightDelta }));
+    H.check('home UI: insight-mode YoY on Total equity (negative YoY) renders in the down color too',
+      insightDelta.yoyColor === 'rgb(179, 38, 30)' && insightDelta.yoyClass.includes('bad'),
+      JSON.stringify(insightDelta));
 
     // Home calendar: renders with the current month, marking the
     // fixture's payment dates per kind, today highlighted. The
@@ -1420,8 +1574,8 @@ export async function run(H, S) {
     const sysPhotos = r.data.insights.filter((c) => c.kind === 'system' && c.section === 'property').map((c) => c.photo);
     H.check('home report photo: the API attaches the photo to the property-entity AI card only',
       aiPhoto === photoUri && sysPhotos.every((p) => p == null), JSON.stringify({ aiPhoto, sysPhotos }));
-    // In report mode the Property section shows the photo on the AI
-    // card and no photo block on any standard card.
+    // In report mode, on the Property section (wheel down once from
+    // Upcoming payments). The active card is index 0, Assessed total.
     await page.evaluate(() => document.querySelector('#homeModeBtn').click());
     await until(() => document.querySelector('#view-home').classList.contains('home-report'));
     const repStage = await page.evaluate(() => {
@@ -1432,12 +1586,31 @@ export async function run(H, S) {
     await page.mouse.move(repStage.x, repStage.y);
     await page.mouse.wheel({ deltaY: 120 });
     await wait(700); // the 600ms navigation lock
-    const reportPhotos = await page.evaluate(() => [...document.querySelectorAll('.report-section[data-report-section="property"] .report-slot')].map((s) => {
-      const img = s.querySelector('.report-photo img');
-      return img ? img.getAttribute('src') : null;
-    }));
-    H.check('home report photo: only the property card with a photo shows one in report mode',
-      JSON.stringify(reportPhotos) === JSON.stringify([null, null, null, photoUri]), JSON.stringify(reportPhotos));
+    // No photo inside any report card: the house photo lives on the
+    // view backdrop instead (see below).
+    const reportPhotos = await page.evaluate(() => [...document.querySelectorAll('#homeReport .insight-card')].map((c) => ({
+      img: !!c.querySelector('img'), photoBlock: !!c.querySelector('.report-photo'),
+    })));
+    H.check('home report photo: no photo element inside any report card',
+      reportPhotos.every((p) => !p.img && !p.photoBlock), JSON.stringify(reportPhotos));
+    // Backdrop: the aggregate card (index 0, Assessed total) gets the
+    // gradient only — no projection. The per-property AI card (index
+    // 3) projects its house photo large and dimmed behind the cards.
+    const backdropOff = await page.evaluate(() => [...document.querySelectorAll('#homeReportBackdrop .report-backdrop-layer')].map((l) => l.classList.contains('is-on')));
+    H.check('home report photo: aggregate card active — no photo backdrop, gradient only',
+      JSON.stringify(backdropOff) === JSON.stringify([false, false]), JSON.stringify(backdropOff));
+    for (let i = 0; i < 3; i++) { await page.keyboard.press('ArrowRight'); await wait(700); }
+    const backdropOn = await page.evaluate((uri) => {
+      const on = [...document.querySelectorAll('#homeReportBackdrop .report-backdrop-layer')]
+        .filter((l) => l.classList.contains('is-on'));
+      return { count: on.length, showsPhoto: on.length === 1 && on[0].style.backgroundImage.includes(uri) };
+    }, photoUri);
+    H.check('home report photo: per-property card active — its photo projects on the backdrop',
+      backdropOn.count === 1 && backdropOn.showsPhoto, JSON.stringify(backdropOn));
+    for (let i = 0; i < 3; i++) { await page.keyboard.press('ArrowLeft'); await wait(700); }
+    const backdropOffAgain = await page.evaluate(() => [...document.querySelectorAll('#homeReportBackdrop .report-backdrop-layer')].map((l) => l.classList.contains('is-on')));
+    H.check('home report photo: back on the aggregate card — the projection fades away',
+      JSON.stringify(backdropOffAgain) === JSON.stringify([false, false]), JSON.stringify(backdropOffAgain));
     // Clean up: back to insight mode, delete the AI card, clear the photo.
     await page.evaluate(() => document.querySelector('#homeModeBtn').click());
     await toInsight();

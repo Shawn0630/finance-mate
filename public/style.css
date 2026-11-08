@@ -369,7 +369,7 @@ tr.clickable:hover td { background: #f2f7fc; }
 .avatar.lg.avatar-letter { font-size: 18px; }
 .owner-chip { display: inline-flex; align-items: center; gap: 4px; }
 .user-cell { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; }
-label.btnlike { display: inline-block; font: inherit; font-size: 13px; color: inherit; cursor: pointer; border: 1px solid #c9d2dc; background: #fff; border-radius: 6px; padding: 3px 8px; margin: 0; }
+label.btnlike { display: inline-block; font: inherit; color: inherit; cursor: pointer; border: 1px solid #c9d2dc; background: #fff; border-radius: 6px; padding: 6px 12px; margin: 0; }
 label.btnlike:hover { background: #f0f4f9; }
 /* Modals */
 .modal-overlay { position: fixed; inset: 0; background: rgba(18, 28, 38, .5); z-index: 100; display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px 24px; overflow-y: auto; }
@@ -758,6 +758,14 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .home-view { background: #fff; border-radius: 14px; padding: 24px 26px 28px; }
 .home-head { display: flex; align-items: flex-start; gap: 12px; }
 .home-head .btn { margin-left: auto; }
+/* Report / Insight toggle switch: Report left, Insight right, the
+   knob sits on the current mode's side and the active label is dark. */
+.home-mode-toggle { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.home-mode-label { font-size: 12px; font-weight: 600; color: #98a4b0; white-space: nowrap; }
+.home-mode-label.is-active { color: #111; }
+.home-mode-switch { position: relative; width: 44px; height: 24px; flex: 0 0 auto; border-radius: 999px; border: 1px solid #dbe2ea; background: #eef1f4; cursor: pointer; padding: 0; }
+.home-mode-knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(16,24,40,.25); transition: left .2s ease; }
+.home-mode-switch:not(.is-report) .home-mode-knob { left: 22px; }
 .home-title { margin: 0; font-size: 22px; font-weight: 700; color: #111; }
 .home-sub { color: #71808f; font-size: 13px; margin-top: 4px; }
 .home-section-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; font-weight: 600; color: #5a6a7a; letter-spacing: .02em; margin: 26px 0 10px; padding-bottom: 8px; border-bottom: 1px solid #eef1f4; }
@@ -797,6 +805,11 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .delta.bad { color: #b3261e; background: #fdeceb; }
 .delta.flat { color: #5a6a7a; background: #f0f3f6; }
 .delta-yoy { font-size: 12px; color: #98a4b0; white-space: nowrap; }
+/* YoY is color-coded by direction in both modes, same green/red as
+   the MoM pill (down-is-good metrics keep their inversion: a
+   decrease there is good, so it stays green). */
+.delta-yoy.good { color: #14632f; }
+.delta-yoy.bad { color: #b3261e; }
 .insight-empty { font-size: 20px; font-weight: 600; color: #98a4b0; margin-top: 6px; }
 .insight-spark { flex: 0 0 200px; height: 96px; }
 .insight-spark canvas { width: 100% !important; height: 80px !important; }
@@ -905,6 +918,29 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 #homeReport { display: none; position: relative; height: clamp(560px, calc(100vh - 250px), 780px); overflow: hidden; margin-top: 6px; }
 #view-home.home-report { background: linear-gradient(155deg, #fff7ed 0%, #fce7f3 38%, #ede9fe 68%, #dbeafe 100%); }
 #view-home.home-report #homeReport { display: block; }
+/* Fullscreen report mode: the top bar and the Home header go away
+   and the gradient covers the whole viewport, no page margins. The
+   mode toggle stays reachable as a floating pill (see .home-head
+   below) and Esc exits to insight mode. */
+body.report-full { overflow: hidden; }
+body.report-full .topbar { display: none; }
+body.report-full #view-home.home-report { position: fixed; inset: 0; z-index: 100; border-radius: 0; padding: 0; }
+body.report-full #view-home.home-report #homeReport { height: 100%; margin-top: 0; }
+/* In fullscreen report mode the header becomes a floating pill
+   holding only the toggle; the title and Re-generate hide. */
+#view-home.home-report .home-head { position: fixed; top: 16px; right: 16px; z-index: 300; margin: 0; }
+#view-home.home-report .home-head .home-title,
+#view-home.home-report .home-head .home-sub,
+#view-home.home-report .home-head #homeRegenBtn { display: none; }
+#view-home.home-report .home-head .home-mode-toggle { margin-left: 0; background: rgba(255,255,255,.88); border: 1px solid rgba(16,24,40,.08); border-radius: 999px; padding: 6px 10px; box-shadow: 0 4px 16px rgba(16,24,40,.12); }
+/* Backdrop projection: the active per-property card's house photo,
+   large, dimmed and blurred behind the carousel (the gradient
+   washes over it through the layer's opacity). Two layers crossfade
+   when the active card changes; aggregate cards get no layer. */
+#homeReportBackdrop { display: none; position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+#view-home.home-report #homeReportBackdrop { display: block; }
+.report-backdrop-layer { position: absolute; inset: -24px; background-size: cover; background-position: center; opacity: 0; transition: opacity .6s ease; filter: blur(18px) saturate(.9); }
+.report-backdrop-layer.is-on { opacity: .38; }
 #view-home.home-report .home-upcoming,
 #view-home.home-report #homeSections,
 #view-home.home-report .home-ai,
@@ -926,16 +962,25 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .report-dots { display: flex; gap: 6px; justify-content: center; padding: 12px 0 2px; }
 .report-dot { width: 8px; height: 8px; border-radius: 50%; border: none; padding: 0; background: rgba(17,17,17,.18); cursor: pointer; }
 .report-dot.is-active { background: #1668c4; }
-/* The card inside a slot is a vertical card: photo (when the
-   property has one) on top, the number, deltas, and the sparkline
-   pinned to the bottom. The slot carries the 3D transform, so the
-   card itself never transforms. */
-.report-slot .insight-card { width: 100%; height: 100%; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 0; padding: 24px 26px; transform: none; margin: 0; }
+/* The card inside a slot is a vertical card: the number, deltas, and
+   the sparkline pinned to the bottom. The slot carries the 3D
+   transform, so the card itself never transforms. Content is clipped
+   inside the card so the chart can never spill below its edge. */
+.report-slot .insight-card { width: 100%; height: 100%; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 0; padding: 24px 26px; transform: none; margin: 0; overflow: hidden; }
 .report-slot .insight-text { flex: 0 0 auto; }
 .report-slot .insight-value { font-size: 46px; }
-.report-slot .insight-spark { flex: 0 0 auto; width: 100%; height: 150px; margin-top: auto; }
-.report-slot .insight-spark canvas { height: 132px !important; }
+/* Report-mode deltas read at a glance next to the big number: MoM
+   and YoY stacked, larger and bolder, the % figure bigger still,
+   color-coded green/red by direction (same as insight mode). */
+.report-slot .insight-deltas { flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 10px; }
+.report-slot .insight-deltas .delta,
+.report-slot .insight-deltas .delta-yoy { font-size: 17px; font-weight: 700; background: none; padding: 0; }
+.report-slot .insight-deltas .delta-pct { font-size: 20px; }
+/* The report chart fills the card's lower area: the spark block grows
+   into the space left by the text (and the photo, when one is shown),
+   so the detailed chart is large on plain cards and still fits on
+   photo cards. The canvas leaves room for the first/last-value row. */
+.report-slot .insight-spark { flex: 1 1 auto; width: 100%; min-height: 120px; height: auto; margin-top: auto; }
+.report-slot .insight-spark canvas { height: calc(100% - 26px) !important; }
 .report-slot .home-pay-card .insight-toggle { margin-top: 16px; }
 .report-slot .home-pay-card .recv-toggle { font-size: 14px; padding: 9px 18px; }
-.report-photo { border-radius: 10px; overflow: hidden; margin-bottom: 16px; aspect-ratio: 16 / 9; flex: 0 0 auto; }
-.report-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }

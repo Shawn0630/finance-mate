@@ -348,6 +348,10 @@ function showView(name) {
   document.querySelectorAll('#mainNav a').forEach((a) =>
     a.classList.toggle('active', a.dataset.nav === (['property', 'asset', 'invest-account', 'invest-holding'].includes(name) ? 'assets' : name))
   );
+  // Fullscreen report mode only applies while the Home view is
+  // showing: leaving Home (e.g. a card click to a detail page) must
+  // bring the top bar back.
+  if (typeof homeSyncModeChrome === 'function') homeSyncModeChrome();
 }
 
 function showSection(key) {
@@ -18192,7 +18196,7 @@ function homeDeltaHtml(d, kind, downIsGood, vsLabel) {
   const good = downIsGood ? down : up;
   const arrow = up ? '↑' : '↓';
   const amt = kind === 'pct' ? `${Math.abs(d.delta).toFixed(1)} pts` : money(Math.abs(d.delta));
-  const pct = d.pct != null ? ` (${up ? '+' : '−'}${Math.abs(d.pct).toFixed(1)}%)` : '';
+  const pct = d.pct != null ? ` <span class="delta-pct">(${up ? '+' : '−'}${Math.abs(d.pct).toFixed(1)}%)</span>` : '';
   return `<span class="delta ${good ? 'good' : 'bad'}">${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
 }
 function homeYoyHtml(d, kind, downIsGood, vsLabel) {
@@ -18200,10 +18204,11 @@ function homeYoyHtml(d, kind, downIsGood, vsLabel) {
   const up = d.delta > 0;
   const down = d.delta < 0;
   if (!up && !down) return `<span class="delta-yoy">YoY ± 0</span>`;
+  const good = downIsGood ? down : up;
   const arrow = up ? '↑' : '↓';
   const amt = kind === 'pct' ? `${Math.abs(d.delta).toFixed(1)} pts` : money(Math.abs(d.delta));
-  const pct = d.pct != null ? ` (${up ? '+' : '−'}${Math.abs(d.pct).toFixed(1)}%)` : '';
-  return `<span class="delta-yoy">YoY ${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
+  const pct = d.pct != null ? ` <span class="delta-pct">(${up ? '+' : '−'}${Math.abs(d.pct).toFixed(1)}%)</span>` : '';
+  return `<span class="delta-yoy ${good ? 'good' : 'bad'}">YoY ${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
 }
 
 function homeInsightCardHtml(c, opts) {
@@ -18213,13 +18218,8 @@ function homeInsightCardHtml(c, opts) {
   const link = homeCardLink(c);
   const linkAttrs = ` data-home-link="${link.href}"${link.category ? ` data-home-category="${esc(link.category)}"` : ''} role="link" tabindex="0"`;
   const keyAttr = ` data-home-key="${esc(homeCardKey(c))}"`;
-  // Report mode only: a property card shows its house photo, and
-  // only when the property has one (server attaches photo, null
-  // otherwise) — no photo, no projection at all.
-  const photoHtml = (opts && opts.photo && c.entity && c.entity.kind === 'property' && c.photo)
-    ? `<div class="report-photo"><img src="${esc(c.photo)}" alt=""></div>` : '';
   if (!c.hasData) {
-    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${photoHtml}
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
       <div class="insight-text">
         <div class="insight-label">${esc(c.title)}${aiTag}</div>
         <div class="insight-empty">No data yet</div>
@@ -18228,10 +18228,10 @@ function homeInsightCardHtml(c, opts) {
   }
   const sparkVals = (c.spark || []).filter((v) => v != null);
   const sparkHtml = sparkVals.length ? `<div class="insight-spark">
-      <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}'></canvas>
+      <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}' data-spark-kind="${esc(c.valueKind || 'money')}"></canvas>
       <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
     </div>` : '';
-  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${photoHtml}
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
     <div class="insight-text">
       <div class="insight-label">${esc(c.title)}${aiTag}</div>
       <div class="insight-value">${homeFormatValue(c)}</div>
@@ -18284,6 +18284,65 @@ function homeDrawSparklines(root) {
     });
     homeCharts.push(ch);
   });
+}
+
+// Short month label for report-mode chart axes: '2025-11' -> 'Nov 25'.
+function homeReportMonthLabel(ym) {
+  const [y, m] = String(ym).split('-').map(Number);
+  return `${MONTH_NAMES[(m || 1) - 1].slice(0, 3)} ${String(y).slice(2)}`;
+}
+
+// Y-axis value label for report-mode charts. homeCompactValue rounds
+// to 2 decimals in millions, which collapses every tick to the same
+// label when the series barely moves (e.g. equity +$3k on $1.21M) —
+// so a narrow series gets one more decimal to stay readable.
+function homeReportAxisValue(v, kind, range) {
+  if (kind === 'pct') return `${v >= 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const a = Math.abs(v);
+  if (a >= 1e6) return `$${(v / 1e6).toFixed(range < 20000 ? 3 : 2)}M`;
+  if (a >= 1e3) return `$${(v / 1e3).toFixed(range < 2000 ? 2 : 1)}K`;
+  return money2(v);
+}
+
+// Detailed chart for the big vertical report cards: the same blue
+// line + light fill as the insight mini sparkline, but larger, with
+// month labels on the x-axis and value gridlines/labels on the
+// y-axis. The first/last values are labeled by the card's
+// .spark-ends row below the canvas.
+function homeDrawReportCharts(root) {
+  for (const ch of homeCharts) { try { ch.destroy(); } catch { /* already gone */ } }
+  homeCharts = [];
+  root.querySelectorAll('canvas[data-spark]').forEach((canvas) => {
+    let vals = []; let labels = []; let kind = 'money';
+    try { vals = JSON.parse(canvas.dataset.spark || '[]'); labels = JSON.parse(canvas.dataset.sparkMonths || '[]'); kind = canvas.dataset.sparkKind || 'money'; } catch { return; }
+    if (!vals.some((v) => v != null)) return;
+    const nums = vals.filter((v) => v != null);
+    const dataRange = nums.length ? Math.max(...nums) - Math.min(...nums) : 0;
+    const ch = new Chart(canvas, {
+      type: 'line',
+      data: { labels: labels.map(homeReportMonthLabel), datasets: [{ data: vals, borderColor: '#1668c4', backgroundColor: 'rgba(22,104,196,0.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, spanGaps: true }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: {
+          x: { display: true, grid: { display: false }, border: { color: 'rgba(16,24,40,0.15)' }, ticks: { maxTicksLimit: 6, autoSkip: true, color: '#98a4b0', font: { size: 11 } } },
+          y: { display: true, grid: { color: 'rgba(16,24,40,0.08)' }, border: { display: false }, ticks: { maxTicksLimit: 5, color: '#98a4b0', font: { size: 11 }, callback: (v) => homeReportAxisValue(v, kind, dataRange) } },
+        },
+      },
+    });
+    homeCharts.push(ch);
+  });
+}
+
+// Draw the charts for whichever Home presentation is showing: the
+// detailed chart in report mode, the bare mini sparkline in insight
+// mode. This must run AFTER the presentation's DOM exists and is
+// visible — drawing into a display:none container, or into canvases
+// that a later render replaces, leaves blank charts (the report
+// charts were never drawn on a fresh load, only after toggling).
+function homeDrawHomeCharts() {
+  if (homeMode === 'report') homeDrawReportCharts($('#homeReport'));
+  else homeDrawSparklines($('#homeSections'));
 }
 
 const HOME_SECTION_TITLES = { property: 'Property', stock: 'Stocks', earning: 'Earning', spending: 'Spending' };
@@ -18366,7 +18425,6 @@ function renderHome() {
     return `<h3 class="home-section-head"><a class="home-section-link" href="${HOME_SECTION_ROUTES[section]}">${HOME_SECTION_TITLES[section]}</a><a class="home-section-all" href="${HOME_SECTION_ROUTES[section]}">View all →</a></h3>
       <div class="home-carousel" data-home-section="${section}">${cards.map(homeInsightCardHtml).join('')}</div>`;
   }).join('');
-  homeDrawSparklines(homeMode === 'report' ? $('#homeReport') : $('#homeSections'));
   homeMarkActiveCarousels($('#view-home'));
   if (homeEditSection) homeEnterEditMode(homeEditSection); // a re-render keeps the section in edit mode
   // Only the visible presentation lives in the DOM: report sections
@@ -18375,11 +18433,15 @@ function renderHome() {
   // queries (AI tag, Delete buttons) and swallow clicks.
   if (homeMode === 'report') renderHomeReport();
   // Mode chrome: report mode is the default landing, so the class
-  // and the toggle label are applied on every render, not only on
+  // and the toggle state are applied on every render, not only on
   // toggle clicks (a re-render after a mark toggle must not flip
   // the user back to insight mode).
   $('#view-home').classList.toggle('home-report', homeMode === 'report');
-  $('#homeModeBtn').textContent = homeMode === 'report' ? 'Insight mode' : 'Report mode';
+  homeSyncModeChrome();
+  // Charts draw LAST: the report DOM is rebuilt by renderHomeReport
+  // above, and #homeReport is display:none until the class toggle —
+  // drawing before either leaves blank canvases.
+  homeDrawHomeCharts();
   renderHomeAiThread();
 }
 
@@ -18439,7 +18501,7 @@ function renderHomeReport() {
         ? (c.empty
           ? `<div class="insight-card"><div class="insight-text"><div class="insight-empty">No upcoming payments</div></div></div>`
           : homePayCardHtml(c))
-        : homeInsightCardHtml(c, { photo: true });
+        : homeInsightCardHtml(c);
       return `<div class="report-slot" data-report-slot="${ci}">${html}</div>`;
     }).join('');
     const dots = sec.cards.map((c, ci) => `<button class="report-dot" data-report-dot="${ci}" aria-label="Card ${ci + 1} of ${sec.cards.length}"></button>`).join('');
@@ -18473,6 +18535,52 @@ function homeReportApply() {
       dot.classList.toggle('is-active', si === homeReport.section && ci === homeReport.card);
     });
   });
+  homeReportBackdrop();
+}
+
+// Fullscreen report mode + the Report/Insight switch: the body class
+// hides the top bar (and stops page scroll) while report mode is on
+// and the Home view is showing; the switch shows the current mode
+// (knob position + active label).
+function homeSyncModeChrome() {
+  const on = homeMode === 'report' && !$('#view-home').classList.contains('hidden');
+  document.body.classList.toggle('report-full', on);
+  const sw = $('#homeModeBtn');
+  if (sw) {
+    sw.classList.toggle('is-report', homeMode === 'report');
+    sw.setAttribute('aria-checked', homeMode === 'report' ? 'true' : 'false');
+    sw.setAttribute('aria-label', homeMode === 'report' ? 'Report mode' : 'Insight mode');
+  }
+  document.querySelectorAll('#homeModeToggle .home-mode-label').forEach((l) => {
+    l.classList.toggle('is-active', l.dataset.modeLabel === homeMode);
+  });
+}
+
+// Backdrop projection: when the active report card is a per-property
+// card with a photo, the photo shows large, dimmed and blurred,
+// behind the carousel (the gradient washes over it); aggregate cards
+// and photo-less cards get the gradient only — no fallback image.
+// Two layers crossfade: the incoming layer fades in over the
+// outgoing one when the active card changes.
+let homeBackdropPhoto = null;
+let homeBackdropFront = 0;
+function homeReportBackdrop() {
+  const wrap = $('#homeReportBackdrop');
+  if (!wrap) return;
+  const sec = homeReportSecs[homeReport.section];
+  const card = sec && sec.cards[homeReport.card];
+  const photo = (card && card.photo) || null;
+  if (photo === homeBackdropPhoto) return;
+  homeBackdropPhoto = photo;
+  const layers = wrap.querySelectorAll('.report-backdrop-layer');
+  if (!layers.length) return;
+  if (!photo) { layers.forEach((l) => l.classList.remove('is-on')); return; }
+  const next = layers[homeBackdropFront % layers.length];
+  const prev = layers[(homeBackdropFront + 1) % layers.length];
+  next.style.backgroundImage = `url(${JSON.stringify(photo)})`;
+  next.classList.add('is-on');
+  prev.classList.remove('is-on');
+  homeBackdropFront = (homeBackdropFront + 1) % layers.length;
 }
 
 function homeReportGo(dir) {
@@ -18487,19 +18595,19 @@ function homeReportGo(dir) {
 function homeSetMode(mode) {
   homeMode = mode;
   $('#view-home').classList.toggle('home-report', mode === 'report');
-  $('#homeModeBtn').textContent = mode === 'report' ? 'Insight mode' : 'Report mode';
+  homeSyncModeChrome();
   if (mode === 'report') {
     homeExitEditMode();
     renderHomeReport();
     homeReportApply();
-    homeDrawSparklines($('#homeReport'));
+    homeDrawHomeCharts();
   } else {
     // Leaving report mode drops its DOM so only the insight
     // presentation exists (see renderHome).
     const el = $('#homeReport');
     if (el) el.innerHTML = '';
     homeReportSecs = [];
-    homeDrawSparklines($('#homeSections'));
+    homeDrawHomeCharts();
   }
 }
 $('#homeModeBtn').addEventListener('click', () => homeSetMode(homeMode === 'report' ? 'insight' : 'report'));
@@ -18532,8 +18640,10 @@ $('#homeReport').addEventListener('wheel', (e) => {
 }, { passive: false });
 
 // Arrow keys navigate too (only while report mode is showing).
+// Esc exits fullscreen report mode back to insight mode.
 document.addEventListener('keydown', (e) => {
   if (homeMode !== 'report' || $('#view-home').classList.contains('hidden')) return;
+  if (e.key === 'Escape') { homeSetMode('insight'); return; }
   const dir = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' }[e.key];
   if (!dir) return;
   e.preventDefault();

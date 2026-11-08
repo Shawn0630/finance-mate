@@ -35,9 +35,14 @@
         <h2 class="home-title">Home</h2>
         <div class="home-sub" id="homeSummary"></div>
       </div>
-      <button class="btn" id="homeModeBtn">Insight mode</button>
+      <div class="home-mode-toggle" id="homeModeToggle">
+        <span class="home-mode-label" data-mode-label="report">Report</span>
+        <button id="homeModeBtn" class="home-mode-switch is-report" role="switch" aria-checked="true" aria-label="Report mode"><span class="home-mode-knob"></span></button>
+        <span class="home-mode-label" data-mode-label="insight">Insight</span>
+      </div>
       <button class="btn" id="homeRegenBtn">Re-generate</button>
     </div>
+    <div class="report-backdrop" id="homeReportBackdrop" aria-hidden="true"><div class="report-backdrop-layer"></div><div class="report-backdrop-layer"></div></div>
     <div id="homeReport"></div>
     <h3 class="home-section-head">Upcoming payments</h3>
     <div class="home-upcoming">
