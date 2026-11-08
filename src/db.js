@@ -954,6 +954,21 @@ CREATE TABLE IF NOT EXISTS income_marks (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (user_id, kind, source_id, pay_date)
 );
+-- Browser-sync log (2026-11-08): one row per browser sync event —
+-- time, direction (upload = this server's data written to the sync
+-- folder; download = a file from the folder imported here), result,
+-- file size and a human note or failure reason. Listed newest-first
+-- in Admin → Data. The retired server-side sync loop never wrote
+-- here; only browser-sync events land in this table.
+CREATE TABLE IF NOT EXISTS sync_log (
+  id INTEGER PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  direction TEXT NOT NULL,             -- 'upload' | 'download'
+  status TEXT NOT NULL,                -- 'ok' | 'error' | 'skipped'
+  bytes INTEGER,                       -- file size when known
+  exported_at TEXT,                    -- the export's exported_at when known
+  detail TEXT                          -- human note / failure reason
+);
 CREATE INDEX IF NOT EXISTS idx_app_commits_module ON app_commits(module);
 CREATE INDEX IF NOT EXISTS idx_app_commits_project ON app_commits(project_id);
 CREATE INDEX IF NOT EXISTS idx_app_commits_entity ON app_commits(entity_type, entity_id);

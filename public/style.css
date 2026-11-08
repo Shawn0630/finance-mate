@@ -379,17 +379,6 @@ label.btnlike:hover { background: #f0f4f9; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .modal-head h3 { margin: 0; font-size: 16px; }
 
-/* Folder picker (Admin → Data → iCloud sync): server-side directory
-   browser, same pattern as the App Manager's picker. */
-.browse-roots { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.browse-roots:empty { display: none; }
-.browse-chip { border: 1px solid #d7e0ea; background: #fff; color: #344054; border-radius: 999px; padding: 4px 10px; font-size: 12.5px; cursor: pointer; }
-.browse-chip:hover { background: #f2f6ff; }
-.browse-chip-active { background: #1668c4; border-color: #1668c4; color: #fff; }
-.browse-crumb { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #344054; word-break: break-all; }
-.browse-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; margin: 10px 0; }
-.browse-item { display: block; width: 100%; text-align: left; background: none; border: none; padding: 7px 8px; border-radius: 6px; font-size: 13.5px; color: #101828; cursor: pointer; }
-.browse-item:hover { background: #f2f6ff; }
 .detail-table td:first-child { width: 190px; color: #5a6a7a; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 /* Mortgage modal's read-only metadata grid: derived figures only,
    no inputs — what can change lives in the terms below it. */
@@ -541,6 +530,21 @@ table.seg-table td:last-child { text-align: right; }
 .loading-spinner { width: 44px; height: 44px; border-radius: 50%; border: 4px solid rgba(22, 104, 196, .22); border-top-color: #1668c4; animation: fm-spin .8s linear infinite; }
 @keyframes fm-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .loading-spinner { animation-duration: 2.4s; } }
+
+/* Browser sync progress (floating): body-level, fixed to the
+   viewport bottom so it stays visible while a sync runs, across
+   every page — hash navigation never hides it. The bar moves on
+   real bytes; when no total is known it slides (indeterminate).
+   Errors tint the bar red and stay until dismissed. */
+.sync-progress { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 1500; width: min(460px, calc(100vw - 32px)); background: #fff; border: 1px solid #d7e0ea; border-radius: 10px; box-shadow: 0 8px 24px rgba(16, 24, 40, .18); padding: 10px 14px 12px; }
+.sync-progress-row { display: flex; align-items: baseline; gap: 8px; font-size: 13px; color: #101828; }
+.sync-progress-row #syncProgressPct { margin-left: auto; color: #667085; font-variant-numeric: tabular-nums; }
+.sync-progress-row #syncProgressClose { border: none; background: none; font-size: 16px; line-height: 1; color: #667085; cursor: pointer; padding: 0 2px; }
+.sync-progress-track { height: 6px; background: #eef2f6; border-radius: 999px; margin-top: 8px; overflow: hidden; }
+.sync-progress-track #syncProgressBar { height: 100%; width: 0; background: #1668c4; border-radius: 999px; transition: width .15s ease; }
+.sync-progress-track.sync-progress-indet #syncProgressBar { animation: fm-sync-slide 1.2s ease-in-out infinite; }
+@keyframes fm-sync-slide { 0% { margin-left: 0; } 50% { margin-left: 60%; } 100% { margin-left: 0; } }
+.sync-progress-error .sync-progress-track #syncProgressBar { background: #b3261e; }
 
 /* Property detail outline: a Google Docs-style section index that
    FLOATS over the page's left edge (position: fixed) — the content

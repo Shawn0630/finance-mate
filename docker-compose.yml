@@ -18,11 +18,13 @@ services:
       # SEED_ADMIN_PASSWORD: admin
     volumes:
       - finance-mate-data:/app/data
-      # iCloud sync (optional): bind-mount a folder in the Mac's iCloud
-      # Drive to /app/data/sync, then enable sync on the Admin page.
-      # The folder must exist on the Mac first:
+      # iCloud sync (RETIRED 2026-11-08): sync now runs in the browser —
+      # the Admin page picks a folder on the Mac with the File System
+      # Access API (Chrome/Edge) and reads/writes the export file while
+      # the page is open, so no bind-mount is needed anymore. The
+      # commented mount below is kept only for reference; the app never
+      # reads /app/data/sync.
       #   mkdir -p ~/Library/Mobile\ Documents/com~apple~CloudDocs/FinanceMate
-      # then uncomment the line below (Docker Compose expands ${HOME}):
       # - ${HOME}/Library/Mobile Documents/com~apple~CloudDocs/FinanceMate:/app/data/sync
     restart: unless-stopped
 

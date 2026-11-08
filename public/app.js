@@ -114,6 +114,18 @@ async function api(path, opts = {}) {
     err.details = data;
     throw err;
   }
+  // Browser sync: a successful mainline write dirties the sync, so
+  // the debounced upload rewrites the export file. Never let this
+  // break the request itself.
+  try {
+    const method = (opts.method || 'GET').toUpperCase();
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)
+      && path.startsWith('/api/')
+      && !path.startsWith('/api/admin/data/')
+      && path !== '/api/login' && path !== '/api/logout') {
+      markBrowserSyncDirty();
+    }
+  } catch { /* sync state must never fail a request */ }
   return data;
 }
 
@@ -8965,14 +8977,8 @@ async function loadAdminData() {
       <td>${esc(b.name)}</td><td>${(b.size / 1024).toFixed(1)} KB</td>
       <td style="white-space:nowrap"><button class="small" data-restore="${esc(b.name)}">Restore</button></td></tr>`).join('')}</tbody></table>`
     : '<div class="note" style="margin-left:0">No backups yet.</div>';
-  try {
-    const s = await api('/api/admin/data/sync');
-    $('#adminSyncEnabled').checked = !!s.enabled;
-    $('#adminSyncFolder').value = s.folder || '';
-    $('#adminSyncStatus').textContent = s.enabled
-      ? (s.lastAt ? `Last synced ${new Date(s.lastAt).toLocaleString('en-CA')} · ${s.lastDirection || ''}` : 'Enabled — not synced yet.')
-      : 'Sync is off.';
-  } catch { $('#adminSyncStatus').textContent = 'Sync status unavailable.'; }
+  loadSyncLog();
+  renderBrowserSyncStatus();
 }
 
 $('#adminBackupList').addEventListener('click', (e) => {
@@ -9008,6 +9014,10 @@ $('#adminImportFile').addEventListener('change', async (e) => {
   if (!confirm('Import replaces all data on this server. A backup is made first. Continue?')) return;
   try {
     await api('/api/admin/data/import', { method: 'POST', body: { data, confirm: true } });
+    // The server data just changed: mark the browser sync dirty so
+    // the next session uploads it to the folder (this page signs out
+    // first, so the debounced upload cannot run here).
+    browserSync.dirty = true; saveBrowserSyncState();
     showMsg(msg, 'ok', 'Import complete. Sign in again.');
     setTimeout(() => { location.href = '/login.html'; }, 1200);
   } catch (err) { showMsg(msg, 'err', err.message); }
@@ -9018,116 +9028,476 @@ window.adminRestoreBackup = async (name) => {
   const msg = $('#adminMsg');
   try {
     await api(`/api/admin/data/backups/${encodeURIComponent(name)}/restore`, { method: 'POST', body: { confirm: true } });
+    browserSync.dirty = true; saveBrowserSyncState();
     showMsg(msg, 'ok', 'Backup restored. Sign in again.');
     setTimeout(() => { location.href = '/login.html'; }, 1200);
   } catch (e) { showMsg(msg, 'err', e.message); }
 };
 
-$('#adminSyncForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const msg = $('#adminMsg');
-  const f = Object.fromEntries(new FormData(e.target).entries());
+// ------------------------------------------- browser iCloud sync ----
+// Sync runs in the browser via the File System Access API (Chrome /
+// Edge on desktop — Safari and Firefox have no folder picker, see
+// the fallback note in Admin). The user picks a folder once (e.g.
+// in iCloud Drive); the directory handle persists in IndexedDB and
+// the page reads/writes the export file in that folder while it is
+// open. No Docker bind-mount is needed: the folder lives on the
+// user's Mac and iCloud syncs it; this app never sees the Mac's
+// filesystem, only the folder the user picked.
+//
+// Same machinery as the manual export/import, reused, not
+// reimplemented: an upload fetches GET /api/admin/data/export and
+// writes that JSON to the folder; a download reads the folder file
+// and POSTs it to /api/admin/data/import (same validation, backup
+// first, last-write-wins by exported_at, loop prevention by content
+// hash). The import wipes sessions, so a download import carries
+// its log entry inside the request — the browser could not post it
+// afterwards. Every event is also logged to the server log table so
+// Admin → Data shows it after a reload.
+const SYNC_FILE_NAME = 'finance-mate-export.json';
+const SYNC_POLL_MS = 5 * 60 * 1000;
+const SYNC_DEBOUNCE_MS = 60 * 1000;
+const SYNC_STATE_KEY = 'fm-browser-sync-state';
+
+const browserSync = {
+  supported: typeof window.showDirectoryPicker === 'function',
+  handle: null,            // FileSystemDirectoryHandle, from IndexedDB
+  folderName: null,
+  permission: 'unknown',   // granted | prompt | denied
+  connected: false,
+  running: false,
+  dirty: false,
+  lastHash: null,          // sha256 of the folder file as last written / imported
+  lastExportedAt: null,
+  lastAt: null,
+  lastDirection: null,
+  pollTimer: null,
+  debounceTimer: null,
+};
+
+// ---- persisted state (this browser only) ----
+function loadBrowserSyncState() {
   try {
-    const s = await api('/api/admin/data/sync', { method: 'PUT', body: { enabled: !!f.enabled, folder: f.folder } });
-    $('#adminSyncEnabled').checked = !!s.enabled;
-    $('#adminSyncFolder').value = s.folder || '';
-    showMsg(msg, 'ok', 'Sync settings saved.');
-    await loadAdminData();
-  } catch (err) { showMsg(msg, 'err', err.message); }
-});
-
-$('#adminSyncNowBtn').addEventListener('click', async () => {
-  const msg = $('#adminMsg');
+    const s = JSON.parse(localStorage.getItem(SYNC_STATE_KEY) || '{}');
+    browserSync.lastHash = s.lastHash || null;
+    browserSync.lastExportedAt = s.lastExportedAt || null;
+    browserSync.lastAt = s.lastAt || null;
+    browserSync.lastDirection = s.lastDirection || null;
+    browserSync.dirty = s.dirty === true;
+  } catch { /* a corrupt state starts fresh */ }
+}
+function saveBrowserSyncState() {
   try {
-    const s = await api('/api/admin/data/sync/now', { method: 'POST' });
-    if (s.error) showMsg(msg, 'err', s.error);
-    else showMsg(msg, 'ok', s.action === 'none' ? 'Already in sync.' : `Sync ${s.action}.`);
-    await loadAdminData();
-  } catch (err) { showMsg(msg, 'err', err.message); }
-});
-
-// Folder picker for the sync folder (Admin only). Same pattern as the
-// App Manager's picker: the server lists the directories the app
-// process can see, one level at a time, rooted at the app folder
-// (/app in Docker) — the Mac's folders never appear here, so a
-// folder that was never mounted into the container simply does not
-// show up. Picking fills the Sync folder field; Save still saves it.
-const syncBrowseModal = $('#syncBrowseModal');
-const syncBrowseRootsEl = $('#syncBrowseRoots');
-const syncBrowsePathEl = $('#syncBrowsePath');
-const syncBrowseListEl = $('#syncBrowseList');
-const syncBrowseErrEl = $('#syncBrowseErr');
-const syncBrowseUpBtn = $('#syncBrowseUp');
-let syncBrowseState = null; // last /api/admin/data/browse response
-
-function renderSyncBrowse() {
-  if (!syncBrowseState) return;
-  // Quick-jump chips from the server's roots list (app folder, plus
-  // the data folder when it exists). A chip is highlighted while the
-  // picker is at — or inside — that root.
-  const roots = syncBrowseState.roots || [];
-  syncBrowseRootsEl.innerHTML = roots.map((r) => {
-    const active = syncBrowseState.path === r.path
-      || (r.path !== '/' && syncBrowseState.path.startsWith(`${r.path}/`));
-    return `<button type="button" class="browse-chip${active ? ' browse-chip-active' : ''}" data-root="${esc(r.path)}" title="${esc(r.path)}">${esc(r.label)}</button>`;
-  }).join('');
-  syncBrowsePathEl.textContent = syncBrowseState.path;
-  syncBrowseUpBtn.disabled = !syncBrowseState.parent;
-  syncBrowseListEl.innerHTML = (syncBrowseState.dirs || []).length
-    ? syncBrowseState.dirs.map((d) =>
-      `<button type="button" class="browse-item" data-dir="${esc(d.path)}"><span class="browse-name">${esc(d.name)}</span></button>`).join('')
-    : '<div class="note" style="margin-left:0">No subfolders here.</div>';
+    localStorage.setItem(SYNC_STATE_KEY, JSON.stringify({
+      lastHash: browserSync.lastHash, lastExportedAt: browserSync.lastExportedAt,
+      lastAt: browserSync.lastAt, lastDirection: browserSync.lastDirection,
+      dirty: browserSync.dirty,
+    }));
+  } catch { /* private mode — sync still works for this page load */ }
+}
+function clearBrowserSyncState() {
+  try { localStorage.removeItem(SYNC_STATE_KEY); } catch { /* ignore */ }
+  browserSync.lastHash = null; browserSync.lastExportedAt = null;
+  browserSync.lastAt = null; browserSync.lastDirection = null; browserSync.dirty = false;
 }
 
-async function syncBrowseTo(dir) {
-  syncBrowseErrEl.style.display = 'none';
-  syncBrowseErrEl.textContent = '';
+// ---- the picked folder, kept in IndexedDB (handles survive reloads) ----
+function syncIdb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('finance-mate-sync', 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore('handles'); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function syncIdbGet() {
+  const db = await syncIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('handles', 'readonly');
+    const req = tx.objectStore('handles').get('syncDir');
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function syncIdbPut(handle) {
+  const db = await syncIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('handles', 'readwrite');
+    tx.objectStore('handles').put(handle, 'syncDir');
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function syncIdbDelete() {
+  const db = await syncIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('handles', 'readwrite');
+    tx.objectStore('handles').delete('syncDir');
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function sha256Hex(buf) {
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Read a stream in chunks with real byte progress. Falls back to a
+// single read when the body has no stream.
+async function readStreamWithProgress(stream, total, onProgress) {
+  if (!stream || typeof stream.getReader !== 'function') return null;
+  const reader = stream.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.byteLength;
+    onProgress(loaded, total);
+  }
+  const out = new Uint8Array(loaded);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
+// ---- floating progress bar (body-level, survives hash navigation) ----
+let syncProgressHideTimer = null;
+function syncProgressShow(label) {
+  const el = $('#syncProgress');
+  if (!el) return;
+  if (syncProgressHideTimer) { clearTimeout(syncProgressHideTimer); syncProgressHideTimer = null; }
+  el.classList.remove('hidden');
+  el.classList.remove('sync-progress-error');
+  $('#syncProgressLabel').textContent = label;
+  $('#syncProgressPct').textContent = '';
+  syncProgressSet(0, 0);
+}
+function syncProgressSet(loaded, total) {
+  const bar = $('#syncProgressBar');
+  const pct = $('#syncProgressPct');
+  if (!bar) return;
+  if (total > 0) {
+    const p = Math.max(0, Math.min(100, (loaded / total) * 100));
+    bar.style.width = `${p.toFixed(1)}%`;
+    bar.parentElement.classList.remove('sync-progress-indet');
+    if (pct) pct.textContent = `${Math.round(p)}%`;
+  } else {
+    bar.style.width = '40%';
+    bar.parentElement.classList.add('sync-progress-indet');
+    if (pct) pct.textContent = '';
+  }
+}
+function syncProgressDone(label) {
+  const el = $('#syncProgress');
+  if (!el) return;
+  $('#syncProgressLabel').textContent = label;
+  syncProgressSet(1, 1);
+  if (syncProgressHideTimer) clearTimeout(syncProgressHideTimer);
+  syncProgressHideTimer = setTimeout(() => { el.classList.add('hidden'); }, 2500);
+}
+function syncProgressError(msg) {
+  const el = $('#syncProgress');
+  if (!el) return;
+  if (syncProgressHideTimer) { clearTimeout(syncProgressHideTimer); syncProgressHideTimer = null; }
+  el.classList.remove('hidden');
+  el.classList.add('sync-progress-error');
+  $('#syncProgressLabel').textContent = msg;
+  $('#syncProgressPct').textContent = '';
+  syncProgressSet(1, 1);
+}
+$('#syncProgressClose').addEventListener('click', () => {
+  if (syncProgressHideTimer) { clearTimeout(syncProgressHideTimer); syncProgressHideTimer = null; }
+  $('#syncProgress').classList.add('hidden');
+});
+
+// ---- sync log (Admin → Data) ----
+async function syncLogEvent(entry) {
+  // The log must never fail a sync itself.
+  try { await api('/api/admin/data/sync/log', { method: 'POST', body: entry }); } catch { /* keep going */ }
+  loadSyncLog();
+}
+async function loadSyncLog() {
+  const host = $('#browserSyncLog');
+  if (!host) return;
   try {
-    const q = dir ? `?path=${encodeURIComponent(dir)}` : '';
-    syncBrowseState = await api(`/api/admin/data/browse${q}`);
-    renderSyncBrowse();
-    return true;
-  } catch (e) {
-    syncBrowseErrEl.textContent = e.message;
-    syncBrowseErrEl.style.display = '';
-    return false;
+    const r = await api('/api/admin/data/sync/log');
+    const rows = r.log || [];
+    host.innerHTML = rows.length
+      ? `<table><thead><tr><th>When</th><th>Direction</th><th>Result</th><th>Size</th><th></th></tr></thead><tbody>${rows.map((e) => `<tr>
+        <td style="white-space:nowrap">${esc(new Date(e.created_at).toLocaleString('en-CA'))}</td>
+        <td>${e.direction === 'upload' ? 'Upload' : 'Download'}</td>
+        <td>${e.status === 'ok' ? 'OK' : e.status === 'skipped' ? 'Skipped' : 'Failed'}</td>
+        <td>${e.bytes == null ? '—' : `${(e.bytes / 1024).toFixed(1)} KB`}</td>
+        <td>${esc(e.detail || '')}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="note" style="margin-left:0">No syncs yet.</div>';
+  } catch { host.innerHTML = '<div class="note" style="margin-left:0">Sync log unavailable.</div>'; }
+}
+
+function renderBrowserSyncStatus() {
+  const statusEl = $('#browserSyncStatus');
+  const panel = $('#browserSyncPanel');
+  const unsupported = $('#browserSyncUnsupported');
+  if (!statusEl || !panel || !unsupported) return;
+  if (!browserSync.supported) {
+    unsupported.classList.remove('hidden');
+    panel.classList.add('hidden');
+    return;
+  }
+  unsupported.classList.add('hidden');
+  panel.classList.remove('hidden');
+  $('#browserSyncReconnectBtn').classList.toggle('hidden',
+    browserSync.permission !== 'prompt' && browserSync.permission !== 'denied');
+  if (!browserSync.handle) statusEl.textContent = 'Not connected.';
+  else if (browserSync.permission !== 'granted') statusEl.textContent = `Folder “${browserSync.folderName}” needs permission — press Reconnect.`;
+  else if (browserSync.lastAt) statusEl.textContent = `Connected to “${browserSync.folderName}” · Last synced ${new Date(browserSync.lastAt).toLocaleString('en-CA')} · ${browserSync.lastDirection || ''}`;
+  else statusEl.textContent = `Connected to “${browserSync.folderName}” — not synced yet.`;
+}
+
+// ---- folder lifecycle ----
+async function browserSyncChoose() {
+  if (!browserSync.supported) return;
+  let handle;
+  try { handle = await window.showDirectoryPicker({ mode: 'readwrite' }); }
+  catch (e) { if (!e || e.name !== 'AbortError') showMsg($('#adminMsg'), 'err', e.message || 'Could not open the folder picker.'); return; }
+  try { await syncIdbPut(handle); } catch (e) { showMsg($('#adminMsg'), 'err', `Could not remember the folder: ${e.message}`); return; }
+  browserSync.handle = handle;
+  browserSync.folderName = handle.name;
+  browserSync.permission = 'granted';
+  browserSync.connected = true;
+  saveBrowserSyncState();
+  renderBrowserSyncStatus();
+  startBrowserSyncPoll();
+  browserSyncCheck({ manual: true });
+}
+
+async function browserSyncInit() {
+  if (!browserSync.supported) { renderBrowserSyncStatus(); return; }
+  loadBrowserSyncState();
+  let handle = null;
+  try { handle = await syncIdbGet(); } catch { handle = null; }
+  if (!handle) { renderBrowserSyncStatus(); return; }
+  browserSync.handle = handle;
+  browserSync.folderName = handle.name;
+  let perm = 'prompt';
+  try { perm = await handle.queryPermission({ mode: 'readwrite' }); } catch { perm = 'prompt'; }
+  browserSync.permission = perm;
+  browserSync.connected = perm === 'granted';
+  renderBrowserSyncStatus();
+  if (perm === 'granted') {
+    startBrowserSyncPoll();
+    // A change made right before a reload, or a file another machine
+    // wrote while this page was closed: catch up quietly on load.
+    if (browserSync.dirty) scheduleBrowserSyncUpload();
+    else browserSyncCheck({ manual: false });
   }
 }
 
-async function openSyncBrowse() {
-  syncBrowseModal.classList.remove('hidden');
-  syncBrowseState = null;
-  syncBrowseRootsEl.innerHTML = '';
-  syncBrowsePathEl.textContent = 'Loading…';
-  syncBrowseListEl.innerHTML = '';
-  syncBrowseErrEl.style.display = 'none';
-  syncBrowseErrEl.textContent = '';
-  // Start where the user already typed (when it looks like an
-  // absolute path); otherwise the server decides (its data folder,
-  // else the app folder). If the typed folder cannot be shown,
-  // retry at the server start and keep the error visible.
-  const typed = $('#adminSyncFolder').value.trim();
-  const ok = await syncBrowseTo(typed.startsWith('/') ? typed : null);
-  if (!ok && typed.startsWith('/')) syncBrowseTo(null);
+async function browserSyncReconnect() {
+  if (!browserSync.handle) return;
+  let perm;
+  try { perm = await browserSync.handle.requestPermission({ mode: 'readwrite' }); }
+  catch (e) { showMsg($('#adminMsg'), 'err', e.message || 'Permission request failed.'); return; }
+  browserSync.permission = perm;
+  browserSync.connected = perm === 'granted';
+  renderBrowserSyncStatus();
+  if (perm === 'granted') {
+    startBrowserSyncPoll();
+    browserSyncCheck({ manual: true });
+  }
 }
 
-$('#adminSyncBrowseBtn').addEventListener('click', openSyncBrowse);
-syncBrowseListEl.addEventListener('click', (ev) => {
-  const btn = ev.target.closest('button[data-dir]');
-  if (btn) syncBrowseTo(btn.dataset.dir);
-});
-syncBrowseRootsEl.addEventListener('click', (ev) => {
-  const btn = ev.target.closest('button[data-root]');
-  if (btn) syncBrowseTo(btn.dataset.root);
-});
-syncBrowseUpBtn.addEventListener('click', () => {
-  if (syncBrowseState && syncBrowseState.parent) syncBrowseTo(syncBrowseState.parent);
-});
-$('#syncBrowseUse').addEventListener('click', () => {
-  if (!syncBrowseState) return;
-  $('#adminSyncFolder').value = syncBrowseState.path;
-  closeModalEl(syncBrowseModal);
-});
+async function browserSyncForget() {
+  try { await syncIdbDelete(); } catch { /* already gone */ }
+  stopBrowserSyncPoll();
+  if (browserSync.debounceTimer) { clearTimeout(browserSync.debounceTimer); browserSync.debounceTimer = null; }
+  browserSync.handle = null; browserSync.folderName = null;
+  browserSync.permission = 'unknown'; browserSync.connected = false;
+  clearBrowserSyncState();
+  renderBrowserSyncStatus();
+}
+
+function startBrowserSyncPoll() {
+  if (browserSync.pollTimer) return;
+  browserSync.pollTimer = setInterval(() => { browserSyncCheck({ manual: false }); }, SYNC_POLL_MS);
+}
+function stopBrowserSyncPoll() {
+  if (browserSync.pollTimer) { clearInterval(browserSync.pollTimer); browserSync.pollTimer = null; }
+}
+
+// ---- dirty tracking: a successful mainline write schedules an upload ----
+function markBrowserSyncDirty() {
+  browserSync.dirty = true;
+  saveBrowserSyncState();
+  if (browserSync.connected) scheduleBrowserSyncUpload();
+}
+function scheduleBrowserSyncUpload() {
+  if (browserSync.debounceTimer) clearTimeout(browserSync.debounceTimer);
+  browserSync.debounceTimer = setTimeout(() => {
+    browserSync.debounceTimer = null;
+    browserSyncUpload({ manual: false });
+  }, SYNC_DEBOUNCE_MS);
+}
+
+// ---- upload: this server's export → the sync folder ----
+async function browserSyncUpload({ manual = false } = {}) {
+  if (!browserSync.handle || browserSync.permission !== 'granted' || browserSync.running) return { action: 'skipped' };
+  browserSync.running = true;
+  try {
+    syncProgressShow('Uploading…');
+    const res = await fetch('/api/admin/data/export');
+    if (res.status === 401) { location.href = '/login.html'; throw new Error('not signed in'); }
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `export failed (${res.status})`);
+    const total = Number(res.headers.get('Content-Length')) || 0;
+    let buf = await readStreamWithProgress(res.body, total, (loaded, t) => syncProgressSet(loaded, t));
+    if (!buf) buf = new Uint8Array(await res.arrayBuffer());
+    const hash = await sha256Hex(buf);
+    if (hash === browserSync.lastHash) {
+      syncProgressDone('Already in sync.');
+      if (manual) await syncLogEvent({ direction: 'upload', status: 'skipped', bytes: buf.byteLength, detail: 'Already in sync.' });
+      return { action: 'none' };
+    }
+    const text = new TextDecoder().decode(buf);
+    let payload;
+    try { payload = JSON.parse(text); } catch { throw new Error('export is not valid JSON'); }
+    // Write in chunks so the bar moves on real bytes.
+    syncProgressShow('Writing to the sync folder…');
+    const bytes = new TextEncoder().encode(text);
+    const fileHandle = await browserSync.handle.getFileHandle(SYNC_FILE_NAME, { create: true });
+    const writable = await fileHandle.createWritable();
+    try {
+      const CHUNK = 64 * 1024;
+      for (let done = 0; done < bytes.byteLength; done += CHUNK) {
+        await writable.write(bytes.slice(done, done + CHUNK));
+        syncProgressSet(done + Math.min(CHUNK, bytes.byteLength - done), bytes.byteLength);
+      }
+      await writable.close();
+    } catch (e) { try { await writable.abort(); } catch { /* already closed */ } throw e; }
+    browserSync.lastHash = hash;
+    browserSync.lastExportedAt = payload.exported_at || null;
+    browserSync.lastAt = new Date().toISOString();
+    browserSync.lastDirection = 'upload';
+    browserSync.dirty = false;
+    saveBrowserSyncState();
+    await syncLogEvent({ direction: 'upload', status: 'ok', bytes: buf.byteLength, exported_at: payload.exported_at, detail: 'Uploaded to the sync folder.' });
+    syncProgressDone('Upload complete.');
+    renderBrowserSyncStatus();
+    return { action: 'uploaded', bytes: buf.byteLength };
+  } catch (e) {
+    await syncLogEvent({ direction: 'upload', status: 'error', detail: e.message });
+    syncProgressError(`Upload failed: ${e.message}`);
+    renderBrowserSyncStatus();
+    return { action: 'error', error: e.message };
+  } finally { browserSync.running = false; }
+}
+
+// ---- check: a newer file in the folder → import it ----
+async function browserSyncCheck({ manual = false } = {}) {
+  if (!browserSync.handle || browserSync.permission !== 'granted' || browserSync.running) return { action: 'skipped' };
+  browserSync.running = true;
+  try {
+    syncProgressShow('Checking the sync folder…');
+    let fileHandle;
+    try { fileHandle = await browserSync.handle.getFileHandle(SYNC_FILE_NAME); }
+    catch (e) {
+      if (e && e.name === 'NotFoundError') {
+        // No file yet: write ours (first connect, or the user deleted it).
+        browserSync.running = false;
+        return browserSyncUpload({ manual });
+      }
+      throw e;
+    }
+    const file = await fileHandle.getFile();
+    const total = file.size || 0;
+    let buf = null;
+    if (file.stream) buf = await readStreamWithProgress(file.stream(), total, (loaded, t) => syncProgressSet(loaded, t));
+    if (!buf) buf = new Uint8Array(await file.arrayBuffer());
+    const hash = await sha256Hex(buf);
+    if (hash === browserSync.lastHash) {
+      syncProgressDone('Already in sync.');
+      if (manual) await syncLogEvent({ direction: 'download', status: 'skipped', bytes: buf.byteLength, detail: 'Already in sync.' });
+      return { action: 'none' };
+    }
+    let payload;
+    try { payload = JSON.parse(new TextDecoder().decode(buf)); }
+    catch { throw new Error('sync file is not valid JSON'); }
+    if (!payload || payload.format !== 'finance-mate-export' || payload.version !== 1 || typeof payload.exported_at !== 'string') {
+      throw new Error('sync file is not a finance-mate export');
+    }
+    if (browserSync.lastExportedAt && payload.exported_at <= browserSync.lastExportedAt) {
+      // Older than our state: leave it — our next upload wins.
+      syncProgressDone('Already in sync.');
+      if (manual) await syncLogEvent({ direction: 'download', status: 'skipped', bytes: buf.byteLength, detail: 'Sync file is older than this server.' });
+      return { action: 'none' };
+    }
+    // Newer file from another machine: import it through the normal
+    // import path (backup first, same validation). The request
+    // carries the log entry — the import wipes sessions, so the
+    // browser could not log afterwards.
+    syncProgressShow('Downloading…');
+    await api('/api/admin/data/import', {
+      method: 'POST',
+      body: {
+        data: payload, confirm: true,
+        sync: { direction: 'download', bytes: buf.byteLength, exported_at: payload.exported_at },
+      },
+    });
+    browserSync.lastHash = hash;
+    browserSync.lastExportedAt = payload.exported_at;
+    browserSync.lastAt = new Date().toISOString();
+    browserSync.lastDirection = 'download';
+    browserSync.dirty = false;
+    saveBrowserSyncState();
+    syncProgressDone('Download complete — sign in again.');
+    renderBrowserSyncStatus();
+    setTimeout(() => { location.href = '/login.html'; }, 1200);
+    return { action: 'downloaded', bytes: buf.byteLength };
+  } catch (e) {
+    await syncLogEvent({ direction: 'download', status: 'error', detail: e.message });
+    syncProgressError(`Download failed: ${e.message}`);
+    renderBrowserSyncStatus();
+    return { action: 'error', error: e.message };
+  } finally { browserSync.running = false; }
+}
+
+async function browserSyncNow() {
+  const msg = $('#adminMsg');
+  if (!browserSync.handle) { showMsg(msg, 'err', 'Choose a sync folder first.'); return; }
+  if (browserSync.permission !== 'granted') { showMsg(msg, 'err', 'Reconnect the sync folder first.'); return; }
+  if (browserSync.dirty) {
+    const r = await browserSyncUpload({ manual: true });
+    if (r.action === 'uploaded') showMsg(msg, 'ok', 'Sync uploaded.');
+    else if (r.action === 'error') showMsg(msg, 'err', r.error);
+    else if (r.action === 'none') showMsg(msg, 'ok', 'Already in sync.');
+    loadSyncLog();
+    return;
+  }
+  const r = await browserSyncCheck({ manual: true });
+  if (r.action === 'none') showMsg(msg, 'ok', 'Already in sync.');
+  else if (r.action === 'error') showMsg(msg, 'err', r.error);
+  loadSyncLog();
+}
+
+$('#browserSyncChooseBtn').addEventListener('click', browserSyncChoose);
+$('#browserSyncNowBtn').addEventListener('click', browserSyncNow);
+$('#browserSyncReconnectBtn').addEventListener('click', browserSyncReconnect);
+$('#browserSyncForgetBtn').addEventListener('click', browserSyncForget);
+
+// Test / debug handle (the directory picker cannot be driven
+// headlessly, so e2e drives the engine with a stubbed handle here).
+window.browserSync = {
+  state: browserSync,
+  init: browserSyncInit,
+  choose: browserSyncChoose,
+  reconnect: browserSyncReconnect,
+  forget: browserSyncForget,
+  now: browserSyncNow,
+  upload: browserSyncUpload,
+  check: browserSyncCheck,
+  progress: { show: syncProgressShow, set: syncProgressSet, done: syncProgressDone, error: syncProgressError },
+};
+
 
 // -------------------------------------------------------------------- misc ---
 $('#logoutBtn').addEventListener('click', async () => {
@@ -11465,6 +11835,7 @@ $('#spendDetailAddTxBtn').addEventListener('click', () => openSpendTxAdd(current
     $('#whoami').textContent = me.username;
     $('#whoamiAvatar').innerHTML = avatarHtml(me);
     if (me.isAdmin) $('#adminNavLink').classList.remove('hidden');
+    if (me.isAdmin) browserSyncInit(); // restores the picked folder + poll (admins only)
   } catch { /* api() already redirected */ }
   await loadOwnerUsers();
   await loadChartColorPrefs();

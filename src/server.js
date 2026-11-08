@@ -54,10 +54,7 @@ import {
   buildExport, validateExport, applyImport, writeBackup, listBackups, readBackup,
   EXPORT_FORMAT, EXPORT_VERSION,
 } from './dataExport.js';
-import {
-  getSyncSettings, saveSyncSettings, getSyncState, markSyncDirty, syncPass, startSyncLoop,
-} from './dataSync.js';
-import { browseFolder } from './folderBrowse.js';
+import { recordSyncLog, listSyncLog } from './syncLog.js';
 import {
   applyStoredCustomSinkRate,
   calcPenalty, validateOp, validateLegs,
@@ -106,21 +103,10 @@ app.use((req, res, next) => {
   json48(req, res, next);
 });
 
-// iCloud sync: any successful mainline write marks the sync dirty, so
-// the debounced sync pass rewrites the export file. The sync endpoints
-// themselves never mark dirty (their own pass manages the state), and
-// login/logout are not data writes.
-app.use((req, res, next) => {
-  res.on('finish', () => {
-    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
-    if (!req.path.startsWith('/api/')) return;
-    if (req.path.startsWith('/api/admin/data/')) return;
-    if (req.path === '/api/login' || req.path === '/api/logout') return;
-    if (res.statusCode < 200 || res.statusCode >= 300) return;
-    try { markSyncDirty(db); } catch { /* sync state must never fail a request */ }
-  });
-  next();
-});
+// (No server-side sync dirty-marking: sync now runs in the browser,
+// which tracks its own dirty state. The server-side sync loop was
+// retired 2026-11-08 — its settings stay in app_meta untouched, but
+// nothing reads or writes them anymore.)
 
 // ---------------------------------------------------------------- auth ---
 function parseCookies(req) {
@@ -783,7 +769,20 @@ app.post('/api/admin/data/import', requireApiAuth, requireAdmin, express.json({ 
   try {
     const backup = writeBackup(db, { includePlanning: true });
     const summary = applyImport(db, payload);
-    markSyncDirty(db);
+    // A browser sync download carries its log entry in the request:
+    // the import wipes sessions, so the browser could not post the
+    // log afterwards. A manual import sends no `sync` field and logs
+    // nothing.
+    if (b.sync && b.sync.direction === 'download') {
+      try {
+        recordSyncLog(db, {
+          direction: 'download', status: 'ok',
+          bytes: Number.isInteger(b.sync.bytes) ? b.sync.bytes : null,
+          exported_at: typeof b.sync.exported_at === 'string' ? b.sync.exported_at : payload.exported_at,
+          detail: 'Downloaded from the sync folder.',
+        });
+      } catch { /* the import itself succeeded; never fail it on the log */ }
+    }
     res.json({ ok: true, summary, backup: backup.name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -799,48 +798,36 @@ app.post('/api/admin/data/backups/:name/restore', requireApiAuth, requireAdmin, 
   try {
     const backup = writeBackup(db, { includePlanning: true });
     const summary = applyImport(db, payload);
-    markSyncDirty(db);
     res.json({ ok: true, summary, backup: backup.name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ------------------------------------------------------------ data sync ---
-// iCloud sync keeps the export file in a sync folder (bind-mounted to
-// an iCloud Drive folder on the Mac — see docker-compose.yml). The
-// folder is per-machine setup, so it is never exported and never
-// overwritten by an import.
-app.get('/api/admin/data/sync', requireApiAuth, requireAdmin, (req, res) => {
-  const settings = getSyncSettings(db);
-  const state = getSyncState(db);
-  res.json({ ...settings, lastAt: state.lastAt, lastDirection: state.lastDirection });
+// ------------------------------------------------------- browser sync log --
+// iCloud sync now runs in the browser (File System Access API): the
+// page reads/writes the export file in a folder the user picked, so
+// no Docker bind-mount is needed. The server only keeps the sync
+// LOG — every browser sync event is posted here (newest first in
+// Admin → Data) — plus the export/import endpoints the browser
+// reuses. The old server-side sync loop (auto-write on change +
+// 5-minute poll of a container folder) was retired 2026-11-08; its
+// settings stay in app_meta untouched, and the old /sync endpoints
+// are gone.
+app.get('/api/admin/data/sync/log', requireApiAuth, requireAdmin, (req, res) => {
+  const limit = req.query.limit === undefined ? 50 : parseInt(req.query.limit, 10);
+  res.json({ log: listSyncLog(db, Number.isNaN(limit) ? 50 : limit) });
 });
 
-app.put('/api/admin/data/sync', requireApiAuth, requireAdmin, (req, res) => {
+app.post('/api/admin/data/sync/log', requireApiAuth, requireAdmin, (req, res) => {
   const b = req.body || {};
-  if (b.folder !== undefined && (typeof b.folder !== 'string' || !b.folder.trim())) {
-    return res.status(400).json({ error: 'sync folder is required' });
-  }
-  const settings = saveSyncSettings(db, { enabled: b.enabled === true, folder: b.folder });
-  if (settings.enabled) markSyncDirty(db);
-  const state = getSyncState(db);
-  res.json({ ...settings, lastAt: state.lastAt, lastDirection: state.lastDirection });
-});
-
-app.post('/api/admin/data/sync/now', requireApiAuth, requireAdmin, (req, res) => {
-  res.json(syncPass(db));
-});
-
-// Folder picker for the sync folder (Admin only): list the
-// directories the app process can see, one level at a time, rooted
-// at the app folder (/app in Docker). Reads directory names only,
-// never file contents — a folder never mounted into the container
-// simply does not appear.
-app.get('/api/admin/data/browse', requireApiAuth, requireAdmin, (req, res) => {
   try {
-    return res.json(browseFolder(req.query.path));
-  } catch (e) {
-    return res.status(e.status || 500).json({ error: e.message || String(e) });
-  }
+    const row = recordSyncLog(db, {
+      direction: b.direction, status: b.status,
+      bytes: b.bytes === undefined ? null : b.bytes,
+      exported_at: b.exported_at === undefined ? null : b.exported_at,
+      detail: b.detail === undefined ? null : b.detail,
+    });
+    res.json({ ok: true, entry: row });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ------------------------------------------------------ address suggest ---
@@ -9209,5 +9196,7 @@ app.use((err, req, res, next) => {
 export { app };
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   app.listen(PORT, () => console.log(`[finance-mate] listening on http://localhost:${PORT} (data: ${DATA_DIR})`));
-  startSyncLoop(db);
+  // No server-side sync loop: sync runs in the browser (see the
+  // browser sync log section above). The retired loop's settings stay
+  // in app_meta untouched.
 }
