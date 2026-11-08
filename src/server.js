@@ -15,13 +15,13 @@ import {
   applyBcaFetchResult, noteBcaAttempt, ensureFreshAssessment, bcaRefreshStatus,
   runHouseSigmaPull, houseSigmaPullStatus, pullHouseSigmaHistoryInBackground,
 } from './assessed.js';
-import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, llmModels, llmDefaultModel, llmConfigured, callLlm, parseModelJson, validateChatFiles, fileContentParts } from './aiFill.js';
+import { handleAiFill, handleAiFillChat, handleAiInvestFillChat, handleAiSlipFill, handleAiProfileFill, llmModels, llmDefaultModel, llmConfigured, callLlm, parseModelJson, validateChatFiles, fileContentParts } from './aiFill.js';
 import { costsView, listCosts, validCostInput, upsertCost, parseStoredMonthlyAmounts, costAnnual } from './costs.js';
 import {
   ACCOUNT_TYPES, EVENT_TYPES, validAccountInput, validHoldingInput, validEventInput, validNavInput, validInitialEvents,
   addNavPoint, updateNavPoint,
   listAccounts, getAccount, listHoldings, getHolding, listEvents, listPricePoints, rebuildEventPricePoints,
-  computeHolding, computeAccount, computePortfolio, computeFillPreview, unitsOn,
+  computeHolding, computeAccount, computePortfolio, computeFillPreview, unitsOn, displayRate,
   effectiveAccountDefaultCurrency, pinCadReturnPct,
 } from './investments.js';
 import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, latestPrice, clearHoldingPriceMeta, ensurePoolHistory, ensureSymbolHistory, listSymbolPricePoints } from './prices.js';
@@ -55,6 +55,13 @@ import {
   EXPORT_FORMAT, EXPORT_VERSION,
 } from './dataExport.js';
 import { recordSyncLog, listSyncLog } from './syncLog.js';
+import {
+  TAX_ITEM_STATUSES, TAX_FILING_STATUSES,
+  effectiveAmount, filingTotals, sectionSummary,
+  validSharePct, validTaxItemInput, validTaxSlipInput, validTaxProfileInput,
+  buildExpectedContext, upsertExpectedItems, rrspBenefit,
+  respRoomSplit, cesgRoomSplit,
+} from './tax.js';
 import {
   applyStoredCustomSinkRate,
   calcPenalty, validateOp, validateLegs,
@@ -4202,6 +4209,759 @@ app.delete('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (
     return { value: { ok: true }, entityId: rental.id };
   });
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------- tax ---
+// Tax (v1, 2026-11-08): an items inventory + linking + slip
+// capture, organised as tax PROJECTS. One person may have MANY
+// projects for one tax year — each project has its own name, its
+// own items/links/slips, and its own on-demand Generate. NO tax
+// computation — no payable/refund math anywhere in this module
+// (the RRSP benefit slider is a scoped estimate from the
+// existing Earnings engine, not a return computation).
+// Jurisdiction logic lives in the region's tax module
+// (src/regions/ca/tax.js); the endpoints below only wire
+// filings/items/slips/profiles to it, so a later US or
+// cross-border region plugs in without touching them. Filings
+// cover every household user EXCEPT admin; the admin account
+// itself never files.
+// NO PRE-GENERATION (user 2026-11-08): expected items appear
+// ONLY when the user presses Generate on a project. Page loads,
+// year changes, list reads and background jobs never generate.
+// The detail page is sectioned like a guided return (Income,
+// Deductions, Credits, Review — TAX_SECTIONS in src/tax.js).
+// A Tax Profile per person records remaining contribution room
+// (RRSP / TFSA / RESP), user-entered from the CRA Notice of
+// Assessment, never invented; the RRSP slider caps at the
+// recorded room when one exists.
+const taxRegionFor = (filing) => {
+  const r = getRegion((filing && filing.region) || 'CA') || getRegion('CA');
+  return r.tax;
+};
+const taxFilers = () => db.prepare('SELECT * FROM users WHERE username != ? ORDER BY id').all(adminUsername());
+const taxFilingLabel = (filing, person) => {
+  const name = filing && filing.name ? filing.name : 'Tax return';
+  const who = person ? person.username : '?';
+  return `${name} · ${who} · ${filing ? filing.tax_year : '?'}`;
+};
+const getTaxProfile = (personId) => db.prepare('SELECT * FROM tax_profiles WHERE person_id = ?').get(Number(personId)) || null;
+const taxItemView = (row) => {
+  if (!row) return null;
+  let detail = {};
+  try { detail = JSON.parse(row.detail || '{}'); } catch { detail = {}; }
+  return { ...row, detail, effective_amount: effectiveAmount(row) };
+};
+const taxSlipView = (row) => {
+  if (!row) return null;
+  let fields = {};
+  try { fields = JSON.parse(row.fields || '{}'); } catch { fields = {}; }
+  let aiFields = null;
+  try { aiFields = row.ai_fields ? JSON.parse(row.ai_fields) : null; } catch { aiFields = null; }
+  return { ...row, fields, ai_fields: aiFields };
+};
+const taxFilingView = (filing) => {
+  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(filing.person_id);
+  const items = db.prepare('SELECT * FROM tax_items WHERE filing_id = ? ORDER BY kind, id').all(filing.id).map(taxItemView);
+  const slips = db.prepare('SELECT * FROM tax_slips WHERE filing_id = ? ORDER BY id').all(filing.id).map(taxSlipView);
+  return {
+    ...filing,
+    person: person ? { id: person.id, username: person.username } : null,
+    items, slips,
+    totals: filingTotals(items),
+  };
+};
+const validTaxYear = (y) => Number.isInteger(Number(y)) && Number(y) >= 2000 && Number(y) <= 2100;
+// The region's expected-items context for one tax year, built
+// from the app's own records: salary jobs (annual gross from the
+// earnings calc), rental years (T776 net from the rental calc),
+// RRSP plans (own contributions, actual generated events first,
+// projected due periods otherwise), and NonRegistered dividends
+// and sales (TFSA/RRSP income is not taxed in-year).
+const deriveTaxContext = (taxYear) => {
+  const region = getRegion('CA');
+  const jobRows = db.prepare('SELECT * FROM earn_jobs WHERE tax_year = ? ORDER BY employer').all(taxYear).map(earnJobRow);
+  const rentalRows = db.prepare('SELECT * FROM earn_rentals ORDER BY label').all().map((r) => {
+    const row = earnRentalRow(r);
+    let owners = [];
+    if (r.property_id != null) {
+      const prop = db.prepare('SELECT owners FROM properties WHERE id = ?').get(r.property_id);
+      owners = parseOwners(prop ? prop.owners : null);
+    }
+    return { ...row, propertyOwners: owners };
+  });
+  // NOTE: the joined columns are aliased to the camelCase names
+  // buildExpectedContext expects (accountType, accountName,
+  // holdingLabel, jobOwner, jobFrequency) — the raw table columns
+  // stay snake_case (start_date, own_amount, …), which
+  // planOwnAnnual / planPeriodAmounts read as-is.
+  const planRows = db.prepare(`
+    SELECT p.*, a.name AS accountName, a.type AS accountType, a.default_currency AS currency,
+      h.label AS holdingLabel, j.owner AS jobOwner, j.frequency AS jobFrequency,
+      j.gross_amount AS jobGrossAmount, j.gross_basis AS jobGrossBasis
+    FROM invest_plans p
+    JOIN invest_accounts a ON a.id = p.account_id
+    LEFT JOIN invest_holdings h ON h.id = p.target_holding_id
+    JOIN earn_jobs j ON j.id = p.job_id ORDER BY p.id`).all()
+    .map((p) => ({
+      ...p,
+      taxYear,
+      currency: p.currency || 'CAD',
+      events: db.prepare("SELECT * FROM invest_events WHERE plan_id = ? AND type = 'buy' ORDER BY date").all(p.id),
+      deletedDueDates: db.prepare('SELECT due_date FROM invest_plan_deleted WHERE plan_id = ?').all(p.id).map((d) => d.due_date),
+      job: { frequency: p.jobFrequency, gross_amount: p.jobGrossAmount, gross_basis: p.jobGrossBasis },
+    }));
+  const eventRows = (type) => db.prepare(`
+    SELECT e.*, h.label AS holdingLabel, h.currency, a.name AS accountName, a.type AS accountType, a.owners AS accountOwners
+    FROM invest_events e
+    JOIN invest_holdings h ON h.id = e.holding_id
+    JOIN invest_accounts a ON a.id = h.account_id
+    WHERE e.type = ? AND substr(e.date, 1, 4) = ? ORDER BY e.date, e.id`).all(type, String(taxYear));
+  return buildExpectedContext({
+    taxYear, jobRows, rentalRows, planRows,
+    dividendRows: eventRows('dividend'), sellRows: eventRows('sell'),
+    payroll: region.payroll,
+  });
+};
+// Refresh one filing's expected items from the region's
+// derivation. Runs inside the caller's commitTx; returns the
+// upsert counts.
+const generateFilingItems = (filing) => {
+  const regionTax = taxRegionFor(filing);
+  const ctx = deriveTaxContext(filing.tax_year);
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  const derived = regionTax.expectedItems(ctx)
+    .filter((d) => d.personKey && person && d.personKey === person.username);
+  return upsertExpectedItems(db, { filingId: filing.id, taxYear: filing.tax_year, derived });
+};
+// Refresh the UNLINKED bucket for a year: derived items no
+// filer owns (no determinable person). System-owned like the
+// filing items — Generate re-derives them, never the user's.
+const generateUnlinkedItems = (taxYear) => {
+  const regionTax = (getRegion('CA') || {}).tax;
+  const ctx = deriveTaxContext(taxYear);
+  const derived = regionTax.expectedItems(ctx).filter((d) => !d.personKey);
+  return upsertExpectedItems(db, { filingId: null, taxYear, derived });
+};
+const getTaxFiling = (id) => db.prepare('SELECT * FROM tax_filings WHERE id = ?').get(Number(id));
+
+app.get('/api/tax/years', requireApiAuth, (req, res) => {
+  const years = new Set([Number(vancouverToday().slice(0, 4))]);
+  for (const r of db.prepare('SELECT DISTINCT tax_year FROM earn_jobs').all()) years.add(Number(r.tax_year));
+  for (const r of db.prepare('SELECT DISTINCT tax_year FROM earn_rental_years').all()) years.add(Number(r.tax_year));
+  for (const r of db.prepare("SELECT DISTINCT CAST(substr(date, 1, 4) AS INTEGER) AS y FROM invest_events").all()) {
+    if (r.y) years.add(Number(r.y));
+  }
+  for (const r of db.prepare('SELECT DISTINCT tax_year FROM tax_filings').all()) years.add(Number(r.tax_year));
+  const sorted = [...years].filter((y) => Number.isInteger(y) && y >= 2000 && y <= 2100).sort((a, b) => b - a);
+  res.json({ years: sorted, current: Number(vancouverToday().slice(0, 4)) });
+});
+
+app.get('/api/tax/filings', requireApiAuth, (req, res) => {
+  const year = Number(req.query.year || vancouverToday().slice(0, 4));
+  if (!validTaxYear(year)) return res.status(400).json({ error: 'year must be between 2000 and 2100.' });
+  // Projects grouped by person: one person may have many
+  // projects for the year, each with its own name, items and
+  // Generate state. Nothing here generates — the list only
+  // reads what already exists.
+  const filers = taxFilers().map((u) => {
+    const projects = db.prepare('SELECT * FROM tax_filings WHERE person_id = ? AND tax_year = ? ORDER BY id').all(u.id, year)
+      .map((f) => {
+        const view = taxFilingView(f);
+        return { ...view, items: undefined, slips: undefined, itemCount: view.items.length };
+      });
+    return {
+      person: { id: u.id, username: u.username },
+      projects,
+      profile: getTaxProfile(u.id),
+    };
+  });
+  const unlinked = db.prepare('SELECT * FROM tax_items WHERE filing_id IS NULL AND tax_year = ? ORDER BY kind, id')
+    .all(year).map(taxItemView);
+  res.json({ year, filers, unlinked });
+});
+
+app.post('/api/tax/filings', requireApiAuth, (req, res) => {
+  const b = req.body || {};
+  const year = Number(b.year);
+  if (!validTaxYear(year)) return res.status(400).json({ error: 'year must be between 2000 and 2100.' });
+  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(b.personId));
+  if (!person || person.username === adminUsername()) {
+    return res.status(400).json({ error: 'person must be a household user (not admin).' });
+  }
+  const regionCode = b.region != null ? String(b.region).toUpperCase() : 'CA';
+  if (!getRegion(regionCode)) return res.status(400).json({ error: `unknown region "${regionCode}".` });
+  // Many projects per person per year are allowed — there is no
+  // duplicate check. The name defaults when blank; the UI asks
+  // for one. Creating a project generates NOTHING — items come
+  // only from an explicit Generate on the project.
+  const name = typeof b.name === 'string' && b.name.trim() ? b.name.trim().slice(0, 100) : `Tax return ${year}`;
+  const out = commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: null,
+    entityLabel: `${name} · ${person.username} · ${year}`,
+    summary: `Created tax project · ${name} · ${person.username} · ${year}`,
+  }, () => {
+    const now = nowIso();
+    const info = db.prepare('INSERT INTO tax_filings (person_id, name, tax_year, region, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(person.id, name, year, regionCode, 'open', now, now);
+    return { value: taxFilingView(db.prepare('SELECT * FROM tax_filings WHERE id = ?').get(info.lastInsertRowid)), entityId: info.lastInsertRowid };
+  });
+  res.status(201).json(out);
+});
+
+app.post('/api/tax/filings/:id/generate', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  // On-demand only: this is the ONE place expected items are
+  // generated, and only when the user presses Generate on this
+  // project. The refresh also re-derives the shared UNLINKED
+  // bucket (system-owned, no commit of its own).
+  const counts = commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: taxFilingLabel(filing, person),
+    summary: `Generated expected items · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    const now = nowIso();
+    db.prepare('UPDATE tax_filings SET generated_at = ?, updated_at = ? WHERE id = ?').run(now, now, filing.id);
+    return { value: generateFilingItems(filing), entityId: filing.id };
+  });
+  const unlinked = generateUnlinkedItems(filing.tax_year);
+  res.json({ filing: taxFilingView(getTaxFiling(filing.id)), counts, unlinked });
+});
+
+app.get('/api/tax/filings/:id', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const regionTax = taxRegionFor(filing);
+  const view = taxFilingView(filing);
+  const person = view.person;
+  // The RRSP slider starts from this person's linked RRSP plan
+  // amounts for the year (actual generated events first,
+  // projected due periods otherwise — planOwnAnnual).
+  const ctx = deriveTaxContext(filing.tax_year);
+  const rrspPlanAnnual = person
+    ? round2(ctx.plans.filter((p) => p.owner === person.username).reduce((s, p) => s + (Number(p.ownAnnual) || 0), 0))
+    : 0;
+  res.json({
+    ...view,
+    slipKinds: regionTax.slipKinds,
+    sections: sectionSummary(view.items),
+    profile: person ? getTaxProfile(person.id) : null,
+    rrspPlanAnnual,
+  });
+});
+
+app.put('/api/tax/filings/:id', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const b = req.body || {};
+  const patch = {};
+  if (b.name !== undefined) {
+    if (typeof b.name !== 'string' || !b.name.trim() || b.name.trim().length > 100) {
+      return res.status(400).json({ error: 'name is required (max 100 characters).' });
+    }
+    patch.name = b.name.trim();
+  }
+  if (b.status !== undefined) {
+    if (!TAX_FILING_STATUSES.includes(String(b.status))) {
+      return res.status(400).json({ error: `status must be one of ${TAX_FILING_STATUSES.join(', ')}.` });
+    }
+    patch.status = String(b.status);
+  }
+  if (!Object.keys(patch).length) return res.json(taxFilingView(filing));
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  const next = { ...filing, ...patch };
+  const summary = patch.name != null && patch.status != null
+    ? `Renamed project and marked ${patch.status} · ${taxFilingLabel(next, person)}`
+    : patch.name != null
+      ? `Renamed project · ${taxFilingLabel(next, person)}`
+      : `Marked filing ${patch.status} · ${taxFilingLabel(filing, person)}`;
+  commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: taxFilingLabel(next, person),
+    summary,
+  }, () => {
+    const sets = Object.keys(patch).map((k) => `${k} = ?`).join(', ');
+    db.prepare(`UPDATE tax_filings SET ${sets}, updated_at = ? WHERE id = ?`)
+      .run(...Object.values(patch), nowIso(), filing.id);
+    return { value: null, entityId: filing.id };
+  });
+  res.json(taxFilingView(getTaxFiling(req.params.id)));
+});
+
+app.delete('/api/tax/filings/:id', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: taxFilingLabel(filing, person),
+    summary: `Deleted tax project · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    // Items and slips go with the project (FK cascade).
+    db.prepare('DELETE FROM tax_filings WHERE id = ?').run(filing.id);
+    return { value: null, entityId: filing.id };
+  });
+  res.json({ ok: true });
+});
+
+app.post('/api/tax/filings/:id/items', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const err = validTaxItemInput(req.body || {});
+  if (err) return res.status(400).json({ error: err });
+  const b = req.body;
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  const out = commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: `${taxFilingLabel(filing, person)}`,
+    summary: `Added ${b.kind} item · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    const now = nowIso();
+    const info = db.prepare(`INSERT INTO tax_items
+      (filing_id, tax_year, kind, label, source_type, source_id, slip_id, amount, currency, share_pct, status, detail, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 'linked', '{}', ?, ?, ?)`)
+      .run(filing.id, filing.tax_year, b.kind, String(b.label).trim(), Number(b.amount),
+        (b.currency || 'CAD').toUpperCase(), b.share_pct == null ? 100 : Number(b.share_pct),
+        b.notes != null ? String(b.notes) : null, now, now);
+    return { value: taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(info.lastInsertRowid)), entityId: filing.id };
+  });
+  res.status(201).json(out);
+});
+
+app.put('/api/tax/items/:id', requireApiAuth, (req, res) => {
+  const item = db.prepare('SELECT * FROM tax_items WHERE id = ?').get(Number(req.params.id));
+  if (!item) return res.status(404).json({ error: 'item not found' });
+  const b = req.body || {};
+  const patch = {};
+  if (b.amount != null) {
+    if (!isFinite(Number(b.amount))) return res.status(400).json({ error: 'amount must be a number.' });
+    patch.amount = Number(b.amount);
+  }
+  if (b.share_pct != null) {
+    if (!validSharePct(b.share_pct)) return res.status(400).json({ error: 'share must be between 0 and 100.' });
+    patch.share_pct = Number(b.share_pct);
+  }
+  if (b.status != null) {
+    if (!TAX_ITEM_STATUSES.includes(b.status)) {
+      return res.status(400).json({ error: `status must be one of ${TAX_ITEM_STATUSES.join(', ')}.` });
+    }
+    patch.status = b.status;
+  }
+  if (b.label != null) {
+    if (typeof b.label !== 'string' || !b.label.trim() || b.label.trim().length > 200) {
+      return res.status(400).json({ error: 'label is required (max 200 characters).' });
+    }
+    patch.label = b.label.trim();
+  }
+  if (b.notes !== undefined) {
+    if (b.notes != null && (typeof b.notes !== 'string' || b.notes.length > 1000)) {
+      return res.status(400).json({ error: 'notes must be text (max 1000 characters).' });
+    }
+    patch.notes = b.notes == null ? null : b.notes;
+  }
+  if (!Object.keys(patch).length) return res.json(taxItemView(item));
+  if (item.filing_id != null) {
+    const filing = getTaxFiling(item.filing_id);
+    const person = filing ? db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id) : null;
+    commitTx(req, 'tax', {
+      module: 'tax', entityType: 'filing', entityId: filing.id,
+      entityLabel: `${taxFilingLabel(filing, person)}`,
+      summary: `Updated ${item.kind} item · ${taxFilingLabel(filing, person)}`,
+    }, () => {
+      applyTaxItemPatch(item.id, patch);
+      return { value: null, entityId: filing.id };
+    });
+  } else {
+    commitTx(req, 'tax', {
+      module: 'tax', entityType: 'filing', entityId: null,
+      entityLabel: `Unlinked · ${item.tax_year}`,
+      summary: `Updated unlinked ${item.kind} item · ${item.tax_year}`,
+      extra: { taxItemId: item.id },
+    }, () => {
+      applyTaxItemPatch(item.id, patch);
+      return { value: null, entityId: null, extra: { taxItemId: item.id } };
+    });
+  }
+  res.json(taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(item.id)));
+});
+
+function applyTaxItemPatch(id, patch) {
+  const sets = [];
+  const vals = [];
+  for (const [k, v] of Object.entries(patch)) { sets.push(`${k} = ?`); vals.push(v); }
+  sets.push('updated_at = ?');
+  vals.push(nowIso(), id);
+  db.prepare(`UPDATE tax_items SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+}
+
+app.delete('/api/tax/items/:id', requireApiAuth, (req, res) => {
+  const item = db.prepare('SELECT * FROM tax_items WHERE id = ?').get(Number(req.params.id));
+  if (!item) return res.status(404).json({ error: 'item not found' });
+  if (item.filing_id != null) {
+    const filing = getTaxFiling(item.filing_id);
+    const person = filing ? db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id) : null;
+    commitTx(req, 'tax', {
+      module: 'tax', entityType: 'filing', entityId: filing.id,
+      entityLabel: `${taxFilingLabel(filing, person)}`,
+      summary: `Deleted ${item.kind} item · ${taxFilingLabel(filing, person)}`,
+    }, () => {
+      db.prepare('DELETE FROM tax_items WHERE id = ?').run(item.id);
+      return { value: null, entityId: filing.id };
+    });
+  } else {
+    commitTx(req, 'tax', {
+      module: 'tax', entityType: 'filing', entityId: null,
+      entityLabel: `Unlinked · ${item.tax_year}`,
+      summary: `Deleted unlinked ${item.kind} item · ${item.tax_year}`,
+      extra: { taxItemId: item.id },
+    }, () => {
+      db.prepare('DELETE FROM tax_items WHERE id = ?').run(item.id);
+      return { value: null, entityId: null, extra: { taxItemId: item.id } };
+    });
+  }
+  res.json({ ok: true });
+});
+
+// Link an UNLINKED item into a filing. The link is a user
+// action — the item keeps its amount and share; only its filing
+// (and expected → linked status) changes.
+app.post('/api/tax/items/:id/link', requireApiAuth, (req, res) => {
+  const item = db.prepare('SELECT * FROM tax_items WHERE id = ?').get(Number(req.params.id));
+  if (!item) return res.status(404).json({ error: 'item not found' });
+  if (item.filing_id != null) return res.status(400).json({ error: 'item is already linked to a filing.' });
+  const filing = getTaxFiling((req.body || {}).filingId);
+  if (!filing) return res.status(400).json({ error: 'filingId must be an existing filing.' });
+  if (filing.tax_year !== item.tax_year) {
+    return res.status(400).json({ error: 'the filing is for a different tax year.' });
+  }
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: `${taxFilingLabel(filing, person)}`,
+    summary: `Linked ${item.kind} item · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    db.prepare("UPDATE tax_items SET filing_id = ?, status = CASE WHEN status = 'expected' THEN 'linked' ELSE status END, updated_at = ? WHERE id = ?")
+      .run(filing.id, nowIso(), item.id);
+    return { value: null, entityId: filing.id };
+  });
+  res.json(taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(item.id)));
+});
+
+// ------------------------------------------------------------ tax slips --
+// A slip belongs to one filing and always creates its filing
+// item (kind + amount from the region's mapping). The item is
+// 'linked' — the slip is the source document, and the user
+// confirms the item when the numbers are checked. Editing a slip
+// re-derives its item's amount while the item is still 'linked';
+// a 'confirmed' item keeps the amount the user verified.
+app.post('/api/tax/filings/:id/slips', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const regionTax = taxRegionFor(filing);
+  const err = validTaxSlipInput(req.body || {}, regionTax);
+  if (err) return res.status(400).json({ error: err });
+  const b = req.body;
+  if (Number(b.tax_year) !== filing.tax_year) {
+    return res.status(400).json({ error: 'the slip year must match the filing year.' });
+  }
+  const source = b.source === 'ai' ? 'ai' : 'manual';
+  const itemKind = regionTax.slipToItemKind(b.kind);
+  const amount = regionTax.slipAmount(b.kind, b.fields);
+  const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  const out = commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: `${taxFilingLabel(filing, person)}`,
+    summary: `Added ${b.kind} slip · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    const now = nowIso();
+    const fields = {};
+    for (const f of regionTax.slipKindDef(b.kind).fields) {
+      if (b.fields[f.key] != null && b.fields[f.key] !== '') fields[f.key] = b.fields[f.key];
+    }
+    const slipInfo = db.prepare(`INSERT INTO tax_slips
+      (filing_id, kind, tax_year, fields, source, ai_fields, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(filing.id, b.kind, Number(b.tax_year), JSON.stringify(fields), source,
+        Array.isArray(b.ai_fields) ? JSON.stringify(b.ai_fields) : null, now, now);
+    const slipId = slipInfo.lastInsertRowid;
+    let item = null;
+    if (itemKind && amount != null) {
+      const info = db.prepare(`INSERT INTO tax_items
+        (filing_id, tax_year, kind, label, source_type, source_id, slip_id, amount, currency, share_pct, status, detail, notes, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'slip', ?, ?, ?, 'CAD', 100, 'linked', ?, NULL, ?, ?)`)
+        .run(filing.id, filing.tax_year, itemKind, `${b.kind} — ${regionTax.slipKindDef(b.kind).label}`,
+          slipId, slipId, amount, JSON.stringify({ slip_kind: b.kind }), now, now);
+      item = taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(info.lastInsertRowid));
+    }
+    return { value: { slip: taxSlipView(db.prepare('SELECT * FROM tax_slips WHERE id = ?').get(slipId)), item }, entityId: filing.id };
+  });
+  res.status(201).json(out);
+});
+
+app.put('/api/tax/slips/:id', requireApiAuth, (req, res) => {
+  const slip = db.prepare('SELECT * FROM tax_slips WHERE id = ?').get(Number(req.params.id));
+  if (!slip) return res.status(404).json({ error: 'slip not found' });
+  const filing = getTaxFiling(slip.filing_id);
+  const regionTax = taxRegionFor(filing);
+  const b = req.body || {};
+  const next = {
+    kind: b.kind != null ? b.kind : slip.kind,
+    tax_year: b.tax_year != null ? Number(b.tax_year) : slip.tax_year,
+    fields: b.fields != null ? b.fields : JSON.parse(slip.fields || '{}'),
+  };
+  const err = validTaxSlipInput(next, regionTax);
+  if (err) return res.status(400).json({ error: err });
+  if (next.tax_year !== filing.tax_year) {
+    return res.status(400).json({ error: 'the slip year must match the filing year.' });
+  }
+  const person = filing ? db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id) : null;
+  commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: `${taxFilingLabel(filing, person)}`,
+    summary: `Updated ${next.kind} slip · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    const fields = {};
+    for (const f of regionTax.slipKindDef(next.kind).fields) {
+      if (next.fields[f.key] != null && next.fields[f.key] !== '') fields[f.key] = next.fields[f.key];
+    }
+    db.prepare('UPDATE tax_slips SET kind = ?, tax_year = ?, fields = ?, updated_at = ? WHERE id = ?')
+      .run(next.kind, next.tax_year, JSON.stringify(fields), nowIso(), slip.id);
+    const item = db.prepare('SELECT * FROM tax_items WHERE slip_id = ?').get(slip.id);
+    if (item && item.status === 'linked') {
+      const amount = regionTax.slipAmount(next.kind, fields);
+      const itemKind = regionTax.slipToItemKind(next.kind);
+      if (itemKind && amount != null) {
+        db.prepare('UPDATE tax_items SET kind = ?, label = ?, amount = ?, updated_at = ? WHERE id = ?')
+          .run(itemKind, `${next.kind} — ${regionTax.slipKindDef(next.kind).label}`, amount, nowIso(), item.id);
+      }
+    }
+    return { value: null, entityId: filing.id };
+  });
+  res.json(taxSlipView(db.prepare('SELECT * FROM tax_slips WHERE id = ?').get(slip.id)));
+});
+
+app.delete('/api/tax/slips/:id', requireApiAuth, (req, res) => {
+  const slip = db.prepare('SELECT * FROM tax_slips WHERE id = ?').get(Number(req.params.id));
+  if (!slip) return res.status(404).json({ error: 'slip not found' });
+  const filing = getTaxFiling(slip.filing_id);
+  const person = filing ? db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id) : null;
+  commitTx(req, 'tax', {
+    module: 'tax', entityType: 'filing', entityId: filing.id,
+    entityLabel: `${taxFilingLabel(filing, person)}`,
+    summary: `Deleted ${slip.kind} slip · ${taxFilingLabel(filing, person)}`,
+  }, () => {
+    const item = db.prepare('SELECT * FROM tax_items WHERE slip_id = ?').get(slip.id);
+    if (item) {
+      if (item.status === 'linked') db.prepare('DELETE FROM tax_items WHERE id = ?').run(item.id);
+      else db.prepare("UPDATE tax_items SET slip_id = NULL, source_type = 'manual', source_id = NULL, updated_at = ? WHERE id = ?").run(nowIso(), item.id);
+    }
+    db.prepare('DELETE FROM tax_slips WHERE id = ?').run(slip.id);
+    return { value: null, entityId: filing.id };
+  });
+  res.json({ ok: true });
+});
+
+// AI slip extraction: text or one attachment in, slip candidate
+// out. Writes nothing — the panel applies the candidate through
+// the slip POST above. Unconfigured LLM → 503, like every other
+// AI fill in the app.
+app.post('/api/tax/slips/fill', requireApiAuth, async (req, res) => {
+  const regionTax = (getRegion('CA') || {}).tax;
+  const { status, body } = await handleAiSlipFill(req.body || {}, {
+    model: getAiFillModel(),
+    slipKinds: regionTax.slipKinds,
+  });
+  if (status === 200 && req.body && req.body.model) setAiFillModel(String(req.body.model).trim());
+  res.status(status).json(body);
+});
+
+// --------------------------------------------------- tax RRSP benefit --
+// Tax saved by an RRSP contribution of `amount`, from the
+// region's own T4127-style engine (rrspBenefit in src/tax.js —
+// the same code Earnings uses: tax without minus tax with).
+// Capped at the person's recorded remaining RRSP room when the
+// Tax Profile has one; otherwise the amount is free. ESTIMATE
+// ONLY — the same "Estimate — actual tax is settled on the T1."
+// disclaimer Earnings carries. Not a T1 computation.
+app.get('/api/tax/filings/:id/rrsp-benefit', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const amount = Number(req.query.amount);
+  if (!isFinite(amount) || amount < 0) return res.status(400).json({ error: 'amount must be a positive number.' });
+  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(filing.person_id);
+  const region = getRegion(filing.region || 'CA') || getRegion('CA');
+  const jobRows = db.prepare('SELECT * FROM earn_jobs WHERE tax_year = ? AND owner = ? ORDER BY employer')
+    .all(filing.tax_year, person ? person.username : '').map(earnJobRow);
+  const profile = person ? getTaxProfile(person.id) : null;
+  const room = profile && profile.rrsp_room != null ? Number(profile.rrsp_room) : null;
+  const effectiveAmount = room != null ? Math.min(amount, room) : amount;
+  const out = rrspBenefit({ jobRows, payroll: region.payroll, amount: effectiveAmount });
+  res.json({
+    ...out,
+    requestedAmount: round2(amount),
+    effectiveAmount: round2(effectiveAmount),
+    room, capped: room != null && amount > room,
+  });
+});
+
+// ------------------------------------------------------- tax charts ---
+// Contributed vs remaining for the project's person, in CAD:
+// RRSP (own amounts on generated plan buy events + profile
+// room), TFSA (net buy-minus-sell from the Stocks records +
+// profile room, plus the accounts' current engine value), RESP
+// (remaining room from the profile split against the verified
+// $50,000 lifetime limit; CESG earned vs the $7,200 lifetime
+// maximum). Only real figures: no room recorded means no
+// remaining portion — never a guessed total; no contributions
+// recorded means a zero contributed portion with a no-data
+// note, never invented history.
+app.get('/api/tax/filings/:id/charts', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(filing.person_id);
+  const username = person ? person.username : '';
+  const profile = person ? getTaxProfile(person.id) : null;
+  const today = vancouverToday();
+  const fx = makeFxResolver(db);
+  const toCad = (amount, currency, date) => {
+    if (!currency || currency === 'CAD') return Number(amount) || 0;
+    const rate = displayRate(fx, currency, 'CAD', date);
+    return rate == null ? Number(amount) || 0 : (Number(amount) || 0) * rate;
+  };
+  // RRSP: own amounts on generated plan buy events for this
+  // person's jobs. Projected due periods are not contributions
+  // made, so they never count here.
+  const rrspRows = db.prepare(`
+    SELECT e.own_amount AS own_amount, a.default_currency AS currency, e.date AS date
+    FROM invest_events e
+    JOIN invest_plans p ON p.id = e.plan_id
+    JOIN invest_accounts a ON a.id = p.account_id
+    JOIN earn_jobs j ON j.id = p.job_id
+    WHERE a.type = 'RRSP' AND e.type = 'buy' AND j.owner = ?`).all(username);
+  const rrspContributedAmt = round2(rrspRows.reduce((s, r) => s + toCad(r.own_amount || 0, r.currency, r.date), 0));
+  // TFSA: net buy-minus-sell across the person's TFSA accounts
+  // (cost basis, not market value), plus the accounts' current
+  // value from the Stocks engine.
+  const tfsaAccounts = db.prepare("SELECT * FROM invest_accounts WHERE type = 'TFSA'").all()
+    .filter((a) => parseOwners(a.owners).includes(username));
+  let tfsaEvents = [];
+  let tfsaValue = 0;
+  if (tfsaAccounts.length) {
+    const ids = tfsaAccounts.map((a) => a.id);
+    tfsaEvents = db.prepare(`
+      SELECT e.*, h.currency AS currency FROM invest_events e
+      JOIN invest_holdings h ON h.id = e.holding_id
+      WHERE h.account_id IN (${ids.map(() => '?').join(',')}) AND e.type IN ('buy', 'sell')`).all(...ids);
+    for (const a of tfsaAccounts) {
+      const computed = computeAccount(db, a, fx, today, 'CAD');
+      tfsaValue = round2(tfsaValue + (computed.summary ? computed.summary.value : 0));
+    }
+  }
+  const tfsaContributedAmt = round2(tfsaEvents.reduce((s, e) => {
+    const v = toCad((Number(e.units) || 0) * (Number(e.price) || 0), e.currency, e.date);
+    return s + (e.type === 'buy' ? v : -v);
+  }, 0));
+  const tfsaNet = Math.max(0, tfsaContributedAmt);
+  res.json({
+    rrsp: {
+      contributed: rrspContributedAmt,
+      room: profile && profile.rrsp_room != null ? Number(profile.rrsp_room) : null,
+      asOf: profile ? profile.as_of_date : null,
+    },
+    tfsa: {
+      contributed: tfsaNet,
+      room: profile && profile.tfsa_room != null ? Number(profile.tfsa_room) : null,
+      asOf: profile ? profile.as_of_date : null,
+      currentValue: tfsaValue,
+    },
+    resp: {
+      beneficiary: profile ? profile.resp_beneficiary : null,
+      subscriber: profile ? profile.resp_subscriber : null,
+      split: respRoomSplit(profile ? profile.resp_room : null),
+      cesg: cesgRoomSplit(profile ? profile.cesg_room : null),
+      asOf: profile ? profile.as_of_date : null,
+    },
+  });
+});
+
+// ----------------------------------------------------- tax profiles ---
+// One profile per person: remaining contribution room
+// (RRSP / TFSA / RESP), user-entered from the CRA Notice of
+// Assessment / My Account, editable, with an as-of date. The
+// app cannot fetch CRA data — a blank figure means "not
+// recorded", never zero, and no figure is ever estimated.
+app.get('/api/tax/profiles', requireApiAuth, (req, res) => {
+  res.json({
+    profiles: taxFilers().map((u) => ({
+      person: { id: u.id, username: u.username },
+      profile: getTaxProfile(u.id),
+    })),
+  });
+});
+
+app.get('/api/tax/profiles/:personId', requireApiAuth, (req, res) => {
+  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.personId));
+  if (!person || person.username === adminUsername()) {
+    return res.status(400).json({ error: 'person must be a household user (not admin).' });
+  }
+  res.json({ person: { id: person.id, username: person.username }, profile: getTaxProfile(person.id) });
+});
+
+app.put('/api/tax/profiles/:personId', requireApiAuth, (req, res) => {
+  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.personId));
+  if (!person || person.username === adminUsername()) {
+    return res.status(400).json({ error: 'person must be a household user (not admin).' });
+  }
+  const b = req.body || {};
+  // Blank inputs arrive as '' — normalise to null (not
+  // recorded), never to zero.
+  const norm = (v) => (v === '' || v == null ? null : Number(v));
+  const body = {
+    rrsp_room: norm(b.rrsp_room),
+    tfsa_room: norm(b.tfsa_room),
+    resp_room: norm(b.resp_room),
+    cesg_room: norm(b.cesg_room),
+    resp_beneficiary: b.resp_beneficiary === '' ? null : (b.resp_beneficiary != null ? String(b.resp_beneficiary).trim() || null : null),
+    resp_subscriber: b.resp_subscriber === '' ? null : (b.resp_subscriber != null ? String(b.resp_subscriber).trim() || null : null),
+    as_of_date: b.as_of_date === '' ? null : (b.as_of_date != null ? String(b.as_of_date) : null),
+    notes: b.notes === '' ? null : (b.notes != null ? String(b.notes) : null),
+  };
+  const err = validTaxProfileInput(body);
+  if (err) return res.status(400).json({ error: err });
+  const out = commitTx(req, 'tax-profile', {
+    module: 'tax', entityType: 'profile', entityId: person.id,
+    entityLabel: `${person.username} · contribution room`,
+    summary: `Updated contribution room · ${person.username}`,
+  }, () => {
+    const now = nowIso();
+    const existing = getTaxProfile(person.id);
+    if (existing) {
+      db.prepare(`UPDATE tax_profiles SET rrsp_room = ?, tfsa_room = ?, resp_beneficiary = ?, resp_subscriber = ?,
+        resp_room = ?, cesg_room = ?, as_of_date = ?, notes = ?, updated_at = ? WHERE person_id = ?`)
+        .run(body.rrsp_room, body.tfsa_room, body.resp_beneficiary, body.resp_subscriber,
+          body.resp_room, body.cesg_room, body.as_of_date, body.notes, now, person.id);
+    } else {
+      db.prepare(`INSERT INTO tax_profiles
+        (person_id, rrsp_room, tfsa_room, resp_beneficiary, resp_subscriber, resp_room, cesg_room, as_of_date, notes, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(person.id, body.rrsp_room, body.tfsa_room, body.resp_beneficiary, body.resp_subscriber,
+          body.resp_room, body.cesg_room, body.as_of_date, body.notes, now, now);
+    }
+    return { value: getTaxProfile(person.id), entityId: person.id };
+  });
+  res.json({ person: { id: person.id, username: person.username }, profile: out });
+});
+
+// AI room extraction from a Notice of Assessment / My Account
+// summary: candidates out, writes nothing — the profile form
+// applies them. Unconfigured LLM → 503.
+app.post('/api/tax/profiles/fill', requireApiAuth, async (req, res) => {
+  const { status, body } = await handleAiProfileFill(req.body || {}, {
+    model: getAiFillModel(),
+  });
+  if (status === 200 && req.body && req.body.model) setAiFillModel(String(req.body.model).trim());
+  res.status(status).json(body);
 });
 
 // ---------------------------------------------------------------- spending ---

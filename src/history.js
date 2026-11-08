@@ -149,6 +149,31 @@ function snapJob(db, jobId) {
     },
   };
 }
+function snapTaxFiling(db, filingId, extra) {
+  // A single UNLINKED item's write (link / delete) has no filing
+  // to snapshot — the commit carries the item id instead, and the
+  // snapshot is just that row, so undo restores exactly it.
+  if (extra && extra.taxItemId) {
+    return {
+      aggregate: 'tax',
+      tables: { tax_items: rows(db, 'SELECT * FROM tax_items WHERE id = ?', extra.taxItemId) },
+    };
+  }
+  return {
+    aggregate: 'tax',
+    tables: {
+      tax_filings: rows(db, 'SELECT * FROM tax_filings WHERE id = ?', filingId),
+      tax_slips: rows(db, 'SELECT * FROM tax_slips WHERE filing_id = ? ORDER BY id', filingId),
+      tax_items: rows(db, 'SELECT * FROM tax_items WHERE filing_id = ? ORDER BY id', filingId),
+    },
+  };
+}
+function snapTaxProfile(db, personId) {
+  return {
+    aggregate: 'tax-profile',
+    tables: { tax_profiles: rows(db, 'SELECT * FROM tax_profiles WHERE person_id = ?', personId) },
+  };
+}
 function snapRental(db, rentalId) {
   return {
     aggregate: 'rental',
@@ -191,6 +216,8 @@ export function snapshotByAggregate(db, aggregate, entityId, extra) {
     case 'job': return snapJob(db, entityId);
     case 'rental': return snapRental(db, entityId);
     case 'card': return snapCard(db, entityId);
+    case 'tax': return snapTaxFiling(db, entityId);
+    case 'tax-profile': return snapTaxProfile(db, entityId);
     case 'spending-global': return snapSpendingGlobal(db, (extra && extra.txIds) || [], (extra && extra.userId) || null);
     case 'other-asset': return snapOtherAsset(db, entityId);
     default: throw new Error(`unknown aggregate ${aggregate}`);
@@ -528,6 +555,40 @@ export function restoreSnapshot(db, snapshot) {
       });
       for (const r of one('spend_cards')) upsertRow(db, 'spend_cards', r);
       for (const r of one('spend_transactions')) upsertRow(db, 'spend_transactions', r);
+      break;
+    }
+    case 'tax': {
+      // A filing's before-state: the filing row, its slips, its
+      // items. Restore deletes the filing's current slips/items
+      // first (so rows created after the snapshot do not linger),
+      // deletes the filing itself when the before-state has none
+      // (undo of a create), then upserts the snapshot rows. A
+      // single UNLINKED item's snapshot carries only tax_items
+      // with no filing — its row is restored by id.
+      const filingId = root('tax_filings')?.id ?? snapshot._entityId;
+      const itemRows = one('tax_items');
+      if (filingId != null) {
+        db.prepare('DELETE FROM tax_slips WHERE filing_id = ?').run(filingId);
+        db.prepare('DELETE FROM tax_items WHERE filing_id = ?').run(filingId);
+        if (!one('tax_filings').length) db.prepare('DELETE FROM tax_filings WHERE id = ?').run(filingId);
+      }
+      for (const r of one('tax_filings')) upsertRow(db, 'tax_filings', r);
+      for (const r of one('tax_slips')) upsertRow(db, 'tax_slips', r);
+      // A single UNLINKED item's snapshot carries only its row
+      // (no filing) — upsert restores it by id, re-inserting a
+      // deleted one.
+      for (const r of itemRows) upsertRow(db, 'tax_items', r);
+      break;
+    }
+    case 'tax-profile': {
+      // Profiles are keyed by person: the commit's entity id is
+      // the person id, and the snapshot row carries person_id.
+      const personId = root('tax_profiles')?.person_id ?? snapshot._entityId;
+      if (one('tax_profiles').length) {
+        for (const r of one('tax_profiles')) upsertRow(db, 'tax_profiles', r);
+      } else if (personId != null) {
+        db.prepare('DELETE FROM tax_profiles WHERE person_id = ?').run(personId);
+      }
       break;
     }
     case 'other-asset': {

@@ -48,6 +48,12 @@ function seed() {
   db.prepare("INSERT INTO earn_rentals (id, label, rental_type, created_at, updated_at) VALUES (1, 'Basement', 'long_term', ?, ?)").run(ts, ts);
   db.prepare("INSERT INTO earn_rental_years (id, rental_id, tax_year, gross_rents, created_at, updated_at) VALUES (1, 1, 2026, 12000, ?, ?)").run(ts, ts);
   db.prepare("INSERT INTO earn_rental_entries (id, rental_id, start_ym, monthly_rent, pay_day, created_at, updated_at) VALUES (1, 1, '2026-01', 1000, 15, ?, ?)").run(ts, ts);
+  // Tax (mainline, like earnings/spending): one project, one
+  // profile, one slip, one linked item + one unlinked item.
+  db.prepare("INSERT INTO tax_filings (id, person_id, name, tax_year, region, status, generated_at, created_at, updated_at) VALUES (1, 2, 'Tax return 2026', 2026, 'CA', 'open', NULL, ?, ?)").run(ts, ts);
+  db.prepare("INSERT INTO tax_profiles (id, person_id, rrsp_room, tfsa_room, resp_beneficiary, resp_subscriber, resp_room, cesg_room, as_of_date, notes, created_at, updated_at) VALUES (1, 2, 20000, 5000, 'Baby', 'Shawn', 45000, 7000, '2026-10-31', NULL, ?, ?)").run(ts, ts);
+  db.prepare("INSERT INTO tax_slips (id, filing_id, kind, tax_year, fields, source, ai_fields, created_at, updated_at) VALUES (1, 1, 'T4', 2026, '{\"box14\":190704.02}', 'manual', NULL, ?, ?)").run(ts, ts);
+  db.prepare("INSERT INTO tax_items (id, filing_id, tax_year, kind, label, source_type, source_id, slip_id, amount, currency, share_pct, status, detail, notes, created_at, updated_at) VALUES (1, 1, 2026, 'employment', 'Meta — employment income', 'job', 1, NULL, 190704.02, 'CAD', 100, 'linked', '{}', NULL, ?, ?), (2, NULL, 2026, 'employment', 'Side gig', 'job', 2, NULL, 5000, 'CAD', 100, 'expected', '{}', NULL, ?, ?)").run(ts, ts, ts, ts);
   db.prepare("INSERT INTO spend_cards (id, name, last4, created_at, updated_at) VALUES (1, 'CIBC', '9586', ?, ?)").run(ts, ts);
   db.prepare("INSERT INTO spend_transactions (id, card_id, date, merchant, category, amount, kind, created_at) VALUES (1, 1, '2026-11-01', 'Store', 'Groceries', -50, 'charge', ?)").run(ts);
   db.prepare("INSERT INTO other_assets (id, category, name, value, currency, owners, created_at, updated_at) VALUES (1, 'other', 'Bike', 500, 'CAD', '[\"Shawn\"]', ?, ?)").run(ts, ts);
@@ -85,6 +91,14 @@ test('manual export covers mainline, excludes planning, sessions and sync settin
   assert.equal(p.tables.rate_segments[0].spread, -1);
   assert.equal(p.tables.invest_events.length, 1);
   assert.equal(p.tables.earn_jobs[0].employer, 'Meta');
+  // Tax tables travel with their rows (mainline, not planning).
+  assert.equal(p.tables.tax_filings.length, 1);
+  assert.equal(p.tables.tax_filings[0].name, 'Tax return 2026');
+  assert.equal(p.tables.tax_profiles[0].rrsp_room, 20000);
+  assert.equal(p.tables.tax_profiles[0].resp_room, 45000);
+  assert.equal(p.tables.tax_slips[0].kind, 'T4');
+  assert.equal(p.tables.tax_items.length, 2);
+  assert.equal(p.tables.tax_items.find((i) => i.filing_id === null).label, 'Side gig');
   // History: the mainline commit travels; planning + merge commits do not.
   assert.deepEqual(p.tables.app_commits.map((c) => c.id), [1]);
   // app_meta: the model key travels; sync keys do not.
@@ -114,6 +128,10 @@ test('round-trip replace restores the exported state and wipes sessions', () => 
   db.prepare("UPDATE earn_jobs SET employer = 'Changed' WHERE id = 1").run();
   db.prepare("INSERT INTO properties (id, address, created_at, updated_at) VALUES (99, 'Junk', '2026-11-07T00:00:00.000Z', '2026-11-07T00:00:00.000Z')").run();
   db.prepare("INSERT INTO spend_cards (id, name, last4, created_at, updated_at) VALUES (99, 'Junk', '0000', '2026-11-07T00:00:00.000Z', '2026-11-07T00:00:00.000Z')").run();
+  // Tax rows are part of the round-trip too: delete the project
+  // (cascades to its slip + linked item) and corrupt the profile.
+  db.prepare("DELETE FROM tax_filings WHERE id = 1").run();
+  db.prepare("UPDATE tax_profiles SET rrsp_room = 1 WHERE id = 1").run();
   fs.unlinkSync(path.join(PHOTOS_DIR, 'property-1-test.png'));
   const summary = applyImport(db, exported);
   assert.equal(summary.tables.properties, 1);
@@ -123,6 +141,15 @@ test('round-trip replace restores the exported state and wipes sessions', () => 
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM spend_cards WHERE id = 99").get().n, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM mortgage_terms').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM rate_segments').get().n, 1);
+  // Tax round-trip: the deleted project (and its slip + linked
+  // item) is back, the profile room is restored, the unlinked
+  // item survived.
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tax_filings WHERE id = 1").get().n, 1);
+  assert.equal(db.prepare("SELECT name FROM tax_filings WHERE id = 1").get().name, 'Tax return 2026');
+  assert.equal(db.prepare("SELECT rrsp_room FROM tax_profiles WHERE id = 1").get().rrsp_room, 20000);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tax_slips WHERE id = 1").get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tax_items').get().n, 2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tax_items WHERE filing_id IS NULL").get().n, 1);
   assert.equal(fs.readFileSync(path.join(PHOTOS_DIR, 'property-1-test.png')).equals(PNG_1X1), true);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM plan_projects').get().n, 1, 'import leaves planning alone');

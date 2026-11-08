@@ -969,6 +969,93 @@ CREATE TABLE IF NOT EXISTS sync_log (
   exported_at TEXT,                    -- the export's exported_at when known
   detail TEXT                          -- human note / failure reason
 );
+-- Tax filings (2026-11-08, v1: items inventory + linking + slip
+-- capture — NO tax computation). A filing is one tax PROJECT:
+-- one person may have MANY projects for one tax year (no unique
+-- constraint on person+year — each project has its own name, its
+-- own items/links/slips, and its own on-demand Generate). Region
+-- defaults to 'CA' and a future region plugs in behind
+-- src/regions/ without touching these tables. The admin user never
+-- gets a filing (filings are for the household's filers only). An
+-- item belongs to one filing, or to no filing (UNLINKED,
+-- filing_id NULL) when the app cannot determine the person — the
+-- user links it on the detail page; the link is a user action,
+-- never guessed. share_pct is the filer's share of the item's
+-- amount (100 = whole item); a source owned by several people
+-- yields one item per owner, each carrying its share.
+-- NOTHING is generated automatically: expected items appear only
+-- when the user presses Generate on a project (generated_at
+-- records when that last happened); page loads, year changes and
+-- background jobs never generate.
+CREATE TABLE IF NOT EXISTS tax_filings (
+  id INTEGER PRIMARY KEY,
+  person_id INTEGER NOT NULL REFERENCES users(id),
+  name TEXT NOT NULL DEFAULT '',
+  tax_year INTEGER NOT NULL,
+  region TEXT NOT NULL DEFAULT 'CA',   -- region code, see src/regions/
+  status TEXT NOT NULL DEFAULT 'open', -- 'open' | 'filed'
+  generated_at TEXT,                   -- last on-demand Generate, NULL = never generated
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- Tax profiles (2026-11-08): one per person — the remaining
+-- contribution room the user entered from their CRA Notice of
+-- Assessment / My Account (RRSP room, TFSA room, and the child's
+-- RESP room). Every figure is USER-ENTERED with an as-of date;
+-- the app cannot fetch CRA data and never invents or estimates a
+-- room — a blank field means "not recorded", never zero. The RESP
+-- is for the baby as beneficiary, held by a parent as subscriber
+-- (both named here). RESP limits, verified against CRA/ESDC
+-- 2026 sources (see src/tax.js): lifetime contribution limit
+-- $50,000 per beneficiary, no annual limit; CESG 20% on the first
+-- $2,500 contributed per year (max $500/yr) to a lifetime maximum
+-- of $7,200 per beneficiary.
+CREATE TABLE IF NOT EXISTS tax_profiles (
+  id INTEGER PRIMARY KEY,
+  person_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+  rrsp_room REAL,                       -- remaining RRSP room ($), NULL = not recorded
+  tfsa_room REAL,                       -- remaining TFSA room ($), NULL = not recorded
+  resp_beneficiary TEXT,                -- RESP beneficiary (the child)
+  resp_subscriber TEXT,                 -- RESP subscriber (the parent holding the plan)
+  resp_room REAL,                       -- remaining RESP lifetime contribution room ($), NULL = not recorded
+  cesg_room REAL,                       -- remaining CESG grant room ($), NULL = not recorded
+  as_of_date TEXT,                      -- date the room figures are as of (YYYY-MM-DD)
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tax_slips (
+  id INTEGER PRIMARY KEY,
+  filing_id INTEGER NOT NULL REFERENCES tax_filings(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,                  -- 'T4' | 'T4A' | 'T5' | 'T3' | 'T4RSP' | 'T4RIF' | 'T5008'
+  tax_year INTEGER NOT NULL,
+  fields TEXT NOT NULL DEFAULT '{}',   -- JSON {box key: value}, keys per the region's slipKinds
+  source TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'ai'
+  ai_fields TEXT,                      -- JSON array of field keys the AI filled
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tax_items (
+  id INTEGER PRIMARY KEY,
+  filing_id INTEGER REFERENCES tax_filings(id) ON DELETE CASCADE,
+  tax_year INTEGER NOT NULL,            -- the return year the item belongs to (the filing's year, or the source's year for UNLINKED items)
+  kind TEXT NOT NULL,                  -- 'employment' | 'rental' | 'rrsp' | 'investment_income' | 'capital_gain' | 'other_income' | 'deduction' | 'credit'
+  label TEXT NOT NULL,
+  source_type TEXT,                    -- 'job' | 'rental' | 'plan' | 'dividend' | 'sell' | 'slip' | 'manual'; NULL = manual, unlinked to any source
+  source_id INTEGER,                   -- id in the source table (job/rental/plan/event id, or slip id when source_type = 'slip')
+  slip_id INTEGER REFERENCES tax_slips(id) ON DELETE SET NULL,
+  amount REAL NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'CAD',
+  share_pct REAL NOT NULL DEFAULT 100, -- the filer's share of the amount, 0 < share <= 100
+  status TEXT NOT NULL DEFAULT 'expected', -- 'expected' | 'linked' | 'confirmed' | 'excluded'
+  detail TEXT NOT NULL DEFAULT '{}',   -- JSON extra figures (gross/deductible/net, basis, units/price, …)
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tax_items_filing ON tax_items(filing_id);
+CREATE INDEX IF NOT EXISTS idx_tax_items_source ON tax_items(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_tax_slips_filing ON tax_slips(filing_id);
 CREATE INDEX IF NOT EXISTS idx_app_commits_module ON app_commits(module);
 CREATE INDEX IF NOT EXISTS idx_app_commits_project ON app_commits(project_id);
 CREATE INDEX IF NOT EXISTS idx_app_commits_entity ON app_commits(entity_type, entity_id);

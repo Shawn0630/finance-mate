@@ -442,6 +442,248 @@ export function parseModelJson(text) {
   return null;
 }
 
+// ------------------------------------------------- tax slip extraction
+// One-shot slip extraction for the Tax module: the model reads ONE
+// tax slip (T4, T5, …) from pasted text or an attached photo / PDF /
+// text file and returns its kind, tax year and box values as JSON.
+// Same hard rules as handleAiFill: extraction NEVER writes to the
+// database — the endpoint returns candidates, the user reviews them
+// in an editable preview and applies with the slip form's own
+// Apply; a value the model cannot determine is OMITTED, never
+// invented (an empty fields set is a decline, not a guess).
+// The slip kinds come from the region (deps.slipKinds) so a future
+// region's slips plug in without touching this function.
+const SLIP_SYSTEM_PROMPT = [
+  'You extract ONE tax slip from a document.',
+  'Reply with ONLY a JSON object of the form {"kind": "T4", "tax_year": 2026, "fields": {...}, "warnings": ["..."]} — no prose, no code fences.',
+  'kind must be one of the kinds listed below; if the document is not a tax slip, or its kind is not in the list, reply {"kind": null, "tax_year": null, "fields": {}, "warnings": ["Not a recognised tax slip."]}.',
+  'fields keys are the box keys listed for that kind; money values are plain numbers (no $, commas or % signs); names are plain text.',
+  'Omit every box you cannot determine from the source — never invent a value, never copy a value from another box.',
+  'warnings lists anything uncertain (a blurry box, two possible years, a total that does not add up).',
+].join('\n');
+
+function buildSlipMessages(slipKinds, text, fileInfo) {
+  const kinds = slipKinds.map((s) => {
+    const boxes = s.fields.map((f) => `${f.key} (${f.label}${f.money ? ', money' : ''})`).join('; ');
+    return `${s.kind} — ${s.label}. Boxes: ${boxes}.`;
+  }).join('\n');
+  const content = [{ type: 'text', text: (text && text.trim()) || 'Extract the slip from the attached document.' }];
+  if (fileInfo) {
+    if (fileInfo.type.startsWith('image/')) {
+      content.push({ type: 'image_url', image_url: { url: `data:${fileInfo.type};base64,${fileInfo.data}` } });
+    } else if (fileInfo.text != null) {
+      content.push({ type: 'text', text: textFileBlock(fileInfo) });
+    } else if (fileInfo.type === 'application/pdf') {
+      const extracted = extractPdfText(fileInfo.bytes);
+      content.push({
+        type: 'text',
+        text: extracted ? `Document text:\n${extracted.slice(0, 20000)}` : 'A PDF was attached, but no text could be extracted from it.',
+      });
+    }
+  }
+  return [
+    { role: 'system', content: `${SLIP_SYSTEM_PROMPT}\n\nSlip kinds:\n${kinds}` },
+    { role: 'user', content },
+  ];
+}
+
+function normalizeSlipFields(slipKinds, kind, rawFields) {
+  const def = slipKinds.find((s) => s.kind === kind);
+  if (!def || !rawFields || typeof rawFields !== 'object' || Array.isArray(rawFields)) return { fields: {}, dropped: [] };
+  const known = new Map(def.fields.map((f) => [f.key, f]));
+  const fields = {};
+  const dropped = [];
+  for (const [k, v] of Object.entries(rawFields)) {
+    const f = known.get(k);
+    if (!f) { dropped.push(k); continue; }
+    if (v == null || v === '') continue;
+    if (f.money) {
+      const n = Number(String(v).replace(/[$,\s]/g, ''));
+      if (!isFinite(n)) { dropped.push(k); continue; }
+      fields[k] = Math.round(n * 100) / 100;
+    } else {
+      fields[k] = String(v).trim();
+    }
+  }
+  return { fields, dropped };
+}
+
+export async function handleAiSlipFill(input, deps = {}) {
+  const env = deps.env || process.env;
+  const call = deps.callLlm || callLlm;
+  const slipKinds = deps.slipKinds || [];
+  const { text, file } = input || {};
+  if (!slipKinds.length) {
+    return { status: 400, body: { error: 'No slip kinds are configured for this region.' } };
+  }
+  if (!llmConfigured(env)) {
+    return {
+      status: 503,
+      body: { error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' },
+    };
+  }
+  const models = llmModels(env);
+  let model = null;
+  if (input && input.model != null && String(input.model).trim() !== '') {
+    model = String(input.model).trim();
+    if (!models.includes(model)) {
+      return { status: 400, body: { error: `model "${model}" is not in the configured model list` } };
+    }
+  } else if (deps.model && models.includes(deps.model)) {
+    model = deps.model;
+  } else {
+    model = llmDefaultModel(env);
+  }
+  let fileInfo = null;
+  if (file != null) {
+    fileInfo = validateFile(file);
+    if (fileInfo.error) return { status: fileInfo.status, body: { error: fileInfo.error } };
+  }
+  const hasText = typeof text === 'string' && text.trim().length > 0;
+  if (!hasText && !fileInfo) {
+    return { status: 400, body: { error: 'Provide text or a file to extract from.' } };
+  }
+  let rawText;
+  try {
+    rawText = await call(buildSlipMessages(slipKinds, hasText ? text : '', fileInfo), env, model);
+  } catch {
+    return { status: 502, body: { error: 'The AI service could not complete the extraction.' } };
+  }
+  const parsed = parseModelJson(rawText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { status: 502, body: { error: 'The AI response could not be read as a slip.' } };
+  }
+  const kind = typeof parsed.kind === 'string' ? parsed.kind.trim().toUpperCase() : null;
+  if (!kind || !slipKinds.some((s) => s.kind === kind)) {
+    const warnings = Array.isArray(parsed.warnings) ? parsed.warnings.filter((w) => typeof w === 'string').slice(0, 5) : [];
+    return { status: 200, body: { kind: null, tax_year: null, fields: {}, warnings: warnings.length ? warnings : ['Not a recognised tax slip.'] } };
+  }
+  const taxYear = Number(parsed.tax_year);
+  const { fields, dropped } = normalizeSlipFields(slipKinds, kind, parsed.fields);
+  const warnings = Array.isArray(parsed.warnings) ? parsed.warnings.filter((w) => typeof w === 'string').slice(0, 5) : [];
+  if (dropped.length) warnings.push(`Could not read: ${dropped.join(', ')}.`);
+  if (!Object.keys(fields).length) warnings.push('No box values could be read from this slip.');
+  return {
+    status: 200,
+    body: {
+      kind, tax_year: Number.isInteger(taxYear) && taxYear >= 2000 && taxYear <= 2100 ? taxYear : null,
+      fields, warnings, model,
+    },
+  };
+}
+
+// ------------------------------------------- tax profile (NOA) extraction
+// One-shot contribution-room extraction for the Tax Profile: the
+// model reads a CRA Notice of Assessment (or a My Account room
+// summary) from pasted text or an attached photo / PDF / text
+// file and returns the room figures as JSON. Same hard rules as
+// the slip fill: extraction NEVER writes — the endpoint returns
+// candidates, the user reviews them in the editable profile form
+// and saves; a value the model cannot determine is OMITTED,
+// never invented. The app cannot fetch CRA data, so a blank
+// field means "not recorded", never zero — and the model must
+// never estimate a room from income or contribution history.
+// The NOA carries the RRSP deduction limit (available RRSP
+// room); TFSA room lives in My Account, not on the NOA, so it
+// is only filled when the source actually shows it.
+const PROFILE_SYSTEM_PROMPT = [
+  'You extract contribution-room figures from a CRA Notice of Assessment or a CRA My Account summary.',
+  'Reply with ONLY a JSON object of the form {"fields": {...}, "warnings": ["..."]} — no prose, no code fences.',
+  'fields keys are a subset of: rrsp_room (number, the RRSP deduction limit / available RRSP contribution room), tfsa_room (number, the TFSA contribution room), as_of_date ("YYYY-MM-DD", the notice date or the as-of date shown). Money values are plain numbers (no $, commas or % signs).',
+  'Omit every figure you cannot determine from the source — never invent a value, never estimate a room from income, age or past contributions, never copy a value from another line.',
+  'The Notice of Assessment does NOT show TFSA room: only fill tfsa_room when the source is a My Account summary that actually lists it.',
+  'warnings lists anything uncertain (a blurry figure, two possible dates, a figure that looks like a limit rather than a remaining room).',
+].join('\n');
+
+function buildProfileMessages(text, fileInfo) {
+  const content = [{ type: 'text', text: (text && text.trim()) || 'Extract the contribution-room figures from the attached document.' }];
+  if (fileInfo) {
+    if (fileInfo.type.startsWith('image/')) {
+      content.push({ type: 'image_url', image_url: { url: `data:${fileInfo.type};base64,${fileInfo.data}` } });
+    } else if (fileInfo.text != null) {
+      content.push({ type: 'text', text: textFileBlock(fileInfo) });
+    } else if (fileInfo.type === 'application/pdf') {
+      const extracted = extractPdfText(fileInfo.bytes);
+      content.push({
+        type: 'text',
+        text: extracted ? `Document text:\n${extracted.slice(0, 20000)}` : 'A PDF was attached, but no text could be extracted from it.',
+      });
+    }
+  }
+  return [
+    { role: 'system', content: PROFILE_SYSTEM_PROMPT },
+    { role: 'user', content },
+  ];
+}
+
+const PROFILE_FIELDS = {
+  rrsp_room: 'money', tfsa_room: 'money', as_of_date: 'date',
+};
+
+export async function handleAiProfileFill(input, deps = {}) {
+  const env = deps.env || process.env;
+  const call = deps.callLlm || callLlm;
+  const { text, file } = input || {};
+  if (!llmConfigured(env)) {
+    return {
+      status: 503,
+      body: { error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' },
+    };
+  }
+  const models = llmModels(env);
+  let model = null;
+  if (input && input.model != null && String(input.model).trim() !== '') {
+    model = String(input.model).trim();
+    if (!models.includes(model)) {
+      return { status: 400, body: { error: `model "${model}" is not in the configured model list` } };
+    }
+  } else if (deps.model && models.includes(deps.model)) {
+    model = deps.model;
+  } else {
+    model = llmDefaultModel(env);
+  }
+  let fileInfo = null;
+  if (file != null) {
+    fileInfo = validateFile(file);
+    if (fileInfo.error) return { status: fileInfo.status, body: { error: fileInfo.error } };
+  }
+  const hasText = typeof text === 'string' && text.trim().length > 0;
+  if (!hasText && !fileInfo) {
+    return { status: 400, body: { error: 'Provide text or a file to extract from.' } };
+  }
+  let rawText;
+  try {
+    rawText = await call(buildProfileMessages(hasText ? text : '', fileInfo), env, model);
+  } catch {
+    return { status: 502, body: { error: 'The AI service could not complete the extraction.' } };
+  }
+  const parsed = parseModelJson(rawText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { status: 502, body: { error: 'The AI response could not be read as room figures.' } };
+  }
+  const fields = {};
+  const dropped = [];
+  const rawFields = parsed.fields && typeof parsed.fields === 'object' && !Array.isArray(parsed.fields) ? parsed.fields : {};
+  for (const [k, v] of Object.entries(rawFields)) {
+    const kind = PROFILE_FIELDS[k];
+    if (!kind) { dropped.push(k); continue; }
+    if (v == null || v === '') continue;
+    if (kind === 'money') {
+      const n = Number(String(v).replace(/[$,\s]/g, ''));
+      if (!isFinite(n) || n < 0) { dropped.push(k); continue; }
+      fields[k] = Math.round(n * 100) / 100;
+    } else if (kind === 'date') {
+      const s = String(v).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) { dropped.push(k); continue; }
+      fields[k] = s;
+    }
+  }
+  const warnings = Array.isArray(parsed.warnings) ? parsed.warnings.filter((w) => typeof w === 'string').slice(0, 5) : [];
+  if (dropped.length) warnings.push(`Could not read: ${dropped.join(', ')}.`);
+  if (!Object.keys(fields).length) warnings.push('No room figures could be read from this document.');
+  return { status: 200, body: { fields, warnings, model } };
+}
+
 // ------------------------------------------------------------ endpoint
 
 export function validateFile(file) {

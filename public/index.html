@@ -616,7 +616,44 @@
     </div>
     <div id="histList"></div>
   </section>
-  <section id="view-tax" class="hidden"><div class="placeholder"><h2>Tax</h2><p>This module is planned for a later round.</p></div></section>
+  <section id="view-tax" class="hidden">
+    <div id="taxHome">
+      <div class="section-head"><h2>Tax</h2><div class="spacer"></div>
+        <select id="taxYearSel" title="Tax year"></select>
+      </div>
+      <div class="msg" id="taxHomeMsg"></div>
+      <div id="taxFilerCards"></div>
+      <div class="panel" id="taxProfilePanel">
+        <h3>Contribution room</h3>
+        <div id="taxProfileList"></div>
+      </div>
+      <div class="panel" id="taxUnlinkedPanel">
+        <h3>Unlinked items</h3>
+        <div id="taxUnlinkedList"></div>
+      </div>
+    </div>
+    <div id="taxDetail" class="hidden">
+      <div class="section-head"><button class="small" id="taxBackBtn">← Tax</button><h2 id="taxDetailTitle">Project</h2><div class="spacer"></div>
+        <span id="taxDetailStatus"></span>
+        <button class="small" id="taxGenerateBtn">Generate expected items</button>
+        <button class="small" id="taxRenameBtn">Rename</button>
+        <button class="small" id="taxFileToggleBtn">Mark filed</button>
+        <button class="small" id="taxDeleteBtn">Delete project</button>
+      </div>
+      <div class="msg" id="taxDetailMsg"></div>
+      <div id="taxSections"></div>
+      <div class="panel"><h3>Slips</h3>
+        <div id="taxSlipList"></div>
+        <div class="toolbar">
+          <button class="small" id="taxAddSlipBtn">+ Add slip</button>
+          <button class="small" id="taxAiSlipBtn">✨ Fill with AI</button>
+        </div>
+      </div>
+      <div class="panel" id="taxChartsPanel"><h3>Accounts</h3>
+        <div id="taxCharts"></div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- ============================ Modals ============================ -->
@@ -876,6 +913,14 @@
         <button type="button" data-close-modal>Cancel</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="taxModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="taxModalTitle"></h3><button class="small" data-close-modal>Close</button></div>
+    <div class="msg" id="taxModalMsg"></div>
+    <div id="taxModalBody"></div>
   </div>
 </div>
 

@@ -15,10 +15,18 @@
 //                  publishes only the current roll, so the history
 //                  behind it comes from HouseSigma (its assessment
 //                  tables are drawn from the same public records).
+//   - tax:         the Tax module's region surface (see
+//                  ./ca/tax.js): the slips Canada recognises, how a
+//                  slip maps to a filing item, and which filing
+//                  items the app's own records imply for a tax
+//                  year. The Tax UI and filing storage never read
+//                  anything else region-specific.
+export { tax };
 // A future region (e.g. a US state) implements the same shape with
 // its own conventions and providers.
 import { fetchAssessment, suggestAddresses } from '../bca.js';
 import { locateProperty, fetchHistory } from '../housesigma.js';
+import * as tax from './ca/tax.js';
 
 export const code = 'CA';
 export const label = 'Canada';
