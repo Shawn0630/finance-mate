@@ -51,6 +51,13 @@ import {
   undoCommit, restoreCommit, findDependents, mergeEventFromEntries, eventFromRowStates, readRow,
 } from './history.js';
 import {
+  buildExport, validateExport, applyImport, writeBackup, listBackups, readBackup,
+  EXPORT_FORMAT, EXPORT_VERSION,
+} from './dataExport.js';
+import {
+  getSyncSettings, saveSyncSettings, getSyncState, markSyncDirty, syncPass, startSyncLoop,
+} from './dataSync.js';
+import {
   applyStoredCustomSinkRate,
   calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
@@ -90,7 +97,29 @@ const SESSION_DAYS = 30;
 seedUsers();
 
 const app = express();
-app.use(express.json({ limit: '48mb' })); // photo uploads arrive as base64 JSON (a gallery batch can carry several)
+const json48 = express.json({ limit: '48mb' }); // photo uploads arrive as base64 JSON (a gallery batch can carry several)
+// The import route parses its own body at 200 MB (a photo-heavy
+// export can exceed 48 MB), so the global parser skips it.
+app.use((req, res, next) => {
+  if (req.path === '/api/admin/data/import') return next();
+  json48(req, res, next);
+});
+
+// iCloud sync: any successful mainline write marks the sync dirty, so
+// the debounced sync pass rewrites the export file. The sync endpoints
+// themselves never mark dirty (their own pass manages the state), and
+// login/logout are not data writes.
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
+    if (!req.path.startsWith('/api/')) return;
+    if (req.path.startsWith('/api/admin/data/')) return;
+    if (req.path === '/api/login' || req.path === '/api/logout') return;
+    if (res.statusCode < 200 || res.statusCode >= 300) return;
+    try { markSyncDirty(db); } catch { /* sync state must never fail a request */ }
+  });
+  next();
+});
 
 // ---------------------------------------------------------------- auth ---
 function parseCookies(req) {
@@ -715,6 +744,89 @@ app.delete('/api/admin/users/:id/avatar', requireApiAuth, requireAdmin, async (r
   if (u.avatar_file) await fs.promises.unlink(path.join(AVATARS_DIR, u.avatar_file)).catch(() => {});
   db.prepare('UPDATE users SET avatar_file = NULL WHERE id = ?').run(u.id);
   res.json(userView(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id)));
+});
+
+// ------------------------------------------------- data export / import ---
+// One JSON file with all mainline data (planning excluded, secrets
+// never included) for migrating to another server. Import replaces
+// the data on this server after a confirmation, backs the current
+// data up first (planning included, so a restore is complete), and
+// signs everyone out — the admin signs back in with the imported
+// admin credentials. Backups live in DATA_DIR/backups and restore
+// through the same import path.
+function exportDownloadName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `finance-mate-export-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.json`;
+}
+
+app.get('/api/admin/data/export', requireApiAuth, requireAdmin, (req, res) => {
+  const payload = buildExport(db, { includePlanning: false });
+  res.setHeader('Content-Disposition', `attachment; filename="${exportDownloadName()}"`);
+  res.type('application/json');
+  res.send(JSON.stringify(payload));
+});
+
+// The import body carries the parsed export JSON; a photo-heavy
+// export can exceed the 48 MB default, so this route alone allows
+// 200 MB. confirm is required — the UI asks first, and the server
+// refuses a bare call.
+app.post('/api/admin/data/import', requireApiAuth, requireAdmin, express.json({ limit: '200mb' }), (req, res) => {
+  const b = req.body || {};
+  if (b.confirm !== true) return res.status(400).json({ error: 'confirm the import first' });
+  let payload = b.data;
+  if (typeof payload === 'string') {
+    try { payload = JSON.parse(payload); } catch { return res.status(400).json({ error: 'import file is not valid JSON' }); }
+  }
+  try { validateExport(payload); } catch (e) { return res.status(400).json({ error: e.message }); }
+  try {
+    const backup = writeBackup(db, { includePlanning: true });
+    const summary = applyImport(db, payload);
+    markSyncDirty(db);
+    res.json({ ok: true, summary, backup: backup.name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.get('/api/admin/data/backups', requireApiAuth, requireAdmin, (req, res) => {
+  res.json({ backups: listBackups() });
+});
+
+app.post('/api/admin/data/backups/:name/restore', requireApiAuth, requireAdmin, (req, res) => {
+  if ((req.body || {}).confirm !== true) return res.status(400).json({ error: 'confirm the restore first' });
+  let payload;
+  try { payload = readBackup(req.params.name); } catch (e) { return res.status(400).json({ error: e.message }); }
+  try {
+    const backup = writeBackup(db, { includePlanning: true });
+    const summary = applyImport(db, payload);
+    markSyncDirty(db);
+    res.json({ ok: true, summary, backup: backup.name });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ------------------------------------------------------------ data sync ---
+// iCloud sync keeps the export file in a sync folder (bind-mounted to
+// an iCloud Drive folder on the Mac — see docker-compose.yml). The
+// folder is per-machine setup, so it is never exported and never
+// overwritten by an import.
+app.get('/api/admin/data/sync', requireApiAuth, requireAdmin, (req, res) => {
+  const settings = getSyncSettings(db);
+  const state = getSyncState(db);
+  res.json({ ...settings, lastAt: state.lastAt, lastDirection: state.lastDirection });
+});
+
+app.put('/api/admin/data/sync', requireApiAuth, requireAdmin, (req, res) => {
+  const b = req.body || {};
+  if (b.folder !== undefined && (typeof b.folder !== 'string' || !b.folder.trim())) {
+    return res.status(400).json({ error: 'sync folder is required' });
+  }
+  const settings = saveSyncSettings(db, { enabled: b.enabled === true, folder: b.folder });
+  if (settings.enabled) markSyncDirty(db);
+  const state = getSyncState(db);
+  res.json({ ...settings, lastAt: state.lastAt, lastDirection: state.lastDirection });
+});
+
+app.post('/api/admin/data/sync/now', requireApiAuth, requireAdmin, (req, res) => {
+  res.json(syncPass(db));
 });
 
 // ------------------------------------------------------ address suggest ---
@@ -9083,4 +9195,5 @@ app.use((err, req, res, next) => {
 export { app };
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   app.listen(PORT, () => console.log(`[finance-mate] listening on http://localhost:${PORT} (data: ${DATA_DIR})`));
+  startSyncLoop(db);
 }

@@ -444,6 +444,23 @@
       </form>
       <div class="note" style="margin-left:0">New users sign in with the initial password. Use “Reset password” in the list to change someone's password later; a reset signs that user out everywhere.</div>
     </div>
+    <div class="panel" id="adminDataPanel">
+      <h3>Data</h3>
+      <div class="toolbar">
+        <button class="primary" id="adminExportBtn">Export data</button>
+        <label class="btnlike">Import data <input type="file" accept="application/json,.json" style="display:none" id="adminImportFile"></label>
+      </div>
+      <div class="note" style="margin-left:0">Import replaces all data on this server. A backup is made first. Planning projects are not exported.</div>
+      <div id="adminBackupList"></div>
+      <h3>iCloud sync</h3>
+      <form id="adminSyncForm" class="toolbar" style="align-items:flex-end">
+        <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="enabled" id="adminSyncEnabled"> Enable</label>
+        <div><label>Sync folder</label><input name="folder" id="adminSyncFolder" autocomplete="off" style="min-width:340px"></div>
+        <button class="primary" type="submit">Save</button>
+        <button type="button" id="adminSyncNowBtn">Sync now</button>
+      </form>
+      <div class="note" style="margin-left:0" id="adminSyncStatus">Sync is off.</div>
+    </div>
   </section>
 
   <!-- ============================ Placeholders ============================ -->

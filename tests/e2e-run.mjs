@@ -18,7 +18,7 @@
 // the setup bucket before its own checks; setup failures BLOCK the
 // module with exit 3, they never count toward own totals):
 //   no deps: core, costs, nollm, photos, costs-nollm, assessments,
-//     chart-colors, investments, spending, epilogue
+//     chart-colors, investments, spending, epilogue, admin
 //   terms <- core; ui-property <- core
 //   veil <- core + ui-property
 //   csv-wizard <- investments; earnings <- investments + csv-wizard
@@ -44,7 +44,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const TESTS = path.join(ROOT, 'tests');
 const MODULES = ['core', 'costs', 'nollm', 'terms', 'photos', 'ui-property', 'costs-nollm',
   'assessments', 'chart-colors', 'veil', 'investments', 'csv-wizard', 'earnings',
-  'spending', 'planning', 'epilogue', 'home'];
+  'spending', 'planning', 'epilogue', 'home', 'admin'];
 const MAX_ATTEMPTS = 3;
 
 const args = process.argv.slice(2);

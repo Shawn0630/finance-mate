@@ -8889,6 +8889,7 @@ async function loadAdminImpl() {
       <button class="small" onclick="adminResetPassword(${u.id})">Reset password</button>
       ${u.isAdmin ? '' : `<button class="small danger" onclick="adminDeleteUser(${u.id})">Delete</button>`}
     </td></tr>`).join('');
+  loadAdminData();
 }
 
 window.adminUploadAvatar = async (userId, input) => {
@@ -8946,6 +8947,99 @@ $('#addUserForm').addEventListener('submit', async (e) => {
     showMsg($('#adminMsg'), 'ok', `User ${u.username} added.`);
     refreshAvatarConsumers(u.id);
   } catch (err) { showMsg($('#adminMsg'), 'err', err.message); }
+});
+
+// ------------------------------------------------------- admin: data -------
+// Export / import + backups + iCloud sync (Admin only). An import
+// replaces the data and wipes sessions, so a successful import or
+// restore sends the admin back to sign in.
+async function loadAdminData() {
+  let backups = [];
+  try { const r = await api('/api/admin/data/backups'); backups = r.backups || []; } catch { /* keep the empty list */ }
+  $('#adminBackupList').innerHTML = backups.length
+    ? `<table><thead><tr><th>Backup</th><th>Size</th><th></th></tr></thead><tbody>${backups.map((b) => `<tr>
+      <td>${esc(b.name)}</td><td>${(b.size / 1024).toFixed(1)} KB</td>
+      <td style="white-space:nowrap"><button class="small" data-restore="${esc(b.name)}">Restore</button></td></tr>`).join('')}</tbody></table>`
+    : '<div class="note" style="margin-left:0">No backups yet.</div>';
+  try {
+    const s = await api('/api/admin/data/sync');
+    $('#adminSyncEnabled').checked = !!s.enabled;
+    $('#adminSyncFolder').value = s.folder || '';
+    $('#adminSyncStatus').textContent = s.enabled
+      ? (s.lastAt ? `Last synced ${new Date(s.lastAt).toLocaleString('en-CA')} · ${s.lastDirection || ''}` : 'Enabled — not synced yet.')
+      : 'Sync is off.';
+  } catch { $('#adminSyncStatus').textContent = 'Sync status unavailable.'; }
+}
+
+$('#adminBackupList').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-restore]');
+  if (btn) adminRestoreBackup(btn.dataset.restore);
+});
+
+$('#adminExportBtn').addEventListener('click', async () => {
+  const msg = $('#adminMsg');
+  try {
+    const res = await fetch('/api/admin/data/export');
+    if (res.status === 401) { location.href = '/login.html'; return; }
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `export failed (${res.status})`);
+    const blob = await res.blob();
+    const name = (res.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)?.[1] || 'finance-mate-export.json';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    showMsg(msg, 'ok', 'Export downloaded.');
+  } catch (e) { showMsg(msg, 'err', e.message); }
+});
+
+$('#adminImportFile').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const msg = $('#adminMsg');
+  let data;
+  try { data = JSON.parse(await file.text()); }
+  catch { showMsg(msg, 'err', 'That file is not valid JSON.'); return; }
+  if (!confirm('Import replaces all data on this server. A backup is made first. Continue?')) return;
+  try {
+    await api('/api/admin/data/import', { method: 'POST', body: { data, confirm: true } });
+    showMsg(msg, 'ok', 'Import complete. Sign in again.');
+    setTimeout(() => { location.href = '/login.html'; }, 1200);
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+window.adminRestoreBackup = async (name) => {
+  if (!confirm(`Restore backup ${name}? Current data is backed up first.`)) return;
+  const msg = $('#adminMsg');
+  try {
+    await api(`/api/admin/data/backups/${encodeURIComponent(name)}/restore`, { method: 'POST', body: { confirm: true } });
+    showMsg(msg, 'ok', 'Backup restored. Sign in again.');
+    setTimeout(() => { location.href = '/login.html'; }, 1200);
+  } catch (e) { showMsg(msg, 'err', e.message); }
+};
+
+$('#adminSyncForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = $('#adminMsg');
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  try {
+    const s = await api('/api/admin/data/sync', { method: 'PUT', body: { enabled: !!f.enabled, folder: f.folder } });
+    $('#adminSyncEnabled').checked = !!s.enabled;
+    $('#adminSyncFolder').value = s.folder || '';
+    showMsg(msg, 'ok', 'Sync settings saved.');
+    await loadAdminData();
+  } catch (err) { showMsg(msg, 'err', err.message); }
+});
+
+$('#adminSyncNowBtn').addEventListener('click', async () => {
+  const msg = $('#adminMsg');
+  try {
+    const s = await api('/api/admin/data/sync/now', { method: 'POST' });
+    if (s.error) showMsg(msg, 'err', s.error);
+    else showMsg(msg, 'ok', s.action === 'none' ? 'Already in sync.' : `Sync ${s.action}.`);
+    await loadAdminData();
+  } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
 // -------------------------------------------------------------------- misc ---
