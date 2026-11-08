@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates,
-  jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrence,
+  jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrence, homeCalendarFocusTarget,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
 import { calcSalary } from '../src/earnings.js';
@@ -558,6 +558,30 @@ test('home: homeCalendarDates uses the highlight date sources for one month, pas
   assert.ok(jun['2026-06-06'].some((x) => x.kind === 'salary' && x.sourceId === 3), JSON.stringify(jun['2026-06-06']));
   // A month before anything started is empty — no invented dates.
   assert.deepEqual(homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2025-12' }), {});
+});
+
+test('home: homeCalendarFocusTarget maps a calendar day to the first matching highlight row', () => {
+  const highlights = [
+    { kind: 'salary', sourceId: 1, date: '2026-11-06' },
+    { kind: 'salary', sourceId: 1, date: '2026-10-23' },
+    { kind: 'rental', sourceId: 1, date: '2026-10-15' },
+    { kind: 'mortgage', sourceId: 2, date: '2026-10-15' },
+    { kind: 'salary', sourceId: 1, date: '2026-10-09' },
+  ];
+  // Exact date + kind + source.
+  assert.deepEqual(
+    homeCalendarFocusTarget('2026-11-06', [{ kind: 'salary', sourceId: 1 }], highlights), highlights[0]);
+  // Several payments one day: the first in highlight order wins (rental before mortgage).
+  assert.deepEqual(
+    homeCalendarFocusTarget('2026-10-15', [{ kind: 'rental', sourceId: 1 }, { kind: 'mortgage', sourceId: 2 }], highlights),
+    highlights[2]);
+  // Same date, wrong kind or wrong source: no row.
+  assert.equal(homeCalendarFocusTarget('2026-10-15', [{ kind: 'salary', sourceId: 1 }], highlights), null);
+  assert.equal(homeCalendarFocusTarget('2026-10-15', [{ kind: 'rental', sourceId: 9 }], highlights), null);
+  // No payments that day: nothing to focus.
+  assert.equal(homeCalendarFocusTarget('2026-11-10', [], highlights), null);
+  // Outside the highlight window the entry has no row, even with payments on the day.
+  assert.equal(homeCalendarFocusTarget('2026-12-04', [{ kind: 'salary', sourceId: 1 }], highlights), null);
 });
 
 test('home: homeCalendarDates keeps a payday that holiday-adjusts into the month', () => {

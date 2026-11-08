@@ -17904,7 +17904,11 @@ function homeCalendarHtml(data) {
       const title = marks.filter((x) => x.kind === k).map((x) => `${label ? label.label : k} · ${x.label}`).join(', ');
       return `<span class="home-cal-dot kind-${k}" title="${esc(title)}"></span>`;
     }).join('');
-    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}" data-cal-date="${date}"><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
+    // Days with payments are clickable: they focus the matching
+    // highlight card (see homeCalendarFocusDay). Days without
+    // payments are plain and do nothing.
+    const hasPay = marks.length > 0;
+    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}${hasPay ? ' has-pay' : ''}" data-cal-date="${date}"${hasPay ? ' tabindex="0" role="button"' : ''}><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
   }
   const legend = HOME_CAL_KINDS.map((k) => `<span class="home-cal-legend-item"><span class="home-cal-dot kind-${k.kind}"></span>${k.label}</span>`).join('');
   return `<div class="home-cal-head">
@@ -18177,8 +18181,57 @@ async function loadHome() {
 }
 $('#homeCalendar').addEventListener('click', (e) => {
   const nav = e.target.closest && e.target.closest('[data-cal-nav]');
-  if (nav) homeCalShift(Number(nav.dataset.calNav));
+  if (nav) { homeCalShift(Number(nav.dataset.calNav)); return; }
+  const day = e.target.closest && e.target.closest('[data-cal-date]');
+  if (day) homeCalendarFocusDay(day.dataset.calDate);
 });
+$('#homeCalendar').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const day = e.target.closest && e.target.closest('[data-cal-date]');
+  if (day) { e.preventDefault(); homeCalendarFocusDay(day.dataset.calDate); }
+});
+
+// Calendar → highlight link: clicking a calendar day focuses the
+// matching payment card — the highlight carousel scrolls to it and
+// it gets a temporary outline. Days with no highlight row (no
+// payments, a marked occurrence that rolled over, or outside the
+// current + previous month window) do nothing. The match mirrors
+// homeCalendarFocusTarget in src/home.js (date + kind + sourceId);
+// the first matching card in carousel order wins.
+let homeCalFocusTimer = 0;
+function homeClearCalFocus() {
+  document.querySelectorAll('#homeHighlightCarousel .home-pay-card.is-cal-focus')
+    .forEach((el) => el.classList.remove('is-cal-focus'));
+  if (homeCalFocusTimer) { clearTimeout(homeCalFocusTimer); homeCalFocusTimer = 0; }
+}
+function homeCalendarFocusDay(date) {
+  if (!homeCalData || !homeData) return;
+  const entries = (homeCalData.days || {})[date] || [];
+  if (!entries.length) return;
+  const keys = new Set(entries.map((x) => `${x.kind}:${x.sourceId}:${date}`));
+  const row = (homeData.highlights || []).find((h) => keys.has(`${h.kind}:${h.sourceId}:${h.date}`));
+  if (!row) return;
+  const car = $('#homeHighlightCarousel');
+  const card = car && car.querySelector(`.home-pay-card[data-pay-kind="${row.kind}"][data-pay-source="${row.sourceId}"][data-pay-date="${row.date}"]`);
+  if (!car || !card) return;
+  homeClearCalFocus();
+  // Scroll by rects, not offsetLeft: a card's offsetLeft is relative
+  // to its offsetParent (the page here, not the carousel — see
+  // homeMarkActiveCarousel), while scrollLeft is carousel-relative.
+  const pad = parseFloat(getComputedStyle(car).scrollPaddingLeft) || 0;
+  const target = card.getBoundingClientRect().left - car.getBoundingClientRect().left + car.scrollLeft - pad;
+  car.scrollTo({ left: target, behavior: 'smooth' });
+  // On narrow screens the carousel sits below the calendar; bring
+  // it into view so the focused card is actually seen.
+  const rect = car.getBoundingClientRect();
+  if (rect.bottom < 0 || rect.top > window.innerHeight) car.scrollIntoView({ block: 'nearest' });
+  card.classList.add('is-cal-focus');
+  homeCalFocusTimer = setTimeout(homeClearCalFocus, 2000);
+  // The next pointer press anywhere clears the focus early. The
+  // listener registers after this click's own pointerdown, so it
+  // cannot fire on the gesture that set the focus.
+  setTimeout(() => document.addEventListener('pointerdown', homeClearCalFocus, { once: true }), 0);
+}
 
 function renderHomeAiThread() {
   const thread = $('#homeAiThread');

@@ -817,6 +817,10 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 
 /* Payment cards: same strip, toggle on the right instead of a chart. */
 .home-pay-card .insight-toggle { flex: 0 0 auto; }
+/* Calendar link: the focused payment card gets a temporary outline
+   (cleared after ~2s or on the next interaction). z-index so the
+   ring is not tucked under the next card's overlap. */
+.home-pay-card.is-cal-focus { border-color: #1668c4; box-shadow: 0 0 0 2px #1668c4, 0 8px 22px rgba(16, 24, 40, .14); z-index: 3; }
 .recv-toggle { border: 1px solid #c9d2dc; background: #fff; color: #1668c4; border-radius: 999px; padding: 7px 14px; font-weight: 600; font-size: 13px; white-space: nowrap; }
 .recv-toggle.on { background: #e7f6ec; border-color: #bfe3c9; color: #14632f; }
 .pay-state { font-size: 12px; color: #98a4b0; }
@@ -850,6 +854,11 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .home-cal-day { min-height: 34px; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px; color: #3c4a59; }
 .home-cal-day.is-blank { visibility: hidden; }
 .home-cal-day.is-today { background: #eef4fb; font-weight: 700; color: #111; box-shadow: inset 0 0 0 1px #1668c4; }
+/* Days with payments are clickable (they focus the matching
+   highlight card); days without payments are plain. */
+.home-cal-day.has-pay { cursor: pointer; }
+.home-cal-day.has-pay:hover { background: #f2f6fa; }
+.home-cal-day.has-pay:focus-visible { outline: 2px solid #1668c4; outline-offset: 1px; }
 .home-cal-num { line-height: 1; }
 .home-cal-dots { display: flex; gap: 3px; min-height: 8px; }
 .home-cal-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }

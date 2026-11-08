@@ -575,6 +575,94 @@ export async function run(H, S) {
     });
     H.check('home UI: calendar prev returns to Nov 2026', backTitle === 'Nov 2026', String(backTitle));
 
+    // Calendar → highlight link: clicking a day focuses its payment
+    // card in the highlight carousel. At 1280px the carousel sits
+    // beside the calendar, so the scroll is visible.
+    await page.setViewport({ width: 1280, height: 800 });
+    await wait(300);
+    const calFocusState = () => page.evaluate(() => {
+      const car = document.querySelector('#homeHighlightCarousel');
+      const f = car.querySelector('.home-pay-card.is-cal-focus');
+      return {
+        scrollLeft: car.scrollLeft,
+        focused: f ? { kind: f.dataset.payKind, source: f.dataset.paySource, date: f.dataset.payDate } : null,
+      };
+    });
+    // Nov 6 salary is the first card, already in view — clicking
+    // its day focuses it without moving the carousel.
+    await page.evaluate(() => document.querySelector('[data-cal-date="2026-11-06"]').click());
+    const focusNov6 = await until(() => {
+      const car = document.querySelector('#homeHighlightCarousel');
+      const f = car.querySelector('.home-pay-card.is-cal-focus');
+      return f ? { kind: f.dataset.payKind, date: f.dataset.payDate, scrollLeft: car.scrollLeft } : null;
+    });
+    H.check('home UI: clicking Nov 6 focuses the Nov 6 salary card',
+      focusNov6 && focusNov6.kind === 'salary' && focusNov6.date === '2026-11-06',
+      JSON.stringify(focusNov6));
+    // Nov 10 has no payments: the focus clears and nothing new is
+    // focused, and the carousel does not move. Wait for the 2s
+    // focus to clear first so the old focus cannot stand in for a new one.
+    await until(() => !document.querySelector('#homeHighlightCarousel .home-pay-card.is-cal-focus'));
+    const scrollBeforeEmpty = (await calFocusState()).scrollLeft;
+    await page.evaluate(() => document.querySelector('[data-cal-date="2026-11-10"]').click());
+    await wait(300);
+    const focusEmpty = await calFocusState();
+    H.check('home UI: clicking a date with no payments focuses nothing and does not scroll',
+      focusEmpty.focused === null && focusEmpty.scrollLeft === scrollBeforeEmpty, JSON.stringify(focusEmpty));
+    // Oct 15 has two payments (rent + mortgage): the first in
+    // highlight order — rent — is focused, and the carousel scrolls to it.
+    await page.evaluate(() => document.querySelector('[data-cal-nav="-1"]').click());
+    await until(() => {
+      const t = document.querySelector('.home-cal-title');
+      return t && t.textContent === 'Oct 2026' ? t.textContent : null;
+    });
+    await page.evaluate(() => document.querySelector('[data-cal-date="2026-10-15"]').click());
+    const focusOct15 = await until(() => {
+      const car = document.querySelector('#homeHighlightCarousel');
+      const f = car.querySelector('.home-pay-card.is-cal-focus');
+      if (!f || car.scrollLeft < 100) return null;
+      return { kind: f.dataset.payKind, date: f.dataset.payDate, scrollLeft: car.scrollLeft };
+    });
+    H.check('home UI: clicking Oct 15 focuses the first of its two payments (rent) and scrolls the carousel',
+      focusOct15 && focusOct15.kind === 'rental' && focusOct15.date === '2026-10-15',
+      JSON.stringify(focusOct15));
+    // Dec 4 has a salary payday on the calendar but no highlight
+    // card (outside the current + previous month window): nothing focuses.
+    // Wait for each month to land before the next click: homeCalShift
+    // reads the displayed month, so a second click before the fetch
+    // resolves would re-request the same month.
+    await page.evaluate(() => document.querySelector('[data-cal-nav="1"]').click());
+    await until(() => {
+      const t = document.querySelector('.home-cal-title');
+      return t && t.textContent === 'Nov 2026' ? t.textContent : null;
+    });
+    await page.evaluate(() => document.querySelector('[data-cal-nav="1"]').click());
+    await until(() => {
+      const t = document.querySelector('.home-cal-title');
+      return t && t.textContent === 'Dec 2026' ? t.textContent : null;
+    });
+    await until(() => !document.querySelector('#homeHighlightCarousel .home-pay-card.is-cal-focus'));
+    const scrollBeforeDec4 = (await calFocusState()).scrollLeft;
+    await page.evaluate(() => document.querySelector('[data-cal-date="2026-12-04"]').click());
+    await wait(300);
+    const focusDec4 = await calFocusState();
+    H.check('home UI: clicking a date outside the highlight window focuses nothing and does not scroll',
+      focusDec4.focused === null && focusDec4.scrollLeft === scrollBeforeDec4, JSON.stringify(focusDec4));
+    // Leave the page as found: back to Nov 2026, 800px viewport,
+    // carousel at its start, no focus.
+    await page.evaluate(() => document.querySelector('[data-cal-nav="-1"]').click());
+    await until(() => {
+      const t = document.querySelector('.home-cal-title');
+      return t && t.textContent === 'Nov 2026' ? t.textContent : null;
+    });
+    await page.evaluate(() => {
+      const car = document.querySelector('#homeHighlightCarousel');
+      car.scrollTo({ left: 0, behavior: 'instant' });
+      car.querySelectorAll('.home-pay-card.is-cal-focus').forEach((el) => el.classList.remove('is-cal-focus'));
+    });
+    await page.setViewport({ width: 800, height: 600 });
+    await wait(300);
+
     // Brand link: Finance Mate in the top bar goes to Home.
     await page.goto('http://ff.local/#assets/overview', { waitUntil: 'networkidle0', timeout: 30000 });
     await until(() => {

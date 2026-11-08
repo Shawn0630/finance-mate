@@ -651,6 +651,18 @@ export function homeCalendarDates({ jobs, rentals, mortgageOccurrences, month })
   return days;
 }
 
+// Calendar → highlight link: the first highlight row (display
+// order) matching any of a calendar day's entries, by date + kind +
+// sourceId. The highlight window is current + previous month only
+// and a marked occurrence rolls over, so a day's entry has no row
+// when it was marked or sits outside the window — then null, and
+// clicking the day does nothing. Returns the row or null.
+export function homeCalendarFocusTarget(date, entries, highlights) {
+  const keys = new Set((entries || []).map((e) => `${e.kind}:${e.sourceId}:${date}`));
+  if (!keys.size) return null;
+  return (highlights || []).find((h) => keys.has(`${h.kind}:${h.sourceId}:${h.date}`)) || null;
+}
+
 // ------------------------------------------------------------ AI metric library --
 // The computable metric library the AI may propose from. Standard ids
 // are the 12 above; per-entity variants are built from live entities
