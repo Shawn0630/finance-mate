@@ -57,6 +57,7 @@ import {
 import {
   getSyncSettings, saveSyncSettings, getSyncState, markSyncDirty, syncPass, startSyncLoop,
 } from './dataSync.js';
+import { browseFolder } from './folderBrowse.js';
 import {
   applyStoredCustomSinkRate,
   calcPenalty, validateOp, validateLegs,
@@ -827,6 +828,19 @@ app.put('/api/admin/data/sync', requireApiAuth, requireAdmin, (req, res) => {
 
 app.post('/api/admin/data/sync/now', requireApiAuth, requireAdmin, (req, res) => {
   res.json(syncPass(db));
+});
+
+// Folder picker for the sync folder (Admin only): list the
+// directories the app process can see, one level at a time, rooted
+// at the app folder (/app in Docker). Reads directory names only,
+// never file contents — a folder never mounted into the container
+// simply does not appear.
+app.get('/api/admin/data/browse', requireApiAuth, requireAdmin, (req, res) => {
+  try {
+    return res.json(browseFolder(req.query.path));
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.message || String(e) });
+  }
 });
 
 // ------------------------------------------------------ address suggest ---

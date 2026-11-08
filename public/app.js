@@ -9046,6 +9046,89 @@ $('#adminSyncNowBtn').addEventListener('click', async () => {
   } catch (err) { showMsg(msg, 'err', err.message); }
 });
 
+// Folder picker for the sync folder (Admin only). Same pattern as the
+// App Manager's picker: the server lists the directories the app
+// process can see, one level at a time, rooted at the app folder
+// (/app in Docker) — the Mac's folders never appear here, so a
+// folder that was never mounted into the container simply does not
+// show up. Picking fills the Sync folder field; Save still saves it.
+const syncBrowseModal = $('#syncBrowseModal');
+const syncBrowseRootsEl = $('#syncBrowseRoots');
+const syncBrowsePathEl = $('#syncBrowsePath');
+const syncBrowseListEl = $('#syncBrowseList');
+const syncBrowseErrEl = $('#syncBrowseErr');
+const syncBrowseUpBtn = $('#syncBrowseUp');
+let syncBrowseState = null; // last /api/admin/data/browse response
+
+function renderSyncBrowse() {
+  if (!syncBrowseState) return;
+  // Quick-jump chips from the server's roots list (app folder, plus
+  // the data folder when it exists). A chip is highlighted while the
+  // picker is at — or inside — that root.
+  const roots = syncBrowseState.roots || [];
+  syncBrowseRootsEl.innerHTML = roots.map((r) => {
+    const active = syncBrowseState.path === r.path
+      || (r.path !== '/' && syncBrowseState.path.startsWith(`${r.path}/`));
+    return `<button type="button" class="browse-chip${active ? ' browse-chip-active' : ''}" data-root="${esc(r.path)}" title="${esc(r.path)}">${esc(r.label)}</button>`;
+  }).join('');
+  syncBrowsePathEl.textContent = syncBrowseState.path;
+  syncBrowseUpBtn.disabled = !syncBrowseState.parent;
+  syncBrowseListEl.innerHTML = (syncBrowseState.dirs || []).length
+    ? syncBrowseState.dirs.map((d) =>
+      `<button type="button" class="browse-item" data-dir="${esc(d.path)}"><span class="browse-name">${esc(d.name)}</span></button>`).join('')
+    : '<div class="note" style="margin-left:0">No subfolders here.</div>';
+}
+
+async function syncBrowseTo(dir) {
+  syncBrowseErrEl.style.display = 'none';
+  syncBrowseErrEl.textContent = '';
+  try {
+    const q = dir ? `?path=${encodeURIComponent(dir)}` : '';
+    syncBrowseState = await api(`/api/admin/data/browse${q}`);
+    renderSyncBrowse();
+    return true;
+  } catch (e) {
+    syncBrowseErrEl.textContent = e.message;
+    syncBrowseErrEl.style.display = '';
+    return false;
+  }
+}
+
+async function openSyncBrowse() {
+  syncBrowseModal.classList.remove('hidden');
+  syncBrowseState = null;
+  syncBrowseRootsEl.innerHTML = '';
+  syncBrowsePathEl.textContent = 'Loading…';
+  syncBrowseListEl.innerHTML = '';
+  syncBrowseErrEl.style.display = 'none';
+  syncBrowseErrEl.textContent = '';
+  // Start where the user already typed (when it looks like an
+  // absolute path); otherwise the server decides (its data folder,
+  // else the app folder). If the typed folder cannot be shown,
+  // retry at the server start and keep the error visible.
+  const typed = $('#adminSyncFolder').value.trim();
+  const ok = await syncBrowseTo(typed.startsWith('/') ? typed : null);
+  if (!ok && typed.startsWith('/')) syncBrowseTo(null);
+}
+
+$('#adminSyncBrowseBtn').addEventListener('click', openSyncBrowse);
+syncBrowseListEl.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-dir]');
+  if (btn) syncBrowseTo(btn.dataset.dir);
+});
+syncBrowseRootsEl.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-root]');
+  if (btn) syncBrowseTo(btn.dataset.root);
+});
+syncBrowseUpBtn.addEventListener('click', () => {
+  if (syncBrowseState && syncBrowseState.parent) syncBrowseTo(syncBrowseState.parent);
+});
+$('#syncBrowseUse').addEventListener('click', () => {
+  if (!syncBrowseState) return;
+  $('#adminSyncFolder').value = syncBrowseState.path;
+  closeModalEl(syncBrowseModal);
+});
+
 // -------------------------------------------------------------------- misc ---
 $('#logoutBtn').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });

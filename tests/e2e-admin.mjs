@@ -5,6 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { runModuleMain } from './e2e-child.mjs';
 export const deps = [];
 export async function run(H, S) {
@@ -143,6 +144,32 @@ export async function run(H, S) {
   r = await H.req('PUT', '/api/admin/data/sync', { enabled: false, folder: syncFolder });
   H.check('sync can be switched off', r.status === 200 && r.data.enabled === false, JSON.stringify(r.data));
 
+  // ---- folder picker API: rooted at the app folder, no escape ----
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  r = await H.req('GET', '/api/admin/data/browse');
+  H.check('folder picker lists the app folder by default',
+    r.status === 200 && typeof r.data.path === 'string' && Array.isArray(r.data.dirs)
+      && Array.isArray(r.data.roots) && r.data.roots.some((x) => x.label === 'App folder' && x.path === repoRoot),
+    JSON.stringify(r.data));
+  r = await H.req('GET', `/api/admin/data/browse?path=${encodeURIComponent(repoRoot)}`);
+  H.check('folder picker at the app folder has no parent and lists src',
+    r.status === 200 && r.data.path === repoRoot && r.data.parent === null
+      && r.data.dirs.some((d) => d.name === 'src' && d.path === path.join(repoRoot, 'src'))
+      && !r.data.dirs.some((d) => d.name === 'package.json'),
+    JSON.stringify(r.data));
+  r = await H.req('GET', `/api/admin/data/browse?path=${encodeURIComponent(path.join(repoRoot, 'src'))}`);
+  H.check('folder picker inside src reports the app folder as parent',
+    r.status === 200 && r.data.path === path.join(repoRoot, 'src') && r.data.parent === repoRoot,
+    JSON.stringify(r.data));
+  for (const bad of ['/etc', path.join(repoRoot, '..', 'etc'), path.join(repoRoot, 'package.json'), '~/data']) {
+    r = await H.req('GET', `/api/admin/data/browse?path=${encodeURIComponent(bad)}`);
+    H.check(`folder picker rejects ${bad}`, r.status === 400, JSON.stringify({ bad, status: r.status }));
+  }
+  await H.req('POST', '/api/login', { username: 'Shawn', password: 'Shawn' });
+  r = await H.req('GET', '/api/admin/data/browse');
+  H.check('folder picker is 403 for a non-admin user', r.status === 403, JSON.stringify(r.status));
+  await ensureAdmin();
+
   // ---- browser: the Admin Data panel renders and Sync now works ----
   if (!H.chromeAvailable) {
     H.check('admin UI: skipped (no Chrome)', true, 'no chrome');
@@ -201,6 +228,30 @@ export async function run(H, S) {
       }
       return null;
     };
+    // until() runs its function in the page, so it cannot see Node
+    // variables — these take the expected value as an argument.
+    const untilText = async (selector, text, tries = 48) => {
+      for (let i = 0; i < tries; i++) {
+        const v = await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          return el ? el.textContent : null;
+        }, selector);
+        if (v === text) return true;
+        await wait(250);
+      }
+      return false;
+    };
+    const untilValue = async (selector, value, tries = 48) => {
+      for (let i = 0; i < tries; i++) {
+        const v = await page.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          return el ? el.value : null;
+        }, selector);
+        if (v === value) return true;
+        await wait(250);
+      }
+      return false;
+    };
     await page.goto('http://ff.local/#admin', { waitUntil: 'networkidle0', timeout: 30000 });
     H.check('admin UI: Data panel renders (Export, Import, sync form, status)',
       await until(() => document.querySelector('#adminExportBtn') && document.querySelector('#adminImportFile')
@@ -238,6 +289,58 @@ export async function run(H, S) {
         return t && (t.includes('Already in sync.') || t.startsWith('Sync '));
       }),
       await page.evaluate(() => document.querySelector('#adminMsg').textContent));
+    // Folder picker: Browse opens the dialog, lists folders, and
+    // Use this folder fills the Sync folder field.
+    await page.click('#adminSyncBrowseBtn');
+    H.check('admin UI: Browse opens the folder picker with a folder list',
+      await until(() => {
+        const m = document.querySelector('#syncBrowseModal');
+        return m && !m.classList.contains('hidden')
+          && document.querySelectorAll('#syncBrowseList [data-dir]').length >= 1
+          && document.querySelectorAll('#syncBrowseRoots [data-root]').length >= 2;
+      }),
+      await page.evaluate(() => document.querySelector('#syncBrowsePath').textContent));
+    const pickerRoot = await page.evaluate(() => {
+      const chip = document.querySelector('#syncBrowseRoots [data-root]');
+      chip.click();
+      return chip.dataset.root;
+    });
+    H.check('admin UI: picker root chip shows the app folder',
+      await untilText('#syncBrowsePath', pickerRoot),
+      await page.evaluate(() => document.querySelector('#syncBrowsePath').textContent));
+    const picked = await page.evaluate((root) => {
+      const btn = document.querySelector(`#syncBrowseList [data-dir="${root}/src"]`);
+      if (!btn) return null;
+      btn.click();
+      return `${root}/src`;
+    }, pickerRoot);
+    H.check('admin UI: picking a subfolder navigates into it',
+      picked && await untilText('#syncBrowsePath', picked),
+      await page.evaluate(() => document.querySelector('#syncBrowsePath').textContent));
+    await page.click('#syncBrowseUp');
+    H.check('admin UI: Up one level returns to the app folder',
+      await untilText('#syncBrowsePath', pickerRoot),
+      await page.evaluate(() => document.querySelector('#syncBrowsePath').textContent));
+    await page.evaluate((root) => {
+      document.querySelector(`#syncBrowseList [data-dir="${root}/src"]`).click();
+    }, pickerRoot);
+    await untilText('#syncBrowsePath', `${pickerRoot}/src`);
+    await page.click('#syncBrowseUse');
+    const pickerClosed = await until(() => document.querySelector('#syncBrowseModal').classList.contains('hidden'));
+    const fieldFilled = await untilValue('#adminSyncFolder', `${pickerRoot}/src`);
+    H.check('admin UI: Use this folder fills the Sync folder field and closes the picker',
+      pickerClosed && fieldFilled,
+      await page.evaluate(() => document.querySelector('#adminSyncFolder').value));
+    // Typing still works: put the folder back by hand and save.
+    await page.evaluate((folder) => { document.querySelector('#adminSyncFolder').value = folder; }, syncFolder);
+    await page.click('#adminSyncForm button[type="submit"]');
+    H.check('admin UI: a typed folder still saves from the form',
+      await until(() => document.querySelector('#adminMsg') && document.querySelector('#adminMsg').textContent.includes('Sync settings saved.')),
+      await page.evaluate(() => document.querySelector('#adminMsg').textContent));
+    r = await H.req('GET', '/api/admin/data/sync');
+    H.check('admin UI: typed folder is the saved folder',
+      r.status === 200 && r.data.folder === syncFolder, JSON.stringify(r.data));
+    await H.req('PUT', '/api/admin/data/sync', { enabled: false, folder: syncFolder });
   } finally {
     await browser.close();
   }

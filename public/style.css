@@ -378,6 +378,18 @@ label.btnlike:hover { background: #f0f4f9; }
 .modal-card h4 { margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid #e6ecf2; font-size: 13.5px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .modal-head h3 { margin: 0; font-size: 16px; }
+
+/* Folder picker (Admin → Data → iCloud sync): server-side directory
+   browser, same pattern as the App Manager's picker. */
+.browse-roots { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.browse-roots:empty { display: none; }
+.browse-chip { border: 1px solid #d7e0ea; background: #fff; color: #344054; border-radius: 999px; padding: 4px 10px; font-size: 12.5px; cursor: pointer; }
+.browse-chip:hover { background: #f2f6ff; }
+.browse-chip-active { background: #1668c4; border-color: #1668c4; color: #fff; }
+.browse-crumb { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #344054; word-break: break-all; }
+.browse-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; margin: 10px 0; }
+.browse-item { display: block; width: 100%; text-align: left; background: none; border: none; padding: 7px 8px; border-radius: 6px; font-size: 13.5px; color: #101828; cursor: pointer; }
+.browse-item:hover { background: #f2f6ff; }
 .detail-table td:first-child { width: 190px; color: #5a6a7a; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 /* Mortgage modal's read-only metadata grid: derived figures only,
    no inputs — what can change lives in the terms below it. */

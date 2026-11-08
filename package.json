@@ -6,7 +6,7 @@
   "description": "\u5bb6\u5ead\u8d22\u52a1\u7ba1\u7406 \u2014 \u8d44\u4ea7\u677f\u5757\uff08\u623f\u4ea7 / \u56fa\u5b9a\u8d44\u4ea7 / \u6295\u8d44\u7406\u8d22\uff09",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test tests/engine.test.mjs tests/aiFill.test.mjs tests/costs.test.mjs tests/investments.test.mjs tests/investShare.test.mjs tests/investVisible.test.mjs tests/overviewChart.test.mjs tests/wsImport.test.mjs tests/csvMapImport.test.mjs tests/earnings.test.mjs tests/rentIncome.test.mjs tests/plans.test.mjs tests/spending.test.mjs tests/planning.test.mjs tests/legacyBackfill.test.mjs tests/planCategories.test.mjs tests/planFactors.test.mjs tests/planScenarios.test.mjs tests/planReports.test.mjs tests/planAiModel.test.mjs tests/planEngines.test.mjs tests/history.test.mjs tests/holidays.test.mjs tests/home.test.mjs tests/whatIf.test.mjs tests/dataExport.test.mjs",
+    "test": "node --test tests/engine.test.mjs tests/aiFill.test.mjs tests/costs.test.mjs tests/investments.test.mjs tests/investShare.test.mjs tests/investVisible.test.mjs tests/overviewChart.test.mjs tests/wsImport.test.mjs tests/csvMapImport.test.mjs tests/earnings.test.mjs tests/rentIncome.test.mjs tests/plans.test.mjs tests/spending.test.mjs tests/planning.test.mjs tests/legacyBackfill.test.mjs tests/planCategories.test.mjs tests/planFactors.test.mjs tests/planScenarios.test.mjs tests/planReports.test.mjs tests/planAiModel.test.mjs tests/planEngines.test.mjs tests/history.test.mjs tests/holidays.test.mjs tests/home.test.mjs tests/whatIf.test.mjs tests/dataExport.test.mjs tests/folderBrowse.test.mjs",
     "e2e": "node tests/e2e-run.mjs"
   },
   "dependencies": {

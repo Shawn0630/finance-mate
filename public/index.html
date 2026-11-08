@@ -460,7 +460,7 @@
       <h3>iCloud sync</h3>
       <form id="adminSyncForm" class="toolbar" style="align-items:flex-end">
         <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="enabled" id="adminSyncEnabled"> Enable</label>
-        <div><label>Sync folder</label><input name="folder" id="adminSyncFolder" autocomplete="off" style="min-width:340px"></div>
+        <div><label>Sync folder</label><div style="display:flex;gap:6px"><input name="folder" id="adminSyncFolder" autocomplete="off" style="min-width:340px"><button type="button" id="adminSyncBrowseBtn">Browse…</button></div></div>
         <button class="primary" type="submit">Save</button>
         <button type="button" id="adminSyncNowBtn">Sync now</button>
       </form>
@@ -1182,6 +1182,27 @@
     <div class="plan-ai-modal-card"><div class="section-head"><h3>Strategies</h3></div><div class="plan-ai-picks" id="planReportAiStrategies"></div></div>
     <div class="toolbar"><button class="small primary" id="planReportAiGenBtn">Generate preview</button></div>
     <div id="planReportAiOut"></div>
+  </div>
+</div>
+
+<!-- Folder picker for the iCloud sync folder (Admin → Data): the
+     server lists the directories the app process can see, one level
+     at a time, rooted at the app folder — the Mac's folders never
+     appear here, and a folder that was never mounted into the
+     container simply does not show up. -->
+<div class="modal-overlay hidden" id="syncBrowseModal">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Choose a sync folder</h3><button class="small" data-close-modal>Close</button></div>
+    <div id="syncBrowseRoots" class="browse-roots"></div>
+    <div id="syncBrowsePath" class="browse-crumb"></div>
+    <div id="syncBrowseList" class="browse-list"></div>
+    <div id="syncBrowseErr" class="note" style="margin-left:0;color:#b3261e;display:none"></div>
+    <div class="note" style="margin-left:0">Only folders inside this app's container appear here — the Mac's folders are not visible. A folder must be mounted into the container first (see docker-compose.yml).</div>
+    <div class="toolbar" style="margin-top:12px">
+      <button type="button" class="small" id="syncBrowseUp">↑ Up one level</button>
+      <div class="spacer"></div>
+      <button type="button" class="primary" id="syncBrowseUse">Use this folder</button>
+    </div>
   </div>
 </div>
 
