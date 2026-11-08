@@ -5055,7 +5055,11 @@ app.get('/api/home/calendar', requireApiAuth, async (req, res) => {
     const { dates } = mortgageMonthInfo(p, proj, termsOf(p.id), month, monthStart, monthEnd);
     for (const d of dates) mortgageOccurrences.push({ date: d, sourceId: p.id, label: String(p.address).split(',')[0] });
   }
-  res.json({ month, today, days: homeCalendarDates({ jobs, rentals, mortgageOccurrences, month }) });
+  // The same income_marks map /api/home builds, so each day entry
+  // carries its mark state (received 1/0) for the done-dot style.
+  const marks = new Map(db.prepare('SELECT kind, source_id, pay_date, received FROM income_marks WHERE user_id = ?').all(req.user.id)
+    .map((m) => [`${m.kind}:${m.source_id}:${m.pay_date}`, m.received]));
+  res.json({ month, today, days: homeCalendarDates({ jobs, rentals, mortgageOccurrences, month, marks }) });
 });
 
 app.post('/api/home/insights/generate', requireApiAuth, async (req, res) => {

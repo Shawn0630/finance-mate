@@ -6,6 +6,7 @@ import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates,
   jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrence, homeCalendarFocusTarget,
+  homeCalDayIsActionable, homeLongPressMoved, homeDropBefore,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
 import { calcSalary } from '../src/earnings.js';
@@ -582,6 +583,58 @@ test('home: homeCalendarFocusTarget maps a calendar day to the first matching hi
   assert.equal(homeCalendarFocusTarget('2026-11-10', [], highlights), null);
   // Outside the highlight window the entry has no row, even with payments on the day.
   assert.equal(homeCalendarFocusTarget('2026-12-04', [{ kind: 'salary', sourceId: 1 }], highlights), null);
+});
+
+test('home: homeCalDayIsActionable — a day is clickable only when a highlight card matches one of its entries', () => {
+  const highlights = [
+    { kind: 'salary', sourceId: 1, date: '2026-11-06' },
+    { kind: 'salary', sourceId: 1, date: '2026-10-23' },
+    { kind: 'rental', sourceId: 1, date: '2026-10-15' },
+    { kind: 'mortgage', sourceId: 2, date: '2026-10-15' },
+    { kind: 'salary', sourceId: 1, date: '2026-10-09' },
+  ];
+  assert.equal(homeCalDayIsActionable('2026-11-06', [{ kind: 'salary', sourceId: 1 }], highlights), true);
+  assert.equal(homeCalDayIsActionable('2026-10-15', [{ kind: 'rental', sourceId: 1 }, { kind: 'mortgage', sourceId: 2 }], highlights), true);
+  // No payments: not actionable.
+  assert.equal(homeCalDayIsActionable('2026-11-10', [], highlights), false);
+  // Payments but no row (marked-and-rolled-off, or outside the window): not actionable.
+  assert.equal(homeCalDayIsActionable('2026-12-04', [{ kind: 'salary', sourceId: 1 }], highlights), false);
+  assert.equal(homeCalDayIsActionable('2026-10-15', [{ kind: 'salary', sourceId: 1 }], highlights), false);
+});
+
+test('home: homeCalendarDates carries the mark state per entry (received only when a mark row exists)', () => {
+  const jobs = [
+    { id: 1, label: 'Acme Corp', frequency: 'biweekly', startDate: '2026-01-02', recentDate: '2026-10-23' },
+  ];
+  const rentals = [
+    { id: 1, label: 'Basement suite', entries: [{ id: 1, start_ym: '2026-01', end_ym: '', monthly_rent: 2000, pay_day: 15 }] },
+  ];
+  const mortgageOccurrences = [{ date: '2026-10-15', sourceId: 2, label: '2 Home Test Way' }];
+  const marks = new Map([
+    ['salary:1:2026-10-09', 1], // marked received
+    ['rental:1:2026-10-15', 0], // explicitly not received
+  ]);
+  const oct = homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2026-10', marks });
+  assert.deepEqual(oct['2026-10-09'], [{ kind: 'salary', sourceId: 1, label: 'Acme Corp', received: 1 }]);
+  assert.deepEqual(oct['2026-10-15'], [
+    { kind: 'rental', sourceId: 1, label: 'Basement suite', received: 0 },
+    { kind: 'mortgage', sourceId: 2, label: '2 Home Test Way' },
+  ]);
+  // Without marks, no entry carries a received key (shape unchanged).
+  const plain = homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2026-10' });
+  assert.deepEqual(plain['2026-10-09'], [{ kind: 'salary', sourceId: 1, label: 'Acme Corp' }]);
+});
+
+test('home: long-press + drop rules — drift cancels the press, the midpoint decides before/after', () => {
+  assert.equal(homeLongPressMoved(100, 100, 100, 100), false);
+  assert.equal(homeLongPressMoved(100, 100, 105, 100), false); // 5px, still a press
+  assert.equal(homeLongPressMoved(100, 100, 111, 100), true); // 11px, the press is cancelled
+  assert.equal(homeLongPressMoved(100, 100, 100, 108), false);
+  assert.equal(homeLongPressMoved(100, 100, 107, 108), true); // ~10.6px diagonal
+  assert.equal(homeDropBefore(100, 0, 200), true); // at the midpoint → insert before
+  assert.equal(homeDropBefore(99, 0, 200), true); // left half → insert before
+  assert.equal(homeDropBefore(101, 0, 200), false); // right half → insert after
+  assert.equal(homeDropBefore(0, 0, 200), true);
 });
 
 test('home: homeCalendarDates keeps a payday that holiday-adjusts into the month', () => {

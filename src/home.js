@@ -613,13 +613,19 @@ export function rentalMonthOccurrence(rental, ym) {
 // month end: a payday nominally dated just after the month can
 // holiday-adjust back into it (e.g. a Jan 1 payday lands Dec 31),
 // and the adjusted date belongs to the month it lands in.
-// Returns { 'YYYY-MM-DD': [{kind, sourceId, label}] } — dates with
-// payments only, keys sorted.
-export function homeCalendarDates({ jobs, rentals, mortgageOccurrences, month }) {
+// Returns { 'YYYY-MM-DD': [{kind, sourceId, label, received?}] } —
+// dates with payments only, keys sorted. `marks` is the optional
+// income_marks map (key `${kind}:${sourceId}:${date}` → received,
+// the same state the highlight shows): an entry with a mark row
+// carries its received value (1 marked, 0 explicitly not); an entry
+// with no row is unmarked and carries no key.
+export function homeCalendarDates({ jobs, rentals, mortgageOccurrences, month, marks }) {
   const days = {};
   const add = (date, kind, sourceId, label) => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '') || String(date).slice(0, 7) !== month) return;
-    (days[date] = days[date] || []).push({ kind, sourceId, label });
+    const entry = { kind, sourceId, label };
+    if (marks && marks.has(`${kind}:${sourceId}:${date}`)) entry.received = marks.get(`${kind}:${sourceId}:${date}`);
+    (days[date] = days[date] || []).push(entry);
   };
   const monthStart = `${month}-01`;
   const monthEnd = `${month}-${String(daysInMonth(month)).padStart(2, '0')}`;
@@ -661,6 +667,27 @@ export function homeCalendarFocusTarget(date, entries, highlights) {
   const keys = new Set((entries || []).map((e) => `${e.kind}:${e.sourceId}:${date}`));
   if (!keys.size) return null;
   return (highlights || []).find((h) => keys.has(`${h.kind}:${h.sourceId}:${h.date}`)) || null;
+}
+
+// A calendar day is actionable (clickable) only when clicking it
+// does something: a highlight card matches one of its entries by
+// date + kind + sourceId. No payments, or payments with no row
+// (marked-and-rolled-off, or outside the current + previous month
+// window), is not actionable — the day renders dimmed instead.
+export function homeCalDayIsActionable(date, entries, highlights) {
+  return homeCalendarFocusTarget(date, entries, highlights) != null;
+}
+
+// Long-press / drag rules, kept pure for the unit tests (the client
+// mirrors them in public/app.js): a press cancels when the pointer
+// drifts more than 10px before the timer fires; a drop inserts
+// before the card under the pointer when the pointer is at or left
+// of its horizontal midpoint, after it otherwise.
+export function homeLongPressMoved(startX, startY, x, y) {
+  return Math.hypot(x - startX, y - startY) > 10;
+}
+export function homeDropBefore(pointerX, rectLeft, rectWidth) {
+  return pointerX <= rectLeft + rectWidth / 2;
 }
 
 // ------------------------------------------------------------ AI metric library --

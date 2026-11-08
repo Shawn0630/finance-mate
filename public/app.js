@@ -17884,11 +17884,30 @@ const HOME_CAL_KINDS = [
   { kind: 'mortgage', label: 'Mortgage' },
 ];
 
+// Calendar → highlight match, the client mirror of
+// homeCalendarFocusTarget in src/home.js: the first highlight row
+// (display order) matching any of a day's entries, by date + kind +
+// sourceId — or null when no row matches (no payments, marked and
+// rolled off, or outside the current + previous month window). A day
+// is actionable only when a row matches: clicking it focuses that
+// card. Every other day renders dimmed (is-dim), with default cursor
+// and no hover; today keeps its background/ring at full strength and
+// only its number and dots dim.
+function homeCalDayTarget(date, entries, highlights) {
+  const keys = new Set((entries || []).map((x) => `${x.kind}:${x.sourceId}:${date}`));
+  if (!keys.size) return null;
+  return (highlights || []).find((h) => keys.has(`${h.kind}:${h.sourceId}:${h.date}`)) || null;
+}
+function homeCalDayActionable(date, entries, highlights) {
+  return homeCalDayTarget(date, entries, highlights) != null;
+}
+
 // The calendar grid for one month: weekday header (Sunday first),
-// leading blanks, one cell per day. A cell carries one dot per kind
-// present that day (a kind shows once even with several payments).
-// Today gets .is-today. Days are plain numbers + dots — no prose.
-function homeCalendarHtml(data) {
+// leading blanks, one cell per day. One dot per payment occurrence;
+// a marked occurrence (received === 1, the same mark state the
+// highlight shows) renders its dot done. Today gets .is-today.
+// Days are plain numbers + dots — no prose.
+function homeCalendarHtml(data, highlights) {
   const [y, m] = data.month.split('-').map(Number);
   const dim = new Date(y, m, 0).getDate();
   const firstDow = new Date(y, m - 1, 1).getDay();
@@ -17898,17 +17917,16 @@ function homeCalendarHtml(data) {
   for (let d = 1; d <= dim; d++) {
     const date = `${data.month}-${String(d).padStart(2, '0')}`;
     const marks = days[date] || [];
-    const kinds = [...new Set(marks.map((x) => x.kind))];
-    const dots = kinds.map((k) => {
-      const label = HOME_CAL_KINDS.find((x) => x.kind === k);
-      const title = marks.filter((x) => x.kind === k).map((x) => `${label ? label.label : k} · ${x.label}`).join(', ');
-      return `<span class="home-cal-dot kind-${k}" title="${esc(title)}"></span>`;
+    const dots = marks.map((x) => {
+      const label = HOME_CAL_KINDS.find((k) => k.kind === x.kind);
+      const title = `${label ? label.label : x.kind} · ${x.label}${x.received === 1 ? ' · Done' : ''}`;
+      return `<span class="home-cal-dot kind-${x.kind}${x.received === 1 ? ' is-done' : ''}" title="${esc(title)}"></span>`;
     }).join('');
-    // Days with payments are clickable: they focus the matching
-    // highlight card (see homeCalendarFocusDay). Days without
-    // payments are plain and do nothing.
-    const hasPay = marks.length > 0;
-    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}${hasPay ? ' has-pay' : ''}" data-cal-date="${date}"${hasPay ? ' tabindex="0" role="button"' : ''}><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
+    // Actionable days are clickable: they focus the matching
+    // highlight card (see homeCalendarFocusDay). Every other day is
+    // dimmed and does nothing.
+    const actionable = homeCalDayActionable(date, marks, highlights);
+    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}${actionable ? ' has-pay' : ' is-dim'}" data-cal-date="${date}"${actionable ? ' tabindex="0" role="button"' : ''}><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
   }
   const legend = HOME_CAL_KINDS.map((k) => `<span class="home-cal-legend-item"><span class="home-cal-dot kind-${k.kind}"></span>${k.label}</span>`).join('');
   return `<div class="home-cal-head">
@@ -17924,7 +17942,7 @@ function homeCalendarHtml(data) {
 function renderHomeCalendar() {
   const el = $('#homeCalendar');
   if (!el || !homeCalData) return;
-  el.innerHTML = homeCalendarHtml(homeCalData);
+  el.innerHTML = homeCalendarHtml(homeCalData, homeData && homeData.highlights);
 }
 
 async function loadHomeCalendar(month) {
@@ -18014,13 +18032,9 @@ function homeInsightCardHtml(c) {
   const aiTag = c.kind === 'ai' ? ' <span class="home-ai-tag">AI</span>' : '';
   const link = homeCardLink(c);
   const linkAttrs = ` data-home-link="${link.href}"${link.category ? ` data-home-category="${esc(link.category)}"` : ''} role="link" tabindex="0"`;
-  // Drag handle: reordering starts ONLY here (see the pointer
-  // handlers below) — the card body keeps click-to-navigate and the
-  // carousel keeps its horizontal scroll/swipe.
-  const dragHandle = `<span class="home-drag-handle" data-drag-handle title="Drag to reorder" aria-label="Drag to reorder">⋮⋮</span>`;
   const keyAttr = ` data-home-key="${esc(homeCardKey(c))}"`;
   if (!c.hasData) {
-    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${dragHandle}
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
       <div class="insight-text">
         <div class="insight-label">${esc(c.title)}${aiTag}</div>
         <div class="insight-empty">No data yet</div>
@@ -18032,7 +18046,7 @@ function homeInsightCardHtml(c) {
       <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}'></canvas>
       <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
     </div>` : '';
-  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${dragHandle}
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
     <div class="insight-text">
       <div class="insight-label">${esc(c.title)}${aiTag}</div>
       <div class="insight-value">${homeFormatValue(c)}</div>
@@ -18169,6 +18183,7 @@ function renderHome() {
   }).join('');
   homeDrawSparklines($('#view-home'));
   homeMarkActiveCarousels($('#view-home'));
+  if (homeEditSection) homeEnterEditMode(homeEditSection); // a re-render keeps the section in edit mode
   renderHomeAiThread();
 }
 
@@ -18207,9 +18222,7 @@ function homeClearCalFocus() {
 function homeCalendarFocusDay(date) {
   if (!homeCalData || !homeData) return;
   const entries = (homeCalData.days || {})[date] || [];
-  if (!entries.length) return;
-  const keys = new Set(entries.map((x) => `${x.kind}:${x.sourceId}:${date}`));
-  const row = (homeData.highlights || []).find((h) => keys.has(`${h.kind}:${h.sourceId}:${h.date}`));
+  const row = homeCalDayTarget(date, entries, homeData.highlights);
   if (!row) return;
   const car = $('#homeHighlightCarousel');
   const card = car && car.querySelector(`.home-pay-card[data-pay-kind="${row.kind}"][data-pay-source="${row.sourceId}"][data-pay-date="${row.date}"]`);
@@ -18301,6 +18314,10 @@ $('#homeAiSend').addEventListener('click', sendHomeAi);
 $('#homeAiClear').addEventListener('click', clearHomeAiSession);
 $('#homeAiText').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendHomeAi(); });
 $('#view-home').addEventListener('click', async (e) => {
+  // Edit mode exits on a tap outside any card (blank space, section
+  // gaps/headers); the click then proceeds normally (a heading link
+  // still navigates). Taps on a card stay in edit mode.
+  if (homeEditSection && !(e.target.closest && e.target.closest('.insight-card'))) homeExitEditMode();
   const t = e.target.closest('[data-mark-kind]');
   if (t) {
     const next = t.dataset.markReceived === '1' ? 0 : 1;
@@ -18308,6 +18325,9 @@ $('#view-home').addEventListener('click', async (e) => {
     try {
       await api('/api/home/marks', { method: 'POST', body: { kind: t.dataset.markKind, source_id: Number(t.dataset.markSource), date: t.dataset.markDate, received: next } });
       await loadHome();
+      // The calendar only fetches once per page session: refresh it
+      // for the displayed month so the day's dot checks at once.
+      if (homeCalData) await loadHomeCalendar(homeCalMonth);
     } catch (err) { showMsg($('#globalError'), 'err', err.message); }
     return;
   }
@@ -18322,44 +18342,109 @@ $('#view-home').addEventListener('click', async (e) => {
   }
   // Card links (the toggle + delete above return first, so they
   // never navigate): the whole insight card goes to its entity's
-  // detail page, or the section summary for standard cards.
+  // detail page, or the section summary for standard cards. In edit
+  // mode a tap never navigates.
   const card = e.target.closest('.insight-card[data-home-link]');
-  if (card) homeNavigateCard(card);
+  if (card) {
+    if (homeEditSection) return;
+    homeNavigateCard(card);
+  }
 });
 $('#view-home').addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' && e.key !== ' ') return;
   const card = e.target.closest && e.target.closest('.insight-card[data-home-link]');
   if (!card) return;
+  if (homeEditSection) return;
   e.preventDefault();
   homeNavigateCard(card);
 });
 
-// Drag-and-drop reorder of insight cards within a section. The drag
-// starts ONLY from a card's handle (⋮⋮) — the card body keeps
-// click-to-navigate and the carousel keeps its horizontal
-// scroll/swipe. While dragging, the card under the pointer becomes
-// the drop target and the DOM reorders live; on release the
-// section's order persists via the reorder endpoint. A drag past the
-// threshold suppresses the click that follows pointerup, so a drag
-// never navigates. The highlight carousel has no handles and never
-// drags.
+// Long-press-to-edit reorder of insight cards within a section.
+// Long-press (~500ms, pointer held still) on any insight card enters
+// edit mode for that section: the cards jiggle and the folded
+// overlap is removed, so every card is fully visible and grabbable.
+// In edit mode a drag starts from ANYWHERE on the card, the card
+// follows the pointer, and the card under the pointer becomes the
+// drop target; on release the order persists via the reorder
+// endpoint. While any section is in edit mode, tapping a card never
+// navigates; tapping blank space (page background, section
+// gaps/headers — anything not on a card) exits edit mode. A short
+// tap never enters edit mode and navigates as before. A drag past
+// the threshold suppresses the click that follows pointerup, so a
+// drag never navigates. The highlight carousel has no edit mode and
+// never drags.
+let homeEditSection = null; // section name in edit mode, else null
+let homeLongPress = null; // {timer, card, carousel, section, startX, startY, pointerId}
 let homeDrag = null; // {section, card, carousel, moved, startX, startY}
 let homeSuppressClick = false;
+const HOME_LONG_PRESS_MS = 500;
+const HOME_LONG_PRESS_MOVE = 10; // px of drift that cancels a pending long-press
+const HOME_DRAG_MOVE = 6; // px of drift before a drag counts as moved
+function homeEnterEditMode(section) {
+  const cars = [...document.querySelectorAll('#homeSections .home-carousel')];
+  homeEditSection = cars.some((car) => car.dataset.homeSection === section) ? section : null;
+  cars.forEach((car) => car.classList.toggle('is-editing', car.dataset.homeSection === homeEditSection));
+}
+function homeExitEditMode() {
+  homeEditSection = null;
+  document.querySelectorAll('#homeSections .home-carousel.is-editing').forEach((car) => car.classList.remove('is-editing'));
+}
+function homeClearLongPress() {
+  if (!homeLongPress) return;
+  clearTimeout(homeLongPress.timer);
+  homeLongPress = null;
+}
+function homeStartDrag(card, carousel, startX, startY, pointerId, suppressClick) {
+  try { card.setPointerCapture(pointerId); } catch { /* no capture on this input */ }
+  const r = card.getBoundingClientRect();
+  homeDrag = { section: carousel.dataset.homeSection, card, carousel, moved: false, startX, startY, grabDX: startX - r.left, grabDY: startY - r.top, suppressClick: !!suppressClick };
+}
 $('#view-home').addEventListener('pointerdown', (e) => {
   homeSuppressClick = false; // a fresh gesture is never the last drag's trailing click
-  const handle = e.target.closest && e.target.closest('[data-drag-handle]');
-  if (!handle) return;
-  const card = handle.closest('.insight-card');
-  const carousel = card && card.closest('.home-carousel[data-home-section]');
-  if (!card || !carousel) return;
-  e.preventDefault();
-  try { handle.setPointerCapture(e.pointerId); } catch { /* no capture on this input */ }
-  homeDrag = { section: carousel.dataset.homeSection, card, carousel, moved: false, startX: e.clientX, startY: e.clientY };
+  const card = e.target.closest && e.target.closest('.home-carousel[data-home-section] .insight-card');
+  if (!card) return;
+  if (e.target.closest && e.target.closest('[data-home-del]')) return; // the delete button keeps its click
+  const carousel = card.closest('.home-carousel[data-home-section]');
+  if (!carousel) return;
+  if (homeEditSection) {
+    // In edit mode the whole card is the grab area: drag starts at once.
+    homeEnterEditMode(carousel.dataset.homeSection);
+    e.preventDefault();
+    // The prevented pointerdown fires no compatibility mouse events,
+    // so no trailing click arrives: nothing to suppress.
+    homeStartDrag(card, carousel, e.clientX, e.clientY, e.pointerId, false);
+    return;
+  }
+  // Not in edit mode: arm the long-press. It fires only if the
+  // pointer stays within 10px for ~500ms; moving or lifting first
+  // cancels it and the gesture stays an ordinary tap/scroll.
+  homeLongPress = { card, carousel, section: carousel.dataset.homeSection, startX: e.clientX, startY: e.clientY, pointerId: e.pointerId, timer: 0 };
+  homeLongPress.timer = setTimeout(() => {
+    const pending = homeLongPress; homeLongPress = null;
+    homeEnterEditMode(pending.section);
+    // The pointer is still down on the card: the drag starts at once
+    // so the card can be dragged without lifting first. This
+    // pointerdown was never prevented, so a trailing click will fire
+    // on release and must be suppressed.
+    homeStartDrag(pending.card, pending.carousel, pending.startX, pending.startY, pending.pointerId, true);
+  }, HOME_LONG_PRESS_MS);
 });
 $('#view-home').addEventListener('pointermove', (e) => {
+  if (homeLongPress) {
+    if (Math.hypot(e.clientX - homeLongPress.startX, e.clientY - homeLongPress.startY) > HOME_LONG_PRESS_MOVE) homeClearLongPress();
+    return;
+  }
   if (!homeDrag) return;
-  if (!homeDrag.moved && Math.hypot(e.clientX - homeDrag.startX, e.clientY - homeDrag.startY) < 6) return;
+  if (!homeDrag.moved && Math.hypot(e.clientX - homeDrag.startX, e.clientY - homeDrag.startY) < HOME_DRAG_MOVE) return;
   if (!homeDrag.moved) { homeDrag.moved = true; homeDrag.card.classList.add('dragging'); }
+  // The dragged card follows the pointer, keeping the grab point
+  // under it. The transform is recomputed from the card's layout
+  // rect each move, so a live reorder (which moves the card's
+  // layout position) never makes the card jump away from the pointer.
+  const follow = homeDrag.card;
+  follow.style.transform = '';
+  const fr = follow.getBoundingClientRect();
+  follow.style.transform = `translate(${e.clientX - fr.left - homeDrag.grabDX}px, ${e.clientY - fr.top - homeDrag.grabDY}px)`;
   const el = document.elementFromPoint(e.clientX, e.clientY);
   const over = el && el.closest ? el.closest('.insight-card') : null;
   if (!over || over === homeDrag.card || !homeDrag.carousel.contains(over)) return;
@@ -18371,8 +18456,13 @@ const homeEndDrag = async () => {
   if (!homeDrag) return;
   const drag = homeDrag; homeDrag = null;
   drag.card.classList.remove('dragging');
+  drag.card.style.transform = '';
   if (!drag.moved) return;
-  homeSuppressClick = true;
+  // Only a long-press-started drag leaves a trailing click to
+  // suppress (its pointerdown was never prevented); an edit-mode
+  // drag's prevented pointerdown fires no click, so arming the flag
+  // here would swallow the user's next legitimate tap instead.
+  if (drag.suppressClick) homeSuppressClick = true;
   const keys = [...drag.carousel.querySelectorAll('.insight-card')].map((el) => el.dataset.homeKey).filter(Boolean);
   try {
     await api('/api/home/insights/reorder', { method: 'POST', body: { section: drag.section, order: keys } });
@@ -18389,8 +18479,8 @@ const homeEndDrag = async () => {
     await loadHome(); // revert the visible order to the stored one
   }
 };
-$('#view-home').addEventListener('pointerup', homeEndDrag);
-$('#view-home').addEventListener('pointercancel', homeEndDrag);
+$('#view-home').addEventListener('pointerup', () => { homeClearLongPress(); homeEndDrag(); });
+$('#view-home').addEventListener('pointercancel', () => { homeClearLongPress(); homeEndDrag(); });
 // Capture-phase: a drag's trailing click never reaches the
 // card-navigation handler above.
 $('#view-home').addEventListener('click', (e) => {

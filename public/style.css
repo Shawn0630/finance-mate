@@ -780,7 +780,7 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
    content width, so roughly two show at once in the carousel with
    a peek on each side — taller, roomier padding, a clearly bigger
    headline number, and a larger sparkline. */
-.insight-card { position: relative; flex: 0 0 clamp(340px, 46%, 540px); min-height: 168px; scroll-snap-align: start; display: flex; gap: 16px; align-items: center; background: #fff; border: 1px solid #e6ebf0; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); padding: 22px 24px; z-index: 1; transform: scale(.97); transition: transform .18s ease, box-shadow .18s ease; }
+.insight-card { position: relative; flex: 0 0 clamp(340px, 46%, 540px); min-height: 168px; scroll-snap-align: start; display: flex; gap: 16px; align-items: center; background: #fff; border: 1px solid #e6ebf0; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); padding: 22px 24px; z-index: 1; transform: scale(.97); transition: transform .18s ease, box-shadow .18s ease; -webkit-touch-callout: none; }
 .insight-card + .insight-card { margin-left: -20px; }
 .insight-card.is-active { z-index: 3; transform: scale(1); box-shadow: 0 8px 22px rgba(16, 24, 40, .14); }
 .insight-card[data-home-link] { cursor: pointer; }
@@ -803,14 +803,23 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .spark-ends { display: flex; justify-content: space-between; font-size: 10px; color: #98a4b0; margin-top: 2px; }
 .home-card-del { position: absolute; top: 8px; right: 10px; border: none; background: none; color: #98a4b0; font-size: 18px; line-height: 1; padding: 2px 6px; }
 .home-card-del:hover { color: #b3261e; background: none; }
-/* Drag handle: a small grip rail on the card's left edge. Dragging
-   starts ONLY here — the card body keeps click-to-navigate and the
-   carousel keeps its horizontal scroll/swipe. touch-action: none so
-   a touch drag never becomes a scroll. */
-.home-drag-handle { flex: 0 0 auto; align-self: stretch; display: flex; align-items: center; cursor: grab; color: #c3ccd6; font-size: 14px; letter-spacing: 1px; padding: 0 2px; margin-left: -8px; touch-action: none; user-select: none; -webkit-user-select: none; }
-.home-drag-handle:hover { color: #5a6a7a; }
-.home-drag-handle:active { cursor: grabbing; }
-.insight-card.dragging { opacity: 0.75; box-shadow: 0 12px 28px rgba(16, 24, 40, .2); z-index: 5; }
+/* Edit mode (long-press to enter): the section's cards jiggle and the
+   folded overlap is removed, so every card is fully visible and
+   grabbable; the whole card drags (touch-action: none so a touch
+   drag never becomes a scroll). The dragged card has
+   pointer-events: none so elementFromPoint sees the card underneath,
+   and no jiggle while it follows the pointer. */
+@keyframes homeJiggle { 0%, 100% { transform: rotate(-.5deg); } 50% { transform: rotate(.5deg); } }
+.home-carousel.is-editing { scroll-snap-type: none; gap: 16px; }
+.home-carousel.is-editing .insight-card { transform: scale(1); cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; animation: homeJiggle .32s ease-in-out infinite; }
+.home-carousel.is-editing .insight-card + .insight-card { margin-left: 0; }
+.home-carousel.is-editing .insight-card.dragging { animation: none; cursor: grabbing; }
+.insight-card.dragging { opacity: 0.75; box-shadow: 0 12px 28px rgba(16, 24, 40, .2); z-index: 5; pointer-events: none; }
+/* Highlight (Upcoming payments): payment cards sit side by side with
+   a real gap — no folded overlap, neighbours at full scale. */
+#homeHighlightCarousel { gap: 16px; }
+#homeHighlightCarousel .insight-card { transform: scale(1); }
+#homeHighlightCarousel .insight-card + .insight-card { margin-left: 0; }
 /* AI-appended cards carry a small AI tag by the title so they read
    as AI-made at a glance; system cards have none. */
 .home-ai-tag { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .05em; color: #1668c4; background: #eef4fb; border: 1px solid #cfe0f2; border-radius: 999px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px; }
@@ -854,14 +863,21 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
 .home-cal-day { min-height: 34px; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px; color: #3c4a59; }
 .home-cal-day.is-blank { visibility: hidden; }
 .home-cal-day.is-today { background: #eef4fb; font-weight: 700; color: #111; box-shadow: inset 0 0 0 1px #1668c4; }
-/* Days with payments are clickable (they focus the matching
-   highlight card); days without payments are plain. */
+/* Days that do nothing when clicked (no payments, or payments with
+   no highlight card) are dimmed: only the number and dots lose
+   contrast, so today keeps its background and ring at full
+   strength. Actionable days (has-pay) focus the matching highlight
+   card and keep full contrast + pointer + hover. */
+.home-cal-day.is-dim .home-cal-num, .home-cal-day.is-dim .home-cal-dots { opacity: .45; }
 .home-cal-day.has-pay { cursor: pointer; }
 .home-cal-day.has-pay:hover { background: #f2f6fa; }
 .home-cal-day.has-pay:focus-visible { outline: 2px solid #1668c4; outline-offset: 1px; }
 .home-cal-num { line-height: 1; }
 .home-cal-dots { display: flex; gap: 3px; min-height: 8px; }
-.home-cal-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.home-cal-dot { position: relative; width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+/* A marked (received/paid) occurrence renders its dot done: a small
+   white check over the kind colour. */
+.home-cal-dot.is-done::after { content: '✓'; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 7px; font-weight: 700; line-height: 1; }
 .home-cal-dot.kind-salary { background: #14632f; }
 .home-cal-dot.kind-rental { background: #1668c4; }
 .home-cal-dot.kind-mortgage { background: #b7791f; }

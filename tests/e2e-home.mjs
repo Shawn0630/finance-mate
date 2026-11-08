@@ -523,6 +523,20 @@ export async function run(H, S) {
       && calDots.nov15.some((c) => c.includes('kind-mortgage'))
       && calDots.nov10 && calDots.nov10.length === 0,
       JSON.stringify(calDots));
+    // Non-actionable days are dimmed; actionable days keep the
+    // interactive style. Nov 10 has no payments (dimmed); Nov 6
+    // focuses the Nov 6 salary card (actionable).
+    const calDim = await page.evaluate(() => {
+      const cls = (date) => {
+        const c = document.querySelector(`[data-cal-date="${date}"]`);
+        return c ? { className: c.className, tab: c.getAttribute('tabindex') } : null;
+      };
+      return { nov10: cls('2026-11-10'), nov6: cls('2026-11-06') };
+    });
+    H.check('home UI: a day with no payments is dimmed and not focusable; an actionable day keeps the interactive style',
+      calDim.nov10 && calDim.nov10.className.includes('is-dim') && !calDim.nov10.className.includes('has-pay') && calDim.nov10.tab == null
+      && calDim.nov6 && calDim.nov6.className.includes('has-pay') && !calDim.nov6.className.includes('is-dim') && calDim.nov6.tab === '0',
+      JSON.stringify(calDim));
     // Today is the real run date (runner TZ is America/Vancouver,
     // same as the server's Vancouver day).
     const nowD = new Date();
@@ -568,6 +582,14 @@ export async function run(H, S) {
     H.check('home UI: calendar next shows Dec 2026 with the Dec 4 salary payday',
       decTitle === 'Dec 2026' && decDots && decDots.some((c) => c.includes('kind-salary')),
       JSON.stringify({ decTitle, decDots }));
+    // Dec 4 has a payday but no highlight card (outside the window):
+    // dimmed, not clickable.
+    const dec4Dim = await page.evaluate(() => {
+      const c = document.querySelector('[data-cal-date="2026-12-04"]');
+      return c ? c.className : null;
+    });
+    H.check('home UI: Dec 4 (payments, no highlight card) is dimmed, not clickable',
+      dec4Dim && dec4Dim.includes('is-dim') && !dec4Dim.includes('has-pay'), JSON.stringify(dec4Dim));
     await page.evaluate(() => document.querySelector('[data-cal-nav="-1"]').click());
     const backTitle = await until(() => {
       const t = document.querySelector('.home-cal-title');
@@ -626,6 +648,14 @@ export async function run(H, S) {
     H.check('home UI: clicking Oct 15 focuses the first of its two payments (rent) and scrolls the carousel',
       focusOct15 && focusOct15.kind === 'rental' && focusOct15.date === '2026-10-15',
       JSON.stringify(focusOct15));
+    // Oct 15: both payments were marked in the API phase (rent +
+    // mortgage), so both dots render done.
+    const oct15Dots = await page.evaluate(() => {
+      const c = document.querySelector('[data-cal-date="2026-10-15"]');
+      return c ? [...c.querySelectorAll('.home-cal-dot')].map((d) => d.className) : null;
+    });
+    H.check('home UI: a marked payment renders its calendar dot done (Oct 15 rent + mortgage both done)',
+      oct15Dots && oct15Dots.length === 2 && oct15Dots.every((c) => c.includes('is-done')), JSON.stringify(oct15Dots));
     // Dec 4 has a salary payday on the calendar but no highlight
     // card (outside the current + previous month window): nothing focuses.
     // Wait for each month to land before the next click: homeCalShift
@@ -751,9 +781,28 @@ export async function run(H, S) {
     H.check('home UI: scrolled carousel peeks the previous card on the left and the next on the right',
       folded.firstRight > folded.carLeft + 5 && folded.thirdLeft != null && folded.thirdLeft < folded.carRight,
       JSON.stringify(folded));
+    // The folded deck lives on the insight sections now (the
+    // highlight sits flat with a gap): scroll the Property carousel
+    // to its second card and check the fold there.
+    await page.evaluate(() => {
+      const sec = document.querySelector('[data-home-section="property"]');
+      window.scrollTo({ top: sec.getBoundingClientRect().top + window.scrollY - 80, behavior: 'instant' });
+      sec.scrollTo({ left: sec.querySelectorAll('.insight-card')[1].offsetLeft, behavior: 'instant' });
+    });
+    await wait(700);
+    const foldedSec = await page.evaluate(() => {
+      const c = document.querySelector('[data-home-section="property"]');
+      const cards = [...c.querySelectorAll('.insight-card')];
+      const cs = cards.map((el) => getComputedStyle(el));
+      return {
+        active: cards[1].classList.contains('is-active'),
+        z1: cs[1].zIndex, z0: cs[0].zIndex,
+        t1: cs[1].transform, t0: cs[0].transform,
+      };
+    });
     H.check('home UI: folded deck — the snapped card is active, on top, full size; the neighbour tucks under',
-      folded.active && Number(folded.z1) > Number(folded.z0) && !folded.t1.includes('0.97') && folded.t0.includes('0.97'),
-      JSON.stringify(folded));
+      foldedSec.active && Number(foldedSec.z1) > Number(foldedSec.z0) && !foldedSec.t1.includes('0.97') && foldedSec.t0.includes('0.97'),
+      JSON.stringify(foldedSec));
 
     // Sections: 4 carousels, strip cards with big number + delta + sparkline.
     const sections = await page.evaluate(() => [...document.querySelectorAll('#homeSections [data-home-section]')].map((el) => ({
@@ -817,6 +866,20 @@ export async function run(H, S) {
       return b && b.textContent.includes('Received') ? b.textContent : null;
     });
     H.check('home UI: Received toggle persists across reload', !!persisted, String(persisted));
+    // The marked Nov 6 payday renders its calendar dot done; the
+    // unmarked Nov 20 payday does not.
+    await until(() => document.querySelectorAll('#homeCalendar .home-cal-day:not(.is-blank)').length > 0);
+    const nov6Done = await page.evaluate(() => {
+      const dots = (date) => {
+        const c = document.querySelector(`[data-cal-date="${date}"]`);
+        return c ? [...c.querySelectorAll('.home-cal-dot')].map((d) => d.className) : null;
+      };
+      return { nov6: dots('2026-11-06'), nov20: dots('2026-11-20') };
+    });
+    H.check('home UI: a marked payment renders its calendar dot done; an unmarked one does not',
+      nov6Done.nov6 && nov6Done.nov6.some((c) => c.includes('is-done'))
+      && nov6Done.nov20 && nov6Done.nov20.every((c) => !c.includes('is-done')),
+      JSON.stringify(nov6Done));
 
     // Mortgage highlight card: "Mark paid" / "Paid", and a link to the property.
     const mortCard = await page.evaluate(() => {
@@ -842,21 +905,27 @@ export async function run(H, S) {
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
 
-    // Drag-and-drop: every insight card has a handle; the highlight carousel has none.
-    const handles = await page.evaluate(() => ({
-      insight: document.querySelectorAll('#homeSections [data-drag-handle]').length,
-      highlight: document.querySelectorAll('#homeHighlightCarousel [data-drag-handle]').length,
-      cards: document.querySelectorAll('#homeSections .insight-card').length,
-    }));
-    H.check('home UI: every insight card has a drag handle; the highlight carousel has none',
-      handles.insight === handles.cards && handles.cards === 12 && handles.highlight === 0, JSON.stringify(handles));
-    // Drag the property section's third card (Outstanding principal)
-    // onto the second (Assessed total): the order becomes Total
-    // equity, Outstanding principal, Assessed total — and the drag
-    // does not navigate. The viewport is only 800px wide, so the
-    // third card starts off-screen: scroll the carousel to the second
-    // card's start (a snap point) so the third card's handle sits in
-    // view and the second card is droppable.
+    // Highlight gap: payment cards sit side by side — adjacent rects
+    // never intersect (no folded overlap in the highlight carousel).
+    const hlGap = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('#homeHighlightCarousel .insight-card')];
+      const rects = cards.map((c) => { const r = c.getBoundingClientRect(); return { left: r.left, right: r.right }; });
+      return { n: cards.length, ok: rects.every((r, i) => i === 0 || r.left >= rects[i - 1].right), rects };
+    });
+    H.check('home UI: highlight cards have a gap — adjacent rects do not intersect',
+      hlGap.n >= 2 && hlGap.ok, JSON.stringify(hlGap));
+
+    // No drag handles anywhere: reorder is long-press to edit mode.
+    H.check('home UI: no drag handles remain on any card',
+      await page.evaluate(() => document.querySelectorAll('[data-drag-handle]').length) === 0, '');
+
+    // Short tap still navigates: clicking the first property card
+    // goes to the Properties list.
+    await page.evaluate(() => { document.querySelector('[data-home-section="property"] .insight-card').click(); });
+    const shortTapNav = await until(() => (location.hash === '#assets/properties' ? location.hash : null));
+    H.check('home UI: a short tap on a card still navigates (no long-press)', !!shortTapNav, await page.evaluate(() => location.hash));
+    await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
     // Wait for the home DOM to settle before touching the
     // carousel: goto(#home) re-fetches /api/home and renderHome
     // replaces the section nodes, but the until() above can pass on
@@ -880,33 +949,94 @@ export async function run(H, S) {
     // viewport, so scroll the PAGE down first (the carousel's own
     // horizontal scroll does not move it vertically), then scroll
     // the carousel to the second card's start (a snap point) so the
-    // third card's handle sits in view and the second card is
-    // droppable.
+    // third card sits in view and the second card is droppable.
     await page.evaluate(() => {
       const sec = document.querySelector('[data-home-section="property"]');
       window.scrollTo({ top: sec.getBoundingClientRect().top + window.scrollY - 80, behavior: 'instant' });
       const car = sec;
       car.scrollTo({ left: car.querySelectorAll('.insight-card')[1].offsetLeft, behavior: 'instant' });
     });
-    // Wait for the third card's handle to be hittable inside the
-    // viewport before starting the drag.
-    const handleReady = await until(() => {
+    // Wait for the third card's centre to be hittable inside the
+    // viewport before starting the long-press.
+    const lpReady = await until(() => {
       const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
       if (cards.length !== 3) return null;
-      const h = cards[2].querySelector('[data-drag-handle]').getBoundingClientRect();
-      const cx = h.left + h.width / 2, cy = h.top + h.height / 2;
+      const r = cards[2].getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
       if (cx <= 0 || cx >= innerWidth || cy <= 0 || cy >= innerHeight) return null;
       const at = document.elementFromPoint(cx, cy);
-      return at === cards[2].querySelector('[data-drag-handle]') ? 'ready' : null;
+      return at && cards[2].contains(at) ? 'ready' : null;
     });
-    H.check('home UI: drag precondition — third card handle is hittable after scrolling',
-      !!handleReady, String(handleReady));
+    H.check('home UI: long-press precondition — third card centre is hittable after scrolling',
+      !!lpReady, String(lpReady));
+    // Long-press the property section's third card (Outstanding
+    // principal) for ~650ms: edit mode starts, the section jiggles,
+    // the overlap is removed, and the trailing click does not navigate.
+    const lpPts = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
+      const r = cards[2].getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    });
+    await page.mouse.move(lpPts.x, lpPts.y);
+    await page.mouse.down();
+    await wait(650);
+    await page.mouse.up();
+    const editState = await page.evaluate(() => {
+      const car = document.querySelector('[data-home-section="property"]');
+      const cards = [...car.querySelectorAll('.insight-card')];
+      return {
+        editing: car.classList.contains('is-editing'),
+        jiggle: cards.every((c) => getComputedStyle(c).animationName.includes('homeJiggle')),
+        gap: getComputedStyle(car).gap,
+        noOverlap: cards[1].getBoundingClientRect().left >= cards[0].getBoundingClientRect().right,
+        hash: location.hash,
+      };
+    });
+    H.check('home UI: long-press enters edit mode — jiggle on, overlap off, no navigation',
+      editState.editing && editState.jiggle && editState.noOverlap && ['', '#home'].includes(editState.hash),
+      JSON.stringify(editState));
+    // Clicking a card in edit mode does not navigate and stays in edit mode.
+    await page.evaluate(() => { document.querySelector('[data-home-section="property"] .insight-card').click(); });
+    await wait(200);
+    const stillEditing = await page.evaluate(() => ({
+      editing: document.querySelector('[data-home-section="property"]').classList.contains('is-editing'),
+      hash: location.hash,
+    }));
+    H.check('home UI: tapping a card in edit mode does not navigate and stays in edit mode',
+      stillEditing.editing && ['', '#home'].includes(stillEditing.hash), JSON.stringify(stillEditing));
+    // Edit mode removes the -20px overlap, which pushes the third
+    // card's centre right — at this 800px viewport it can slide just
+    // past the viewport edge, where a pointerdown hits nothing. Nudge
+    // the carousel left until the centre is hittable again, then drag.
+    await page.evaluate(() => {
+      const sec = document.querySelector('[data-home-section="property"]');
+      const cards = [...sec.querySelectorAll('.insight-card')];
+      const r = cards[2].getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      if (cx >= innerWidth - 20) sec.scrollLeft += cx - (innerWidth - 60);
+    });
+    await wait(300);
+    const dragReady = await until(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
+      if (cards.length !== 3) return null;
+      const r = cards[2].getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      if (cx <= 0 || cx >= innerWidth || cy <= 0 || cy >= innerHeight) return null;
+      const at = document.elementFromPoint(cx, cy);
+      return at && cards[2].contains(at) ? 'ready' : null;
+    });
+    H.check('home UI: drag precondition — third card centre is hittable in edit mode',
+      !!dragReady, String(dragReady));
+    // Drag the third card onto the second: the order becomes Total
+    // equity, Outstanding principal, Assessed total. The drag starts
+    // from anywhere on the card (no handle) and the card follows the
+    // pointer.
     const dragPts = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
-      const h = cards[2].querySelector('[data-drag-handle]').getBoundingClientRect();
+      const from = cards[2].getBoundingClientRect();
       const second = cards[1].getBoundingClientRect();
       return {
-        from: { x: h.left + h.width / 2, y: h.top + h.height / 2 },
+        from: { x: from.left + from.width / 2, y: from.top + from.height / 2 },
         to: { x: second.left + 30, y: second.top + second.height / 2 },
       };
     });
@@ -915,7 +1045,7 @@ export async function run(H, S) {
     await page.mouse.move(dragPts.to.x, dragPts.to.y, { steps: 12 });
     await page.mouse.up();
     const propOrderAfterDrag = await page.evaluate(() => [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent));
-    H.check('home UI: dragging a card by its handle reorders the section',
+    H.check('home UI: dragging a card in edit mode reorders the section',
       JSON.stringify(propOrderAfterDrag) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']),
       JSON.stringify(propOrderAfterDrag));
     H.check('home UI: dragging a card does not navigate away from Home',
@@ -925,6 +1055,18 @@ export async function run(H, S) {
       JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric))
       === JSON.stringify(['property_equity', 'property_outstanding', 'property_assessed']),
       JSON.stringify(r.data.insights.filter((c) => c.section === 'property').map((c) => c.metric)));
+    // Tapping blank space exits edit mode; a subsequent tap navigates.
+    await page.evaluate(() => document.querySelector('#homeSections').click());
+    const exited = await page.evaluate(() => ({
+      editing: document.querySelector('[data-home-section="property"]').classList.contains('is-editing'),
+      hash: location.hash,
+    }));
+    H.check('home UI: tapping blank space exits edit mode',
+      !exited.editing && ['', '#home'].includes(exited.hash), JSON.stringify(exited));
+    await page.evaluate(() => { document.querySelector('[data-home-section="property"] .insight-card').click(); });
+    const afterExitNav = await until(() => (location.hash === '#assets/properties' ? location.hash : null));
+    H.check('home UI: after exiting edit mode, tapping a card navigates again',
+      !!afterExitNav, await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
     const propOrderReload = await until(() => {
       const labels = [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent);
@@ -937,6 +1079,24 @@ export async function run(H, S) {
       return labels.length === 3 && JSON.stringify(labels) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']) ? labels : null;
     });
     H.check('home UI: Re-generate keeps the dragged order', !!propOrderRegen, JSON.stringify(propOrderRegen));
+
+    // Nov 15 has two payments (rent + mortgage): marking only the
+    // rent leaves one done dot + one pending dot. The mark goes in
+    // via the API, so the page needs a real reload (same-URL goto
+    // is a no-op) for the calendar to re-fetch with the mark.
+    r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: rentalId, date: '2026-11-15', received: 1 });
+    H.check('home UI: marking the Nov 15 rent succeeds', r.status === 200 && r.data.received === 1, JSON.stringify(r.data));
+    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    await until(() => document.querySelectorAll('#homeCalendar .home-cal-day:not(.is-blank)').length > 0);
+    const nov15Dots = await page.evaluate(() => {
+      const c = document.querySelector('[data-cal-date="2026-11-15"]');
+      return c ? [...c.querySelectorAll('.home-cal-dot')].map((d) => d.className) : null;
+    });
+    H.check('home UI: a day with two payments where only one is marked shows one done + one pending dot',
+      nov15Dots && nov15Dots.length === 2
+      && nov15Dots.filter((c) => c.includes('is-done')).length === 1
+      && nov15Dots.find((c) => c.includes('is-done')).includes('kind-rental'),
+      JSON.stringify(nov15Dots));
 
     // AI-append in the browser: propose → Apply appends one → Delete removes it.
     fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'spending', title: 'Groceries spend', metric: 'category_spend:Groceries' } }));
