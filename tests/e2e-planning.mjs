@@ -3036,11 +3036,69 @@ export async function run(H, S) {
       && amznWi.actualValues[amznWi.cutoffIndex + 12] === 2000 && msftWi.actualValues[msftWi.cutoffIndex + 12] === 2000
       && amznWi.actual.ratePct === 0,
     JSON.stringify({ amzn12: amznWi.altValues[amznWi.cutoffIndex + 12], msft12: msftWi.altValues[msftWi.cutoffIndex + 12], actual12: amznWi.actualValues[amznWi.cutoffIndex + 12], actualRate: amznWi.actual.ratePct }));
-  // What-if panel in the browser: the report renders one panel per
-  // buy target (AMZN + MSFT), each with a canvas, a start-month
-  // select and an end-values table; picking an earlier start month
-  // re-normalizes the table in place (no round-trip).
-  r = await H.req('POST', `/api/planning/projects/${flatProjId}/reports`, { name: 'What-if browser', definition: { charts: [] }, strategy_ids: [flatStrat.id, msftStratId], scenario_ids: [] });
+  // ---- What-if merge (user 2026-11-07): each entry also carries
+  // the backtest legs re-anchored to the projection's stock value at
+  // the cutoff month, so the merged Cash pool chart's backtest meets
+  // the forecast with no jump. The anchor is the trajectory's own
+  // stock_value at the current month — an end-of-first-month value,
+  // so one month of growth is already in it: the flat pool's
+  // baseline anchor is exactly the $2,000 amount (POOL.B is flat),
+  // while a strategy's anchor is the amount grown one month at its
+  // leg's rate (AMZN: 2000 × 1.3302^(1/12) ≈ 2048.11). The actual
+  // leg's factor is 1 in the flat pool; the alt leg's is not.
+  r = await H.req('GET', `/api/planning/projects/${flatProjId}/comparison`);
+  const flatTrajs = (r.data.report && r.data.report.trajectories) || [];
+  const flatCutRow = (key) => (((flatTrajs.find((t) => t.key === key) || {}).monthly || []).find((m) => m.month === _poolVan.slice(0, 7)) || {}).stock_value ?? null;
+  const flatBaseCut = flatCutRow('baseline');
+  const flatAmznCut = flatCutRow(String(flatStrat.id));
+  const flatMsftCut = flatCutRow(String(msftStratId));
+  H.check('whatif-merge: anchored legs meet the projection at the cutoff in the flat pool',
+    flatBaseCut != null && Math.abs(flatBaseCut - 2000) < 0.01
+      && flatAmznCut != null && Math.abs(flatAmznCut - 2000 * Math.pow(1 + amznRate, 1 / 12)) < 1
+      && flatMsftCut != null && Math.abs(flatMsftCut - 2000 * Math.pow(1 + msftRate, 1 / 12)) < 1
+      && Math.abs(amznWi.anchoredActualValues[amznWi.cutoffIndex] - flatBaseCut) < 0.01
+      && Math.abs(amznWi.anchoredAltValues[amznWi.cutoffIndex] - flatAmznCut) < 0.01
+      && Math.abs(msftWi.anchoredActualValues[msftWi.cutoffIndex] - flatBaseCut) < 0.01
+      && Math.abs(msftWi.anchoredAltValues[msftWi.cutoffIndex] - flatMsftCut) < 0.01
+      && amznWi.anchoredActualValues[0] === amznWi.actualValues[0]
+      && Math.abs(amznWi.anchoredAltValues[0] - amznWi.altValues[0] * flatAmznCut / 2000) < 1,
+    JSON.stringify({ flatBaseCut, flatAmznCut, flatMsftCut, aCut: amznWi.anchoredActualValues[amznWi.cutoffIndex], altCut: amznWi.anchoredAltValues[amznWi.cutoffIndex] }));
+  // The genuine non-1 anchor lives on the growth pool project
+  // (100% of POOL.C, not the $1,100 pool project): the AMZN buy
+  // leaves a POOL.C remainder, so the strategy's anchor sits above
+  // the baseline's. Note the comparison with no scenarioIds runs
+  // under the project's base scenario ('Growth world', stock 10%),
+  // so the baseline cut is 2000 × 1.10^(1/12) ≈ 2015.95 — NOT the
+  // flat-world 2037.54. The pin asserts the mechanism (anchored ==
+  // the trajectory's own values, both above the $2,000 amount),
+  // not a world-dependent figure.
+  r = await H.req('GET', `/api/planning/projects/${poolGrowthId}/comparison`);
+  const growthWhatIf = (r.data.report && r.data.report.whatIf) || [];
+  const growthAmzn = growthWhatIf.find((e) => e.alt && e.alt.symbol === 'AMZN');
+  const growthTrajs = (r.data.report && r.data.report.trajectories) || [];
+  const growthCutRow = (key) => (((growthTrajs.find((t) => t.key === key) || {}).monthly || []).find((m) => m.month === _poolVan.slice(0, 7)) || {}).stock_value ?? null;
+  const growthBaseCut = growthCutRow('baseline');
+  const growthStratCut = growthCutRow(String(poolBuyStratId));
+  H.check('whatif-merge: anchored legs meet the projection at the cutoff in the growth pool (factor ≠ 1)',
+    !!growthAmzn && growthBaseCut != null && growthStratCut != null
+      && Math.abs(growthBaseCut - 2000) > 1 && Math.abs(growthStratCut - 2000) > 1
+      && Math.abs(growthStratCut - growthBaseCut) > 1
+      && Math.abs(growthAmzn.anchoredActualValues[growthAmzn.cutoffIndex] - growthBaseCut) < 0.01
+      && Math.abs(growthAmzn.anchoredAltValues[growthAmzn.cutoffIndex] - growthStratCut) < 0.01
+      && growthAmzn.actualValues[growthAmzn.cutoffIndex] === 2000 && growthAmzn.altValues[growthAmzn.cutoffIndex] === 2000
+      && Math.abs(growthAmzn.anchoredAltValues[0] - growthStratCut * growthAmzn.altPrices[0] / growthAmzn.altPrices[growthAmzn.cutoffIndex]) < 1,
+    JSON.stringify({ baseCut: growthBaseCut, stratCut: growthStratCut, aCut: growthAmzn && growthAmzn.anchoredActualValues[growthAmzn.cutoffIndex], altCut: growthAmzn && growthAmzn.anchoredAltValues[growthAmzn.cutoffIndex], alt0: growthAmzn && growthAmzn.anchoredAltValues[0] }));
+  // What-if merged into the Cash pool chart in the browser (user
+  // 2026-11-07): no separate what-if panel — the Cash pool chart
+  // extends back to the backtest start with real prices, the Today
+  // cutoff splits Backtest from Forecast, the Range slider spans
+  // the whole merged range, and one Start/Today/Horizon +
+  // Difference table per buy target sits under the chart. Picking
+  // an earlier backtest start moves the window's left edge (and
+  // the tables' Start column) in place, no round-trip. The report
+  // carries the Cash pool chart in its definition, so the merged
+  // chart renders.
+  r = await H.req('POST', `/api/planning/projects/${flatProjId}/reports`, { name: 'What-if browser', definition: { charts: [{ template: 'time_line', title: 'Cash pool', series: ['pool_balance', 'stock_value'] }] }, strategy_ids: [flatStrat.id, msftStratId], scenario_ids: [] });
   H.check('whatif: browser report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
   if (!H.puppeteer || !H.chromeAvailable) {
     console.log('planning what-if browser checks skipped (puppeteer-core / probe Chrome not available)');
@@ -3101,25 +3159,44 @@ export async function run(H, S) {
       });
       await waitW(1500);
       const wiView = await page.evaluate(() => {
-        const panels = [...document.querySelectorAll('[data-whatif-panel]')];
+        const cashPanel = [...document.querySelectorAll('.panel')].find((p) => (p.querySelector('h3') || {}).textContent === 'Cash pool');
+        const chart = cashPanel ? cashPanel.querySelector('canvas') : null;
+        const chartInst = chart && window.Chart ? Chart.getChart(chart) : null;
+        const cutoff = chartInst && chartInst.options && chartInst.options.plugins && chartInst.options.plugins.planCutoff
+          ? chartInst.options.plugins.planCutoff.index : null;
+        const cutX = chartInst && cutoff != null ? (chartInst.getDatasetMeta(0).data[cutoff] || {}).x : null;
+        const range = cashPanel ? cashPanel.querySelector('[data-ai-block-range]') : null;
+        const startInput = range ? range.querySelector('[data-ai-block-start]') : null;
+        const rangeLabel = range ? (range.querySelector('[data-ai-block-label]') || {}).textContent || '' : '';
+        const sel = cashPanel ? cashPanel.querySelector('[data-whatif-merged-start]') : null;
+        const tables = [...document.querySelectorAll('[data-whatif-merged-table]')];
         return {
-          count: panels.length,
-          titles: panels.map((p) => (p.querySelector('h3') || {}).textContent || ''),
-          canvases: panels.map((p) => !!p.querySelector('canvas')),
-          selects: panels.map((p) => { const s = p.querySelector('select'); return s ? [...s.options].map((o) => o.value) : []; }),
-          tables: panels.map((p) => p.textContent.includes('Difference')),
+          separatePanels: document.querySelectorAll('[data-whatif-panel]').length,
+          cashPanel: !!cashPanel,
+          canvas: !!chart,
+          cutoff, cutXFinite: Number.isFinite(cutX),
+          rangeMax: startInput ? Number(startInput.max) : null,
+          rangeLabel,
+          selectOpts: sel ? [...sel.options].map((o) => o.value) : [],
+          selectValue: sel ? sel.value : null,
+          tables: tables.map((t) => ({ amzn: t.textContent.includes('AMZN'), msft: t.textContent.includes('MSFT'), diff: t.textContent.includes('Difference') })),
+          titles: tables.map((t) => (t.previousElementSibling || {}).textContent || ''),
+          forecastNote: cashPanel ? cashPanel.textContent.includes('Forecast, not a prediction') : false,
+          rateLines: cashPanel ? (cashPanel.textContent.includes('33.02%/yr') && cashPanel.textContent.includes('50%/yr')) : false,
         };
       });
-      H.check('whatif: report renders one panel per buy target, each with canvas, start select and Difference table',
-        wiView.count === 2 && wiView.titles.some((t) => t.includes('AMZN')) && wiView.titles.some((t) => t.includes('MSFT'))
-          && wiView.titles.every((t) => t.includes('POOL.B')) && wiView.canvases.every(Boolean)
-          && wiView.selects.every((opts) => opts[0] === '2025-11' && opts[opts.length - 1] === _poolVan.slice(0, 7))
-          && wiView.tables.every(Boolean),
+      H.check('whatif-merge: no separate what-if panel — the Cash pool chart carries the backtest, cutoff, slider and per-target tables',
+        wiView.separatePanels === 0 && wiView.cashPanel && wiView.canvas
+          && wiView.cutoff === 0 && wiView.cutXFinite
+          && wiView.rangeMax === 372 && wiView.rangeLabel.includes('Nov 2026') && wiView.rangeLabel.includes('Nov 2056') && wiView.rangeLabel.includes('361 months')
+          && wiView.selectOpts[0] === '2025-11' && wiView.selectOpts[wiView.selectOpts.length - 1] === _poolVan.slice(0, 7)
+          && wiView.selectValue === _poolVan.slice(0, 7)
+          && wiView.tables.length === 2 && wiView.tables.every((t) => t.diff)
+          && wiView.titles.some((t) => t.includes('AMZN')) && wiView.titles.some((t) => t.includes('MSFT'))
+          && wiView.forecastNote && wiView.rateLines,
         JSON.stringify(wiView));
       const picked = await page.evaluate(() => {
-        const panel = [...document.querySelectorAll('[data-whatif-panel]')].find((p) => ((p.querySelector('h3') || {}).textContent || '').includes('AMZN'));
-        if (!panel) return null;
-        const sel = panel.querySelector('select');
+        const sel = document.querySelector('[data-whatif-merged-start]');
         if (!sel) return null;
         sel.value = '2025-11';
         sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -3127,12 +3204,21 @@ export async function run(H, S) {
       });
       await waitW(400);
       const afterPick = await page.evaluate(() => {
-        const panel = [...document.querySelectorAll('[data-whatif-panel]')].find((p) => ((p.querySelector('h3') || {}).textContent || '').includes('AMZN'));
-        const th = panel ? panel.querySelector('table thead th:nth-child(2)') : null;
-        return th ? th.textContent : null;
+        const cashPanel = [...document.querySelectorAll('.panel')].find((p) => (p.querySelector('h3') || {}).textContent === 'Cash pool');
+        const range = cashPanel ? cashPanel.querySelector('[data-ai-block-range]') : null;
+        const rangeLabel = range ? (range.querySelector('[data-ai-block-label]') || {}).textContent || '' : '';
+        const tbl = document.querySelector('[data-whatif-merged-table]');
+        const th = tbl ? tbl.querySelector('table thead th:nth-child(2)') : null;
+        const chart = cashPanel ? cashPanel.querySelector('canvas') : null;
+        const chartInst = chart && window.Chart ? Chart.getChart(chart) : null;
+        const cutoff = chartInst && chartInst.options && chartInst.options.plugins && chartInst.options.plugins.planCutoff
+          ? chartInst.options.plugins.planCutoff.index : null;
+        return { rangeLabel, startHead: th ? th.textContent : null, chartLabels: chartInst ? chartInst.data.labels.length : null, cutoff };
       });
-      H.check('whatif: picking an earlier start month re-normalizes the table in place',
-        picked === true && afterPick && afterPick.includes('2025'),
+      H.check('whatif-merge: picking an earlier backtest start moves the window and the tables\' Start column in place',
+        picked === true && afterPick.startHead && afterPick.startHead.includes('Nov 2025')
+          && afterPick.rangeLabel.includes('Nov 2025') && afterPick.rangeLabel.includes('373 months')
+          && afterPick.chartLabels === 373 && afterPick.cutoff === 12,
         JSON.stringify({ picked, afterPick }));
     } finally { await browserW.close(); }
   }

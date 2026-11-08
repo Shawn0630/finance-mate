@@ -74,6 +74,7 @@ import {
   validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind, aiSuggestNamePrompt, cleanAiSuggestedName,
   validateReportVariables, applyReportVariables, validateAiEngine, evaluateAiEngine,
   aiReportRefinePrompt, aiReportDefinitionDiff, whatIfBacktest,
+  anchorWhatIfLeg,
   droppedScenarioPrimeSteps, primeStepDroppedMessage,
 } from './planning.js';
 
@@ -6836,7 +6837,7 @@ function planPoolHistoryHoldings(p, strategies) {
 // backtest). A leg with no usable history is kept with a null rate
 // (forecast flat, labeled) — the entry is dropped only when
 // NEITHER leg has any price history at all.
-function planWhatIfEntries(p, rows, horizonMonth, currentMonth) {
+function planWhatIfEntries(p, rows, horizonMonth, currentMonth, cutStockByTraj = null) {
   if (p.category !== 'investment' || !rows || !rows.length || !horizonMonth || horizonMonth <= currentMonth) return [];
   const baseMainline = planAssembleMainline(p.id);
   const poolMainline = planPoolMainline(p, baseMainline, currentMonth);
@@ -6922,6 +6923,13 @@ function planWhatIfEntries(p, rows, horizonMonth, currentMonth) {
       actual: { symbol: actualHolding.symbol, currency: actualHolding.currency || 'CAD', ratePct: actualRate ? actualRate.ratePct : null, rateWindow: actualRate ? actualRate.window : null, rateBasis: actualRate ? actualRate.basis : null },
       alt: { symbol: altSym, currency: altCurrency, ratePct: altRate ? altRate.ratePct : null, rateWindow: altRate ? altRate.window : null, rateBasis: altRate ? altRate.basis : null },
       amountCad: round2(amountCad), ...series,
+      // Merged-chart legs (user 2026-11-07): each leg re-anchored
+      // so its value AT the cutoff equals the projection's stock
+      // value that month (baseline → actual leg, this strategy →
+      // alt leg) — the backtest meets the forecast with no jump.
+      // Without a cutoff stock value the leg carries no backtest.
+      anchoredActualValues: anchorWhatIfLeg(series.actualValues, series.actualCutValue, cutStockByTraj ? cutStockByTraj.get('baseline') : null),
+      anchoredAltValues: anchorWhatIfLeg(series.altValues, series.altCutValue, cutStockByTraj ? cutStockByTraj.get(String(st.id)) : null),
     });
   }
   return out;
@@ -7106,8 +7114,11 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
     // real history before today, history-rate forecast after. The
     // horizon is the comparison's own last month, so the chart ends
     // where the report ends. Symbol pull failures are named here
-    // (stored points used instead, never a failed report).
-    whatIf: investmentScope ? planWhatIfEntries(p, rows, reportTrajectories[0] ? (reportTrajectories[0].monthly[reportTrajectories[0].monthly.length - 1] || {}).month : null, currentMonthKey()) : [],
+    // (stored points used instead, never a failed report). The
+    // merged chart re-anchors each backtest leg to the projection's
+    // stock value at the cutoff month, so the cut-stock map travels
+    // with the entries (baseline → 'baseline', strategies by id).
+    whatIf: investmentScope ? planWhatIfEntries(p, rows, reportTrajectories[0] ? (reportTrajectories[0].monthly[reportTrajectories[0].monthly.length - 1] || {}).month : null, currentMonthKey(), new Map((reportTrajectories || []).map((t) => [t.key, (((t.monthly || []).find((r) => r.month === currentMonthKey()) || {}).stock_value ?? null)]))) : [],
     symbolHistoryNotes: [...new Map(rows.flatMap((r) => (r.symbolHistoryNotes || []).map((n) => [n.symbol, n]))).values()],
     // Headline time window (user 2026-11-06): the window starts at
     // the current month; the default end is the end of the entity

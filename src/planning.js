@@ -2970,6 +2970,25 @@ export function whatIfBacktest({ actual, alt, amountCad, startMonth, currentMont
   };
 }
 
+// Re-anchor a what-if leg to the projection's cutoff value (user
+// 2026-11-07 — the what-if panel merges into the Cash pool chart):
+// the backtest leg is scaled so its value AT the cutoff equals the
+// projection's stock value that month, so the backtest (real prices)
+// meets the forecast (projection) with no jump. The shape is the
+// real price history — only the level changes: anchored[m] =
+// anchor × price[m] / price[cutoff], which the what-if values
+// already encode (value[m] / value[cutoff] = price[m] /
+// price[cutoff]), so a plain rescale by anchor / cutValue does it.
+// Nulls stay null; a missing or non-positive cut value, or a
+// missing anchor, yields all nulls (no backtest for that leg),
+// never an invented level.
+export function anchorWhatIfLeg(values, cutValue, anchorValue) {
+  const arr = Array.isArray(values) ? values : [];
+  if (cutValue == null || !(cutValue > 0) || anchorValue == null || !Number.isFinite(anchorValue)) return arr.map(() => null);
+  const f = anchorValue / cutValue;
+  return arr.map((v) => (v == null ? null : round2(v * f)));
+}
+
 // Pool stock-value band (user 2026-11-06): the AGGREGATE P10–P90
 // range of a projection's stock value — the per-holding detail is
 // the fan; this is the pool as a whole. Each holding contributes its

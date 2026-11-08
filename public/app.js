@@ -14695,6 +14695,14 @@ function planAiBlockRedraw(view, blockIdx) {
     // passed only at first draw would be lost on the first drag.
     const opts = { ...(spec.lineOpts || {}) };
     if (spec.endLabels) opts.endLabels = sliced.map((d) => `${d.label} ${money2(d.data[d.data.length - 1])}`);
+    // Merged what-if chart: the Today cutoff travels with the
+    // window — it draws only while the cutoff month is visible,
+    // at its position inside the sliced labels.
+    if (spec.cutoff != null) {
+      const c = spec.cutoff - startIdx;
+      if (c >= 0 && c <= endIdx - startIdx) opts.cutoff = c;
+      else delete opts.cutoff;
+    }
     if (spec.kind === 'line') planLineChart(spec.cid, labels, sliced, opts);
     else if (spec.kind === 'bar') planBarChart(spec.cid, labels, sliced);
     else if (spec.kind === 'groupedBar') planGroupedBarChart(spec.cid, labels, sliced);
@@ -14814,65 +14822,44 @@ function planReportViewWire(view) {
   planAiBlockWire(view);
 }
 
-// What-if backtest panel (user 2026-11-07): ONE continuous chart
-// per strategy buy — the actual holding vs the buy target, same
-// money. The past is real prices (Backtest), the future is the
-// history-derived forecast (Forecast), split by a "Today" cutoff
-// line at the current month. The start month defaults to the
-// buy-op month (or 5 years ago when the buy is in the future) and
-// is pickable in the chart: re-normalizing needs no round-trip —
-// every value is scaled by amount ÷ value[start month], which is
-// exactly amount × price[m] ÷ price[start]. A leg with no usable
-// history forecasts flat at its cutoff value and says so. Price
-// return only; distributions are not reinvested.
 function planWhatIfRateLabel(leg) {
   if (leg.ratePct == null) return 'no usable history — forecast flat';
   const basis = leg.rateBasis ? ` (${esc(leg.rateBasis)})` : '';
   const win = leg.rateWindow ? ` · ${esc(leg.rateWindow)}` : '';
   return `${leg.ratePct}%/yr${basis}${win}`;
 }
-function planWhatIfPanelHtml(entry) {
-  const wid = `whatif${entry.strategyId}`;
-  const opts = entry.months.filter((m) => m <= entry.cutoffMonth).map((m) => `<option value="${m}"${m === entry.startMonth ? ' selected' : ''}>${formatYM(m)}</option>`).join('');
-  return `<div class="panel" data-whatif-panel="${entry.strategyId}">
-    <div class="section-head"><h3>What if — ${esc(entry.alt.symbol)} instead of ${esc(entry.actual.symbol)} · ${esc(entry.strategyLetter)}</h3></div>
-    <div class="toolbar"><label>Start <select data-whatif-start="${entry.strategyId}">${opts}</select></label>
-    <span class="note">Same ${money2(entry.amountCad)} in both · ${formatYM(entry.historyStartMonth)} – ${formatYM(entry.horizonMonth)}</span></div>
-    <div class="chart-wrap" style="height:280px"><canvas id="${wid}"></canvas></div>
-    <div data-whatif-table="${entry.strategyId}"></div>
-    <div class="note">${esc(entry.actual.symbol)}: ${planWhatIfRateLabel(entry.actual)} · ${esc(entry.alt.symbol)}: ${planWhatIfRateLabel(entry.alt)}</div>
-    <div class="note">Forecast, not a prediction — the rate depends on the window (1y / 3y / 5y). Price return only; distributions are not reinvested.</div>
-  </div>`;
-}
-function planWhatIfDraw(entry, startMonth) {
-  const wid = `whatif${entry.strategyId}`;
-  const startIdx = Math.max(0, entry.months.indexOf(startMonth || entry.startMonth));
-  const renorm = (values) => {
-    const base = values[startIdx];
-    if (base == null || !(base > 0)) return values.map((v) => (v == null ? null : round2c(v)));
-    const f = entry.amountCad / base;
-    return values.map((v) => (v == null ? null : round2c(v * f)));
-  };
-  const aVals = renorm(entry.actualValues);
-  const bVals = renorm(entry.altValues);
-  const labels = entry.months.map((m) => formatYM(m));
-  const lastNonNull = (arr) => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i]; return null; };
-  const aEnd = lastNonNull(aVals);
-  const bEnd = lastNonNull(bVals);
-  const datasets = [
-    { label: entry.actual.symbol, data: aVals, borderColor: planColor(0), backgroundColor: planColor(0), fill: false, pointRadius: 0, borderWidth: 2 },
-    { label: entry.alt.symbol, data: bVals, borderColor: '#b03a3a', backgroundColor: '#b03a3a', fill: false, pointRadius: 0, borderWidth: 2 },
-  ];
-  planLineChart(wid, labels, datasets, { cutoff: entry.cutoffIndex, endLabels: [`${entry.actual.symbol} ${aEnd == null ? '—' : money2(aEnd)}`, `${entry.alt.symbol} ${bEnd == null ? '—' : money2(bEnd)}`] });
-  const cut = entry.cutoffIndex;
-  const cell = (arr, i) => (arr[i] == null ? '—' : money2(arr[i]));
-  const diff = (i) => (aVals[i] == null || bVals[i] == null ? '—' : planSigned(bVals[i] - aVals[i]));
-  const tbl = document.querySelector(`[data-whatif-table="${entry.strategyId}"]`);
-  if (tbl) tbl.innerHTML = `<table class="tbl"><thead><tr><th></th><th>${formatYM(entry.months[startIdx])}</th><th>Today (${formatYM(entry.cutoffMonth)})</th><th>${formatYM(entry.horizonMonth)}</th></tr></thead><tbody>
-    <tr><td>${esc(entry.actual.symbol)}</td><td>${cell(aVals, startIdx)}</td><td>${cell(aVals, cut)}</td><td>${cell(aVals, aVals.length - 1)}</td></tr>
-    <tr><td>${esc(entry.alt.symbol)}</td><td>${cell(bVals, startIdx)}</td><td>${cell(bVals, cut)}</td><td>${cell(bVals, bVals.length - 1)}</td></tr>
-    <tr><td>Difference (${esc(entry.alt.symbol)} − ${esc(entry.actual.symbol)})</td><td>—</td><td>${diff(cut)}</td><td>${diff(aVals.length - 1)}</td></tr>
+// Merged what-if summary tables (user 2026-11-07): the Start /
+// Today / Horizon + Difference table per buy target, read from the
+// merged Cash pool chart's own stock lines (baseline = actual leg,
+// strategy = alt leg), so the table always describes the chart
+// above it. The Start column follows the backtest-start picker.
+function planWhatIfMergedTables(view) {
+  const ctx = view && view.whatIfMerged;
+  if (!ctx) return;
+  const spec = (view.aiCharts || []).find((s) => s.blockIdx === ctx.blockIdx);
+  if (!spec) return;
+  const labels = spec.labels || [];
+  const startIdx = Math.max(0, labels.indexOf(ctx.startMonth));
+  const cutIdx = spec.cutoff != null ? spec.cutoff : labels.indexOf(ctx.cutoffMonth);
+  const endIdx = labels.length - 1;
+  if (startIdx < 0 || cutIdx < 0 || endIdx < 0) return;
+  const line = (trajKey) => (spec.datasets || []).find((d) => d.sid === 'stock_value' && String(d.trajKey) === String(trajKey));
+  const cell = (arr, i) => (arr == null || arr[i] == null ? '—' : money2(arr[i]));
+  for (const entry of ctx.entries) {
+    const host = document.querySelector(`[data-whatif-merged-table="${entry.strategyId}"]`);
+    if (!host) continue;
+    const aDs = line('baseline');
+    const bDs = line(entry.strategyId);
+    if (!aDs || !bDs) { host.innerHTML = ''; continue; }
+    const aVals = aDs.data || [];
+    const bVals = bDs.data || [];
+    const diff = (i) => (aVals[i] == null || bVals[i] == null ? '—' : planSigned(bVals[i] - aVals[i]));
+    host.innerHTML = `<table class="tbl"><thead><tr><th></th><th>${formatYM(labels[startIdx])}</th><th>Today (${formatYM(labels[cutIdx])})</th><th>${formatYM(labels[endIdx])}</th></tr></thead><tbody>
+    <tr><td>${esc(entry.actual.symbol)}</td><td>${cell(aVals, startIdx)}</td><td>${cell(aVals, cutIdx)}</td><td>${cell(aVals, endIdx)}</td></tr>
+    <tr><td>${esc(entry.alt.symbol)}</td><td>${cell(bVals, startIdx)}</td><td>${cell(bVals, cutIdx)}</td><td>${cell(bVals, endIdx)}</td></tr>
+    <tr><td>Difference (${esc(entry.alt.symbol)} − ${esc(entry.actual.symbol)})</td><td>${diff(startIdx)}</td><td>${diff(cutIdx)}</td><td>${diff(endIdx)}</td></tr>
   </tbody></table>`;
+  }
 }
 
 async function loadPlanReport(projectId, reportId) {
@@ -15068,11 +15055,63 @@ async function loadPlanReport(projectId, reportId) {
       const cid = `planReportChart${i}`;
       if (c.template === 'time_line') {
         const sids = series || ['mortgage_balance'];
+        // What-if merged into the Cash pool chart (user 2026-11-07):
+        // the stock-value lines extend BACKWARD to the backtest start
+        // with real prices — each leg re-anchored (server-side) to
+        // its own line's value at the cutoff month, so the backtest
+        // meets the forecast with no jump. The Today cutoff splits
+        // Backtest (left) from Forecast (right); the P10–P90 band
+        // stays forecast-only (null in the backtest). The separate
+        // what-if panel is gone; its picker, summary table, rate
+        // lines and forecast note live in this panel instead.
+        const wiUsable = template.key === 'pool' && c.title === 'Cash pool'
+          ? (rep.whatIf || []).filter((e) => e && e.available !== false
+              && Array.isArray(e.anchoredActualValues) && Array.isArray(e.anchoredAltValues)
+              && (comp.strategies || []).some((r) => r.strategy.id === e.strategyId))
+          : [];
+        let chartLabels = months;
+        let wiCutoff = null;
+        let wiStartIdx = 0;
+        let mergedMonths = null;
+        let seriesFor = (traj, sid) => seriesAt(traj, sid);
+        if (wiUsable.length) {
+          const cutMonth = wiUsable[0].cutoffMonth;
+          const horizonMonth = wiUsable[0].horizonMonth;
+          const firstMonth = wiUsable.map((e) => e.historyStartMonth).filter(Boolean).sort()[0];
+          mergedMonths = [];
+          { let [yy, mm] = firstMonth.split('-').map(Number);
+            const [ey, em] = horizonMonth.split('-').map(Number);
+            while (yy < ey || (yy === ey && mm <= em)) {
+              mergedMonths.push(`${yy}-${String(mm).padStart(2, '0')}`);
+              mm++; if (mm > 12) { mm = 1; yy++; }
+            } }
+          chartLabels = mergedMonths;
+          wiCutoff = mergedMonths.indexOf(cutMonth);
+          wiStartIdx = Math.max(0, mergedMonths.indexOf(wiUsable[0].startMonth));
+          // Month → value maps for the anchored legs. The actual leg
+          // is the same holding in every entry (and the anchored
+          // values are identical wherever both are defined — the
+          // anchor removes the per-entry normalization), so the
+          // baseline map unions all entries; each strategy has its
+          // own alt leg. Months before a leg's first price stay null.
+          const legMap = (entry, field) => { const m = new Map(); (entry.months || []).forEach((mo, idx) => m.set(mo, entry[field][idx] ?? null)); return m; };
+          const baseBack = new Map();
+          for (const e of wiUsable) for (const [mo, v] of legMap(e, 'anchoredActualValues')) if (!baseBack.has(mo)) baseBack.set(mo, v);
+          const altBackByStrat = new Map(wiUsable.map((e) => [String(e.strategyId), legMap(e, 'anchoredAltValues')]));
+          const projMap = (traj, sid) => { const m = new Map(); (traj.monthly || []).forEach((r) => m.set(r.month, r[sid] ?? null)); return m; };
+          seriesFor = (traj, sid) => {
+            const proj = projMap(traj, sid);
+            let back = null;
+            if (sid === 'stock_value') back = traj.key === 'baseline' ? baseBack : altBackByStrat.get(String(traj.key));
+            return mergedMonths.map((mo) => (mo < cutMonth ? (back ? (back.get(mo) ?? null) : null) : (proj.get(mo) ?? null)));
+          };
+          planReportView.whatIfMerged = { blockIdx: i, startMonth: wiUsable[0].startMonth, cutoffMonth: cutMonth, entries: wiUsable };
+        }
         const datasets = [];
         for (const sid of sids) {
           trajs.forEach((t, ti) => {
             const color = ti === 0 ? '#888' : planColor(ti - 1);
-            datasets.push({ label: `${t.label} · ${PLAN_REPORT_SERIES_LABEL[sid] || sid}`, data: seriesAt(t, sid), borderColor: color, backgroundColor: color, fill: false, pointRadius: 0, spanGaps: true, trajKey: t.key, sid });
+            datasets.push({ label: `${t.label} · ${PLAN_REPORT_SERIES_LABEL[sid] || sid}`, data: seriesFor(t, sid), borderColor: color, backgroundColor: color, fill: false, pointRadius: 0, spanGaps: true, trajKey: t.key, sid });
             // Pool volatility band (user 2026-11-06): on a cash-pool
             // report the stock-value trajectory carries a P10–P90
             // fill around its median line, from the trajectory's
@@ -15086,8 +15125,8 @@ async function loadPlanReport(projectId, reportId) {
             // to P10; the filters travel on the spec so a slider
             // redraw keeps them hidden.
             if (sid === 'stock_value' && template.key === 'pool') {
-              const p10 = seriesAt(t, 'stock_p10');
-              const p90 = seriesAt(t, 'stock_p90');
+              const p10 = seriesFor(t, 'stock_p10');
+              const p90 = seriesFor(t, 'stock_p90');
               if (p10.some((v) => v != null) && p90.some((v) => v != null)) {
                 datasets.push({ label: `${t.label} · P10`, data: p10, borderColor: color, borderWidth: 0, pointRadius: 0, spanGaps: true, band: true, bandSid: sid, tableSkip: true });
                 datasets.push({ label: `${t.label} · P90`, data: p90, borderColor: color, borderWidth: 0, pointRadius: 0, spanGaps: true, fill: '-1', backgroundColor: planColorAlpha(color, 0.12), band: true, bandSid: sid, tableSkip: true });
@@ -15096,7 +15135,7 @@ async function loadPlanReport(projectId, reportId) {
           });
         }
         const lineOpts = { tooltipFilter: (it) => !it.dataset.band, legendFilter: (item, data) => !data.datasets[item.datasetIndex].band };
-        const spec = { cid, kind: 'line', labels: months, datasets, blockIdx: i, win: { startIdx: 0, endIdx: months.length - 1 }, headlineMode: 'strategy', headlineSids: sids, tableKind: 'monthly', lineOpts };
+        const spec = { cid, kind: 'line', labels: chartLabels, datasets, blockIdx: i, win: { startIdx: wiStartIdx, endIdx: chartLabels.length - 1 }, headlineMode: 'strategy', headlineSids: sids, tableKind: 'monthly', lineOpts, ...(wiCutoff != null ? { cutoff: wiCutoff } : {}) };
         planReportView.aiCharts.push(spec);
         // Pool band notes (user 2026-11-06): the Cash pool panel
         // names the holdings with no band and the history pulls that
@@ -15111,8 +15150,25 @@ async function loadPlanReport(projectId, reportId) {
           if (datasets.some((d) => d.band)) parts.push('<div class="note">P10–P90 band: each holding’s history volatility (longest window) around its median projection; holdings combined with no correlation; the cash balance has no volatility.</div>');
           return parts.join('');
         })();
-        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div><div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><div class="note">${esc(how)}</div>${poolBandNotes}</div>`);
-        draws.push(() => planLineChart(cid, months, datasets, lineOpts));
+        // Merged what-if controls: the backtest-start picker (it
+        // selects the backtest start month — the block window's left
+        // edge) plus, under the chart, one Start/Today/Horizon +
+        // Difference table per buy target with its rate lines. The
+        // backtest is real prices scaled to each line's cutoff-month
+        // value, so the legs meet the forecast with no jump.
+        const wiPickerHtml = wiUsable.length ? (() => {
+          const opts = mergedMonths.filter((mo) => mo <= wiUsable[0].cutoffMonth).map((mo) => `<option value="${mo}"${mo === wiUsable[0].startMonth ? ' selected' : ''}>${formatYM(mo)}</option>`).join('');
+          return `<div class="toolbar"><label>Backtest start <select data-whatif-merged-start>${opts}</select></label><span class="note">Backtest: real prices, scaled to the ${formatYM(wiUsable[0].cutoffMonth)} pool value</span></div>`;
+        })() : '';
+        const wiFooterHtml = wiUsable.length ? wiUsable.map((e) => `<div class="section-head"><h4>What if — ${esc(e.alt.symbol)} instead of ${esc(e.actual.symbol)} · ${esc(e.strategyLetter)}</h4></div><div data-whatif-merged-table="${e.strategyId}"></div><div class="note">${esc(e.actual.symbol)}: ${planWhatIfRateLabel(e.actual)} · ${esc(e.alt.symbol)}: ${planWhatIfRateLabel(e.alt)}</div>`).join('') + '<div class="note">Forecast, not a prediction — the rate depends on the window (1y / 3y / 5y). Price return only; distributions are not reinvested.</div>' : '';
+        pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="plan-ai-block-head" data-ai-block-head="${i}">${planAiBlockHeadlineHtml(planReportView, i)}</div>${planAiBlockRangeHtml(planReportView, i)}${wiPickerHtml}<div class="chart-wrap" style="height:260px"><canvas id="${cid}"></canvas></div><div data-ai-block-table="${cid}"></div><div class="toolbar" data-ai-block-pager="${cid}"></div>${wiFooterHtml}<div class="note">X: month · Y: ${sids.map((sid) => esc(PLAN_REPORT_SERIES_LABEL[sid] || sid)).join(' · ')} (CAD).</div><div class="note">${esc(how)}</div>${poolBandNotes}</div>`);
+        // Merged what-if chart: the first draw is sliced to the
+        // default window (start = the buy-op month) — the backtest
+        // is reached by dragging the slider's left handle back,
+        // not shown by default. planAiBlockRedraw also translates
+        // the Today cutoff into the sliced labels.
+        draws.push(() => { if (wiUsable.length) planAiBlockRedraw(planReportView, i); else planLineChart(cid, chartLabels, datasets, wiCutoff != null ? { ...lineOpts, cutoff: wiCutoff } : lineOpts); });
+        if (wiUsable.length) draws.push(() => planWhatIfMergedTables(planReportView));
       } else if (c.template === 'metric_cards') {
         const sids = series || ['cost', 'gain', 'net'];
         const valOf = (row, sid) => sid === 'cost' ? row.comparison.cost : sid === 'gain' ? row.comparison.gain : sid === 'net' ? row.comparison.net : sid === 'stock_gain' ? row.comparison.stockGain : sid === 'payoff_month' ? row.comparison.payoffShiftMonths : sid === 'monthly_payment' ? row.comparison.paymentDelta : null;
@@ -15277,15 +15333,9 @@ async function loadPlanReport(projectId, reportId) {
         pushPanel(`<div class="panel"><div class="section-head"><h3>${esc(c.title)}</h3></div><div class="note">Not rendered: unknown template ${esc(c.template)}.</div></div>`);
       }
     });
-    // What-if backtest panels (user 2026-11-07): derived data, NOT
-    // definition charts — appended after the preset/AI charts with
-    // no Block Delete button. One per strategy with a symbol buy.
-    const whatIfEntries = (rep.whatIf || []).filter((e) => e && e.available !== false);
-    planReportView.whatIf = whatIfEntries;
-    const whatIfPanels = whatIfEntries.map((entry) => {
-      draws.push(() => planWhatIfDraw(entry, entry.startMonth));
-      return planWhatIfPanelHtml(entry);
-    });
+    // What-if backtest (user 2026-11-07): merged INTO the Cash pool
+    // chart above — no separate panel. The entries ride on the
+    // report payload; the time_line branch consumes them.
     // World label for the header: every pinned scenario by name, or
     // the flat world when the pin is empty.
     const worldLabel = scenarioIds.length
@@ -15317,7 +15367,7 @@ async function loadPlanReport(projectId, reportId) {
       // Block identity is the definition chart index, not the
       // panel position: a skipped block leaves a gap, and Block
       // Delete splices definition.charts by this index.
-      charts: (panels.map((p, i) => `<div data-plan-report-block="${panelChartIdx[i]}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${panelChartIdx[i]}">Delete</button></div></div>`).join('') + whatIfPanels.map((p) => `<div data-plan-report-block="whatif">${p}</div>`).join('')) || '<div class="panel"><div class="note">No charts in this report.</div></div>',
+      charts: panels.map((p, i) => `<div data-plan-report-block="${panelChartIdx[i]}">${p}<div class="toolbar"><button class="small danger" data-plan-report-block-del="${panelChartIdx[i]}">Delete</button></div></div>`).join('') || '<div class="panel"><div class="note">No charts in this report.</div></div>',
       comparison: `<div class="panel" id="planReportComparePanel">
         <div class="section-head"><h3>Strategy comparison</h3></div>
         <div class="note" id="planReportTrajectoryNote"></div>
@@ -15368,11 +15418,30 @@ async function loadPlanReport(projectId, reportId) {
       ${template.sections.map((s) => sections[s] || '').join('')}
       <div data-plan-report-block="refine">${planReportAiHtml()}</div>`;
     draws.forEach((d) => { try { d(); } catch { /* a failed chart never blocks the tables */ } });
-    // What-if start-month picker: re-normalize + redraw in place.
-    (planReportView.whatIf || []).forEach((entry) => {
-      const sel = document.querySelector(`[data-whatif-start="${entry.strategyId}"]`);
-      if (sel) sel.addEventListener('change', () => { try { planWhatIfDraw(entry, sel.value); } catch { /* keep the old chart */ } });
-    });
+    // Merged what-if backtest-start picker: moves the Cash pool
+    // block window's left edge (and the summary tables' Start
+    // column); the Range slider still spans the whole merged range.
+    if (planReportView.whatIfMerged) {
+      const sel = document.querySelector('[data-whatif-merged-start]');
+      if (sel) sel.addEventListener('change', () => {
+        try {
+          const ctx = planReportView.whatIfMerged;
+          const spec = (planReportView.aiCharts || []).find((s) => s.blockIdx === ctx.blockIdx);
+          if (!spec) return;
+          const idx = (spec.labels || []).indexOf(sel.value);
+          if (idx < 0) return;
+          const { endIdx } = planAiBlockWin(spec);
+          const startIdx = Math.min(idx, endIdx);
+          spec.win = { startIdx, endIdx };
+          ctx.startMonth = sel.value;
+          const range = document.querySelector(`[data-ai-block-range="${ctx.blockIdx}"]`);
+          const startInput = range && range.querySelector('[data-ai-block-start]');
+          if (startInput) startInput.value = String(startIdx);
+          planAiBlockRedraw(planReportView, ctx.blockIdx);
+          planWhatIfMergedTables(planReportView);
+        } catch { /* keep the old chart */ }
+      });
+    }
     // Table section renders from the already-fetched trajectories.
     planReportTableRender(planReportView);
     // Comparison component: the Δ chart + payment breakdown render

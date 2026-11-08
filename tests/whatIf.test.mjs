@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import { ensureSymbolHistory, listSymbolPricePoints } from '../src/prices.js';
-import { computeProjection, whatIfBacktest, currentReturnRateFromPoints } from '../src/planning.js';
+import { computeProjection, whatIfBacktest, anchorWhatIfLeg, currentReturnRateFromPoints } from '../src/planning.js';
 
 // 13 monthly labels, 2025-11 → 2026-11.
 const MONTHS13 = [];
@@ -238,4 +238,37 @@ test('whatIfBacktest: no price history on either leg returns null', () => {
     amountCad: 10000, startMonth: '2025-11', currentMonth: '2026-11', horizonMonth: '2027-11',
   });
   assert.equal(out, null);
+});
+
+// ---- anchorWhatIfLeg: merged chart — backtest meets the forecast ----
+
+test('anchorWhatIfLeg: re-anchors a backtest leg to the projection cutoff value, shape kept', () => {
+  const out = whatIfBacktest({
+    actual: leg('AAA', 100, 1.02, 26.8242),
+    alt: leg('BBB', 50, 1.03, 42.5761),
+    amountCad: 10000, startMonth: '2025-11', currentMonth: '2026-11', horizonMonth: '2027-11',
+  });
+  // The projection's stock value at the cutoff is 5000 (actual leg)
+  // and 8000 (alt leg) — the merged chart's backtest meets the
+  // forecast at exactly those levels.
+  const a = anchorWhatIfLeg(out.actualValues, out.actualCutValue, 5000);
+  const b = anchorWhatIfLeg(out.altValues, out.altCutValue, 8000);
+  assert.equal(a[out.cutoffIndex], 5000, 'actual meets the projection at the cutoff');
+  assert.equal(b[out.cutoffIndex], 8000, 'alt meets the projection at the cutoff');
+  // The shape is the real price history: the start value is the
+  // anchor scaled by the price ratio start/cutoff.
+  assert.ok(approx(a[0], 5000 / Math.pow(1.02, 12), 0.01), `actual start ${a[0]}`);
+  assert.ok(approx(b[0], 8000 / Math.pow(1.03, 12), 0.01), `alt start ${b[0]}`);
+  // The forecast leg still grows at its own rate from the anchor.
+  assert.ok(approx(a[a.length - 1], 5000 * 1.268242, 0.5), `actual end ${a[a.length - 1]}`);
+  assert.ok(approx(b[b.length - 1], 8000 * 1.425761, 0.5), `alt end ${b[b.length - 1]}`);
+});
+
+test('anchorWhatIfLeg: nulls stay null, and a missing cut value or anchor yields no backtest', () => {
+  const vals = [100, null, 300];
+  assert.deepEqual(anchorWhatIfLeg(vals, 300, 600), [200, null, 600]);
+  assert.deepEqual(anchorWhatIfLeg(vals, null, 600), [null, null, null]);
+  assert.deepEqual(anchorWhatIfLeg(vals, 0, 600), [null, null, null]);
+  assert.deepEqual(anchorWhatIfLeg(vals, 300, null), [null, null, null]);
+  assert.deepEqual(anchorWhatIfLeg(vals, 300, 0), [0, null, 0], 'a zero anchor is a flat $0 leg, not an error');
 });
