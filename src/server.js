@@ -43,6 +43,7 @@ import {
 import {
   buildStandardInsights, homeHighlightRows, buildHomeMetricLibrary, resolveHomeMetric, homeAiPrompt,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates, jobTakehomePeriods,
+  homeCalendarDates, daysInMonth as homeDaysInMonth,
   nextMonth as homeNextMonth, prevMonth as homePrevMonth,
 } from './home.js';
 import {
@@ -4645,6 +4646,29 @@ const homeR2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
 // Assemble every series buildStandardInsights needs, plus the
 // per-entity series resolveHomeMetric needs and the job/rental lists
+// Payment dates of ONE mortgage in ONE month, on the projection's
+// own grid (the same governing-term + mortgageMonthPaymentDates
+// computation the highlight uses). Returns { dates, row, gov, freq }:
+// dates are the payment dates in the month, capped to [from, to];
+// row/gov/freq are the projection row, the term governing the month,
+// and its frequency, for the amount derivation (collectHomeData uses
+// them; the calendar only needs dates).
+function mortgageMonthInfo(p, proj, terms, month, from, to) {
+  const row = (proj.series || []).find((r) => r.month === month);
+  if (!row) return { dates: [], row: null, gov: null, freq: 'monthly' };
+  let gov = null;
+  for (const t of terms || []) { if (String(t.start_date).slice(0, 7) <= month) gov = t; }
+  gov = gov || (terms && terms[0]) || null;
+  const freq = gov && FREQUENCY_KEYS.includes(gov.payment_frequency) ? gov.payment_frequency
+    : (FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly');
+  const anchorDay = gov && gov.payment_day != null ? gov.payment_day : (p.payment_day ?? null);
+  const dates = mortgageMonthPaymentDates({
+    frequency: freq, anchorDay, rowDate: row.date, month,
+    from, to, earliest: p.mortgage_balance_date,
+  });
+  return { dates, row, gov, freq };
+}
+
 // homeHighlightRows needs.
 async function collectHomeData() {
   const today = vancouverToday();
@@ -4917,29 +4941,19 @@ async function collectHomeData() {
       const terms = termsOf(p.id);
       const occurrences = [];
       for (const m of [windowStart, cur]) {
-        const row = proj.series.find((r) => r.month === m);
-        if (!row) continue;
-        let gov = null;
-        for (const t of terms) { if (String(t.start_date).slice(0, 7) <= m) gov = t; }
-        gov = gov || terms[0] || null;
-        const freq = gov && FREQUENCY_KEYS.includes(gov.payment_frequency) ? gov.payment_frequency
-          : (FREQUENCY_KEYS.includes(p.payment_frequency) ? p.payment_frequency : 'monthly');
-        const anchorDay = gov && gov.payment_day != null ? gov.payment_day : (p.payment_day ?? null);
+        const info = mortgageMonthInfo(p, proj, terms, m, fromDate, today);
+        if (!info.row) continue;
         let perPeriod = null;
-        if (!gov || gov.repayment_method !== 'equal_principal') {
-          const monthly = (gov && proj.termPayments && proj.termPayments[gov.id]
-            && proj.termPayments[gov.id].paymentUsed != null)
-            ? proj.termPayments[gov.id].paymentUsed : proj.paymentUsed;
+        if (!info.gov || info.gov.repayment_method !== 'equal_principal') {
+          const monthly = (info.gov && proj.termPayments && proj.termPayments[info.gov.id]
+            && proj.termPayments[info.gov.id].paymentUsed != null)
+            ? proj.termPayments[info.gov.id].paymentUsed : proj.paymentUsed;
           if (monthly == null) continue;
-          perPeriod = periodPaymentFor(monthly, freq);
+          perPeriod = periodPaymentFor(monthly, info.freq);
         }
-        const dates = mortgageMonthPaymentDates({
-          frequency: freq, anchorDay, rowDate: row.date, month: m,
-          from: fromDate, to: today, earliest: p.mortgage_balance_date,
-        });
-        if (!dates.length) continue;
-        if (perPeriod == null) perPeriod = homeR2(row.payment / dates.length);
-        for (const d of dates) occurrences.push({ date: d, amount: perPeriod });
+        if (!info.dates.length) continue;
+        if (perPeriod == null) perPeriod = homeR2(info.row.payment / info.dates.length);
+        for (const d of info.dates) occurrences.push({ date: d, amount: perPeriod });
       }
       if (occurrences.length) {
         occurrences.sort((a, b) => a.date.localeCompare(b.date));
@@ -5009,6 +5023,39 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   const stale = !sys.length || sys.some((r) => Date.now() - new Date(r.generated_at).getTime() > staleMs);
   if (stale) insights = generateStandardInsights(userId, data);
   res.json({ highlights, insights, generatedAt: sys.length ? sys[0].generated_at : null });
+});
+
+// Home calendar: payment dates in ONE month (salary, rental,
+// mortgage), color-coded per kind on the client. The date sources
+// are exactly the highlight's — the job payday grid, the rental due
+// dates, the mortgage projection grid — but the month is NOT capped
+// at today: the calendar shows the whole month, past and future, so
+// prev/next navigation into other months works. Jobs and rentals
+// come straight from their tables (no series needed); mortgage
+// dates come from the projection grid via mortgageMonthInfo.
+app.get('/api/home/calendar', requireApiAuth, async (req, res) => {
+  const today = vancouverToday();
+  const cur = currentMonthKey();
+  const month = String(req.query.month || cur);
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) return res.status(400).json({ error: 'month must be YYYY-MM' });
+  const jobs = db.prepare('SELECT id, employer, frequency, start_date, recent_pay_date FROM earn_jobs ORDER BY id').all()
+    .map((j) => ({ id: j.id, label: j.employer, frequency: j.frequency, startDate: j.start_date, recentDate: j.recent_pay_date }));
+  const rentals = db.prepare('SELECT * FROM earn_rentals ORDER BY id').all().map((r) => ({
+    id: r.id, label: r.label,
+    entries: db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(r.id)
+      .map((e) => ({ id: e.id, start_ym: e.start_ym, end_ym: e.end_ym, monthly_rent: e.monthly_rent, pay_day: e.pay_day })),
+  }));
+  const monthStart = `${month}-01`;
+  const monthEnd = `${month}-${String(homeDaysInMonth(month)).padStart(2, '0')}`;
+  const mortgageOccurrences = [];
+  for (const p of db.prepare('SELECT * FROM properties ORDER BY id').all()) {
+    if (!(p.mortgage_balance > 0)) continue;
+    const proj = projectionFor(p);
+    if (!proj || !proj.series.length) continue;
+    const { dates } = mortgageMonthInfo(p, proj, termsOf(p.id), month, monthStart, monthEnd);
+    for (const d of dates) mortgageOccurrences.push({ date: d, sourceId: p.id, label: String(p.address).split(',')[0] });
+  }
+  res.json({ month, today, days: homeCalendarDates({ jobs, rentals, mortgageOccurrences, month }) });
 });
 
 app.post('/api/home/insights/generate', requireApiAuth, async (req, res) => {

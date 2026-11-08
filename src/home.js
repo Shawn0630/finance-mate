@@ -585,6 +585,72 @@ export function homeHighlightRows({ jobs, rentals, mortgages, marks, today }) {
   return rows;
 }
 
+// ------------------------------------------------------------ calendar --
+// One rental's occurrence in one month: amounts sum across covering
+// entries, due day from the latest-starting entry, clamped to the
+// month's length. Null when no entry covers the month.
+export function rentalMonthOccurrence(rental, ym) {
+  const entries = rental.entries || [];
+  const covering = entries.filter((e) => e.start_ym <= ym && (e.end_ym == null || e.end_ym === '' || ym <= e.end_ym));
+  if (!covering.length) return null;
+  const amount = r2(covering.reduce((s, e) => s + Number(e.monthly_rent || 0), 0));
+  const latest = [...covering].sort((a, b) => String(a.start_ym).localeCompare(String(b.start_ym)) || (a.id - b.id)).pop();
+  const day = Math.min(Number(latest.pay_day) || 1, daysInMonth(ym));
+  return { date: `${ym}-${String(day).padStart(2, '0')}`, amount };
+}
+
+// Payment occurrences in ONE month, for the Home calendar.
+// jobs: [{id, label, frequency, startDate, recentDate}]
+// rentals: [{id, label, entries: [{start_ym, end_ym, monthly_rent, pay_day}]}]
+// mortgageOccurrences: [{date, sourceId, label}] — precomputed from
+//   the projection's own grid (the same source as the highlight).
+// The date sources are exactly the highlight's: the job's own payday
+// grid (payDatesInWindow + the holiday advance), the rental's
+// per-month due date, the mortgage's projection grid. Unlike the
+// highlight, a month's dates are NOT capped at today — the calendar
+// shows the whole month, past and future. A job with no dates is
+// skipped, never guessed. The nominal grid runs 7 days past the
+// month end: a payday nominally dated just after the month can
+// holiday-adjust back into it (e.g. a Jan 1 payday lands Dec 31),
+// and the adjusted date belongs to the month it lands in.
+// Returns { 'YYYY-MM-DD': [{kind, sourceId, label}] } — dates with
+// payments only, keys sorted.
+export function homeCalendarDates({ jobs, rentals, mortgageOccurrences, month }) {
+  const days = {};
+  const add = (date, kind, sourceId, label) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '') || String(date).slice(0, 7) !== month) return;
+    (days[date] = days[date] || []).push({ kind, sourceId, label });
+  };
+  const monthStart = `${month}-01`;
+  const monthEnd = `${month}-${String(daysInMonth(month)).padStart(2, '0')}`;
+  const gridEnd = addDaysStr(monthEnd, 7);
+  for (const job of jobs || []) {
+    if (!PAY_FREQUENCIES[job.frequency] || !normJobDate(job.startDate) || !normJobDate(job.recentDate)) continue;
+    let nominal;
+    if (job.frequency === 'annual') {
+      const anchor = nominalRecentDate(job.recentDate);
+      const [, am, ad] = anchor.split('-').map(Number);
+      nominal = [];
+      for (let y = Number(job.startDate.slice(0, 4)); y <= Number(month.slice(0, 4)) + 1; y++) {
+        const ym = `${y}-${String(am).padStart(2, '0')}`;
+        const d = `${ym}-${String(Math.min(ad, daysInMonth(ym))).padStart(2, '0')}`;
+        if (d >= job.startDate && d >= monthStart && d <= gridEnd) nominal.push(d);
+      }
+    } else {
+      nominal = payDatesInWindow(job.frequency, job.startDate, gridEnd, nominalRecentDate(job.recentDate));
+    }
+    // Two nominal dates can adjust onto the same day; one entry.
+    const dates = [...new Set(nominal.map((d) => adjustPayday(d)))].sort();
+    for (const d of dates) add(d, 'salary', job.id, job.label);
+  }
+  for (const rental of rentals || []) {
+    const occ = rentalMonthOccurrence(rental, month);
+    if (occ) add(occ.date, 'rental', rental.id, rental.label);
+  }
+  for (const o of mortgageOccurrences || []) add(o.date, 'mortgage', o.sourceId, o.label);
+  return days;
+}
+
 // ------------------------------------------------------------ AI metric library --
 // The computable metric library the AI may propose from. Standard ids
 // are the 12 above; per-entity variants are built from live entities

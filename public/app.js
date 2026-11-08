@@ -17872,6 +17872,72 @@ let homeAiHistory = []; // [{role, text}]
 let homeAiPending = null; // {section, title, metric, preview} awaiting Apply
 let homeAiEpoch = 0; // bumped by Clear session; a reply from an earlier epoch is dropped
 let homeCharts = [];
+// Home calendar: the displayed month ('YYYY-MM') and its fetched
+// markers {month, today, days}. The month persists across loadHome
+// calls (marking a payment re-fetches /api/home, not the calendar).
+let homeCalMonth = null;
+let homeCalData = null;
+
+const HOME_CAL_KINDS = [
+  { kind: 'salary', label: 'Salary' },
+  { kind: 'rental', label: 'Rent' },
+  { kind: 'mortgage', label: 'Mortgage' },
+];
+
+// The calendar grid for one month: weekday header (Sunday first),
+// leading blanks, one cell per day. A cell carries one dot per kind
+// present that day (a kind shows once even with several payments).
+// Today gets .is-today. Days are plain numbers + dots — no prose.
+function homeCalendarHtml(data) {
+  const [y, m] = data.month.split('-').map(Number);
+  const dim = new Date(y, m, 0).getDate();
+  const firstDow = new Date(y, m - 1, 1).getDay();
+  const days = data.days || {};
+  let cells = '';
+  for (let i = 0; i < firstDow; i++) cells += '<div class="home-cal-day is-blank"></div>';
+  for (let d = 1; d <= dim; d++) {
+    const date = `${data.month}-${String(d).padStart(2, '0')}`;
+    const marks = days[date] || [];
+    const kinds = [...new Set(marks.map((x) => x.kind))];
+    const dots = kinds.map((k) => {
+      const label = HOME_CAL_KINDS.find((x) => x.kind === k);
+      const title = marks.filter((x) => x.kind === k).map((x) => `${label ? label.label : k} · ${x.label}`).join(', ');
+      return `<span class="home-cal-dot kind-${k}" title="${esc(title)}"></span>`;
+    }).join('');
+    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}" data-cal-date="${date}"><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
+  }
+  const legend = HOME_CAL_KINDS.map((k) => `<span class="home-cal-legend-item"><span class="home-cal-dot kind-${k.kind}"></span>${k.label}</span>`).join('');
+  return `<div class="home-cal-head">
+      <button class="home-cal-nav" data-cal-nav="-1" aria-label="Previous month">‹</button>
+      <span class="home-cal-title">${MONTH_NAMES[m - 1]} ${y}</span>
+      <button class="home-cal-nav" data-cal-nav="1" aria-label="Next month">›</button>
+    </div>
+    <div class="home-cal-week">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<span>${d}</span>`).join('')}</div>
+    <div class="home-cal-grid">${cells}</div>
+    <div class="home-cal-legend">${legend}</div>`;
+}
+
+function renderHomeCalendar() {
+  const el = $('#homeCalendar');
+  if (!el || !homeCalData) return;
+  el.innerHTML = homeCalendarHtml(homeCalData);
+}
+
+async function loadHomeCalendar(month) {
+  try {
+    const q = month ? `?month=${month}` : '';
+    homeCalData = await api(`/api/home/calendar${q}`);
+    homeCalMonth = homeCalData.month;
+    renderHomeCalendar();
+  } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+}
+
+function homeCalShift(delta) {
+  if (!homeCalMonth) return;
+  const [y, m] = homeCalMonth.split('-').map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  loadHomeCalendar(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+}
 
 // Clear session resets only the conversation (in-memory thread +
 // pending proposal). Appended insight cards and stored data are
@@ -18106,8 +18172,13 @@ async function loadHome() {
   try {
     homeData = await api('/api/home');
     renderHome();
+    if (!homeCalData) loadHomeCalendar(); // first load only; nav keeps its month
   } catch (err) { showMsg($('#globalError'), 'err', err.message); }
 }
+$('#homeCalendar').addEventListener('click', (e) => {
+  const nav = e.target.closest && e.target.closest('[data-cal-nav]');
+  if (nav) homeCalShift(Number(nav.dataset.calNav));
+});
 
 function renderHomeAiThread() {
   const thread = $('#homeAiThread');

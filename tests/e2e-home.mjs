@@ -141,6 +141,35 @@ export async function run(H, S) {
       mortNov && mortNov.amount === 1744.81 && mortNov.isCurrent === true, JSON.stringify(mortNov));
   }
 
+  // ---- API: GET /api/home/calendar ----
+  // Same date sources as the highlight, but the month is not capped
+  // at today: future dates inside the month show too.
+  r = await H.req('GET', '/api/home/calendar?month=2026-10');
+  const calOct = r.data.days || {};
+  H.check('home API: calendar Oct 2026 marks salary Oct 9 + Oct 23, rent + mortgage Oct 15',
+    r.status === 200 && r.data.month === '2026-10'
+    && (calOct['2026-10-09'] || []).some((x) => x.kind === 'salary')
+    && (calOct['2026-10-23'] || []).some((x) => x.kind === 'salary')
+    && (calOct['2026-10-15'] || []).map((x) => x.kind).sort().join(',') === 'mortgage,rental',
+    JSON.stringify(calOct));
+  r = await H.req('GET', '/api/home/calendar?month=2026-11');
+  const calNov = r.data.days || {};
+  H.check('home API: calendar Nov 2026 marks salary Nov 6 + Nov 20 and the future Nov 15 rent + mortgage',
+    r.status === 200 && r.data.month === '2026-11'
+    && (calNov['2026-11-06'] || []).some((x) => x.kind === 'salary')
+    && (calNov['2026-11-20'] || []).some((x) => x.kind === 'salary')
+    && (calNov['2026-11-15'] || []).map((x) => x.kind).sort().join(',') === 'mortgage,rental',
+    JSON.stringify(calNov));
+  r = await H.req('GET', '/api/home/calendar?month=2025-01');
+  H.check('home API: calendar Jan 2025 (before the job, rental, and mortgage) is empty',
+    r.status === 200 && Object.keys(r.data.days || {}).length === 0, JSON.stringify(r.data.days));
+  r = await H.req('GET', '/api/home/calendar');
+  H.check('home API: calendar with no month defaults to the current month',
+    r.status === 200 && r.data.month === '2026-11' && typeof r.data.today === 'string',
+    JSON.stringify({ month: r.data.month, today: r.data.today }));
+  r = await H.req('GET', '/api/home/calendar?month=2026-13');
+  H.check('home API: calendar rejects a bad month', r.status === 400, JSON.stringify(r.data));
+
   // Standard cards: hand-computed from the fixture.
   H.check('home API: assessed total is $1,500,000 (Nov 2026)',
     card('property_assessed') && card('property_assessed').value === 1500000 && card('property_assessed').period === '2026-11',
@@ -468,6 +497,83 @@ export async function run(H, S) {
       // Admin is a pre-existing seventh link, shown only to admin users.
       && (navLinks === 'Assets,Earnings,Spending,Planning,History,Tax' || navLinks === 'Assets,Earnings,Spending,Planning,History,Tax,Admin'),
       navLinks);
+
+    // Home calendar: renders with the current month, marking the
+    // fixture's payment dates per kind, today highlighted. The
+    // calendar loads on its own fetch, so wait for its day cells.
+    const calReady = await until(() => {
+      const el = document.querySelector('#homeCalendar');
+      return el && el.querySelectorAll('.home-cal-day:not(.is-blank)').length > 0 ? el.textContent : null;
+    });
+    H.check('home UI: calendar renders with the Nov 2026 title + a Salary / Rent / Mortgage legend',
+      !!calReady && calReady.includes('Nov 2026')
+      && ['Salary', 'Rent', 'Mortgage'].every((k) => calReady.includes(k)),
+      String(calReady && calReady.slice(0, 200)));
+    const calDots = await page.evaluate(() => {
+      const dots = (date) => {
+        const c = document.querySelector(`[data-cal-date="${date}"]`);
+        return c ? [...c.querySelectorAll('.home-cal-dot')].map((d) => d.className) : null;
+      };
+      return { nov6: dots('2026-11-06'), nov15: dots('2026-11-15'), nov20: dots('2026-11-20'), nov10: dots('2026-11-10') };
+    });
+    H.check('home UI: calendar marks Nov 6 + Nov 20 salary, Nov 15 rent + mortgage, nothing on Nov 10',
+      calDots.nov6 && calDots.nov6.some((c) => c.includes('kind-salary'))
+      && calDots.nov20 && calDots.nov20.some((c) => c.includes('kind-salary'))
+      && calDots.nov15 && calDots.nov15.some((c) => c.includes('kind-rental'))
+      && calDots.nov15.some((c) => c.includes('kind-mortgage'))
+      && calDots.nov10 && calDots.nov10.length === 0,
+      JSON.stringify(calDots));
+    // Today is the real run date (runner TZ is America/Vancouver,
+    // same as the server's Vancouver day).
+    const nowD = new Date();
+    const todayStr = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}-${String(nowD.getDate()).padStart(2, '0')}`;
+    const todayHi = await page.evaluate((t) => {
+      const c = document.querySelector(`[data-cal-date="${t}"]`);
+      return c ? c.className : null;
+    }, todayStr);
+    H.check('home UI: calendar highlights today', todayHi && todayHi.includes('is-today'), JSON.stringify({ todayStr, todayHi }));
+    // At the default 800px viewport the calendar stacks ABOVE the
+    // carousel (the side-by-side row only applies past 1000px, so
+    // the folded deck keeps two big cards + a peek).
+    const stacked = await page.evaluate(() => {
+      const cal = document.querySelector('#homeCalendar').getBoundingClientRect();
+      const car = document.querySelector('#homeHighlightCarousel').getBoundingClientRect();
+      return { calBottom: cal.bottom, carTop: car.top, calW: cal.width };
+    });
+    H.check('home UI: at 800px the calendar stacks above the highlight carousel',
+      stacked.calBottom <= stacked.carTop + 1, JSON.stringify(stacked));
+    // At a wide viewport it sits LEFT of the carousel in the same row.
+    await page.setViewport({ width: 1280, height: 800 });
+    await wait(300);
+    const sideBySide = await page.evaluate(() => {
+      const cal = document.querySelector('#homeCalendar').getBoundingClientRect();
+      const car = document.querySelector('#homeHighlightCarousel').getBoundingClientRect();
+      return { calRight: cal.right, carLeft: car.left, calTop: cal.top, carTop: car.top };
+    });
+    H.check('home UI: at 1280px the calendar sits left of the highlight carousel',
+      sideBySide.calRight <= sideBySide.carLeft + 1 && Math.abs(sideBySide.calTop - sideBySide.carTop) < 60,
+      JSON.stringify(sideBySide));
+    await page.setViewport({ width: 800, height: 600 });
+    await wait(300);
+    // Prev/next navigation: Dec 2026 shows the Dec 4 payday, then back to Nov.
+    await page.evaluate(() => document.querySelector('[data-cal-nav="1"]').click());
+    const decTitle = await until(() => {
+      const t = document.querySelector('.home-cal-title');
+      return t && t.textContent === 'Dec 2026' ? t.textContent : null;
+    });
+    const decDots = await page.evaluate(() => {
+      const c = document.querySelector('[data-cal-date="2026-12-04"]');
+      return c ? [...c.querySelectorAll('.home-cal-dot')].map((d) => d.className) : null;
+    });
+    H.check('home UI: calendar next shows Dec 2026 with the Dec 4 salary payday',
+      decTitle === 'Dec 2026' && decDots && decDots.some((c) => c.includes('kind-salary')),
+      JSON.stringify({ decTitle, decDots }));
+    await page.evaluate(() => document.querySelector('[data-cal-nav="-1"]').click());
+    const backTitle = await until(() => {
+      const t = document.querySelector('.home-cal-title');
+      return t && t.textContent === 'Nov 2026' ? t.textContent : null;
+    });
+    H.check('home UI: calendar prev returns to Nov 2026', backTitle === 'Nov 2026', String(backTitle));
 
     // Brand link: Finance Mate in the top bar goes to Home.
     await page.goto('http://ff.local/#assets/overview', { waitUntil: 'networkidle0', timeout: 30000 });

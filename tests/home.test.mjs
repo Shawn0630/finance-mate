@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates,
-  jobTakehomePeriods,
+  jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrence,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
 import { calcSalary } from '../src/earnings.js';
@@ -500,4 +500,72 @@ test('home: resolveHomeMetric — account + account-type + per-period take-home 
   assert.ok(lib.some((m) => m.metric === 'account_type_gain:RRSP' && m.section === 'stock'));
   assert.ok(lib.some((m) => m.metric === 'job_takehome_period:4' && m.section === 'earning'));
   assert.equal(lib.filter((m) => m.metric === 'account_value').length, 0);
+});
+
+test('home: rentalMonthOccurrence sums covering entries, due day from the latest-starting entry', () => {
+  const rental = {
+    id: 1, label: 'Basement suite',
+    entries: [
+      { id: 1, start_ym: '2026-01', end_ym: '2026-06', monthly_rent: 2000, pay_day: 15 },
+      { id: 2, start_ym: '2026-04', end_ym: '', monthly_rent: 1800, pay_day: 20 },
+    ],
+  };
+  // May: both entries cover it — $3,800, due day 20 (latest start).
+  assert.deepEqual(rentalMonthOccurrence(rental, '2026-05'), { date: '2026-05-20', amount: 3800 });
+  // February: only the first entry — $2,000 on the 15th.
+  assert.deepEqual(rentalMonthOccurrence(rental, '2026-02'), { date: '2026-02-15', amount: 2000 });
+  // December: only the ongoing entry — $1,800 on the 20th.
+  assert.deepEqual(rentalMonthOccurrence(rental, '2026-12'), { date: '2026-12-20', amount: 1800 });
+  // Before any entry starts: nothing.
+  assert.equal(rentalMonthOccurrence(rental, '2025-12'), null);
+  // A pay day past the month's end clamps (31 in February 2026 → 28).
+  const clamp = { id: 2, label: 'Suite', entries: [{ id: 3, start_ym: '2026-01', end_ym: '', monthly_rent: 1000, pay_day: 31 }] };
+  assert.deepEqual(rentalMonthOccurrence(clamp, '2026-02'), { date: '2026-02-28', amount: 1000 });
+  assert.deepEqual(rentalMonthOccurrence({ id: 3, label: 'Empty', entries: [] }, '2026-10'), null);
+});
+
+test('home: homeCalendarDates uses the highlight date sources for one month, past and future', () => {
+  const jobs = [
+    { id: 1, label: 'Acme Corp', frequency: 'biweekly', startDate: '2026-01-02', recentDate: '2026-10-23' },
+    { id: 2, label: 'Side gig', frequency: 'monthly', startDate: '2026-03-15', recentDate: '2026-10-15' },
+    { id: 3, label: 'Annual bonus job', frequency: 'annual', startDate: '2024-06-06', recentDate: '2026-06-06' },
+    { id: 4, label: 'No dates', frequency: 'biweekly', startDate: '', recentDate: '' },
+  ];
+  const rentals = [
+    { id: 1, label: 'Basement suite', entries: [{ id: 1, start_ym: '2026-01', end_ym: '', monthly_rent: 2000, pay_day: 15 }] },
+  ];
+  const mortgageOccurrences = [
+    { date: '2026-10-15', sourceId: 2, label: '2 Home Test Way' },
+    { date: '2026-11-15', sourceId: 2, label: '2 Home Test Way' },
+  ];
+  const nov = homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2026-11' });
+  // Biweekly from the Oct 23 anchor: Nov 6 + Nov 20. Monthly on the
+  // 15th. Rent + mortgage share the 15th. No annual date in November.
+  assert.deepEqual(Object.keys(nov).sort(), ['2026-11-06', '2026-11-15', '2026-11-20']);
+  assert.deepEqual(nov['2026-11-06'], [{ kind: 'salary', sourceId: 1, label: 'Acme Corp' }]);
+  assert.deepEqual(nov['2026-11-15'], [
+    { kind: 'salary', sourceId: 2, label: 'Side gig' },
+    { kind: 'rental', sourceId: 1, label: 'Basement suite' },
+    { kind: 'mortgage', sourceId: 2, label: '2 Home Test Way' },
+  ]);
+  assert.deepEqual(nov['2026-11-20'], [{ kind: 'salary', sourceId: 1, label: 'Acme Corp' }]);
+  // October: biweekly Oct 9 + Oct 23, monthly Oct 15, rent Oct 15, mortgage Oct 15.
+  const oct = homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2026-10' });
+  assert.deepEqual(Object.keys(oct).sort(), ['2026-10-09', '2026-10-15', '2026-10-23']);
+  assert.deepEqual(oct['2026-10-09'], [{ kind: 'salary', sourceId: 1, label: 'Acme Corp' }]);
+  // June: the annual anniversary lands Jun 6.
+  const jun = homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2026-06' });
+  assert.ok(jun['2026-06-06'].some((x) => x.kind === 'salary' && x.sourceId === 3), JSON.stringify(jun['2026-06-06']));
+  // A month before anything started is empty — no invented dates.
+  assert.deepEqual(homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2025-12' }), {});
+});
+
+test('home: homeCalendarDates keeps a payday that holiday-adjusts into the month', () => {
+  // Monthly on the 1st: the Jan 1, 2026 payday is a holiday, so it
+  // lands Dec 31, 2025 — December shows it, January does not.
+  const jobs = [{ id: 1, label: 'First of month', frequency: 'monthly', startDate: '2025-01-01', recentDate: '2025-12-01' }];
+  const dec = homeCalendarDates({ jobs, rentals: [], mortgageOccurrences: [], month: '2025-12' });
+  assert.deepEqual(Object.keys(dec).sort(), ['2025-12-01', '2025-12-31']);
+  assert.deepEqual(dec['2025-12-31'], [{ kind: 'salary', sourceId: 1, label: 'First of month' }]);
+  assert.deepEqual(homeCalendarDates({ jobs, rentals: [], mortgageOccurrences: [], month: '2026-01' }), {});
 });

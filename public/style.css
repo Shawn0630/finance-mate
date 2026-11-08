@@ -835,3 +835,33 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
    it resets only the conversation, never cards or stored data. */
 .home-ai-clear { border: none; background: none; color: #6b7a89; font-size: 12px; font-weight: 400; letter-spacing: 0; padding: 2px 0; cursor: pointer; }
 .home-ai-clear:hover { color: #1c2733; text-decoration: underline; }
+
+/* Upcoming payments: the calendar sits LEFT of the highlight
+   carousel on wide screens; on narrow screens it stacks ABOVE it. */
+.home-upcoming { display: flex; gap: 16px; align-items: flex-start; }
+.home-upcoming-main { flex: 1 1 auto; min-width: 0; }
+.home-calendar { flex: 0 0 300px; background: #fff; border: 1px solid #e6ebf0; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05); padding: 14px 16px 12px; }
+.home-cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.home-cal-title { font-size: 14px; font-weight: 700; color: #111; }
+.home-cal-nav { border: 1px solid #e6ebf0; background: #fff; color: #5a6a7a; border-radius: 8px; width: 28px; height: 28px; font-size: 16px; line-height: 1; padding: 0; cursor: pointer; }
+.home-cal-nav:hover { border-color: #c9d2dc; color: #111; }
+.home-cal-week { display: grid; grid-template-columns: repeat(7, 1fr); font-size: 10px; font-weight: 600; color: #98a4b0; text-align: center; margin-bottom: 4px; }
+.home-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.home-cal-day { min-height: 34px; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px; color: #3c4a59; }
+.home-cal-day.is-blank { visibility: hidden; }
+.home-cal-day.is-today { background: #eef4fb; font-weight: 700; color: #111; box-shadow: inset 0 0 0 1px #1668c4; }
+.home-cal-num { line-height: 1; }
+.home-cal-dots { display: flex; gap: 3px; min-height: 8px; }
+.home-cal-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.home-cal-dot.kind-salary { background: #14632f; }
+.home-cal-dot.kind-rental { background: #1668c4; }
+.home-cal-dot.kind-mortgage { background: #b7791f; }
+.home-cal-legend { display: flex; gap: 12px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #eef1f4; font-size: 11px; color: #5a6a7a; }
+.home-cal-legend-item { display: flex; align-items: center; gap: 4px; }
+/* The deck needs ~570px of carousel to keep two big cards + a peek
+   visible, so the side-by-side row only applies on wide screens;
+   at or below 1000px the calendar stacks above the carousel. */
+@media (max-width: 1000px) {
+  .home-upcoming { flex-direction: column; }
+  .home-calendar { flex: 1 1 auto; width: 100%; }
+}
