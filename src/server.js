@@ -5023,6 +5023,22 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   const staleMs = 7 * 24 * 3600 * 1000;
   const stale = !sys.length || sys.some((r) => Date.now() - new Date(r.generated_at).getTime() > staleMs);
   if (stale) insights = generateStandardInsights(userId, data);
+  // Report mode shows a property card's house photo: attach the
+  // first gallery photo (or the legacy photo_url) to property-entity
+  // cards. No photo → photo: null, and the card renders no
+  // projection at all. Standard cards carry no entity and are
+  // untouched.
+  const photoByProperty = new Map();
+  for (const c of insights) {
+    if (!c.entity || c.entity.kind !== 'property' || photoByProperty.has(c.entity.id)) continue;
+    const p = db.prepare('SELECT id, photo_url FROM properties WHERE id = ?').get(c.entity.id);
+    const photos = p ? photosView(p) : [];
+    photoByProperty.set(c.entity.id, photos.length ? photos[0].src : null);
+  }
+  if (photoByProperty.size) {
+    insights = insights.map((c) => (c.entity && c.entity.kind === 'property'
+      ? { ...c, photo: photoByProperty.get(c.entity.id) ?? null } : c));
+  }
   res.json({ highlights, insights, generatedAt: sys.length ? sys[0].generated_at : null });
 });
 

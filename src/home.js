@@ -105,6 +105,48 @@ export function applyHomeInsightOrder(insights, orders) {
   return out;
 }
 
+// ------------------------------------------------------------ report mode --
+// Report mode is a different PRESENTATION of the same Home data
+// (same highlight rows + insight cards), not a new data model:
+// Upcoming payments first, then the four insight sections in
+// order. A section with no cards is skipped — except Upcoming
+// payments, which always renders (one empty card when there are no
+// highlight rows). Pure — the client renders these sections.
+export const HOME_REPORT_SECTION_DEFS = [
+  { key: 'highlight', title: 'Upcoming payments' },
+  { key: 'property', title: 'Property' },
+  { key: 'stock', title: 'Stocks' },
+  { key: 'earning', title: 'Earning' },
+  { key: 'spending', title: 'Spending' },
+];
+export function homeReportSections(homeData) {
+  const out = [];
+  const highlights = (homeData && homeData.highlights) || [];
+  out.push({
+    key: 'highlight', title: 'Upcoming payments',
+    cards: highlights.length ? highlights : [{ empty: true }],
+  });
+  const insights = (homeData && homeData.insights) || [];
+  for (const def of HOME_REPORT_SECTION_DEFS.slice(1)) {
+    const cards = insights.filter((c) => c.section === def.key);
+    if (cards.length) out.push({ key: def.key, title: def.title, cards });
+  }
+  return out;
+}
+// Move the report-mode focus: left/right step within the section,
+// up/down step between sections (the card index is kept when the
+// new section has that many cards, otherwise clamped to its last
+// card). Pure — the client applies the returned state.
+export function homeReportMove(state, sections, dir) {
+  const s = { section: state.section, card: state.card };
+  const count = (i) => (sections[i] && sections[i].cards.length) || 0;
+  if (dir === 'left') s.card = Math.max(0, s.card - 1);
+  else if (dir === 'right') s.card = Math.min(count(s.section) - 1, s.card + 1);
+  else if (dir === 'up') { s.section = Math.max(0, s.section - 1); s.card = Math.min(s.card, count(s.section) - 1); }
+  else if (dir === 'down') { s.section = Math.min(sections.length - 1, s.section + 1); s.card = Math.min(s.card, count(s.section) - 1); }
+  return s;
+}
+
 // ------------------------------------------------------------ mortgage dates --
 // Payment dates of ONE mortgage in ONE month, on the projection's
 // own grid. rowDate is that month's last payment date from the

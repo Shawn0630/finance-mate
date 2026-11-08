@@ -890,3 +890,52 @@ the fill between the handles (set by planHeadlineWindowTrackFill). */
   .home-upcoming { flex-direction: column; }
   .home-calendar { flex: 1 1 auto; width: 100%; }
 }
+
+/* ------------------------------------------------------------ Report mode --
+   One big vertical card per page on a soft Instagram-style gradient
+   (peach → pink → lavender → blue, light enough that the card
+   numbers stay readable). Insight mode (calendar, section
+   carousels, AI panel) hides; the header stays. Sections are
+   full-stage pages: the active one slides in, the others slide
+   out vertically — a clearly visible directional transition, never
+   an instant jump. Inside a section the cards sit in a 3D
+   carousel: the active card front and centre, neighbours tilted
+   and faded at the sides, with a soft shadow, a ground ellipse,
+   and a mirrored reflection below the active card. */
+#homeReport { display: none; position: relative; height: clamp(560px, calc(100vh - 250px), 780px); overflow: hidden; margin-top: 6px; }
+#view-home.home-report { background: linear-gradient(155deg, #fff7ed 0%, #fce7f3 38%, #ede9fe 68%, #dbeafe 100%); }
+#view-home.home-report #homeReport { display: block; }
+#view-home.home-report .home-upcoming,
+#view-home.home-report #homeSections,
+#view-home.home-report .home-ai,
+#view-home.home-report > .home-section-head { display: none; }
+.report-section { position: absolute; inset: 0; display: flex; flex-direction: column; visibility: hidden; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease, visibility 0s linear .55s; }
+.report-section.is-active { transform: translateY(0); opacity: 1; z-index: 2; visibility: visible; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease, visibility 0s; }
+.report-section.is-before { transform: translateY(-102%); opacity: .5; }
+.report-section.is-after { transform: translateY(102%); opacity: .5; }
+.report-section-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; font-weight: 600; color: #5a6a7a; letter-spacing: .02em; padding-bottom: 8px; border-bottom: 1px solid rgba(90,106,122,.18); margin-bottom: 10px; }
+.report-section-pos { font-size: 12px; color: #98a4b0; }
+.report-stage { position: relative; flex: 1 1 auto; min-height: 0; perspective: 1400px; }
+.report-ground { position: absolute; left: 50%; bottom: 4%; width: 360px; max-width: 70%; height: 28px; transform: translateX(-50%); background: radial-gradient(ellipse at center, rgba(16,24,40,.30), transparent 70%); filter: blur(4px); pointer-events: none; }
+.report-slot { position: absolute; left: 50%; top: 44%; width: min(430px, 86%); height: min(540px, 80%); transform: translate(-50%, -50%) translateX(0) rotateY(0deg) scale(1); opacity: 1; transition: transform .55s cubic-bezier(.22,1,.36,1), opacity .55s ease; will-change: transform; }
+.report-slot.is-prev { transform: translate(-50%, -50%) translateX(-78%) rotateY(30deg) scale(.82); opacity: .45; }
+.report-slot.is-next { transform: translate(-50%, -50%) translateX(78%) rotateY(-30deg) scale(.82); opacity: .45; }
+.report-slot.is-far-prev { transform: translate(-50%, -50%) translateX(-145%) rotateY(45deg) scale(.7); opacity: 0; pointer-events: none; }
+.report-slot.is-far-next { transform: translate(-50%, -50%) translateX(145%) rotateY(-45deg) scale(.7); opacity: 0; pointer-events: none; }
+.report-slot.is-active { z-index: 3; box-shadow: 0 24px 48px rgba(16,24,40,.22); border-radius: 14px; -webkit-box-reflect: below 10px linear-gradient(rgba(0,0,0,.28), transparent 60%); }
+.report-dots { display: flex; gap: 6px; justify-content: center; padding: 12px 0 2px; }
+.report-dot { width: 8px; height: 8px; border-radius: 50%; border: none; padding: 0; background: rgba(17,17,17,.18); cursor: pointer; }
+.report-dot.is-active { background: #1668c4; }
+/* The card inside a slot is a vertical card: photo (when the
+   property has one) on top, the number, deltas, and the sparkline
+   pinned to the bottom. The slot carries the 3D transform, so the
+   card itself never transforms. */
+.report-slot .insight-card { width: 100%; height: 100%; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 0; padding: 24px 26px; transform: none; margin: 0; }
+.report-slot .insight-text { flex: 0 0 auto; }
+.report-slot .insight-value { font-size: 46px; }
+.report-slot .insight-spark { flex: 0 0 auto; width: 100%; height: 150px; margin-top: auto; }
+.report-slot .insight-spark canvas { height: 132px !important; }
+.report-slot .home-pay-card .insight-toggle { margin-top: 16px; }
+.report-slot .home-pay-card .recv-toggle { font-size: 14px; padding: 9px 18px; }
+.report-photo { border-radius: 10px; overflow: hidden; margin-bottom: 16px; aspect-ratio: 16 / 9; flex: 0 0 auto; }
+.report-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }

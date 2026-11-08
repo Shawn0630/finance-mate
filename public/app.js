@@ -363,9 +363,26 @@ function showSection(key) {
 // startup before the planning section below has evaluated.
 let planCompareScenarioIds = null; // null = not yet initialized for this project load
 let planStrategyScenarioId; // undefined = server default (base scenario); 0 = explicit flat world; N = scenario N
+
+// Home report-mode state, declared up here for the same reason:
+// route() resets to report mode on the first #home entry of the
+// page session, which runs before the Home section below has
+// evaluated.
+let homeMode = 'report'; // 'report' (default landing) | 'insight'
+let homeReport = { section: 0, card: 0 }; // focus inside the report sections
+let homeReportDefaultApplied = false; // the per-visit default lands once
 function route() {
   const hash = location.hash || '#home';
   if (hash === '#home') {
+    // The per-visit default: the FIRST #home entry of the page
+    // session always lands in report mode. Later entries within the
+    // same visit (brand click, back from a detail page) keep the
+    // mode the user chose with the toggle.
+    if (!homeReportDefaultApplied) {
+      homeMode = 'report';
+      homeReport = { section: 0, card: 0 };
+      homeReportDefaultApplied = true;
+    }
     showView('home');
     loadHome();
   } else if (hash.startsWith('#property/')) {
@@ -18095,15 +18112,20 @@ function homeYoyHtml(d, kind, downIsGood, vsLabel) {
   return `<span class="delta-yoy">YoY ${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
 }
 
-function homeInsightCardHtml(c) {
+function homeInsightCardHtml(c, opts) {
   const delBtn = c.kind === 'ai'
     ? `<button class="home-card-del" data-home-del="${c.id}" aria-label="Delete card">×</button>` : '';
   const aiTag = c.kind === 'ai' ? ' <span class="home-ai-tag">AI</span>' : '';
   const link = homeCardLink(c);
   const linkAttrs = ` data-home-link="${link.href}"${link.category ? ` data-home-category="${esc(link.category)}"` : ''} role="link" tabindex="0"`;
   const keyAttr = ` data-home-key="${esc(homeCardKey(c))}"`;
+  // Report mode only: a property card shows its house photo, and
+  // only when the property has one (server attaches photo, null
+  // otherwise) — no photo, no projection at all.
+  const photoHtml = (opts && opts.photo && c.entity && c.entity.kind === 'property' && c.photo)
+    ? `<div class="report-photo"><img src="${esc(c.photo)}" alt=""></div>` : '';
   if (!c.hasData) {
-    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${photoHtml}
       <div class="insight-text">
         <div class="insight-label">${esc(c.title)}${aiTag}</div>
         <div class="insight-empty">No data yet</div>
@@ -18115,7 +18137,7 @@ function homeInsightCardHtml(c) {
       <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}'></canvas>
       <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
     </div>` : '';
-  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}${photoHtml}
     <div class="insight-text">
       <div class="insight-label">${esc(c.title)}${aiTag}</div>
       <div class="insight-value">${homeFormatValue(c)}</div>
@@ -18250,11 +18272,211 @@ function renderHome() {
     return `<h3 class="home-section-head"><a class="home-section-link" href="${HOME_SECTION_ROUTES[section]}">${HOME_SECTION_TITLES[section]}</a><a class="home-section-all" href="${HOME_SECTION_ROUTES[section]}">View all →</a></h3>
       <div class="home-carousel" data-home-section="${section}">${cards.map(homeInsightCardHtml).join('')}</div>`;
   }).join('');
-  homeDrawSparklines($('#view-home'));
+  homeDrawSparklines(homeMode === 'report' ? $('#homeReport') : $('#homeSections'));
   homeMarkActiveCarousels($('#view-home'));
   if (homeEditSection) homeEnterEditMode(homeEditSection); // a re-render keeps the section in edit mode
+  // Only the visible presentation lives in the DOM: report sections
+  // render in report mode, insight carousels in insight mode. A
+  // second copy of every card would double-count document-wide
+  // queries (AI tag, Delete buttons) and swallow clicks.
+  if (homeMode === 'report') renderHomeReport();
+  // Mode chrome: report mode is the default landing, so the class
+  // and the toggle label are applied on every render, not only on
+  // toggle clicks (a re-render after a mark toggle must not flip
+  // the user back to insight mode).
+  $('#view-home').classList.toggle('home-report', homeMode === 'report');
+  $('#homeModeBtn').textContent = homeMode === 'report' ? 'Insight mode' : 'Report mode';
   renderHomeAiThread();
 }
+
+// ------------------------------------------------------- Home report mode --
+// Report mode is the same Home data in a different presentation:
+// one big vertical card per page, a 3D horizontal carousel inside
+// each section, scroll up/down between sections, scroll left/right
+// between cards. Default landing on a fresh #home entry; the toggle
+// switches to insight mode (the current Home page) and back. No
+// reorder in report mode (edit mode stays in insight mode).
+// Client mirrors of homeReportSections / homeReportMove in
+// src/home.js (app.js is a classic script, not a module).
+const HOME_REPORT_SECTION_DEFS = [
+  { key: 'highlight', title: 'Upcoming payments' },
+  { key: 'property', title: 'Property' },
+  { key: 'stock', title: 'Stocks' },
+  { key: 'earning', title: 'Earning' },
+  { key: 'spending', title: 'Spending' },
+];
+function homeReportSectionsClient(homeData) {
+  const out = [];
+  const highlights = (homeData && homeData.highlights) || [];
+  out.push({
+    key: 'highlight', title: 'Upcoming payments',
+    cards: highlights.length ? highlights : [{ empty: true }],
+  });
+  const insights = (homeData && homeData.insights) || [];
+  for (const def of HOME_REPORT_SECTION_DEFS.slice(1)) {
+    const cards = insights.filter((c) => c.section === def.key);
+    if (cards.length) out.push({ key: def.key, title: def.title, cards });
+  }
+  return out;
+}
+function homeReportMoveClient(state, sections, dir) {
+  const s = { section: state.section, card: state.card };
+  const count = (i) => (sections[i] && sections[i].cards.length) || 0;
+  if (dir === 'left') s.card = Math.max(0, s.card - 1);
+  else if (dir === 'right') s.card = Math.min(count(s.section) - 1, s.card + 1);
+  else if (dir === 'up') { s.section = Math.max(0, s.section - 1); s.card = Math.min(s.card, count(s.section) - 1); }
+  else if (dir === 'down') { s.section = Math.min(sections.length - 1, s.section + 1); s.card = Math.min(s.card, count(s.section) - 1); }
+  return s;
+}
+let homeReportSecs = []; // sections for the current homeData
+let homeReportLockUntil = 0; // navigation lock while a transition runs
+const HOME_REPORT_WHEEL_MIN = 48; // px of accumulated scroll that moves once
+const HOME_REPORT_LOCK_MS = 600; // ms a transition locks out further moves
+
+function renderHomeReport() {
+  const el = $('#homeReport');
+  if (!el || !homeData) return;
+  homeReportSecs = homeReportSectionsClient(homeData);
+  homeReport.section = Math.min(homeReport.section, Math.max(0, homeReportSecs.length - 1));
+  homeReport.card = Math.min(homeReport.card, Math.max(0, homeReportSecs[homeReport.section].cards.length - 1));
+  el.innerHTML = homeReportSecs.map((sec, si) => {
+    const slots = sec.cards.map((c, ci) => {
+      const html = sec.key === 'highlight'
+        ? (c.empty
+          ? `<div class="insight-card"><div class="insight-text"><div class="insight-empty">No upcoming payments</div></div></div>`
+          : homePayCardHtml(c))
+        : homeInsightCardHtml(c, { photo: true });
+      return `<div class="report-slot" data-report-slot="${ci}">${html}</div>`;
+    }).join('');
+    const dots = sec.cards.map((c, ci) => `<button class="report-dot" data-report-dot="${ci}" aria-label="Card ${ci + 1} of ${sec.cards.length}"></button>`).join('');
+    return `<div class="report-section" data-report-section="${sec.key}">
+      <div class="report-section-title"><span>${esc(sec.title)}</span><span class="report-section-pos">${si + 1} / ${homeReportSecs.length}</span></div>
+      <div class="report-stage"><div class="report-ground"></div>${slots}</div>
+      <div class="report-dots">${dots}</div>
+    </div>`;
+  }).join('');
+  homeReportApply();
+}
+
+function homeReportApply() {
+  const el = $('#homeReport');
+  if (!el) return;
+  el.querySelectorAll('.report-section').forEach((secEl, si) => {
+    const rel = si - homeReport.section;
+    secEl.classList.toggle('is-active', rel === 0);
+    secEl.classList.toggle('is-before', rel < 0);
+    secEl.classList.toggle('is-after', rel > 0);
+    secEl.querySelectorAll('.report-slot').forEach((slot, ci) => {
+      const d = ci - homeReport.card;
+      const inSection = si === homeReport.section;
+      slot.classList.toggle('is-active', inSection && d === 0);
+      slot.classList.toggle('is-prev', inSection && d === -1);
+      slot.classList.toggle('is-next', inSection && d === 1);
+      slot.classList.toggle('is-far-prev', inSection && d < -1);
+      slot.classList.toggle('is-far-next', inSection && d > 1);
+    });
+    secEl.querySelectorAll('.report-dot').forEach((dot, ci) => {
+      dot.classList.toggle('is-active', si === homeReport.section && ci === homeReport.card);
+    });
+  });
+}
+
+function homeReportGo(dir) {
+  if (!homeReportSecs.length || Date.now() < homeReportLockUntil) return;
+  const next = homeReportMoveClient(homeReport, homeReportSecs, dir);
+  if (next.section === homeReport.section && next.card === homeReport.card) return;
+  homeReport = next;
+  homeReportApply();
+  homeReportLockUntil = Date.now() + HOME_REPORT_LOCK_MS;
+}
+
+function homeSetMode(mode) {
+  homeMode = mode;
+  $('#view-home').classList.toggle('home-report', mode === 'report');
+  $('#homeModeBtn').textContent = mode === 'report' ? 'Insight mode' : 'Report mode';
+  if (mode === 'report') {
+    homeExitEditMode();
+    renderHomeReport();
+    homeReportApply();
+    homeDrawSparklines($('#homeReport'));
+  } else {
+    // Leaving report mode drops its DOM so only the insight
+    // presentation exists (see renderHome).
+    const el = $('#homeReport');
+    if (el) el.innerHTML = '';
+    homeReportSecs = [];
+    homeDrawSparklines($('#homeSections'));
+  }
+}
+$('#homeModeBtn').addEventListener('click', () => homeSetMode(homeMode === 'report' ? 'insight' : 'report'));
+
+// Scroll-based navigation, no arrow buttons: vertical scroll moves
+// between sections, horizontal scroll between cards in the section.
+// Trackpad two-finger scrolls arrive as many small wheel events, so
+// deltas accumulate until one move's worth is reached; a diagonal
+// gesture locks to its dominant axis; the lock stops one flick from
+// skipping several pages. The listener is passive:false so the page
+// never scrolls under the report stage.
+let homeReportWheelDX = 0;
+let homeReportWheelDY = 0;
+let homeReportWheelTimer = 0;
+$('#homeReport').addEventListener('wheel', (e) => {
+  if (homeMode !== 'report') return;
+  e.preventDefault();
+  if (Date.now() < homeReportLockUntil) return;
+  homeReportWheelDX += e.deltaX;
+  homeReportWheelDY += e.deltaY;
+  clearTimeout(homeReportWheelTimer);
+  homeReportWheelTimer = setTimeout(() => { homeReportWheelDX = 0; homeReportWheelDY = 0; }, 220);
+  const ax = Math.abs(homeReportWheelDX);
+  const ay = Math.abs(homeReportWheelDY);
+  if (Math.max(ax, ay) < HOME_REPORT_WHEEL_MIN) return;
+  const dir = ax > ay ? (homeReportWheelDX > 0 ? 'right' : 'left') : (homeReportWheelDY > 0 ? 'down' : 'up');
+  homeReportWheelDX = 0;
+  homeReportWheelDY = 0;
+  homeReportGo(dir);
+}, { passive: false });
+
+// Arrow keys navigate too (only while report mode is showing).
+document.addEventListener('keydown', (e) => {
+  if (homeMode !== 'report' || $('#view-home').classList.contains('hidden')) return;
+  const dir = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' }[e.key];
+  if (!dir) return;
+  e.preventDefault();
+  homeReportGo(dir);
+});
+
+// Dots jump to a card; tapping a neighbour card centres it (the
+// active card's own click bubbles on to #view-home: navigate, or
+// the Received / Mark paid toggle — both keep working in report
+// mode). No reorder in report mode: nothing here enters edit mode.
+$('#homeReport').addEventListener('click', (e) => {
+  const dot = e.target.closest && e.target.closest('[data-report-dot]');
+  if (dot) {
+    if (Date.now() < homeReportLockUntil) return;
+    e.stopPropagation();
+    homeReport.card = Number(dot.dataset.reportDot);
+    homeReportApply();
+    homeReportLockUntil = Date.now() + HOME_REPORT_LOCK_MS;
+    return;
+  }
+  const slot = e.target.closest && e.target.closest('.report-slot');
+  if (!slot) return;
+  const sectionEl = slot.closest('.report-section');
+  if (!sectionEl || !sectionEl.classList.contains('is-active')) return;
+  const idx = Number(slot.dataset.reportSlot);
+  if (idx === homeReport.card) return; // active card: let the click bubble on
+  // A button inside a neighbour card is a real action (Received /
+  // Mark paid toggle, AI-card Delete), not a request to centre the
+  // card: let it bubble to #view-home instead of intercepting it.
+  if (e.target.closest && e.target.closest('button')) return;
+  if (Date.now() < homeReportLockUntil) return;
+  e.stopPropagation();
+  e.preventDefault();
+  homeReport.card = idx;
+  homeReportApply();
+  homeReportLockUntil = Date.now() + HOME_REPORT_LOCK_MS;
+});
 
 async function loadHome() {
   try {

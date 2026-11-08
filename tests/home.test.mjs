@@ -6,7 +6,7 @@ import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates,
   jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrence, homeCalendarFocusTarget,
-  homeCalDayIsActionable, homeLongPressMoved, homeDropBefore,
+  homeCalDayIsActionable, homeLongPressMoved, homeDropBefore, homeReportSections, homeReportMove,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
 import { calcSalary } from '../src/earnings.js';
@@ -645,4 +645,41 @@ test('home: homeCalendarDates keeps a payday that holiday-adjusts into the month
   assert.deepEqual(Object.keys(dec).sort(), ['2025-12-01', '2025-12-31']);
   assert.deepEqual(dec['2025-12-31'], [{ kind: 'salary', sourceId: 1, label: 'First of month' }]);
   assert.deepEqual(homeCalendarDates({ jobs, rentals: [], mortgageOccurrences: [], month: '2026-01' }), {});
+});
+
+test('home: report mode sections — highlight first, empty insight sections skipped', () => {
+  const data = {
+    highlights: [{ kind: 'salary', date: '2026-11-06', amount: 100 }],
+    insights: [
+      { section: 'property', metric: 'property_equity', title: 'Total equity' },
+      { section: 'stock', metric: 'stock_value', title: 'Portfolio value' },
+      { section: 'stock', metric: 'stock_gain', title: 'Total gain' },
+    ],
+  };
+  const secs = homeReportSections(data);
+  assert.deepEqual(secs.map((s) => s.key), ['highlight', 'property', 'stock']);
+  assert.deepEqual(secs.map((s) => s.title), ['Upcoming payments', 'Property', 'Stocks']);
+  assert.equal(secs[0].cards.length, 1);
+  assert.equal(secs[2].cards.length, 2); // card order inside a section is preserved
+  // Nothing at all: only Upcoming payments renders, with one empty card.
+  const empty = homeReportSections({ highlights: [], insights: [] });
+  assert.deepEqual(empty.map((s) => s.key), ['highlight']);
+  assert.equal(empty[0].cards.length, 1);
+  assert.equal(empty[0].cards[0].empty, true);
+});
+
+test('home: report mode move — left/right clamp, up/down clamp the card index', () => {
+  const secs = [
+    { key: 'highlight', cards: [{}, {}] },
+    { key: 'property', cards: [{}] },
+    { key: 'stock', cards: [{}, {}, {}] },
+  ];
+  assert.deepEqual(homeReportMove({ section: 0, card: 0 }, secs, 'left'), { section: 0, card: 0 });
+  assert.deepEqual(homeReportMove({ section: 0, card: 1 }, secs, 'right'), { section: 0, card: 1 });
+  assert.deepEqual(homeReportMove({ section: 0, card: 0 }, secs, 'right'), { section: 0, card: 1 });
+  assert.deepEqual(homeReportMove({ section: 0, card: 1 }, secs, 'down'), { section: 1, card: 0 }); // clamps to the 1-card section
+  assert.deepEqual(homeReportMove({ section: 2, card: 2 }, secs, 'up'), { section: 1, card: 0 });
+  assert.deepEqual(homeReportMove({ section: 1, card: 0 }, secs, 'up'), { section: 0, card: 0 });
+  assert.deepEqual(homeReportMove({ section: 2, card: 2 }, secs, 'down'), { section: 2, card: 2 }); // already last
+  assert.deepEqual(homeReportMove({ section: 0, card: 0 }, secs, 'up'), { section: 0, card: 0 }); // already first
 });

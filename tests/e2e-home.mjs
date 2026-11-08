@@ -482,6 +482,19 @@ export async function run(H, S) {
       }
       return null;
     };
+    // Fresh #home entries land in report mode; every pin below that
+    // needs the insight carousels calls this after its goto/reload.
+    // It waits for the Home DOM, flips the toggle if report mode is
+    // showing, then waits for the insight carousels to be visible.
+    const toInsight = async () => {
+      await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0
+        || document.querySelectorAll('.report-section').length > 0);
+      await page.evaluate(() => {
+        if (document.querySelector('#view-home').classList.contains('home-report')) document.querySelector('#homeModeBtn').click();
+      });
+      await until(() => !document.querySelector('#view-home').classList.contains('home-report')
+        && document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    };
 
     // Default landing: no hash → Home.
     await page.goto('http://ff.local/', { waitUntil: 'networkidle0', timeout: 30000 });
@@ -497,6 +510,149 @@ export async function run(H, S) {
       // Admin is a pre-existing seventh link, shown only to admin users.
       && (navLinks === 'Assets,Earnings,Spending,Planning,History,Tax' || navLinks === 'Assets,Earnings,Spending,Planning,History,Tax,Admin'),
       navLinks);
+
+    // ---- report mode: the default landing ----
+    // Every fresh #home entry lands in report mode: 5 sections in
+    // order (Upcoming payments, Property, Stocks, Earning, Spending),
+    // one big vertical card per page in a 3D carousel on a gradient,
+    // with a toggle to insight mode. The calendar stays in insight
+    // mode, so it is pinned in the toInsight() section below.
+    H.check('home UI: report mode is the default landing on a fresh entry',
+      await page.evaluate(() => {
+        const v = document.querySelector('#view-home');
+        return v && v.classList.contains('home-report') && getComputedStyle(document.querySelector('#homeReport')).display !== 'none';
+      }), await page.evaluate(() => document.querySelector('#view-home') ? document.querySelector('#view-home').className : 'no view-home'));
+    const reportSections = await page.evaluate(() => [...document.querySelectorAll('.report-section')].map((s) => ({
+      title: s.querySelector('.report-section-title').textContent,
+      slots: s.querySelectorAll('.report-slot').length, active: s.classList.contains('is-active'),
+    })));
+    H.check('home UI: report mode shows the 5 sections in order, Upcoming payments first and active',
+      reportSections.length === 5
+      && reportSections.map((s) => s.title.replace(/\d+ \/ 5$/, '')).join('|') === 'Upcoming payments|Property|Stocks|Earning|Spending'
+      && reportSections[0].active && reportSections[0].slots > 0,
+      JSON.stringify(reportSections));
+    const reportStyle = await page.evaluate(() => {
+      const v = document.querySelector('#view-home');
+      const slot = document.querySelector('.report-section.is-active .report-slot.is-active');
+      const cs = slot ? getComputedStyle(slot) : null;
+      return {
+        gradient: getComputedStyle(v).backgroundImage,
+        reflect: cs ? cs.webkitBoxReflect : null,
+        shadow: cs ? cs.boxShadow : null,
+        sectionTransition: getComputedStyle(document.querySelector('.report-section')).transitionDuration,
+      };
+    });
+    H.check('home UI: report mode has the gradient background, the active card carries the ground reflection + shadow, and sections transition visibly',
+      reportStyle.gradient.includes('linear-gradient')
+      && reportStyle.reflect && reportStyle.reflect.startsWith('below')
+      && reportStyle.shadow && reportStyle.shadow !== 'none'
+      && reportStyle.sectionTransition.includes('0.55s'),
+      JSON.stringify(reportStyle));
+    // A long press in report mode does NOT enter edit mode (reorder
+    // stays in insight mode). The active card is the Nov 6 salary
+    // row, which has no link, so the trailing click navigates
+    // nowhere.
+    const reportStage = await page.evaluate(() => {
+      const el = document.querySelector('#homeReport');
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    });
+    await page.mouse.move(reportStage.x, reportStage.y);
+    await page.mouse.down();
+    await wait(700);
+    await page.mouse.up();
+    H.check('home UI: long-press in report mode does not enter edit mode and does not navigate',
+      await page.evaluate(() => !document.querySelector('#view-home').classList.contains('home-edit-mode')
+        && ['', '#home'].includes(location.hash)),
+      await page.evaluate(() => `${document.querySelector('#view-home').className} ${location.hash}`));
+    // Wheel down moves to the next section (Property); the section
+    // slides, it never jumps.
+    await page.mouse.wheel({ deltaY: 120 });
+    await wait(700); // the 600ms navigation lock
+    const afterDown = await until(() => {
+      const s = document.querySelector('.report-section.is-active');
+      return s && s.dataset.reportSection === 'property' ? s.querySelector('.report-section-pos').textContent : null;
+    });
+    H.check('home UI: scrolling down in report mode moves to the Property section', !!afterDown && afterDown.includes('2 / 5'), String(afterDown));
+    // Wheel right moves to the next card in the section (Total equity
+    // → Assessed total); wheel left comes back.
+    await page.mouse.wheel({ deltaX: 120 });
+    await wait(700); // the 600ms navigation lock
+    const afterRight = await until(() => {
+      const s = document.querySelector('.report-section.is-active .report-slot.is-active');
+      return s && s.querySelector('.insight-label').textContent === 'Assessed total' ? 'Assessed total' : null;
+    });
+    H.check('home UI: scrolling right in report mode moves to the next card', !!afterRight, String(afterRight));
+    await page.mouse.wheel({ deltaX: -120 });
+    await wait(700); // the 600ms navigation lock
+    const afterLeft = await until(() => {
+      const s = document.querySelector('.report-section.is-active .report-slot.is-active');
+      return s && s.querySelector('.insight-label').textContent === 'Total equity' ? 'Total equity' : null;
+    });
+    H.check('home UI: scrolling left in report mode moves back to the previous card', !!afterLeft, String(afterLeft));
+    // Arrow keys navigate too.
+    await page.keyboard.press('ArrowDown');
+    await wait(700); // the 600ms navigation lock
+    const afterKeyDown = await until(() => {
+      const s = document.querySelector('.report-section.is-active');
+      return s && s.dataset.reportSection === 'stock' ? s.dataset.reportSection : null;
+    });
+    H.check('home UI: ArrowDown in report mode moves to the next section', !!afterKeyDown, String(afterKeyDown));
+    await page.keyboard.press('ArrowUp');
+    await wait(700); // the 600ms navigation lock
+    const afterKeyUp = await until(() => {
+      const s = document.querySelector('.report-section.is-active');
+      return s && s.dataset.reportSection === 'property' ? s.dataset.reportSection : null;
+    });
+    H.check('home UI: ArrowUp in report mode moves to the previous section', !!afterKeyUp, String(afterKeyUp));
+    // Wheel up returns to Upcoming payments; the Received toggle
+    // works on the report-mode highlight card (Nov 6 salary, first
+    // card, unmarked at this point). Toggling it back off restores
+    // the state the insight-mode pins below expect.
+    await page.mouse.wheel({ deltaY: -120 });
+    await wait(700); // the 600ms navigation lock
+    const backToHl = await until(() => {
+      const s = document.querySelector('.report-section.is-active');
+      return s && s.dataset.reportSection === 'highlight' ? 'highlight' : null;
+    });
+    H.check('home UI: scrolling up in report mode returns to Upcoming payments', !!backToHl, String(backToHl));
+    await page.evaluate(() => { document.querySelector('.report-section.is-active .report-slot.is-active [data-mark-kind]').click(); });
+    const reportToggled = await until(() => {
+      const b = document.querySelector('.report-section.is-active .report-slot.is-active [data-mark-kind]');
+      return b && b.textContent.includes('Received') ? b.textContent : null;
+    });
+    H.check('home UI: the Received toggle works on a report-mode highlight card', !!reportToggled, String(reportToggled));
+    await page.evaluate(() => { document.querySelector('.report-section.is-active .report-slot.is-active [data-mark-kind]').click(); });
+    const reportUntoggled = await until(() => {
+      const b = document.querySelector('.report-section.is-active .report-slot.is-active [data-mark-kind]');
+      return b && b.textContent.includes('Mark received') ? b.textContent : null;
+    });
+    H.check('home UI: toggling the report-mode card back off restores its Mark received state', !!reportUntoggled, String(reportUntoggled));
+    // The toggle switches to insight mode and back; a fresh entry
+    // always lands in report mode again.
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    const inInsight = await until(() => !document.querySelector('#view-home').classList.contains('home-report')
+      && getComputedStyle(document.querySelector('#homeReport')).display === 'none'
+      && document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    H.check('home UI: the toggle switches to insight mode (report stage hides, carousels show)', !!inInsight,
+      await page.evaluate(() => document.querySelector('#view-home').className));
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    const backInReport = await until(() => document.querySelector('#view-home').classList.contains('home-report')
+      && document.querySelectorAll('.report-section').length === 5);
+    H.check('home UI: the toggle switches back to report mode', !!backInReport,
+      await page.evaluate(() => document.querySelector('#view-home').className));
+    // A fresh entry (page reload) always lands in report mode, even
+    // when the visit before it ended in insight mode.
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    await until(() => !document.querySelector('#view-home').classList.contains('home-report'));
+    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    const freshReport = await until(() => document.querySelector('#view-home').classList.contains('home-report')
+      && document.querySelectorAll('.report-section').length === 5);
+    H.check('home UI: a fresh #home entry always lands in report mode', !!freshReport,
+      await page.evaluate(() => document.querySelector('#view-home').className));
+    // Insight mode from here on: every pin below needs the insight
+    // carousels.
+    await toInsight();
 
     // Home calendar: renders with the current month, marking the
     // fixture's payment dates per kind, today highlighted. The
@@ -831,6 +987,7 @@ export async function run(H, S) {
     });
     H.check('home UI: Property heading navigates to the Properties list', !!propLanded, await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
     await page.evaluate(() => document.querySelector('[data-home-section="spending"]').previousElementSibling.querySelector('.home-section-all').click());
     const spendLanded = await until(() => {
@@ -839,6 +996,7 @@ export async function run(H, S) {
     });
     H.check('home UI: Spending View all navigates to the Spending page', !!spendLanded, await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
     const assessedText = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
@@ -861,6 +1019,7 @@ export async function run(H, S) {
     H.check('home UI: marking does not navigate away from Home',
       await page.evaluate(() => ['', '#home'].includes(location.hash)), await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     const persisted = await until(() => {
       const b = document.querySelector('#homeHighlightCarousel .insight-card[data-pay-kind="salary"] [data-mark-kind]');
       return b && b.textContent.includes('Received') ? b.textContent : null;
@@ -903,6 +1062,7 @@ export async function run(H, S) {
     H.check('home UI: clicking the mortgage card opens that property detail page',
       !!mortDetail, String(mortDetail && mortDetail.slice(0, 200)));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
 
     // Highlight gap: payment cards sit side by side — adjacent rects
@@ -925,6 +1085,7 @@ export async function run(H, S) {
     const shortTapNav = await until(() => (location.hash === '#assets/properties' ? location.hash : null));
     H.check('home UI: a short tap on a card still navigates (no long-press)', !!shortTapNav, await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
     // Wait for the home DOM to settle before touching the
     // carousel: goto(#home) re-fetches /api/home and renderHome
@@ -1068,6 +1229,7 @@ export async function run(H, S) {
     H.check('home UI: after exiting edit mode, tapping a card navigates again',
       !!afterExitNav, await page.evaluate(() => location.hash));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     const propOrderReload = await until(() => {
       const labels = [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent);
       return labels.length === 3 && JSON.stringify(labels) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']) ? labels : null;
@@ -1087,6 +1249,7 @@ export async function run(H, S) {
     r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: rentalId, date: '2026-11-15', received: 1 });
     H.check('home UI: marking the Nov 15 rent succeeds', r.status === 200 && r.data.received === 1, JSON.stringify(r.data));
     await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeCalendar .home-cal-day:not(.is-blank)').length > 0);
     const nov15Dots = await page.evaluate(() => {
       const c = document.querySelector('[data-cal-date="2026-11-15"]');
@@ -1133,6 +1296,7 @@ export async function run(H, S) {
     H.check('home UI: clicking the Groceries card opens Spending with Groceries filtered',
       !!catView, String(catView));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
     const delCount = await page.evaluate(() => document.querySelectorAll('.home-card-del').length);
     H.check('home UI: only the AI card has a Delete button (system cards have none)',
@@ -1215,6 +1379,7 @@ export async function run(H, S) {
     H.check('home UI: clicking the property card opens that property detail page',
       !!propDetail, String(propDetail && propDetail.slice(0, 200)));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
     await page.evaluate(() => document.querySelector('.home-card-del').click());
     const propDel = await until(() => {
@@ -1224,6 +1389,66 @@ export async function run(H, S) {
     H.check('home UI: deleting the property AI card removes it and stays on Home',
       !!propDel && await page.evaluate(() => ['', '#home'].includes(location.hash)),
       JSON.stringify({ propDel, hash: await page.evaluate(() => location.hash) }));
+
+    // Report mode: a property card shows the house photo only when
+    // the property has one — no photo, no projection at all. The
+    // photo is a tiny data-URI image so the pin needs no network.
+    const photoUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    r = await H.req('PUT', `/api/properties/${pidA}`, { photo_url: photoUri });
+    H.check('home report photo: setting a photo on property A succeeds', r.status === 200, JSON.stringify(r.data));
+    // Append the per-property AI card again via the panel (it was
+    // deleted above), then check the API attaches the photo to it.
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'property', title: 'Test home equity', metric: `property_equity:${pidA}` } }));
+    await page.evaluate(() => {
+      const input = document.querySelector('#homeAiText');
+      input.value = 'Show me the first property equity';
+      document.querySelector('#homeAiSend').click();
+    });
+    const photoProposed = await until(() => {
+      const b = document.querySelector('#homeAiApplyBtn');
+      return b ? document.querySelector('#homeAiThread').textContent : null;
+    });
+    H.check('home report photo: AI-append proposes the property equity card again', !!photoProposed && photoProposed.includes('Test home equity'), String(photoProposed && photoProposed.slice(0, 200)));
+    await page.evaluate(() => document.querySelector('#homeAiApplyBtn').click());
+    const photoAppended = await until(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
+      return cards.length === 4 ? 'appended' : null;
+    });
+    H.check('home report photo: Apply appends the property AI card again', !!photoAppended, String(photoAppended));
+    r = await H.req('GET', '/api/home');
+    const aiPhoto = (r.data.insights.find((c) => c.kind === 'ai' && c.metric === `property_equity:${pidA}`) || {}).photo;
+    const sysPhotos = r.data.insights.filter((c) => c.kind === 'system' && c.section === 'property').map((c) => c.photo);
+    H.check('home report photo: the API attaches the photo to the property-entity AI card only',
+      aiPhoto === photoUri && sysPhotos.every((p) => p == null), JSON.stringify({ aiPhoto, sysPhotos }));
+    // In report mode the Property section shows the photo on the AI
+    // card and no photo block on any standard card.
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    await until(() => document.querySelector('#view-home').classList.contains('home-report'));
+    const repStage = await page.evaluate(() => {
+      const el = document.querySelector('#homeReport');
+      const rr = el.getBoundingClientRect();
+      return { x: rr.left + rr.width / 2, y: rr.top + rr.height / 2 };
+    });
+    await page.mouse.move(repStage.x, repStage.y);
+    await page.mouse.wheel({ deltaY: 120 });
+    await wait(700); // the 600ms navigation lock
+    const reportPhotos = await page.evaluate(() => [...document.querySelectorAll('.report-section[data-report-section="property"] .report-slot')].map((s) => {
+      const img = s.querySelector('.report-photo img');
+      return img ? img.getAttribute('src') : null;
+    }));
+    H.check('home report photo: only the property card with a photo shows one in report mode',
+      JSON.stringify(reportPhotos) === JSON.stringify([null, null, null, photoUri]), JSON.stringify(reportPhotos));
+    // Clean up: back to insight mode, delete the AI card, clear the photo.
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    await toInsight();
+    await page.evaluate(() => document.querySelector('.home-card-del').click());
+    const photoDel = await until(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="property"] .insight-card')];
+      return cards.length === 3 ? 'back to 3' : null;
+    });
+    H.check('home report photo: deleting the AI card cleans up', !!photoDel, String(photoDel));
+    r = await H.req('PUT', `/api/properties/${pidA}`, { photo_url: null });
+    H.check('home report photo: clearing the photo succeeds', r.status === 200, JSON.stringify(r.data));
 
     // A standard card falls back to its section summary page.
     await page.evaluate(() => {
@@ -1237,6 +1462,7 @@ export async function run(H, S) {
     H.check('home UI: clicking a standard card opens its section summary page',
       !!stdNav, String(stdNav));
     await page.goto('http://ff.local/#home', { waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
     await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
 
     // Overview is untouched: its route still renders.
