@@ -282,11 +282,26 @@ const stooqCsvBySymbol = {
   ].join('\n'),
   // New-symbol sink pin: AMZN has no holding in the fixture, so its
   // current price comes from the tiers — the stub makes it 266.03.
+  // The 2025-11 point is what gives the buy target a usable 1y
+  // history rate (2025-11 $200 → 2026-10 $266.03 = 33.02%/yr after
+  // the engine's round4): without a point a year back, the 1y
+  // window has no start and the buy stays flat.
   'amzn.us': [
     'Date,Open,High,Low,Close,Volume',
+    '2025-11-28,199,201,198,200,1000',
     '2026-01-02,197,199,196,198,1000',
     '2026-01-30,199,201,198,200,1000',
     '2026-10-30,264,267,263,266.03,1000',
+  ].join('\n'),
+  // Second non-held symbol (user 2026-11-07): the buy-target pull
+  // is generic, so the fixture pins a second symbol too — MSFT at
+  // a 50% 1y rate (2025-11 $100 → 2026-10 $150).
+  'msft.us': [
+    'Date,Open,High,Low,Close,Volume',
+    '2025-11-28,99,101,98,100,1000',
+    '2026-01-02,104,106,103,105,1000',
+    '2026-01-30,104,106,103,105,1000',
+    '2026-10-30,149,151,148,150,1000',
   ].join('\n'),
 };
 const stooqStub = http.createServer((req, res) => {

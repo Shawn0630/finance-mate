@@ -583,6 +583,79 @@ export async function ensurePoolHistory(db, holdings, opts = {}) {
   return { results, notes: results.filter((r) => !r.ok).map((r) => ({ holdingId: r.holdingId, symbol: r.symbol, error: r.error })) };
 }
 
+// Stored price points for a buy-target symbol (invest_symbol_prices),
+// ascending by date. A symbol with no rows has no history.
+export function listSymbolPricePoints(db, symbol) {
+  const sym = String(symbol || '').trim().toUpperCase();
+  if (!sym) return [];
+  return db.prepare('SELECT date, price, currency, source FROM invest_symbol_prices WHERE symbol = ? ORDER BY date')
+    .all(sym).map((r) => ({ date: r.date, price: Number(r.price), currency: r.currency, source: r.source }));
+}
+
+// Buy-target history pull (user 2026-11-07 — the AMZN-flat fix):
+// a buy op can target a symbol the user does not hold yet, so the
+// pool pull (holding-keyed) never sees it and the projection's
+// synthetic holding stays flat at 0%. At Generate, pull the full
+// history for each symbol-only buy target through the same chain
+// (Stooq → Yahoo chart → Nasdaq) and store it in
+// invest_symbol_prices, so the synthetic holding grows at its
+// history rate (1y → 3y → 5y CAGR, same as held holdings) and the
+// what-if backtest has real past prices. The gate is the same as
+// the pool pull's: a symbol whose stored points already yield a
+// usable rate is never pulled. Never throws and never fails the
+// caller: a failed fetch falls back to stored points (or flat, when
+// there are none) and is reported in the returned notes. A
+// dedicated backoff meta key (invest_symhist_<SYM>_try) keeps a
+// failing symbol from being re-attempted on every render.
+// fetchSymbol is injectable so tests drive the pull without the
+// live network; the default runs the tier chain.
+export async function ensureSymbolHistory(db, symbols, opts = {}) {
+  const currentMonth = opts.currentMonth;
+  const backoffMs = opts.backoffMs ?? FAIL_BACKOFF_MS;
+  const fetchSymbol = opts.fetchSymbol || ((s) => tryPriceTiers(s.symbol));
+  const jobs = [];
+  for (const s of symbols || []) {
+    const sym = String(s && s.symbol || '').trim().toUpperCase();
+    if (!sym) continue;
+    const currency = (s && s.currency) || 'CAD';
+    const points = listSymbolPricePoints(db, sym);
+    const rate = currentReturnRateFromPoints(points, currentMonth);
+    if (rate) continue; // already usable — never pull
+    const tryKey = `invest_symhist_${sym}_try`;
+    const lastTry = Number(getMeta(db, tryKey) || 0);
+    if (lastTry && Date.now() - lastTry < backoffMs) continue; // failing symbol: back off
+    jobs.push((async () => {
+      setMeta(db, tryKey, String(Date.now()));
+      let attempt;
+      try { attempt = await fetchSymbol({ symbol: sym, currency }); } catch (err) { attempt = { rows: null, source: null, error: err }; }
+      const rows = attempt && attempt.rows;
+      if (!rows || !rows.length) {
+        const message = (attempt && attempt.error && attempt.error.message) || 'no market data';
+        return { symbol: sym, currency, pulled: true, ok: false, error: message };
+      }
+      try {
+        const ts = new Date().toISOString();
+        db.transaction(() => {
+          db.prepare("DELETE FROM invest_symbol_prices WHERE symbol = ? AND source IN ('stooq', 'yahoo', 'nasdaq')").run(sym);
+          const ins = db.prepare(
+            'INSERT OR REPLACE INTO invest_symbol_prices (symbol, date, price, currency, source, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+          for (const r of rows) ins.run(sym, r.date, r.price, currency, attempt.source || 'stooq', ts);
+        })();
+      } catch (err) {
+        console.warn(`[prices] symbol price cache write for ${sym} failed: ${err.message}`);
+        return { symbol: sym, currency, pulled: true, ok: false, error: err.message };
+      }
+      clearMeta(db, tryKey);
+      const after = listSymbolPricePoints(db, sym);
+      const rateAfter = currentReturnRateFromPoints(after, currentMonth);
+      const volAfter = holdingVolatilityFromPoints(after, currentMonth);
+      return { symbol: sym, currency, pulled: true, ok: true, ratePct: rateAfter ? rateAfter.ratePct : null, volPct: volAfter ? volAfter.volPct : null, points: after.length };
+    })());
+  }
+  const results = await Promise.all(jobs);
+  return { results, notes: results.filter((r) => !r.ok).map((r) => ({ symbol: r.symbol, error: r.error })) };
+}
+
 // How a holding is currently priced, for the UI's honesty
 // labels: which source carries its latest price, whether the
 // fetched series is stale (a fetch is due / failed today), and

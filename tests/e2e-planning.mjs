@@ -2935,12 +2935,13 @@ export async function run(H, S) {
       && !!amznBuy && amznBuy.params.price === 266.03 && amznBuy.params.amount === 600 && amznBuy.params.accountId === poolAcctA
       && newStockOps.some((o) => o.params && o.params.symbol === 'POOL.B'),
     JSON.stringify(newStockOps));
-  // AMZN has no price history: under the flat world its buy is
-  // flat. Pool-buy funding (user 2026-11-05): the buy is funded BY
-  // the pool, so the $2,000 AMZN buy sells the whole flat pool B —
-  // the strategy holds AMZN only ($2,000 flat), and Value Δ is $0,
-  // not +$2,000. The old pin asserted $4,000 (pool + AMZN both
-  // held): that was the double-count bug, not the behaviour.
+  // Buy-target history (user 2026-11-07 — the AMZN-flat fix): the
+  // buy is funded BY the pool, so the $2,000 AMZN buy sells the
+  // whole flat pool B — the strategy holds AMZN only (not $4,000,
+  // the old double-count), and AMZN now grows at its OWN history
+  // rate instead of flat. The rate is read from the comparison
+  // payload below, not hardcoded, so the pin stays true if the
+  // stub closes move.
   r = await H.req('POST', '/api/planning/projects', { name: 'Flat Pool Project', question: 'q', category: 'investment', subcategory: 'stock', entity: { type: 'pool', items: [{ holdingId: poolHoldB, percent: 100 }] }, applyRecommendation: true });
   H.check('sink-simplify: flat pool project created', r.status === 201 && r.data.project && r.data.project.id > 0, JSON.stringify(r.data));
   const flatProjId = r.data.project.id;
@@ -2951,14 +2952,43 @@ export async function run(H, S) {
   r = await H.req('GET', `/api/planning/strategies/${flatStrat.id}?scenarioId=0`);
   const flatSeries = r.data.projection && r.data.projection.stocks && r.data.projection.stocks.series;
   const flatBaseSeries = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
-  H.check('poolbuy-funding: AMZN buy sells the flat pool — strategy holds AMZN only ($2,000 flat, not $4,000)',
-    flatSeries && flatSeries.length > 0 && flatSeries[0].value === flatSeries[flatSeries.length - 1].value && Math.abs(flatSeries[0].value - 2000) < 1
-      && flatBaseSeries && flatBaseSeries.length > 0 && Math.abs(flatBaseSeries[0].value - 2000) < 1,
-    JSON.stringify({ first: flatSeries && flatSeries[0], last: flatSeries && flatSeries[flatSeries.length - 1], baseFirst: flatBaseSeries && flatBaseSeries[0] }));
+  // ---- Second non-held symbol (user 2026-11-07): the buy-target
+  // pull is generic, so the fixture buys a second symbol the pool
+  // does not hold (MSFT) on its own strategy — same shape, its own
+  // rate. Both strategies pin the general case, not just AMZN.
+  r = await H.req('POST', `/api/planning/projects/${flatProjId}/strategies`, { name: 'MSFT Buy', source: 'manual' });
+  H.check('buy-target-history: MSFT strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
+  const msftStratId = r.data.strategy.id;
+  r = await H.req('POST', `/api/planning/strategies/${msftStratId}/ops`, { op_type: 'buy', params: { accountId: poolAcctB, symbol: 'MSFT', date: `${_poolVan.slice(0, 7)}-01`, amount: 2000, price: 150 }, legs: [{ source_ref: 'cash', amount: 'remainder' }] });
+  H.check('buy-target-history: MSFT buy posts at the stubbed current price', r.status === 201, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/planning/strategies/${msftStratId}?scenarioId=0`);
+  const msftSeries = r.data.projection && r.data.projection.stocks && r.data.projection.stocks.series;
+  // The comparison is where each buy target's history is pulled and
+  // where the what-if entries live — the rates below come from it.
+  r = await H.req('GET', `/api/planning/projects/${flatProjId}/comparison`);
+  const flatWhatIf = (r.data.report && r.data.report.whatIf) || [];
+  const amznWi = flatWhatIf.find((e) => e.alt && e.alt.symbol === 'AMZN');
+  const msftWi = flatWhatIf.find((e) => e.alt && e.alt.symbol === 'MSFT');
+  const amznRate = amznWi && amznWi.alt ? amznWi.alt.ratePct / 100 : null;
+  const msftRate = msftWi && msftWi.alt ? msftWi.alt.ratePct / 100 : null;
+  H.check('buy-target-history: AMZN buy sells the flat pool and grows at its own history rate, not flat',
+    flatSeries && flatSeries.length > 0 && amznRate != null && amznRate > 0
+      && Math.abs(flatSeries[0].value - 2000 * Math.pow(1 + amznRate, 1 / 12)) < 5
+      && Math.abs(flatSeries[flatSeries.length - 1].value / flatSeries[0].value - Math.pow(1 + amznRate, 30)) / Math.pow(1 + amznRate, 30) < 0.005
+      && flatBaseSeries && flatBaseSeries.length > 0 && Math.abs(flatBaseSeries[flatBaseSeries.length - 1].value - 2000) < 1,
+    JSON.stringify({ rate: amznRate, first: flatSeries && flatSeries[0], last: flatSeries && flatSeries[flatSeries.length - 1], baseLast: flatBaseSeries && flatBaseSeries[flatBaseSeries.length - 1] }));
+  H.check('buy-target-history: MSFT buy grows at ITS OWN history rate (50%/yr), not AMZN\'s',
+    msftSeries && msftSeries.length > 0 && msftRate != null && Math.abs(msftRate - 0.5) < 0.001
+      && Math.abs(msftSeries[0].value - 2000 * Math.pow(1 + msftRate, 1 / 12)) < 5
+      && Math.abs(msftSeries[msftSeries.length - 1].value / msftSeries[0].value - Math.pow(1 + msftRate, 30)) / Math.pow(1 + msftRate, 30) < 0.005,
+    JSON.stringify({ rate: msftRate, first: msftSeries && msftSeries[0], last: msftSeries && msftSeries[msftSeries.length - 1] }));
   // ---- Pool-buy funding, Buy SPY shape (user 2026-11-05,
-  // "baseline的不对啊"): the whole $2,000 pool buys AMZN (flat, no
-  // history) while the baseline's POOL.C grows at 25% — Value Δ must
-  // DECLINE from ~$0, not sit flat at +$2,000.
+  // "baseline的不对啊"): the whole $2,000 pool buys AMZN while the
+  // baseline's POOL.C grows at 25% — AMZN now grows at its own
+  // 33.02%/yr history rate, so Value Δ must RISE from ~$0, not
+  // decline. (The old pin asserted a decline because AMZN was
+  // flat; the $37.54 POOL.C remainder — the pool held $2,037.54 at
+  // the buy month — rides along in both worlds.)
   r = await H.req('POST', `/api/planning/projects/${poolGrowthId}/strategies`, { name: 'Pool Buy Funding', source: 'manual' });
   H.check('poolbuy-funding: funding pin strategy created', r.status === 201 && r.data.strategy && r.data.strategy.id > 0, JSON.stringify(r.data));
   const poolBuyStratId = r.data.strategy.id;
@@ -2968,16 +2998,144 @@ export async function run(H, S) {
   const poolBuyBase = r.data.baseline && r.data.baseline.stocks && r.data.baseline.stocks.series;
   const poolBuySeries = r.data.projection && r.data.projection.stocks && r.data.projection.stocks.series;
   const poolBuyDelta = (i) => (poolBuySeries && poolBuyBase && poolBuySeries[i] && poolBuyBase[i]) ? poolBuySeries[i].value - poolBuyBase[i].value : null;
-  H.check('poolbuy-funding: Value Δ declines from ~$0 (AMZN flat minus POOL.C growing at 25%)',
+  H.check('poolbuy-funding: Value Δ rises from ~$0 (AMZN at 33.02%/yr outgrows POOL.C at 25%)',
     poolBuySeries && poolBuyBase && poolBuySeries.length > 12
-      && Math.abs(poolBuyDelta(0)) < 1
-      && Math.abs(poolBuyDelta(12) + 500) < 5
-      && poolBuyDelta(poolBuySeries.length - 1) < -1000000,
+      && Math.abs(poolBuyDelta(0) - 48.11) < 10
+      && Math.abs(poolBuyDelta(12) - 224.40) < 10
+      && poolBuyDelta(poolBuySeries.length - 1) > 8000000,
     JSON.stringify({ d0: poolBuyDelta(0), d12: poolBuyDelta(12), dLast: poolBuyDelta(poolBuySeries.length - 1), first: poolBuySeries && poolBuySeries[0], last: poolBuySeries && poolBuySeries[poolBuySeries.length - 1] }));
   H.check('poolbuy-funding: the buy row Sell-from-pool figure equals the pool draw (buyCashFromSells == buy amount)',
     r.data.projection && r.data.projection.stocks && r.data.projection.stocks.buyCash === 2000 && r.data.projection.stocks.buyCashFromSells === 2000
       && (r.data.projection.errors || []).length === 0,
     JSON.stringify({ stocks: r.data.projection && r.data.projection.stocks, errors: r.data.projection && r.data.projection.errors }));
+  // ---- What-if backtest (user 2026-11-07): the comparison payload
+  // carries one entry per strategy with a symbol buy — actual (the
+  // pool's holding) vs alternative (the buy target), same money,
+  // real prices before today, history-rate forecast after. The
+  // buy-op month is the current month here, so the backtest segment
+  // starts at the cutoff (a past start month is pinned at unit
+  // level in tests/whatIf.test.mjs); the payload still proves both
+  // lines, the cutoff, the stub prices, and each leg's own rate.
+  H.check('whatif: one entry per buy target, actual is the pool holding, alt is the buy target',
+    flatWhatIf.length === 2 && !!amznWi && !!msftWi
+      && amznWi.actual.symbol === 'POOL.B' && amznWi.alt.symbol === 'AMZN' && amznWi.amountCad === 2000
+      && msftWi.actual.symbol === 'POOL.B' && msftWi.alt.symbol === 'MSFT' && msftWi.amountCad === 2000,
+    JSON.stringify(flatWhatIf.map((e) => ({ actual: e.actual && e.actual.symbol, alt: e.alt && e.alt.symbol, amount: e.amountCad }))));
+  H.check('whatif: cutoff is the current month, both lines present, past prices are the stub closes',
+    amznWi.cutoffMonth === _poolVan.slice(0, 7) && amznWi.cutoffIndex === 12
+      && amznWi.months[0] === '2025-11' && amznWi.months[amznWi.cutoffIndex] === amznWi.cutoffMonth && amznWi.months.length === 373
+      && amznWi.actualPrices[0] === 40 && amznWi.altPrices[0] === 200 && amznWi.altPrices[12] === 266.03
+      && msftWi.altPrices[0] === 100 && msftWi.altPrices[12] === 150 && amznWi.historyStartMonth === '2025-11'
+      && amznWi.actualValues[0] === 2000 && Math.abs(amznWi.altValues[0] - 2000 * 200 / 266.03) < 1
+      && amznWi.altValues[amznWi.cutoffIndex] === 2000,
+    JSON.stringify({ cutoff: amznWi.cutoffMonth, idx: amznWi.cutoffIndex, months: amznWi.months.length, aPx: amznWi.actualPrices[0], altPx: amznWi.altPrices[0], msftPx: msftWi.altPrices[0], histStart: amznWi.historyStartMonth }));
+  H.check('whatif: future grows at each alt\'s own history rate, actual stays flat',
+    amznRate != null && msftRate != null
+      && Math.abs(amznWi.altValues[amznWi.cutoffIndex + 12] - 2000 * (1 + amznRate)) < 5
+      && Math.abs(msftWi.altValues[msftWi.cutoffIndex + 12] - 2000 * (1 + msftRate)) < 5
+      && amznWi.actualValues[amznWi.cutoffIndex + 12] === 2000 && msftWi.actualValues[msftWi.cutoffIndex + 12] === 2000
+      && amznWi.actual.ratePct === 0,
+    JSON.stringify({ amzn12: amznWi.altValues[amznWi.cutoffIndex + 12], msft12: msftWi.altValues[msftWi.cutoffIndex + 12], actual12: amznWi.actualValues[amznWi.cutoffIndex + 12], actualRate: amznWi.actual.ratePct }));
+  // What-if panel in the browser: the report renders one panel per
+  // buy target (AMZN + MSFT), each with a canvas, a start-month
+  // select and an end-values table; picking an earlier start month
+  // re-normalizes the table in place (no round-trip).
+  r = await H.req('POST', `/api/planning/projects/${flatProjId}/reports`, { name: 'What-if browser', definition: { charts: [] }, strategy_ids: [flatStrat.id, msftStratId], scenario_ids: [] });
+  H.check('whatif: browser report created', r.status === 201 && r.data.report && r.data.report.id > 0, JSON.stringify(r.data));
+  if (!H.puppeteer || !H.chromeAvailable) {
+    console.log('planning what-if browser checks skipped (puppeteer-core / probe Chrome not available)');
+  } else {
+    const forwardW = (rq) => new Promise((resolve, reject) => {
+      const rr = http.request(
+        { host: '127.0.0.1', port: H.PORT, path: rq.url, method: rq.method, headers: rq.headers },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, headers: resp.headers, body: Buffer.concat(chunks) }));
+        }
+      );
+      rr.on('error', reject);
+      if (rq.postData) rr.write(Buffer.from(rq.postData, 'utf8'));
+      rr.end();
+    });
+    const loginResW = await fetch(H.BASE + '/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin' }),
+    });
+    const cookieValueW = loginResW.headers.get('set-cookie').split(';')[0].split('=')[1];
+    const browserW = await H.puppeteer.launch({
+      executablePath: '/opt/meta-chromium/chrome',
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-dev-shm-usage',
+        ...(process.env.CHROME_EXTRA_FLAGS ? process.env.CHROME_EXTRA_FLAGS.split(/\s+/).filter(Boolean) : [])],
+    });
+    try {
+      const page = await browserW.newPage();
+      const client = await page.target().createCDPSession();
+      await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      client.on('Fetch.requestPaused', async (e) => {
+        try {
+          const u = new URL(e.request.url);
+          if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+          const headers = {};
+          for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+          const resp = await forwardW({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+          const respHeaders = Object.entries(resp.headers)
+            .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+            .map(([name, value]) => ({ name, value: String(value) }));
+          await client.send('Fetch.fulfillRequest', {
+            requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+            body: resp.body.toString('base64'),
+          });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+      await client.send('Network.setCookie', { name: 'ff_session', value: cookieValueW, domain: 'ff.local', path: '/', httpOnly: true });
+      const waitW = (ms) => new Promise((res2) => setTimeout(res2, ms));
+      await page.goto(`http://ff.local/#planning/project/${flatProjId}`, { waitUntil: 'networkidle0', timeout: 30000 });
+      await waitW(1200);
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll('[data-plan-report-view]')].find((el) => el.textContent.includes('What-if browser'));
+        if (card) card.click();
+      });
+      await waitW(1500);
+      const wiView = await page.evaluate(() => {
+        const panels = [...document.querySelectorAll('[data-whatif-panel]')];
+        return {
+          count: panels.length,
+          titles: panels.map((p) => (p.querySelector('h3') || {}).textContent || ''),
+          canvases: panels.map((p) => !!p.querySelector('canvas')),
+          selects: panels.map((p) => { const s = p.querySelector('select'); return s ? [...s.options].map((o) => o.value) : []; }),
+          tables: panels.map((p) => p.textContent.includes('Difference')),
+        };
+      });
+      H.check('whatif: report renders one panel per buy target, each with canvas, start select and Difference table',
+        wiView.count === 2 && wiView.titles.some((t) => t.includes('AMZN')) && wiView.titles.some((t) => t.includes('MSFT'))
+          && wiView.titles.every((t) => t.includes('POOL.B')) && wiView.canvases.every(Boolean)
+          && wiView.selects.every((opts) => opts[0] === '2025-11' && opts[opts.length - 1] === _poolVan.slice(0, 7))
+          && wiView.tables.every(Boolean),
+        JSON.stringify(wiView));
+      const picked = await page.evaluate(() => {
+        const panel = [...document.querySelectorAll('[data-whatif-panel]')].find((p) => ((p.querySelector('h3') || {}).textContent || '').includes('AMZN'));
+        if (!panel) return null;
+        const sel = panel.querySelector('select');
+        if (!sel) return null;
+        sel.value = '2025-11';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      });
+      await waitW(400);
+      const afterPick = await page.evaluate(() => {
+        const panel = [...document.querySelectorAll('[data-whatif-panel]')].find((p) => ((p.querySelector('h3') || {}).textContent || '').includes('AMZN'));
+        const th = panel ? panel.querySelector('table thead th:nth-child(2)') : null;
+        return th ? th.textContent : null;
+      });
+      H.check('whatif: picking an earlier start month re-normalizes the table in place',
+        picked === true && afterPick && afterPick.includes('2025'),
+        JSON.stringify({ picked, afterPick }));
+    } finally { await browserW.close(); }
+  }
   // The strategy GET no longer carries a sink or poolAccounts, and
   // the comparison row carries the buy list for the card label.
   r = await H.req('GET', `/api/planning/strategies/${newStockStratId}`);

@@ -24,7 +24,7 @@ import {
   computeHolding, computeAccount, computePortfolio, computeFillPreview, unitsOn,
   effectiveAccountDefaultCurrency, pinCadReturnPct,
 } from './investments.js';
-import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, latestPrice, clearHoldingPriceMeta, ensurePoolHistory } from './prices.js';
+import { ensureHoldingPrices, ensureFxRates, refreshAllPrices, priceStatusFor, makeFxResolver, searchSecurities, latestPrice, clearHoldingPriceMeta, ensurePoolHistory, ensureSymbolHistory, listSymbolPricePoints } from './prices.js';
 import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
@@ -53,7 +53,7 @@ import {
   applyStoredCustomSinkRate,
   calcPenalty, validateOp, validateLegs,
   computeProjection, compareProjections, returnSuggestionsFromPoints,
-  buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx,
+  buildMergeWrites, buildRevertInverse, OP_TYPES, monthIdxOf, ymOfIdx, round2,
   latestMaturityMonth, maturityHorizonMonths, activeTermEndMonth,
   reportMonthlySeries, reportCostBreakdown, monthlyNetCashflowSeries,
   planProjectTemplate, buildPlanAiSnapshot, normalizeAiAsk,
@@ -72,7 +72,7 @@ import {
   validateReportScenarioIds, validateAiChartMethods, validateReportDefinition,
   validateAiReportChartSeries, aiReportPrompt, validateAiReportBaselineKind, aiSuggestNamePrompt, cleanAiSuggestedName,
   validateReportVariables, applyReportVariables, validateAiEngine, evaluateAiEngine,
-  aiReportRefinePrompt, aiReportDefinitionDiff,
+  aiReportRefinePrompt, aiReportDefinitionDiff, whatIfBacktest,
   droppedScenarioPrimeSteps, primeStepDroppedMessage,
 } from './planning.js';
 
@@ -5435,8 +5435,46 @@ async function planProjectionFor(strategy, project, scenarioInput, overrides) {
     ? overrides.horizonMonths
     : maturityHorizonMonths(ops, currentMonth);
   const args = { mainline, ops, legs, primeHistory, currentPrime, currentMonth, potInitial, poolHoldingIds, horizonMonths };
+  // Buy-target history (user 2026-11-07 — the AMZN-flat fix): a buy
+  // op can target a symbol the user does not hold yet (no
+  // holdingId), so the pool pull never sees it. Pull its history
+  // here — every projection runs through this function (strategy
+  // page, merge preview, comparison), so all of them get the same
+  // fix — and hand the stored points to the engine so the synthetic
+  // holding grows at its history rate. The pull is gated (a usable
+  // rate → skip) and backed off, so repeated renders cost nothing
+  // after the first fetch; a failed fetch never fails the
+  // projection (the buy stays flat and the note names it).
+  let symbolHistoryNotes = [];
+  let symbolPricePoints = {};
+  {
+    const targets = [];
+    const seenSym = new Set();
+    for (const o of ops) {
+      const p = o.params || {};
+      if (o.op_type !== 'buy' || p.holdingId != null || !p.symbol) continue;
+      const sym = String(p.symbol).toUpperCase();
+      if (seenSym.has(sym)) continue;
+      seenSym.add(sym);
+      targets.push({ symbol: sym, currency: p.currency || 'CAD' });
+    }
+    if (targets.length) {
+      try {
+        const pulled = await ensureSymbolHistory(db, targets, { currentMonth });
+        symbolHistoryNotes = pulled.notes;
+        for (const t of targets) {
+          const pts = listSymbolPricePoints(db, t.symbol);
+          if (pts.length) symbolPricePoints[t.symbol] = pts;
+        }
+      } catch (err) {
+        console.warn(`[planning] symbol history pull failed, using stored points: ${err.message}`);
+        symbolHistoryNotes = [{ symbol: targets.map((t) => t.symbol).join(', '), error: err.message }];
+      }
+    }
+  }
+  const argsWithSymbols = { ...args, symbolPricePoints };
   const { map: holdingGrowth, rates: currentRates } = planHoldingGrowth(mainline, currentMonth);
-  const baseline = computeProjection({ ...args, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
+  const baseline = computeProjection({ ...argsWithSymbols, ops: [], legs: [], assumptions: baseAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
   baseline.currentRates = currentRates;
   // A buy of a holding outside the pool is injected into the
   // strategy run's mainline with empty events + actual price points:
@@ -5458,8 +5496,8 @@ async function planProjectionFor(strategy, project, scenarioInput, overrides) {
   // buys; a stock sink's trend is dropped (the scenario return
   // governs now). The sink column is otherwise unread.
   applyStoredCustomSinkRate(ops, planStrategySink(strategy));
-  const strategyProj = computeProjection({ ...args, mainline: strategyMainline, assumptions: strategyAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
-  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property', investmentScope: project.category === 'investment' }), factors, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates };
+  const strategyProj = computeProjection({ ...argsWithSymbols, mainline: strategyMainline, assumptions: strategyAssumptions, scenario: primeFactorToScenario(factors), holdingGrowth });
+  return { baseline, strategy: strategyProj, comparison: compareProjections(baseline, strategyProj, { excludeStockGain: project.category === 'property', investmentScope: project.category === 'investment' }), factors, appliedScenario: scenarioRow ? { id: scenarioRow.id, name: scenarioRow.name } : null, currentRates, symbolHistoryNotes };
 }
 function planScenarioRow(r) {
   if (!r) return null;
@@ -6736,6 +6774,107 @@ function planPoolHistoryHoldings(p, strategies) {
   }
   return [...ids].map((id) => byId.get(id)).filter(Boolean);
 }
+// What-if backtest entries (user 2026-11-07): one per strategy with
+// a symbol buy — the actual holding (the pool's dominant holding by
+// current value) vs the buy target, same money, one continuous
+// chart: real history back 5y, forecast after today. The pair is
+// skipped when the buy targets what the pool already holds (no
+// alternative to compare). Amount defaults to the buy-op amount;
+// the start month defaults to the buy-op month when it is in the
+// past, else 5 years ago (a future buy-op date cannot start a
+// backtest). A leg with no usable history is kept with a null rate
+// (forecast flat, labeled) — the entry is dropped only when
+// NEITHER leg has any price history at all.
+function planWhatIfEntries(p, rows, horizonMonth, currentMonth) {
+  if (p.category !== 'investment' || !rows || !rows.length || !horizonMonth || horizonMonth <= currentMonth) return [];
+  const baseMainline = planAssembleMainline(p.id);
+  const poolMainline = planPoolMainline(p, baseMainline, currentMonth);
+  const fxRows = db.prepare('SELECT date, rate FROM invest_fx_rates ORDER BY date').all();
+  const fxLatest = fxRows.length ? Number(fxRows[fxRows.length - 1].rate) : 1;
+  const fxByMonth = {};
+  {
+    let last = fxLatest;
+    const byDate = new Map(fxRows.map((r) => [String(r.date), Number(r.rate)]));
+    const startIdx = monthIdxOf(currentMonth) - 72;
+    for (let i = startIdx; i <= monthIdxOf(horizonMonth); i++) {
+      const m = ymOfIdx(i);
+      const cut = `${m}-31`;
+      for (const [d, v] of byDate) if (d <= cut) last = v; else break;
+      fxByMonth[m] = last;
+    }
+  }
+  const toCad = (h, v) => (h && h.currency === 'USD' ? v * fxLatest : v);
+  const priceOn = (h, monthKey) => {
+    let last = null;
+    for (const pt of h.pricePoints || []) if (String(pt.date).slice(0, 10) <= `${monthKey}-31`) last = pt; else break;
+    return last ? Number(last.price) : null;
+  };
+  const holdingValueAt = (h) => {
+    let units = 0;
+    for (const e of h.events || []) {
+      if (String(e.date).slice(0, 7) > currentMonth) continue;
+      if (['buy', 'grant', 'position'].includes(e.type)) units += Number(e.units) || 0;
+      else if (e.type === 'sell') units -= Number(e.units) || 0;
+    }
+    const pr = priceOn(h, currentMonth);
+    return pr == null ? 0 : toCad(h, units * pr);
+  };
+  const poolHoldings = (poolMainline.holdings || []).filter((h) => holdingValueAt(h) > 0);
+  const actualHolding = poolHoldings.length
+    ? poolHoldings.reduce((best, h) => (holdingValueAt(h) > holdingValueAt(best) ? h : best))
+    : null;
+  if (!actualHolding) return [];
+  const actualRate = currentReturnRateFromPoints(actualHolding.pricePoints || [], currentMonth);
+  const poolTotal = poolHoldings.reduce((s, h) => s + holdingValueAt(h), 0);
+  const out = [];
+  for (const row of rows) {
+    const st = row.strategy;
+    const buys = planOpsOf(st.id).filter((o) => o.op_type === 'buy' && o.params && o.params.symbol);
+    if (!buys.length) continue;
+    const buy = buys[0];
+    const bp = buy.params;
+    const altSym = String(bp.symbol).toUpperCase();
+    if (String(actualHolding.symbol || '').toUpperCase() === altSym) continue;
+    // Alt points: a buy of a held holding reuses that holding's
+    // points; a symbol-only buy reads the symbol store (pulled at
+    // Generate by ensureSymbolHistory).
+    let altPoints = null;
+    let altCurrency = bp.currency || 'CAD';
+    const held = bp.holdingId != null
+      ? (baseMainline.holdings || []).find((h) => Number(h.id) === Number(bp.holdingId))
+      : (baseMainline.holdings || []).find((h) => Number(h.accountId) === Number(bp.accountId) && String(h.symbol || '').toUpperCase() === altSym);
+    if (held) {
+      altPoints = (held.pricePoints || []).map((pt) => ({ date: pt.date, price: pt.price }));
+      altCurrency = held.currency || altCurrency;
+    } else {
+      altPoints = listSymbolPricePoints(db, altSym).map((pt) => ({ date: pt.date, price: pt.price }));
+    }
+    const altRate = currentReturnRateFromPoints(altPoints || [], currentMonth);
+    const buyPrice = bp.price != null ? Number(bp.price) : null;
+    const buyUnits = bp.units != null ? Number(bp.units) : (bp.amount != null && buyPrice ? Number(bp.amount) / buyPrice : null);
+    let amountCad = null;
+    if (bp.amount != null) amountCad = toCad({ currency: altCurrency }, Number(bp.amount));
+    else if (buyUnits != null && buyPrice != null) amountCad = toCad({ currency: altCurrency }, buyUnits * buyPrice);
+    else amountCad = poolTotal;
+    if (!(amountCad > 0)) continue;
+    const buyMonth = String(bp.date || '').slice(0, 7);
+    const startMonth = buyMonth && buyMonth <= currentMonth ? buyMonth : ymOfIdx(monthIdxOf(currentMonth) - 60);
+    const series = whatIfBacktest({
+      actual: { symbol: actualHolding.symbol, currency: actualHolding.currency || 'CAD', points: (actualHolding.pricePoints || []).map((pt) => ({ date: pt.date, price: pt.price })), ratePct: actualRate ? actualRate.ratePct : null },
+      alt: { symbol: altSym, currency: altCurrency, points: altPoints || [], ratePct: altRate ? altRate.ratePct : null },
+      amountCad, startMonth, currentMonth, horizonMonth, fxByMonth, fxLatest,
+    });
+    if (!series) continue;
+    out.push({
+      strategyId: st.id, strategyLetter: st.letter, strategyName: st.name,
+      available: true,
+      actual: { symbol: actualHolding.symbol, currency: actualHolding.currency || 'CAD', ratePct: actualRate ? actualRate.ratePct : null, rateWindow: actualRate ? actualRate.window : null, rateBasis: actualRate ? actualRate.basis : null },
+      alt: { symbol: altSym, currency: altCurrency, ratePct: altRate ? altRate.ratePct : null, rateWindow: altRate ? altRate.window : null, rateBasis: altRate ? altRate.basis : null },
+      amountCad: round2(amountCad), ...series,
+    });
+  }
+  return out;
+}
 async function planComparisonBlock(p, scenarioRow, opts = {}) {
   const strategies = db.prepare('SELECT * FROM plan_strategies WHERE project_id = ? ORDER BY id').all(p.id);
   // Pool history pull (user 2026-11-06): at Generate, pull full
@@ -6786,7 +6925,7 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
     }
     if (!baseline) baseline = r.baseline;
     const stOps = planOpsOf(st.id);
-    rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, buys: stOps.filter((o) => o.op_type === 'buy').map((o) => (o.params && (o.params.symbol || o.holdingSymbol)) || '').filter(Boolean), opCount: stOps.length });
+    rows.push({ strategy: st, projection: r.strategy, comparison: r.comparison, factors: r.factors, symbolHistoryNotes: r.symbolHistoryNotes || [], buys: stOps.filter((o) => o.op_type === 'buy').map((o) => (o.params && (o.params.symbol || o.holdingSymbol)) || '').filter(Boolean), opCount: stOps.length });
   }
   // Baseline-only projection: the reference the strategy deltas are
   // computed against, and the chart's baseline line.
@@ -6911,6 +7050,14 @@ async function planComparisonBlock(p, scenarioRow, opts = {}) {
     trajectories: reportTrajectories,
     costBreakdown: Object.fromEntries(rows.map((r) => [r.strategy.id, reportCostBreakdown(r.comparison)])),
     investmentScope,
+    // What-if backtest (user 2026-11-07): one entry per strategy
+    // with a symbol buy — actual holding vs buy target, same money,
+    // real history before today, history-rate forecast after. The
+    // horizon is the comparison's own last month, so the chart ends
+    // where the report ends. Symbol pull failures are named here
+    // (stored points used instead, never a failed report).
+    whatIf: investmentScope ? planWhatIfEntries(p, rows, reportTrajectories[0] ? (reportTrajectories[0].monthly[reportTrajectories[0].monthly.length - 1] || {}).month : null, currentMonthKey()) : [],
+    symbolHistoryNotes: [...new Map(rows.flatMap((r) => (r.symbolHistoryNotes || []).map((n) => [n.symbol, n]))).values()],
     // Headline time window (user 2026-11-06): the window starts at
     // the current month; the default end is the end of the entity
     // property's ACTIVE mortgage term (property reports) or the full

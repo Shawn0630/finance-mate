@@ -338,7 +338,7 @@ export function applyStoredCustomSinkRate(ops, sink) {
 // scenario: prime-path scenario object (or null = actual history only)
 // Returns {mortgage: {perProperty, totals}, stocks: {...}, fees, penalties,
 // cost, gain, net, valueAtHorizon, errors[], warnings[]}.
-export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null, potInitial = 0, poolHoldingIds = null }) {
+export function computeProjection({ mainline, ops = [], legs = [], assumptions = {}, scenario = null, primeHistory = [], currentPrime = null, currentMonth, horizonMonths = 360, holdingGrowth = null, potInitial = 0, poolHoldingIds = null, symbolPricePoints = null }) {
   const errors = [];
   const warnings = [];
   const primeHist = scenarioPrimeHistory(primeHistory, scenario, currentMonth);
@@ -585,6 +585,7 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
   // rate carried on a buy op, which wins over the global
   // stockReturnPct (scenario stock factor), which wins over every
   // per-holding history rate.
+  const growthFallbackCache = new Map(); // buy-target rates, derived once per holding (below)
   const growthFor = (holding) => {
     if (byHolding && num(byHolding[holding.id]) != null) return num(byHolding[holding.id]) / 100;
     if (buyReturns.has(holding.id)) return buyReturns.get(holding.id) / 100;
@@ -593,7 +594,21 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       const g = num(holdingGrowth[holding.id]);
       return g == null ? 0 : g / 100;
     }
-    return 0;
+    // Buy-target (synthetic) holdings have no holdingGrowth entry —
+    // their rate was never precomputed because the holding did not
+    // exist when the mainline was assembled. Derive it from their
+    // own stored history, same rule as planHoldingGrowth (1y → 3y →
+    // 5y CAGR). A single-point holding (a custom product with only
+    // its buy price) has no window and stays flat. Memoized per
+    // holding id: priceAt calls this every month of the series.
+    if (growthFallbackCache.has(holding.id)) return growthFallbackCache.get(holding.id);
+    let g = 0;
+    if (holding.pricePoints && holding.pricePoints.length) {
+      const r = currentReturnRateFromPoints(holding.pricePoints, currentMonth);
+      if (r) g = r.ratePct / 100;
+    }
+    growthFallbackCache.set(holding.id, g);
+    return g;
   };
   const holdingsById = new Map((mainline.holdings || []).map((h) => [h.id, h]));
   const stockOps = sortedOps.filter((o) => ['buy', 'sell', 'position'].includes(o.op_type));
@@ -706,7 +721,16 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       if (!holding && p.symbol) holding = (mainline.holdings || []).find((h) => h.accountId === Number(p.accountId) && String(h.symbol || '').toUpperCase() === String(p.symbol).toUpperCase()) || null;
       const isNew = !holding;
       if (isNew) {
-        holding = { id: `new:${op.seq}`, accountId: Number(p.accountId), symbol: p.symbol || null, label: p.symbol || 'New holding', currency: p.currency || 'CAD', events: [], pricePoints: [] };
+        // A symbol-only buy (a stock the user does not hold yet):
+        // seed the synthetic holding with the symbol's stored price
+        // history (pulled at Generate by ensureSymbolHistory), so
+        // it grows at its history rate instead of flat 0%. Without
+        // stored history the points stay empty and the buy-price
+        // point below is the only point — flat by rule, never
+        // invented.
+        const symPts = symbolPricePoints && p.symbol
+          ? symbolPricePoints[String(p.symbol).toUpperCase()] : null;
+        holding = { id: `new:${op.seq}`, accountId: Number(p.accountId), symbol: p.symbol || null, label: p.symbol || 'New holding', currency: p.currency || 'CAD', events: [], pricePoints: symPts && symPts.length ? symPts.map((pt) => ({ date: pt.date, price: pt.price })) : [] };
       }
       // A rate carried on the buy (a custom product's own rate, e.g.
       // a GIC) governs this holding's growth from the buy month on.
@@ -770,8 +794,10 @@ export function computeProjection({ mainline, ops = [], legs = [], assumptions =
       // A bought holding's price path starts at its buy price, then
       // grows at the assumed return — this is what lets a custom
       // product (no stored price history, e.g. a GIC) project from
-      // its buy price.
-      if (isNew && pr != null) holding.pricePoints = [{ date: p.date, price: pr }];
+      // its buy price. A symbol with stored history keeps its full
+      // series (seeded above) — the single point must not overwrite
+      // it, or the history rate would be lost.
+      if (isNew && pr != null && !(holding.pricePoints && holding.pricePoints.length)) holding.pricePoints = [{ date: p.date, price: pr }];
       if (isNew) {
         if (!mainline.holdings.find((h) => h.id === holding.id)) mainline.holdings.push(holding);
         holdingsById.set(holding.id, holding);
@@ -2836,6 +2862,112 @@ export function stockFanSeries({ value0, ratePct, volPct, months }) {
     p90.push(round2(med * f));
   }
   return { months: [...(months || [])], median, p10, p90 };
+}
+
+// What-if backtest (user 2026-11-07): ONE continuous series per
+// symbol — the past uses REAL historical prices, the future uses the
+// history-derived forecast, split by a cutoff at the current month.
+// Both lines start at the same amount (amountCad) in the start
+// month, so the chart answers "same money in A vs B": the backtest
+// leg is amount × (price[m] / price[start]) per month, the forecast
+// leg compounds the cutoff-month value at each symbol's own history
+// rate (1y → 3y → 5y CAGR via currentReturnRateFromPoints — the
+// same rate the projection grows at). A symbol with no usable rate
+// forecasts FLAT at its cutoff value and is flagged (never
+// invented). Prices are monthly CAD (the caller converts USD at
+// each month's FX); a month before a symbol's first price is null,
+// never carried backward. startMonth is clamped to the earliest
+// month where BOTH symbols have a price (effectiveStartMonth) — a
+// line cannot start before its own history exists. The window is
+// labeled by the caller: the forecast rate is window-sensitive
+// (1y vs 3y vs 5y CAGRs differ), so it is never presented as a
+// prediction. Price return only — distributions are not reinvested.
+export function whatIfBacktest({ actual, alt, amountCad, startMonth, currentMonth, horizonMonth, fxByMonth = null, fxLatest = 1 }) {
+  const toCad = (leg, price) => {
+    if (price == null) return null;
+    if (!leg || leg.currency === 'CAD') return price;
+    const fx = fxByMonth && fxByMonth[leg.month] != null ? fxByMonth[leg.month] : fxLatest;
+    return price * (fx || 1);
+  };
+  const monthlyPrice = (leg) => {
+    const pts = ((leg && leg.points) || []).map((p) => ({ date: String(p.date).slice(0, 10), price: Number(p.price) }))
+      .filter((p) => isFinite(p.price)).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    const byMonth = new Map();
+    for (const p of pts) {
+      const m = p.date.slice(0, 7);
+      byMonth.set(m, p.price); // last point in the month wins
+    }
+    return byMonth;
+  };
+  const aPx = monthlyPrice(actual);
+  const bPx = monthlyPrice(alt);
+  const firstMonthWithPrice = (byMonth) => {
+    const keys = [...byMonth.keys()].sort();
+    return keys.length ? keys[0] : null;
+  };
+  const historyStartMonth = (() => {
+    const a = firstMonthWithPrice(aPx);
+    const b = firstMonthWithPrice(bPx);
+    if (!a || !b) return null;
+    return a > b ? a : b;
+  })();
+  if (!historyStartMonth) return null;
+  // The series carries the FULL available history (from the first
+  // month both legs have prices) even when the default start is
+  // later: the start-month picker needs the earlier months, and the
+  // client re-normalizes to any picked start from the values as
+  // returned. The normalization reference stays the default start
+  // (the buy-op month, or 5y ago for a future buy), so the initial
+  // render matches the default.
+  const effStart = startMonth && startMonth > historyStartMonth ? startMonth : historyStartMonth;
+  const startIdx = monthIdxOf(historyStartMonth);
+  const cutIdx = monthIdxOf(currentMonth);
+  const endIdx = monthIdxOf(horizonMonth);
+  if (endIdx < cutIdx) return null;
+  const months = [];
+  for (let i = startIdx; i <= endIdx; i++) months.push(ymOfIdx(i));
+  const priceAt = (byMonth, leg, m) => {
+    // Last known price at or before the month (carried forward —
+    // the same rule as the projection's priceAt); null before the
+    // first point, never invented backward.
+    let last = null;
+    for (const [mm, pr] of byMonth) if (mm <= m) last = pr; else break;
+    if (last == null) return null;
+    return toCad({ ...leg, month: m }, last);
+  };
+  const build = (leg, byMonth) => {
+    const prices = months.map((m) => priceAt(byMonth, leg, m));
+    const values = months.map(() => null);
+    const startPrice = prices[months.indexOf(effStart)];
+    const cutPos = months.indexOf(currentMonth);
+    if (startPrice == null || cutPos < 0) return { prices, values };
+    const g = leg && leg.ratePct != null ? num(leg.ratePct) / 100 : null;
+    for (let i = 0; i <= cutPos; i++) {
+      if (prices[i] == null) continue;
+      values[i] = round2(amountCad * (prices[i] / startPrice));
+    }
+    const cutValue = values[cutPos];
+    if (cutValue != null) {
+      for (let i = cutPos + 1; i < months.length; i++) {
+        const t = monthIdxOf(months[i]) - cutIdx;
+        values[i] = round2(cutValue * Math.pow(1 + (g == null ? 0 : g), t / 12));
+      }
+    }
+    return { prices, values };
+  };
+  const a = build(actual, aPx);
+  const b = build(alt, bPx);
+  const cutPos = months.indexOf(currentMonth);
+  return {
+    months, cutoffMonth: currentMonth, cutoffIndex: cutPos,
+    startMonth: effStart, historyStartMonth, horizonMonth,
+    actualPrices: a.prices, altPrices: b.prices,
+    actualValues: a.values, altValues: b.values,
+    actualCutValue: cutPos >= 0 ? a.values[cutPos] : null,
+    altCutValue: cutPos >= 0 ? b.values[cutPos] : null,
+    actualEndValue: a.values[a.values.length - 1],
+    altEndValue: b.values[b.values.length - 1],
+  };
 }
 
 // Pool stock-value band (user 2026-11-06): the AGGREGATE P10–P90

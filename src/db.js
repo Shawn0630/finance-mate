@@ -213,6 +213,23 @@ CREATE TABLE IF NOT EXISTS invest_prices (
   created_at TEXT NOT NULL,
   UNIQUE (holding_id, date, source)
 );
+-- Buy-target price history (user 2026-11-07 — the AMZN-flat fix):
+-- a buy op can target a symbol the user does not hold yet, so its
+-- history cannot live in invest_prices (keyed by holding_id). The
+-- fetched series lives here, keyed by uppercase symbol, in the
+-- symbol's native currency; the projection seeds a symbol-only
+-- buy's synthetic holding from it, and the what-if backtest reads
+-- it for the past segment. A symbol with no usable history stays
+-- flat and is labeled as such — never invented.
+CREATE TABLE IF NOT EXISTS invest_symbol_prices (
+  symbol TEXT NOT NULL,                        -- uppercase, e.g. 'XYZ'
+  date TEXT NOT NULL,                          -- 'YYYY-MM-DD'
+  price REAL NOT NULL,                         -- per-unit price in the native currency
+  currency TEXT NOT NULL DEFAULT 'CAD',        -- native currency of the fetched series
+  source TEXT NOT NULL DEFAULT 'manual',       -- 'stooq' | 'yahoo' | 'nasdaq'
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (symbol, date)
+);
 -- Contribution plans (salary-linked recurring buys): one plan
 -- per account + job + target holding. Frequency is NOT stored
 -- — it derives from the linked job at read time. A generated
