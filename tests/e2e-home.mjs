@@ -468,10 +468,32 @@ export async function run(H, S) {
     page.on('dialog', (d) => d.accept()); // confirm() on AI-card Delete
     const client = await page.target().createCDPSession();
     await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+    // Veil pin gate (2026-11-08): holding POST /api/home/insights/generate
+    // while Re-generate runs, so the global loading veil's 200ms
+    // delay elapses before the generate completes.
+    let genGate = null; // null | 'hold'
+    const genHeld = [];
+    const releaseGenHeld = async () => {
+      const items = genHeld.splice(0);
+      for (const e of items) {
+        const u = new URL(e.request.url);
+        const headers = {};
+        for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+        const resp = await forwardH({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+        const respHeaders = Object.entries(resp.headers)
+          .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+          .map(([name, value]) => ({ name, value: String(value) }));
+        await client.send('Fetch.fulfillRequest', {
+          requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+          body: resp.body.toString('base64'),
+        });
+      }
+    };
     client.on('Fetch.requestPaused', async (e) => {
       try {
         const u = new URL(e.request.url);
         if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
+        if (genGate === 'hold' && u.pathname === '/api/home/insights/generate' && e.request.method === 'POST') { genHeld.push(e); return; }
         const headers = {};
         for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
         const resp = await forwardH({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
@@ -1446,6 +1468,51 @@ export async function run(H, S) {
       return labels.length === 3 && JSON.stringify(labels) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']) ? labels : null;
     });
     H.check('home UI: Re-generate keeps the dragged order', !!propOrderRegen, JSON.stringify(propOrderRegen));
+
+    // Home Re-generate shows the global loading veil while it runs
+    // (2026-11-08: Re-generate / AI-append / AI-Apply run inside
+    // withLoading, the same veil the detail pages use). The
+    // generate POST is held via CDP Fetch so the veil's 200ms
+    // delay elapses before it completes — same pattern as the
+    // veil module's slow path.
+    await toInsight();
+    await page.evaluate(() => {
+      window.__veilSeen = false;
+      const el = document.getElementById('globalLoading');
+      const check = () => { if (el && !el.classList.contains('hidden')) window.__veilSeen = true; };
+      new MutationObserver(check).observe(el, { attributes: true, attributeFilter: ['class'] });
+      setInterval(check, 25);
+    });
+    const pollState = async (pred, tries = 40) => {
+      for (let i = 0; i < tries; i++) {
+        try { const s = await page.evaluate(() => window.__fmLoading.state()); if (pred(s)) return s; } catch {}
+        await wait(200);
+      }
+      return null;
+    };
+    genGate = 'hold';
+    await page.evaluate(() => { window.__veilSeen = false; });
+    // The previous Re-generate's labels can render a poll before
+    // its handler re-enables the button — a click on a disabled
+    // button is a no-op, so wait for it to be enabled first.
+    await until(() => { const b = document.querySelector('#homeRegenBtn'); return b && !b.disabled ? true : null; });
+    await page.evaluate(() => document.querySelector('#homeRegenBtn').click());
+    const veilShown = await pollState((s) => s.visible === true, 25);
+    const veilSeen = await page.evaluate(() => window.__veilSeen);
+    H.check('home UI: Re-generate shows the global loading veil while it runs',
+      !!veilShown && veilShown.count >= 1 && veilSeen === true,
+      JSON.stringify({ veilShown, veilSeen, held: genHeld.length }));
+    await releaseGenHeld();
+    genGate = null;
+    const veilSettled = await pollState((s) => s.count === 0 && s.visible === false, 40);
+    H.check('home UI: the veil lifts once Re-generate finishes',
+      !!veilSettled, JSON.stringify(veilSettled));
+    const propOrderRegenVeil = await until(() => {
+      const labels = [...document.querySelectorAll('[data-home-section="property"] .insight-card .insight-label')].map((el) => el.textContent);
+      return labels.length === 3 && JSON.stringify(labels) === JSON.stringify(['Total equity', 'Outstanding principal', 'Assessed total']) ? labels : null;
+    });
+    H.check('home UI: the held Re-generate still completes and keeps the dragged order',
+      !!propOrderRegenVeil, JSON.stringify(propOrderRegenVeil));
 
     // Nov 15 has two payments (rent + mortgage): marking only the
     // rent leaves one done dot + one pending dot. The mark goes in

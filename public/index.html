@@ -610,6 +610,7 @@
         <option value="stocks">Stocks</option>
         <option value="earnings">Earnings</option>
         <option value="spending">Spending</option>
+        <option value="tax">Tax</option>
       </select>
       <input id="histSearch" type="text" placeholder="Filter by entity or summary">
       <button id="histRefreshBtn" class="small">Refresh</button>
@@ -622,36 +623,41 @@
         <select id="taxYearSel" title="Tax year"></select>
       </div>
       <div class="msg" id="taxHomeMsg"></div>
-      <div id="taxFilerCards"></div>
-      <div class="panel" id="taxProfilePanel">
-        <h3>Contribution room</h3>
-        <div id="taxProfileList"></div>
-      </div>
-      <div class="panel" id="taxUnlinkedPanel">
-        <h3>Unlinked items</h3>
-        <div id="taxUnlinkedList"></div>
+      <div class="range-btns" id="taxPersonTabs"></div>
+      <div id="taxPersonBody"></div>
+      <div class="panel" id="taxRoomPanel">
+        <div class="section-head"><h3>Contribution room</h3><div class="spacer"></div>
+          <button class="small" id="taxRoomEditBtn">Edit</button>
+          <button class="small" id="taxRoomAiBtn">✨ Fill with AI</button></div>
+        <div id="taxRoomLine"></div>
+        <div id="taxHomeCharts"></div>
       </div>
     </div>
     <div id="taxDetail" class="hidden">
-      <div class="section-head"><button class="small" id="taxBackBtn">← Tax</button><h2 id="taxDetailTitle">Project</h2><div class="spacer"></div>
+      <div class="section-head"><a id="taxBackLink" href="#tax">← Back to Tax</a><h2 id="taxDetailTitle">Project</h2><div class="spacer"></div>
         <span id="taxDetailStatus"></span>
-        <button class="small" id="taxGenerateBtn">Generate expected items</button>
         <button class="small" id="taxRenameBtn">Rename</button>
         <button class="small" id="taxFileToggleBtn">Mark filed</button>
-        <button class="small" id="taxDeleteBtn">Delete project</button>
+        <button class="danger" id="taxDeleteBtn">Delete project</button>
       </div>
       <div class="msg" id="taxDetailMsg"></div>
-      <div id="taxSections"></div>
-      <div class="panel"><h3>Slips</h3>
-        <div id="taxSlipList"></div>
-        <div class="toolbar">
-          <button class="small" id="taxAddSlipBtn">+ Add slip</button>
-          <button class="small" id="taxAiSlipBtn">✨ Fill with AI</button>
+      <div id="taxRefundHeadline"></div>
+      <div class="grid2">
+        <div class="panel" id="taxProfileBlock">
+          <div class="section-head"><h3>Tax Profile</h3><div class="spacer"></div>
+            <button class="small" id="taxDetailProfileEditBtn">Edit</button>
+            <button class="small" id="taxDetailProfileAiBtn">✨ Fill with AI</button></div>
+          <div id="taxDetailProfileBody"></div>
+          <div id="taxDetailCharts"></div>
+        </div>
+        <div class="panel" id="taxSlipsPanel">
+          <div class="section-head"><h3>Slips</h3><div class="spacer"></div>
+            <button class="small" id="taxAddSlipBtn">+ Add slip</button>
+            <button class="small" id="taxAiSlipBtn">✨ Fill with AI</button></div>
+          <div id="taxSlipList"></div>
         </div>
       </div>
-      <div class="panel" id="taxChartsPanel"><h3>Accounts</h3>
-        <div id="taxCharts"></div>
-      </div>
+      <div id="taxSections"></div>
     </div>
   </section>
 </main>

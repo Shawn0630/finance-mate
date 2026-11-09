@@ -1,10 +1,15 @@
 // tax: Tax module — projects per person-year (many per
-// person-year), on-demand Generate only (nothing pre-generates),
-// TurboTax-style sections, RRSP benefit slider + Tax Profile +
-// contributed-vs-remaining charts, export round-trip, and UI.
+// person-year), NO Generate anywhere (projects start empty; the
+// user adds items via Add, picking from the region's candidate
+// list), TurboTax-style sections, the T776 rental flow with the
+// derived deduction row, the RRSP window, the RRSP contribution
+// tool, the T1 refund headline + popup (pinned against the
+// user's 2025 return), the home person switcher + room charts,
+// the History Tax filter, export round-trip, and UI.
 // Run standalone: node tests/e2e-tax.mjs
 // Run via the suite runner: node tests/e2e-run.mjs --only tax
 import http from 'node:http';
+import fs from 'node:fs';
 import { runModuleMain } from './e2e-child.mjs';
 export const deps = [];
 export async function run(H, S) {
@@ -20,8 +25,9 @@ export async function run(H, S) {
     r.status === 200 && Array.isArray(r.data.years) && r.data.years.includes(2026) && r.data.current === 2026,
     JSON.stringify(r.data));
 
-  // ---- seed: a Shawn job (Meta-like), an ownerless job, an RRSP
-  // plan for the slider start, and a TFSA buy for the charts ----
+  // ---- seed: a Shawn job (Meta-like), an ownerless job, a 2025
+  // Shawn job for the refund fixture, an RRSP plan for the
+  // windowed annual, and a TFSA buy for the charts ----
   r = await H.req('POST', '/api/earnings/jobs', {
     employer: 'Tax Meta', owner: 'Shawn', currency: 'CAD', province: 'BC',
     frequency: 'biweekly', gross_amount: 7334.77, gross_basis: 'period', tax_year: 2026,
@@ -36,6 +42,12 @@ export async function run(H, S) {
   });
   H.check('tax: ownerless job created', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
   const gigJobId = r.data.id;
+  r = await H.req('POST', '/api/earnings/jobs', {
+    employer: 'Tax Meta', owner: 'Shawn', currency: 'CAD', province: 'BC',
+    frequency: 'biweekly', gross_amount: 29406.07, gross_basis: 'period', tax_year: 2025,
+  });
+  H.check('tax: 2025 Shawn job created for the refund fixture',
+    r.status === 201 && !!r.data.id, JSON.stringify(r.data));
 
   r = await H.req('POST', '/api/investments/accounts', { name: 'Tax RRSP', type: 'RRSP', owners: ['Shawn'] });
   H.check('tax: RRSP account created', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
@@ -64,7 +76,7 @@ export async function run(H, S) {
     r.status === 201 && !!r.data.id, JSON.stringify(r.data));
 
   // NonRegistered account: a dividend and a sell feed the
-  // investment-income and capital-gain derivations on Generate.
+  // investment-income and capital-gain candidates.
   r = await H.req('POST', '/api/investments/accounts', { name: 'Tax Margin', type: 'NonRegistered', owners: ['Shawn'] });
   const marginAcctId = r.data.id;
   r = await H.req('POST', `/api/investments/accounts/${marginAcctId}/holdings`, { label: 'SHOP', kind: 'exchange', symbol: 'SHOP.TO', currency: 'CAD' });
@@ -77,6 +89,26 @@ export async function run(H, S) {
   H.check('tax: sell recorded (10 × $150.50 = $1,505 proceeds)',
     r.status === 201 && !!r.data.id, JSON.stringify(r.data));
 
+  // Rental (no linked property → the candidate is unlinked):
+  // $2,000/mo rent, $6,000 mortgage interest, $12,000 property
+  // tax shared 50%, $500 advertising direct → gross $24,000,
+  // deductible $12,500, net $11,500.
+  r = await H.req('POST', '/api/earnings/rentals', {
+    label: 'Basement suite', rental_type: 'long_term', services_level: 'basic',
+  });
+  H.check('tax: rental created', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
+  const rentalId = r.data.id;
+  r = await H.req('POST', `/api/earnings/rentals/${rentalId}/years`, {
+    tax_year: 2026, other_income: 0, area_share_pct: 50,
+    mortgage_interest: 6000, mortgage_principal: 9000,
+    expenses: [{ line: '9180', amount: 12000, direct: false }, { line: '8521', amount: 500, direct: true }],
+  });
+  H.check('tax: rental year created', r.status === 201 && r.data.tax_year === 2026, JSON.stringify(r.data));
+  r = await H.req('POST', `/api/earnings/rentals/${rentalId}/entries`, {
+    start_ym: '2025-01', end_ym: '2026-12', monthly_rent: 2000, pay_day: 1, cash_amount: 500, tenant_name: 'Test Tenant',
+  });
+  H.check('tax: rent entry created', r.status === 201 && r.data.entries.length === 1, JSON.stringify(r.data.entries));
+
   // ---- filers: Shawn + Jiaying, admin excluded ----
   r = await H.req('GET', '/api/tax/filings?year=2026');
   H.check('tax: filings list has Shawn + Jiaying and no admin',
@@ -84,6 +116,7 @@ export async function run(H, S) {
       && r.data.filers.map((f) => f.person.username).sort().join(',') === 'Jiaying,Shawn',
     JSON.stringify((r.data.filers || []).map((f) => f.person.username)));
   const shawnId = r.data.filers.find((f) => f.person.username === 'Shawn').person.id;
+  const jiayingId = r.data.filers.find((f) => f.person.username === 'Jiaying').person.id;
 
   // ---- two projects for the same person + year ----
   r = await H.req('POST', '/api/tax/filings', { personId: shawnId, year: 2026, name: 'Tax return 2026' });
@@ -101,59 +134,102 @@ export async function run(H, S) {
   // ---- no pre-generation: both projects list 0 items ----
   r = await H.req('GET', '/api/tax/filings?year=2026');
   const shawn = r.data.filers.find((f) => f.person.username === 'Shawn');
-  H.check('tax: no pre-generation — both projects list 0 items before Generate',
-    shawn.projects.length === 2 && shawn.projects.every((p) => p.itemCount === 0 && !p.generated_at),
-    JSON.stringify(shawn.projects.map((p) => ({ name: p.name, itemCount: p.itemCount, generated_at: p.generated_at }))));
+  H.check('tax: no pre-generation — both projects list 0 items',
+    shawn.projects.length === 2 && shawn.projects.every((p) => p.itemCount === 0),
+    JSON.stringify(shawn.projects.map((p) => ({ name: p.name, itemCount: p.itemCount }))));
 
-  // ---- detail before Generate: sections exist, no items ----
+  // ---- detail before adding: the four guided sections, no
+  // items, the windowed RRSP annual and the RRSP window ----
   r = await H.req('GET', `/api/tax/filings/${projA}`);
-  H.check('tax: detail renders the guided sections with no items yet',
-    r.status === 200 && r.data.sections && Object.keys(r.data.sections).sort().join(',') === 'credits,deductions,income'
-      && r.data.items.length === 0 && r.data.generated_at === null && r.data.rrspPlanAnnual === 5061.15,
-    JSON.stringify({ sections: Object.keys(r.data.sections || {}), items: (r.data.items || []).length, rrspPlanAnnual: r.data.rrspPlanAnnual }));
+  H.check('tax: detail renders the four guided sections with no items yet',
+    r.status === 200 && r.data.sections && Object.keys(r.data.sections).sort().join(',') === 'deductions,income,provincial,registered'
+      && r.data.items.length === 0 && r.data.rrspPlanAnnual === 3960.9
+      && r.data.rrspWindow && r.data.rrspWindow.start === '2026-03-01' && r.data.rrspWindow.end === '2027-03-01',
+    JSON.stringify({ sections: Object.keys(r.data.sections || {}), items: (r.data.items || []).length, rrspPlanAnnual: r.data.rrspPlanAnnual, rrspWindow: r.data.rrspWindow }));
 
-  // ---- Generate on A only ----
-  r = await H.req('POST', `/api/tax/filings/${projA}/generate`, {});
-  H.check('tax: Generate on A adds exactly 4 items (employment, RRSP, dividend, sell)',
-    r.status === 200 && r.data.counts && r.data.counts.added === 4, JSON.stringify(r.data && r.data.counts));
+  // ---- candidates: the region derivation, minus nothing yet ----
+  r = await H.req('GET', `/api/tax/filings/${projA}/candidates`);
+  const cands = r.data.candidates || [];
+  const candBy = (kind, sourceType) => cands.find((c) => c.kind === kind && (!sourceType || c.sourceType === sourceType));
+  // Two jobs exist (the gig sorts first alphabetically), so the
+  // Meta employment is matched by its source id, not by find.
+  const empCand = cands.find((c) => c.sourceType === 'job' && Number(c.sourceId) === Number(metaJobId));
+  H.check('tax: candidates list employment, RRSP, dividend, sell and the unlinked rental',
+    r.status === 200
+      && empCand && empCand.amount === 190704.02
+      && candBy('employment', 'job') && candBy('employment', 'job').amount === 26000
+      && candBy('rrsp', 'plan') && candBy('rrsp', 'plan').amount === 3960.9
+      && candBy('investment_income', 'dividend') && candBy('investment_income', 'dividend').amount === 123.45
+      && candBy('capital_gain', 'sell') && candBy('capital_gain', 'sell').amount === 1505
+      && candBy('rental', 'rental') && candBy('rental', 'rental').amount === 11500,
+    JSON.stringify(cands.map((c) => ({ kind: c.kind, sourceType: c.sourceType, amount: c.amount }))));
+
+  // ---- add the candidates to A, one explicit Add each ----
+  const addCand = async (sourceType, sourceId) => H.req('POST', `/api/tax/filings/${projA}/items/from-candidate`, { sourceType, sourceId });
+  r = await addCand('job', metaJobId);
+  H.check('tax: employment candidate added as linked ($190,704.02)',
+    r.status === 201 && r.data.kind === 'employment' && r.data.amount === 190704.02 && r.data.status === 'linked',
+    JSON.stringify(r.data));
+  r = await addCand('job', metaJobId);
+  H.check('tax: adding the same candidate twice is a 400', r.status === 400, JSON.stringify(r.status));
+  r = await addCand('plan', (await H.req('GET', `/api/tax/filings/${projA}/candidates`)).data.candidates.find((c) => c.kind === 'rrsp').sourceId);
+  H.check('tax: RRSP candidate added ($3,960.90 — the windowed annual)',
+    r.status === 201 && r.data.kind === 'rrsp' && r.data.amount === 3960.9, JSON.stringify(r.data));
+  r = await addCand('dividend', candBy('investment_income', 'dividend').sourceId);
+  H.check('tax: dividend candidate added ($123.45)',
+    r.status === 201 && r.data.kind === 'investment_income' && r.data.amount === 123.45, JSON.stringify(r.data));
+  r = await addCand('sell', candBy('capital_gain', 'sell').sourceId);
+  H.check('tax: sell candidate added ($1,505 proceeds)',
+    r.status === 201 && r.data.kind === 'capital_gain' && r.data.amount === 1505, JSON.stringify(r.data));
+
+  // ---- manual T776 on A: the server re-derives the net and
+  // syncs the derived rental-deduction row ----
+  const t776Lines = { gross_rents: 22800, other_income: 200, 8710: 12000, 8521: 6903.37 };
+  r = await H.req('POST', `/api/tax/filings/${projA}/items`, {
+    kind: 'rental', label: 'Manual rental (T776)', amount: 4096.63, share_pct: 100,
+    detail: { form: 'T776', lines: t776Lines },
+  });
+  H.check('tax: manual T776 rental added — server derives gross $23,000 / deductible $18,903.37 / net $4,096.63',
+    r.status === 201 && r.data.kind === 'rental' && r.data.amount === 4096.63
+      && r.data.detail && r.data.detail.gross === 23000 && r.data.detail.deductible === 18903.37 && r.data.detail.net === 4096.63,
+    JSON.stringify(r.data));
+  const manualRentalId = r.data.id;
   r = await H.req('GET', `/api/tax/filings/${projA}`);
-  const empItem = (r.data.items || []).find((i) => i.kind === 'employment' && i.source_type === 'job');
-  const rrspItem = (r.data.items || []).find((i) => i.kind === 'rrsp');
-  const divItem = (r.data.items || []).find((i) => i.kind === 'investment_income');
-  const sellItem = (r.data.items || []).find((i) => i.kind === 'capital_gain');
-  H.check('tax: A holds employment $190,704.02, RRSP $5,061.15, dividend $123.45, sell $1,505',
-    r.status === 200 && empItem && empItem.amount === 190704.02 && empItem.status === 'expected'
-      && rrspItem && rrspItem.amount === 5061.15 && divItem && divItem.amount === 123.45 && sellItem && sellItem.amount === 1505,
-    JSON.stringify((r.data.items || []).map((i) => ({ kind: i.kind, amount: i.amount, status: i.status }))));
-  r = await H.req('GET', '/api/tax/filings?year=2026');
-  const afterGen = r.data.filers.find((f) => f.person.username === 'Shawn').projects;
-  H.check('tax: B still has 0 items after A was generated',
-    afterGen.find((p) => p.id === projA).itemCount > 0 && afterGen.find((p) => p.id === projB).itemCount === 0,
-    JSON.stringify(afterGen.map((p) => ({ id: p.id, itemCount: p.itemCount }))));
-  const unlinkedGig = (r.data.unlinked || []).find((i) => i.label && i.label.includes('Tax Gig'));
-  H.check('tax: the ownerless job lands in the unlinked bucket',
-    !!unlinkedGig && unlinkedGig.kind === 'employment' && unlinkedGig.amount === 26000,
-    JSON.stringify(r.data.unlinked));
-
-  // ---- Re-generate adds nothing (no duplicates) ----
-  const countBefore = afterGen.find((p) => p.id === projA).itemCount;
-  r = await H.req('POST', `/api/tax/filings/${projA}/generate`, {});
-  H.check('tax: re-generate adds 0 items',
-    r.status === 200 && r.data.counts && r.data.counts.added === 0, JSON.stringify(r.data && r.data.counts));
+  const derivedA = (r.data.items || []).find((i) => i.detail && i.detail.derived);
+  H.check('tax: the derived rental-deduction row appears ($18,903.37, linked, in Income)',
+    !!derivedA && derivedA.kind === 'deduction' && derivedA.amount === 18903.37 && derivedA.status === 'linked'
+      && derivedA.source_type === 'rental-deduction',
+    JSON.stringify((r.data.items || []).map((i) => ({ kind: i.kind, amount: i.amount, derived: !!(i.detail && i.detail.derived) }))));
+  H.check('tax: Income totals the net rental, not the gross — and the derived row adds $0',
+    r.data.sections && r.data.sections.income && r.data.sections.income.amount === 196429.1
+      && r.data.sections.deductions && r.data.sections.deductions.amount === 0,
+    JSON.stringify(r.data.sections));
+  r = await H.req('PUT', `/api/tax/items/${derivedA.id}`, { amount: 1 });
+  H.check('tax: editing the derived row directly is a 400', r.status === 400, JSON.stringify(r.status));
+  // Edit the T776 (mortgage interest $12,000 → $11,000): the
+  // item re-derives and the derived row follows in the same write.
+  r = await H.req('PUT', `/api/tax/items/${manualRentalId}`, {
+    detail: { form: 'T776', lines: { ...t776Lines, 8710: 11000 } },
+  });
+  H.check('tax: editing the T776 re-derives the rental net ($5,096.63)',
+    r.status === 200 && r.data.amount === 5096.63 && r.data.detail && r.data.detail.deductible === 17903.37,
+    JSON.stringify(r.data));
   r = await H.req('GET', `/api/tax/filings/${projA}`);
-  H.check('tax: item count unchanged after re-generate',
-    (r.data.items || []).length === countBefore, JSON.stringify((r.data.items || []).length));
+  const derivedA2 = (r.data.items || []).find((i) => i.detail && i.detail.derived);
+  H.check('tax: the derived row follows the T776 edit ($17,903.37)',
+    !!derivedA2 && derivedA2.amount === 17903.37, JSON.stringify(derivedA2));
 
-  // ---- Link the unlinked gig item into B ----
-  r = await H.req('POST', `/api/tax/items/${unlinkedGig.id}/link`, { filingId: projB });
-  H.check('tax: unlinked item links into B', r.status === 200, JSON.stringify(r.data));
-  r = await H.req('GET', `/api/tax/filings/${projB}`);
-  H.check('tax: B now holds the gig item as linked',
-    (r.data.items || []).some((i) => i.kind === 'employment' && i.amount === 26000 && i.status === 'linked'),
-    JSON.stringify((r.data.items || []).map((i) => ({ kind: i.kind, amount: i.amount, status: i.status }))));
-  r = await H.req('GET', '/api/tax/filings?year=2026');
-  H.check('tax: unlinked bucket is empty after the link',
-    !(r.data.unlinked || []).some((i) => i.id === unlinkedGig.id), JSON.stringify(r.data.unlinked));
+  // ---- RESP: tracked, non-deductible, $0 in every total ----
+  r = await H.req('POST', `/api/tax/filings/${projA}/items`, {
+    kind: 'resp', label: 'RESP — Baby', amount: 5000, share_pct: 100,
+  });
+  H.check('tax: RESP item added as a manual tracked item',
+    r.status === 201 && r.data.kind === 'resp' && r.data.amount === 5000, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/filings/${projA}`);
+  H.check('tax: Registered totals the RRSP only — RESP contributes $0',
+    r.data.sections && r.data.sections.registered && r.data.sections.registered.amount === 3960.9
+      && (r.data.items || []).length === 7,
+    JSON.stringify({ registered: r.data.sections.registered, items: (r.data.items || []).length }));
 
   // ---- Slip on A creates a linked item ----
   r = await H.req('POST', `/api/tax/filings/${projA}/slips`, {
@@ -166,6 +242,58 @@ export async function run(H, S) {
   H.check('tax: unknown slip kind is a 400', r.status === 400, JSON.stringify(r.status));
   r = await H.req('POST', `/api/tax/filings/${projA}/slips`, { kind: 'T4', tax_year: 2025, fields: { box14: 1 } });
   H.check('tax: slip year must match the filing year', r.status === 400, JSON.stringify(r.status));
+
+  // ---- B takes the ownerless gig and the unlinked rental ----
+  r = await H.req('GET', `/api/tax/filings/${projB}/candidates`);
+  const candsB = r.data.candidates || [];
+  H.check('tax: B still sees the unlinked gig and rental candidates',
+    candsB.some((c) => c.kind === 'employment' && c.sourceId === gigJobId && c.amount === 26000)
+      && candsB.some((c) => c.kind === 'rental' && c.amount === 11500),
+    JSON.stringify(candsB.map((c) => ({ kind: c.kind, sourceId: c.sourceId, amount: c.amount }))));
+  r = await H.req('POST', `/api/tax/filings/${projB}/items/from-candidate`, { sourceType: 'job', sourceId: gigJobId });
+  H.check('tax: gig candidate added to B as linked ($26,000)',
+    r.status === 201 && r.data.amount === 26000 && r.data.status === 'linked', JSON.stringify(r.data));
+  r = await H.req('POST', `/api/tax/filings/${projB}/items/from-candidate`, { sourceType: 'rental', sourceId: rentalId });
+  H.check('tax: rental candidate added to B ($11,500 net)',
+    r.status === 201 && r.data.kind === 'rental' && r.data.amount === 11500, JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/filings/${projB}`);
+  const derivedB = (r.data.items || []).find((i) => i.detail && i.detail.derived);
+  H.check('tax: B has the gig, the rental and its derived deduction row ($12,500)',
+    (r.data.items || []).length === 3 && !!derivedB && derivedB.amount === 12500,
+    JSON.stringify((r.data.items || []).map((i) => ({ kind: i.kind, amount: i.amount, derived: !!(i.detail && i.detail.derived) }))));
+
+  // ---- 2025 fixture filing: the T4 slip places the employment
+  // item, the rest are added manually — the refund must
+  // reproduce his real 2025 return ($16,615.42) ----
+  r = await H.req('POST', '/api/tax/filings', { personId: shawnId, year: 2025, name: 'Tax return 2025' });
+  H.check('tax: 2025 fixture filing created', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
+  const proj2025 = r.data.id;
+  r = await H.req('POST', `/api/tax/filings/${proj2025}/slips`, {
+    kind: 'T4', tax_year: 2025, fields: { box14: 764557.72, box22: 354009.41, employer_name: 'Tax Meta' }, source: 'manual',
+  });
+  H.check('tax: 2025 T4 slip places the $764,557.72 employment item',
+    r.status === 201 && r.data.item && r.data.item.amount === 764557.72, JSON.stringify(r.data));
+  for (const [kind, label, amount] of [
+    ['investment_income', 'Interest', 528.20],
+    ['rental', 'Rental', -3610.98],
+    ['other_income', 'RRSP income', 677.00],
+    ['rrsp', 'RRSP contributions', 33251.00],
+  ]) {
+    r = await H.req('POST', `/api/tax/filings/${proj2025}/items`, { kind, label, amount, share_pct: 100 });
+    H.check(`tax: 2025 fixture item ${kind} $${amount} added`,
+      r.status === 201 && r.data.amount === amount, JSON.stringify(r.data));
+  }
+  r = await H.req('GET', `/api/tax/filings/${proj2025}/refund`);
+  H.check('tax: the 2025 refund reproduces his return — $16,615.42',
+    r.status === 200 && r.data.refund === 16615.42 && r.data.isRefund === true && r.data.label === 'Refund'
+      && Array.isArray(r.data.lines) && r.data.lines.find((l) => l.line === '48400') && r.data.lines.find((l) => l.line === '48400').amount === 16615.42
+      && r.data.lines.find((l) => l.line === '15000').amount === 762151.94
+      && r.data.lines.find((l) => l.line === '43500').amount === 337393.99,
+    JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/filings/${projA}/refund`);
+  H.check('tax: the 2026 refund endpoint answers for A too',
+    r.status === 200 && typeof r.data.refund === 'number' && r.data.province === 'BC',
+    JSON.stringify({ refund: r.data.refund, province: r.data.province }));
 
   // ---- Tax Profile: user-entered room, validated ----
   r = await H.req('PUT', `/api/tax/profiles/${shawnId}`, {
@@ -193,24 +321,47 @@ export async function run(H, S) {
   r = await H.req('GET', `/api/tax/filings/${projA}/rrsp-benefit?amount=-1`);
   H.check('tax: negative amount is a 400', r.status === 400, JSON.stringify(r.status));
 
-  // ---- Charts: contributed vs remaining, from real records ----
-  r = await H.req('GET', `/api/tax/filings/${projA}/charts`);
-  H.check('tax: charts split contributed vs remaining (RRSP plan buys, TFSA $1,450, RESP $5,000 of $50,000, CESG $200 of $7,200)',
+  // ---- Charts: contributed vs remaining — the home (profile)
+  // charts read the app records; the filing charts read this
+  // project's items when it has any (basis tells which) ----
+  r = await H.req('GET', `/api/tax/profiles/${shawnId}/charts`);
+  H.check('tax: home charts split contributed vs remaining (RRSP plan buys $5,061.15, TFSA $1,450, RESP $5,000 of $50,000, CESG $200 of $7,200)',
     r.status === 200
-      && r.data.rrsp && r.data.rrsp.contributed === 5061.15 && r.data.rrsp.room === 20000
+      && r.data.rrsp && r.data.rrsp.contributed === 5061.15 && r.data.rrsp.room === 20000 && r.data.rrsp.basis === 'plans'
       && r.data.tfsa && r.data.tfsa.contributed === 1450 && r.data.tfsa.room === 5000
       && r.data.resp && r.data.resp.split && r.data.resp.split.contributed === 5000 && r.data.resp.split.remaining === 45000
       && r.data.resp.cesg && r.data.resp.cesg.earned === 200 && r.data.resp.cesg.remaining === 7000,
     JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/filings/${projA}/charts`);
+  H.check('tax: filing charts use this project\'s RRSP items ($3,960.90, basis project)',
+    r.status === 200 && r.data.rrsp && r.data.rrsp.contributed === 3960.9 && r.data.rrsp.basis === 'project' && r.data.rrsp.room === 20000,
+    JSON.stringify(r.data.rrsp));
+
+  // ---- History: the Tax filter covers tax + tax-profile ----
+  r = await H.req('GET', '/api/history/commits?limit=200');
+  const allCommits = r.data.commits || [];
+  const taxCount = allCommits.filter((c) => c.module === 'tax' || c.module === 'tax-profile').length;
+  H.check('tax: the run produced tax + tax-profile commits',
+    r.status === 200 && taxCount > 0 && allCommits.some((c) => c.module === 'tax-profile'),
+    JSON.stringify({ total: r.data.total, taxCount }));
+  r = await H.req('GET', '/api/history/commits?module=tax&limit=200');
+  H.check('tax: History filter by tax shows only tax + tax-profile commits',
+    r.status === 200 && r.data.total === taxCount
+      && (r.data.commits || []).every((c) => c.module === 'tax' || c.module === 'tax-profile')
+      && (r.data.commits || []).some((c) => c.module === 'tax-profile'),
+    JSON.stringify({ total: r.data.total, taxCount, modules: [...new Set((r.data.commits || []).map((c) => c.module))] }));
 
   // ---- Export round-trip: tax tables travel, delete, import, back ----
+  // A: 8 items (4 candidates + manual T776 + derived row + RESP +
+  // T4-slip employment) · B: 3 (gig + rental + derived row) ·
+  // 2025: 5 (T4-slip employment + 4 manual) · slips: 2.
   r = await H.req('GET', '/api/admin/data/export');
   const taxExport = r.data;
-  H.check('tax: export carries all four Tax tables with rows',
+  H.check('tax: export carries all four Tax tables with rows (16 items, 2 slips)',
     r.status === 200 && Array.isArray(taxExport.tables.tax_filings) && taxExport.tables.tax_filings.some((f) => f.id === projA)
       && Array.isArray(taxExport.tables.tax_profiles) && taxExport.tables.tax_profiles.some((p) => p.rrsp_room === 20000)
-      && Array.isArray(taxExport.tables.tax_items) && taxExport.tables.tax_items.length === 6
-      && Array.isArray(taxExport.tables.tax_slips) && taxExport.tables.tax_slips.some((s) => s.kind === 'T4'),
+      && Array.isArray(taxExport.tables.tax_items) && taxExport.tables.tax_items.length === 16
+      && Array.isArray(taxExport.tables.tax_slips) && taxExport.tables.tax_slips.length === 2,
     JSON.stringify({ filings: (taxExport.tables.tax_filings || []).length, profiles: (taxExport.tables.tax_profiles || []).length, items: (taxExport.tables.tax_items || []).length, slips: (taxExport.tables.tax_slips || []).length }));
   r = await H.req('DELETE', `/api/tax/filings/${projA}`);
   H.check('tax: project A deleted', r.status === 200, JSON.stringify(r.status));
@@ -221,11 +372,11 @@ export async function run(H, S) {
   await ensureAdmin();
   r = await H.req('GET', `/api/tax/filings/${projA}`);
   H.check('tax: project A is back after import',
-    r.status === 200 && r.data.name === 'Tax return 2026' && (r.data.items || []).length === 5 && (r.data.slips || []).length === 1,
+    r.status === 200 && r.data.name === 'Tax return 2026' && (r.data.items || []).length === 8 && (r.data.slips || []).length === 1,
     JSON.stringify({ name: r.data && r.data.name, items: (r.data.items || []).length, slips: (r.data.slips || []).length }));
 
-  // ---- UI: home lists the projects, detail shows sections, slider
-  // and charts; the slider updates the benefit live ----
+  // ---- UI: switcher, card click, detail, refund popup, RRSP
+  // tool, AI fill preview, profile Edit ----
   if (!H.chromeAvailable) {
     H.check('tax UI: skipped (no Chrome)', true, 'no chrome');
     return;
@@ -285,57 +436,177 @@ export async function run(H, S) {
   };
   try {
     await page.goto('http://ff.local/#tax', { waitUntil: 'networkidle0', timeout: 30000 });
-    H.check('tax UI: home lists both projects for Shawn',
+    H.check('tax UI: switcher shows Shawn + Jiaying, Shawn selected',
       await until(() => {
-        const el = document.querySelector('#taxFilerCards');
-        return el && el.textContent.includes('Tax return 2026') && el.textContent.includes('Rental only') ? true : null;
+        const tabs = document.querySelectorAll('#taxPersonTabs button');
+        const active = document.querySelector('#taxPersonTabs button.active');
+        return tabs.length === 2 && active && active.textContent.trim() === 'Shawn' ? true : null;
       }),
-      await page.evaluate(() => document.querySelector('#taxFilerCards').textContent));
-    H.check('tax UI: profile panel shows the recorded RRSP room ($20,000.00)',
+      await page.evaluate(() => document.querySelector('#taxPersonTabs').textContent));
+    H.check('tax UI: home lists only Shawn\'s projects (both 2026 projects, no Open button, no Generate button)',
       await until(() => {
-        const el = document.querySelector('#taxProfileList');
+        const body = document.querySelector('#taxPersonBody');
+        if (!body || !body.textContent.includes('Tax return 2026') || !body.textContent.includes('Rental only')) return null;
+        if (document.querySelector('#taxGenerateBtn')) return null;
+        // Scoped to the Tax home: other (hidden) views carry
+        // their own Generate buttons — only #taxHome counts here.
+        if ([...document.querySelector('#taxHome').querySelectorAll('button')].some((b) => /Generate/.test(b.textContent))) return null;
+        if ([...body.querySelectorAll('button')].some((b) => b.textContent.trim() === 'Open')) return null;
+        return true;
+      }),
+      await page.evaluate(() => document.querySelector('#taxPersonBody').textContent.slice(0, 300)));
+    H.check('tax UI: room line shows the recorded RRSP room ($20,000.00)',
+      await until(() => {
+        const el = document.querySelector('#taxRoomLine');
         return el && el.textContent.includes('20,000.00') ? true : null;
       }),
-      await page.evaluate(() => document.querySelector('#taxProfileList').textContent));
-    await page.evaluate((id) => { location.hash = `#tax/filing/${id}`; }, projA);
-    H.check('tax UI: detail title shows the project',
+      await page.evaluate(() => document.querySelector('#taxRoomLine').textContent));
+    H.check('tax UI: home room charts render (RRSP / TFSA / RESP / CESG, 4 doughnuts)',
+      await until(() => {
+        const el = document.querySelector('#taxHomeCharts');
+        return el && ['RRSP', 'TFSA', 'RESP', 'CESG grant'].every((s) => el.textContent.includes(s))
+          && el.querySelectorAll('canvas').length >= 4 ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxHomeCharts').textContent.slice(0, 300)));
+    // Switch to Jiaying: no projects, no recorded room — then back.
+    await page.evaluate((id) => { document.querySelector(`[data-tax-person="${id}"]`).click(); }, jiayingId);
+    H.check('tax UI: switching to Jiaying shows her (empty) projects and rooms',
+      await until(() => {
+        const body = document.querySelector('#taxPersonBody');
+        const line = document.querySelector('#taxRoomLine');
+        return body && !body.querySelector('[data-tax-open]')
+          && line && line.textContent.includes('No contribution room recorded.') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxPersonBody').textContent.slice(0, 200)));
+    await page.evaluate((id) => { document.querySelector(`[data-tax-person="${id}"]`).click(); }, shawnId);
+    await until(() => {
+      const body = document.querySelector('#taxPersonBody');
+      return body && body.querySelector('[data-tax-open]') ? true : null;
+    });
+    // The whole card opens the detail on click.
+    await page.evaluate((id) => { document.querySelector(`[data-tax-open="${id}"]`).click(); }, projA);
+    H.check('tax UI: clicking the project card opens the detail',
       await until(() => {
         const el = document.querySelector('#taxDetailTitle');
         return el && el.textContent.includes('Tax return 2026') ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxDetailTitle').textContent));
-    H.check('tax UI: Income / Deductions / Credits / Review sections render',
+    H.check('tax UI: detail has the four sections + Review + Finish and file, a plain Back link, and a danger Delete',
       await until(() => {
         const el = document.querySelector('#taxSections');
-        return el && ['Income', 'Deductions', 'Credits', 'Review'].every((s) => el.textContent.includes(s)) ? true : null;
+        if (!el || !['Income', 'Registered savings plans', 'Deductions', 'Provincial', 'Review', 'Finish and file'].every((s) => el.textContent.includes(s))) return null;
+        const back = document.querySelector('#taxBackLink');
+        if (!back || back.tagName !== 'A' || back.getAttribute('href') !== '#tax') return null;
+        const del = document.querySelector('#taxDeleteBtn');
+        if (!del || !del.classList.contains('danger')) return null;
+        if (document.querySelector('#taxGenerateBtn')) return null;
+        if ([...document.querySelectorAll('#taxDetail button')].some((b) => /Generate/.test(b.textContent))) return null;
+        return true;
       }),
-      await page.evaluate(() => document.querySelector('#taxSections').textContent.slice(0, 200)));
-    H.check('tax UI: RRSP slider and its estimate render',
+      await page.evaluate(() => document.querySelector('#taxSections').textContent.slice(0, 300)));
+    H.check('tax UI: detail charts render in the Tax Profile block',
+      await until(() => {
+        const el = document.querySelector('#taxDetailCharts');
+        return el && ['RRSP', 'TFSA', 'RESP', 'CESG grant'].every((s) => el.textContent.includes(s))
+          && el.querySelectorAll('canvas').length >= 4 ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxDetailCharts').textContent.slice(0, 300)));
+    // Refund headline on the 2025 filing: the figure, then the popup.
+    await page.evaluate((id) => { location.hash = `#tax/filing/${id}`; }, proj2025);
+    H.check('tax UI: the 2025 refund headline shows $16,615.42 as a Refund',
+      await until(() => {
+        const el = document.querySelector('#taxRefundCard');
+        return el && el.textContent.includes('16,615.42') && el.textContent.includes('Refund') ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxRefundCard') || { textContent: 'missing' }).textContent));
+    await page.evaluate(() => { document.querySelector('#taxRefundCard').click(); });
+    H.check('tax UI: clicking the headline opens the line-by-line T1 popup (line 48400, $16,615.42)',
+      await until(() => {
+        const el = document.querySelector('#taxModalBody');
+        return el && el.textContent.includes('48400') && el.textContent.includes('16,615.42') ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxModalBody') || { textContent: 'missing' }).textContent.slice(0, 400)));
+    await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });
+    // RRSP contribution tool: the button opens the modal with the
+    // slider, the highlighted tax-saved figure and the doughnut.
+    await page.evaluate((id) => { location.hash = `#tax/filing/${id}`; }, projA);
+    await until(() => document.querySelector('[data-tax-rrsp-tool]') ? true : null);
+    await page.evaluate(() => { document.querySelector('[data-tax-rrsp-tool]').click(); });
+    H.check('tax UI: RRSP tool opens with slider + highlighted tax-saved figure + doughnut',
       await until(() => {
         const s = document.querySelector('#taxRrspSlider');
         const res = document.querySelector('#taxRrspResult');
-        return s && res && res.textContent.includes('Tax saved') ? true : null;
+        const chart = document.querySelector('#taxRrspEstimatorChart');
+        return s && res && res.textContent.includes('Estimated tax saved')
+          && chart && chart.querySelector('canvas') ? true : null;
       }),
       await page.evaluate(() => (document.querySelector('#taxRrspResult') || { textContent: 'missing' }).textContent));
-    // Drag the slider to $5,000 and watch the benefit update live.
+    const savedBefore = await page.evaluate(() => (document.querySelector('#taxRrspResult .v') || { textContent: '' }).textContent);
+    await page.evaluate((v) => { window.__savedBefore = v; }, savedBefore);
     await page.evaluate(() => {
       const s = document.querySelector('#taxRrspSlider');
       s.value = '5000';
       s.dispatchEvent(new Event('input', { bubbles: true }));
     });
-    H.check('tax UI: moving the slider updates the benefit ($5,000 contributed)',
+    H.check('tax UI: moving the slider updates the amount ($5,000) and the tax-saved figure live',
       await until(() => {
-        const res = document.querySelector('#taxRrspResult');
-        return res && res.textContent.includes('5,000.00') && res.textContent.includes('Tax saved') ? true : null;
+        const amt = document.querySelector('#taxRrspAmount');
+        const res = document.querySelector('#taxRrspResult .v');
+        return amt && amt.value === '5,000' && res && res.textContent !== '' && res.textContent !== window.__savedBefore ? true : null;
       }),
-      await page.evaluate(() => (document.querySelector('#taxRrspResult') || { textContent: 'missing' }).textContent));
-    H.check('tax UI: contributed-vs-remaining charts render (RRSP / TFSA / RESP / CESG)',
+      await page.evaluate(() => `${document.querySelector('#taxRrspAmount').value} / ${(document.querySelector('#taxRrspResult .v') || {}).textContent}`));
+    await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });
+    // Fill with AI in the Add item modal: stubbed extraction
+    // previews, Apply fills the form, Save adds the item.
+    await page.evaluate(() => { document.querySelector('[data-tax-add-item="income"]').click(); });
+    await until(() => document.querySelector('#taxAddAiBtn') ? true : null);
+    await page.evaluate(() => { document.querySelector('#taxAddAiBtn').click(); });
+    await until(() => document.querySelector('#taxAiItemExtract') ? true : null);
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ kind: 'other_income', label: 'AI test income', amount: 777.77 }));
+    await page.evaluate(() => {
+      document.querySelector('#taxAiItemText').value = 'Other income $777.77 for 2026';
+      document.querySelector('#taxAiItemExtract').click();
+    });
+    H.check('tax UI: Fill with AI previews the stubbed extraction and Apply fills the form',
       await until(() => {
-        const el = document.querySelector('#taxCharts');
-        return el && ['RRSP', 'TFSA', 'RESP', 'CESG grant'].every((s) => el.textContent.includes(s))
-          && el.querySelectorAll('canvas').length >= 4 ? true : null;
+        const msg = document.querySelector('#taxAddAiMsg');
+        const form = document.querySelector('#taxAddManualForm');
+        if (!msg || !msg.textContent.includes('Extracted — review the fields, then Save.')) return null;
+        if (!form) return null;
+        const amt = form.querySelector('input[name="amount"]');
+        const label = form.querySelector('input[name="label"]');
+        return amt && amt.value === '777.77' && label && label.value === 'AI test income' ? true : null;
       }),
-      await page.evaluate(() => document.querySelector('#taxCharts').textContent.slice(0, 300)));
+      await page.evaluate(() => (document.querySelector('#taxAddAiMsg') || { textContent: 'missing' }).textContent));
+    await page.evaluate(() => { document.querySelector('#taxAddManualForm button[type="submit"]').click(); });
+    H.check('tax UI: saving the AI-filled item adds it to Income',
+      await until(() => {
+        const el = document.querySelector('#taxSections');
+        return el && el.textContent.includes('AI test income') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxSections').textContent.slice(0, 400)));
+    // Profile Edit from home saves a room change and stays on home.
+    await page.evaluate(() => { location.hash = '#tax'; });
+    await until(() => document.querySelector('#taxRoomEditBtn') ? true : null);
+    await page.evaluate(() => { document.querySelector('#taxRoomEditBtn').click(); });
+    H.check('tax UI: profile Edit opens with the saved rooms ($20,000 RRSP)',
+      await until(() => {
+        const f = document.querySelector('#taxProfileForm');
+        return f && f.querySelector('input[name="rrsp_room"]').value === '20,000' ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxProfileForm') || { textContent: 'missing' }).textContent.slice(0, 200)));
+    await page.evaluate(() => {
+      const f = document.querySelector('#taxProfileForm');
+      f.querySelector('input[name="rrsp_room"]').value = '21,000';
+      f.querySelector('button[type="submit"]').click();
+    });
+    H.check('tax UI: saving the profile updates the room line ($21,000.00) and stays on Tax home',
+      await until(() => {
+        const line = document.querySelector('#taxRoomLine');
+        const home = document.querySelector('#taxHome');
+        return line && line.textContent.includes('21,000.00') && home && !home.classList.contains('hidden') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxRoomLine').textContent));
   } finally {
     await browser.close();
   }

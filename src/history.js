@@ -335,7 +335,14 @@ export function commitListRow(row) {
 export function listCommits(db, { module, q, projectId, limit, offset }) {
   const conds = [];
   const vals = [];
-  if (module) { conds.push('module = ?'); vals.push(module); }
+  // The Tax filter covers both tax write streams: 'tax' (filings,
+  // items, slips) and 'tax-profile' (the contribution-room
+  // profile). They are one module in the UI — the dropdown lists
+  // no separate tax-profile option.
+  if (module) {
+    if (module === 'tax') conds.push(`module IN ('tax', 'tax-profile')`);
+    else { conds.push('module = ?'); vals.push(module); }
+  }
   if (projectId != null) { conds.push('project_id = ?'); vals.push(projectId); }
   if (q) { conds.push('(entity_label LIKE ? OR summary LIKE ?)'); vals.push(`%${q}%`, `%${q}%`); }
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';

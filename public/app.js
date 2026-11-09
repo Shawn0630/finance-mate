@@ -518,31 +518,46 @@ function route() {
 window.addEventListener('hashchange', route);
 
 // ------------------------------------------------------------------- Tax --
-// v1: tax PROJECTS per person per tax year (many per person-year),
-// on-demand Generate only — nothing generates on page load, year
-// change or in the background. The detail page is sectioned like
-// a guided return (Income / Deductions / Credits / Review), with
-// an RRSP benefit slider in Deductions and contributed-vs-
-// remaining account charts. No tax computation anywhere — the
-// slider is a scoped estimate from the existing Earnings engine.
+// ------------------------------------------------------------------- Tax --
+// v1: tax PROJECTS per person per tax year (many per person-year).
+// Nothing generates automatically — a project starts empty (0
+// items) and the user adds items via Add, picking from the
+// region's candidate list (jobs, rentals, RRSP plans, dividends,
+// sells) or from a slip / manual form. No Generate button anywhere
+// (removed 2026-11-08). Project cards open on click; there is no
+// Open button. The detail page is sectioned like a guided return
+// (Income / Registered savings plans / Deductions / Provincial /
+// Review / Finish and file), with the refund headline at the very
+// top (computed T1 — see src/regions/ca/t1.js), Tax Profile +
+// Slips side by side below it, and the RRSP contribution tool as
+// a button in Registered savings plans. Room doughnuts are one
+// renderer shared by the home switcher and the detail page.
 const TAX_KIND_LABELS = {
-  employment: 'Employment', rental: 'Rental', rrsp: 'RRSP',
+  employment: 'Employment', rental: 'Rental', rrsp: 'RRSP', resp: 'RESP',
+  prpp: 'PRPP', rpp: 'RPP', hbp: 'Home buyers plan',
   investment_income: 'Investment income', capital_gain: 'Capital gain',
-  other_income: 'Other income', deduction: 'Deduction', credit: 'Credit',
+  other_income: 'Other income', deduction: 'Deduction', disability: 'Disability',
+  student: 'Student', credit: 'Credit',
 };
 const TAX_SECTIONS = [
-  { key: 'income', label: 'Income', kinds: ['employment', 'rental', 'investment_income', 'capital_gain', 'other_income'] },
-  { key: 'deductions', label: 'Deductions', kinds: ['rrsp', 'deduction'] },
-  { key: 'credits', label: 'Credits', kinds: ['credit'] },
+  { key: 'income', label: 'Income', sub: 'T4 Employment income · T5 Investment income · T4RSP Income from an RRSP · Rental properties', kinds: ['employment', 'rental', 'investment_income', 'capital_gain', 'other_income'] },
+  { key: 'registered', label: 'Registered savings plans', sub: 'RRSP contributions · PRPP contributions · Registered pension plan (RPP) · Home buyers plan (HBP)', kinds: ['rrsp', 'resp', 'prpp', 'rpp', 'hbp'] },
+  { key: 'deductions', label: 'Deductions', sub: 'Disability amount · Students', kinds: ['deduction', 'disability', 'student'] },
+  { key: 'provincial', label: 'Provincial', sub: 'Provincial tax credits (BC)', kinds: ['credit'] },
 ];
 let taxYear = null;
 let taxFiling = null;
 let taxSlipKinds = [];
+let taxT776Form = null;
+let taxRrspWindow = null;
+let taxPersonId = null;
 let taxChartsDrawn = {};
 
 function taxMsg(el, kind, text) { showMsg(el, kind, text); }
 
 async function loadTax() {
+  taxFiling = null; // home has no current filing — a profile save
+  // from here must refresh home, not jump back to the detail.
   $('#taxDetail').classList.add('hidden');
   $('#taxHome').classList.remove('hidden');
   const msg = $('#taxHomeMsg');
@@ -554,62 +569,52 @@ async function loadTax() {
     sel.innerHTML = years.years.map((y) => `<option value="${y}"${y === taxYear ? ' selected' : ''}>${y}</option>`).join('');
     sel.onchange = () => { taxYear = Number(sel.value); loadTax(); };
     const data = await api(`/api/tax/filings?year=${taxYear}`);
-    // One card per person: their projects for the year, each
-    // with its own Generate / Re-generate and Open.
-    $('#taxFilerCards').innerHTML = data.filers.map((f) => {
-      const projects = f.projects.map((p) => {
+    const filers = data.filers || [];
+    if (taxPersonId == null || !filers.some((f) => f.person.id === taxPersonId)) {
+      taxPersonId = filers.length ? filers[0].person.id : null;
+    }
+    // Person switcher: only the selected person's projects and
+    // rooms are shown.
+    $('#taxPersonTabs').innerHTML = filers.map((f) =>
+      `<button class="small${f.person.id === taxPersonId ? ' active' : ''}" data-tax-person="${f.person.id}">${esc(f.person.username)}</button>`).join(' ');
+    document.querySelectorAll('[data-tax-person]').forEach((b) => b.addEventListener('click', () => {
+      taxPersonId = Number(b.dataset.taxPerson);
+      loadTax();
+    }));
+    const filer = filers.find((f) => f.person.id === taxPersonId);
+    if (!filer) {
+      $('#taxPersonBody').innerHTML = '<div class="note">No filers.</div>';
+      $('#taxRoomLine').innerHTML = '';
+      $('#taxHomeCharts').innerHTML = '';
+      return;
+    }
+    // One card per project for the year. The whole card opens
+    // the detail on click — no Open button.
+    const projects = filer.projects || [];
+    $('#taxPersonBody').innerHTML = `<div class="section-head"><h3>${esc(filer.person.username)} · ${taxYear}</h3><div class="spacer"></div>
+      <button class="small" id="taxCreateProjectBtn">+ Create project</button></div>` +
+      (projects.map((p) => {
         const status = p.status === 'filed' ? 'Filed' : 'Open';
         const kinds = Object.entries(p.totals.byKind || {})
           .map(([k, v]) => `${TAX_KIND_LABELS[k] || k} ${money2(v)}`).join(' · ');
-        const genLabel = p.generated_at ? 'Re-generate' : 'Generate';
-        return `<div class="panel" style="margin-top:8px"><div class="section-head"><h3>${esc(p.name)}</h3>
-          <div class="spacer"></div><span>${status}</span>
-          <button class="small" data-tax-generate="${p.id}">${genLabel}</button>
-          <button class="small" data-tax-open="${p.id}">Open</button></div>
-          <div>${p.itemCount} item${p.itemCount === 1 ? '' : 's'}${kinds ? ` · ${kinds}` : ''}${p.generated_at ? '' : ' · Not generated yet'}</div></div>`;
-      }).join('');
-      return `<div class="panel"><div class="section-head"><h3>${esc(f.person.username)} · ${taxYear}</h3>
-        <div class="spacer"></div>
-        <button class="small" data-tax-create="${f.person.id}">+ Create project</button></div>
-        ${projects || '<div class="note">No projects yet.</div>'}</div>`;
-    }).join('') || '<div class="note">No filers.</div>';
-    document.querySelectorAll('[data-tax-open]').forEach((b) => b.addEventListener('click', () => { location.hash = `#tax/filing/${b.dataset.taxOpen}`; }));
-    document.querySelectorAll('[data-tax-create]').forEach((b) => b.addEventListener('click', () => taxCreateProjectModal(Number(b.dataset.taxCreate))));
-    document.querySelectorAll('[data-tax-generate]').forEach((b) => b.addEventListener('click', async () => {
-      try {
-        await api(`/api/tax/filings/${b.dataset.taxGenerate}/generate`, { method: 'POST', body: {} });
-        loadTax();
-      } catch (err) { taxMsg(msg, 'err', err.message); }
-    }));
-    // Contribution-room profiles (user-entered from the CRA
-    // Notice of Assessment — blank means not recorded).
+        return `<div class="panel breakdown-card" data-tax-open="${p.id}"><div class="section-head"><h3>${esc(p.name)}</h3>
+          <div class="spacer"></div><span>${status}</span></div>
+          <div>${p.itemCount} item${p.itemCount === 1 ? '' : 's'}${kinds ? ` · ${kinds}` : ''}</div></div>`;
+      }).join('') || '<div class="note">No projects yet.</div>');
+    document.querySelectorAll('[data-tax-open]').forEach((el) => el.addEventListener('click', () => { location.hash = `#tax/filing/${el.dataset.taxOpen}`; }));
+    $('#taxCreateProjectBtn').addEventListener('click', () => taxCreateProjectModal(filer.person.id));
+    // Contribution room for the selected person (user-entered
+    // from the CRA Notice of Assessment — blank means not recorded).
+    const prof = filer.profile;
     const room = (v) => (v == null ? 'Not recorded' : money2(v));
-    $('#taxProfileList').innerHTML = data.filers.map((f) => {
-      const p = f.profile;
-      return `<div class="panel" style="margin-top:8px"><div class="section-head"><h3>${esc(f.person.username)}</h3>
-        <div class="spacer"></div><button class="small" data-tax-profile="${f.person.id}">${p ? 'Edit profile' : 'Add profile'}</button></div>
-        <div>RRSP room ${room(p ? p.rrsp_room : null)} · TFSA room ${room(p ? p.tfsa_room : null)}${p && p.resp_beneficiary ? ` · RESP (${esc(p.resp_beneficiary)}) room ${room(p.resp_room)} · CESG room ${room(p.cesg_room)}` : ''}${p && p.as_of_date ? ` · as of ${esc(p.as_of_date)}` : ''}</div></div>`;
-    }).join('');
-    document.querySelectorAll('[data-tax-profile]').forEach((b) => b.addEventListener('click', () => taxProfileModal(Number(b.dataset.taxProfile))));
-    // Unlinked items: link into any project of the same year.
-    const allProjects = data.filers.flatMap((f) => f.projects.map((p) => ({ ...p, username: f.person.username })));
-    const unlinked = data.unlinked || [];
-    $('#taxUnlinkedPanel').style.display = unlinked.length ? '' : 'none';
-    $('#taxUnlinkedList').innerHTML = unlinked.length
-      ? `<table><thead><tr><th>Kind</th><th>Item</th><th class="num">Amount</th><th>Share</th><th>Link to</th></tr></thead><tbody>${
-        unlinked.map((it) => `<tr><td>${esc(TAX_KIND_LABELS[it.kind] || it.kind)}</td><td>${esc(it.label)}</td>
-          <td class="num">${money2(it.amount)}</td><td class="num">${it.share_pct}%</td>
-          <td><select data-tax-link="${it.id}"><option value="">—</option>${
-            allProjects.map((p) => `<option value="${p.id}">${esc(p.username)} — ${esc(p.name)}</option>`).join('')
-          }</select></td></tr>`).join('')}</tbody></table>`
-      : '';
-    document.querySelectorAll('[data-tax-link]').forEach((sel) => sel.addEventListener('change', async () => {
-      if (!sel.value) return;
-      try {
-        await api(`/api/tax/items/${sel.dataset.taxLink}/link`, { method: 'POST', body: { filingId: Number(sel.value) } });
-        loadTax();
-      } catch (err) { taxMsg(msg, 'err', err.message); }
-    }));
+    $('#taxRoomLine').innerHTML = prof
+      ? `RRSP room ${room(prof.rrsp_room)} · TFSA room ${room(prof.tfsa_room)}${prof.resp_beneficiary ? ` · RESP (${esc(prof.resp_beneficiary)}) room ${room(prof.resp_room)} · CESG room ${room(prof.cesg_room)}` : ''}${prof.as_of_date ? ` · as of ${esc(prof.as_of_date)}` : ''}`
+      : 'No contribution room recorded.';
+    $('#taxRoomEditBtn').onclick = () => taxProfileModal(filer.person.id);
+    $('#taxRoomAiBtn').onclick = () => taxProfileModal(filer.person.id, { aiOpen: true });
+    // Room charts for the selected person — the same renderer
+    // the detail page uses, with a 'home' prefix on canvas ids.
+    await taxRenderCharts($('#taxHomeCharts'), `/api/tax/profiles/${filer.person.id}/charts`, 'home');
   } catch (err) { taxMsg(msg, 'err', err.message); }
 }
 
@@ -629,63 +634,104 @@ function taxCreateProjectModal(personId) {
 }
 
 function taxItemRowHtml(it) {
+  const derived = it.detail && it.detail.derived;
+  const tags = [];
+  if (derived) tags.push('Derived');
+  if (it.kind === 'resp') tags.push('Non-deductible');
+  const tagHtml = tags.length ? ` <span class="note">${tags.join(' · ')}</span>` : '';
   return `<tr><td>${esc(TAX_KIND_LABELS[it.kind] || it.kind)}</td>
-    <td>${esc(it.label)}${it.detail && it.detail.note ? `<div class="note" style="margin:0">${esc(it.detail.note)}</div>` : ''}${it.notes ? `<div class="note" style="margin:0">${esc(it.notes)}</div>` : ''}</td>
+    <td>${esc(it.label)}${tagHtml}${it.detail && it.detail.note ? `<div class="note">${esc(it.detail.note)}</div>` : ''}${it.notes ? `<div class="note">${esc(it.notes)}</div>` : ''}</td>
     <td class="num">${money2(it.amount)}</td><td class="num">${it.share_pct}%</td>
     <td class="num">${money2(it.effective_amount)}</td><td>${esc(it.status)}</td>
-    <td style="white-space:nowrap">
+    <td class="actions">${derived ? '' : `
       ${it.status !== 'confirmed' ? `<button class="small" data-tax-confirm="${it.id}">Confirm</button>` : `<button class="small" data-tax-unconfirm="${it.id}">Unconfirm</button>`}
       <button class="small" data-tax-edit-item="${it.id}">Edit</button>
-      <button class="small" data-tax-del-item="${it.id}">Delete</button>
+      <button class="small danger" data-tax-del-item="${it.id}">Delete</button>`}
     </td></tr>`;
 }
 
 async function loadTaxFiling(id) {
   $('#taxHome').classList.add('hidden');
   $('#taxDetail').classList.remove('hidden');
-  for (const k of Object.keys(taxChartsDrawn)) { try { taxChartsDrawn[k].destroy(); } catch {} }
-  taxChartsDrawn = {};
   const msg = $('#taxDetailMsg');
   msg.textContent = '';
   try {
     const data = await api(`/api/tax/filings/${id}`);
     taxFiling = data;
     taxSlipKinds = data.slipKinds || [];
+    taxT776Form = data.t776Form || null;
+    taxRrspWindow = data.rrspWindow || null;
     $('#taxDetailTitle').textContent = `${data.name} — ${data.person ? data.person.username : '?'} · ${data.tax_year}`;
     $('#taxDetailStatus').textContent = data.status === 'filed' ? 'Filed' : 'Open';
     $('#taxFileToggleBtn').textContent = data.status === 'filed' ? 'Reopen' : 'Mark filed';
-    $('#taxGenerateBtn').textContent = data.generated_at ? 'Re-generate expected items' : 'Generate expected items';
-    // Guided-return sections: each shows expected vs linked /
-    // confirmed vs still to review, so the return is worked
-    // through section by section.
+    // Refund headline — the very top of the detail, above the
+    // Tax Profile / Slips row.
+    await taxLoadRefundHeadline(data.id);
+    // Tax Profile block (top-left): room line + charts, with
+    // Edit + Fill with AI beside it.
+    const prof = data.profile;
+    const room = (v) => (v == null ? 'Not recorded' : money2(v));
+    $('#taxDetailProfileBody').innerHTML = prof
+      ? `RRSP room ${room(prof.rrsp_room)} · TFSA room ${room(prof.tfsa_room)}${prof.resp_beneficiary ? ` · RESP (${esc(prof.resp_beneficiary)}) room ${room(prof.resp_room)} · CESG room ${room(prof.cesg_room)}` : ''}${prof.as_of_date ? ` · as of ${esc(prof.as_of_date)}` : ''}`
+      : 'No contribution room recorded.';
+    $('#taxDetailProfileEditBtn').onclick = () => taxProfileModal(data.person.id);
+    $('#taxDetailProfileAiBtn').onclick = () => taxProfileModal(data.person.id, { aiOpen: true });
+    // Charts re-draw on every load, so any item/slip/profile
+    // change inside this project updates them with no reload.
+    await taxRenderCharts($('#taxDetailCharts'), `/api/tax/filings/${data.id}/charts`, 'detail');
+    // Slips (top-right). Adding a slip places its item below.
+    $('#taxSlipList').innerHTML = data.slips.length
+      ? `<table><thead><tr><th>Slip</th><th>Year</th><th>Boxes</th><th>Source</th><th></th></tr></thead><tbody>${
+        data.slips.map((s) => {
+          const def = taxSlipKinds.find((k) => k.kind === s.kind);
+          const boxes = def ? def.fields.filter((f) => f.money && s.fields[f.key] != null)
+            .map((f) => `${f.label.split('—')[0].trim()} ${money2(s.fields[f.key])}`).join(' · ') : '';
+          return `<tr><td>${esc(s.kind)} — ${esc(def ? def.label.split('—')[1]?.trim() || '' : '')}</td>
+            <td>${s.tax_year}</td><td>${esc(boxes)}</td><td>${esc(s.source)}</td>
+            <td class="actions"><button class="small" data-tax-edit-slip="${s.id}">Edit</button>
+            <button class="small danger" data-tax-del-slip="${s.id}">Delete</button></td></tr>`;
+        }).join('')}</tbody></table>`
+      : '<div class="note">No slips yet.</div>';
+    document.querySelectorAll('[data-tax-edit-slip]').forEach((b) => b.addEventListener('click', () => taxSlipModal(Number(b.dataset.taxEditSlip))));
+    document.querySelectorAll('[data-tax-del-slip]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Delete this slip? Its linked item is deleted too, unless confirmed.')) return;
+      try { await api(`/api/tax/slips/${b.dataset.taxDelSlip}`, { method: 'DELETE' }); loadTaxFiling(id); }
+      catch (err) { taxMsg(msg, 'err', err.message); }
+    }));
+    // Guided-return sections. Derived rental-deduction rows
+    // render in Income (under their rental item) and never in
+    // Deductions; the Deductions section holds the manual kinds.
     const sectionsHtml = TAX_SECTIONS.map((s) => {
-      const st = (data.sections && data.sections[s.key]) || { total: 0, expected: 0, linked: 0, confirmed: 0, excluded: 0, amount: 0 };
-      const items = (data.items || []).filter((i) => s.kinds.includes(i.kind));
-      const stateLine = data.generated_at
-        ? `${st.expected} expected · ${st.linked} linked · ${st.confirmed} confirmed${st.excluded ? ` · ${st.excluded} excluded` : ''} · ${money2(st.amount)}`
-        : 'Not generated yet — Generate to see expected items.';
+      const st = (data.sections && data.sections[s.key]) || { total: 0, linked: 0, confirmed: 0, excluded: 0, amount: 0 };
+      const items = (data.items || []).filter((i) => {
+        const derived = i.detail && i.detail.derived;
+        if (s.key === 'income') return s.kinds.includes(i.kind) || derived;
+        if (derived) return false;
+        return s.kinds.includes(i.kind);
+      });
+      const stateLine = `${st.linked} linked · ${st.confirmed} confirmed${st.excluded ? ` · ${st.excluded} excluded` : ''} · ${money2(st.amount)}`;
       return `<div class="panel"><div class="section-head"><h3>${s.label}</h3><div class="spacer"></div><span>${stateLine}</span>
-        <button class="small" data-tax-add-item="${s.kinds[0]}">+ Add</button></div>
+        ${s.key === 'registered' ? '<button class="small" data-tax-rrsp-tool>RRSP contribution tool</button>' : ''}
+        <button class="small" data-tax-add-item="${s.key}">+ Add</button></div>
+        <div class="note">${esc(s.sub)}${s.key === 'registered' && taxRrspWindow ? ` · RRSP window ${esc(taxRrspWindow.label)}` : ''}</div>
         ${items.length
           ? `<table><thead><tr><th>Kind</th><th>Item</th><th class="num">Amount</th><th class="num">Share</th><th class="num">Effective</th><th>Status</th><th></th></tr></thead><tbody>${items.map(taxItemRowHtml).join('')}</tbody></table>`
-          : '<div class="note">No items yet.</div>'}
-        ${s.key === 'deductions' ? '<div id="taxRrspEstimator"></div>' : ''}</div>`;
+          : '<div class="note">No items yet.</div>'}</div>`;
     }).join('');
     const reviewCards = TAX_SECTIONS.map((s) => {
-      const st = (data.sections && data.sections[s.key]) || { amount: 0, expected: 0, linked: 0, confirmed: 0, excluded: 0 };
-      const done = st.confirmed;
-      const total = st.expected + st.linked + st.confirmed;
-      return `<div class="summary-card"><div class="k">${s.label}</div><div class="v">${money2(st.amount)}</div><div>${done} of ${total} confirmed</div></div>`;
+      const st = (data.sections && data.sections[s.key]) || { amount: 0, confirmed: 0, total: 0 };
+      return `<div class="summary-card"><div class="k">${s.label}</div><div class="v">${money2(st.amount)}</div><div>${st.confirmed} of ${st.total} confirmed</div></div>`;
     }).join('');
-    const prof = data.profile;
-    const roomLine = prof
-      ? `RRSP room ${prof.rrsp_room == null ? 'Not recorded' : money2(prof.rrsp_room)} · TFSA room ${prof.tfsa_room == null ? 'Not recorded' : money2(prof.tfsa_room)}${prof.resp_beneficiary ? ` · RESP (${esc(prof.resp_beneficiary)}) room ${prof.resp_room == null ? 'Not recorded' : money2(prof.resp_room)} · CESG room ${prof.cesg_room == null ? 'Not recorded' : money2(prof.cesg_room)}` : ''}${prof.as_of_date ? ` · as of ${esc(prof.as_of_date)}` : ''}`
-      : 'No contribution room recorded — add it on the Tax home profile.';
     const reviewHtml = `<div class="panel"><div class="section-head"><h3>Review</h3><div class="spacer"></div><span>${data.status === 'filed' ? 'Filed' : 'Open'}</span></div>
-      <div class="summary-row">${reviewCards}<div class="summary-card"><div class="k">Total</div><div class="v">${money2(data.totals.total)}</div></div></div>
-      <div>${roomLine}</div>
-      <div class="note">Estimate — actual tax is settled on the T1.</div></div>`;
-    $('#taxSections').innerHTML = sectionsHtml + reviewHtml;
+      <div class="summary-row">${reviewCards}<div class="summary-card"><div class="k">Total</div><div class="v">${money2(data.totals.total)}</div></div></div></div>`;
+    const finishHtml = `<div class="panel"><div class="section-head"><h3>Finish and file</h3></div>
+      ${TAX_SECTIONS.map((s) => {
+        const st = (data.sections && data.sections[s.key]) || { total: 0, confirmed: 0 };
+        return `<div>${s.label}: ${st.confirmed} of ${st.total} confirmed</div>`;
+      }).join('')}
+      <div>Contribution room: ${prof ? (prof.rrsp_room != null || prof.tfsa_room != null ? 'Recorded' : 'No room recorded') : 'No profile yet'}</div>
+      <div>Slips: ${data.slips.length} attached</div></div>`;
+    $('#taxSections').innerHTML = sectionsHtml + reviewHtml + finishHtml;
     document.querySelectorAll('[data-tax-confirm]').forEach((b) => b.addEventListener('click', () => taxSetItemStatus(Number(b.dataset.taxConfirm), 'confirmed')));
     document.querySelectorAll('[data-tax-unconfirm]').forEach((b) => b.addEventListener('click', () => taxSetItemStatus(Number(b.dataset.taxUnconfirm), 'linked')));
     document.querySelectorAll('[data-tax-edit-item]').forEach((b) => b.addEventListener('click', () => taxEditItemModal(Number(b.dataset.taxEditItem))));
@@ -695,27 +741,45 @@ async function loadTaxFiling(id) {
       catch (err) { taxMsg(msg, 'err', err.message); }
     }));
     document.querySelectorAll('[data-tax-add-item]').forEach((b) => b.addEventListener('click', () => taxAddItemModal(b.dataset.taxAddItem)));
-    $('#taxSlipList').innerHTML = data.slips.length
-      ? `<table><thead><tr><th>Slip</th><th>Year</th><th>Boxes</th><th>Source</th><th></th></tr></thead><tbody>${
-        data.slips.map((s) => {
-          const def = taxSlipKinds.find((k) => k.kind === s.kind);
-          const boxes = def ? def.fields.filter((f) => f.money && s.fields[f.key] != null)
-            .map((f) => `${f.label.split('—')[0].trim()} ${money2(s.fields[f.key])}`).join(' · ') : '';
-          return `<tr><td>${esc(s.kind)} — ${esc(def ? def.label.split('—')[1]?.trim() || '' : '')}</td>
-            <td>${s.tax_year}</td><td>${esc(boxes)}</td><td>${esc(s.source)}</td>
-            <td style="white-space:nowrap"><button class="small" data-tax-edit-slip="${s.id}">Edit</button>
-            <button class="small" data-tax-del-slip="${s.id}">Delete</button></td></tr>`;
-        }).join('')}</tbody></table>`
-      : '<div class="note">No slips yet.</div>';
-    document.querySelectorAll('[data-tax-edit-slip]').forEach((b) => b.addEventListener('click', () => taxSlipModal(Number(b.dataset.taxEditSlip))));
-    document.querySelectorAll('[data-tax-del-slip]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Delete this slip? Its linked item is deleted too, unless confirmed.')) return;
-      try { await api(`/api/tax/slips/${b.dataset.taxDelSlip}`, { method: 'DELETE' }); loadTaxFiling(id); }
-      catch (err) { taxMsg(msg, 'err', err.message); }
-    }));
-    taxInitRrspEstimator(data);
-    taxLoadCharts(data);
+    document.querySelectorAll('[data-tax-rrsp-tool]').forEach((b) => b.addEventListener('click', taxRrspEstimatorModal));
   } catch (err) { taxMsg(msg, 'err', err.message); }
+}
+
+// ------------------------------------------------------- refund headline --
+// One big figure at the very top of the detail. Positive = refund
+// (green), negative = balance owing (red); the sign convention is
+// stated under the figure. Click opens the line-by-line T1 popup.
+async function taxLoadRefundHeadline(filingId) {
+  const host = $('#taxRefundHeadline');
+  if (!host) return;
+  host.innerHTML = '';
+  let r;
+  try {
+    r = await api(`/api/tax/filings/${filingId}/refund`);
+  } catch (err) {
+    host.innerHTML = `<div class="note">${esc(err.message)}</div>`;
+    return;
+  }
+  if (r.unsupportedProvince || r.unsupportedYear) {
+    host.innerHTML = `<div class="note">${esc((r.notes || ['Refund unavailable.'])[0])}</div>`;
+    return;
+  }
+  host.innerHTML = `<div class="summary-card" id="taxRefundCard" style="cursor:pointer;text-align:center">
+    <div class="k">${esc(r.label)}</div>
+    <div class="v ${r.isRefund ? 'positive' : 'negative'}">${money2(r.displayAmount)}</div>
+    <div class="n">Tap for the line-by-line T1 breakdown · positive = refund, negative = balance owing</div></div>`;
+  $('#taxRefundCard').addEventListener('click', () => taxRefundModal(r));
+}
+
+function taxRefundModal(r) {
+  const rows = (r.lines || []).map((l) => `<tr${l.sub ? ' class="sub"' : ''}><td>${l.line == null ? '' : esc(String(l.line))}</td><td>${esc(l.label)}</td><td class="num">${money2(l.amount)}</td></tr>`).join('');
+  const notes = (r.notes || []).length
+    ? `<div class="note">${(r.notes || []).map((n) => esc(n)).join('<br>')}</div>` : '';
+  taxOpenModal(`${r.label} — ${money2(r.displayAmount)}`, `
+    <div>Tax year ${r.taxYear} · ${esc(r.province)} · positive = refund, negative = balance owing.</div>
+    <table><thead><tr><th>Line</th><th></th><th class="num">Amount</th></tr></thead><tbody>${rows}</tbody></table>
+    ${notes}
+    <div class="toolbar"><button type="button" data-close-modal>Close</button></div>`);
 }
 
 async function taxSetItemStatus(itemId, status) {
@@ -735,147 +799,95 @@ function taxOpenModal(title, bodyHtml) {
   openModal('taxModal');
 }
 
-function taxItemFormHtml(item, defaultKind) {
-  const kindOpts = Object.entries(TAX_KIND_LABELS)
-    .map(([k, v]) => `<option value="${k}"${(item && item.kind === k) || (!item && k === defaultKind) ? ' selected' : ''}>${v}</option>`).join('');
-  return `<form id="taxItemForm">
-    <div class="grid2">
-      <div><label>Kind *</label><select name="kind">${kindOpts}</select></div>
-      <div><label>Amount *</label><input name="amount" type="text" inputmode="decimal" data-money required value="${item ? formatMoneyInput(item.amount) : ''}"></div>
-    </div>
-    <div><label>Label *</label><input name="label" required value="${item ? esc(item.label) : ''}"></div>
-    <div class="grid2">
-      <div><label>Share % (this filer's share)</label><input name="share_pct" type="number" step="0.01" min="0" max="100" value="${item ? item.share_pct : 100}"></div>
-      ${item ? `<div><label>Status</label><select name="status">${['expected', 'linked', 'confirmed', 'excluded'].map((s) => `<option value="${s}"${item.status === s ? ' selected' : ''}>${s}</option>`).join('')}</select></div>` : ''}
-    </div>
-    <div><label>Notes</label><input name="notes" value="${item && item.notes ? esc(item.notes) : ''}"></div>
-    <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" data-close-modal>Cancel</button></div>
-  </form>`;
+
+// --------------------------------------------------------- T776 forms --
+// The T776 (Statement of Real Estate Rentals) form: income lines
+// 8141/8230, numbered expense lines from the region, net 9946.
+// The server derives the amount from the lines; the client only
+// previews the net.
+function taxT776LinesHtml(lines) {
+  if (!taxT776Form) return '';
+  const val = (k) => (lines && lines[k] != null ? formatMoneyInput(lines[k]) : '');
+  const income = taxT776Form.income.map((f) => `<div><label>${esc(f.label)}</label>
+    <input name="t776_${f.key}" type="text" inputmode="decimal" data-money value="${val(f.key)}"></div>`).join('');
+  const expenses = taxT776Form.expenses.map((f) => `<div><label>${esc(f.label)}</label>
+    <input name="t776_${f.key}" type="text" inputmode="decimal" data-money value="${val(f.key)}"></div>`).join('');
+  return `<div class="grid2">${income}</div><div class="grid2">${expenses}</div>
+    <div class="note">Net (line 9946) = gross (8299) − expenses; the server derives it from these lines.</div>`;
 }
 
-function taxAddItemModal(defaultKind) {
-  taxOpenModal('Add item', taxItemFormHtml(null, defaultKind || 'other_income'));
-  $('#taxItemForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    const body = {
-      kind: f.kind.value,
-      label: f.label.value.trim(),
-      amount: Number(parseMoneyInput(f.amount.value)),
-      share_pct: Number(f.share_pct.value) || 100,
-      notes: f.notes.value.trim() || null,
-    };
-    try {
-      await api(`/api/tax/filings/${taxFiling.id}/items`, { method: 'POST', body });
-      closeModalEl($('#taxModal'));
-      loadTaxFiling(taxFiling.id);
-    } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
-  });
+function taxT776LinesFromForm(form) {
+  const lines = {};
+  if (!taxT776Form) return lines;
+  for (const f of [...taxT776Form.income, ...taxT776Form.expenses]) {
+    const input = form[`t776_${f.key}`];
+    if (!input) continue;
+    const raw = parseMoneyInput(input.value);
+    if (raw !== '' && raw != null) lines[f.key] = Number(raw);
+  }
+  return lines;
 }
 
-function taxEditItemModal(itemId) {
-  const item = (taxFiling.items || []).find((i) => i.id === itemId);
-  if (!item) return;
-  taxOpenModal('Edit item', taxItemFormHtml(item));
-  $('#taxItemForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    const body = {
-      label: f.label.value.trim(),
-      amount: Number(parseMoneyInput(f.amount.value)),
-      share_pct: Number(f.share_pct.value) || 100,
-      status: f.status ? f.status.value : undefined,
-      notes: f.notes.value.trim() || null,
-    };
-    try {
-      await api(`/api/tax/items/${itemId}`, { method: 'PUT', body });
-      closeModalEl($('#taxModal'));
-      loadTaxFiling(taxFiling.id);
-    } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
-  });
+function taxT776Net(lines) {
+  const num = (v) => (isFinite(Number(v)) ? Number(v) : 0);
+  const gross = Math.round((num(lines.gross_rents) + num(lines.other_income)) * 100) / 100;
+  let expenses = 0;
+  for (const [k, v] of Object.entries(lines || {})) {
+    if (k === 'gross_rents' || k === 'other_income') continue;
+    expenses += num(v);
+  }
+  expenses = Math.round(expenses * 100) / 100;
+  return { gross, expenses, net: Math.round((gross - expenses) * 100) / 100 };
 }
 
-function taxSlipFieldsHtml(kind, fields) {
-  const def = taxSlipKinds.find((s) => s.kind === kind);
-  if (!def) return '';
-  return def.fields.map((f) => `<div><label>${esc(f.label)}</label>
-    <input name="field_${f.key}" type="text" ${f.money ? 'inputmode="decimal" data-money' : ''} value="${fields && fields[f.key] != null ? esc(f.money ? formatMoneyInput(fields[f.key]) : fields[f.key]) : ''}"></div>`).join('');
+// Read-only T776 view for a source-backed rental item (its
+// figures come from the rental year under Earnings).
+function taxT776ReadHtml(item) {
+  const d = item.detail || {};
+  const lines = Array.isArray(d.lines) ? d.lines : [];
+  const rows = (d.expenseRows || []).map((r) => `<tr><td>${esc(r.label)}</td><td class="num">${money2(r.total)}</td><td class="num">${r.pct != null ? `${r.pct}%` : ''}</td><td class="num">${money2(r.deductible)}</td></tr>`).join('');
+  return `<table><thead><tr><th>T776 line</th><th class="num">Amount</th></tr></thead><tbody>${
+    lines.map((l) => `<tr><td>Line ${esc(String(l.line))} — ${esc(l.label)}</td><td class="num">${money2(l.amount)}</td></tr>`).join('')
+  }</tbody></table>
+  ${rows ? `<table><thead><tr><th>Expense</th><th class="num">Total</th><th class="num">Rental %</th><th class="num">Deductible</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+  <div>Gross ${money2(d.gross)} · Deductible ${money2(d.deductible)} · Net (9946) ${money2(d.net)}</div>`;
 }
 
-function taxSlipFormHtml(kind, taxYearValue, fields, aiFields) {
-  const kindOpts = taxSlipKinds.map((s) => `<option value="${s.kind}"${s.kind === kind ? ' selected' : ''}>${s.kind} — ${esc(s.label.split('—')[1]?.trim() || s.label)}</option>`).join('');
-  return `<form id="taxSlipForm">
-    <div class="grid2">
-      <div><label>Slip *</label><select name="kind" id="taxSlipKindSel">${kindOpts}</select></div>
-      <div><label>Tax year *</label><input name="tax_year" type="number" value="${taxYearValue || taxFiling.tax_year}" required></div>
-    </div>
-    <div id="taxSlipFields">${taxSlipFieldsHtml(kind, fields)}</div>
-    ${aiFields && aiFields.length ? `<div class="note" style="margin-left:0">Filled by AI: ${esc(aiFields.join(', '))}</div>` : ''}
-    <div class="toolbar"><button type="submit" class="primary">Save slip</button><button type="button" data-close-modal>Cancel</button></div>
-  </form>`;
-}
-
-function taxSlipModal(slipId) {
-  const slip = slipId ? (taxFiling.slips || []).find((s) => s.id === slipId) : null;
-  const open = (kind, fields) => {
-    taxOpenModal(slip ? 'Edit slip' : 'Add slip', taxSlipFormHtml(kind, slip ? slip.tax_year : taxFiling.tax_year, fields || (slip ? slip.fields : {}), slip ? slip.ai_fields : null));
-    const kindSel = $('#taxSlipKindSel');
-    kindSel.addEventListener('change', () => {
-      const kept = {};
-      document.querySelectorAll('#taxSlipFields input').forEach((i) => { kept[i.name.slice(6)] = i.value; });
-      $('#taxSlipFields').innerHTML = taxSlipFieldsHtml(kindSel.value, kept);
-    });
-    $('#taxSlipForm').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const f = e.target;
-      const def = taxSlipKinds.find((s) => s.kind === f.kind.value);
-      const fields = {};
-      for (const fld of def.fields) {
-        const input = f[`field_${fld.key}`];
-        if (!input) continue;
-        const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
-        if (raw !== '' && raw != null) fields[fld.key] = fld.money ? Number(raw) : raw;
-      }
-      const body = { kind: f.kind.value, tax_year: Number(f.tax_year.value), fields };
-      try {
-        if (slip) await api(`/api/tax/slips/${slip.id}`, { method: 'PUT', body });
-        else await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { ...body, source: 'manual' } });
-        closeModalEl($('#taxModal'));
-        loadTaxFiling(taxFiling.id);
-      } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
-    });
-  };
-  open(slip ? slip.kind : (taxSlipKinds[0] ? taxSlipKinds[0].kind : 'T4'), slip ? slip.fields : {});
-}
-
-function taxAiSlipModal() {
-  taxOpenModal('Fill slip with AI', `<form id="taxAiSlipForm">
-    <div><label>Paste text from a slip, or describe it…</label><textarea name="text" rows="4"></textarea></div>
-    <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" name="file">
-    <select name="model" id="taxAiSlipModel" style="width:auto;flex:0 1 auto"></select>
-    <button type="button" class="primary small" id="taxAiSlipExtract">Extract</button></div>
-    <div class="msg" id="taxAiSlipMsg"></div>
-    <div id="taxAiSlipPreview"></div>
-  </form>`);
+// ------------------------------------------------------- AI item fill --
+// One shared AI-fill panel for the Add/Edit item modals: text or
+// a slip/receipt file in, the extracted item fields out as an
+// EDITABLE preview — the caller fills its form from them; only
+// Save writes. Never writes without Apply, never invents a value
+// the model is unsure about (the server omits those).
+function taxWireAiItemFill({ panel, msg, section, apply }) {
+  if (!panel || panel.dataset.wired) return;
+  panel.dataset.wired = '1';
+  panel.innerHTML = `<div><label>Paste text from a slip or receipt, or describe it…</label><textarea id="taxAiItemText" rows="3"></textarea></div>
+    <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" id="taxAiItemFile">
+    <select id="taxAiItemModel" style="width:auto;flex:0 1 auto"></select>
+    <button type="button" class="primary small" id="taxAiItemExtract">Extract</button></div>`;
   loadAiConfig().then((cfg) => {
     const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
-    $('#taxAiSlipModel').innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
-    if (cfg.model) $('#taxAiSlipModel').value = cfg.model;
+    const sel = $('#taxAiItemModel');
+    if (sel) {
+      sel.innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      if (cfg.model) sel.value = cfg.model;
+    }
   });
-  $('#taxAiSlipExtract').addEventListener('click', async () => {
-    const form = $('#taxAiSlipForm');
-    const msg = $('#taxAiSlipMsg');
-    const text = form.text.value.trim();
-    const file = form.file.files && form.file.files[0];
+  $('#taxAiItemExtract').addEventListener('click', async () => {
+    const text = $('#taxAiItemText').value.trim();
+    const fileInput = $('#taxAiItemFile');
+    const file = fileInput.files && fileInput.files[0];
     msg.textContent = '';
     msg.className = 'msg';
     if (!text && !file) { showMsg(msg, 'err', 'Paste text or attach a photo, PDF or text file first.'); return; }
-    const btn = $('#taxAiSlipExtract');
+    const btn = $('#taxAiItemExtract');
     btn.disabled = true;
     btn.textContent = 'Extracting…';
     try {
-      const body = {};
-      if (form.model.value) body.model = form.model.value;
+      const body = { section };
+      const modelSel = $('#taxAiItemModel');
+      if (modelSel && modelSel.value) body.model = modelSel.value;
       if (text) body.text = text;
       if (file) {
         const dataUrl = await new Promise((resolve, reject) => {
@@ -886,115 +898,359 @@ function taxAiSlipModal() {
         });
         body.file = { name: file.name, type: file.type, data: String(dataUrl).split(',')[1] || '' };
       }
-      const r = await api('/api/tax/slips/fill', { method: 'POST', body });
+      const r = await api('/api/tax/items/fill', { method: 'POST', body });
       if (!r.kind) {
-        showMsg(msg, 'err', (r.warnings || ['Not a recognised tax slip.']).join(' '));
+        showMsg(msg, 'err', (r.warnings || ['Not a recognised tax document.']).join(' '));
         return;
       }
-      // Editable preview: the candidate is a proposal, never a
-      // write — Apply saves it through the slip POST.
-      const def = taxSlipKinds.find((s) => s.kind === r.kind);
-      const rows = def ? def.fields.map((f) => `<div><label>${esc(f.label)}</label>
-        <input name="field_${f.key}" type="text" ${f.money ? 'inputmode="decimal" data-money' : ''} value="${r.fields && r.fields[f.key] != null ? esc(f.money ? formatMoneyInput(r.fields[f.key]) : r.fields[f.key]) : ''}"></div>`).join('') : '';
-      $('#taxAiSlipPreview').innerHTML = `<div class="note" style="margin-left:0">Extracted: ${esc(r.kind)}${r.tax_year ? ` · ${r.tax_year}` : ''}${(r.warnings || []).length ? ` — ${esc(r.warnings.join(' '))}` : ''}</div>
-        <form id="taxAiSlipApplyForm">
-          <div class="grid2">
-            <div><label>Slip *</label><select name="kind">${taxSlipKinds.map((s) => `<option value="${s.kind}"${s.kind === r.kind ? ' selected' : ''}>${s.kind}</option>`).join('')}</select></div>
-            <div><label>Tax year *</label><input name="tax_year" type="number" value="${r.tax_year || taxFiling.tax_year}" required></div>
-          </div>
-          ${rows}
-          <div class="toolbar"><button type="submit" class="primary">Apply slip</button></div>
-        </form>`;
-      $('#taxAiSlipApplyForm').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const f = e.target;
-        const kind = f.kind.value;
-        const kindDef = taxSlipKinds.find((s) => s.kind === kind);
-        const fields = {};
-        const aiFields = [];
-        for (const fld of kindDef.fields) {
-          const input = f[`field_${fld.key}`];
-          if (!input) continue;
-          const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
-          if (raw !== '' && raw != null) { fields[fld.key] = fld.money ? Number(raw) : raw; aiFields.push(fld.key); }
-        }
-        try {
-          await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { kind, tax_year: Number(f.tax_year.value), fields, source: 'ai', ai_fields: aiFields } });
-          closeModalEl($('#taxModal'));
-          loadTaxFiling(taxFiling.id);
-        } catch (err) { showMsg(msg, 'err', err.message); }
-      });
+      apply(r);
+      showMsg(msg, (r.warnings || []).length ? 'err' : 'ok',
+        (r.warnings || []).length ? r.warnings.join(' ') : 'Extracted — review the fields, then Save.');
     } catch (err) { showMsg(msg, 'err', err.message); }
     finally { btn.disabled = false; btn.textContent = 'Extract'; }
   });
 }
 
-// --------------------------------------------- RRSP benefit slider --
-// Lives in the Deductions section. Dragging the contribution
-// shows the tax it saves, live, from the existing Earnings
-// engine (GET rrsp-benefit). The slider starts from the
-// person's linked RRSP plan amounts for the year; it caps at
-// the recorded remaining RRSP room when the profile has one,
-// otherwise the amount is free. Estimate only.
-function taxInitRrspEstimator(data) {
-  const host = $('#taxRrspEstimator');
-  if (!host) return;
-  const planAnnual = data.rrspPlanAnnual || 0;
-  const room = data.profile && data.profile.rrsp_room != null ? Number(data.profile.rrsp_room) : null;
-  const start = room != null ? Math.min(planAnnual, room) : planAnnual;
-  const max = room != null ? room : Math.max(20000, Math.ceil((planAnnual * 2) / 1000) * 1000);
-  host.innerHTML = `<div class="section-head" style="margin-top:12px"><h3>RRSP contribution estimator</h3><div class="spacer"></div>
-    <span>${room != null ? `Capped at your recorded RRSP room ${money2(room)}${data.profile.as_of_date ? ` (as of ${esc(data.profile.as_of_date)})` : ''}` : 'No RRSP room recorded — add it on your profile'}</span></div>
-    <div class="grid2"><div><label>Contribution ($)</label>
-      <input type="range" id="taxRrspSlider" min="0" max="${Math.round(max)}" step="100" value="${Math.round(start)}" style="width:100%">
-    </div><div><label>Amount</label><input id="taxRrspAmount" type="text" inputmode="decimal" data-money value="${formatMoneyInput(start)}"></div></div>
-    <div id="taxRrspResult"></div>
-    <div class="note">Estimate — actual tax is settled on the T1.</div>`;
-  const slider = $('#taxRrspSlider');
-  const amountInput = $('#taxRrspAmount');
-  let timer = null;
-  const fetchBenefit = async (amount) => {
-    const resultEl = $('#taxRrspResult');
-    if (!resultEl) return;
-    try {
-      const r = await api(`/api/tax/filings/${data.id}/rrsp-benefit?amount=${amount}`);
-      resultEl.innerHTML = `<div class="summary-row">
-        <div class="summary-card"><div class="k">Tax without contribution</div><div class="v">${money2(r.taxWithout)}</div></div>
-        <div class="summary-card"><div class="k">Tax with ${money2(r.effectiveAmount)} contributed</div><div class="v">${money2(r.taxWith)}</div></div>
-        <div class="summary-card"><div class="k">Tax saved</div><div class="v">${money2(r.benefit)}</div><div>${r.benefitRatePct}% of the contribution</div></div></div>
-        ${r.income ? `<div>Income ${money2(r.income)}${r.province ? ` · ${esc(r.province)}` : ''}${r.provinceVerified ? '' : ' · provincial estimate unavailable — federal only'}</div>` : '<div>No salary income for this year — the estimate needs a linked job.</div>'}
-        ${r.capped ? `<div class="note">Capped at your recorded RRSP room ${money2(r.room)}.</div>` : ''}`;
-    } catch (err) {
-      resultEl.innerHTML = `<div class="note">${esc(err.message)}</div>`;
+// --------------------------------------------------------- Add item --
+// Candidates first (the region's derivation for the year, minus
+// what is already in the filing), then the manual form: a slip
+// form (T4/T5/T4A), a T776 form, or a simple manual item,
+// depending on the section.
+function taxAddItemModal(sectionKey) {
+  const sec = TAX_SECTIONS.find((s) => s.key === sectionKey) || TAX_SECTIONS[0];
+  const isIncome = sec.key === 'income';
+  const slipKinds = isIncome ? taxSlipKinds.filter((s) => ['T4', 'T5', 'T4A'].includes(s.kind)) : [];
+  const formOpts = isIncome
+    ? [...slipKinds.map((s) => ({ value: `slip:${s.kind}`, label: `${s.kind} — ${(s.label.split('—')[1] || s.label).trim()}` })),
+       { value: 't776', label: 'T776 — Statement of Real Estate Rentals' },
+       { value: 'manual', label: 'Manual item' }]
+    : [];
+  taxOpenModal(`Add — ${sec.label}`, `
+    <div id="taxAddCandidates"><div class="note">Loading candidates…</div></div>
+    <h4>Add manually</h4>
+    ${isIncome ? `<div><label>Form</label><select id="taxAddFormSel">${formOpts.map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('')}</select></div>` : ''}
+    <div id="taxAddManual"></div>
+    <div class="toolbar"><button type="button" class="small" id="taxAddAiBtn">✨ Fill with AI</button></div>
+    <div class="msg" id="taxAddAiMsg"></div>
+    <div id="taxAddAiPanel"></div>`);
+  api(`/api/tax/filings/${taxFiling.id}/candidates`).then((r) => {
+    const list = (r.candidates || []).filter((c) => sec.kinds.includes(c.kind));
+    const host = $('#taxAddCandidates');
+    if (!host || !host.isConnected) return;
+    host.innerHTML = list.length
+      ? `<div class="note">From your records — pick one to add:</div>` + list.map((c) =>
+          `<div class="kv"><div>${esc(c.label)} · ${money2(c.amount)}</div>
+          <button class="small" data-tax-add-candidate="${esc(c.sourceType)}:${c.sourceId}">Add</button></div>`).join('')
+      : '<div class="note">No addable records for this section.</div>';
+    host.querySelectorAll('[data-tax-add-candidate]').forEach((b) => b.addEventListener('click', async () => {
+      const [sourceType, sourceId] = b.dataset.taxAddCandidate.split(':');
+      try {
+        await api(`/api/tax/filings/${taxFiling.id}/items/from-candidate`, { method: 'POST', body: { sourceType, sourceId: Number(sourceId) } });
+        closeModalEl($('#taxModal'));
+        loadTaxFiling(taxFiling.id);
+      } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+    }));
+  }).catch((err) => {
+    const host = $('#taxAddCandidates');
+    if (host) host.innerHTML = `<div class="note">${esc(err.message)}</div>`;
+  });
+  const renderManual = (formType, preset) => {
+    const host = $('#taxAddManual');
+    if (!host) return;
+    if (formType.startsWith('slip:')) {
+      const kind = formType.slice(5);
+      host.innerHTML = `<form id="taxAddSlipForm">
+        <div id="taxAddSlipFields">${taxSlipFieldsHtml(kind, preset && preset.fields ? preset.fields : {})}</div>
+        <div class="note">Saving the slip places its item in ${esc(sec.label)}.</div>
+        <div class="toolbar"><button type="submit" class="primary">Save slip</button><button type="button" data-close-modal>Cancel</button></div>
+      </form>`;
+      $('#taxAddSlipForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const def = taxSlipKinds.find((s) => s.kind === kind);
+        const fields = {};
+        for (const fld of def.fields) {
+          const input = e.target[`field_${fld.key}`];
+          if (!input) continue;
+          const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
+          if (raw !== '' && raw != null) fields[fld.key] = fld.money ? Number(raw) : raw;
+        }
+        try {
+          await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { kind, tax_year: taxFiling.tax_year, fields, source: 'manual' } });
+          closeModalEl($('#taxModal'));
+          loadTaxFiling(taxFiling.id);
+        } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+      });
+    } else if (formType === 't776') {
+      host.innerHTML = `<form id="taxAddT776Form">
+        <div><label>Label *</label><input name="label" required value="${preset && preset.label ? esc(preset.label) : 'Rental property'}"></div>
+        ${taxT776LinesHtml(preset && preset.lines ? preset.lines : {})}
+        <div class="grid2"><div><label>Share % (this filer's share)</label><input name="share_pct" type="number" step="0.01" min="0" max="100" value="100"></div>
+        <div><label>Net (9946) — derived</label><input id="taxAddT776Net" type="text" readonly value=""></div></div>
+        <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" data-close-modal>Cancel</button></div>
+      </form>`;
+      const form = $('#taxAddT776Form');
+      const updateNet = () => {
+        const el = $('#taxAddT776Net');
+        if (el) el.value = formatMoneyInput(taxT776Net(taxT776LinesFromForm(form)).net);
+      };
+      form.addEventListener('input', updateNet);
+      updateNet();
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const lines = taxT776LinesFromForm(form);
+        const net = taxT776Net(lines);
+        try {
+          await api(`/api/tax/filings/${taxFiling.id}/items`, { method: 'POST', body: {
+            kind: 'rental', label: form.label.value.trim(), amount: net.net,
+            share_pct: Number(form.share_pct.value) || 100,
+            detail: { form: 'T776', lines },
+          } });
+          closeModalEl($('#taxModal'));
+          loadTaxFiling(taxFiling.id);
+        } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+      });
+    } else {
+      const kindOpts = sec.kinds.map((k) => `<option value="${k}"${preset && preset.kind === k ? ' selected' : ''}>${TAX_KIND_LABELS[k] || k}</option>`).join('');
+      host.innerHTML = `<form id="taxAddManualForm">
+        <div class="grid2">
+          <div><label>Kind *</label><select name="kind">${kindOpts}</select></div>
+          <div><label>Amount *</label><input name="amount" type="text" inputmode="decimal" data-money required value="${preset && preset.amount != null ? formatMoneyInput(preset.amount) : ''}"></div>
+        </div>
+        <div><label>Label *</label><input name="label" required value="${preset && preset.label ? esc(preset.label) : ''}"></div>
+        <div><label>Share % (this filer's share)</label><input name="share_pct" type="number" step="0.01" min="0" max="100" value="100"></div>
+        <div><label>Notes</label><input name="notes" value=""></div>
+        <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" data-close-modal>Cancel</button></div>
+      </form>`;
+      $('#taxAddManualForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const f = e.target;
+        try {
+          await api(`/api/tax/filings/${taxFiling.id}/items`, { method: 'POST', body: {
+            kind: f.kind.value, label: f.label.value.trim(),
+            amount: Number(parseMoneyInput(f.amount.value)),
+            share_pct: Number(f.share_pct.value) || 100,
+            notes: f.notes.value.trim() || null,
+          } });
+          closeModalEl($('#taxModal'));
+          loadTaxFiling(taxFiling.id);
+        } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+      });
     }
   };
-  const onAmount = (v) => {
-    const n = Math.max(0, Number(parseMoneyInput(String(v))) || 0);
-    const clamped = room != null ? Math.min(n, room) : n;
-    if (clamped > Number(slider.max)) slider.max = Math.ceil(clamped / 1000) * 1000;
-    slider.value = String(Math.round(clamped));
-    amountInput.value = formatMoneyInput(clamped);
-    clearTimeout(timer);
-    timer = setTimeout(() => fetchBenefit(clamped), 250);
+  let currentForm = isIncome ? (formOpts[0] ? formOpts[0].value : 'manual') : 'manual';
+  renderManual(currentForm);
+  const sel = $('#taxAddFormSel');
+  if (sel) sel.addEventListener('change', () => { currentForm = sel.value; renderManual(currentForm); });
+  $('#taxAddAiBtn').addEventListener('click', () => taxWireAiItemFill({
+    panel: $('#taxAddAiPanel'), msg: $('#taxAddAiMsg'), section: sec.key,
+    apply: (r) => {
+      if (r.slipKind && isIncome) {
+        currentForm = `slip:${r.slipKind}`;
+        if (sel) sel.value = currentForm;
+        renderManual(currentForm, { fields: r.fields || {} });
+      } else if (r.form === 'T776' && isIncome) {
+        currentForm = 't776';
+        if (sel) sel.value = currentForm;
+        renderManual(currentForm, { label: r.label, lines: r.lines || {} });
+      } else {
+        currentForm = 'manual';
+        if (sel) sel.value = currentForm;
+        renderManual(currentForm, { kind: r.kind, label: r.label, amount: r.amount });
+      }
+    },
+  }));
+}
+
+// -------------------------------------------------------- Edit item --
+// The form follows the item's backing: slip-backed items are
+// edited through the slip's boxes, source-backed amounts are
+// read-only (except a capital gain, where the user confirms the
+// gain), manual T776 items through their lines, manual items
+// through the simple form. The derived rental-deduction row has
+// no Edit button at all.
+function taxEditItemModal(itemId) {
+  const item = (taxFiling.items || []).find((i) => i.id === itemId);
+  if (!item) return;
+  if (item.detail && item.detail.derived) {
+    taxOpenModal('Edit item', '<div class="note">This rental deduction is derived from the T776 in Income — edit the rental item instead.</div><div class="toolbar"><button type="button" data-close-modal>Close</button></div>');
+    return;
+  }
+  const slip = item.slip_id != null ? (taxFiling.slips || []).find((s) => s.id === item.slip_id) : null;
+  const sourceBacked = item.source_type != null && item.source_type !== 'manual';
+  const statusOpts = ['expected', 'linked', 'confirmed', 'excluded'].map((s) => `<option value="${s}"${item.status === s ? ' selected' : ''}>${s}</option>`).join('');
+  const shareStatusNotes = `<div class="grid2">
+      <div><label>Share % (this filer's share)</label><input name="share_pct" type="number" step="0.01" min="0" max="100" value="${item.share_pct}"></div>
+      <div><label>Status</label><select name="status">${statusOpts}</select></div>
+    </div>
+    <div><label>Notes</label><input name="notes" value="${item.notes ? esc(item.notes) : ''}"></div>`;
+  const aiRow = `<div class="toolbar"><button type="button" class="small" id="taxEditAiBtn">✨ Fill with AI</button><span class="spacer"></span>
+    <button type="submit" class="primary">Save</button><button type="button" data-close-modal>Cancel</button></div>
+    <div class="msg" id="taxEditAiMsg"></div><div id="taxEditAiPanel"></div>`;
+  const saveAndReload = async (fn) => {
+    try {
+      await fn();
+      closeModalEl($('#taxModal'));
+      loadTaxFiling(taxFiling.id);
+    } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
   };
-  slider.addEventListener('input', () => onAmount(slider.value));
-  amountInput.addEventListener('input', () => onAmount(amountInput.value));
-  fetchBenefit(start);
+  if (slip) {
+    taxOpenModal('Edit item — slip-backed', `<form id="taxEditItemForm">
+      <div class="note">Backed by a ${esc(slip.kind)} slip — the amount comes from its boxes; edit the slip, not the amount. Amount (from slip) ${money2(item.amount)}.</div>
+      <div id="taxEditSlipFields">${taxSlipFieldsHtml(slip.kind, slip.fields)}</div>
+      ${shareStatusNotes}
+      ${aiRow}
+    </form>`);
+    $('#taxEditItemForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const def = taxSlipKinds.find((s) => s.kind === slip.kind);
+      const fields = {};
+      for (const fld of def.fields) {
+        const input = f[`field_${fld.key}`];
+        if (!input) continue;
+        const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
+        if (raw !== '' && raw != null) fields[fld.key] = fld.money ? Number(raw) : raw;
+      }
+      saveAndReload(async () => {
+        await api(`/api/tax/slips/${slip.id}`, { method: 'PUT', body: { kind: slip.kind, tax_year: slip.tax_year, fields } });
+        await api(`/api/tax/items/${itemId}`, { method: 'PUT', body: {
+          share_pct: Number(f.share_pct.value) || 100, status: f.status.value, notes: f.notes.value.trim() || null,
+        } });
+      });
+    });
+    $('#taxEditAiBtn').addEventListener('click', () => taxWireAiItemFill({
+      panel: $('#taxEditAiPanel'), msg: $('#taxEditAiMsg'), section: null,
+      apply: (r) => {
+        if (r.slipKind && r.slipKind === slip.kind) {
+          $('#taxEditSlipFields').innerHTML = taxSlipFieldsHtml(slip.kind, r.fields || {});
+        }
+      },
+    }));
+    return;
+  }
+  if (sourceBacked && item.kind === 'rental') {
+    taxOpenModal('Edit item — T776', `<form id="taxEditItemForm">
+      <div class="note">From your rental records — the figures below are read-only; edit the rental year under Earnings to change them.</div>
+      ${taxT776ReadHtml(item)}
+      ${shareStatusNotes}
+      <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" data-close-modal>Cancel</button></div>
+    </form>`);
+    $('#taxEditItemForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = e.target;
+      saveAndReload(() => api(`/api/tax/items/${itemId}`, { method: 'PUT', body: {
+        share_pct: Number(f.share_pct.value) || 100, status: f.status.value, notes: f.notes.value.trim() || null,
+      } }));
+    });
+    return;
+  }
+  if (sourceBacked) {
+    const amountField = item.kind === 'capital_gain'
+      ? `<div><label>Amount * — confirm the gain against the cost base</label><input name="amount" type="text" inputmode="decimal" data-money required value="${formatMoneyInput(item.amount)}"></div>`
+      : `<div>Amount ${money2(item.amount)} (from the app record — not editable).</div>`;
+    taxOpenModal('Edit item', `<form id="taxEditItemForm">
+      <div class="note">From your app records — ${esc(item.label)}.</div>
+      ${amountField}
+      ${shareStatusNotes}
+      <div class="toolbar"><button type="submit" class="primary">Save</button><button type="button" data-close-modal>Cancel</button></div>
+    </form>`);
+    $('#taxEditItemForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const body = {
+        share_pct: Number(f.share_pct.value) || 100, status: f.status.value, notes: f.notes.value.trim() || null,
+      };
+      if (item.kind === 'capital_gain') body.amount = Number(parseMoneyInput(f.amount.value));
+      saveAndReload(() => api(`/api/tax/items/${itemId}`, { method: 'PUT', body }));
+    });
+    return;
+  }
+  if (item.kind === 'rental' && item.detail && item.detail.form === 'T776') {
+    taxOpenModal('Edit item — T776', `<form id="taxEditItemForm">
+      <div><label>Label *</label><input name="label" required value="${esc(item.label)}"></div>
+      <div id="taxEditT776Lines">${taxT776LinesHtml(item.detail.lines || {})}</div>
+      <div class="grid2">
+        <div><label>Share % (this filer's share)</label><input name="share_pct" type="number" step="0.01" min="0" max="100" value="${item.share_pct}"></div>
+        <div><label>Status</label><select name="status">${statusOpts}</select></div>
+      </div>
+      <div><label>Net (9946) — derived</label><input id="taxEditT776Net" type="text" readonly value=""></div>
+      <div><label>Notes</label><input name="notes" value="${item.notes ? esc(item.notes) : ''}"></div>
+      ${aiRow}
+    </form>`);
+    const form = $('#taxEditItemForm');
+    const updateNet = () => {
+      const el = $('#taxEditT776Net');
+      if (el) el.value = formatMoneyInput(taxT776Net(taxT776LinesFromForm(form)).net);
+    };
+    form.addEventListener('input', updateNet);
+    updateNet();
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = e.target;
+      saveAndReload(() => api(`/api/tax/items/${itemId}`, { method: 'PUT', body: {
+        label: f.label.value.trim(), share_pct: Number(f.share_pct.value) || 100, status: f.status.value,
+        notes: f.notes.value.trim() || null,
+        detail: { form: 'T776', lines: taxT776LinesFromForm(f) },
+      } }));
+    });
+    $('#taxEditAiBtn').addEventListener('click', () => taxWireAiItemFill({
+      panel: $('#taxEditAiPanel'), msg: $('#taxEditAiMsg'), section: 'income',
+      apply: (r) => {
+        if (r.form === 'T776') {
+          const wrap = $('#taxEditT776Lines');
+          if (wrap) wrap.innerHTML = taxT776LinesHtml(r.lines || {});
+          updateNet();
+        }
+        if (r.label) form.label.value = r.label;
+      },
+    }));
+    return;
+  }
+  taxOpenModal('Edit item', `<form id="taxEditItemForm">
+    <div class="grid2">
+      <div><label>Kind</label><input type="text" readonly value="${esc(TAX_KIND_LABELS[item.kind] || item.kind)}"></div>
+      <div><label>Amount *</label><input name="amount" type="text" inputmode="decimal" data-money required value="${formatMoneyInput(item.amount)}"></div>
+    </div>
+    <div><label>Label *</label><input name="label" required value="${esc(item.label)}"></div>
+    ${shareStatusNotes}
+    ${aiRow}
+  </form>`);
+  $('#taxEditItemForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const f = e.target;
+    saveAndReload(() => api(`/api/tax/items/${itemId}`, { method: 'PUT', body: {
+      label: f.label.value.trim(), amount: Number(parseMoneyInput(f.amount.value)),
+      share_pct: Number(f.share_pct.value) || 100, status: f.status.value, notes: f.notes.value.trim() || null,
+    } }));
+  });
+  $('#taxEditAiBtn').addEventListener('click', () => taxWireAiItemFill({
+    panel: $('#taxEditAiPanel'), msg: $('#taxEditAiMsg'), section: null,
+    apply: (r) => {
+      const f = $('#taxEditItemForm');
+      if (!f) return;
+      if (r.amount != null) f.amount.value = formatMoneyInput(r.amount);
+      if (r.label) f.label.value = r.label;
+    },
+  }));
 }
 
 // -------------------------------------------------- account charts --
-// Contributed vs remaining doughnuts (RRSP / TFSA / RESP). Only
-// real figures: no room recorded means no remaining portion —
-// never a guessed total. Amounts are labelled in the text under
-// each chart, so the split reads without hovering.
-function taxDrawRoomDoughnut(key, d) {
-  const el = document.getElementById(`taxChart-${key}`);
+// Contributed vs remaining doughnuts (RRSP / TFSA / RESP / CESG).
+// ONE renderer shared by the Tax home switcher, the project
+// detail and the RRSP tool modal — the prefix keeps the canvas
+// ids distinct across hosts ('home' / 'detail' / 'estimator').
+// Only real figures: no room recorded means no remaining
+// portion — never a guessed total. Amounts are labelled in the
+// text under each chart, so the split reads without hovering.
+function taxDrawRoomDoughnut(prefix, key, d) {
+  const el = document.getElementById(`taxChart-${prefix}-${key}`);
   if (!el || !el.isConnected || !d || d.room == null) return;
   const contributed = Number(d.contributed) || 0;
   const remaining = Number(d.room) || 0;
   if (contributed <= 0 && remaining <= 0) return;
-  if (taxChartsDrawn[key]) { try { taxChartsDrawn[key].destroy(); } catch {} }
-  taxChartsDrawn[key] = new Chart(el, {
+  const slot = `${prefix}-${key}`;
+  if (taxChartsDrawn[slot]) { try { taxChartsDrawn[slot].destroy(); } catch {} }
+  taxChartsDrawn[slot] = new Chart(el, {
     type: 'doughnut',
     data: {
       labels: ['Contributed', 'Remaining'],
@@ -1018,23 +1274,29 @@ function taxDrawRoomDoughnut(key, d) {
   });
 }
 
-function taxRoomCardHtml(key, label, d, contributedNote, currentValue) {
+function taxRoomCardHtml(prefix, key, label, d, contributedNote, currentValue) {
   const hasRoom = d && d.room != null;
   const contributed = d ? Number(d.contributed) || 0 : 0;
   const legend = hasRoom
-    ? `<div style="height:180px"><canvas id="taxChart-${key}"></canvas></div>
+    ? `<div class="chart-wrap short"><canvas id="taxChart-${prefix}-${key}"></canvas></div>
        <div>Contributed ${money2(contributed)} · Remaining ${money2(d.room)}${d.asOf ? ` · as of ${esc(d.asOf)}` : ''}</div>`
     : `<div>No room recorded — add it on your profile to see the split.</div><div>Contributed ${money2(contributed)}</div>`;
-  return `<div class="panel" style="margin-top:8px"><h3>${label}</h3><div class="note" style="margin:0 0 8px">${contributedNote}</div>${legend}
+  return `<div class="panel"><h3>${label}</h3><div class="note">${contributedNote}</div>${legend}
     ${currentValue != null ? `<div>Current value ${money2(currentValue)}</div>` : ''}</div>`;
 }
 
-async function taxLoadCharts(data) {
-  const host = $('#taxCharts');
+// Renders the room cards into any host from either charts
+// endpoint (filing charts for a project, profile charts for
+// the home switcher). `keys` limits the cards — the RRSP tool
+// modal renders the RRSP card only. Re-draws on every call, so
+// any item / slip / profile change updates the charts with no
+// page reload.
+async function taxRenderCharts(host, url, prefix, keys) {
   if (!host) return;
+  const want = keys || ['rrsp', 'tfsa', 'resp', 'cesg'];
   host.innerHTML = '<div class="note">Loading…</div>';
   try {
-    const c = await api(`/api/tax/filings/${data.id}/charts`);
+    const c = await api(url);
     const resp = c.resp || {};
     const respSplit = resp.split || null;
     const cesg = resp.cesg || null;
@@ -1042,33 +1304,96 @@ async function taxLoadCharts(data) {
       ? `Beneficiary ${esc(resp.beneficiary)}${resp.subscriber ? ` · Subscriber ${esc(resp.subscriber)}` : ''}`
       : 'No beneficiary recorded — add it on the profile.';
     const respLegend = respSplit
-      ? `<div style="height:180px"><canvas id="taxChart-resp"></canvas></div>
+      ? `<div class="chart-wrap short"><canvas id="taxChart-${prefix}-resp"></canvas></div>
          <div>Contributed ${money2(respSplit.contributed)} · Remaining ${money2(respSplit.remaining)} · Lifetime limit ${money2(respSplit.limit)}${resp.asOf ? ` · as of ${esc(resp.asOf)}` : ''}</div>`
       : `<div>No RESP room recorded — add it on your profile to see the split.</div><div>Lifetime contribution limit $50,000 per beneficiary.</div>`;
     const cesgLegend = cesg
-      ? `<div style="height:180px"><canvas id="taxChart-cesg"></canvas></div>
+      ? `<div class="chart-wrap short"><canvas id="taxChart-${prefix}-cesg"></canvas></div>
          <div>Grant earned ${money2(cesg.earned)} · Grant remaining ${money2(cesg.remaining)} · Lifetime maximum ${money2(cesg.limit)}</div>`
       : `<div>No CESG room recorded.</div><div>Lifetime CESG maximum $7,200 per beneficiary.</div>`;
-    host.innerHTML =
-      taxRoomCardHtml('rrsp', 'RRSP', c.rrsp, 'Contributions from your RRSP plans.') +
-      taxRoomCardHtml('tfsa', 'TFSA', c.tfsa, 'Net contributions from your TFSA accounts (buys minus sells).', c.tfsa ? c.tfsa.currentValue : null) +
-      `<div class="panel" style="margin-top:8px"><h3>RESP</h3><div class="note" style="margin:0 0 8px">${who}</div>${respLegend}</div>` +
-      `<div class="panel" style="margin-top:8px"><h3>CESG grant</h3><div class="note" style="margin:0 0 8px">20% on the first $2,500 contributed per year (max $500/yr).</div>${cesgLegend}</div>`;
-    taxDrawRoomDoughnut('rrsp', c.rrsp);
-    taxDrawRoomDoughnut('tfsa', c.tfsa);
-    taxDrawRoomDoughnut('resp', respSplit ? { contributed: respSplit.contributed, room: respSplit.remaining } : null);
-    taxDrawRoomDoughnut('cesg', cesg ? { contributed: cesg.earned, room: cesg.remaining } : null);
+    const cards = [];
+    if (want.includes('rrsp')) cards.push(taxRoomCardHtml(prefix, 'rrsp', 'RRSP', c.rrsp,
+      c.rrsp && c.rrsp.basis === 'project' ? 'Contributions from this filing\u2019s RRSP items.' : 'Contributions from your RRSP plans.'));
+    if (want.includes('tfsa')) cards.push(taxRoomCardHtml(prefix, 'tfsa', 'TFSA', c.tfsa,
+      'Net contributions from your TFSA accounts (buys minus sells).', c.tfsa ? c.tfsa.currentValue : null));
+    if (want.includes('resp')) cards.push(`<div class="panel"><h3>RESP</h3><div class="note">${who}</div>${respLegend}</div>`);
+    if (want.includes('cesg')) cards.push(`<div class="panel"><h3>CESG grant</h3><div class="note">20% on the first $2,500 contributed per year (max $500/yr).</div>${cesgLegend}</div>`);
+    host.innerHTML = cards.join('');
+    if (want.includes('rrsp')) taxDrawRoomDoughnut(prefix, 'rrsp', c.rrsp);
+    if (want.includes('tfsa')) taxDrawRoomDoughnut(prefix, 'tfsa', c.tfsa);
+    if (want.includes('resp')) taxDrawRoomDoughnut(prefix, 'resp', respSplit ? { contributed: respSplit.contributed, room: respSplit.remaining } : null);
+    if (want.includes('cesg')) taxDrawRoomDoughnut(prefix, 'cesg', cesg ? { contributed: cesg.earned, room: cesg.remaining } : null);
   } catch (err) {
     host.innerHTML = `<div class="note">${esc(err.message)}</div>`;
   }
+}
+
+// --------------------------------------------- RRSP benefit slider --
+// The RRSP contribution tool: a BUTTON in Registered savings
+// plans opens it as a modal — never an always-visible section.
+// Dragging the contribution shows the tax it saves, live, from
+// the existing Earnings engine (GET rrsp-benefit), as one
+// highlighted big figure, with the RRSP room doughnut below.
+// The slider starts from the person's linked RRSP plan amounts
+// for the year; it caps at the recorded remaining RRSP room
+// when the profile has one, otherwise the amount is free.
+// Estimate only. Baseline: tax with RRSP deduction 0.
+function taxRrspEstimatorModal() {
+  const data = taxFiling;
+  if (!data) return;
+  const planAnnual = data.rrspPlanAnnual || 0;
+  const room = data.profile && data.profile.rrsp_room != null ? Number(data.profile.rrsp_room) : null;
+  const start = room != null ? Math.min(planAnnual, room) : planAnnual;
+  const max = room != null ? room : Math.max(20000, Math.ceil((planAnnual * 2) / 1000) * 1000);
+  taxOpenModal('RRSP contribution tool', `
+    <div class="note">${room != null ? `Capped at your recorded RRSP room ${money2(room)}${data.profile.as_of_date ? ` (as of ${esc(data.profile.as_of_date)})` : ''}` : 'No RRSP room recorded — add it on your profile'}</div>
+    <div class="grid2"><div><label>Contribution ($)</label>
+      <input type="range" id="taxRrspSlider" min="0" max="${Math.round(max)}" step="100" value="${Math.round(start)}">
+    </div><div><label>Amount</label><input id="taxRrspAmount" type="text" inputmode="decimal" data-money value="${formatMoneyInput(start)}"></div></div>
+    <div id="taxRrspResult"></div>
+    <div id="taxRrspEstimatorChart"></div>
+    <div class="note">Estimate — actual tax is settled on the T1.</div>`);
+  const slider = $('#taxRrspSlider');
+  const amountInput = $('#taxRrspAmount');
+  let timer = null;
+  const fetchBenefit = async (amount) => {
+    const resultEl = $('#taxRrspResult');
+    if (!resultEl) return;
+    try {
+      const r = await api(`/api/tax/filings/${data.id}/rrsp-benefit?amount=${amount}`);
+      resultEl.innerHTML = `<div class="summary-card" style="text-align:center">
+        <div class="k">Estimated tax saved</div>
+        <div class="v positive">${money2(r.benefit)}</div>
+        <div class="n">Tax without ${money2(r.taxWithout)} → with ${money2(r.taxWith)} · ${r.benefitRatePct}% of the contribution</div></div>
+        ${r.income ? `<div class="note">Income ${money2(r.income)}${r.province ? ` · ${esc(r.province)}` : ''}${r.provinceVerified ? '' : ' · provincial estimate unavailable — federal only'}</div>` : '<div class="note">No salary income for this year — the estimate needs a linked job.</div>'}
+        ${r.capped ? `<div class="note">Capped at your recorded RRSP room ${money2(r.room)}.</div>` : ''}`;
+    } catch (err) {
+      resultEl.innerHTML = `<div class="note">${esc(err.message)}</div>`;
+    }
+  };
+  const onAmount = (v) => {
+    const n = Math.max(0, Number(parseMoneyInput(String(v))) || 0);
+    const clamped = room != null ? Math.min(n, room) : n;
+    if (clamped > Number(slider.max)) slider.max = Math.ceil(clamped / 1000) * 1000;
+    slider.value = String(Math.round(clamped));
+    amountInput.value = formatMoneyInput(clamped);
+    clearTimeout(timer);
+    timer = setTimeout(() => fetchBenefit(clamped), 250);
+  };
+  slider.addEventListener('input', () => onAmount(slider.value));
+  amountInput.addEventListener('input', () => onAmount(amountInput.value));
+  taxRenderCharts($('#taxRrspEstimatorChart'), `/api/tax/filings/${data.id}/charts`, 'estimator', ['rrsp']);
+  fetchBenefit(start);
 }
 
 // ------------------------------------------------------- tax profile --
 // One profile per person: remaining RRSP / TFSA / RESP room,
 // user-entered from the CRA Notice of Assessment / My Account.
 // Blank means not recorded, never zero — the app never invents
-// a room figure.
-async function taxProfileModal(personId) {
+// a room figure. `aiOpen` opens the Fill-with-AI panel at once
+// (the home room section's Fill with AI button).
+async function taxProfileModal(personId, opts) {
+  const aiOpen = opts && opts.aiOpen;
   let existing = null;
   try {
     const r = await api(`/api/tax/profiles/${personId}`);
@@ -1171,16 +1496,153 @@ async function taxProfileModal(personId) {
       finally { btn.disabled = false; btn.textContent = 'Extract'; }
     });
   });
+  if (aiOpen) $('#taxProfileAiBtn').click();
 }
 
-$('#taxBackBtn').addEventListener('click', () => { location.hash = '#tax'; });
-$('#taxGenerateBtn').addEventListener('click', async () => {
-  const msg = $('#taxDetailMsg');
-  try {
-    await api(`/api/tax/filings/${taxFiling.id}/generate`, { method: 'POST', body: {} });
-    loadTaxFiling(taxFiling.id);
-  } catch (err) { taxMsg(msg, 'err', err.message); }
-});
+// ------------------------------------------------------------ slips --
+// A slip is added by hand or by Fill with AI; saving it places
+// its item in the section below (T4 → Income, RRSP receipt →
+// Registered savings plans, …). The placed item stays editable
+// / deletable like any other item.
+function taxSlipFieldsHtml(kind, fields) {
+  const def = taxSlipKinds.find((s) => s.kind === kind);
+  if (!def) return '';
+  return def.fields.map((f) => `<div><label>${esc(f.label)}</label>
+    <input name="field_${f.key}" type="text" ${f.money ? 'inputmode="decimal" data-money' : ''} value="${fields && fields[f.key] != null ? esc(f.money ? formatMoneyInput(fields[f.key]) : fields[f.key]) : ''}"></div>`).join('');
+}
+
+function taxSlipFormHtml(kind, taxYearValue, fields, aiFields) {
+  const kindOpts = taxSlipKinds.map((s) => `<option value="${s.kind}"${s.kind === kind ? ' selected' : ''}>${s.kind} — ${esc(s.label.split('—')[1]?.trim() || s.label)}</option>`).join('');
+  return `<form id="taxSlipForm">
+    <div class="grid2">
+      <div><label>Slip *</label><select name="kind" id="taxSlipKindSel">${kindOpts}</select></div>
+      <div><label>Tax year *</label><input name="tax_year" type="number" value="${taxYearValue || taxFiling.tax_year}" required></div>
+    </div>
+    <div id="taxSlipFields">${taxSlipFieldsHtml(kind, fields)}</div>
+    ${aiFields && aiFields.length ? `<div class="note">Filled by AI: ${esc(aiFields.join(', '))}</div>` : ''}
+    <div class="toolbar"><button type="submit" class="primary">Save slip</button><button type="button" data-close-modal>Cancel</button></div>
+  </form>`;
+}
+
+function taxSlipModal(slipId) {
+  const slip = slipId ? (taxFiling.slips || []).find((s) => s.id === slipId) : null;
+  const open = (kind, fields) => {
+    taxOpenModal(slip ? 'Edit slip' : 'Add slip', taxSlipFormHtml(kind, slip ? slip.tax_year : taxFiling.tax_year, fields || (slip ? slip.fields : {}), slip ? slip.ai_fields : null));
+    const kindSel = $('#taxSlipKindSel');
+    kindSel.addEventListener('change', () => {
+      const kept = {};
+      document.querySelectorAll('#taxSlipFields input').forEach((i) => { kept[i.name.slice(6)] = i.value; });
+      $('#taxSlipFields').innerHTML = taxSlipFieldsHtml(kindSel.value, kept);
+    });
+    $('#taxSlipForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const def = taxSlipKinds.find((s) => s.kind === f.kind.value);
+      const fields = {};
+      for (const fld of def.fields) {
+        const input = f[`field_${fld.key}`];
+        if (!input) continue;
+        const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
+        if (raw !== '' && raw != null) fields[fld.key] = fld.money ? Number(raw) : raw;
+      }
+      const body = { kind: f.kind.value, tax_year: Number(f.tax_year.value), fields };
+      try {
+        if (slip) await api(`/api/tax/slips/${slip.id}`, { method: 'PUT', body });
+        else await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { ...body, source: 'manual' } });
+        closeModalEl($('#taxModal'));
+        loadTaxFiling(taxFiling.id);
+      } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+    });
+  };
+  open(slip ? slip.kind : (taxSlipKinds[0] ? taxSlipKinds[0].kind : 'T4'), slip ? slip.fields : {});
+}
+
+function taxAiSlipModal() {
+  taxOpenModal('Fill slip with AI', `<form id="taxAiSlipForm">
+    <div><label>Paste text from a slip, or describe it…</label><textarea name="text" rows="4"></textarea></div>
+    <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" name="file">
+    <select name="model" id="taxAiSlipModel" style="width:auto;flex:0 1 auto"></select>
+    <button type="button" class="primary small" id="taxAiSlipExtract">Extract</button></div>
+    <div class="msg" id="taxAiSlipMsg"></div>
+    <div id="taxAiSlipPreview"></div>
+  </form>`);
+  loadAiConfig().then((cfg) => {
+    const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
+    $('#taxAiSlipModel').innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    if (cfg.model) $('#taxAiSlipModel').value = cfg.model;
+  });
+  $('#taxAiSlipExtract').addEventListener('click', async () => {
+    const form = $('#taxAiSlipForm');
+    const msg = $('#taxAiSlipMsg');
+    const text = form.text.value.trim();
+    const file = form.file.files && form.file.files[0];
+    msg.textContent = '';
+    msg.className = 'msg';
+    if (!text && !file) { showMsg(msg, 'err', 'Paste text or attach a photo, PDF or text file first.'); return; }
+    const btn = $('#taxAiSlipExtract');
+    btn.disabled = true;
+    btn.textContent = 'Extracting…';
+    try {
+      const body = {};
+      if (form.model.value) body.model = form.model.value;
+      if (text) body.text = text;
+      if (file) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        body.file = { name: file.name, type: file.type, data: String(dataUrl).split(',')[1] || '' };
+      }
+      const r = await api('/api/tax/slips/fill', { method: 'POST', body });
+      if (!r.kind) {
+        showMsg(msg, 'err', (r.warnings || ['Not a recognised tax slip.']).join(' '));
+        return;
+      }
+      // Editable preview: the candidate is a proposal, never a
+      // write — Apply saves it through the slip POST.
+      const def = taxSlipKinds.find((s) => s.kind === r.kind);
+      const rows = def ? def.fields.map((f) => `<div><label>${esc(f.label)}</label>
+        <input name="field_${f.key}" type="text" ${f.money ? 'inputmode="decimal" data-money' : ''} value="${r.fields && r.fields[f.key] != null ? esc(f.money ? formatMoneyInput(r.fields[f.key]) : r.fields[f.key]) : ''}"></div>`).join('') : '';
+      $('#taxAiSlipPreview').innerHTML = `<div class="note">Extracted: ${esc(r.kind)}${r.tax_year ? ` · ${r.tax_year}` : ''}${(r.warnings || []).length ? ` — ${esc(r.warnings.join(' '))}` : ''}</div>
+        <form id="taxAiSlipApplyForm">
+          <div class="grid2">
+            <div><label>Slip *</label><select name="kind">${taxSlipKinds.map((s) => `<option value="${s.kind}"${s.kind === r.kind ? ' selected' : ''}>${s.kind}</option>`).join('')}</select></div>
+            <div><label>Tax year *</label><input name="tax_year" type="number" value="${r.tax_year || taxFiling.tax_year}" required></div>
+          </div>
+          ${rows}
+          <div class="toolbar"><button type="submit" class="primary">Apply slip</button></div>
+        </form>`;
+      $('#taxAiSlipApplyForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const f = e.target;
+        const kind = f.kind.value;
+        const kindDef = taxSlipKinds.find((s) => s.kind === kind);
+        const fields = {};
+        const aiFields = [];
+        for (const fld of kindDef.fields) {
+          const input = f[`field_${fld.key}`];
+          if (!input) continue;
+          const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
+          if (raw !== '' && raw != null) { fields[fld.key] = fld.money ? Number(raw) : raw; aiFields.push(fld.key); }
+        }
+        try {
+          await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { kind, tax_year: Number(f.tax_year.value), fields, source: 'ai', ai_fields: aiFields } });
+          closeModalEl($('#taxModal'));
+          loadTaxFiling(taxFiling.id);
+        } catch (err) { showMsg(msg, 'err', err.message); }
+      });
+    } catch (err) { showMsg(msg, 'err', err.message); }
+    finally { btn.disabled = false; btn.textContent = 'Extract'; }
+  });
+}
+
+// ---------------------------------------------------- detail wiring --
+// Static wiring for the detail page. The Back control is a plain
+// anchor in the markup (← Back to Tax, same as Spending) — no
+// handler here. There is no Generate handler: no Generate button
+// exists anywhere in Tax (removed 2026-11-08).
 $('#taxFileToggleBtn').addEventListener('click', async () => {
   const msg = $('#taxDetailMsg');
   try {
@@ -19909,55 +20371,66 @@ function renderHomeAiThread() {
   if (applyBtn) applyBtn.addEventListener('click', applyHomeAiProposal);
 }
 
+// The Home Add / Generate actions run inside withLoading — the
+// same global loading veil the Stocks and Property detail pages
+// use. Each handler keeps its own error surface (the thread or
+// the global banner); the inner catches swallow before
+// withLoading would show a second one.
 async function sendHomeAi() {
-  const input = $('#homeAiText');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-  const epoch = homeAiEpoch;
-  const history = [...homeAiHistory];
-  homeAiHistory.push({ role: 'user', text });
-  homeAiPending = null;
-  renderHomeAiThread();
-  try {
-    const res = await api('/api/home/insights/ai-append', { method: 'POST', body: { text, history } });
-    if (epoch !== homeAiEpoch) return; // cleared while this was in flight — drop the stale reply
-    if (res.proposal) {
-      homeAiPending = res.proposal;
-      homeAiHistory.push({ role: 'assistant', text: `Proposed: ${res.proposal.title} (${res.proposal.section}). Apply to add it.` });
-    } else if (res.ask) {
-      homeAiHistory.push({ role: 'assistant', text: res.ask });
-    } else if (res.decline) {
-      homeAiHistory.push({ role: 'assistant', text: res.decline });
-    } else if (res.note) {
-      homeAiHistory.push({ role: 'assistant', text: res.note });
+  return withLoading(async () => {
+    const input = $('#homeAiText');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    const epoch = homeAiEpoch;
+    const history = [...homeAiHistory];
+    homeAiHistory.push({ role: 'user', text });
+    homeAiPending = null;
+    renderHomeAiThread();
+    try {
+      const res = await api('/api/home/insights/ai-append', { method: 'POST', body: { text, history } });
+      if (epoch !== homeAiEpoch) return; // cleared while this was in flight — drop the stale reply
+      if (res.proposal) {
+        homeAiPending = res.proposal;
+        homeAiHistory.push({ role: 'assistant', text: `Proposed: ${res.proposal.title} (${res.proposal.section}). Apply to add it.` });
+      } else if (res.ask) {
+        homeAiHistory.push({ role: 'assistant', text: res.ask });
+      } else if (res.decline) {
+        homeAiHistory.push({ role: 'assistant', text: res.decline });
+      } else if (res.note) {
+        homeAiHistory.push({ role: 'assistant', text: res.note });
+      }
+    } catch (err) {
+      homeAiHistory.push({ role: 'assistant', text: err.message });
     }
-  } catch (err) {
-    homeAiHistory.push({ role: 'assistant', text: err.message });
-  }
-  renderHomeAiThread();
+    renderHomeAiThread();
+  });
 }
 
 async function applyHomeAiProposal() {
   if (!homeAiPending) return;
-  const def = { section: homeAiPending.section, title: homeAiPending.title, metric: homeAiPending.metric };
-  homeAiPending = null;
-  try {
-    const res = await api('/api/home/insights/ai-apply', { method: 'POST', body: { definition: def } });
-    homeAiHistory.push({ role: 'assistant', text: res.duplicate ? 'That card is already on the page.' : `Added “${res.insight.title}”.` });
-    await loadHome();
-  } catch (err) {
-    homeAiHistory.push({ role: 'assistant', text: err.message });
-    renderHomeAiThread();
-  }
+  return withLoading(async () => {
+    const def = { section: homeAiPending.section, title: homeAiPending.title, metric: homeAiPending.metric };
+    homeAiPending = null;
+    try {
+      const res = await api('/api/home/insights/ai-apply', { method: 'POST', body: { definition: def } });
+      homeAiHistory.push({ role: 'assistant', text: res.duplicate ? 'That card is already on the page.' : `Added “${res.insight.title}”.` });
+      await loadHome();
+    } catch (err) {
+      homeAiHistory.push({ role: 'assistant', text: err.message });
+      renderHomeAiThread();
+    }
+  });
 }
 
 $('#homeRegenBtn').addEventListener('click', async () => {
   const btn = $('#homeRegenBtn');
   btn.disabled = true;
   try {
-    await api('/api/home/insights/generate', { method: 'POST' });
-    await loadHome();
+    await withLoading(async () => {
+      await api('/api/home/insights/generate', { method: 'POST' });
+      await loadHome();
+    });
   } catch (err) { showMsg($('#globalError'), 'err', err.message); }
   btn.disabled = false;
 });

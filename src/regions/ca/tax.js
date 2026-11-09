@@ -10,11 +10,16 @@
 //   - nothing generates automatically — Generate runs only on
 //     the user's explicit action on a project;
 //   - the detail page is sectioned (TAX_SECTIONS in src/tax.js):
-//     Income, Deductions, Credits, Review;
+//     Income, Registered savings plans, Deductions, Provincial,
+//     Review, Finish and file (2026-11-08 re-split);
 //   - the RRSP benefit estimate reuses the region's T4127-style
 //     engine (calcSalary over the region's payroll tables —
 //     src/tax.js rrspBenefit). The region provides the payroll
 //     tables; it does NOT provide a second calculator;
+//   - the refund headline + popup (2026-11-08) DOES compute a T1:
+//     computeT1 in ./t1.js, from the federal + province modules
+//     (./federal.js, ./bc.js). Headline + popup only — the full
+//     filing flow is still out of scope.
 //   - the Tax Profile's room figures are user-entered from the
 //     CRA Notice of Assessment, never derived or estimated.
 //     The RESP/CESG limits (src/tax.js) only split an entered
@@ -34,7 +39,10 @@
 //   expectedItems(ctx) -> [{ kind, label, sourceType, sourceId,
 //     personKey, amount, currency, sharePct, detail }]
 //     — the filing items the app's own records imply for one tax
-//     year. ctx:
+//     year. This is the ADD PICKER's candidate list, not a
+//     generator: nothing is written until the user picks a
+//     candidate (2026-11-08: Generate was removed entirely).
+//     ctx:
 //       { taxYear,
 //         jobs: [{ id, employer, owner, annualGross, currency }],
 //         rentals: [{ id, label, gross, deductible, net,
@@ -44,15 +52,27 @@
 //                       currency, ownerUsernames }],
 //         sells: [{ id, holdingLabel, accountName, proceeds, units,
 //                   price, currency, ownerUsernames }] }
-//     Item kinds: 'employment' | 'rental' | 'rrsp' |
-//     'investment_income' | 'capital_gain' | 'other_income' |
-//     'deduction' | 'credit'. personKey is a username, or null
+//     Item kinds: 'employment' | 'rental' | 'rrsp' | 'resp' |
+//     'prpp' | 'rpp' | 'hbp' | 'investment_income' |
+//     'capital_gain' | 'other_income' | 'deduction' |
+//     'disability' | 'student' | 'credit'. The derivation only
+//     ever yields employment / rental / rrsp / investment_income
+//     / capital_gain — prpp, rpp, hbp, disability, student,
+//     resp and the generic 'deduction' are manual-only kinds
+//     (the app holds no source records for them); the user adds
+//     them by hand or from a receipt. personKey is a username, or null
 //     when the app cannot determine the person — the item is then
 //     UNLINKED and the user links it on the detail page; it is
 //     never guessed. sharePct is the filer's share of the amount
 //     (100 = whole item); a source owned by several people yields
 //     one item per owner, each carrying its share. detail is free
 //     JSON the UI shows beside the amount.
+//   rrspWindow(taxYear) -> { start, end, label } — the CRA
+//     first-60-days contribution window for a tax year.
+//   t776FormDef(expenseLines) -> the T776 form structure (income
+//     lines, numbered expense lines, computed totals/net).
+//   t776Totals(lines) -> { gross, expenses, net } from a T776
+//     line set. validT776Lines(lines, expenseLines) validates one.
 //
 // What this module deliberately does NOT do: no tax computation.
 // v1 is an items inventory + linking + slip capture; the T1
@@ -177,6 +197,88 @@ export function slipAmount(kind, fields) {
   return seen ? Math.round(total * 100) / 100 : null;
 }
 
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
+
+// The RRSP contribution window for a tax year — the CRA
+// first-60-days rule (verified 2026-11-08): contributions made
+// from March 1 of the tax year through the first 60 days of the
+// NEXT year count toward that tax year. The 60th day of the next
+// year is March 1 in a common year and February 29 in a leap
+// year; when it falls on a weekend the CRA extends the deadline
+// to the next business day (the 2025 deadline was Monday,
+// March 2, 2026, because March 1 was a Sunday). Returns
+// { start, end, label } as ISO dates plus a display label.
+export function rrspWindow(taxYear) {
+  const y = Number(taxYear);
+  const next = y + 1;
+  const leap = (next % 4 === 0 && next % 100 !== 0) || next % 400 === 0;
+  let end = new Date(Date.UTC(next, leap ? 1 : 2, leap ? 29 : 1));
+  const dow = end.getUTCDay();
+  if (dow === 6) end = new Date(end.getTime() + 2 * 86400000);
+  else if (dow === 0) end = new Date(end.getTime() + 86400000);
+  const start = `${y}-03-01`;
+  const endIso = end.toISOString().slice(0, 10);
+  const fmt = (s) => {
+    const [yy, mm, dd] = s.split('-').map(Number);
+    return new Date(Date.UTC(yy, mm - 1, dd)).toLocaleDateString('en-CA', {
+      month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
+    });
+  };
+  return { start, end: endIso, label: `${fmt(start)} – ${fmt(endIso)}` };
+}
+
+// The T776 (Statement of Real Estate Rentals) form structure.
+// Income lines are the form's own: 8141 total gross rents, 8230
+// other income, 8299 total gross rental income (computed). The
+// numbered expense lines come from the region's rental module
+// (getRegion('CA').rental.t776Lines) — the server passes them in
+// so the two modules never import each other. Net is line 9946
+// (gross − expenses); the net flows to T1 line 12600, the gross
+// to line 12599. There is NO T5A slip in CRA's set — the
+// similarly-named slip is T4A (already in slipKinds above);
+// the app must never invent a T5A form.
+export const T776_INCOME_LINES = [
+  { key: 'gross_rents', line: '8141', label: 'Line 8141 — Total gross rents', money: true },
+  { key: 'other_income', line: '8230', label: 'Line 8230 — Other income', money: true },
+];
+export function t776FormDef(expenseLines) {
+  return {
+    form: 'T776',
+    label: 'T776 — Statement of Real Estate Rentals',
+    income: T776_INCOME_LINES,
+    expenses: (expenseLines || []).map((l) => ({
+      key: l.line, line: l.line, label: `Line ${l.line} — ${l.label}`, money: true,
+    })),
+    totalGrossLine: { key: 'total_gross', line: '8299', label: 'Line 8299 — Total gross rental income' },
+    netLine: { key: 'net', line: '9946', label: 'Line 9946 — Net rental income' },
+  };
+}
+// Totals from a T776 line set: { gross_rents, other_income,
+// '<expense line number>': amount, ... } → { gross, expenses, net }.
+export function t776Totals(lines) {
+  const num = (v) => (isFinite(Number(v)) ? Number(v) : 0);
+  const gross = round2(num(lines.gross_rents) + num(lines.other_income));
+  let expenses = 0;
+  for (const [k, v] of Object.entries(lines || {})) {
+    if (k === 'gross_rents' || k === 'other_income') continue;
+    expenses += num(v);
+  }
+  expenses = round2(expenses);
+  return { gross, expenses, net: round2(gross - expenses) };
+}
+export function validT776Lines(lines, expenseLines) {
+  if (!lines || typeof lines !== 'object' || Array.isArray(lines)) {
+    return 'lines must be an object of T776 line values.';
+  }
+  const known = new Set(['gross_rents', 'other_income', ...((expenseLines || []).map((l) => l.line))]);
+  for (const [k, v] of Object.entries(lines)) {
+    if (!known.has(k)) return `unknown T776 line "${k}".`;
+    if (v != null && v !== '' && !isFinite(Number(v))) return `T776 line "${k}" must be a number.`;
+    if (isFinite(Number(v)) && Number(v) < 0) return `T776 line "${k}" must not be negative.`;
+  }
+  return null;
+}
+
 // Split a source owned by several people into one expected item
 // per owner, each carrying its equal share. A source with no
 // known owners yields one UNLINKED item (personKey null) — the
@@ -223,8 +325,16 @@ export function expectedItems(ctx) {
       currency: 'CAD',
       detail: {
         gross: Math.round(Number(rental.gross || 0) * 100) / 100,
+        grossRents: Math.round(Number(rental.grossRents ?? rental.gross) * 100) / 100,
+        otherIncome: Math.round(Number(rental.otherIncome || 0) * 100) / 100,
         deductible: Math.round(Number(rental.deductible || 0) * 100) / 100,
         net: Math.round(Number(rental.net || 0) * 100) / 100,
+        // The T776 view of the rental year: the manual lines by
+        // T776 line number, and the rental calc's deductible
+        // expense table (derived property costs + manual rows +
+        // mortgage interest — the 8710 content lives here).
+        lines: rental.lines || null,
+        expenseRows: rental.expenseRows || null,
         taxYear: year,
       },
     };
@@ -276,3 +386,9 @@ export function expectedItems(ctx) {
   }
   return items;
 }
+
+// The T1 computation behind the refund headline + popup (see
+// ./t1.js): one compute surface, federal + province modules under
+// it. Re-exported so the server calls region.tax.computeT1(...)
+// and the UI never sees a bracket table.
+export { computeT1 } from './t1.js';

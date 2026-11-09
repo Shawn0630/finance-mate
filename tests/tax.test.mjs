@@ -1,23 +1,29 @@
 // Tax module: the region interface (CA slips, slip → item
-// mapping, expected-items derivation), the split math, the
-// per-item share, plan annual contributions, and the
-// upsertExpectedItems refresh/prune rules against a real
-// SQLite table. No tax computation exists in v1 — nothing here
-// asserts a payable or a refund.
+// mapping, expected-items derivation), the RRSP contribution
+// window, the T776 form math, the split math, the per-item
+// share, plan annual contributions, the guided-return sections,
+// and the T1 computation behind the refund headline + popup
+// (federal + BC modules, pinned against the user's 2025 return).
+// Nothing generates automatically — the derivation is a
+// CANDIDATE list for the Add picker, never an auto-apply.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { getRegion } from '../src/regions/index.js';
 import * as caTax from '../src/regions/ca/tax.js';
-import { payroll } from '../src/regions/ca.js';
+import { payroll, rental } from '../src/regions/ca.js';
+import { federalTable } from '../src/regions/ca/federal.js';
+import { bcTable } from '../src/regions/ca/bc.js';
+import { computeT1 } from '../src/regions/ca/t1.js';
+import { listCommits } from '../src/history.js';
 import {
   TAX_ITEM_KINDS, TAX_ITEM_STATUSES, TAX_SECTIONS, sectionForKind, sectionSummary,
   RESP_LIFETIME_LIMIT, CESG_LIFETIME_MAX, respRoomSplit, cesgRoomSplit,
   tfsaNetContributed, rrspContributed, rrspBenefit,
-  effectiveAmount, filingTotals,
+  effectiveAmount, filingTotals, rentalDeductible, rentalNet,
   validSharePct, validTaxItemInput, validTaxSlipInput, validTaxProfileInput,
-  buildExpectedContext, planOwnAnnual, upsertExpectedItems,
+  buildExpectedContext, planOwnAnnual,
 } from '../src/tax.js';
 
 const jobRow = (over = {}) => ({
@@ -38,9 +44,11 @@ test('region registry: CA exposes a tax surface; unknown regions return null', (
   assert.equal(getRegion('xx'), null);
 });
 
-test('CA slip kinds: the seven slips, each with box fields', () => {
+test('CA slip kinds: the seven slips, each with box fields — T4A, never T5A', () => {
   const kinds = caTax.slipKinds.map((s) => s.kind);
   assert.deepEqual(kinds, ['T4', 'T4A', 'T5', 'T3', 'T4RSP', 'T4RIF', 'T5008']);
+  assert.ok(kinds.includes('T4A'), 'T4A (pension/retirement/other income) is covered');
+  assert.ok(!kinds.includes('T5A'), 'there is no T5A slip in CRA\'s set — never invent one');
   for (const s of caTax.slipKinds) {
     assert.ok(s.label && s.form);
     assert.ok(Array.isArray(s.fields) && s.fields.length > 0);
@@ -75,6 +83,9 @@ test('slipAmount: only the income boxes count — tax deducted and cost base nev
 });
 
 // --------------------------------------------------------- expected items --
+// The derivation is the Add picker's CANDIDATE list (jobs,
+// rentals, RRSP plans, dividends, sells that exist in the app).
+// Candidates are shown for the user to choose, never auto-applied.
 test('expectedItems: a job with an owner links; without one it is UNLINKED; zero gross is skipped', () => {
   const items = caTax.expectedItems({
     taxYear: 2026,
@@ -107,6 +118,12 @@ test('expectedItems: a rental splits equally per owner; the last owner absorbs r
   ]);
   assert.equal(two[0].detail.gross, 22800);
   assert.equal(two[0].detail.deductible, 18903.37);
+  // No T776 line set on the raw input: the gross is the gross
+  // rents, there is no other income, and lines/expenseRows stay null.
+  assert.equal(two[0].detail.grossRents, 22800);
+  assert.equal(two[0].detail.otherIncome, 0);
+  assert.equal(two[0].detail.lines, null);
+  assert.equal(two[0].detail.expenseRows, null);
 
   const three = caTax.expectedItems({
     taxYear: 2026, jobs: [], plans: [], dividends: [], sells: [],
@@ -149,13 +166,17 @@ test('expectedItems: RRSP plans link to the job owner; dividends and sells split
 });
 
 // ------------------------------------------------------ context derivation --
-test('buildExpectedContext: job annual gross, rental split, RRSP-only plans, NonRegistered-only events', () => {
+test('buildExpectedContext: job annual gross, rental split + T776 lines, RRSP-only plans, NonRegistered-only events', () => {
   const ctx = buildExpectedContext({
     taxYear: 2026,
     jobRows: [jobRow(), jobRow({ id: 2, employer: 'Other year', tax_year: 2025, owner: 'Jiaying' })],
     rentalRows: [{
       id: 5, label: '2985 Basement', propertyOwners: '["Shawn","Jiaying"]',
-      years: [{ tax_year: 2026, calc: { grossWhole: 22800, deductibleExpenses: 18903.37, netWhole9946: 3896.63 } }],
+      years: [{ tax_year: 2026, calc: {
+        grossWhole: 22800, otherIncome: 200, deductibleExpenses: 18903.37, netWhole9946: 3896.63,
+        expensesByLine: { 8710: 12000, 8521: 6903.37 },
+        expenseTable: { rows: [{ label: 'Mortgage interest', total: 12000, pct: 100, deductible: 12000 }] },
+      } }],
     }],
     planRows: [
       { id: 7, accountType: 'RRSP', accountName: 'Manulife RRSP', holdingLabel: 'ML Mercer 2030', jobOwner: 'Shawn', currency: 'CAD', taxYear: 2026, own_amount: 220.05, employer_amount: 220.05, jobFrequency: 'biweekly', job: { frequency: 'biweekly', gross_amount: 7334.77, gross_basis: 'period' }, start_date: '2026-11-06', events: [] },
@@ -170,13 +191,23 @@ test('buildExpectedContext: job annual gross, rental split, RRSP-only plans, Non
       { id: 14, holdingLabel: 'RRSP sell', accountName: 'RRSP', units: 5, price: 100, currency: 'CAD', accountType: 'RRSP', accountOwners: '["Shawn"]' },
     ],
     payroll,
+    rrspWindow: caTax.rrspWindow(2026),
+    t776Lines: rental.t776Lines,
   });
   assert.equal(ctx.jobs.length, 1); // the 2025 job is another year's
   assert.equal(ctx.jobs[0].annualGross, 190704.02);
   assert.equal(ctx.rentals.length, 1);
   assert.equal(ctx.rentals[0].net, 3896.63);
+  assert.equal(ctx.rentals[0].grossRents, 22600); // 22800 gross − 200 other income
+  assert.equal(ctx.rentals[0].otherIncome, 200);
+  assert.equal(ctx.rentals[0].lines.find((l) => l.line === '8710').amount, 12000);
+  assert.equal(ctx.rentals[0].lines.find((l) => l.line === '8521').amount, 6903.37);
+  assert.equal(ctx.rentals[0].expenseRows.length, 1);
   assert.equal(ctx.plans.length, 1); // TFSA plan is not a deduction
-  assert.equal(ctx.plans[0].ownAnnual, 880.2); // 4 due periods × 220.05, projected
+  // The RRSP window (Mar 1, 2026 – Mar 1, 2027), not the calendar
+  // year: a Nov 6 start has 9 due dates in the window (Nov 6 →
+  // Feb 26) × $220.05, projected.
+  assert.equal(ctx.plans[0].ownAnnual, 1980.45);
   assert.equal(ctx.plans[0].basis, 'projected');
   assert.equal(ctx.dividends.length, 1); // TFSA dividend is not taxed in-year
   assert.equal(ctx.sells.length, 1); // RRSP sell is not a capital gain
@@ -185,13 +216,76 @@ test('buildExpectedContext: job annual gross, rental split, RRSP-only plans, Non
   const items = caTax.expectedItems(ctx);
   assert.equal(items.filter((i) => i.kind === 'employment').length, 1);
   assert.equal(items.filter((i) => i.kind === 'rental').length, 2);
+  assert.equal(items.find((i) => i.kind === 'rental').detail.grossRents, 22600);
   assert.equal(items.filter((i) => i.kind === 'rrsp').length, 1);
+  assert.equal(items.find((i) => i.kind === 'rrsp').amount, 1980.45);
   assert.equal(items.filter((i) => i.kind === 'investment_income').length, 1);
   assert.equal(items.filter((i) => i.kind === 'capital_gain').length, 2);
 });
 
+// ---------------------------------------------------------- RRSP window --
+// The CRA first-60-days rule (verified 2026-11-08): for a tax
+// year, eligible contributions run March 1 of that year through
+// the 60th day of the next year — March 1 in a common year,
+// February 29 in a leap year, extended to Monday when the 60th
+// day falls on a weekend (2025's deadline was Monday, March 2,
+// 2026, because March 1 was a Sunday).
+test('rrspWindow: Mar 1 of the tax year through the first 60 days of the next year', () => {
+  assert.deepEqual(
+    (({ start, end }) => ({ start, end }))(caTax.rrspWindow(2025)),
+    { start: '2025-03-01', end: '2026-03-02' });
+  assert.match(caTax.rrspWindow(2025).label, /Mar 1, 2025.*Mar 2, 2026/);
+  assert.deepEqual(
+    (({ start, end }) => ({ start, end }))(caTax.rrspWindow(2026)),
+    { start: '2026-03-01', end: '2027-03-01' });
+  assert.match(caTax.rrspWindow(2026).label, /Mar 1, 2026.*Mar 1, 2027/);
+  assert.deepEqual(
+    (({ start, end }) => ({ start, end }))(caTax.rrspWindow(2027)),
+    { start: '2027-03-01', end: '2028-02-29' }); // 2028 is a leap year
+  assert.match(caTax.rrspWindow(2027).label, /Mar 1, 2027.*Feb 29, 2028/);
+});
+
+// --------------------------------------------------------------- T776 --
+// Rental income is reported on CRA Form T776 (Statement of Real
+// Estate Rentals): gross rents line 8141, other income 8230,
+// total gross 8299, net 9946 (gross − expenses).
+test('t776Totals / validT776Lines: gross, expenses and net from the form lines', () => {
+  const lines = { gross_rents: 22800, other_income: 200, 8710: 12000, 8521: 6903.37 };
+  assert.deepEqual(caTax.t776Totals(lines), { gross: 23000, expenses: 18903.37, net: 4096.63 });
+  assert.deepEqual(caTax.t776Totals({}), { gross: 0, expenses: 0, net: 0 });
+  assert.equal(caTax.validT776Lines(lines, rental.t776Lines), null);
+  assert.equal(caTax.validT776Lines({ gross_rents: 1 }, rental.t776Lines), null);
+  assert.match(caTax.validT776Lines({ gross_rents: 1, 9999: 5 }, rental.t776Lines), /unknown T776 line "9999"/);
+  assert.match(caTax.validT776Lines({ gross_rents: -1 }, rental.t776Lines), /must not be negative/);
+  assert.match(caTax.validT776Lines({ gross_rents: 'abc' }, rental.t776Lines), /must be a number/);
+  assert.match(caTax.validT776Lines(null, rental.t776Lines), /must be an object/);
+  assert.match(caTax.validT776Lines([], rental.t776Lines), /must be an object/);
+  // The form definition carries the income lines and the
+  // region's expense lines by T776 line number.
+  const def = caTax.t776FormDef(rental.t776Lines);
+  assert.equal(def.form, 'T776');
+  assert.deepEqual(def.income.map((l) => l.line), ['8141', '8230']);
+  assert.equal(def.expenses.find((l) => l.line === '8710').label, 'Line 8710 — Interest and bank charges');
+  assert.equal(def.netLine.line, '9946');
+});
+
+test('rentalDeductible / rentalNet: stored deductible + net win; otherwise the T776 lines', () => {
+  assert.equal(rentalDeductible({ detail: { deductible: 18903.37, net: 3896.63 } }), 18903.37);
+  assert.equal(rentalNet({ detail: { deductible: 18903.37, net: 3896.63 } }), 3896.63);
+  const fromLines = { detail: { gross: 22800, lines: { gross_rents: 22800, 8710: 12000, 8521: 6903.37 } } };
+  assert.equal(rentalDeductible(fromLines), 18903.37); // income lines never count as expenses
+  assert.equal(rentalNet(fromLines), 3896.63); // gross − deductible
+  assert.equal(rentalDeductible({}), 0);
+  assert.equal(rentalNet({}), 0);
+  assert.equal(rentalDeductible(null), 0);
+});
+
 // ---------------------------------------------------------- plan own annual --
+// The year is the RRSP contribution WINDOW, not the calendar
+// year: with no window the calendar year is used (the old
+// behaviour, kept for callers without a region).
 test('planOwnAnnual: generated buys are the ground truth (actual); otherwise due periods × per-period own (projected)', () => {
+  const window = caTax.rrspWindow(2026);
   const base = {
     taxYear: 2026, own_amount: 100, employer_amount: 100,
     jobFrequency: 'biweekly', job: { frequency: 'biweekly', gross_amount: 7334.77, gross_basis: 'period' },
@@ -205,35 +299,44 @@ test('planOwnAnnual: generated buys are the ground truth (actual); otherwise due
       { type: 'buy', date: '2025-12-31', own_amount: 999 },
       { type: 'sell', date: '2026-04-01', own_amount: 500 },
     ],
-  });
+  }, window);
   assert.equal(actual, 440.1);
   const planA = { ...base, events: [{ type: 'buy', date: '2026-03-15', own_amount: 220.05 }] };
-  planOwnAnnual(planA);
+  planOwnAnnual(planA, window);
   assert.equal(planA._basis, 'actual');
 
-  const projected = planOwnAnnual({ ...base });
-  assert.equal(projected, 2700); // 27 bi-weekly due dates in 2026 from Jan 1 × $100
+  // 26 bi-weekly due dates inside the window (Mar 12, 2026 →
+  // Feb 25, 2027) × $100 — the calendar year has 27.
+  const projected = planOwnAnnual({ ...base }, window);
+  assert.equal(projected, 2600);
+  assert.equal(planOwnAnnual({ ...base }), 2700);
   const planP = { ...base };
-  planOwnAnnual(planP);
+  planOwnAnnual(planP, window);
   assert.equal(planP._basis, 'projected');
 
+  // A plan starting in 2027 has no due dates in calendar 2026,
+  // but 5 inside the window (Jan 1 → Feb 26, 2027).
   assert.equal(planOwnAnnual({ ...base, start_date: '2027-01-01' }), 0);
-  assert.equal(planOwnAnnual({ ...base, own_amount: 0 }), 0);
+  assert.equal(planOwnAnnual({ ...base, start_date: '2027-01-01' }, window), 500);
+  assert.equal(planOwnAnnual({ ...base, own_amount: 0 }, window), 0);
 });
 
 test('planOwnAnnual: percent plans derive from the current per-period gross', () => {
+  const window = caTax.rrspWindow(2026);
   const plan = {
     taxYear: 2026, own_pct: 3, employer_pct: 3,
     jobFrequency: 'biweekly', job: { frequency: 'biweekly', gross_amount: 7334.77, gross_basis: 'period' },
     start_date: '2026-01-01', events: [], deletedDueDates: [],
   };
-  // 3% × 7334.77 = 220.04 per period × 27 due dates.
+  // 3% × 7334.77 = 220.04 per period × 26 window due dates
+  // (27 in the calendar year).
+  assert.equal(planOwnAnnual(plan, window), 5721.04);
   assert.equal(planOwnAnnual(plan), 5941.08);
   assert.equal(plan._basis, 'projected');
 });
 
 // ------------------------------------------------------------- share math --
-test('effectiveAmount and filingTotals: share × amount, excluded items never count', () => {
+test('effectiveAmount and filingTotals: share × amount, excluded items never count — and neither do RESP or derived rows', () => {
   assert.equal(effectiveAmount({ amount: 2000, share_pct: 50 }), 1000);
   assert.equal(effectiveAmount({ amount: 100, share_pct: 33.33 }), 33.33);
   assert.equal(effectiveAmount({ amount: 100, share_pct: null }), 100);
@@ -241,20 +344,30 @@ test('effectiveAmount and filingTotals: share × amount, excluded items never co
     { kind: 'employment', amount: 190704.02, share_pct: 100, status: 'confirmed' },
     { kind: 'rental', amount: 3896.63, share_pct: 50, status: 'linked' },
     { kind: 'rrsp', amount: 880.2, share_pct: 100, status: 'excluded' },
+    // RESP is tracked, never deductible: $0 in every total.
+    { kind: 'resp', amount: 5000, share_pct: 100, status: 'linked' },
+    // A derived rental-deduction row displays numbers already
+    // netted in its rental item: $0 in every total.
+    { kind: 'deduction', amount: 18903.37, share_pct: 50, status: 'linked', detail: { derived: true } },
   ]);
   assert.equal(totals.byKind.employment, 190704.02);
   assert.equal(totals.byKind.rental, 1948.32);
   assert.equal(totals.byKind.rrsp, undefined);
+  assert.equal(totals.byKind.resp, undefined);
+  assert.equal(totals.byKind.deduction, undefined);
   assert.equal(totals.total, 192652.34);
 });
 
-test('validSharePct and validTaxItemInput', () => {
+test('validSharePct and validTaxItemInput — incl. the manual-only kinds', () => {
   assert.equal(validSharePct(100), true);
   assert.equal(validSharePct(0.01), true);
   assert.equal(validSharePct(0), false);
   assert.equal(validSharePct(100.01), false);
   assert.equal(validSharePct('x'), false);
   assert.equal(validTaxItemInput({ kind: 'employment', label: 'Meta', amount: 1 }), null);
+  for (const kind of ['resp', 'prpp', 'rpp', 'hbp', 'disability', 'student']) {
+    assert.equal(validTaxItemInput({ kind, label: 'Manual', amount: 1 }), null, `${kind} must be a valid item kind`);
+  }
   assert.match(validTaxItemInput({ kind: 'nope', label: 'x', amount: 1 }), /kind/);
   assert.match(validTaxItemInput({ kind: 'employment', label: ' ', amount: 1 }), /label/);
   assert.match(validTaxItemInput({ kind: 'employment', label: 'x', amount: 'a' }), /amount/);
@@ -271,105 +384,64 @@ test('validTaxSlipInput: unknown kind, unknown box, bad year', () => {
   assert.match(validTaxSlipInput({ ...good, fields: [] }, caTax), /fields/);
 });
 
-test('upsertExpectedItems: add, refresh amounts, prune stale — and never touch user-owned items', () => {
-  const db = new Database(':memory:');
-  db.exec(`CREATE TABLE tax_items (
-    id INTEGER PRIMARY KEY, filing_id INTEGER, tax_year INTEGER NOT NULL,
-    kind TEXT NOT NULL, label TEXT NOT NULL, source_type TEXT, source_id INTEGER,
-    slip_id INTEGER, amount REAL NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'CAD',
-    share_pct REAL NOT NULL DEFAULT 100, status TEXT NOT NULL DEFAULT 'expected',
-    detail TEXT NOT NULL DEFAULT '{}', notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-  )`);
-  const now = new Date().toISOString();
-  const insert = db.prepare(`INSERT INTO tax_items
-    (filing_id, tax_year, kind, label, source_type, source_id, amount, currency, share_pct, status, detail, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)`);
-  // A linked item for a source that will disappear from the
-  // derived list: the user owns it, so Generate must keep it.
-  insert.run(1, 2026, 'employment', 'Old job', 'job', 99, 5000, 'CAD', 100, 'linked', now, now);
-  // A manual item (no source): never touched either.
-  insert.run(1, 2026, 'deduction', 'Manual', null, null, 300, 'CAD', 100, 'linked', now, now);
-  // An expected item whose source will vanish: pruned.
-  insert.run(1, 2026, 'rental', 'Gone', 'rental', 77, 100, 'CAD', 100, 'expected', now, now);
-
-  const first = upsertExpectedItems(db, {
-    filingId: 1, taxYear: 2026,
-    derived: [
-      { kind: 'employment', label: 'Meta — employment income', sourceType: 'job', sourceId: 1, amount: 190704.02, currency: 'CAD', sharePct: 100, detail: {} },
-      { kind: 'rental', label: '2985 Basement — rental income (T776)', sourceType: 'rental', sourceId: 5, amount: 3896.63, currency: 'CAD', sharePct: 50, detail: {} },
-    ],
-  });
-  assert.deepEqual(first, { added: 2, updated: 0, removed: 1 });
-  const rows = db.prepare('SELECT * FROM tax_items ORDER BY id').all();
-  assert.equal(rows.length, 4); // 2 kept + 2 added, 1 pruned
-  assert.equal(rows.find((r) => r.source_id === 99).status, 'linked');
-  assert.equal(rows.find((r) => r.source_type === null).label, 'Manual');
-
-  // Refresh: the job amount changes, the rental is unchanged.
-  const second = upsertExpectedItems(db, {
-    filingId: 1, taxYear: 2026,
-    derived: [
-      { kind: 'employment', label: 'Meta — employment income', sourceType: 'job', sourceId: 1, amount: 195000, currency: 'CAD', sharePct: 100, detail: {} },
-      { kind: 'rental', label: '2985 Basement — rental income (T776)', sourceType: 'rental', sourceId: 5, amount: 3896.63, currency: 'CAD', sharePct: 50, detail: {} },
-    ],
-  });
-  assert.deepEqual(second, { added: 0, updated: 1, removed: 0 });
-  assert.equal(db.prepare("SELECT amount FROM tax_items WHERE source_type = 'job' AND source_id = 1").get().amount, 195000);
-
-  // A user-confirmed item for a derived source is never
-  // overwritten, even when the derived amount moves.
-  db.prepare("UPDATE tax_items SET status = 'confirmed', amount = 1 WHERE source_type = 'job' AND source_id = 1").run();
-  const third = upsertExpectedItems(db, {
-    filingId: 1, taxYear: 2026,
-    derived: [
-      { kind: 'employment', label: 'Meta — employment income', sourceType: 'job', sourceId: 1, amount: 200000, currency: 'CAD', sharePct: 100, detail: {} },
-      { kind: 'rental', label: '2985 Basement — rental income (T776)', sourceType: 'rental', sourceId: 5, amount: 3896.63, currency: 'CAD', sharePct: 50, detail: {} },
-    ],
-  });
-  assert.deepEqual(third, { added: 0, updated: 0, removed: 0 });
-  assert.equal(db.prepare("SELECT amount FROM tax_items WHERE source_type = 'job' AND source_id = 1").get().amount, 1);
-
-  // The unlinked bucket (filingId null) is a separate scope.
-  const fourth = upsertExpectedItems(db, {
-    filingId: null, taxYear: 2026,
-    derived: [{ kind: 'employment', label: 'Side gig', sourceType: 'job', sourceId: 2, amount: 5000, currency: 'CAD', sharePct: 100, detail: {} }],
-  });
-  assert.deepEqual(fourth, { added: 1, updated: 0, removed: 0 });
-  assert.equal(db.prepare('SELECT COUNT(*) c FROM tax_items WHERE filing_id IS NULL').get().c, 1);
-  db.close();
-});
-
 // ------------------------------------------------- sections / credits --
-// The guided-return checklist (TurboTax-style): Income,
-// Deductions, Credits, then Review (a summary, not a kind
-// bucket). 'credit' is a first-class item kind.
+// The guided-return checklist (TurboTax-style, user 2026-11-08
+// 16:19 — supersedes the Income / Deductions / Credits split):
+// Income, Registered savings plans, Deductions, Provincial, then
+// Review (a summary, not a kind bucket) and Finish and file.
+// 'credit' is a first-class item kind and renders under
+// Provincial (BC) — there is no federal-credits section. The
+// disability amount is technically a non-refundable credit; it
+// sits under Deductions because the user placed it there.
 test("'credit' is a valid item kind; sectionSummary counts expected/linked/confirmed/excluded per section", () => {
   assert.ok(TAX_ITEM_KINDS.includes('credit'));
   assert.equal(validTaxItemInput({ kind: 'credit', label: 'Canada workers benefit', amount: 100 }), null);
   assert.equal(sectionForKind('employment'), 'income');
   assert.equal(sectionForKind('rental'), 'income');
-  assert.equal(sectionForKind('rrsp'), 'deductions');
+  assert.equal(sectionForKind('investment_income'), 'income');
+  assert.equal(sectionForKind('capital_gain'), 'income');
+  assert.equal(sectionForKind('other_income'), 'income');
+  assert.equal(sectionForKind('rrsp'), 'registered');
+  assert.equal(sectionForKind('resp'), 'registered');
+  assert.equal(sectionForKind('prpp'), 'registered');
+  assert.equal(sectionForKind('rpp'), 'registered');
+  assert.equal(sectionForKind('hbp'), 'registered');
   assert.equal(sectionForKind('deduction'), 'deductions');
-  assert.equal(sectionForKind('credit'), 'credits');
+  assert.equal(sectionForKind('disability'), 'deductions');
+  assert.equal(sectionForKind('student'), 'deductions');
+  assert.equal(sectionForKind('credit'), 'provincial');
   assert.equal(sectionForKind('nope'), 'income');
   const items = [
     { kind: 'employment', amount: 100, share_pct: 100, status: 'confirmed' },
     { kind: 'rental', amount: 200, share_pct: 50, status: 'linked' },
     { kind: 'rrsp', amount: 300, share_pct: 100, status: 'expected' },
+    { kind: 'resp', amount: 5000, share_pct: 100, status: 'linked' },
+    { kind: 'prpp', amount: 1000, share_pct: 100, status: 'confirmed' },
+    { kind: 'disability', amount: 10138, share_pct: 100, status: 'linked' },
     { kind: 'credit', amount: 400, share_pct: 100, status: 'confirmed' },
     { kind: 'credit', amount: 999, share_pct: 100, status: 'excluded' },
+    // The derived rental-deduction row renders in Income, under
+    // its rental item: it counts in Income's row counts but $0
+    // in every amount.
+    { kind: 'deduction', amount: 18903.37, share_pct: 50, status: 'linked', detail: { derived: true } },
   ];
   const s = sectionSummary(items);
-  assert.deepEqual(Object.keys(s), ['income', 'deductions', 'credits']);
-  assert.equal(s.income.total, 2);
+  assert.deepEqual(Object.keys(s), ['income', 'registered', 'deductions', 'provincial']);
+  assert.equal(s.income.total, 3);
   assert.equal(s.income.confirmed, 1);
-  assert.equal(s.income.linked, 1);
-  assert.equal(s.income.amount, 200); // 100 + 200×50%
-  assert.equal(s.deductions.expected, 1);
-  assert.equal(s.deductions.amount, 300);
-  assert.equal(s.credits.total, 2);
-  assert.equal(s.credits.excluded, 1);
-  assert.equal(s.credits.amount, 400); // the excluded credit never counts
+  assert.equal(s.income.linked, 2);
+  assert.equal(s.income.amount, 200); // 100 + 200×50% + 0 for the derived row
+  assert.equal(s.registered.total, 3);
+  assert.equal(s.registered.expected, 1);
+  assert.equal(s.registered.linked, 1);
+  assert.equal(s.registered.confirmed, 1);
+  assert.equal(s.registered.amount, 1300); // 300 + 1000; RESP contributes $0
+  assert.equal(s.deductions.total, 1);
+  assert.equal(s.deductions.linked, 1);
+  assert.equal(s.deductions.amount, 10138);
+  assert.equal(s.provincial.total, 2);
+  assert.equal(s.provincial.excluded, 1);
+  assert.equal(s.provincial.amount, 400); // the excluded credit never counts
   assert.deepEqual(sectionSummary([]).income, {
     key: 'income', label: 'Income', total: 0, expected: 0, linked: 0, confirmed: 0, excluded: 0, amount: 0,
   });
@@ -470,6 +542,146 @@ test('validTaxProfileInput: nulls are fine (not recorded); negatives, over-limit
   assert.match(validTaxProfileInput({ as_of_date: '31/10/2026' }), /as_of_date/);
   assert.match(validTaxProfileInput({ resp_beneficiary: 'x'.repeat(101) }), /resp_beneficiary/);
   assert.match(validTaxProfileInput({ notes: 'x'.repeat(1001) }), /notes/);
+});
+
+// ------------------------------------------------------------ T1 tables --
+// The 2026 federal + BC tables behind the refund headline must
+// not drift from the Earnings payroll module — the two table
+// sets feed the same calcSalary. 2025's blended 14.5% lowest
+// rate is pinned here too (never 15%).
+test('federal.js / bc.js 2026 tables match the Earnings payroll module', () => {
+  const f26 = federalTable(2026);
+  assert.deepEqual(f26.brackets, payroll.federal.brackets);
+  assert.equal(f26.bpaMax, payroll.federal.bpaMax);
+  assert.equal(f26.bpaBase, payroll.federal.bpaBase);
+  assert.equal(f26.phaseOutStart, payroll.federal.phaseOutStart);
+  assert.equal(f26.phaseOutEnd, payroll.federal.phaseOutEnd);
+  assert.equal(f26.lowestRate, payroll.federal.lowestRate);
+  assert.equal(f26.employmentAmountMax, payroll.federal.employmentAmountMax);
+  assert.deepEqual(f26.cpp, payroll.cpp);
+  assert.deepEqual(f26.ei, payroll.ei);
+  const b26 = bcTable(2026);
+  assert.deepEqual(b26.brackets, payroll.provinces.BC.brackets);
+  assert.equal(b26.bpa, payroll.provinces.BC.bpa);
+  assert.equal(b26.lowestRate, payroll.provinces.BC.lowestRate);
+  // 2025: the July 1 cut from 15% to 14% blends to 14.5% for
+  // the full year; the T4032 flag on payroll's $1,501 is
+  // confirmed by the 2026 employment-amount maximum.
+  assert.equal(federalTable(2025).lowestRate, 0.145);
+  assert.equal(federalTable(2025).employmentAmountMax, 1471);
+  assert.equal(federalTable(2026).employmentAmountMax, 1501);
+  assert.equal(federalTable(2024), null);
+  assert.equal(bcTable(2024), null);
+});
+
+// ------------------------------------------------------- T1 computation --
+// The user's real 2025 T1 (Shaofeng, pasted 2026-11-08): the
+// engine must reproduce it line-for-line from equivalent 2025
+// items, a T4 slip carrying the tax deducted, and his Meta-like
+// job for the CPP/EI split (capped at these income levels, so
+// the exact gross is immaterial — only that it clears YMPE/MIE).
+const t1Line = (lines, line) => lines.find((l) => l.line === line)?.amount;
+test('computeT1 reproduces his 2025 return: refund $16,615.42', () => {
+  const job2025 = jobRow({ tax_year: 2025, gross_amount: 29406.07 });
+  const items = [
+    { kind: 'employment', label: 'Meta — employment income', amount: 764557.72, share_pct: 100, status: 'linked', detail: {} },
+    { kind: 'investment_income', label: 'Interest', amount: 528.20, share_pct: 100, status: 'linked', detail: {} },
+    { kind: 'rental', label: '2985 Basement — rental income (T776)', amount: -3610.98, share_pct: 100, status: 'linked', detail: {} },
+    { kind: 'other_income', label: 'RRSP income', amount: 677.00, share_pct: 100, status: 'linked', detail: {} },
+    { kind: 'rrsp', label: 'RRSP contributions', amount: 33251.00, share_pct: 100, status: 'linked', detail: {} },
+  ];
+  const slips = [{ kind: 'T4', fields: { box22: 354009.41 } }];
+  const r = computeT1({ taxYear: 2025, province: 'BC', items, slips, jobs: [job2025] });
+  assert.equal(r.refund, 16615.42);
+  assert.equal(r.isRefund, true);
+  assert.equal(r.label, 'Refund');
+  assert.equal(r.displayAmount, 16615.42);
+  assert.equal(t1Line(r.lines, '10100'), 764557.72);
+  assert.equal(t1Line(r.lines, '12100'), 528.20);
+  assert.equal(t1Line(r.lines, '12600'), -3610.98);
+  assert.equal(t1Line(r.lines, '12900'), 677.00);
+  assert.equal(t1Line(r.lines, '15000'), 762151.94);
+  assert.equal(t1Line(r.lines, '20800'), 33251.00);
+  assert.equal(t1Line(r.lines, '22215'), 1074.00); // CPP enhancement: 1% × 67,800 + 4% × 9,900
+  assert.equal(t1Line(r.lines, '23600'), 727826.94);
+  assert.equal(t1Line(r.lines, '26000'), 727826.94);
+  assert.equal(t1Line(r.lines, '30000'), 14538); // phased-out BPA at this income
+  assert.equal(t1Line(r.lines, '30800'), 3356.10); // CPP base: 4.95% × (71,300 − 3,500)
+  assert.equal(t1Line(r.lines, '31200'), 1077.48); // EI: 1.64% × 65,700
+  assert.equal(t1Line(r.lines, '31260'), 1471);
+  assert.equal(t1Line(r.lines, '33500'), 20442.58);
+  assert.equal(t1Line(r.lines, '33800'), 2964.17); // 20,442.58 × 14.5%
+  assert.equal(t1Line(r.lines, '35000'), 2964.17);
+  assert.equal(t1Line(r.lines, '40600'), 211991.95);
+  assert.equal(t1Line(r.lines, '42000'), 211991.95);
+  assert.equal(t1Line(r.lines, '42800'), 125402.04);
+  assert.equal(t1Line(r.lines, '43500'), 337393.99);
+  assert.equal(t1Line(r.lines, '43700'), 354009.41);
+  assert.equal(t1Line(r.lines, '48200'), 354009.41);
+  assert.equal(t1Line(r.lines, '48400'), 16615.42);
+  // The gross-tax sub-lines (line null) carry the pre-credit figures.
+  const fedGross = r.lines.find((l) => l.line == null && /Federal tax on taxable income/.test(l.label));
+  assert.equal(fedGross.amount, 214956.12);
+  const bcGross = r.lines.find((l) => l.line == null && /British Columbia tax on taxable income/.test(l.label));
+  assert.equal(bcGross.amount, 126280.74);
+});
+
+test('computeT1: T4A pension income goes to 11500, other RRSP income to 12900', () => {
+  const r = computeT1({
+    taxYear: 2026, province: 'BC',
+    items: [
+      { kind: 'other_income', label: 'Pension', amount: 5000, share_pct: 100, status: 'linked', detail: {}, slipKind: 'T4A' },
+      { kind: 'other_income', label: 'RRSP income', amount: 677, share_pct: 100, status: 'linked', detail: {} },
+    ],
+    slips: [], jobs: [],
+  });
+  assert.equal(t1Line(r.lines, '11500'), 5000);
+  assert.equal(t1Line(r.lines, '12900'), 677);
+  assert.equal(t1Line(r.lines, '15000'), 5677);
+  assert.equal(r.refund, 0);
+});
+
+test('computeT1: unsupported province / year returns a flag, never a guessed number; empty filing refunds $0', () => {
+  const base = { taxYear: 2025, province: 'BC', items: [], slips: [], jobs: [] };
+  const on = computeT1({ ...base, province: 'ON' });
+  assert.equal(on.unsupportedProvince, true);
+  assert.equal(on.refund, undefined);
+  const y24 = computeT1({ ...base, taxYear: 2024 });
+  assert.equal(y24.unsupportedYear, true);
+  assert.equal(y24.refund, undefined);
+  const empty = computeT1({ taxYear: 2026, province: 'BC', items: [], slips: [], jobs: [] });
+  assert.equal(empty.refund, 0);
+  assert.equal(empty.isRefund, true);
+  assert.equal(t1Line(empty.lines, '15000'), 0);
+  assert.ok(empty.notes.some((n) => /No job or T4/.test(n)));
+});
+
+// ---------------------------------------------------------- history tax --
+// The History module filter's Tax option covers both tax write
+// streams — 'tax' (filings, items, slips) and 'tax-profile'
+// (the contribution-room profile) — as one module.
+test('listCommits: module=tax matches tax + tax-profile commits, nothing else', () => {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE app_commits (
+    id INTEGER PRIMARY KEY, user_id INTEGER, username TEXT, module TEXT NOT NULL,
+    entity_type TEXT NOT NULL, entity_id INTEGER, entity_label TEXT, project_id INTEGER,
+    strategy_id INTEGER, merge_record_id INTEGER, kind TEXT NOT NULL DEFAULT 'commit',
+    summary TEXT NOT NULL, event TEXT NOT NULL, snapshot TEXT NOT NULL, created_at TEXT NOT NULL
+  )`);
+  const now = new Date().toISOString();
+  const ins = db.prepare("INSERT INTO app_commits (module, entity_type, summary, event, snapshot, created_at) VALUES (?, ?, ?, '[]', '{}', ?)");
+  ins.run('tax', 'tax_filing', 'Created tax project', now);
+  ins.run('tax', 'tax_item', 'Added item', now);
+  ins.run('tax-profile', 'tax_profile', 'Saved contribution room', now);
+  ins.run('planning', 'project', 'Created project', now);
+  const tax = listCommits(db, { module: 'tax', limit: 10, offset: 0 });
+  assert.equal(tax.total, 3);
+  assert.deepEqual(tax.commits.map((c) => c.module).sort(), ['tax', 'tax', 'tax-profile']);
+  const planning = listCommits(db, { module: 'planning', limit: 10, offset: 0 });
+  assert.equal(planning.total, 1);
+  const all = listCommits(db, { module: null, limit: 10, offset: 0 });
+  assert.equal(all.total, 4);
+  db.close();
 });
 
 // --------------------------------------------- export + multi-project --

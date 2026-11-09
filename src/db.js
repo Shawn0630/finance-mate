@@ -892,7 +892,7 @@ CREATE TABLE IF NOT EXISTS app_commits (
   id INTEGER PRIMARY KEY,
   user_id INTEGER,
   username TEXT,
-  module TEXT NOT NULL,                -- planning | property | stocks | earnings | spending
+  module TEXT NOT NULL,                -- planning | property | stocks | earnings | spending | tax | tax-profile
   entity_type TEXT NOT NULL,
   entity_id INTEGER,
   entity_label TEXT,

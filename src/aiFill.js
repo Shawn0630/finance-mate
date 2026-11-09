@@ -572,6 +572,160 @@ export async function handleAiSlipFill(input, deps = {}) {
   };
 }
 
+// -------------------------------------------- tax item extraction
+// One-shot tax-item extraction for the item Add/Edit modal: the
+// model reads ONE document — a tax slip, an RRSP/RESP
+// contribution receipt, or a rental statement — and returns the
+// item it implies as JSON. Same hard rules as the slip fill:
+// extraction NEVER writes to the database — the modal shows the
+// candidate in its editable form and only Save writes; a value
+// the model cannot determine is OMITTED, never invented (an
+// empty candidate is a decline, not a guess). The slip kinds,
+// item kinds and T776 lines come from the region (deps), so a
+// future region plugs in without touching this function.
+const ITEM_SYSTEM_PROMPT = [
+  'You extract ONE tax item from a document.',
+  'Reply with ONLY a JSON object of the form {"kind": "employment", "label": "...", "amount": 0, "date": "2026-03-15", "slipKind": null, "fields": {}, "form": null, "lines": {}, "warnings": ["..."]} — no prose, no code fences.',
+  'kind must be one of the item kinds listed below; if the document is not a tax document, or its kind cannot be determined, reply {"kind": null, "label": null, "amount": null, "warnings": ["Not a recognised tax document."]}.',
+  'label is a short plain-text label for the item (employer, payer, account or property name plus what it is).',
+  'amount is the item amount as a plain number (no $, commas or % signs): for a slip, the income boxes only (see the slip rules); for an RRSP or RESP receipt, the contribution amount; for a rental statement, the NET rental income (gross rents minus deductible expenses).',
+  'date is the contribution or payment date as "YYYY-MM-DD" when the document shows one, otherwise null.',
+  'If the document is a recognised tax slip, set slipKind to its kind and fields to its box values (box keys listed for that kind; money values are plain numbers; names are plain text). The slip itself is stored with the item, so the boxes matter more than the amount.',
+  'If the document is a rental statement, set form to "T776" and lines to the T776 line values: gross_rents (line 8141), other_income (line 8230), and the numbered expense lines listed below. The net is computed from the lines, so report the lines, not just a total.',
+  'Omit every value you cannot determine from the source — never invent a value, never copy a value from another box or line, never estimate a room, a rate or a total.',
+  'warnings lists anything uncertain (a blurry figure, two possible years, a total that does not add up).',
+].join('\n');
+
+function buildItemMessages(itemKinds, slipKinds, t776Lines, section, text, fileInfo) {
+  const kinds = slipKinds.map((s) => {
+    const boxes = s.fields.map((f) => `${f.key} (${f.label}${f.money ? ', money' : ''})`).join('; ');
+    return `${s.kind} — ${s.label}. Boxes: ${boxes}.`;
+  }).join('\n');
+  const lines = (t776Lines || []).map((l) => `${l.line} (${l.label})`).join('; ');
+  const hint = section ? `The item belongs in the ${section} section of the return.` : '';
+  const content = [{ type: 'text', text: [hint, (text && text.trim()) || 'Extract the tax item from the attached document.'].filter(Boolean).join('\n') }];
+  if (fileInfo) {
+    if (fileInfo.type.startsWith('image/')) {
+      content.push({ type: 'image_url', image_url: { url: `data:${fileInfo.type};base64,${fileInfo.data}` } });
+    } else if (fileInfo.text != null) {
+      content.push({ type: 'text', text: textFileBlock(fileInfo) });
+    } else if (fileInfo.type === 'application/pdf') {
+      const extracted = extractPdfText(fileInfo.bytes);
+      content.push({
+        type: 'text',
+        text: extracted ? `Document text:\n${extracted.slice(0, 20000)}` : 'A PDF was attached, but no text could be extracted from it.',
+      });
+    }
+  }
+  return [
+    { role: 'system', content: `${ITEM_SYSTEM_PROMPT}\n\nItem kinds: ${itemKinds.join(', ')}.\n\nSlip kinds:\n${kinds}\n\nT776 expense lines: ${lines}.` },
+    { role: 'user', content },
+  ];
+}
+
+function normalizeT776ItemLines(t776Lines, rawLines) {
+  if (!rawLines || typeof rawLines !== 'object' || Array.isArray(rawLines)) return { lines: {}, dropped: [] };
+  const known = new Set(['gross_rents', 'other_income', ...((t776Lines || []).map((l) => l.line))]);
+  const lines = {};
+  const dropped = [];
+  for (const [k, v] of Object.entries(rawLines)) {
+    if (!known.has(k)) { dropped.push(k); continue; }
+    if (v == null || v === '') continue;
+    const n = Number(String(v).replace(/[$,\s]/g, ''));
+    if (!isFinite(n) || n < 0) { dropped.push(k); continue; }
+    lines[k] = Math.round(n * 100) / 100;
+  }
+  return { lines, dropped };
+}
+
+export async function handleAiItemFill(input, deps = {}) {
+  const env = deps.env || process.env;
+  const call = deps.callLlm || callLlm;
+  const slipKinds = deps.slipKinds || [];
+  const itemKinds = deps.itemKinds || [];
+  const t776Lines = deps.t776Lines || [];
+  if (!itemKinds.length) {
+    return { status: 400, body: { error: 'No item kinds are configured for this region.' } };
+  }
+  if (!llmConfigured(env)) {
+    return {
+      status: 503,
+      body: { error: 'The server has no LLM configured. Set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL in the server .env file, then restart the server.' },
+    };
+  }
+  const models = llmModels(env);
+  let model = null;
+  if (input && input.model != null && String(input.model).trim() !== '') {
+    model = String(input.model).trim();
+    if (!models.includes(model)) {
+      return { status: 400, body: { error: `model "${model}" is not in the configured model list` } };
+    }
+  } else if (deps.model && models.includes(deps.model)) {
+    model = deps.model;
+  } else {
+    model = llmDefaultModel(env);
+  }
+  let fileInfo = null;
+  if (input && input.file != null) {
+    fileInfo = validateFile(input.file);
+    if (fileInfo.error) return { status: fileInfo.status, body: { error: fileInfo.error } };
+  }
+  const hasText = input && typeof input.text === 'string' && input.text.trim().length > 0;
+  if (!hasText && !fileInfo) {
+    return { status: 400, body: { error: 'Provide text or a file to extract from.' } };
+  }
+  let rawText;
+  try {
+    rawText = await call(
+      buildItemMessages(itemKinds, slipKinds, t776Lines, input.section || null, hasText ? input.text : '', fileInfo),
+      env, model,
+    );
+  } catch {
+    return { status: 502, body: { error: 'The AI service could not complete the extraction.' } };
+  }
+  const parsed = parseModelJson(rawText);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { status: 502, body: { error: 'The AI response could not be read as a tax item.' } };
+  }
+  const warnings = Array.isArray(parsed.warnings) ? parsed.warnings.filter((w) => typeof w === 'string').slice(0, 5) : [];
+  const kind = typeof parsed.kind === 'string' ? parsed.kind.trim() : null;
+  if (!kind || !itemKinds.includes(kind)) {
+    return { status: 200, body: { kind: null, label: null, amount: null, warnings: warnings.length ? warnings : ['Not a recognised tax document.'] } };
+  }
+  const label = typeof parsed.label === 'string' && parsed.label.trim()
+    ? parsed.label.trim().slice(0, 200) : null;
+  const amount = parsed.amount != null && isFinite(Number(parsed.amount)) ? Math.round(Number(parsed.amount) * 100) / 100 : null;
+  const date = typeof parsed.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date.trim()) ? parsed.date.trim() : null;
+  let slipKind = null;
+  let fields = {};
+  if (typeof parsed.slipKind === 'string' && parsed.slipKind.trim()) {
+    const sk = parsed.slipKind.trim().toUpperCase();
+    if (slipKinds.some((s) => s.kind === sk)) {
+      slipKind = sk;
+      const norm = normalizeSlipFields(slipKinds, sk, parsed.fields);
+      fields = norm.fields;
+      if (norm.dropped.length) warnings.push(`Could not read: ${norm.dropped.join(', ')}.`);
+    } else {
+      warnings.push(`Unknown slip kind "${parsed.slipKind}" — ignored.`);
+    }
+  }
+  let form = null;
+  let lines = {};
+  if (parsed.form === 'T776') {
+    form = 'T776';
+    const norm = normalizeT776ItemLines(t776Lines, parsed.lines);
+    lines = norm.lines;
+    if (norm.dropped.length) warnings.push(`Could not read T776 lines: ${norm.dropped.join(', ')}.`);
+  }
+  if (amount == null && !slipKind && form !== 'T776' && !Object.keys(lines).length) {
+    warnings.push('No amount could be read from this document.');
+  }
+  return {
+    status: 200,
+    body: { kind, label, amount, date, slipKind, fields, form, lines, warnings, model },
+  };
+}
+
 // ------------------------------------------- tax profile (NOA) extraction
 // One-shot contribution-room extraction for the Tax Profile: the
 // model reads a CRA Notice of Assessment (or a My Account room

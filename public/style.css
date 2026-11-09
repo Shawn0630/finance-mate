@@ -33,6 +33,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px; }
 .summary-card .k { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
 .summary-card .v { font-size: 22px; font-weight: 650; margin-top: 4px; }
 .summary-card .v.negative { color: #b3261e; }
+.summary-card .v.positive { color: #14632f; }
 .note { color: #71808f; font-size: 12px; margin: 6px 2px 16px; }
 h2 { font-size: 16px; margin: 22px 0 10px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
@@ -135,6 +136,14 @@ th { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing:
 .spend-tx-catpanel label input[type="checkbox"] { width: auto; flex: none; margin: 0; padding: 0; }
 .spend-tx-controls .toolbar { margin: 0; }
 td.num, th.num { text-align: right; }
+/* Table-cell notes carry no margin — the cell padding is the
+   spacing (used by Tax item notes and anywhere a .note sits
+   inside a table). Action columns never wrap their buttons. */
+td .note { margin: 0; }
+td.actions { white-space: nowrap; }
+/* Sub-lines inside a breakdown table (e.g. the T1 popup's
+   intermediate lines) render dimmed like a note. */
+tr.sub td { color: #71808f; font-size: 12px; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
 .toolbar .spacer { flex: 1; }
 .range-btns { position: relative; }
@@ -284,6 +293,22 @@ td.num, th.num { text-align: right; }
 #spendCardDetail .section-head { padding: 16px 17px; flex-wrap: wrap; }
 #spendCardDetail .section-head h2 { margin-top: 0; }
 #spendBackBtn { flex-basis: 100%; }
+/* Tax home + project detail heads: the same standard as
+   Properties/Stocks/Spending — inset to the panels' content
+   edges (1px border + 16px padding) with 16px of air above
+   and below. The detail head wraps so the Back link takes its
+   own line above, exactly like the Spending card detail. */
+#taxHome >.section-head { padding: 16px 17px; }
+#taxHome >.section-head h2 { margin-top: 0; }
+#taxDetail >.section-head { padding: 16px 17px; flex-wrap: wrap; }
+#taxDetail >.section-head h2 { margin-top: 0; }
+#taxBackLink { flex-basis: 100%; }
+/* Refund headline host: one standard block gap under it, the
+   same rhythm the .panel margin-bottom gives the rows below. */
+#taxRefundHeadline { margin-bottom: 14px; }
+/* RRSP estimator result: the same block gap under it, before
+   the room doughnut below. */
+#taxRrspResult { margin-bottom: 14px; }
 /* Card-detail balance line: the owed figure is bold and enlarged
    against the small muted line; the as-of stays small. */
 .spend-balance-figure { font-size: 18px; font-weight: 700; color: #1c2733; }

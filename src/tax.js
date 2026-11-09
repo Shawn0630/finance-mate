@@ -10,6 +10,11 @@
 //     slips, and on-demand Generate. Nothing generates
 //     automatically — Generate runs only when the user presses
 //     it on a project (generated_at records when);
+//     (2026-11-08, superseded: Generate was REMOVED entirely.
+//     Projects start empty; the user adds items manually via an
+//     Add action, picking from the region's expected-items
+//     derivation as a CANDIDATE list. Nothing generates on page
+//     load, year change, or in the background, ever.)
 //   - an item belongs to one filing, or to no filing (UNLINKED);
 //   - an item's effective amount is amount × sharePct / 100 —
 //     the split between filers is a per-item share, editable,
@@ -32,18 +37,40 @@ import { calcSalary, PAY_FREQUENCIES, calcRentalYear, deriveRentalYearFigures } 
 import { planPeriodAmounts, planJobPerPeriodGross, payDatesFrom } from './plans.js';
 
 export const TAX_ITEM_KINDS = [
-  'employment', 'rental', 'rrsp', 'investment_income',
-  'capital_gain', 'other_income', 'deduction', 'credit',
+  'employment', 'rental', 'rrsp', 'resp', 'prpp', 'rpp', 'hbp',
+  'investment_income', 'capital_gain', 'other_income',
+  'deduction', 'disability', 'student', 'credit',
 ];
 export const TAX_ITEM_STATUSES = ['expected', 'linked', 'confirmed', 'excluded'];
 export const TAX_FILING_STATUSES = ['open', 'filed'];
 
-// Guided-return sections (TurboTax-style checklist). Review
-// has no kinds — it summarises the other three.
+// Guided-return sections (TurboTax-style checklist, user
+// 2026-11-08 16:19 — supersedes the Income / Deductions /
+// Credits split). Review and Finish and file are summaries,
+// not kind buckets: Review totals the four sections, Finish
+// and file is a completeness/readiness summary, never a filing
+// calculation (v1 has no T1 math). The sub-labels name what
+// each section holds, as on the TurboTax checklist.
+//   - Income: T4 employment, T5 investment, T4RSP RRSP income,
+//     rental properties (the T776's deductible expenses ride
+//     along as a DERIVED row under their rental item — the
+//     rental amount is already net, so the row never adds to
+//     the section total).
+//   - Registered savings plans: RRSP / PRPP / RPP / HBP
+//     contributions — and RESP contributions (a registered plan;
+//     tracked, non-deductible, $0 in every total).
+//   - Deductions: disability amount, students, other manual
+//     deductions. (The disability amount is technically a
+//     non-refundable credit, not a deduction — it sits here
+//     because the user placed it here.)
+//   - Provincial: provincial tax credits (BC). There is no
+//     separate federal-credits section in this split, so every
+//     'credit' item renders here.
 export const TAX_SECTIONS = [
-  { key: 'income', label: 'Income', kinds: ['employment', 'rental', 'investment_income', 'capital_gain', 'other_income'] },
-  { key: 'deductions', label: 'Deductions', kinds: ['rrsp', 'deduction'] },
-  { key: 'credits', label: 'Credits', kinds: ['credit'] },
+  { key: 'income', label: 'Income', sub: 'T4 Employment income · T5 Investment income · T4RSP Income from an RRSP · Rental properties', kinds: ['employment', 'rental', 'investment_income', 'capital_gain', 'other_income'] },
+  { key: 'registered', label: 'Registered savings plans', sub: 'RRSP contributions · PRPP contributions · Registered pension plan (RPP) · Home buyers plan (HBP)', kinds: ['rrsp', 'resp', 'prpp', 'rpp', 'hbp'] },
+  { key: 'deductions', label: 'Deductions', sub: 'Disability amount · Students', kinds: ['deduction', 'disability', 'student'] },
+  { key: 'provincial', label: 'Provincial', sub: 'Provincial tax credits (BC)', kinds: ['credit'] },
 ];
 export function sectionForKind(kind) {
   for (const s of TAX_SECTIONS) if (s.kinds.includes(kind)) return s.key;
@@ -52,11 +79,18 @@ export function sectionForKind(kind) {
 // Per-section checklist state: how many items are still
 // 'expected' (derived, not yet reviewed — the work left in the
 // section), how many are linked/confirmed, and the section's
-// effective total (excluded items never count).
+// effective total (excluded items never count; a derived
+// rental-deduction row never adds to any total — its rental item
+// already carries the net). The derived rental-deduction row
+// renders in Income, under its rental item, so it counts in
+// Income's row counts but in no section's amount.
 export function sectionSummary(items) {
   const out = {};
+  const derived = (items || []).filter((i) => i.detail && i.detail.derived);
+  const regular = (items || []).filter((i) => !(i.detail && i.detail.derived));
   for (const s of TAX_SECTIONS) {
-    const rows = (items || []).filter((i) => s.kinds.includes(i.kind));
+    let rows = regular.filter((i) => s.kinds.includes(i.kind));
+    if (s.key === 'income') rows = rows.concat(derived);
     const counted = rows.filter((i) => i.status !== 'excluded');
     out[s.key] = {
       key: s.key, label: s.label,
@@ -197,11 +231,48 @@ export function filingTotals(items) {
   let total = 0;
   for (const it of items || []) {
     if (it.status === 'excluded') continue;
+    // A derived row (the rental deduction) is a display of
+    // numbers already netted in its source item — it contributes
+    // $0 to every total, in every section and in Review.
+    if (it.detail && it.detail.derived) continue;
+    // RESP contributions are NOT tax-deductible in Canada (CRA,
+    // verified 2026-11-08): an RESP item is tracked, never counted
+    // in any deduction total — it contributes $0 here, in every
+    // section total and in Review. The row still shows its own
+    // amount; only the totals skip it.
+    if (it.kind === 'resp') continue;
     const eff = effectiveAmount(it);
     byKind[it.kind] = round2((byKind[it.kind] || 0) + eff);
     total = round2(total + eff);
   }
   return { byKind, total };
+}
+
+// A rental item's deductible expenses and net, from its detail:
+// a manual T776 item carries its lines (the expense lines sum
+// to the deductible; gross − expenses is the net); a
+// source-backed item carries the rental calc's deductible and
+// net directly. The server stores deductible + net in the detail
+// at write time for manual items, so this is a read, not a
+// recomputation — the fallback only covers older rows.
+export function rentalDeductible(item) {
+  const d = (item && item.detail) || {};
+  if (isFinite(Number(d.deductible))) return round2(Number(d.deductible));
+  if (d.lines && typeof d.lines === 'object') {
+    let s = 0;
+    for (const [k, v] of Object.entries(d.lines)) {
+      if (k === 'gross_rents' || k === 'other_income') continue;
+      s += Number(v) || 0;
+    }
+    return round2(s);
+  }
+  return 0;
+}
+export function rentalNet(item) {
+  const d = (item && item.detail) || {};
+  if (isFinite(Number(d.net))) return round2(Number(d.net));
+  const gross = isFinite(Number(d.gross)) ? Number(d.gross) : 0;
+  return round2(gross - rentalDeductible(item));
 }
 
 // ------------------------------------------------------------ validation --
@@ -283,7 +354,7 @@ export function validTaxProfileInput(b) {
 // ({ owner, frequency, gross_amount, gross_basis }); dividendRows
 // and sellRows are invest_events rows joined with their holding
 // ({ label, currency }) and account ({ name, type, owners }).
-export function buildExpectedContext({ taxYear, jobRows, rentalRows, planRows, dividendRows, sellRows, payroll }) {
+export function buildExpectedContext({ taxYear, jobRows, rentalRows, planRows, dividendRows, sellRows, payroll, rrspWindow, t776Lines }) {
   const jobs = (jobRows || [])
     .filter((j) => Number(j.tax_year) === Number(taxYear))
     .map((j) => {
@@ -301,17 +372,31 @@ export function buildExpectedContext({ taxYear, jobRows, rentalRows, planRows, d
     const yearRow = (r.years || []).find((y) => Number(y.tax_year) === Number(taxYear));
     if (!yearRow || !yearRow.calc) continue;
     const c = yearRow.calc;
+    // The T776 view of the year: the manual lines by T776 line
+    // number (labels from the region's rental module, passed in
+    // through ctx so this file never imports region code), and
+    // the rental calc's deductible expense table (derived
+    // property costs + manual rows + mortgage interest).
+    const lines = (t776Lines || []).map((l) => ({
+      line: l.line, label: l.label,
+      amount: round2(Number((c.expensesByLine || {})[l.line]) || 0),
+    }));
+    const expenseRows = (c.expenseTable && c.expenseTable.rows) || [];
     rentals.push({
       id: r.id, label: r.label,
-      gross: c.grossWhole, deductible: c.deductibleExpenses,
+      gross: c.grossWhole,
+      grossRents: round2((c.grossWhole || 0) - (c.otherIncome || 0)),
+      otherIncome: c.otherIncome || 0,
+      deductible: c.deductibleExpenses,
       net: c.netWhole9946,
       ownerUsernames: parseOwners(r.propertyOwners),
+      lines, expenseRows,
     });
   }
   const plans = [];
   for (const p of planRows || []) {
     if (p.accountType !== 'RRSP') continue; // TFSA buys are not a deduction
-    const ownAnnual = planOwnAnnual(p);
+    const ownAnnual = planOwnAnnual(p, rrspWindow);
     if (!(ownAnnual > 0)) continue;
     plans.push({
       id: p.id,
@@ -344,73 +429,32 @@ export function buildExpectedContext({ taxYear, jobRows, rentalRows, planRows, d
 // One plan's OWN contributions for a tax year: generated buy
 // events are the ground truth ('actual'); with none yet, the
 // year's due periods × the current per-period own amount
-// ('projected' — the plan may not have generated yet).
-export function planOwnAnnual(plan) {
+// ('projected' — the plan may not have generated yet). The year
+// is the RRSP CONTRIBUTION WINDOW, not the calendar year: for
+// tax year Y, contributions from March 1 of Y through the first
+// 60 days of Y+1 (the region's rrspWindow — CRA rule). Pass no
+// window and the calendar year is used (the old behaviour,
+// kept for callers without a region).
+export function planOwnAnnual(plan, window) {
   const year = Number(plan.taxYear);
+  const start = window ? window.start : `${year}-01-01`;
+  const end = window ? window.end : `${year}-12-31`;
   const events = plan.events || [];
   const actual = events
-    .filter((e) => e.type === 'buy' && Number(String(e.date).slice(0, 4)) === year)
+    .filter((e) => e.type === 'buy' && String(e.date) >= start && String(e.date) <= end)
     .reduce((s, e) => s + (Number(e.own_amount) || 0), 0);
   if (actual > 0) { plan._basis = 'actual'; return round2(actual); }
   const perPeriodGross = planJobPerPeriodGross(plan.job || {});
   const amounts = planPeriodAmounts(plan, perPeriodGross);
   if (!(amounts.own > 0)) return 0;
-  const start = plan.start_date;
-  if (!start || start > `${year}-12-31`) return 0;
-  const due = payDatesFrom(plan.jobFrequency || (plan.job && plan.job.frequency), start, `${year}-12-31`)
-    .filter((d) => d >= `${year}-01-01` && d <= `${year}-12-31`
-      && d >= start && !(plan.deletedDueDates || []).includes(d));
+  const planStart = plan.start_date;
+  if (!planStart || planStart > end) return 0;
+  const due = payDatesFrom(plan.jobFrequency || (plan.job && plan.job.frequency), planStart, end)
+    .filter((d) => d >= start && d <= end
+      && d >= planStart && !(plan.deletedDueDates || []).includes(d));
   if (!due.length) return 0;
   plan._basis = 'projected';
   return round2(amounts.own * due.length);
-}
-
-// ------------------------------------------------------------- generate --
-// Upsert one filing's (or the unlinked bucket's, filingId null)
-// expected items from the region's derived list. Only
-// 'expected' items are refreshed or pruned; user-owned
-// ('linked'/'confirmed'/'excluded') items are never touched.
-// Returns { added, updated, removed }.
-export function upsertExpectedItems(db, { filingId, taxYear, derived }) {
-  const now = new Date().toISOString();
-  const existing = db.prepare(
-    'SELECT * FROM tax_items WHERE filing_id IS ? AND tax_year = ? AND source_type IS NOT NULL ORDER BY id',
-  ).all(filingId, taxYear);
-  const byKey = new Map(existing.map((r) => [`${r.source_type}:${r.source_id}`, r]));
-  const seen = new Set();
-  let added = 0;
-  let updated = 0;
-  for (const d of derived || []) {
-    const key = `${d.sourceType}:${d.sourceId}`;
-    seen.add(key);
-    const row = byKey.get(key);
-    if (!row) {
-      db.prepare(`INSERT INTO tax_items
-        (filing_id, tax_year, kind, label, source_type, source_id, slip_id, amount, currency, share_pct, status, detail, notes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'expected', ?, NULL, ?, ?)`)
-        .run(filingId, taxYear, d.kind, d.label, d.sourceType, d.sourceId,
-          d.amount, d.currency || 'CAD', d.sharePct == null ? 100 : d.sharePct,
-          JSON.stringify(d.detail || {}), now, now);
-      added += 1;
-    } else if (row.status === 'expected') {
-      const detail = JSON.stringify(d.detail || {});
-      const ch = db.prepare(`UPDATE tax_items SET kind = ?, label = ?, amount = ?, currency = ?,
-        share_pct = ?, detail = ?, updated_at = ? WHERE id = ? AND
-        (kind != ? OR label != ? OR amount != ? OR currency != ? OR share_pct != ? OR detail != ?)`)
-        .run(d.kind, d.label, d.amount, d.currency || 'CAD', d.sharePct == null ? 100 : d.sharePct,
-          detail, now, row.id, d.kind, d.label, d.amount, d.currency || 'CAD',
-          d.sharePct == null ? 100 : d.sharePct, detail);
-      if (ch.changes) updated += 1;
-    }
-  }
-  let removed = 0;
-  for (const row of existing) {
-    if (row.status !== 'expected') continue;
-    if (seen.has(`${row.source_type}:${row.source_id}`)) continue;
-    db.prepare('DELETE FROM tax_items WHERE id = ?').run(row.id);
-    removed += 1;
-  }
-  return { added, updated, removed };
 }
 
 // Re-exported for the server's rental read path reuse in tests.
