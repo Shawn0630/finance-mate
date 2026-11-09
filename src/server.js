@@ -3200,6 +3200,7 @@ app.post('/api/investments/accounts/:id/plans', requireApiAuth, (req, res) => {
     module: 'stocks', entityType: 'account', entityId: account.id,
     entityLabel: account.name, summary: `Added contribution plan · ${account.name}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     const ts = nowIso();
     const info = db.prepare(
       'INSERT INTO invest_plans (account_id, job_id, target_holding_id, start_date, own_amount, employer_amount, own_pct, employer_pct, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -3225,6 +3226,7 @@ app.put('/api/investments/plans/:id', requireApiAuth, (req, res) => {
     module: 'stocks', entityType: 'account', entityId: account.id,
     entityLabel: account.name, summary: `Updated contribution plan · ${account.name}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare('UPDATE invest_plans SET job_id = ?, target_holding_id = ?, start_date = ?, own_amount = ?, employer_amount = ?, own_pct = ?, employer_pct = ?, updated_at = ? WHERE id = ?')
       .run(v.jobId, v.holdingId, v.startDate, v.ownAmount, v.employerAmount, v.ownPct, v.employerPct, nowIso(), plan.id);
     const updated = getPlan(db, plan.id);
@@ -3242,6 +3244,7 @@ app.delete('/api/investments/plans/:id', requireApiAuth, (req, res) => {
     module: 'stocks', entityType: 'account', entityId: account.id,
     entityLabel: account ? account.name : null, summary: `Deleted contribution plan · ${account ? account.name : ''}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     // Generated buys stay as ordinary history (their plan link
     // clears); only the plan and its tombstones go.
     db.prepare('UPDATE invest_events SET plan_id = NULL WHERE plan_id = ?').run(plan.id);
@@ -3864,6 +3867,7 @@ app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
       module: 'earnings', entityType: 'job', entityId: null,
       entityLabel: v.employer, summary: `Added job ${v.employer}`,
     }, () => {
+      dropSystemHomeInsights(req.user.id);
       const id = db.transaction(() => {
         const info = db.prepare(
           `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
@@ -3884,6 +3888,7 @@ app.post('/api/earnings/jobs', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'job', entityId: null,
     entityLabel: v.employer, summary: `Added job ${v.employer}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     const info = db.prepare(
       `INSERT INTO earn_jobs (employer, owner, currency, province, frequency, gross_amount, gross_basis, tax_year,
        td1_federal, td1_provincial, ytd_cpp, ytd_cpp2, ytd_ei, cpp_exempt, ei_exempt, created_at, updated_at)
@@ -3954,6 +3959,7 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
       module: 'earnings', entityType: 'job', entityId: id,
       entityLabel: v.employer, summary: `Updated job ${v.employer}`,
     }, () => {
+      dropSystemHomeInsights(req.user.id);
       db.transaction(() => {
         db.prepare(
           `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
@@ -3973,6 +3979,7 @@ app.put('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'job', entityId: id,
     entityLabel: v.employer, summary: `Updated job ${v.employer}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare(
       `UPDATE earn_jobs SET employer = ?, owner = ?, currency = ?, province = ?, frequency = ?, gross_amount = ?, gross_basis = ?,
        tax_year = ?, td1_federal = ?, td1_provincial = ?, ytd_cpp = ?, ytd_cpp2 = ?, ytd_ei = ?,
@@ -3999,6 +4006,7 @@ app.delete('/api/earnings/jobs/:id', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'job', entityId: id,
     entityLabel: job.employer, summary: `Deleted job ${job.employer}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare('DELETE FROM earn_jobs WHERE id = ?').run(id);
     return { value: { ok: true }, entityId: id };
   });
@@ -6293,12 +6301,14 @@ const readHomeInsights = (userId) => {
 };
 
 // Home insight cards are stored snapshots: the system set only
-// regenerates when >7 days stale (GET /api/home). A rental or rent
-// entry change makes those snapshots wrong immediately, so the
-// write drops the system rows — the next Home load regenerates
-// them from live data instead of waiting out the 7 days (user
-// 2026-11-08: the system Rental income card showed $1,700 while
-// the freshly-appended AI card showed the right $7,260).
+// regenerates when >7 days stale (GET /api/home). A rental, rent
+// entry, salary job, or contribution plan change makes those
+// snapshots wrong immediately, so the write drops the system rows —
+// the next Home load regenerates them from live data instead of
+// waiting out the 7 days (user 2026-11-08: the system Rental
+// income card showed $1,700 while the freshly-appended AI card
+// showed the right $7,260; user 2026-11-09: the same for Salary
+// take-home after a job change).
 function dropSystemHomeInsights(userId) {
   db.prepare('DELETE FROM home_insights WHERE user_id = ? AND kind = ?').run(userId, 'system');
 }
@@ -6347,6 +6357,52 @@ function refreshRentalAiInsights(userId, insights, data) {
   return changed ? out : insights;
 }
 
+// Salary-dependent AI cards are stored snapshots too and never
+// auto-refresh, so one goes stale when its job's pay or a linked
+// plan changes (and outlives its job when the job is deleted).
+// Recompute those from the live data on every Home load — pure
+// computation on data already collected — and keep the model's
+// title/section. System cards are handled by the staleness
+// regeneration above. (User 2026-11-09, approved "一起给改上":
+// the same treatment the rental cards got in c3bd73f.)
+const SALARY_AI_METRICS = new Set(['earning_salary', 'earning_total']);
+function refreshSalaryAiInsights(userId, insights, data) {
+  const now = new Date().toISOString();
+  let changed = false;
+  const out = [];
+  for (const row of insights) {
+    if (row.kind !== 'ai') { out.push(row); continue; }
+    const colon = String(row.metric).indexOf(':');
+    const base = colon === -1 ? String(row.metric) : String(row.metric).slice(0, colon);
+    if (!SALARY_AI_METRICS.has(row.metric) && base !== 'job_takehome' && base !== 'job_takehome_period') { out.push(row); continue; }
+    const computed = resolveHomeMetric(row.metric, data);
+    if (!computed || computed.error) {
+      // The job itself is gone — the card can never compute
+      // again, so drop it. A job that merely has no pay history
+      // yet keeps its card (dates can be filled in later).
+      if ((base === 'job_takehome' || base === 'job_takehome_period') && computed && computed.error
+        && !db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(Number(row.metric.slice(colon + 1)))) {
+        db.prepare('DELETE FROM home_insights WHERE id = ?').run(row.id);
+        changed = true;
+        continue;
+      }
+      out.push(row);
+      continue;
+    }
+    const fresh = { ...computed, title: row.title, section: row.section };
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy]);
+    if (sig(fresh) !== sig(row)) {
+      db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(fresh), now, now, row.id);
+      changed = true;
+      out.push({ ...row, ...fresh, generated_at: now });
+    } else {
+      out.push(row);
+    }
+  }
+  return changed ? out : insights;
+}
+
 // Recompute the standard set only; AI cards are untouched.
 function generateStandardInsights(userId, data) {
   const cards = buildStandardInsights(data);
@@ -6374,6 +6430,9 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   // Rental-dependent AI cards refresh from live data (see
   // refreshRentalAiInsights): an entry edit must move them at once.
   insights = refreshRentalAiInsights(userId, insights, data);
+  // Salary-dependent AI cards refresh from live data (see
+  // refreshSalaryAiInsights): a pay or plan edit must move them at once.
+  insights = refreshSalaryAiInsights(userId, insights, data);
   // Report mode shows a property card's house photo: attach the
   // first gallery photo (or the legacy photo_url) to property-entity
   // cards. No photo → photo: null, and the card renders no

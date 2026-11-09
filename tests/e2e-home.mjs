@@ -1926,6 +1926,183 @@ export async function run(H, S) {
       && !homeClean.insights.some((c) => c.kind === 'ai'),
       JSON.stringify(homeClean.insights.filter((c) => c.metric === 'earning_rental' || c.kind === 'ai')));
 
+    // Salary take-home card goes stale (user 2026-11-09, approved
+    // "一起给改上"): same bug class as the rental card — a job pay
+    // edit or a contribution-plan edit never invalidated the stored
+    // system cards, so Salary take-home and Total income kept
+    // showing the generation-time values. Oracle: the job's
+    // monthly-chart series prices the current pay, so the Oct 2026
+    // displayed salary is net[Oct] minus the Oct benefit paydays ×
+    // the job row's per-period benefit (the plan starts Nov 6, so
+    // October has no benefit paydays until a plan edit moves its
+    // start into October).
+    const expectedOctSalary = async (jid) => {
+      const mc = (await H.req('GET', `/api/earnings/jobs/${jid}/monthly-chart`)).data;
+      const jobs = (await H.req('GET', '/api/earnings')).data;
+      const j = (jobs.jobs || []).find((x) => x.id === jid);
+      const ben = j && j.taxBenefit ? j.taxBenefit.perPeriod : 0;
+      const i = mc.months.indexOf('2026-10');
+      const nPays = (mc.taxBenefitPays || []).filter((p) => String(p.date).slice(0, 7) === '2026-10').length;
+      return Math.round((mc.net[i] - nPays * ben) * 100) / 100;
+    };
+    const money0 = (n) => n.toLocaleString('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+    const homeSal = async () => (await H.req('GET', '/api/home')).data;
+    const sysCard = (home, metric) => home.insights.find((c) => c.metric === metric && c.kind === 'system');
+    const aiCard = (home, metric) => home.insights.find((c) => c.metric === metric && c.kind === 'ai');
+    const homeS0 = await homeSal();
+    H.check('home salary stale: baseline Oct salary is the fixture 2 × cashNet, total = salary + $2,000 rent',
+      sysCard(homeS0, 'earning_salary') && sysCard(homeS0, 'earning_salary').value === octSalary
+      && sysCard(homeS0, 'earning_total') && sysCard(homeS0, 'earning_total').value === octSalary + 2000,
+      JSON.stringify({ salary: sysCard(homeS0, 'earning_salary'), total: sysCard(homeS0, 'earning_total') }));
+    // Per-job AI cards: monthly take-home (the Oct salary for this
+    // job) and per-period take-home (the latest payday's displayed
+    // cash — the Nov 6 payday, same figure as the highlight).
+    r = await H.req('POST', '/api/home/insights/ai-apply', { metric: `job_takehome:${jobId}`, section: 'earning', title: 'Acme take-home' });
+    const jobTakehomeAiId = r.data && r.data.insight ? r.data.insight.id : null;
+    H.check('home salary stale: per-job AI card appends at the Oct salary',
+      r.status === 201 && r.data.insight && r.data.insight.value === octSalary, JSON.stringify(r.data));
+    r = await H.req('POST', '/api/home/insights/ai-apply', { metric: `job_takehome_period:${jobId}`, section: 'earning', title: 'Acme per-period take-home' });
+    const jobPeriodAiId = r.data && r.data.insight ? r.data.insight.id : null;
+    H.check('home salary stale: per-period AI card appends at the displayed per-payday cash',
+      r.status === 201 && r.data.insight && r.data.insight.value === displayedCash, JSON.stringify(r.data));
+    // Bare job edit (the edit form sends only the recent value):
+    // $3,000 → $3,500 per period. The monthly series prices the
+    // current pay, so the Oct cards must move at once — no manual
+    // Re-generate, no waiting out the 7 days.
+    r = await H.req('PUT', `/api/earnings/jobs/${jobId}`, { employer: 'Acme Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-02', recent_pay_date: '2026-10-23', recent_pay_value: 3500 });
+    H.check('home salary stale: pay edit succeeds', r.status === 200, JSON.stringify(r.data));
+    const expPay = await expectedOctSalary(jobId);
+    const homeS1 = await homeSal();
+    H.check('home salary stale: system + per-job AI salary cards and Total income follow the pay edit at once',
+      sysCard(homeS1, 'earning_salary') && sysCard(homeS1, 'earning_salary').value === expPay && expPay !== octSalary
+      && aiCard(homeS1, `job_takehome:${jobId}`) && aiCard(homeS1, `job_takehome:${jobId}`).value === expPay
+      && sysCard(homeS1, 'earning_total') && sysCard(homeS1, 'earning_total').value === expPay + 2000,
+      JSON.stringify({ salary: sysCard(homeS1, 'earning_salary'), ai: aiCard(homeS1, `job_takehome:${jobId}`), total: sysCard(homeS1, 'earning_total'), expPay }));
+    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
+    await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    const sysSalUi = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="earning"] .insight-card')]
+        .filter((c) => c.textContent.includes('Salary take-home') && !c.querySelector('.home-ai-tag'));
+      return cards.length === 1 ? cards[0].querySelector('.insight-value').textContent : null;
+    });
+    H.check('home salary stale UI: system Salary take-home card shows the new Oct figure',
+      sysSalUi === money0(expPay), JSON.stringify(sysSalUi));
+    r = await H.req('PUT', `/api/earnings/jobs/${jobId}`, { employer: 'Acme Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-02', recent_pay_date: '2026-10-23', recent_pay_value: 3000 });
+    H.check('home salary stale: restoring the pay succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeS2 = await homeSal();
+    H.check('home salary stale: restoring the pay moves the cards back to the fixture values',
+      sysCard(homeS2, 'earning_salary') && sysCard(homeS2, 'earning_salary').value === octSalary
+      && aiCard(homeS2, `job_takehome:${jobId}`) && aiCard(homeS2, `job_takehome:${jobId}`).value === octSalary
+      && sysCard(homeS2, 'earning_total') && sysCard(homeS2, 'earning_total').value === octSalary + 2000,
+      JSON.stringify({ salary: sysCard(homeS2, 'earning_salary'), ai: aiCard(homeS2, `job_takehome:${jobId}`), total: sysCard(homeS2, 'earning_total') }));
+    // Pay-change add: an entry effective 2026-10-01 at $3,500. The
+    // latest payday (Nov 6) prices the new pay in force, so the
+    // per-period card must move too — priced from the job row's
+    // per-period cashNet minus its per-period benefit.
+    r = await H.req('PUT', `/api/earnings/jobs/${jobId}`, { employer: 'Acme Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-02', recent_pay_date: '2026-10-23', recent_pay_value: 3500, pay_changes: [{ effective_date: '2026-10-01', amount: 3500, basis: 'gross', scope: 'period' }] });
+    H.check('home salary stale: pay-change edit succeeds', r.status === 200, JSON.stringify(r.data));
+    const expPc = await expectedOctSalary(jobId);
+    const jobsPc = (await H.req('GET', '/api/earnings')).data;
+    const jobPc = (jobsPc.jobs || []).find((x) => x.id === jobId);
+    const expPeriod = Math.round(((jobPc.calc.perPeriod.cashNet) - (jobPc.taxBenefit ? jobPc.taxBenefit.perPeriod : 0)) * 100) / 100;
+    const homeS3 = await homeSal();
+    H.check('home salary stale: pay-change edit moves the monthly cards and the per-period AI card',
+      sysCard(homeS3, 'earning_salary') && sysCard(homeS3, 'earning_salary').value === expPc && expPc !== octSalary
+      && aiCard(homeS3, `job_takehome:${jobId}`) && aiCard(homeS3, `job_takehome:${jobId}`).value === expPc
+      && aiCard(homeS3, `job_takehome_period:${jobId}`) && aiCard(homeS3, `job_takehome_period:${jobId}`).value === expPeriod && expPeriod !== displayedCash
+      && sysCard(homeS3, 'earning_total') && sysCard(homeS3, 'earning_total').value === expPc + 2000,
+      JSON.stringify({ salary: sysCard(homeS3, 'earning_salary'), ai: aiCard(homeS3, `job_takehome:${jobId}`), period: aiCard(homeS3, `job_takehome_period:${jobId}`), total: sysCard(homeS3, 'earning_total'), expPc, expPeriod }));
+    r = await H.req('PUT', `/api/earnings/jobs/${jobId}`, { employer: 'Acme Corp', province: 'BC', frequency: 'biweekly', start_date: '2026-01-02', recent_pay_date: '2026-10-23', recent_pay_value: 3000, pay_changes: [] });
+    H.check('home salary stale: clearing the pay change succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeS4 = await homeSal();
+    H.check('home salary stale: clearing the pay change moves the cards back',
+      sysCard(homeS4, 'earning_salary') && sysCard(homeS4, 'earning_salary').value === octSalary
+      && aiCard(homeS4, `job_takehome:${jobId}`) && aiCard(homeS4, `job_takehome:${jobId}`).value === octSalary
+      && aiCard(homeS4, `job_takehome_period:${jobId}`) && aiCard(homeS4, `job_takehome_period:${jobId}`).value === displayedCash
+      && sysCard(homeS4, 'earning_total') && sysCard(homeS4, 'earning_total').value === octSalary + 2000,
+      JSON.stringify({ salary: sysCard(homeS4, 'earning_salary'), ai: aiCard(homeS4, `job_takehome:${jobId}`), period: aiCard(homeS4, `job_takehome_period:${jobId}`), total: sysCard(homeS4, 'earning_total') }));
+    // Contribution-plan edit: move the plan start into October
+    // (2026-10-01). The Oct paydays now carry the RRSP deduction
+    // and the tax benefit, so the Oct salary card must fall at once.
+    r = await H.req('GET', `/api/investments/accounts/${rrspId}/plans`);
+    const planId = r.data.plans[0].id;
+    H.check('home salary stale: fixture RRSP plan found', r.status === 200 && r.data.plans.length === 1, JSON.stringify(r.data));
+    r = await H.req('PUT', `/api/investments/plans/${planId}`, { job_id: jobId, target_holding_id: fundId, start_date: '2026-10-01', own_amount: 220.05, employer_amount: 0 });
+    H.check('home salary stale: plan edit succeeds', r.status === 200, JSON.stringify(r.data));
+    const expPlan = await expectedOctSalary(jobId);
+    const homeS5 = await homeSal();
+    H.check('home salary stale: plan edit moves the Oct salary card at once',
+      sysCard(homeS5, 'earning_salary') && sysCard(homeS5, 'earning_salary').value === expPlan && expPlan !== octSalary
+      && aiCard(homeS5, `job_takehome:${jobId}`) && aiCard(homeS5, `job_takehome:${jobId}`).value === expPlan
+      && sysCard(homeS5, 'earning_total') && sysCard(homeS5, 'earning_total').value === expPlan + 2000,
+      JSON.stringify({ salary: sysCard(homeS5, 'earning_salary'), ai: aiCard(homeS5, `job_takehome:${jobId}`), total: sysCard(homeS5, 'earning_total'), expPlan }));
+    r = await H.req('PUT', `/api/investments/plans/${planId}`, { job_id: jobId, target_holding_id: fundId, start_date: '2026-11-06', own_amount: 220.05, employer_amount: 0 });
+    H.check('home salary stale: restoring the plan succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeS6 = await homeSal();
+    H.check('home salary stale: restoring the plan moves the cards back',
+      sysCard(homeS6, 'earning_salary') && sysCard(homeS6, 'earning_salary').value === octSalary
+      && aiCard(homeS6, `job_takehome:${jobId}`) && aiCard(homeS6, `job_takehome:${jobId}`).value === octSalary
+      && sysCard(homeS6, 'earning_total') && sysCard(homeS6, 'earning_total').value === octSalary + 2000,
+      JSON.stringify({ salary: sysCard(homeS6, 'earning_salary'), ai: aiCard(homeS6, `job_takehome:${jobId}`), total: sysCard(homeS6, 'earning_total') }));
+    // Contribution-plan create: a second plan on the same job
+    // starting 2026-10-01 at $100 own — the Oct card must move —
+    // then deleting it moves the card straight back.
+    r = await H.req('POST', `/api/investments/accounts/${rrspId}/plans`, { job_id: jobId, target_holding_id: fundId, start_date: '2026-10-01', own_amount: 100, employer_amount: 0 });
+    const plan2Id = r.data && r.data.id ? r.data.id : null;
+    H.check('home salary stale: second plan creates', r.status === 201 && plan2Id != null, JSON.stringify(r.data));
+    const expPlan2 = await expectedOctSalary(jobId);
+    const homeS7 = await homeSal();
+    H.check('home salary stale: creating a plan moves the Oct salary card at once',
+      sysCard(homeS7, 'earning_salary') && sysCard(homeS7, 'earning_salary').value === expPlan2 && expPlan2 !== octSalary
+      && sysCard(homeS7, 'earning_total') && sysCard(homeS7, 'earning_total').value === expPlan2 + 2000,
+      JSON.stringify({ salary: sysCard(homeS7, 'earning_salary'), total: sysCard(homeS7, 'earning_total'), expPlan2 }));
+    r = await H.req('DELETE', `/api/investments/plans/${plan2Id}`);
+    H.check('home salary stale: deleting the second plan succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeS8 = await homeSal();
+    H.check('home salary stale: deleting the plan moves the cards back',
+      sysCard(homeS8, 'earning_salary') && sysCard(homeS8, 'earning_salary').value === octSalary
+      && sysCard(homeS8, 'earning_total') && sysCard(homeS8, 'earning_total').value === octSalary + 2000,
+      JSON.stringify({ salary: sysCard(homeS8, 'earning_salary'), total: sysCard(homeS8, 'earning_total') }));
+    // Deleting a job drops its per-job AI card (the entity is gone)
+    // and the totals follow at once.
+    r = await H.req('POST', '/api/earnings/jobs', { employer: 'Temp Corp', currency: 'CAD', province: 'BC', frequency: 'biweekly', start_date: '2026-01-05', recent_pay_date: '2026-10-26', recent_pay_value: 2000 });
+    const tempJobId = r.data.id;
+    H.check('home salary stale: temp job creates', r.status === 201, JSON.stringify(r.data));
+    const expTemp = await expectedOctSalary(tempJobId);
+    const homeS9 = await homeSal();
+    H.check('home salary stale: adding a job moves the system salary and total cards',
+      sysCard(homeS9, 'earning_salary') && sysCard(homeS9, 'earning_salary').value === octSalary + expTemp
+      && sysCard(homeS9, 'earning_total') && sysCard(homeS9, 'earning_total').value === octSalary + expTemp + 2000,
+      JSON.stringify({ salary: sysCard(homeS9, 'earning_salary'), total: sysCard(homeS9, 'earning_total'), expTemp }));
+    r = await H.req('POST', '/api/home/insights/ai-apply', { metric: `job_takehome:${tempJobId}`, section: 'earning', title: 'Temp take-home' });
+    H.check('home salary stale: temp per-job AI card appends',
+      r.status === 201 && r.data.insight && r.data.insight.value === expTemp, JSON.stringify(r.data));
+    r = await H.req('DELETE', `/api/earnings/jobs/${tempJobId}`);
+    H.check('home salary stale: temp job deletes', r.status === 200, JSON.stringify(r.data));
+    const homeS10 = await homeSal();
+    H.check('home salary stale: after the delete the temp AI card is gone and the totals are back to the fixture values',
+      !homeS10.insights.some((c) => c.metric === `job_takehome:${tempJobId}`)
+      && sysCard(homeS10, 'earning_salary') && sysCard(homeS10, 'earning_salary').value === octSalary
+      && sysCard(homeS10, 'earning_total') && sysCard(homeS10, 'earning_total').value === octSalary + 2000,
+      JSON.stringify(homeS10.insights.filter((c) => String(c.metric).startsWith('job_takehome') || c.metric === 'earning_salary' || c.metric === 'earning_total')));
+    // Cleanup: delete the two fixture-job AI cards so later pins
+    // see the fixture state only (no AI cards).
+    if (jobTakehomeAiId) {
+      r = await H.req('DELETE', `/api/home/insights/${jobTakehomeAiId}`);
+      H.check('home salary stale: cleanup deletes the per-job AI card', r.status === 200, JSON.stringify(r.data));
+    }
+    if (jobPeriodAiId) {
+      r = await H.req('DELETE', `/api/home/insights/${jobPeriodAiId}`);
+      H.check('home salary stale: cleanup deletes the per-period AI card', r.status === 200, JSON.stringify(r.data));
+    }
+    const homeSClean = await homeSal();
+    H.check('home salary stale: after cleanup the system cards are back to the fixture values and no AI cards remain',
+      sysCard(homeSClean, 'earning_salary') && sysCard(homeSClean, 'earning_salary').value === octSalary
+      && sysCard(homeSClean, 'earning_total') && sysCard(homeSClean, 'earning_total').value === octSalary + 2000
+      && !homeSClean.insights.some((c) => c.kind === 'ai'),
+      JSON.stringify(homeSClean.insights.filter((c) => c.metric === 'earning_salary' || c.metric === 'earning_total' || c.kind === 'ai')));
+
     // AI-append in the browser: propose → Apply appends one → Delete removes it.
     fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'spending', title: 'Groceries spend', metric: 'category_spend:Groceries' } }));
     await page.evaluate(() => {
