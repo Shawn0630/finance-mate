@@ -591,25 +591,27 @@ async function loadTax() {
     // One card per project for the year. The whole card opens
     // the detail on click — no Open button.
     const projects = filer.projects || [];
-    $('#taxPersonBody').innerHTML = `<div class="section-head"><h3>${esc(filer.person.username)} · ${taxYear}</h3><div class="spacer"></div>
+    $('#taxPersonBody').innerHTML = `<div class="section-head"><h3>Tax profile for ${esc(filer.person.username)} · ${taxYear}</h3><div class="spacer"></div>
       <button class="small" id="taxCreateProjectBtn">+ Create project</button></div>` +
       (projects.map((p) => {
         const kinds = Object.entries(p.totals.byKind || {})
-          .map(([k, v]) => `${TAX_KIND_LABELS[k] || k} ${money2(v)}`).join(' · ');
+          .map(([k, v]) => `<span class="nowrap">${TAX_KIND_LABELS[k] || k} ${money2(v)}</span>`).join(' · ');
         // No status element on an open project — the whole card
         // opens on click. A filed project alone carries a Filed tag.
         return `<div class="panel breakdown-card" data-tax-open="${p.id}"><div class="section-head"><h3>${esc(p.name)}</h3>
           <div class="spacer"></div>${p.status === 'filed' ? '<span>Filed</span>' : ''}</div>
-          <div>${p.itemCount} item${p.itemCount === 1 ? '' : 's'}${kinds ? ` · ${kinds}` : ''}</div></div>`;
+          <div><span class="nowrap">${p.itemCount} item${p.itemCount === 1 ? '' : 's'}</span>${kinds ? ` · ${kinds}` : ''}</div></div>`;
       }).join('') || '<div class="note">No projects yet.</div>');
     document.querySelectorAll('[data-tax-open]').forEach((el) => el.addEventListener('click', () => { location.hash = `#tax/filing/${el.dataset.taxOpen}`; }));
     $('#taxCreateProjectBtn').addEventListener('click', () => taxCreateProjectModal(filer.person.id));
     // Contribution room for the selected person (user-entered
     // from the CRA Notice of Assessment — blank means not recorded).
+    // Segments are nowrap spans so the line wraps only at the
+    // " · " separators, never mid-segment.
     const prof = filer.profile;
     const room = (v) => (v == null ? 'Not recorded' : money2(v));
     $('#taxRoomLine').innerHTML = prof
-      ? `RRSP room ${room(prof.rrsp_room)} · TFSA room ${room(prof.tfsa_room)}${prof.resp_beneficiary ? ` · RESP (${esc(prof.resp_beneficiary)}) room ${room(prof.resp_room)} · CESG room ${room(prof.cesg_room)}` : ''}${prof.as_of_date ? ` · as of ${esc(prof.as_of_date)}` : ''}`
+      ? `${taxRoomSeg(`RRSP room ${room(prof.rrsp_room)}`)} · ${taxRoomSeg(`TFSA room ${room(prof.tfsa_room)}`)}${prof.resp_beneficiary ? ` · ${taxRoomSeg(`RESP (${esc(prof.resp_beneficiary)}) room ${room(prof.resp_room)}`)} · ${taxRoomSeg(`CESG room ${room(prof.cesg_room)}`)}` : ''}${prof.as_of_date ? ` · ${taxRoomSeg(`as of ${esc(prof.as_of_date)}`)}` : ''}`
       : 'No contribution room recorded.';
     $('#taxRoomEditBtn').onclick = () => taxProfileModal(filer.person.id);
     $('#taxRoomAiBtn').onclick = () => taxProfileModal(filer.person.id, { aiOpen: true });
@@ -675,7 +677,7 @@ async function loadTaxFiling(id) {
     const prof = data.profile;
     const room = (v) => (v == null ? 'Not recorded' : money2(v));
     $('#taxDetailProfileBody').innerHTML = prof
-      ? `RRSP room ${room(prof.rrsp_room)} · TFSA room ${room(prof.tfsa_room)}${prof.resp_beneficiary ? ` · RESP (${esc(prof.resp_beneficiary)}) room ${room(prof.resp_room)} · CESG room ${room(prof.cesg_room)}` : ''}${prof.as_of_date ? ` · as of ${esc(prof.as_of_date)}` : ''}`
+      ? `${taxRoomSeg(`RRSP room ${room(prof.rrsp_room)}`)} · ${taxRoomSeg(`TFSA room ${room(prof.tfsa_room)}`)}${prof.resp_beneficiary ? ` · ${taxRoomSeg(`RESP (${esc(prof.resp_beneficiary)}) room ${room(prof.resp_room)}`)} · ${taxRoomSeg(`CESG room ${room(prof.cesg_room)}`)}` : ''}${prof.as_of_date ? ` · ${taxRoomSeg(`as of ${esc(prof.as_of_date)}`)}` : ''}`
       : 'No contribution room recorded.';
     $('#taxDetailProfileEditBtn').onclick = () => taxProfileModal(data.person.id);
     $('#taxDetailProfileAiBtn').onclick = () => taxProfileModal(data.person.id, { aiOpen: true });
@@ -1276,6 +1278,10 @@ function taxDrawRoomDoughnut(prefix, key, d) {
     },
   });
 }
+
+// One nowrap segment of a room line (RRSP / TFSA / RESP / CESG /
+// as-of) — the line wraps only between segments, never inside one.
+function taxRoomSeg(t) { return `<span class="nowrap">${t}</span>`; }
 
 function taxRoomCardHtml(prefix, key, label, d, contributedNote, currentValue) {
   const hasRoom = d && d.room != null;

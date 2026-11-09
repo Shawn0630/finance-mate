@@ -549,6 +549,58 @@ export async function run(H, S) {
         const b = document.querySelector('#taxRoomPanel').getBoundingClientRect();
         return `room ${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}x${Math.round(b.height)} body ${Math.round(a.left)},${Math.round(a.top)} ${Math.round(a.width)}x${Math.round(a.height)}`;
       }));
+    // Layout polish: the two columns' headers share one baseline
+    // (h3 tops within 2px), the right heading reads "Tax profile
+    // for <person> · <year>", the 2x2 room grid rows are
+    // even-height, the project card's meta line never breaks
+    // mid-segment (each nowrap segment is a single line box), and
+    // no stray element floats at the room panel's bottom-left
+    // corner.
+    H.check('tax UI: home column headers share one baseline and the right heading reads "Tax profile for Shawn · 2026"',
+      await until(() => {
+        const lh = document.querySelector('#taxRoomPanel > .section-head h3');
+        const rh = document.querySelector('#taxPersonBody > .section-head h3');
+        if (!lh || !rh) return null;
+        return Math.abs(lh.getBoundingClientRect().top - rh.getBoundingClientRect().top) <= 2
+          && rh.textContent.trim() === 'Tax profile for Shawn · 2026' ? true : null;
+      }),
+      await page.evaluate(() => {
+        const lh = document.querySelector('#taxRoomPanel > .section-head h3');
+        const rh = document.querySelector('#taxPersonBody > .section-head h3');
+        return `left h3 top ${lh ? Math.round(lh.getBoundingClientRect().top) : '?'} right h3 top ${rh ? Math.round(rh.getBoundingClientRect().top) : '?'} heading "${rh ? rh.textContent.trim() : '?'}"`;
+      }));
+    H.check('tax UI: home room grid rows are even-height (all four cards the same height)',
+      await until(() => {
+        const grid = document.querySelector('#taxHomeCharts .tax-room-grid');
+        if (!grid || grid.children.length < 4) return null;
+        const hs = [...grid.children].map((c) => Math.round(c.getBoundingClientRect().height));
+        return Math.max(...hs) - Math.min(...hs) <= 2 ? true : null;
+      }),
+      await page.evaluate(() => [...document.querySelectorAll('#taxHomeCharts .tax-room-grid > *')].map((c) => Math.round(c.getBoundingClientRect().height)).join(',')));
+    H.check('tax UI: project card meta line never breaks mid-segment (each segment is one line box)',
+      await until(() => {
+        const card = document.querySelector('[data-tax-open]');
+        if (!card) return null;
+        const spans = [...card.querySelectorAll('.nowrap')];
+        return spans.length > 0 && spans.every((s) => s.getClientRects().length === 1) ? true : null;
+      }),
+      await page.evaluate(() => [...document.querySelectorAll('[data-tax-open] .nowrap')].map((s) => `${s.textContent}=>${s.getClientRects().length}`).join(' | ')));
+    H.check('tax UI: no stray element floats at the room panel bottom-left corner',
+      await until(() => {
+        const rp = document.querySelector('#taxRoomPanel');
+        if (!rp) return null;
+        const r = rp.getBoundingClientRect();
+        const y = Math.min(r.bottom - 8, window.innerHeight - 10);
+        const top = document.elementsFromPoint(r.left + 16, y)[0];
+        return top && (top === rp || rp.contains(top)) ? true : null;
+      }),
+      await page.evaluate(() => {
+        const rp = document.querySelector('#taxRoomPanel');
+        const r = rp.getBoundingClientRect();
+        const y = Math.min(r.bottom - 8, window.innerHeight - 10);
+        const top = document.elementsFromPoint(r.left + 16, y)[0];
+        return top ? `${top.tagName}#${top.id || ''}.${top.className || ''}` : 'none';
+      }));
     await page.setViewport({ width: 700, height: 900 });
     H.check('tax UI: home Contribution room and projects stack vertically on a narrow viewport (room first)',
       await until(() => {
@@ -592,6 +644,12 @@ export async function run(H, S) {
       await until(() => {
         const el = document.querySelector('#taxDetailTitle');
         return el && el.textContent.includes('Tax return 2026') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxDetailTitle').textContent));
+    H.check('tax UI: detail title is name-first-then-year ("Tax return 2026 — Shawn · 2026")',
+      await until(() => {
+        const el = document.querySelector('#taxDetailTitle');
+        return el && el.textContent.trim() === 'Tax return 2026 — Shawn · 2026' ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxDetailTitle').textContent));
     H.check('tax UI: an open project detail shows no status element (no Open, no Filed)',

@@ -314,8 +314,14 @@ tr.sub td { color: #71808f; font-size: 12px; }
    detail's Tax Profile block), up to 4 across on a wide home
    panel, 1 column on a narrow screen. The .panel bottom margin
    is neutralised inside the grid so the gap stays even. */
-.tax-room-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
-.tax-room-grid .panel { margin-bottom: 0; }
+.tax-room-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; grid-auto-rows: 1fr; }
+.tax-room-grid .panel { margin-bottom: 0; display: flex; flex-direction: column; }
+/* Even-height rows: the last line of each card is footer-anchored
+   so a stretched text-only card reads as a card with a footer,
+   not a void at the bottom. The doughnut is a little shorter so
+   the chart cards don't tower over the text-only cards. */
+.tax-room-grid .panel > div:last-child { margin-top: auto; }
+.tax-room-grid .chart-wrap.short { height: 150px; }
 /* Tax home: Contribution room (left) and the project list
    (right) sit side by side in two columns — the year selector,
    person switcher and headings stay above them. Stacked on
@@ -323,6 +329,18 @@ tr.sub td { color: #71808f; font-size: 12px; }
    point). The room cards' own grid is unchanged. */
 .tax-home-cols { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 @media (max-width: 900px) { .tax-home-cols { grid-template-columns: 1fr; } }
+/* The right column's heading shares the left panel's header
+   baseline: the panel's 16px top padding is matched here, and
+   the h3 loses the browser's default margins (which made this
+   row 52px tall) and matches the panel h3 size, so both header
+   rows are 25px tall with text tops within 1px (the 1px is the
+   panel's 1px border). */
+#taxPersonBody > .section-head { padding: 16px 0 0; }
+#taxPersonBody > .section-head h3 { margin: 0 0 8px; font-size: 15px; }
+/* Meta segments never break mid-segment (the "Rental -$3,506.90"
+   hyphen used to split across lines) — wraps happen only at the
+   " · " separators between segments. */
+.nowrap { white-space: nowrap; }
 /* Card-detail balance line: the owed figure is bold and enlarged
    against the small muted line; the as-of stays small. */
 .spend-balance-figure { font-size: 18px; font-weight: 700; color: #1c2733; }
