@@ -944,6 +944,12 @@ export async function run(H, S) {
     await until(() => document.querySelector('#taxAddAiBtn') ? true : null);
     await page.evaluate(() => { document.querySelector('#taxAddAiBtn').click(); });
     await until(() => document.querySelector('#taxAiItemExtract') ? true : null);
+    H.check('tax UI: item Fill with AI label mentions pasting an image',
+      await page.evaluate(() => {
+        const ta = document.querySelector('#taxAiItemText');
+        const label = ta && ta.parentElement.querySelector('label');
+        return label && label.textContent === 'Paste text or an image from a slip or receipt, or describe it…' ? true : null;
+      }));
     H.check('tax UI: a text-only paste into the item Fill with AI is not intercepted',
       await page.evaluate(() => {
         const dt = new DataTransfer();
@@ -981,6 +987,12 @@ export async function run(H, S) {
     // Slip box: same paste behaviour in the Fill slip with AI modal.
     await page.evaluate(() => { document.querySelector('#taxAiSlipBtn').click(); });
     await until(() => document.querySelector('#taxAiSlipExtract') ? true : null);
+    H.check('tax UI: slip Fill with AI label mentions pasting an image',
+      await page.evaluate(() => {
+        const form = document.querySelector('#taxAiSlipForm');
+        const label = form && form.text.parentElement.querySelector('label');
+        return label && label.textContent === 'Paste text or an image from a slip, or describe it…' ? true : null;
+      }));
     H.check('tax UI: a text-only paste into the slip Fill with AI is not intercepted',
       await page.evaluate(() => {
         const form = document.querySelector('#taxAiSlipForm');
@@ -1019,6 +1031,12 @@ export async function run(H, S) {
     await until(() => document.querySelector('#taxProfileAiBtn') ? true : null);
     await page.evaluate(() => { document.querySelector('#taxProfileAiBtn').click(); });
     await until(() => document.querySelector('#taxProfileAiExtract') ? true : null);
+    H.check('tax UI: profile Fill with AI label mentions pasting an image',
+      await page.evaluate(() => {
+        const ta = document.querySelector('#taxProfileAiText');
+        const label = ta && ta.parentElement.querySelector('label');
+        return label && label.textContent === 'Paste text or an image from a Notice of Assessment, or describe it…' ? true : null;
+      }));
     H.check('tax UI: a text-only paste into the profile Fill with AI is not intercepted',
       await page.evaluate(() => {
         const dt = new DataTransfer();

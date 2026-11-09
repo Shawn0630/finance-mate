@@ -901,7 +901,7 @@ function taxWireAiPaste(textarea, fileInput, msg) {
 function taxWireAiItemFill({ panel, msg, section, apply }) {
   if (!panel || panel.dataset.wired) return;
   panel.dataset.wired = '1';
-  panel.innerHTML = `<div><label>Paste text from a slip or receipt, or describe it…</label><textarea id="taxAiItemText" rows="3"></textarea></div>
+  panel.innerHTML = `<div><label>Paste text or an image from a slip or receipt, or describe it…</label><textarea id="taxAiItemText" rows="3"></textarea></div>
     <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" id="taxAiItemFile">
     <select id="taxAiItemModel" style="width:auto;flex:0 1 auto"></select>
     <button type="button" class="primary small" id="taxAiItemExtract">Extract</button></div>`;
@@ -1500,7 +1500,7 @@ async function taxProfileModal(personId, opts) {
     const preview = $('#taxProfileAiPreview');
     if (preview.dataset.wired) return;
     preview.dataset.wired = '1';
-    preview.innerHTML = `<div><label>Paste text from a Notice of Assessment, or describe it…</label><textarea id="taxProfileAiText" rows="3"></textarea></div>
+    preview.innerHTML = `<div><label>Paste text or an image from a Notice of Assessment, or describe it…</label><textarea id="taxProfileAiText" rows="3"></textarea></div>
       <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" id="taxProfileAiFile">
       <select id="taxProfileAiModel" style="width:auto;flex:0 1 auto"></select>
       <button type="button" class="primary small" id="taxProfileAiExtract">Extract</button></div>`;
@@ -1646,7 +1646,7 @@ function taxSlipModal(slipId) {
 
 function taxAiSlipModal() {
   taxOpenModal('Fill slip with AI', `<form id="taxAiSlipForm">
-    <div><label>Paste text from a slip, or describe it…</label><textarea name="text" rows="4"></textarea></div>
+    <div><label>Paste text or an image from a slip, or describe it…</label><textarea name="text" rows="4"></textarea></div>
     <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" name="file">
     <select name="model" id="taxAiSlipModel" style="width:auto;flex:0 1 auto"></select>
     <button type="button" class="primary small" id="taxAiSlipExtract">Extract</button></div>
