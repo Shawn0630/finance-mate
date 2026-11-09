@@ -4036,6 +4036,7 @@ app.post('/api/earnings/rentals', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'rental', entityId: null,
     entityLabel: v.label, summary: `Added rental ${v.label}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     const ts = nowIso();
     const info = db.prepare(
       `INSERT INTO earn_rentals (property_id, label, address, rental_type, services_level,
@@ -4059,6 +4060,7 @@ app.put('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'rental', entityId: id,
     entityLabel: v.label, summary: `Updated rental ${v.label}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare(
       `UPDATE earn_rentals SET property_id = ?, label = ?, address = ?, rental_type = ?, services_level = ?,
        rental_portion_pct = ?, is_principal_residence = ?, was_principal_residence = ?, structural_change = ?,
@@ -4076,6 +4078,7 @@ app.delete('/api/earnings/rentals/:id', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'rental', entityId: rental.id,
     entityLabel: rental.label, summary: `Deleted rental ${rental.label}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare('DELETE FROM earn_rentals WHERE id = ?').run(Number(req.params.id));
     return { value: { ok: true }, entityId: rental.id };
   });
@@ -4167,6 +4170,7 @@ app.post('/api/earnings/rentals/:id/entries', requireApiAuth, (req, res) => {
     module: 'earnings', entityType: 'rental', entityId: rental.id,
     entityLabel: rental.label, summary: `Updated rent entry · ${rental.label}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     const ts = nowIso();
     const info = db.prepare(
       `INSERT INTO earn_rental_entries (rental_id, start_ym, end_ym, monthly_rent, pay_day, cash_amount, tenant_name, created_at, updated_at)
@@ -4191,6 +4195,7 @@ app.put('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (req
     module: 'earnings', entityType: 'rental', entityId: rental.id,
     entityLabel: rental.label, summary: `Updated rent entry · ${rental.label}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare(
       `UPDATE earn_rental_entries SET start_ym = ?, end_ym = ?, monthly_rent = ?, pay_day = ?,
        cash_amount = ?, tenant_name = ?, updated_at = ? WHERE id = ?`).run(
@@ -4211,6 +4216,7 @@ app.delete('/api/earnings/rentals/:rentalId/entries/:entryId', requireApiAuth, (
     module: 'earnings', entityType: 'rental', entityId: rental.id,
     entityLabel: rental.label, summary: `Updated rent entry · ${rental.label}`,
   }, () => {
+    dropSystemHomeInsights(req.user.id);
     db.prepare('DELETE FROM earn_rental_entries WHERE id = ? AND rental_id = ?')
       .run(Number(req.params.entryId), Number(req.params.rentalId));
     return { value: { ok: true }, entityId: rental.id };
@@ -6286,6 +6292,61 @@ const readHomeInsights = (userId) => {
   return applyHomeInsightOrder(rows, orders);
 };
 
+// Home insight cards are stored snapshots: the system set only
+// regenerates when >7 days stale (GET /api/home). A rental or rent
+// entry change makes those snapshots wrong immediately, so the
+// write drops the system rows — the next Home load regenerates
+// them from live data instead of waiting out the 7 days (user
+// 2026-11-08: the system Rental income card showed $1,700 while
+// the freshly-appended AI card showed the right $7,260).
+function dropSystemHomeInsights(userId) {
+  db.prepare('DELETE FROM home_insights WHERE user_id = ? AND kind = ?').run(userId, 'system');
+}
+
+// Rental-dependent AI cards are stored snapshots too and never
+// auto-refresh, so one goes stale when its rental's entries change
+// (and outlives its rental when the rental is deleted). Recompute
+// those from the live data on every Home load — pure computation on
+// data already collected — and keep the model's title/section.
+// System cards are handled by the staleness regeneration above.
+const RENTAL_AI_METRICS = new Set(['earning_rental', 'earning_total']);
+function refreshRentalAiInsights(userId, insights, data) {
+  const now = new Date().toISOString();
+  let changed = false;
+  const out = [];
+  for (const row of insights) {
+    if (row.kind !== 'ai') { out.push(row); continue; }
+    const colon = String(row.metric).indexOf(':');
+    const base = colon === -1 ? String(row.metric) : String(row.metric).slice(0, colon);
+    if (!RENTAL_AI_METRICS.has(row.metric) && base !== 'rental_income') { out.push(row); continue; }
+    const computed = resolveHomeMetric(row.metric, data);
+    if (!computed || computed.error) {
+      // The rental itself is gone — the card can never compute
+      // again, so drop it. A rental that merely has no entries yet
+      // keeps its card (entries can be added later).
+      if (base === 'rental_income' && computed && computed.error
+        && !db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(Number(row.metric.slice(colon + 1)))) {
+        db.prepare('DELETE FROM home_insights WHERE id = ?').run(row.id);
+        changed = true;
+        continue;
+      }
+      out.push(row);
+      continue;
+    }
+    const fresh = { ...computed, title: row.title, section: row.section };
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy]);
+    if (sig(fresh) !== sig(row)) {
+      db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(fresh), now, now, row.id);
+      changed = true;
+      out.push({ ...row, ...fresh, generated_at: now });
+    } else {
+      out.push(row);
+    }
+  }
+  return changed ? out : insights;
+}
+
 // Recompute the standard set only; AI cards are untouched.
 function generateStandardInsights(userId, data) {
   const cards = buildStandardInsights(data);
@@ -6310,6 +6371,9 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   const staleMs = 7 * 24 * 3600 * 1000;
   const stale = !sys.length || sys.some((r) => Date.now() - new Date(r.generated_at).getTime() > staleMs);
   if (stale) insights = generateStandardInsights(userId, data);
+  // Rental-dependent AI cards refresh from live data (see
+  // refreshRentalAiInsights): an entry edit must move them at once.
+  insights = refreshRentalAiInsights(userId, insights, data);
   // Report mode shows a property card's house photo: attach the
   // first gallery photo (or the legacy photo_url) to property-entity
   // cards. No photo → photo: null, and the card renders no

@@ -1809,6 +1809,123 @@ export async function run(H, S) {
     r = await H.req('DELETE', `/api/earnings/rentals/${splitRentalId}`);
     H.check('home split: cleanup deletes the Split suite rental', r.status === 200, JSON.stringify(r.data));
 
+    // Rental income card goes stale (user 2026-11-08): the system
+    // Rental income card showed $1,700 for Oct 2026 while the
+    // AI-appended card showed the right $7,260 — the stored system
+    // card is a snapshot that only regenerates when >7 days stale,
+    // and rent entry edits never invalidate it. Fixture mirrors the
+    // live case: the fixture basement is $2,000/mo (not his live
+    // $1,800), Nash is $960 + $1,600, and a third rental stands in
+    // for the ~$2,900/mo of his live rent that is not in my notes —
+    // $2,700 here so the Oct 2026 total is exactly his confirmed
+    // $7,260 (2,000 + 960 + 1,600 + 2,700).
+    r = await H.req('POST', '/api/earnings/rentals', { label: 'Nash suite', rental_type: 'long_term', services_level: 'basic' });
+    const nashRentalId = r.data.id;
+    r = await H.req('POST', `/api/earnings/rentals/${nashRentalId}/entries`, { start_ym: '2026-05', end_ym: '2027-02', monthly_rent: 960, pay_day: 1 });
+    const nashEntryA = r.data.entries.find((e) => e.monthly_rent === 960).id;
+    r = await H.req('POST', `/api/earnings/rentals/${nashRentalId}/entries`, { start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1600, pay_day: 1 });
+    const nashEntryB = r.data.entries.find((e) => e.monthly_rent === 1600).id;
+    r = await H.req('POST', '/api/earnings/rentals', { label: 'Third suite', rental_type: 'long_term', services_level: 'basic' });
+    const thirdRentalId = r.data.id;
+    r = await H.req('POST', `/api/earnings/rentals/${thirdRentalId}/entries`, { start_ym: '2026-01', monthly_rent: 2700, pay_day: 1 });
+    const thirdEntryId = r.data.entries.find((e) => e.monthly_rent === 2700).id;
+    const homeAfterRentals = (await H.req('GET', '/api/home')).data;
+    const cardAfter = (metric) => homeAfterRentals.insights.find((c) => c.metric === metric);
+    H.check('home rental income: system card equals the fresh total $7,260 (2,000 + 960 + 1,600 + 2,700)',
+      cardAfter('earning_rental') && cardAfter('earning_rental').value === 7260
+      && cardAfter('earning_total') && cardAfter('earning_total').value === cardAfter('earning_salary').value + 7260,
+      JSON.stringify({ rental: cardAfter('earning_rental'), total: cardAfter('earning_total') }));
+    // UI (insight mode): the system Rental income card shows $7,260.
+    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
+    await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    const sysRentalUi = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="earning"] .insight-card')]
+        .filter((c) => c.textContent.includes('Rental income') && !c.querySelector('.home-ai-tag'));
+      return cards.length === 1 ? cards[0].querySelector('.insight-value').textContent : null;
+    });
+    H.check('home rental income UI: system Rental income card shows $7,260',
+      sysRentalUi && sysRentalUi.includes('7,260'), JSON.stringify(sysRentalUi));
+    // Edit one entry ($2,700 → $2,800): the system card must follow
+    // at once — no manual Re-generate, no waiting out the 7 days.
+    r = await H.req('PUT', `/api/earnings/rentals/${thirdRentalId}/entries/${thirdEntryId}`, { start_ym: '2026-01', monthly_rent: 2800, pay_day: 1 });
+    H.check('home rental income: entry edit succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeAfterEdit = (await H.req('GET', '/api/home')).data;
+    const cardEdit = (metric) => homeAfterEdit.insights.find((c) => c.metric === metric);
+    H.check('home rental income: system card follows the entry edit to $7,360 without a Re-generate',
+      cardEdit('earning_rental') && cardEdit('earning_rental').value === 7360
+      && cardEdit('earning_total') && cardEdit('earning_total').value === cardEdit('earning_salary').value + 7360,
+      JSON.stringify({ rental: cardEdit('earning_rental'), total: cardEdit('earning_total') }));
+    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
+    await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    const sysRentalUi2 = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="earning"] .insight-card')]
+        .filter((c) => c.textContent.includes('Rental income') && !c.querySelector('.home-ai-tag'));
+      return cards.length === 1 ? cards[0].querySelector('.insight-value').textContent : null;
+    });
+    H.check('home rental income UI: system Rental income card shows $7,360 after the edit',
+      sysRentalUi2 && sysRentalUi2.includes('7,360'), JSON.stringify(sysRentalUi2));
+    // Per-rental AI card: append Nash income ($2,560), then edit a
+    // Nash entry ($1,600 → $1,700) — the AI card must follow too.
+    r = await H.req('POST', '/api/home/insights/ai-apply', { metric: `rental_income:${nashRentalId}`, section: 'earning', title: 'Nash income' });
+    const nashAiId = r.data && r.data.insight ? r.data.insight.id : null;
+    H.check('home rental income: per-rental AI card appends at $2,560',
+      r.status === 201 && r.data.insight && r.data.insight.value === 2560, JSON.stringify(r.data));
+    r = await H.req('PUT', `/api/earnings/rentals/${nashRentalId}/entries/${nashEntryB}`, { start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1700, pay_day: 1 });
+    H.check('home rental income: Nash entry edit succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeAfterNash = (await H.req('GET', '/api/home')).data;
+    const cardNash = (metric) => homeAfterNash.insights.find((c) => c.metric === metric);
+    H.check('home rental income: system card follows the Nash edit to $7,460 and the AI Nash card to $2,660',
+      cardNash('earning_rental') && cardNash('earning_rental').value === 7460
+      && cardNash(`rental_income:${nashRentalId}`) && cardNash(`rental_income:${nashRentalId}`).value === 2660,
+      JSON.stringify({ rental: cardNash('earning_rental'), nash: cardNash(`rental_income:${nashRentalId}`) }));
+    // AI card on the standard total: append Rental income ($7,460),
+    // then edit the third entry ($2,800 → $2,900) — it must follow.
+    r = await H.req('POST', '/api/home/insights/ai-apply', { metric: 'earning_rental', section: 'earning', title: 'Rental income' });
+    const aiTotalId = r.data && r.data.insight ? r.data.insight.id : null;
+    H.check('home rental income: AI card on the standard total appends at $7,460',
+      r.status === 201 && r.data.insight && r.data.insight.value === 7460, JSON.stringify(r.data));
+    r = await H.req('PUT', `/api/earnings/rentals/${thirdRentalId}/entries/${thirdEntryId}`, { start_ym: '2026-01', monthly_rent: 2900, pay_day: 1 });
+    H.check('home rental income: third entry edit succeeds', r.status === 200, JSON.stringify(r.data));
+    const homeAfterThird = (await H.req('GET', '/api/home')).data;
+    const cardThird = (metric) => homeAfterThird.insights.find((c) => c.metric === metric);
+    H.check('home rental income: system card follows to $7,560, AI total card follows, AI Nash card stays $2,660',
+      homeAfterThird.insights.find((c) => c.metric === 'earning_rental' && c.kind === 'system').value === 7560
+      && homeAfterThird.insights.filter((c) => c.metric === 'earning_rental' && c.kind === 'ai').length === 1
+      && homeAfterThird.insights.find((c) => c.metric === 'earning_rental' && c.kind === 'ai').value === 7560
+      && cardThird(`rental_income:${nashRentalId}`) && cardThird(`rental_income:${nashRentalId}`).value === 2660,
+      JSON.stringify({ rental: cardThird('earning_rental'), aiTotal: homeAfterThird.insights.find((c) => c.metric === 'earning_rental' && c.kind === 'ai'), nash: cardThird(`rental_income:${nashRentalId}`) }));
+    // Deleting the Nash rental drops its per-rental AI card (its
+    // entity is gone) and the totals follow at once.
+    r = await H.req('DELETE', `/api/earnings/rentals/${nashRentalId}`);
+    H.check('home rental income: Nash rental deletes', r.status === 200, JSON.stringify(r.data));
+    const homeAfterDel = (await H.req('GET', '/api/home')).data;
+    H.check('home rental income: after the delete the Nash AI card is gone and the totals are $4,900',
+      !homeAfterDel.insights.some((c) => c.metric === `rental_income:${nashRentalId}`)
+      && homeAfterDel.insights.find((c) => c.metric === 'earning_rental' && c.kind === 'system').value === 4900
+      && homeAfterDel.insights.find((c) => c.metric === 'earning_rental' && c.kind === 'ai').value === 4900,
+      JSON.stringify(homeAfterDel.insights.filter((c) => c.metric === 'earning_rental' || String(c.metric).startsWith('rental_income:'))));
+    // Cleanup: delete the third rental and the AI total card so
+    // later pins see the fixture state only (basement $2,000).
+    r = await H.req('DELETE', `/api/earnings/rentals/${thirdRentalId}`);
+    H.check('home rental income: cleanup deletes the third rental', r.status === 200, JSON.stringify(r.data));
+    if (aiTotalId) {
+      r = await H.req('DELETE', `/api/home/insights/${aiTotalId}`);
+      H.check('home rental income: cleanup deletes the AI total card', r.status === 200, JSON.stringify(r.data));
+    }
+    if (nashAiId) {
+      r = await H.req('DELETE', `/api/home/insights/${nashAiId}`);
+      // 200 when the rental delete left the card behind (the bug),
+      // 404 when the fix already dropped it with the rental.
+      H.check('home rental income: cleanup deletes a leftover AI Nash card if the delete did not drop it', r.status === 200 || r.status === 404, JSON.stringify(r.data));
+    }
+    const homeClean = (await H.req('GET', '/api/home')).data;
+    H.check('home rental income: after cleanup the system card is back to the fixture $2,000',
+      homeClean.insights.find((c) => c.metric === 'earning_rental' && c.kind === 'system').value === 2000
+      && !homeClean.insights.some((c) => c.kind === 'ai'),
+      JSON.stringify(homeClean.insights.filter((c) => c.metric === 'earning_rental' || c.kind === 'ai')));
+
     // AI-append in the browser: propose → Apply appends one → Delete removes it.
     fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'spending', title: 'Groceries spend', metric: 'category_spend:Groceries' } }));
     await page.evaluate(() => {
