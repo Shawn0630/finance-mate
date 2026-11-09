@@ -492,11 +492,32 @@ export async function run(H, S) {
         });
       }
     };
+    // Entry-load veil pin gate (2026-11-08): holding GET /api/home
+    // while the page-entry loadHome runs, same 200ms reason.
+    let homeGate = null; // null | 'hold'
+    const homeHeld = [];
+    const releaseHomeHeld = async () => {
+      const items = homeHeld.splice(0);
+      for (const e of items) {
+        const u = new URL(e.request.url);
+        const headers = {};
+        for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
+        const resp = await forwardH({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
+        const respHeaders = Object.entries(resp.headers)
+          .filter(([k]) => !['content-length', 'transfer-encoding'].includes(k.toLowerCase()))
+          .map(([name, value]) => ({ name, value: String(value) }));
+        await client.send('Fetch.fulfillRequest', {
+          requestId: e.requestId, responseCode: resp.status, responseHeaders: respHeaders,
+          body: resp.body.toString('base64'),
+        });
+      }
+    };
     client.on('Fetch.requestPaused', async (e) => {
       try {
         const u = new URL(e.request.url);
         if (u.hostname !== 'ff.local') { await client.send('Fetch.continueRequest', { requestId: e.requestId }); return; }
         if (genGate === 'hold' && u.pathname === '/api/home/insights/generate' && e.request.method === 'POST') { genHeld.push(e); return; }
+        if (homeGate === 'hold' && u.pathname === '/api/home' && e.request.method === 'GET') { homeHeld.push(e); return; }
         const headers = {};
         for (const [k, v] of Object.entries(e.request.headers)) if (k.toLowerCase() !== 'host') headers[k] = v;
         const resp = await forwardH({ url: u.pathname + u.search, method: e.request.method, headers, postData: e.request.postData });
@@ -545,7 +566,8 @@ export async function run(H, S) {
     H.check('home UI: there is no Home tab in the top nav — Home is entered only via the brand',
       await page.evaluate(() => document.querySelector('#mainNav a[data-nav="home"]') === null)
       // Admin is a pre-existing seventh link, shown only to admin users.
-      && (navLinks === 'Assets,Earnings,Spending,Planning,History,Tax' || navLinks === 'Assets,Earnings,Spending,Planning,History,Tax,Admin'),
+      // Tax sits before Planning (2026-11-08).
+      && (navLinks === 'Assets,Earnings,Spending,Tax,Planning,History' || navLinks === 'Assets,Earnings,Spending,Tax,Planning,History,Admin'),
       navLinks);
 
     // ---- report mode: the default landing ----
@@ -1587,6 +1609,35 @@ export async function run(H, S) {
     });
     H.check('home UI: the held Re-generate still completes and keeps the dragged order',
       !!propOrderRegenVeil, JSON.stringify(propOrderRegenVeil));
+
+    // Page-entry loadHome runs inside the global loading veil too
+    // (2026-11-08: loadHome is wrapped in withLoading like every
+    // other page load, so the stale auto-regenerate on entry is
+    // veiled). Hold GET /api/home via CDP Fetch, reload into #home
+    // (first entry of the page session lands in report mode), and
+    // assert the veil shows while the load is held.
+    homeGate = 'hold';
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.evaluate(() => {
+      window.__veilSeen = false;
+      const el = document.getElementById('globalLoading');
+      const check = () => { if (el && !el.classList.contains('hidden')) window.__veilSeen = true; };
+      new MutationObserver(check).observe(el, { attributes: true, attributeFilter: ['class'] });
+      setInterval(check, 25);
+    });
+    const entryVeilShown = await pollState((s) => s.visible === true, 25);
+    const entryVeilSeen = await page.evaluate(() => window.__veilSeen);
+    H.check('home UI: entering Home shows the global loading veil while loadHome runs',
+      !!entryVeilShown && entryVeilShown.count >= 1 && entryVeilSeen === true,
+      JSON.stringify({ entryVeilShown, entryVeilSeen, held: homeHeld.length }));
+    await releaseHomeHeld();
+    homeGate = null;
+    const entryVeilSettled = await pollState((s) => s.count === 0 && s.visible === false, 40);
+    H.check('home UI: the veil lifts once the entry load finishes',
+      !!entryVeilSettled, JSON.stringify(entryVeilSettled));
+    const entryCard = await until(() => document.querySelector('.report-section.is-active .report-slot.is-active .home-pay-card') ? true : null);
+    H.check('home UI: the held entry load still completes and renders a payment card',
+      !!entryCard, JSON.stringify(entryCard));
 
     // Nov 15 has two payments (rent + mortgage): marking only the
     // rent leaves one done dot + one pending dot. The mark goes in

@@ -2103,6 +2103,7 @@ async function withLoading(fn) {
 }
 
 async function loadAssets(force = false) { return withLoading(() => loadAssetsImpl(force)); }
+async function loadHome() { return withLoading(() => loadHomeImpl()); }
 async function loadPortfolio() { return withLoading(() => loadPortfolioImpl()); }
 async function loadPropertyDetail(id) { return withLoading(() => loadPropertyDetailImpl(id)); }
 async function loadAssetDetail(id) { return withLoading(() => loadAssetDetailImpl(id)); }
@@ -20435,12 +20436,10 @@ $('#homeReport').addEventListener('click', (e) => {
   homeReportLockUntil = Date.now() + HOME_REPORT_LOCK_MS;
 });
 
-async function loadHome() {
-  try {
-    homeData = await api('/api/home');
-    renderHome();
-    if (!homeCalData) loadHomeCalendar(); // first load only; nav keeps its month
-  } catch (err) { showMsg($('#globalError'), 'err', err.message); }
+async function loadHomeImpl() {
+  homeData = await api('/api/home');
+  renderHome();
+  if (!homeCalData) loadHomeCalendar(); // first load only; nav keeps its month
 }
 $('#homeCalendar').addEventListener('click', (e) => {
   const nav = e.target.closest && e.target.closest('[data-cal-nav]');
