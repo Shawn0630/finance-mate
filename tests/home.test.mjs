@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   buildStandardInsights, homeHighlightRows, resolveHomeMetric, buildHomeMetricLibrary,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates,
-  jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrence, homeCalendarFocusTarget,
+  jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrences, homeCalendarFocusTarget,
   homeCalDayIsActionable, homeLongPressMoved, homeDropBefore, homeReportSections, homeReportMove,
   trailing12, lastCompletedMonth, monthLabel,
 } from '../src/home.js';
@@ -233,6 +233,47 @@ test('home: highlight — rental due day clamps to month length, most recent fir
     marks: new Map(), today: '2026-11-20',
   });
   assert.deepEqual(rows2.map((r) => r.date), ['2026-11-15', '2026-10-15']);
+});
+
+test('home: highlight — overlapping rent entries stay separate, one card per entry', () => {
+  // Live data (user 2026-11-08): 2881 has two ongoing entries, both
+  // pay on day 1 — $960 (May 2026–Feb 2027) + $1,600 (Jul 2026–Jul
+  // 2027). They must never merge into one $2,560 card.
+  const rentals = [{
+    id: 9, label: '2881',
+    entries: [
+      { id: 41, start_ym: '2026-05', end_ym: '2027-02', monthly_rent: 960, pay_day: 1 },
+      { id: 42, start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1600, pay_day: 1 },
+    ],
+  }];
+  const rows = homeHighlightRows({ jobs: [], rentals, marks: new Map(), today: '2026-11-08' });
+  // Window Oct + Nov 2026: two rows per month, one per entry.
+  assert.deepEqual(rows.map((r) => [r.date, r.amount, r.sourceId]), [
+    ['2026-11-01', 960, 41],
+    ['2026-11-01', 1600, 42],
+    ['2026-10-01', 960, 41],
+    ['2026-10-01', 1600, 42],
+  ]);
+  assert.ok(rows.every((r) => r.isCurrent === (r.date === '2026-11-01')));
+  assert.ok(!rows.some((r) => r.amount === 2560), 'never a summed $2,560 row');
+  // Marking one entry's Nov 1 received marks ONLY that entry — the
+  // sibling stays unmarked.
+  const marks = new Map([['rental:41:2026-11-01', 1]]);
+  const rows2 = homeHighlightRows({ jobs: [], rentals, marks, today: '2026-11-08' });
+  const nov41 = rows2.find((r) => r.sourceId === 41 && r.date === '2026-11-01');
+  const nov42 = rows2.find((r) => r.sourceId === 42 && r.date === '2026-11-01');
+  assert.equal(nov41.received, 1);
+  assert.equal(nov42.received, null);
+  // The marked entry's UNMARKED Oct 1 keeps showing — it rolls off
+  // only once IT is marked; the sibling's Oct 1 stays too.
+  assert.ok(rows2.some((r) => r.sourceId === 41 && r.date === '2026-10-01' && r.received == null), 'marked entry Oct 1 still shows until marked');
+  assert.ok(rows2.some((r) => r.sourceId === 42 && r.date === '2026-10-01' && r.received == null), 'sibling Oct 1 stays');
+  // Marking the sibling's Oct 1 rolls ONLY that row off.
+  const marks2 = new Map([['rental:42:2026-10-01', 1]]);
+  const rows3 = homeHighlightRows({ jobs: [], rentals, marks: marks2, today: '2026-11-08' });
+  assert.ok(!rows3.some((r) => r.sourceId === 42 && r.date === '2026-10-01'), 'marked Oct 1 rolled off');
+  assert.ok(rows3.some((r) => r.sourceId === 41 && r.date === '2026-10-01'), 'other entry Oct 1 unaffected');
+  assert.ok(rows3.some((r) => r.sourceId === 42 && r.date === '2026-11-01'), 'current Nov 1 still shows');
 });
 
 test('home: resolveHomeMetric — per-entity variants + unknown metric', () => {
@@ -503,7 +544,7 @@ test('home: resolveHomeMetric — account + account-type + per-period take-home 
   assert.equal(lib.filter((m) => m.metric === 'account_value').length, 0);
 });
 
-test('home: rentalMonthOccurrence sums covering entries, due day from the latest-starting entry', () => {
+test('home: rentalMonthOccurrences lists one occurrence per covering entry, never summed', () => {
   const rental = {
     id: 1, label: 'Basement suite',
     entries: [
@@ -511,18 +552,22 @@ test('home: rentalMonthOccurrence sums covering entries, due day from the latest
       { id: 2, start_ym: '2026-04', end_ym: '', monthly_rent: 1800, pay_day: 20 },
     ],
   };
-  // May: both entries cover it — $3,800, due day 20 (latest start).
-  assert.deepEqual(rentalMonthOccurrence(rental, '2026-05'), { date: '2026-05-20', amount: 3800 });
+  // May: both entries cover it — two occurrences, $2,000 on the 15th
+  // and $1,800 on the 20th (never one $3,800 row).
+  assert.deepEqual(rentalMonthOccurrences(rental, '2026-05'), [
+    { date: '2026-05-15', amount: 2000, entryId: 1 },
+    { date: '2026-05-20', amount: 1800, entryId: 2 },
+  ]);
   // February: only the first entry — $2,000 on the 15th.
-  assert.deepEqual(rentalMonthOccurrence(rental, '2026-02'), { date: '2026-02-15', amount: 2000 });
+  assert.deepEqual(rentalMonthOccurrences(rental, '2026-02'), [{ date: '2026-02-15', amount: 2000, entryId: 1 }]);
   // December: only the ongoing entry — $1,800 on the 20th.
-  assert.deepEqual(rentalMonthOccurrence(rental, '2026-12'), { date: '2026-12-20', amount: 1800 });
+  assert.deepEqual(rentalMonthOccurrences(rental, '2026-12'), [{ date: '2026-12-20', amount: 1800, entryId: 2 }]);
   // Before any entry starts: nothing.
-  assert.equal(rentalMonthOccurrence(rental, '2025-12'), null);
+  assert.deepEqual(rentalMonthOccurrences(rental, '2025-12'), []);
   // A pay day past the month's end clamps (31 in February 2026 → 28).
   const clamp = { id: 2, label: 'Suite', entries: [{ id: 3, start_ym: '2026-01', end_ym: '', monthly_rent: 1000, pay_day: 31 }] };
-  assert.deepEqual(rentalMonthOccurrence(clamp, '2026-02'), { date: '2026-02-28', amount: 1000 });
-  assert.deepEqual(rentalMonthOccurrence({ id: 3, label: 'Empty', entries: [] }, '2026-10'), null);
+  assert.deepEqual(rentalMonthOccurrences(clamp, '2026-02'), [{ date: '2026-02-28', amount: 1000, entryId: 3 }]);
+  assert.deepEqual(rentalMonthOccurrences({ id: 3, label: 'Empty', entries: [] }, '2026-10'), []);
 });
 
 test('home: homeCalendarDates uses the highlight date sources for one month, past and future', () => {
@@ -623,6 +668,38 @@ test('home: homeCalendarDates carries the mark state per entry (received only wh
   // Without marks, no entry carries a received key (shape unchanged).
   const plain = homeCalendarDates({ jobs, rentals, mortgageOccurrences, month: '2026-10' });
   assert.deepEqual(plain['2026-10-09'], [{ kind: 'salary', sourceId: 1, label: 'Acme Corp' }]);
+});
+
+test('home: homeCalendarDates dots each rent entry separately, with independent mark state', () => {
+  const rentals = [{
+    id: 9, label: '2881',
+    entries: [
+      { id: 41, start_ym: '2026-05', end_ym: '2027-02', monthly_rent: 960, pay_day: 1 },
+      { id: 42, start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1600, pay_day: 1 },
+    ],
+  }];
+  const nov = homeCalendarDates({ jobs: [], rentals, mortgageOccurrences: [], month: '2026-11' });
+  assert.deepEqual(Object.keys(nov), ['2026-11-01']);
+  assert.deepEqual(nov['2026-11-01'], [
+    { kind: 'rental', sourceId: 41, label: '2881' },
+    { kind: 'rental', sourceId: 42, label: '2881' },
+  ]);
+  // Marking one entry checks only its dot.
+  const marked = homeCalendarDates({
+    jobs: [], rentals, mortgageOccurrences: [], month: '2026-11',
+    marks: new Map([['rental:41:2026-11-01', 1]]),
+  });
+  assert.deepEqual(marked['2026-11-01'], [
+    { kind: 'rental', sourceId: 41, label: '2881', received: 1 },
+    { kind: 'rental', sourceId: 42, label: '2881' },
+  ]);
+  // Focus target: the first matching highlight row in display order.
+  const highlights = [
+    { kind: 'rental', sourceId: 41, date: '2026-11-01' },
+    { kind: 'rental', sourceId: 42, date: '2026-11-01' },
+  ];
+  assert.equal(homeCalendarFocusTarget('2026-11-01', nov['2026-11-01'], highlights), highlights[0]);
+  assert.equal(homeCalDayIsActionable('2026-11-01', nov['2026-11-01'], highlights), true);
 });
 
 test('home: long-press + drop rules — drift cancels the press, the midpoint decides before/after', () => {

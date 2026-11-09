@@ -275,7 +275,7 @@ export async function run(H, S) {
         return {
           hasBasement: text.includes('Basement suite'),
           head, sub,
-          wantDate: r && r.nextRentDue ? window.earnJobDateLabel(r.nextRentDue.date) : null,
+          wantDate: r && r.nextRentDues && r.nextRentDues[0] ? window.earnJobDateLabel(r.nextRentDues[0].date) : null,
           hasNeutral: text.includes('No upcoming payment'),
           hasOwnerShare: text.includes('Owner share'),
           hasDerived: text.includes('from rent entries'),
@@ -289,6 +289,46 @@ export async function run(H, S) {
         rentalUi.hasBasement && rentalHeadOk
           && !rentalUi.hasOwnerShare && !rentalUi.hasDerived && !rentalUi.hasTenant,
         JSON.stringify(rentalUi));
+      // Rent entries stay separate (user 2026-11-08): a rental with
+      // two ongoing entries shows ONE Next rent due box per entry,
+      // never a single earliest payment. Mirrors the live 2881 case
+      // ($960 + $1,600, both due Dec 1, 2026).
+      r = await H.req('POST', '/api/earnings/rentals', { label: 'Split suite', rental_type: 'long_term', services_level: 'basic' });
+      const splitRentalId = r.data.id;
+      r = await H.req('POST', `/api/earnings/rentals/${splitRentalId}/entries`, { start_ym: '2026-05', end_ym: '2027-02', monthly_rent: 960, pay_day: 1 });
+      const splitEntryA = r.data.entries.find((e) => e.monthly_rent === 960).id;
+      r = await H.req('POST', `/api/earnings/rentals/${splitRentalId}/entries`, { start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1600, pay_day: 1 });
+      const splitEntryB = r.data.entries.find((e) => e.monthly_rent === 1600).id;
+      r = await H.req('GET', '/api/earnings');
+      const splitApi = r.data.rentals.find((x) => x.label === 'Split suite');
+      H.check('earnings split: the API lists one next rent due per ongoing entry, sorted by date then entry start',
+        splitApi && splitApi.nextRentDues && splitApi.nextRentDues.length === 2
+        && splitApi.nextRentDues[0].date === '2026-12-01' && splitApi.nextRentDues[0].amount === 960 && splitApi.nextRentDues[0].entryId === splitEntryA
+        && splitApi.nextRentDues[1].date === '2026-12-01' && splitApi.nextRentDues[1].amount === 1600 && splitApi.nextRentDues[1].entryId === splitEntryB
+        && !('nextRentDue' in splitApi),
+        JSON.stringify(splitApi && splitApi.nextRentDues));
+      // UI: the list card renders two Next rent due boxes. The page
+      // is already on #earnings/rentals, so a same-URL goto would be
+      // a no-op — reload so the list re-fetches with the new rental.
+      await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+      await waitE(800);
+      const splitUi = await page.evaluate(() => {
+        const card = [...document.querySelectorAll('#earnRentalList .earn-rental-card')]
+          .find((c) => c.textContent.includes('Split suite'));
+        if (!card) return null;
+        return [...card.querySelectorAll('.summary-card')].map((s) => ({
+          head: s.querySelector('.v')?.textContent.trim(),
+          sub: s.querySelector('.n')?.textContent.trim(),
+        }));
+      });
+      H.check('earnings split UI: the list card shows two Next rent due boxes, $960 and $1,600 on Dec 1, 2026',
+        splitUi && splitUi.length === 2
+        && splitUi.some((s) => s.sub && s.sub.includes('960.00'))
+        && splitUi.some((s) => s.sub && s.sub.includes('1,600.00'))
+        && splitUi.every((s) => s.head && s.head.includes('Dec 1, 2026')),
+        JSON.stringify(splitUi));
+      r = await H.req('DELETE', `/api/earnings/rentals/${splitRentalId}`);
+      H.check('earnings split: cleanup deletes the Split suite rental', r.status === 200, JSON.stringify(r.data));
       // Earnings charts: overview composition, rental net — plus
       // the standard legend left-click toggle. The Salary view
       // carries no chart any more (it moved to the job detail

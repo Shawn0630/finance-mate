@@ -76,6 +76,9 @@ export async function run(H, S) {
   r = await H.req('POST', '/api/earnings/rentals', { label: 'Basement suite', rental_type: 'long_term', services_level: 'basic' });
   const rentalId = r.data.id;
   r = await H.req('POST', `/api/earnings/rentals/${rentalId}/entries`, { start_ym: '2026-01', monthly_rent: 2000, pay_day: 15 });
+  // The entry-create response carries the rental row; the entry id
+  // lives in its entries list (r.data.id is the rental id).
+  const rentalEntryId = r.data.entries[0].id; // rental marks key by ENTRY id (user 2026-11-08), not the rental id
   H.check('home fixture: rental entry created', r.status === 201, JSON.stringify(r.data));
 
   // ---- fixture: RRSP plan on the same job (Fix 4) ----
@@ -244,7 +247,7 @@ export async function run(H, S) {
     && r.data.highlights.some((x) => x.kind === 'salary' && x.date === '2026-10-23')
     && r.data.highlights.some((x) => x.kind === 'rental' && x.date === '2026-10-15'),
     JSON.stringify(r.data.highlights.map((x) => x.date)));
-  r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: rentalId, date: '2026-10-15', received: 1 });
+  r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: rentalEntryId, date: '2026-10-15', received: 1 });
   r = await H.req('GET', '/api/home');
   H.check('home marks: marking the CURRENT row keeps it, marked received',
     r.data.highlights.some((x) => x.kind === 'rental' && x.date === '2026-10-15' && x.received === 1),
@@ -1589,7 +1592,7 @@ export async function run(H, S) {
     // rent leaves one done dot + one pending dot. The mark goes in
     // via the API, so the page needs a real reload (same-URL goto
     // is a no-op) for the calendar to re-fetch with the mark.
-    r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: rentalId, date: '2026-11-15', received: 1 });
+    r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: rentalEntryId, date: '2026-11-15', received: 1 });
     H.check('home UI: marking the Nov 15 rent succeeds', r.status === 200 && r.data.received === 1, JSON.stringify(r.data));
     await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
     await toInsight();
@@ -1603,6 +1606,100 @@ export async function run(H, S) {
       && nov15Dots.filter((c) => c.includes('is-done')).length === 1
       && nov15Dots.find((c) => c.includes('is-done')).includes('kind-rental'),
       JSON.stringify(nov15Dots));
+
+    // Rent entries stay separate (user 2026-11-08): a rental with
+    // two overlapping entries gets ONE highlight card per entry,
+    // never one summed card — in insight mode, in report mode, and
+    // on the calendar. Mirrors the live 2881 case ($960 + $1,600,
+    // both due day 1).
+    r = await H.req('POST', '/api/earnings/rentals', { label: 'Split suite', rental_type: 'long_term', services_level: 'basic' });
+    const splitRentalId = r.data.id;
+    r = await H.req('POST', `/api/earnings/rentals/${splitRentalId}/entries`, { start_ym: '2026-05', end_ym: '2027-02', monthly_rent: 960, pay_day: 1 });
+    const splitEntryA = r.data.entries.find((e) => e.monthly_rent === 960).id;
+    r = await H.req('POST', `/api/earnings/rentals/${splitRentalId}/entries`, { start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1600, pay_day: 1 });
+    const splitEntryB = r.data.entries.find((e) => e.monthly_rent === 1600).id;
+    // API: two Nov 1 cards for the rental, $960 and $1,600, each
+    // keyed by its entry id; Oct 1 likewise, never a $2,560 sum.
+    r = await H.req('GET', '/api/home');
+    const splitRows = r.data.highlights.filter((x) => x.kind === 'rental' && x.sourceLabel === 'Split suite');
+    H.check('home split: two overlapping entries give two highlight cards per month, never one summed card',
+      splitRows.filter((x) => x.date === '2026-11-01').length === 2
+      && splitRows.filter((x) => x.date === '2026-10-01').length === 2
+      && splitRows.some((x) => x.date === '2026-11-01' && x.amount === 960 && x.sourceId === splitEntryA)
+      && splitRows.some((x) => x.date === '2026-11-01' && x.amount === 1600 && x.sourceId === splitEntryB)
+      && !splitRows.some((x) => x.amount === 2560),
+      JSON.stringify(splitRows));
+    // Marking one entry's Nov 1 received marks only that entry.
+    r = await H.req('POST', '/api/home/marks', { kind: 'rental', source_id: splitEntryA, date: '2026-11-01', received: 1 });
+    H.check('home split: marking one entry succeeds', r.status === 200 && r.data.received === 1, JSON.stringify(r.data));
+    r = await H.req('GET', '/api/home');
+    const splitAfter = r.data.highlights.filter((x) => x.kind === 'rental' && x.sourceLabel === 'Split suite' && x.date === '2026-11-01');
+    H.check('home split: marking one entry leaves its sibling unmarked',
+      splitAfter.length === 2
+      && splitAfter.find((x) => x.sourceId === splitEntryA).received === 1
+      && splitAfter.find((x) => x.sourceId === splitEntryB).received == null,
+      JSON.stringify(splitAfter));
+    // UI (insight mode): reload so the calendar re-fetches, then the
+    // two Split suite cards show with independent toggles, and Nov 1
+    // carries two rent dots — one done (entry A), one pending (B).
+    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
+    await toInsight();
+    await until(() => document.querySelectorAll('#homeHighlightCarousel .insight-card').length > 0);
+    const splitUi = await page.evaluate((a, b) => {
+      const cards = [...document.querySelectorAll('#homeHighlightCarousel .home-pay-card')]
+        .filter((c) => c.textContent.includes('Split suite') && c.dataset.payDate === '2026-11-01');
+      const one = (id) => cards.find((c) => Number(c.dataset.paySource) === id) || null;
+      const ca = one(a); const cb = one(b);
+      return {
+        count: cards.length,
+        a: ca ? { amount: ca.querySelector('.insight-value').textContent, on: !!ca.querySelector('.recv-toggle.on') } : null,
+        b: cb ? { amount: cb.querySelector('.insight-value').textContent, on: !!cb.querySelector('.recv-toggle.on') } : null,
+      };
+    }, splitEntryA, splitEntryB);
+    H.check('home split UI: insight shows two Split suite cards, $960 marked and $1,600 unmarked',
+      splitUi.count === 2 && splitUi.a && splitUi.a.amount.includes('960') && splitUi.a.on === true
+      && splitUi.b && splitUi.b.amount.includes('1,600') && splitUi.b.on === false,
+      JSON.stringify(splitUi));
+    const nov1Dots = await page.evaluate(() => {
+      const c = document.querySelector('[data-cal-date="2026-11-01"]');
+      return c ? [...c.querySelectorAll('.home-cal-dot')].map((d) => d.className) : null;
+    });
+    H.check('home split UI: Nov 1 carries two rent dots, one done and one pending',
+      nov1Dots && nov1Dots.length === 2
+      && nov1Dots.every((c) => c.includes('kind-rental'))
+      && nov1Dots.filter((c) => c.includes('is-done')).length === 1,
+      JSON.stringify(nov1Dots));
+    // Clicking the $1,600 card's toggle marks only that card.
+    await page.evaluate((b) => {
+      document.querySelector(`#homeHighlightCarousel .home-pay-card[data-pay-source="${b}"][data-pay-date="2026-11-01"] .recv-toggle`).click();
+    }, splitEntryB);
+    const splitToggled = await until(() => {
+      const cards = [...document.querySelectorAll('#homeHighlightCarousel .home-pay-card')]
+        .filter((c) => c.textContent.includes('Split suite') && c.dataset.payDate === '2026-11-01');
+      return cards.length === 2 && cards.every((c) => c.querySelector('.recv-toggle.on'))
+        ? cards.map((c) => c.querySelector('.insight-value').textContent) : null;
+    });
+    H.check('home split UI: toggling the $1,600 card marks only it — both Nov 1 cards now received',
+      !!splitToggled && splitToggled.some((t) => t.includes('960')) && splitToggled.some((t) => t.includes('1,600')),
+      JSON.stringify(splitToggled));
+    // Report mode: the same two cards appear in Upcoming payments
+    // (all sections stay in the DOM, so no active-section wait).
+    await page.evaluate(() => document.querySelector('#homeModeBtn').click());
+    const splitReport = await until(() => {
+      const sec = document.querySelector('.report-section[data-report-section="highlight"]');
+      if (!sec) return null;
+      const cards = [...sec.querySelectorAll('.home-pay-card')]
+        .filter((c) => c.textContent.includes('Split suite') && c.dataset.payDate === '2026-11-01');
+      return cards.length === 2 ? cards.map((c) => c.querySelector('.insight-value').textContent) : null;
+    });
+    H.check('home split UI: report mode also shows two Split suite cards, $960 and $1,600',
+      !!splitReport && splitReport.some((t) => t.includes('960')) && splitReport.some((t) => t.includes('1,600')),
+      JSON.stringify(splitReport));
+    // Back to insight mode for the AI-append block below, then
+    // delete the rental so later pins see the fixture state only.
+    await toInsight();
+    r = await H.req('DELETE', `/api/earnings/rentals/${splitRentalId}`);
+    H.check('home split: cleanup deletes the Split suite rental', r.status === 200, JSON.stringify(r.data));
 
     // AI-append in the browser: propose → Apply appends one → Delete removes it.
     fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'spending', title: 'Groceries spend', metric: 'category_spend:Groceries' } }));

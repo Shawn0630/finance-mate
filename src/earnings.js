@@ -1023,15 +1023,19 @@ export function deriveRentalYearFigures(entries, taxYear, now = currentYm()) {
   return { gross_rents: gross, rental_days: days, covered: coveredMonths.size > 0 };
 }
 
-// The next rent payment on or after today ('YYYY-MM-DD'): each entry
-// pays on its pay day (clamped to the month's length) for every month
-// it covers; the earliest such date across entries wins, null when no
-// entry covers a future date. The amount is the entry's gross monthly
-// rent — the owner's share is applied downstream, not here.
-export function nextRentPayment(entries, todayStr) {
-  if (!todayStr) return null;
+// The next rent payment on or after today ('YYYY-MM-DD'), one per
+// entry: each entry pays on its pay day (clamped to the month's
+// length) for every month it covers. Entries stay separate, never
+// merged (user 2026-11-08) — two ongoing entries yield two boxes,
+// even on the same date. Sorted by date, then entry start (stable
+// sort keeps the caller's start_ym/id order within a date). Empty
+// when no entry covers a future date. The amount is the entry's
+// gross monthly rent — the owner's share is applied downstream,
+// not here.
+export function nextRentPayments(entries, todayStr) {
+  if (!todayStr) return [];
   const [ty, tm] = todayStr.split('-').map(Number);
-  let best = null;
+  const out = [];
   for (const e of entries || []) {
     if (!e || !e.start_ym || e.monthly_rent == null) continue;
     const [sy, sm] = String(e.start_ym).split('-').map(Number);
@@ -1044,14 +1048,15 @@ export function nextRentPayment(entries, todayStr) {
       const d = Math.min(day, daysInMonth(y, m));
       const iso = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
       if (iso >= todayStr) {
-        if (!best || iso < best.date) best = { date: iso, amount: round2(Number(e.monthly_rent)) };
+        out.push({ date: iso, amount: round2(Number(e.monthly_rent)), entryId: e.id });
         break;
       }
       m++;
       if (m > 12) { m = 1; y++; }
     }
   }
-  return best;
+  out.sort((a, b) => a.date.localeCompare(b.date));
+  return out;
 }
 
 export function validRentalYearInput(body, t776Lines) {

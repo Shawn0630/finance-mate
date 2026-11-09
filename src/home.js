@@ -519,7 +519,9 @@ export function buildStandardInsights(data) {
 // even when unmarked. Within the window, per source: the current
 // occurrence (latest on or before today) is always shown; every
 // unmarked occurrence in the window is shown too. A marked
-// occurrence that is not the current one has rolled off.
+// occurrence that is not the current one has rolled off. Rental rows
+// are per ENTRY (sourceId is the entry id), never merged across a
+// rental's entries (user 2026-11-08).
 export function homeHighlightRows({ jobs, rentals, mortgages, marks, today }) {
   const cur = String(today).slice(0, 7);
   const windowStart = prevMonth(cur);
@@ -584,61 +586,64 @@ export function homeHighlightRows({ jobs, rentals, mortgages, marks, today }) {
   for (const rental of rentals || []) {
     const entries = rental.entries || [];
     if (!entries.length) continue;
-    // Months from the earliest entry start through the current month,
-    // bounded below by the window start.
-    const startYm = entries.map((e) => e.start_ym).sort()[0];
-    const months = [];
-    let m = startYm < windowStart ? windowStart : startYm;
-    while (m <= cur) { months.push(m); m = nextMonth(m); }
-    // One occurrence per (rental, month): amounts sum across
-    // covering entries, due day from the latest-starting entry.
-    const occ = [];
-    for (const ym of months) {
-      const covering = entries.filter((e) => e.start_ym <= ym && (e.end_ym == null || e.end_ym === '' || ym <= e.end_ym));
-      if (!covering.length) continue;
-      const amount = r2(covering.reduce((s, e) => s + Number(e.monthly_rent || 0), 0));
-      const latest = [...covering].sort((a, b) => String(a.start_ym).localeCompare(String(b.start_ym)) || (a.id - b.id)).pop();
-      const day = Math.min(Number(latest.pay_day) || 1, daysInMonth(ym));
-      const d = `${ym}-${String(day).padStart(2, '0')}`;
-      if (d > today) continue;
-      occ.push({ date: d, month: ym, amount });
-    }
-    if (!occ.length) continue;
-    const current = occ[occ.length - 1].date;
-    for (const o of occ) {
-      if (o.date === current || !isMarked('rental', rental.id, o.date)) {
-        rows.push({
-          kind: 'rental', sourceId: rental.id, sourceLabel: rental.label, date: o.date,
-          month: o.month, amount: o.amount,
-          received: marks.get(`rental:${rental.id}:${o.date}`) ?? null,
-          isCurrent: o.date === current,
-        });
+    // Rent entries stay separate, never merged (user 2026-11-08):
+    // one highlight row per (entry, month), each with its own due
+    // day, amount, and mark. The rollover rule applies per entry:
+    // an entry's current occurrence always shows; an unmarked
+    // occurrence in the window shows too; a marked occurrence that
+    // is not that entry's current one has rolled off.
+    for (const entry of entries) {
+      const occ = [];
+      let m = entry.start_ym < windowStart ? windowStart : entry.start_ym;
+      while (m <= cur) {
+        if (entry.end_ym == null || entry.end_ym === '' || m <= entry.end_ym) {
+          const day = Math.min(Number(entry.pay_day) || 1, daysInMonth(m));
+          const d = `${m}-${String(day).padStart(2, '0')}`;
+          if (d <= today) occ.push({ date: d, month: m, amount: r2(Number(entry.monthly_rent || 0)) });
+        }
+        m = nextMonth(m);
+      }
+      if (!occ.length) continue;
+      const current = occ[occ.length - 1].date;
+      for (const o of occ) {
+        if (o.date === current || !isMarked('rental', entry.id, o.date)) {
+          rows.push({
+            kind: 'rental', sourceId: entry.id, rentalId: rental.id, entryId: entry.id,
+            sourceLabel: rental.label, date: o.date, month: o.month, amount: o.amount,
+            received: marks.get(`rental:${entry.id}:${o.date}`) ?? null,
+            isCurrent: o.date === current,
+          });
+        }
       }
     }
   }
   for (const m of mortgages || []) {
     pushOccurrences('mortgage', m.id, m.label, m.occurrences);
   }
-  // Most recent first; ties: salary before rental before mortgage, then label.
+  // Most recent first; ties: salary before rental before mortgage, then label,
+  // then entry id (two entries of one rental on the same day keep entry order).
   const kindRank = { salary: 0, rental: 1, mortgage: 2 };
   rows.sort((a, b) => b.date.localeCompare(a.date)
     || (kindRank[a.kind] ?? 9) - (kindRank[b.kind] ?? 9)
-    || String(a.sourceLabel).localeCompare(String(b.sourceLabel)));
+    || String(a.sourceLabel).localeCompare(String(b.sourceLabel))
+    || (a.entryId ?? 0) - (b.entryId ?? 0));
   return rows;
 }
 
 // ------------------------------------------------------------ calendar --
-// One rental's occurrence in one month: amounts sum across covering
-// entries, due day from the latest-starting entry, clamped to the
-// month's length. Null when no entry covers the month.
-export function rentalMonthOccurrence(rental, ym) {
+// One rental's occurrences in one month: one per covering entry —
+// entries stay separate, never summed (user 2026-11-08). Each
+// occurrence carries its entry id so marks and calendar focus stay
+// per entry. Empty when no entry covers the month.
+export function rentalMonthOccurrences(rental, ym) {
   const entries = rental.entries || [];
-  const covering = entries.filter((e) => e.start_ym <= ym && (e.end_ym == null || e.end_ym === '' || ym <= e.end_ym));
-  if (!covering.length) return null;
-  const amount = r2(covering.reduce((s, e) => s + Number(e.monthly_rent || 0), 0));
-  const latest = [...covering].sort((a, b) => String(a.start_ym).localeCompare(String(b.start_ym)) || (a.id - b.id)).pop();
-  const day = Math.min(Number(latest.pay_day) || 1, daysInMonth(ym));
-  return { date: `${ym}-${String(day).padStart(2, '0')}`, amount };
+  const out = [];
+  for (const e of entries) {
+    if (!(e.start_ym <= ym && (e.end_ym == null || e.end_ym === '' || ym <= e.end_ym))) continue;
+    const day = Math.min(Number(e.pay_day) || 1, daysInMonth(ym));
+    out.push({ date: `${ym}-${String(day).padStart(2, '0')}`, amount: r2(Number(e.monthly_rent || 0)), entryId: e.id });
+  }
+  return out;
 }
 
 // Payment occurrences in ONE month, for the Home calendar.
@@ -648,7 +653,7 @@ export function rentalMonthOccurrence(rental, ym) {
 //   the projection's own grid (the same source as the highlight).
 // The date sources are exactly the highlight's: the job's own payday
 // grid (payDatesInWindow + the holiday advance), the rental's
-// per-month due date, the mortgage's projection grid. Unlike the
+// per-entry due dates, the mortgage's projection grid. Unlike the
 // highlight, a month's dates are NOT capped at today — the calendar
 // shows the whole month, past and future. A job with no dates is
 // skipped, never guessed. The nominal grid runs 7 days past the
@@ -692,8 +697,7 @@ export function homeCalendarDates({ jobs, rentals, mortgageOccurrences, month, m
     for (const d of dates) add(d, 'salary', job.id, job.label);
   }
   for (const rental of rentals || []) {
-    const occ = rentalMonthOccurrence(rental, month);
-    if (occ) add(occ.date, 'rental', rental.id, rental.label);
+    for (const occ of rentalMonthOccurrences(rental, month)) add(occ.date, 'rental', occ.entryId, rental.label);
   }
   for (const o of mortgageOccurrences || []) add(o.date, 'mortgage', o.sourceId, o.label);
   return days;

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor } from './db.js';
+import { db, DATA_DIR, PHOTOS_DIR, AVATARS_DIR, seedUsers, verifyPassword, hashPassword, defaultAvatarColor, migrateRentalMarkSources } from './db.js';
 import { buildSchedule, segmentForMonth, segmentAnnualRate, segmentRateForMonth, derivePayment, primeAtDateResolver, primeHistoryResolver, remainingBalanceAt, FREQUENCIES, FREQUENCY_KEYS, periodPaymentFor } from './engine.js';
 import { getRegion, REGION_CODES } from './regions/index.js';
 import { getCurrentPrime, getPrimeHistory, ensureFreshPrime, refreshPrime, primeInfo, primeStatus, vancouverToday } from './prime.js';
@@ -29,7 +29,7 @@ import { parseWealthsimpleCsv, validateImportApply } from './wsImport.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, aggregateEarningsCharts, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
-  deriveRentalYearFigures, entryCoveredYears, resolvePayChangeValues, positionValueFor, nextRentPayment,
+  deriveRentalYearFigures, entryCoveredYears, resolvePayChangeValues, positionValueFor, nextRentPayments,
 } from './earnings.js';
 import {
   validPlanInput, listPlans, getPlan, planView, generatePlan, generatePlansForAccount,
@@ -777,6 +777,9 @@ app.post('/api/admin/data/import', requireApiAuth, requireAdmin, express.json({ 
   try {
     const backup = writeBackup(db, { includePlanning: true });
     const summary = applyImport(db, payload);
+    // An old export carries rental marks keyed by rental id; rewrite
+    // them to entry ids (same migration as server startup).
+    migrateRentalMarkSources(db);
     // A browser sync download carries its log entry in the request:
     // the import wipes sessions, so the browser could not post the
     // log afterwards. A manual import sends no `sync` field and logs
@@ -806,6 +809,9 @@ app.post('/api/admin/data/backups/:name/restore', requireApiAuth, requireAdmin, 
   try {
     const backup = writeBackup(db, { includePlanning: true });
     const summary = applyImport(db, payload);
+    // A backup from before the entry-keyed marks carries rental marks
+    // keyed by rental id; rewrite them (same migration as startup).
+    migrateRentalMarkSources(db);
     res.json({ ok: true, summary, backup: backup.name });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -3721,7 +3727,7 @@ const earnRentalRow = (row) => {
   rental.ownership_pct = derivedOwnershipPct();
   const entries = db.prepare('SELECT * FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id').all(row.id);
   rental.entries = entries;
-  rental.nextRentDue = nextRentPayment(entries, vancouverToday());
+  rental.nextRentDues = nextRentPayments(entries, vancouverToday());
   const years = db.prepare('SELECT * FROM earn_rental_years WHERE rental_id = ? ORDER BY tax_year DESC').all(row.id);
   const derivedByYear = rentalDerivedInputs(rental);
   return { ...rental, years: years.map((y) => earnRentalYearRow(rental, y, derivedByYear)) };
@@ -6374,10 +6380,13 @@ app.post('/api/home/marks', requireApiAuth, (req, res) => {
   if (!kind || !Number.isInteger(sourceId) || sourceId <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(date) || received == null) {
     return res.status(400).json({ error: 'kind, source_id, date and received (0/1) are required.' });
   }
+  // Rental marks key by the rent ENTRY (its id), not the rental:
+  // entries stay separate, never merged (user 2026-11-08), so one
+  // entry's mark must not mark its sibling.
   const exists = kind === 'salary'
     ? db.prepare('SELECT id FROM earn_jobs WHERE id = ?').get(sourceId)
     : kind === 'rental'
-      ? db.prepare('SELECT id FROM earn_rentals WHERE id = ?').get(sourceId)
+      ? db.prepare('SELECT id FROM earn_rental_entries WHERE id = ?').get(sourceId)
       : db.prepare('SELECT id FROM properties WHERE id = ?').get(sourceId);
   if (!exists) return res.status(404).json({ error: 'source not found' });
   const now = new Date().toISOString();

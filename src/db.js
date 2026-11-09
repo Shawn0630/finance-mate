@@ -944,7 +944,9 @@ CREATE TABLE IF NOT EXISTS home_insight_order (
 -- (a marked row leaves the highlight only when the next occurrence
 -- of the same source has arrived). Absence of a row = unmarked:
 -- the row keeps showing, however old. Marks never change Earnings
--- figures — highlight only.
+-- figures — highlight only. The "source" is the job id (salary),
+-- the rent ENTRY id (rental — entries stay separate, never merged,
+-- user 2026-11-08), or the property id (mortgage).
 CREATE TABLE IF NOT EXISTS income_marks (
   user_id INTEGER NOT NULL,
   kind TEXT NOT NULL,                  -- 'salary' | 'rental' | 'mortgage'
@@ -1065,6 +1067,59 @@ CREATE INDEX IF NOT EXISTS idx_plan_legs_op ON plan_legs(op_id);
 CREATE INDEX IF NOT EXISTS idx_plan_scenarios_project ON plan_scenarios(project_id);
 CREATE INDEX IF NOT EXISTS idx_plan_merge_strategy ON plan_merge_records(strategy_id);
 `);
+
+// Rental marks used to key by the RENTAL id; since entries are
+// separate (user 2026-11-08), they key by the rent ENTRY id.
+// One-time rewrite, idempotent: a row whose source_id is already an
+// entry id is untouched. An old row maps to every entry of that
+// rental whose due date in the mark's month equals the mark's date
+// (the merged card's mark was for all of them); an old row with no
+// matching entry, or whose rental is gone, is dropped.
+export function migrateRentalMarkSources(dbHandle) {
+  const rows = dbHandle.prepare(
+    `SELECT user_id, kind, source_id, pay_date, received, updated_at
+     FROM income_marks WHERE kind = 'rental'`,
+  ).all();
+  if (!rows.length) return { migrated: 0, dropped: 0 };
+  const entryIds = new Set(dbHandle.prepare('SELECT id FROM earn_rental_entries').all().map((r) => r.id));
+  const rentalIds = new Set(dbHandle.prepare('SELECT id FROM earn_rentals').all().map((r) => r.id));
+  const insert = dbHandle.prepare(
+    `INSERT OR IGNORE INTO income_marks (user_id, kind, source_id, pay_date, received, updated_at)
+     VALUES (?, 'rental', ?, ?, ?, ?)`,
+  );
+  const del = dbHandle.prepare(
+    `DELETE FROM income_marks WHERE user_id = ? AND kind = 'rental' AND source_id = ? AND pay_date = ?`,
+  );
+  const entriesByRental = new Map();
+  const entriesOf = (rentalId) => {
+    if (!entriesByRental.has(rentalId)) {
+      entriesByRental.set(rentalId, dbHandle.prepare(
+        'SELECT id, start_ym, end_ym, pay_day FROM earn_rental_entries WHERE rental_id = ? ORDER BY start_ym, id',
+      ).all(rentalId));
+    }
+    return entriesByRental.get(rentalId);
+  };
+  let migrated = 0;
+  let dropped = 0;
+  dbHandle.transaction(() => {
+    for (const m of rows) {
+      if (entryIds.has(m.source_id)) continue; // already an entry id
+      const entries = rentalIds.has(m.source_id) ? entriesOf(m.source_id) : [];
+      const ym = String(m.pay_date).slice(0, 7);
+      const matching = entries.filter((e) => {
+        if (!(e.start_ym <= ym && (e.end_ym == null || e.end_ym === '' || ym <= e.end_ym))) return false;
+        const day = Math.min(Number(e.pay_day) || 1, new Date(Number(ym.slice(0, 4)), Number(ym.slice(5, 7)), 0).getDate());
+        return `${ym}-${String(day).padStart(2, '0')}` === m.pay_date;
+      });
+      for (const e of matching) migrated += insert.run(m.user_id, e.id, m.pay_date, m.received, m.updated_at).changes;
+      if (!matching.length) dropped++;
+      del.run(m.user_id, m.source_id, m.pay_date);
+    }
+  })();
+  return { migrated, dropped };
+}
+migrateRentalMarkSources(db);
+
 {
   // Planning template metadata (2026-10-31): template + metadata JSON on
   // the project (NULL template = legacy, keeps the full generic panels);

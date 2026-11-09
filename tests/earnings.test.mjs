@@ -7,7 +7,7 @@ import { payroll, rental } from '../src/regions/ca.js';
 import {
   PAY_FREQUENCIES, validJobInput, validRentalInput, validRentalYearInput, validRentalEntryInput,
   calcSalary, calcRentalYear, federalBpa, bracketTax,
-  deriveRentalYearFigures, entryCoveredYears, nextRentPayment,
+  deriveRentalYearFigures, entryCoveredYears, nextRentPayments,
   payDatesInWindow, deriveJobYtd, solveGrossForTakeHome, nextPayDate, jobMonthlySeries,
   validPayChanges, resolvePayChangeValues, positionValueFor,
 } from '../src/earnings.js';
@@ -191,19 +191,31 @@ test('rental validation: rental portion is optional, must be 1–100 when set', 
   assert.ok(validRentalInput({ ...base, rental_portion_pct: 'abc' }).error);
 });
 
-test('next rent payment: ongoing entry pays on its pay day, on/after today', () => {
-  const e = { start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1800, pay_day: 15 };
-  assert.deepEqual(nextRentPayment([e], '2026-11-05'), { date: '2026-11-15', amount: 1800 });
-  assert.deepEqual(nextRentPayment([e], '2026-11-15'), { date: '2026-11-15', amount: 1800 });
-  assert.deepEqual(nextRentPayment([e], '2026-11-16'), { date: '2026-12-15', amount: 1800 });
+test('next rent payments: one per entry, never merged', () => {
+  const e = { id: 1, start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1800, pay_day: 15 };
+  assert.deepEqual(nextRentPayments([e], '2026-11-05'), [{ date: '2026-11-15', amount: 1800, entryId: 1 }]);
+  assert.deepEqual(nextRentPayments([e], '2026-11-15'), [{ date: '2026-11-15', amount: 1800, entryId: 1 }]);
+  assert.deepEqual(nextRentPayments([e], '2026-11-16'), [{ date: '2026-12-15', amount: 1800, entryId: 1 }]);
   // Pay day 31 clamps to the month's length.
-  const e31 = { start_ym: '2026-01', end_ym: null, monthly_rent: 1000, pay_day: 31 };
-  assert.deepEqual(nextRentPayment([e31], '2026-02-10'), { date: '2026-02-28', amount: 1000 });
+  const e31 = { id: 2, start_ym: '2026-01', end_ym: null, monthly_rent: 1000, pay_day: 31 };
+  assert.deepEqual(nextRentPayments([e31], '2026-02-10'), [{ date: '2026-02-28', amount: 1000, entryId: 2 }]);
   // A future entry's first pay day; an ended entry has no next payment.
-  assert.deepEqual(nextRentPayment([{ start_ym: '2027-01', end_ym: null, monthly_rent: 2000, pay_day: 1 }], '2026-11-05'), { date: '2027-01-01', amount: 2000 });
-  assert.equal(nextRentPayment([{ start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 2000, pay_day: 15 }], '2026-11-05'), null);
-  assert.equal(nextRentPayment([], '2026-11-05'), null);
-  assert.equal(nextRentPayment(null, '2026-11-05'), null);
+  assert.deepEqual(nextRentPayments([{ id: 3, start_ym: '2027-01', end_ym: null, monthly_rent: 2000, pay_day: 1 }], '2026-11-05'), [{ date: '2027-01-01', amount: 2000, entryId: 3 }]);
+  assert.deepEqual(nextRentPayments([{ start_ym: '2025-01', end_ym: '2025-12', monthly_rent: 2000, pay_day: 15 }], '2026-11-05'), []);
+  assert.deepEqual(nextRentPayments([], '2026-11-05'), []);
+  assert.deepEqual(nextRentPayments(null, '2026-11-05'), []);
+  // Two ongoing entries on the same pay day: two boxes, sorted by
+  // date then entry start — the live 2881 case ($960 + $1,600, both
+  // due Dec 1, 2026).
+  const a = { id: 11, start_ym: '2026-05', end_ym: '2027-02', monthly_rent: 960, pay_day: 1 };
+  const b = { id: 12, start_ym: '2026-07', end_ym: '2027-07', monthly_rent: 1600, pay_day: 1 };
+  assert.deepEqual(nextRentPayments([a, b], '2026-11-08'), [
+    { date: '2026-12-01', amount: 960, entryId: 11 },
+    { date: '2026-12-01', amount: 1600, entryId: 12 },
+  ]);
+  // Different next dates sort by date, not entry order.
+  const c = { id: 13, start_ym: '2026-01', end_ym: null, monthly_rent: 100, pay_day: 20 };
+  assert.deepEqual(nextRentPayments([c, a], '2026-11-08').map((x) => x.date), ['2026-11-20', '2026-12-01']);
 });
 
 test('rental: property-derived costs scale by the rental portion, manual lines stay additional', () => {

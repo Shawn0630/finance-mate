@@ -10873,14 +10873,16 @@ function earnEntryTableHtml(r) {
 
 function earnRentalCard(r) {
   const hidden = rentHiddenRentals.has(r.id);
-  const nxt = r.nextRentDue;
-  // The list card stays slim: title + the next payment headline
-  // only. Entries and year records live on the detail page.
+  const dues = r.nextRentDues || [];
+  // The list card stays slim: title + the next payment headline(s)
+  // only. Entries and year records live on the detail page. One box
+  // per ongoing entry — entries stay separate, never merged (user
+  // 2026-11-08).
   return `<div class="panel rent-card earn-rental-card" data-rental-id="${r.id}" style="cursor:pointer">
     <button type="button" class="rent-hide-btn invest-eye-btn${hidden ? ' invest-eye-hidden' : ''}" data-rental-id="${r.id}" title="${hidden ? 'Show' : 'Hide'}" aria-label="${hidden ? 'Show' : 'Hide'}" onclick="toggleRentRental(${r.id})">${RENT_EYE_SVG}</button>
     <div class="section-head"><h3>${esc(r.label)}</h3><span class="note">${esc(r.rental_type)} · ${esc(r.services_level)} · ${r.ownership_pct}% owned</span></div>
-    ${nxt
-    ? `<div class="summary-strip"><div class="summary-card"><div class="k">Next rent due</div><div class="v">${esc(earnJobDateLabel(nxt.date))}</div><div class="n">${money2(nxt.amount)}</div></div></div>`
+    ${dues.length
+    ? `<div class="summary-strip">${dues.map((nxt) => `<div class="summary-card"><div class="k">Next rent due</div><div class="v">${esc(earnJobDateLabel(nxt.date))}</div><div class="n">${money2(nxt.amount)}</div></div>`).join('')}</div>`
     : `<div class="note">No upcoming payment</div>`}
   </div>`;
 }
