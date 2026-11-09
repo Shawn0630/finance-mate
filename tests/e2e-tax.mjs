@@ -937,6 +937,120 @@ export async function run(H, S) {
         return el && el.textContent.includes('AI test income') ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxSections').textContent.slice(0, 400)));
+    // Paste: a clipboard image fills the file input in all three
+    // Tax Fill with AI boxes (same pattern as the property/term
+    // panel); a text-only paste is untouched. Item box first.
+    await page.evaluate(() => { document.querySelector('[data-tax-add-item="income"]').click(); });
+    await until(() => document.querySelector('#taxAddAiBtn') ? true : null);
+    await page.evaluate(() => { document.querySelector('#taxAddAiBtn').click(); });
+    await until(() => document.querySelector('#taxAiItemExtract') ? true : null);
+    H.check('tax UI: a text-only paste into the item Fill with AI is not intercepted',
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', 'plain words');
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        const notPrevented = document.querySelector('#taxAiItemText').dispatchEvent(ev);
+        const file = document.querySelector('#taxAiItemFile');
+        return notPrevented && file.files.length === 0;
+      }));
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], 't4-shot.png', { type: 'image/png' }));
+      document.querySelector('#taxAiItemText')
+        .dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    H.check('tax UI: pasting an image into the item Fill with AI fills the file input',
+      await page.evaluate(() => {
+        const f = document.querySelector('#taxAiItemFile');
+        return f.files.length === 1 && f.files[0].name === 't4-shot.png' ? true : null;
+      }));
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ kind: 'other_income', label: 'AI pasted income', amount: 555.55 }));
+    await page.evaluate(() => { document.querySelector('#taxAiItemExtract').click(); });
+    H.check('tax UI: Extract sends the pasted image and previews the stubbed extraction',
+      await until(() => {
+        const msg = document.querySelector('#taxAddAiMsg');
+        const form = document.querySelector('#taxAddManualForm');
+        if (!msg || !msg.textContent.includes('Extracted — review the fields, then Save.')) return null;
+        if (!form) return null;
+        const amt = form.querySelector('input[name="amount"]');
+        const label = form.querySelector('input[name="label"]');
+        return amt && amt.value === '555.55' && label && label.value === 'AI pasted income' ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxAddAiMsg') || { textContent: 'missing' }).textContent));
+    await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });
+    // Slip box: same paste behaviour in the Fill slip with AI modal.
+    await page.evaluate(() => { document.querySelector('#taxAiSlipBtn').click(); });
+    await until(() => document.querySelector('#taxAiSlipExtract') ? true : null);
+    H.check('tax UI: a text-only paste into the slip Fill with AI is not intercepted',
+      await page.evaluate(() => {
+        const form = document.querySelector('#taxAiSlipForm');
+        const dt = new DataTransfer();
+        dt.setData('text/plain', 'plain words');
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        const notPrevented = form.text.dispatchEvent(ev);
+        return notPrevented && form.file.files.length === 0;
+      }));
+    await page.evaluate(() => {
+      const form = document.querySelector('#taxAiSlipForm');
+      const dt = new DataTransfer();
+      dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], 't4-shot.png', { type: 'image/png' }));
+      form.text.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    H.check('tax UI: pasting an image into the slip Fill with AI fills the file input',
+      await page.evaluate(() => {
+        const f = document.querySelector('#taxAiSlipForm').file;
+        return f.files.length === 1 && f.files[0].name === 't4-shot.png' ? true : null;
+      }));
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ kind: 'T4', tax_year: 2026, fields: { employer_name: 'Meta', box14: 190704.02 } }));
+    await page.evaluate(() => { document.querySelector('#taxAiSlipExtract').click(); });
+    H.check('tax UI: Extract sends the pasted slip image and previews the T4',
+      await until(() => {
+        const prev = document.querySelector('#taxAiSlipPreview');
+        const box14 = prev && prev.querySelector('input[name="field_box14"]');
+        return prev && prev.textContent.includes('Extracted: T4') && box14 && box14.value === '190,704.02' ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxAiSlipPreview') || { textContent: 'missing' }).textContent.slice(0, 200)));
+    await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });
+    // Profile box: same paste behaviour in the Tax Profile Fill with AI.
+    // Opened from the detail (same modal as the home Edit) so the
+    // flow stays on the detail page for the pins that follow.
+    await until(() => document.querySelector('#taxDetailProfileEditBtn') ? true : null);
+    await page.evaluate(() => { document.querySelector('#taxDetailProfileEditBtn').click(); });
+    await until(() => document.querySelector('#taxProfileAiBtn') ? true : null);
+    await page.evaluate(() => { document.querySelector('#taxProfileAiBtn').click(); });
+    await until(() => document.querySelector('#taxProfileAiExtract') ? true : null);
+    H.check('tax UI: a text-only paste into the profile Fill with AI is not intercepted',
+      await page.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', 'plain words');
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        const notPrevented = document.querySelector('#taxProfileAiText').dispatchEvent(ev);
+        const file = document.querySelector('#taxProfileAiFile');
+        return notPrevented && file.files.length === 0;
+      }));
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], 'noa-shot.png', { type: 'image/png' }));
+      document.querySelector('#taxProfileAiText')
+        .dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    H.check('tax UI: pasting an image into the profile Fill with AI fills the file input',
+      await page.evaluate(() => {
+        const f = document.querySelector('#taxProfileAiFile');
+        return f.files.length === 1 && f.files[0].name === 'noa-shot.png' ? true : null;
+      }));
+    fs.writeFileSync(H.aiStubFile, JSON.stringify({ fields: { rrsp_room: 21000, tfsa_room: 6000, as_of_date: '2026-04-23' } }));
+    await page.evaluate(() => { document.querySelector('#taxProfileAiExtract').click(); });
+    H.check('tax UI: Extract sends the pasted NOA image and fills the profile rooms from the stub',
+      await until(() => {
+        const msg = document.querySelector('#taxProfileAiMsg');
+        const form = document.querySelector('#taxProfileForm');
+        if (!msg || !msg.textContent.includes('Extracted — review the fields, then Save.')) return null;
+        if (!form) return null;
+        return form.rrsp_room.value === '21,000' && form.tfsa_room.value === '6,000' ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxProfileAiMsg') || { textContent: 'missing' }).textContent));
+    await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });
     // The in-project Tax Profile follows the person's CURRENT
     // profile record — one source of truth, no per-project copy.
     // Editing it from inside the detail updates the in-project

@@ -874,6 +874,24 @@ function taxT776ReadHtml(item) {
   <div>Gross ${money2(d.gross)} · Deductible ${money2(d.deductible)} · Net (9946) ${money2(d.net)}</div>`;
 }
 
+// Paste: a clipboard carrying a file fills the paired file input
+// (the panel's single attachment), exactly like the property/term
+// AI Fill panel; a text clipboard pastes as text, untouched.
+// The native file input shows the pasted filename, so the user
+// sees the image is attached before Extract.
+function taxWireAiPaste(textarea, fileInput, msg) {
+  if (!textarea || !fileInput) return;
+  textarea.addEventListener('paste', (e) => {
+    const files = e.clipboardData ? [...e.clipboardData.files] : [];
+    if (!files.length) return;
+    e.preventDefault();
+    const dt = new DataTransfer();
+    dt.items.add(files[0]);
+    fileInput.files = dt.files;
+    if (msg) { msg.textContent = ''; msg.className = 'msg'; }
+  });
+}
+
 // ------------------------------------------------------- AI item fill --
 // One shared AI-fill panel for the Add/Edit item modals: text or
 // a slip/receipt file in, the extracted item fields out as an
@@ -887,6 +905,7 @@ function taxWireAiItemFill({ panel, msg, section, apply }) {
     <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" id="taxAiItemFile">
     <select id="taxAiItemModel" style="width:auto;flex:0 1 auto"></select>
     <button type="button" class="primary small" id="taxAiItemExtract">Extract</button></div>`;
+  taxWireAiPaste($('#taxAiItemText'), $('#taxAiItemFile'), msg);
   loadAiConfig().then((cfg) => {
     const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
     const sel = $('#taxAiItemModel');
@@ -1485,6 +1504,7 @@ async function taxProfileModal(personId, opts) {
       <div class="ai-panel-row"><input type="file" accept="image/*,application/pdf,.csv,.txt" id="taxProfileAiFile">
       <select id="taxProfileAiModel" style="width:auto;flex:0 1 auto"></select>
       <button type="button" class="primary small" id="taxProfileAiExtract">Extract</button></div>`;
+    taxWireAiPaste($('#taxProfileAiText'), $('#taxProfileAiFile'), $('#taxProfileAiMsg'));
     loadAiConfig().then((cfg) => {
       const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
       $('#taxProfileAiModel').innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
@@ -1633,6 +1653,8 @@ function taxAiSlipModal() {
     <div class="msg" id="taxAiSlipMsg"></div>
     <div id="taxAiSlipPreview"></div>
   </form>`);
+  const slipForm = $('#taxAiSlipForm');
+  taxWireAiPaste(slipForm.text, slipForm.file, $('#taxAiSlipMsg'));
   loadAiConfig().then((cfg) => {
     const models = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
     $('#taxAiSlipModel').innerHTML = models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
