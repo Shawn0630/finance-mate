@@ -197,6 +197,23 @@ export function slipAmount(kind, fields) {
   return seen ? Math.round(total * 100) / 100 : null;
 }
 
+// The slip field carrying the payer/employer name — the
+// identity a slip is matched against an existing item by when
+// it is added (see findSlipLinkMatches in src/tax.js). A slip
+// with no name field filled cannot be matched to an item.
+const SLIP_PAYER_FIELD = {
+  T4: 'employer_name',
+  T4A: 'payer_name', T5: 'payer_name', T3: 'payer_name',
+  T4RSP: 'payer_name', T4RIF: 'payer_name', T5008: 'payer_name',
+};
+
+export function slipPayerName(kind, fields) {
+  const key = SLIP_PAYER_FIELD[kind];
+  if (!key || !fields || typeof fields !== 'object') return null;
+  const v = fields[key];
+  return typeof v === 'string' && v.trim() ? v.trim() : null;
+}
+
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
 // The RRSP contribution window for a tax year — the CRA

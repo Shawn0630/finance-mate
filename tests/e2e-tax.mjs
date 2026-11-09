@@ -170,6 +170,7 @@ export async function run(H, S) {
   H.check('tax: employment candidate added as linked ($190,704.02)',
     r.status === 201 && r.data.kind === 'employment' && r.data.amount === 190704.02 && r.data.status === 'linked',
     JSON.stringify(r.data));
+  const metaItemId = r.data.id;
   r = await addCand('job', metaJobId);
   H.check('tax: adding the same candidate twice is a 400', r.status === 400, JSON.stringify(r.status));
   r = await addCand('plan', (await H.req('GET', `/api/tax/filings/${projA}/candidates`)).data.candidates.find((c) => c.kind === 'rrsp').sourceId);
@@ -231,13 +232,22 @@ export async function run(H, S) {
       && (r.data.items || []).length === 7,
     JSON.stringify({ registered: r.data.sections.registered, items: (r.data.items || []).length }));
 
-  // ---- Slip on A creates a linked item ----
+  // ---- Slip on A links to the candidate item — no duplicate ----
   r = await H.req('POST', `/api/tax/filings/${projA}/slips`, {
     kind: 'T4', tax_year: 2026, fields: { box14: 190704.02, employer_name: 'Tax Meta' }, source: 'manual',
   });
-  H.check('tax: T4 slip created with its linked employment item',
-    r.status === 201 && r.data.slip && r.data.slip.kind === 'T4' && r.data.item && r.data.item.amount === 190704.02 && r.data.item.status === 'linked',
+  H.check('tax: T4 slip links to the candidate employment item instead of duplicating it',
+    r.status === 201 && r.data.slip && r.data.slip.kind === 'T4' && r.data.linked === true
+      && r.data.item && r.data.item.id === metaItemId && r.data.item.amount === 190704.02
+      && r.data.item.slip_id === r.data.slip.id && r.data.amountUpdated === false && r.data.previousAmount === null,
     JSON.stringify(r.data));
+  const slipAId = r.data.slip.id;
+  r = await H.req('GET', `/api/tax/filings/${projA}`);
+  const empItemsA = (r.data.items || []).filter((i) => i.kind === 'employment');
+  H.check('tax: project A still has exactly one employment item, slip-backed, counted once',
+    (r.data.items || []).length === 7 && empItemsA.length === 1
+      && empItemsA[0].id === metaItemId && empItemsA[0].slip_id === slipAId,
+    JSON.stringify((r.data.items || []).map((i) => ({ kind: i.kind, amount: i.amount, slip_id: i.slip_id }))));
   r = await H.req('POST', `/api/tax/filings/${projA}/slips`, { kind: 'T9', tax_year: 2026, fields: {} });
   H.check('tax: unknown slip kind is a 400', r.status === 400, JSON.stringify(r.status));
   r = await H.req('POST', `/api/tax/filings/${projA}/slips`, { kind: 'T4', tax_year: 2025, fields: { box14: 1 } });
@@ -261,6 +271,94 @@ export async function run(H, S) {
   H.check('tax: B has the gig, the rental and its derived deduction row ($12,500)',
     (r.data.items || []).length === 3 && !!derivedB && derivedB.amount === 12500,
     JSON.stringify((r.data.items || []).map((i) => ({ kind: i.kind, amount: i.amount, derived: !!(i.detail && i.detail.derived) }))));
+
+  // ---- Slip linking: ambiguous matches ask, the T4 governs the amount ----
+  // Two ownerless jobs share the employer name 'Tax Meta', and one
+  // 'Tax Side' job's annual gross ($50,000.60) differs from its T4
+  // box 14 ($50,000). Ownerless, so they never enter any filing's
+  // CPP/EI (the refund's job rows filter by owner).
+  r = await H.req('POST', '/api/earnings/jobs', {
+    employer: 'Tax Meta', currency: 'CAD', province: 'BC',
+    frequency: 'biweekly', gross_amount: 1000, gross_basis: 'period', tax_year: 2026,
+  });
+  H.check('tax: second ownerless Tax Meta job created (annual gross $26,000)',
+    r.status === 201 && !!r.data.id, JSON.stringify(r.data));
+  const metaJob2Id = r.data.id;
+  r = await H.req('POST', '/api/earnings/jobs', {
+    employer: 'Tax Side', currency: 'CAD', province: 'BC',
+    frequency: 'biweekly', gross_amount: 1923.10, gross_basis: 'period', tax_year: 2026,
+  });
+  H.check('tax: ownerless Tax Side job created (annual gross $50,000.60)',
+    r.status === 201 && r.data.calc && r.data.calc.annualGross === 50000.6,
+    JSON.stringify(r.data && r.data.calc));
+  const sideJobId = r.data.id;
+  r = await H.req('POST', '/api/tax/filings', { personId: shawnId, year: 2026, name: 'Slip linking' });
+  H.check('tax: project C created for the slip-linking pins', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
+  const projC = r.data.id;
+  const addCandC = async (sourceType, sourceId) => H.req('POST', `/api/tax/filings/${projC}/items/from-candidate`, { sourceType, sourceId });
+  r = await addCandC('job', metaJobId);
+  const metaItemCId = r.data.id;
+  H.check('tax: C takes the Tax Meta candidate ($190,704.02)',
+    r.status === 201 && r.data.kind === 'employment' && r.data.amount === 190704.02, JSON.stringify(r.data));
+  r = await addCandC('job', metaJob2Id);
+  const meta2ItemCId = r.data.id;
+  H.check('tax: C takes the second Tax Meta candidate ($26,000)',
+    r.status === 201 && r.data.kind === 'employment' && r.data.amount === 26000, JSON.stringify(r.data));
+  r = await addCandC('job', sideJobId);
+  const sideItemCId = r.data.id;
+  H.check('tax: C takes the Tax Side candidate ($50,000.60)',
+    r.status === 201 && r.data.kind === 'employment' && r.data.amount === 50000.6, JSON.stringify(r.data));
+  // A T4 for 'Tax Meta' matches both Meta items — 409, nothing written.
+  r = await H.req('POST', `/api/tax/filings/${projC}/slips`, {
+    kind: 'T4', tax_year: 2026, fields: { box14: 190704.02, employer_name: 'Tax Meta' }, source: 'manual',
+  });
+  H.check('tax: ambiguous T4 is a 409 with both matches, nothing written',
+    r.status === 409 && Array.isArray(r.data.candidates) && r.data.candidates.length === 2
+      && r.data.candidates.map((c) => c.id).sort().join(',') === [metaItemCId, meta2ItemCId].sort().join(','),
+    JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/filings/${projC}`);
+  H.check('tax: the 409 left no slip and no new item in C',
+    (r.data.slips || []).length === 0 && (r.data.items || []).length === 3,
+    JSON.stringify({ slips: (r.data.slips || []).length, items: (r.data.items || []).length }));
+  // The explicit pick links the slip to the chosen item.
+  r = await H.req('POST', `/api/tax/filings/${projC}/slips`, {
+    kind: 'T4', tax_year: 2026, fields: { box14: 190704.02, employer_name: 'Tax Meta' }, source: 'manual', linkItemId: metaItemCId,
+  });
+  H.check('tax: explicit linkItemId links the T4 to the chosen item (amount already matches)',
+    r.status === 201 && r.data.linked === true && r.data.amountUpdated === false
+      && r.data.item && r.data.item.id === metaItemCId && r.data.item.slip_id === r.data.slip.id,
+    JSON.stringify(r.data));
+  // A pick that is not a match is a 400, not a silent link.
+  r = await H.req('POST', `/api/tax/filings/${projC}/slips`, {
+    kind: 'T4', tax_year: 2026, fields: { box14: 26000, employer_name: 'Tax Meta' }, source: 'manual', linkItemId: sideItemCId,
+  });
+  H.check('tax: linkItemId pointing at a non-match is a 400',
+    r.status === 400, JSON.stringify(r.status));
+  // The T4 governs: the Side item's amount moves to the slip's $50,000.
+  r = await H.req('POST', `/api/tax/filings/${projC}/slips`, {
+    kind: 'T4', tax_year: 2026, fields: { box14: 50000, employer_name: 'Tax Side' }, source: 'manual',
+  });
+  H.check('tax: T4 governs — the Side item takes the slip figure ($50,000.60 → $50,000)',
+    r.status === 201 && r.data.linked === true && r.data.amountUpdated === true && r.data.previousAmount === 50000.6
+      && r.data.item && r.data.item.id === sideItemCId && r.data.item.amount === 50000,
+    JSON.stringify(r.data));
+  const slipSideId = r.data.slip.id;
+  r = await H.req('GET', `/api/tax/filings/${projC}`);
+  const sideItem = (r.data.items || []).find((i) => i.id === sideItemCId);
+  H.check('tax: the link records the pre-slip amount; C still has 3 items and 2 slips',
+    (r.data.items || []).length === 3 && (r.data.slips || []).length === 2
+      && sideItem && sideItem.detail && sideItem.detail.preSlipAmount === 50000.6,
+    JSON.stringify({ items: (r.data.items || []).length, slips: (r.data.slips || []).length, sideItem }));
+  // Deleting the slip unlinks the item and restores its amount.
+  r = await H.req('DELETE', `/api/tax/slips/${slipSideId}`);
+  H.check('tax: deleting the Side slip succeeds', r.status === 200, JSON.stringify(r.status));
+  r = await H.req('GET', `/api/tax/filings/${projC}`);
+  const sideItem2 = (r.data.items || []).find((i) => i.id === sideItemCId);
+  H.check('tax: after the delete the Side item stays, unlinked, at its pre-slip amount',
+    (r.data.items || []).length === 3 && (r.data.slips || []).length === 1
+      && sideItem2 && sideItem2.slip_id == null && sideItem2.amount === 50000.6
+      && !(sideItem2.detail && sideItem2.detail.preSlipAmount != null),
+    JSON.stringify(sideItem2));
 
   // ---- 2025 fixture filing: the T4 slip places the employment
   // item, the rest are added manually — the refund must
@@ -291,8 +389,12 @@ export async function run(H, S) {
       && r.data.lines.find((l) => l.line === '43500').amount === 337393.99,
     JSON.stringify(r.data));
   r = await H.req('GET', `/api/tax/filings/${projA}/refund`);
-  H.check('tax: the 2026 refund endpoint answers for A too',
-    r.status === 200 && typeof r.data.refund === 'number' && r.data.province === 'BC',
+  H.check('tax: the 2026 refund is computed on the single employment item — Balance owing $54,251.60',
+    r.status === 200 && r.data.refund === -54251.6 && r.data.isRefund === false && r.data.label === 'Balance owing'
+      && r.data.displayAmount === 54251.6 && r.data.province === 'BC'
+      && r.data.lines.find((l) => l.line === '15000') && r.data.lines.find((l) => l.line === '15000').amount === 195924.1
+      && r.data.lines.find((l) => l.line === '43500').amount === 54251.6
+      && r.data.lines.find((l) => l.line === '48400').amount === -54251.6,
     JSON.stringify({ refund: r.data.refund, province: r.data.province }));
   // ---- the list endpoint carries the card balance ----
   const refundA = r.data;
@@ -389,16 +491,18 @@ export async function run(H, S) {
     JSON.stringify({ total: r.data.total, taxCount, modules: [...new Set((r.data.commits || []).map((c) => c.module))] }));
 
   // ---- Export round-trip: tax tables travel, delete, import, back ----
-  // A: 8 items (4 candidates + manual T776 + derived row + RESP +
-  // T4-slip employment) · B: 3 (gig + rental + derived row) ·
-  // 2025: 5 (T4-slip employment + 4 manual) · slips: 2.
+  // A: 7 items (4 candidates + manual T776 + derived row + RESP —
+  // the T4 slip linked to the candidate, no duplicate) · B: 3
+  // (gig + rental + derived row) · C: 3 (three job candidates,
+  // one slip-linked) · 2025: 5 (T4-slip employment + 4 manual) ·
+  // slips: 3 (A 1, C 1, 2025 1 — the Side slip was deleted).
   r = await H.req('GET', '/api/admin/data/export');
   const taxExport = r.data;
-  H.check('tax: export carries all four Tax tables with rows (16 items, 2 slips)',
+  H.check('tax: export carries all four Tax tables with rows (18 items, 3 slips)',
     r.status === 200 && Array.isArray(taxExport.tables.tax_filings) && taxExport.tables.tax_filings.some((f) => f.id === projA)
       && Array.isArray(taxExport.tables.tax_profiles) && taxExport.tables.tax_profiles.some((p) => p.rrsp_room === 20000)
-      && Array.isArray(taxExport.tables.tax_items) && taxExport.tables.tax_items.length === 16
-      && Array.isArray(taxExport.tables.tax_slips) && taxExport.tables.tax_slips.length === 2,
+      && Array.isArray(taxExport.tables.tax_items) && taxExport.tables.tax_items.length === 18
+      && Array.isArray(taxExport.tables.tax_slips) && taxExport.tables.tax_slips.length === 3,
     JSON.stringify({ filings: (taxExport.tables.tax_filings || []).length, profiles: (taxExport.tables.tax_profiles || []).length, items: (taxExport.tables.tax_items || []).length, slips: (taxExport.tables.tax_slips || []).length }));
   r = await H.req('DELETE', `/api/tax/filings/${projA}`);
   H.check('tax: project A deleted', r.status === 200, JSON.stringify(r.status));
@@ -409,7 +513,7 @@ export async function run(H, S) {
   await ensureAdmin();
   r = await H.req('GET', `/api/tax/filings/${projA}`);
   H.check('tax: project A is back after import',
-    r.status === 200 && r.data.name === 'Tax return 2026' && (r.data.items || []).length === 8 && (r.data.slips || []).length === 1,
+    r.status === 200 && r.data.name === 'Tax return 2026' && (r.data.items || []).length === 7 && (r.data.slips || []).length === 1,
     JSON.stringify({ name: r.data && r.data.name, items: (r.data.items || []).length, slips: (r.data.slips || []).length }));
 
   // ---- UI: switcher, card click, detail, refund popup, RRSP
@@ -719,6 +823,18 @@ export async function run(H, S) {
         return el && el.textContent.trim() === 'Tax return 2026 — Shawn · 2026' ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxDetailTitle').textContent));
+    H.check('tax UI: the slip row shows the item it was linked to',
+      await until(() => {
+        const el = document.querySelector('#taxSlipList');
+        return el && el.textContent.includes('Tax Meta — employment income') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxSlipList').textContent));
+    H.check('tax UI: the linked employment item carries the T4 slip tag',
+      await until(() => {
+        const el = document.querySelector('#taxSections');
+        return el && /T4 slip/.test(el.textContent) ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxSections').textContent.slice(0, 600)));
     H.check('tax UI: an open project detail shows no status element (no Open, no Filed)',
       await until(() => {
         const st = document.querySelector('#taxDetailStatus');

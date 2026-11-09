@@ -362,6 +362,58 @@ export function validTaxProfileInput(b) {
   return null;
 }
 
+// --------------------------------------------- slip → item linking --
+// Adding a slip links it to an equivalent item already in the
+// project instead of creating a second one (user 2026-11-08).
+// "Equivalent" is KIND + SOURCE NAME, deliberately NOT the
+// amount: the slip governs (user 2026-11-08 19:28 — the T4's
+// boxes are the official figures), so a candidate item whose
+// amount differs by rounding — or by the app's own record of
+// the source — still matches, and the link updates the item to
+// the slip's figures. The amount is never part of the identity.
+//
+//   - kind: the slip's item kind (region slipToItemKind).
+//   - source name: the slip's employer/payer name against the
+//     item's detail.employer / detail.payer (job candidates
+//     store detail.employer; a manual item matches only when it
+//     carries one of those detail fields). Compared
+//     case-insensitively with whitespace collapsed; a slip with
+//     no name filled matches nothing.
+//   - the pool excludes items already backed by a slip (a second
+//     slip for the same source is its own item — the user edits
+//     or deletes the first slip), derived rows, and excluded
+//     items.
+// One match → link it. Several → the server answers 409 with
+// the matches and the UI asks the user which one; it never
+// guesses. No match → the slip creates its item as before.
+export function normalizeSourceName(name) {
+  if (typeof name !== 'string') return null;
+  const n = name.trim().replace(/\s+/g, ' ');
+  return n ? n.toLowerCase() : null;
+}
+
+export function itemSourceName(item) {
+  if (!item) return null;
+  let d = item.detail;
+  if (typeof d === 'string') { try { d = JSON.parse(d || '{}'); } catch { d = {}; } }
+  if (!d || typeof d !== 'object') return null;
+  return d.employer || d.payer || null;
+}
+
+export function findSlipLinkMatches(items, itemKind, payerName) {
+  const want = normalizeSourceName(payerName);
+  if (!itemKind || !want) return [];
+  return (items || []).filter((it) => {
+    if (!it || it.kind !== itemKind) return false;
+    if (it.status === 'excluded') return false;
+    if (it.slip_id != null) return false;
+    let d = it.detail;
+    if (typeof d === 'string') { try { d = JSON.parse(d || '{}'); } catch { d = {}; } }
+    if (d && typeof d === 'object' && d.derived) return false;
+    return normalizeSourceName(itemSourceName(it)) === want;
+  });
+}
+
 // ------------------------------------------- expected-items context --
 // Build the region's expectedItems() context from the app's rows.
 // jobRows are earnJobRow-shaped ({ tax_year, employer, owner,

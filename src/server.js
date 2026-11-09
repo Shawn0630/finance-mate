@@ -61,7 +61,7 @@ import {
   validSharePct, validTaxItemInput, validTaxSlipInput, validTaxProfileInput,
   buildExpectedContext, rrspBenefit, rentalDeductible, rentalNet,
   respRoomSplit, cesgRoomSplit, RESP_LIFETIME_LIMIT,
-  taxRoomCutoff, throughDate,
+  taxRoomCutoff, throughDate, findSlipLinkMatches,
 } from './tax.js';
 import {
   applyStoredCustomSinkRate,
@@ -4847,16 +4847,47 @@ app.post('/api/tax/filings/:id/slips', requireApiAuth, (req, res) => {
   const itemKind = regionTax.slipToItemKind(b.kind);
   const amount = regionTax.slipAmount(b.kind, b.fields);
   const person = db.prepare('SELECT username FROM users WHERE id = ?').get(filing.person_id);
+  // The slip's box fields, cleaned to the kind's own fields —
+  // the payer name and the stored slip both read this object.
+  const fields = {};
+  for (const f of regionTax.slipKindDef(b.kind).fields) {
+    if (b.fields[f.key] != null && b.fields[f.key] !== '') fields[f.key] = b.fields[f.key];
+  }
+  // Slip → existing-item linking (user 2026-11-08): when an
+  // equivalent item is already in this project, the slip links
+  // to it instead of creating a second one. The match is
+  // decided BEFORE anything is written — on ambiguity nothing
+  // is saved and the client asks the user which item it is.
+  let linkTarget = null;
+  if (itemKind && amount != null) {
+    const payerName = regionTax.slipPayerName(b.kind, fields);
+    const filingItems = db.prepare('SELECT * FROM tax_items WHERE filing_id = ?').all(filing.id).map(taxItemView);
+    const matches = findSlipLinkMatches(filingItems, itemKind, payerName);
+    if (b.linkItemId != null) {
+      // The user's explicit pick after an ambiguous 409: it
+      // must be one of the matches, re-checked here (never
+      // trusted from the client).
+      linkTarget = matches.find((m) => Number(m.id) === Number(b.linkItemId)) || null;
+      if (!linkTarget) {
+        return res.status(400).json({ error: 'that item is not a match for this slip — pick one of the listed matches.' });
+      }
+    } else if (matches.length === 1) {
+      linkTarget = matches[0];
+    } else if (matches.length > 1) {
+      return res.status(409).json({
+        error: `this ${b.kind} slip matches ${matches.length} items already in this project — pick which one it belongs to.`,
+        candidates: matches,
+      });
+    }
+  }
   const out = commitTx(req, 'tax', {
     module: 'tax', entityType: 'filing', entityId: filing.id,
     entityLabel: `${taxFilingLabel(filing, person)}`,
-    summary: `Added ${b.kind} slip · ${taxFilingLabel(filing, person)}`,
+    summary: linkTarget
+      ? `Linked ${b.kind} slip to ${linkTarget.label} · ${taxFilingLabel(filing, person)}`
+      : `Added ${b.kind} slip · ${taxFilingLabel(filing, person)}`,
   }, () => {
     const now = nowIso();
-    const fields = {};
-    for (const f of regionTax.slipKindDef(b.kind).fields) {
-      if (b.fields[f.key] != null && b.fields[f.key] !== '') fields[f.key] = b.fields[f.key];
-    }
     const slipInfo = db.prepare(`INSERT INTO tax_slips
       (filing_id, kind, tax_year, fields, source, ai_fields, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -4864,15 +4895,34 @@ app.post('/api/tax/filings/:id/slips', requireApiAuth, (req, res) => {
         Array.isArray(b.ai_fields) ? JSON.stringify(b.ai_fields) : null, now, now);
     const slipId = slipInfo.lastInsertRowid;
     let item = null;
+    let linked = false;
+    let amountUpdated = false;
+    let previousAmount = null;
     if (itemKind && amount != null) {
-      const info = db.prepare(`INSERT INTO tax_items
+      if (linkTarget) {
+        // The slip governs (user 2026-11-08 19:28): the item
+        // takes the slip's figures. A changed amount is recorded
+        // in the item's detail so deleting the slip restores it.
+        const detail = { ...(linkTarget.detail || {}) };
+        if (Number(linkTarget.amount) !== Number(amount)) {
+          previousAmount = Number(linkTarget.amount);
+          detail.preSlipAmount = previousAmount;
+          amountUpdated = true;
+        }
+        db.prepare('UPDATE tax_items SET slip_id = ?, amount = ?, detail = ?, updated_at = ? WHERE id = ?')
+          .run(slipId, amount, JSON.stringify(detail), now, linkTarget.id);
+        item = taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(linkTarget.id));
+        linked = true;
+      } else {
+        const info = db.prepare(`INSERT INTO tax_items
         (filing_id, tax_year, kind, label, source_type, source_id, slip_id, amount, currency, share_pct, status, detail, notes, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'slip', ?, ?, ?, 'CAD', 100, 'linked', ?, NULL, ?, ?)`)
-        .run(filing.id, filing.tax_year, itemKind, `${b.kind} — ${regionTax.slipKindDef(b.kind).label}`,
-          slipId, slipId, amount, JSON.stringify({ slip_kind: b.kind }), now, now);
-      item = taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(info.lastInsertRowid));
+          .run(filing.id, filing.tax_year, itemKind, `${b.kind} — ${regionTax.slipKindDef(b.kind).label}`,
+            slipId, slipId, amount, JSON.stringify({ slip_kind: b.kind }), now, now);
+        item = taxItemView(db.prepare('SELECT * FROM tax_items WHERE id = ?').get(info.lastInsertRowid));
+      }
     }
-    return { value: { slip: taxSlipView(db.prepare('SELECT * FROM tax_slips WHERE id = ?').get(slipId)), item }, entityId: filing.id };
+    return { value: { slip: taxSlipView(db.prepare('SELECT * FROM tax_slips WHERE id = ?').get(slipId)), item, linked, amountUpdated, previousAmount }, entityId: filing.id };
   });
   res.status(201).json(out);
 });
@@ -4910,8 +4960,16 @@ app.put('/api/tax/slips/:id', requireApiAuth, (req, res) => {
       const amount = regionTax.slipAmount(next.kind, fields);
       const itemKind = regionTax.slipToItemKind(next.kind);
       if (itemKind && amount != null) {
-        db.prepare('UPDATE tax_items SET kind = ?, label = ?, amount = ?, updated_at = ? WHERE id = ?')
-          .run(itemKind, `${next.kind} — ${regionTax.slipKindDef(next.kind).label}`, amount, nowIso(), item.id);
+        if (item.source_type === 'slip') {
+          db.prepare('UPDATE tax_items SET kind = ?, label = ?, amount = ?, updated_at = ? WHERE id = ?')
+            .run(itemKind, `${next.kind} — ${regionTax.slipKindDef(next.kind).label}`, amount, nowIso(), item.id);
+        } else {
+          // A pre-existing item linked to this slip keeps its own
+          // label (it names the source) — only the slip's figures
+          // follow the slip; the slip governs the amount.
+          db.prepare('UPDATE tax_items SET kind = ?, amount = ?, updated_at = ? WHERE id = ?')
+            .run(itemKind, amount, nowIso(), item.id);
+        }
       }
     }
     return { value: null, entityId: filing.id };
@@ -4931,8 +4989,24 @@ app.delete('/api/tax/slips/:id', requireApiAuth, (req, res) => {
   }, () => {
     const item = db.prepare('SELECT * FROM tax_items WHERE slip_id = ?').get(slip.id);
     if (item) {
-      if (item.status === 'linked') db.prepare('DELETE FROM tax_items WHERE id = ?').run(item.id);
-      else db.prepare("UPDATE tax_items SET slip_id = NULL, source_type = 'manual', source_id = NULL, updated_at = ? WHERE id = ?").run(nowIso(), item.id);
+      if (item.source_type === 'slip' && item.status === 'linked') {
+        db.prepare('DELETE FROM tax_items WHERE id = ?').run(item.id);
+      } else if (item.source_type === 'slip') {
+        db.prepare("UPDATE tax_items SET slip_id = NULL, source_type = 'manual', source_id = NULL, updated_at = ? WHERE id = ?").run(nowIso(), item.id);
+      } else {
+        // The item predates the slip (a candidate or manual item
+        // the slip was linked to): it stays, unlinked, with its
+        // pre-slip amount restored when the link had changed it.
+        let detail = {};
+        try { detail = JSON.parse(item.detail || '{}'); } catch { detail = {}; }
+        let amount = item.amount;
+        if (isFinite(Number(detail.preSlipAmount))) {
+          amount = Number(detail.preSlipAmount);
+          delete detail.preSlipAmount;
+        }
+        db.prepare('UPDATE tax_items SET slip_id = NULL, amount = ?, detail = ?, updated_at = ? WHERE id = ?')
+          .run(amount, JSON.stringify(detail), nowIso(), item.id);
+      }
     }
     db.prepare('DELETE FROM tax_slips WHERE id = ?').run(slip.id);
     return { value: null, entityId: filing.id };

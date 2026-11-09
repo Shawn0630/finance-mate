@@ -25,6 +25,7 @@ import {
   effectiveAmount, filingTotals, rentalDeductible, rentalNet,
   validSharePct, validTaxItemInput, validTaxSlipInput, validTaxProfileInput,
   buildExpectedContext, planOwnAnnual,
+  normalizeSourceName, itemSourceName, findSlipLinkMatches,
 } from '../src/tax.js';
 
 const jobRow = (over = {}) => ({
@@ -81,6 +82,63 @@ test('slipAmount: only the income boxes count — tax deducted and cost base nev
   assert.equal(caTax.slipAmount('T4', {}), null);
   assert.equal(caTax.slipAmount('T4', { box22: 40000 }), null);
   assert.equal(caTax.slipAmount('NOPE', { box14: 1 }), null);
+});
+
+test('slipPayerName: the name field per kind — employer_name on a T4, payer_name elsewhere; blank is null', () => {
+  assert.equal(caTax.slipPayerName('T4', { employer_name: 'Tax Meta', box14: 1 }), 'Tax Meta');
+  assert.equal(caTax.slipPayerName('T5', { payer_name: 'Big Bank', box13: 5 }), 'Big Bank');
+  assert.equal(caTax.slipPayerName('T4A', { payer_name: 'Pension Co' }), 'Pension Co');
+  assert.equal(caTax.slipPayerName('T4', { box14: 1 }), null);
+  assert.equal(caTax.slipPayerName('T4', { employer_name: '  ' }), null);
+  assert.equal(caTax.slipPayerName('NOPE', { payer_name: 'X' }), null);
+});
+
+// -------------------------------------------- slip → item linking --
+// The matching rule (user 2026-11-08; the slip governs, 19:28):
+// kind + source name only — the amount is NOT part of the
+// identity, so a candidate whose amount differs from the slip
+// still matches and the link updates it to the slip's figures.
+test('findSlipLinkMatches: kind + source name, case/whitespace-insensitive; the amount is not the identity', () => {
+  const jobItem = { id: 1, kind: 'employment', amount: 190704.02, status: 'linked', slip_id: null, detail: { employer: 'Tax Meta', taxYear: 2026 } };
+  assert.deepEqual(findSlipLinkMatches([jobItem], 'employment', 'Tax Meta').map((i) => i.id), [1]);
+  assert.deepEqual(findSlipLinkMatches([jobItem], 'employment', '  tax   META ').map((i) => i.id), [1]);
+  // The candidate's amount differs from the slip's by rounding —
+  // it still matches; the T4 governs the figure on link.
+  const rounded = { ...jobItem, amount: 190704.00 };
+  assert.deepEqual(findSlipLinkMatches([rounded], 'employment', 'Tax Meta').map((i) => i.id), [1]);
+  // A bigger disagreement is still a match: the app's record of
+  // the source may differ from the slip, and the slip wins.
+  const off = { ...jobItem, amount: 50000.60 };
+  assert.deepEqual(findSlipLinkMatches([off], 'employment', 'Tax Meta').map((i) => i.id), [1]);
+  assert.equal(normalizeSourceName('  Tax   Meta '), 'tax meta');
+  assert.equal(normalizeSourceName(''), null);
+  assert.equal(normalizeSourceName(null), null);
+  assert.equal(itemSourceName(jobItem), 'Tax Meta');
+  assert.equal(itemSourceName({ detail: { payer: 'Big Bank' } }), 'Big Bank');
+  assert.equal(itemSourceName({ detail: {} }), null);
+  assert.equal(itemSourceName({ detail: '{"employer":"Tax Meta"}' }), 'Tax Meta');
+});
+
+test('findSlipLinkMatches: no name, wrong kind, slip-backed, derived and excluded items never match', () => {
+  const base = { kind: 'employment', amount: 100, status: 'linked', slip_id: null, detail: { employer: 'Tax Meta' } };
+  assert.deepEqual(findSlipLinkMatches([base], 'employment', null), []);
+  assert.deepEqual(findSlipLinkMatches([base], 'employment', ''), []);
+  assert.deepEqual(findSlipLinkMatches([base], 'investment_income', 'Tax Meta'), []);
+  assert.deepEqual(findSlipLinkMatches([{ ...base, slip_id: 9 }], 'employment', 'Tax Meta'), []);
+  assert.deepEqual(findSlipLinkMatches([{ ...base, status: 'excluded' }], 'employment', 'Tax Meta'), []);
+  assert.deepEqual(findSlipLinkMatches([{ ...base, detail: { employer: 'Tax Meta', derived: true } }], 'employment', 'Tax Meta'), []);
+  // A T5 never matches a dividend candidate: the candidate
+  // carries a holding/account, not the slip's payer name.
+  const div = { id: 7, kind: 'investment_income', amount: 123.45, status: 'linked', slip_id: null, detail: { holding: 'SHOP', account: 'Tax Margin' } };
+  assert.deepEqual(findSlipLinkMatches([div], 'investment_income', 'SHOP'), []);
+  assert.deepEqual(findSlipLinkMatches([div], 'investment_income', 'Tax Margin'), []);
+  // Two items for the same employer both match — the server
+  // answers 409 and the UI asks; it never guesses.
+  const two = [
+    { id: 1, ...base },
+    { id: 2, ...base, amount: 26000 },
+  ];
+  assert.deepEqual(findSlipLinkMatches(two, 'employment', 'Tax Meta').map((i) => i.id), [1, 2]);
 });
 
 // --------------------------------------------------------- expected items --

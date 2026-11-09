@@ -644,11 +644,15 @@ function taxCreateProjectModal(personId) {
   });
 }
 
-function taxItemRowHtml(it) {
+function taxItemRowHtml(it, slips) {
   const derived = it.detail && it.detail.derived;
   const tags = [];
   if (derived) tags.push('Derived');
   if (it.kind === 'resp') tags.push('Non-deductible');
+  if (it.slip_id != null) {
+    const slip = (slips || []).find((s) => s.id === it.slip_id);
+    tags.push(slip ? `${slip.kind} slip` : 'Slip');
+  }
   const tagHtml = tags.length ? ` <span class="note">${tags.join(' · ')}</span>` : '';
   return `<tr><td>${esc(TAX_KIND_LABELS[it.kind] || it.kind)}</td>
     <td>${esc(it.label)}${tagHtml}${it.detail && it.detail.note ? `<div class="note">${esc(it.detail.note)}</div>` : ''}${it.notes ? `<div class="note">${esc(it.notes)}</div>` : ''}</td>
@@ -697,7 +701,8 @@ async function loadTaxFiling(id) {
           const def = taxSlipKinds.find((k) => k.kind === s.kind);
           const boxes = def ? def.fields.filter((f) => f.money && s.fields[f.key] != null)
             .map((f) => `${f.label.split('—')[0].trim()} ${money2(s.fields[f.key])}`).join(' · ') : '';
-          return `<tr><td>${esc(s.kind)} — ${esc(def ? def.label.split('—')[1]?.trim() || '' : '')}</td>
+          const linkedItem = (data.items || []).find((i) => i.slip_id === s.id);
+          return `<tr><td>${esc(s.kind)} — ${esc(def ? def.label.split('—')[1]?.trim() || '' : '')}${linkedItem ? `<div class="note">→ ${esc(linkedItem.label)} · ${money2(linkedItem.amount)}</div>` : ''}</td>
             <td>${s.tax_year}</td><td>${esc(boxes)}</td><td>${esc(s.source)}</td>
             <td class="actions"><button class="small" data-tax-edit-slip="${s.id}">Edit</button>
             <button class="small danger" data-tax-del-slip="${s.id}">Delete</button></td></tr>`;
@@ -705,7 +710,12 @@ async function loadTaxFiling(id) {
       : '<div class="note">No slips yet.</div>';
     document.querySelectorAll('[data-tax-edit-slip]').forEach((b) => b.addEventListener('click', () => taxSlipModal(Number(b.dataset.taxEditSlip))));
     document.querySelectorAll('[data-tax-del-slip]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Delete this slip? Its linked item is deleted too, unless confirmed.')) return;
+      const slip = (data.slips || []).find((s) => s.id === Number(b.dataset.taxDelSlip));
+      const linkedItem = slip ? (data.items || []).find((i) => i.slip_id === slip.id) : null;
+      const confirmText = linkedItem && linkedItem.source_type !== 'slip'
+        ? 'Delete this slip? The item it was linked to stays in the project (it existed before the slip).'
+        : 'Delete this slip? Its linked item is deleted too, unless confirmed.';
+      if (!confirm(confirmText)) return;
       try { await api(`/api/tax/slips/${b.dataset.taxDelSlip}`, { method: 'DELETE' }); loadTaxFiling(id); }
       catch (err) { taxMsg(msg, 'err', err.message); }
     }));
@@ -726,7 +736,7 @@ async function loadTaxFiling(id) {
         <button class="small" data-tax-add-item="${s.key}">+ Add</button></div>
         <div class="note">${esc(s.sub)}${s.key === 'registered' && taxRrspWindow ? ` · RRSP window ${esc(taxRrspWindow.label)}` : ''}</div>
         ${items.length
-          ? `<table><thead><tr><th>Kind</th><th>Item</th><th class="num">Amount</th><th class="num">Share</th><th class="num">Effective</th><th>Status</th><th></th></tr></thead><tbody>${items.map(taxItemRowHtml).join('')}</tbody></table>`
+          ? `<table><thead><tr><th>Kind</th><th>Item</th><th class="num">Amount</th><th class="num">Share</th><th class="num">Effective</th><th>Status</th><th></th></tr></thead><tbody>${items.map((it) => taxItemRowHtml(it, data.slips)).join('')}</tbody></table>`
           : '<div class="note">No items yet.</div>'}</div>`;
     }).join('');
     const reviewCards = TAX_SECTIONS.map((s) => {
@@ -972,7 +982,7 @@ function taxAddItemModal(sectionKey) {
       const kind = formType.slice(5);
       host.innerHTML = `<form id="taxAddSlipForm">
         <div id="taxAddSlipFields">${taxSlipFieldsHtml(kind, preset && preset.fields ? preset.fields : {})}</div>
-        <div class="note">Saving the slip places its item in ${esc(sec.label)}.</div>
+        <div class="note">Saving the slip places its item in ${esc(sec.label)} — or links it to the matching item if one is already there.</div>
         <div class="toolbar"><button type="submit" class="primary">Save slip</button><button type="button" data-close-modal>Cancel</button></div>
       </form>`;
       $('#taxAddSlipForm').addEventListener('submit', async (e) => {
@@ -985,11 +995,9 @@ function taxAddItemModal(sectionKey) {
           const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
           if (raw !== '' && raw != null) fields[fld.key] = fld.money ? Number(raw) : raw;
         }
-        try {
-          await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { kind, tax_year: taxFiling.tax_year, fields, source: 'manual' } });
-          closeModalEl($('#taxModal'));
-          loadTaxFiling(taxFiling.id);
-        } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+        await taxSaveSlip({ kind, tax_year: taxFiling.tax_year, fields, source: 'manual' },
+          () => { closeModalEl($('#taxModal')); loadTaxFiling(taxFiling.id); },
+          (err) => taxMsg($('#taxModalMsg'), 'err', err.message));
       });
     } else if (formType === 't776') {
       host.innerHTML = `<form id="taxAddT776Form">
@@ -1547,6 +1555,40 @@ function taxSlipFormHtml(kind, taxYearValue, fields, aiFields) {
   </form>`;
 }
 
+// Save a slip; when the server answers 409 (the slip matches
+// several items already in the project), ask the user which one
+// it belongs to instead of creating a duplicate. onSaved runs
+// after a successful save (direct or via the chooser); onError
+// takes any other failure. Nothing is written on a 409 — the
+// chooser re-POSTs the same slip with linkItemId.
+async function taxSaveSlip(body, onSaved, onError) {
+  try {
+    await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body });
+    onSaved();
+  } catch (err) {
+    const cands = err && err.details && Array.isArray(err.details.candidates) ? err.details.candidates : null;
+    if (!cands || !cands.length) { onError(err); return; }
+    taxSlipLinkChooser(body, cands, onSaved, onError);
+  }
+}
+
+function taxSlipLinkChooser(body, candidates, onSaved, onError) {
+  taxOpenModal('Link slip to an existing item', `
+    <div class="note">This ${esc(body.kind)} slip matches ${candidates.length} items already in this project. Pick the one it belongs to — the slip's figures will replace that item's amount. Nothing was saved yet.</div>
+    <form id="taxSlipLinkForm">
+      ${candidates.map((c) => `<label class="kv"><span>${esc(c.label)} · ${money2(c.amount)} · ${esc(c.status)}</span><input type="radio" name="linkItemId" value="${c.id}" required></label>`).join('')}
+      <div class="toolbar"><button type="submit" class="primary">Link slip</button><button type="button" data-close-modal>Cancel</button></div>
+    </form>`);
+  $('#taxSlipLinkForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const linkItemId = Number(new FormData(e.target).get('linkItemId'));
+    try {
+      await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { ...body, linkItemId } });
+      onSaved();
+    } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+  });
+}
+
 function taxSlipModal(slipId) {
   const slip = slipId ? (taxFiling.slips || []).find((s) => s.id === slipId) : null;
   const open = (kind, fields) => {
@@ -1569,12 +1611,14 @@ function taxSlipModal(slipId) {
         if (raw !== '' && raw != null) fields[fld.key] = fld.money ? Number(raw) : raw;
       }
       const body = { kind: f.kind.value, tax_year: Number(f.tax_year.value), fields };
-      try {
-        if (slip) await api(`/api/tax/slips/${slip.id}`, { method: 'PUT', body });
-        else await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { ...body, source: 'manual' } });
-        closeModalEl($('#taxModal'));
-        loadTaxFiling(taxFiling.id);
-      } catch (err) { taxMsg($('#taxModalMsg'), 'err', err.message); }
+      const done = () => { closeModalEl($('#taxModal')); loadTaxFiling(taxFiling.id); };
+      const fail = (err) => taxMsg($('#taxModalMsg'), 'err', err.message);
+      if (slip) {
+        try { await api(`/api/tax/slips/${slip.id}`, { method: 'PUT', body }); done(); }
+        catch (err) { fail(err); }
+      } else {
+        await taxSaveSlip({ ...body, source: 'manual' }, done, fail);
+      }
     });
   };
   open(slip ? slip.kind : (taxSlipKinds[0] ? taxSlipKinds[0].kind : 'T4'), slip ? slip.fields : {});
@@ -1650,11 +1694,9 @@ function taxAiSlipModal() {
           const raw = fld.money ? parseMoneyInput(input.value) : input.value.trim();
           if (raw !== '' && raw != null) { fields[fld.key] = fld.money ? Number(raw) : raw; aiFields.push(fld.key); }
         }
-        try {
-          await api(`/api/tax/filings/${taxFiling.id}/slips`, { method: 'POST', body: { kind, tax_year: Number(f.tax_year.value), fields, source: 'ai', ai_fields: aiFields } });
-          closeModalEl($('#taxModal'));
-          loadTaxFiling(taxFiling.id);
-        } catch (err) { showMsg(msg, 'err', err.message); }
+        await taxSaveSlip({ kind, tax_year: Number(f.tax_year.value), fields, source: 'ai', ai_fields: aiFields },
+          () => { closeModalEl($('#taxModal')); loadTaxFiling(taxFiling.id); },
+          (err) => showMsg(msg, 'err', err.message));
       });
     } catch (err) { showMsg(msg, 'err', err.message); }
     finally { btn.disabled = false; btn.textContent = 'Extract'; }
