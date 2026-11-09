@@ -55,7 +55,11 @@ const TAX_DEDUCTED_BOXES = {
   T4RSP: ['box22'], T4RIF: ['box22'],
 };
 
-function countedItems(items) {
+// Items that enter the T1 math: not excluded, and not a derived
+// row (a derived rental-deduction row is already netted in its
+// source item — counting it would double-count). Exported so the
+// server's home-card balance uses the same rule as the headline.
+export function countedItems(items) {
   return (items || []).filter((it) => {
     if (!it || it.status === 'excluded') return false;
     if (it.detail && it.detail.derived) return false; // already netted in its source item

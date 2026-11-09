@@ -583,25 +583,31 @@ async function loadTax() {
     }));
     const filer = filers.find((f) => f.person.id === taxPersonId);
     if (!filer) {
-      $('#taxPersonBody').innerHTML = '<div class="note">No filers.</div>';
+      $('#taxPersonBody').innerHTML = '<div class="panel"><div class="note">No filers.</div></div>';
       $('#taxRoomLine').innerHTML = '';
       $('#taxHomeCharts').innerHTML = '';
       return;
     }
-    // One card per project for the year. The whole card opens
-    // the detail on click — no Open button.
+    // One card per project for the year: title + highlighted
+    // balance (the same T1 refund / balance-owing figure as the
+    // detail headline), nothing else — no meta line. A project
+    // with no computable balance yet shows the title only. The
+    // whole card opens the detail on click — no Open button.
+    // The right column is a panel like the left one, so both
+    // sections start at the same height with their headers on
+    // one baseline.
     const projects = filer.projects || [];
-    $('#taxPersonBody').innerHTML = `<div class="section-head"><h3>Tax profile for ${esc(filer.person.username)} · ${taxYear}</h3><div class="spacer"></div>
+    $('#taxPersonBody').innerHTML = `<div class="panel" id="taxPersonPanel"><div class="section-head"><h3>Tax profile for ${esc(filer.person.username)} · ${taxYear}</h3><div class="spacer"></div>
       <button class="small" id="taxCreateProjectBtn">+ Create project</button></div>` +
       (projects.map((p) => {
-        const kinds = Object.entries(p.totals.byKind || {})
-          .map(([k, v]) => `<span class="nowrap">${TAX_KIND_LABELS[k] || k} ${money2(v)}</span>`).join(' · ');
         // No status element on an open project — the whole card
         // opens on click. A filed project alone carries a Filed tag.
+        const bal = p.refund
+          ? `<div class="k">${esc(p.refund.label)}</div><div class="v ${p.refund.isRefund ? 'positive' : 'negative'}">${money2(p.refund.displayAmount)}</div>`
+          : '';
         return `<div class="panel breakdown-card" data-tax-open="${p.id}"><div class="section-head"><h3>${esc(p.name)}</h3>
-          <div class="spacer"></div>${p.status === 'filed' ? '<span>Filed</span>' : ''}</div>
-          <div><span class="nowrap">${p.itemCount} item${p.itemCount === 1 ? '' : 's'}</span>${kinds ? ` · ${kinds}` : ''}</div></div>`;
-      }).join('') || '<div class="note">No projects yet.</div>');
+          <div class="spacer"></div>${p.status === 'filed' ? '<span>Filed</span>' : ''}</div>${bal}</div>`;
+      }).join('') || '<div class="note">No projects yet.</div>') + `</div>`;
     document.querySelectorAll('[data-tax-open]').forEach((el) => el.addEventListener('click', () => { location.hash = `#tax/filing/${el.dataset.taxOpen}`; }));
     $('#taxCreateProjectBtn').addEventListener('click', () => taxCreateProjectModal(filer.person.id));
     // Contribution room for the selected person (user-entered

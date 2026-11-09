@@ -32,8 +32,8 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px; }
 .summary-card { background: #fff; border: 1px solid #dde4ec; border-radius: 10px; padding: 14px 16px; }
 .summary-card .k { font-size: 12px; color: #5a6a7a; text-transform: uppercase; letter-spacing: .04em; }
 .summary-card .v { font-size: 22px; font-weight: 650; margin-top: 4px; }
-.summary-card .v.negative { color: #b3261e; }
-.summary-card .v.positive { color: #14632f; }
+.summary-card .v.negative, .breakdown-card .v.negative { color: #b3261e; }
+.summary-card .v.positive, .breakdown-card .v.positive { color: #14632f; }
 .note { color: #71808f; font-size: 12px; margin: 6px 2px 16px; }
 h2 { font-size: 16px; margin: 22px 0 10px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
@@ -323,20 +323,24 @@ tr.sub td { color: #71808f; font-size: 12px; }
 .tax-room-grid .panel > div:last-child { margin-top: auto; }
 .tax-room-grid .chart-wrap.short { height: 150px; }
 /* Tax home: Contribution room (left) and the project list
-   (right) sit side by side in two columns — the year selector,
-   person switcher and headings stay above them. Stacked on
-   narrow screens (900px matches the .portfolio-grid stack
-   point). The room cards' own grid is unchanged. */
+   (right) sit side by side in two parallel panels — the
+   person switcher + year selector share one row above them.
+   Stacked on narrow screens (900px matches the .portfolio-grid
+   stack point). The room cards' own grid is unchanged. */
 .tax-home-cols { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 @media (max-width: 900px) { .tax-home-cols { grid-template-columns: 1fr; } }
-/* The right column's heading shares the left panel's header
-   baseline: the panel's 16px top padding is matched here, and
-   the h3 loses the browser's default margins (which made this
-   row 52px tall) and matches the panel h3 size, so both header
-   rows are 25px tall with text tops within 1px (the 1px is the
-   panel's 1px border). */
-#taxPersonBody > .section-head { padding: 16px 0 0; }
-#taxPersonBody > .section-head h3 { margin: 0 0 8px; font-size: 15px; }
+/* Tax home: person switcher and tax-year selector share one row —
+   switcher left, year right at fitting width (the global
+   select { width: 100% } rule must not stretch it full-width). */
+.tax-selector-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.tax-selector-row select { width: auto; margin-left: auto; }
+/* Tax home: the two columns are parallel panels — the right
+   column's body is wrapped in #taxPersonPanel, so both sections
+   start at the same height with their headers on one baseline
+   (the same .panel padding, the same .section-head row). The
+   last inner card sheds its bottom margin so the panel's own
+   padding is the bottom air. */
+#taxPersonPanel > .breakdown-card:last-child { margin-bottom: 0; }
 /* Meta segments never break mid-segment (the "Rental -$3,506.90"
    hyphen used to split across lines) — wraps happen only at the
    " · " separators between segments. */

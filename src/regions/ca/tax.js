@@ -390,5 +390,8 @@ export function expectedItems(ctx) {
 // The T1 computation behind the refund headline + popup (see
 // ./t1.js): one compute surface, federal + province modules under
 // it. Re-exported so the server calls region.tax.computeT1(...)
-// and the UI never sees a bracket table.
-export { computeT1 } from './t1.js';
+// and the UI never sees a bracket table. countedItems is the same
+// rule the T1 math uses for which items count — the server's home
+// project-card balance shows a figure only when a project has at
+// least one counted item, never a guessed $0.
+export { computeT1, countedItems } from './t1.js';

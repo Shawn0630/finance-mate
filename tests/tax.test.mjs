@@ -15,7 +15,7 @@ import * as caTax from '../src/regions/ca/tax.js';
 import { payroll, rental } from '../src/regions/ca.js';
 import { federalTable } from '../src/regions/ca/federal.js';
 import { bcTable } from '../src/regions/ca/bc.js';
-import { computeT1 } from '../src/regions/ca/t1.js';
+import { computeT1, countedItems } from '../src/regions/ca/t1.js';
 import { listCommits } from '../src/history.js';
 import {
   TAX_ITEM_KINDS, TAX_ITEM_STATUSES, TAX_SECTIONS, sectionForKind, sectionSummary,
@@ -673,6 +673,24 @@ test('computeT1: unsupported province / year returns a flag, never a guessed num
   assert.equal(empty.isRefund, true);
   assert.equal(t1Line(empty.lines, '15000'), 0);
   assert.ok(empty.notes.some((n) => /No job or T4/.test(n)));
+});
+
+// The home card's show/hide rule — the same rule the T1 math
+// uses: only counted items make a balance showable. The engine
+// computes refund $0 for an empty filing (see above), so the card
+// must NOT show that $0; and a filing whose only item is a
+// derived rental-deduction row (already netted in its source
+// item) must not show one either.
+test('countedItems: only non-excluded, non-derived items count toward a showable card balance', () => {
+  assert.deepEqual(countedItems([]), []);
+  assert.equal(countedItems([{ kind: 'employment', amount: 100, status: 'linked' }]).length, 1);
+  assert.equal(countedItems([{ kind: 'deduction', amount: 17903.37, status: 'linked', detail: { derived: true } }]).length, 0);
+  assert.equal(countedItems([{ kind: 'rrsp', amount: 100, status: 'excluded' }]).length, 0);
+  assert.equal(countedItems([
+    { kind: 'employment', amount: 100, status: 'linked' },
+    { kind: 'deduction', amount: 17903.37, status: 'linked', detail: { derived: true } },
+    { kind: 'rrsp', amount: 50, status: 'excluded' },
+  ]).length, 1);
 });
 
 // ---------------------------------------------------------- history tax --

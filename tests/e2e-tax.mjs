@@ -134,9 +134,9 @@ export async function run(H, S) {
   // ---- no pre-generation: both projects list 0 items ----
   r = await H.req('GET', '/api/tax/filings?year=2026');
   const shawn = r.data.filers.find((f) => f.person.username === 'Shawn');
-  H.check('tax: no pre-generation — both projects list 0 items',
-    shawn.projects.length === 2 && shawn.projects.every((p) => p.itemCount === 0),
-    JSON.stringify(shawn.projects.map((p) => ({ name: p.name, itemCount: p.itemCount }))));
+  H.check('tax: no pre-generation — both projects list 0 items and no card balance',
+    shawn.projects.length === 2 && shawn.projects.every((p) => p.itemCount === 0 && p.refund === null),
+    JSON.stringify(shawn.projects.map((p) => ({ name: p.name, itemCount: p.itemCount, refund: p.refund }))));
 
   // ---- detail before adding: the four guided sections, no
   // items, the windowed RRSP annual and the RRSP window ----
@@ -294,6 +294,27 @@ export async function run(H, S) {
   H.check('tax: the 2026 refund endpoint answers for A too',
     r.status === 200 && typeof r.data.refund === 'number' && r.data.province === 'BC',
     JSON.stringify({ refund: r.data.refund, province: r.data.province }));
+  // ---- the list endpoint carries the card balance ----
+  const refundA = r.data;
+  H.check('tax: refund endpoint returns a balance-owing figure for A (no tax withheld)',
+    refundA && refundA.isRefund === false && refundA.label === 'Balance owing'
+      && typeof refundA.displayAmount === 'number' && refundA.displayAmount > 0
+      && refundA.refund === -refundA.displayAmount,
+    JSON.stringify({ isRefund: refundA && refundA.isRefund, label: refundA && refundA.label, displayAmount: refundA && refundA.displayAmount, refund: refundA && refundA.refund }));
+  r = await H.req('POST', '/api/tax/filings', { personId: shawnId, year: 2026, name: 'Empty draft' });
+  H.check('tax: empty draft project created', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
+  const projEmpty = r.data.id;
+  r = await H.req('GET', '/api/tax/filings?year=2026');
+  const shawnAfter = r.data.filers.find((f) => f.person.username === 'Shawn');
+  const listA = shawnAfter.projects.find((p) => p.id === projA);
+  const listB = shawnAfter.projects.find((p) => p.id === projB);
+  const listEmpty = shawnAfter.projects.find((p) => p.id === projEmpty);
+  H.check('tax: list endpoint carries the same refund figure on A and B, and null on the empty draft',
+    listA && listA.refund && listA.refund.displayAmount === refundA.displayAmount
+      && listA.refund.label === refundA.label && listA.refund.isRefund === refundA.isRefund
+      && listB && listB.refund && listB.refund.label === 'Balance owing' && listB.refund.displayAmount > 0
+      && listEmpty && listEmpty.refund === null,
+    JSON.stringify(shawnAfter.projects.map((p) => ({ name: p.name, refund: p.refund }))));
 
   // ---- Tax Profile: user-entered room, validated ----
   r = await H.req('PUT', `/api/tax/profiles/${shawnId}`, {
@@ -549,25 +570,31 @@ export async function run(H, S) {
         const b = document.querySelector('#taxRoomPanel').getBoundingClientRect();
         return `room ${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}x${Math.round(b.height)} body ${Math.round(a.left)},${Math.round(a.top)} ${Math.round(a.width)}x${Math.round(a.height)}`;
       }));
-    // Layout polish: the two columns' headers share one baseline
+    // Layout polish: the two columns are parallel panels whose
+    // tops are equal and whose headers share one baseline
     // (h3 tops within 2px), the right heading reads "Tax profile
     // for <person> · <year>", the 2x2 room grid rows are
-    // even-height, the project card's meta line never breaks
-    // mid-segment (each nowrap segment is a single line box), and
-    // no stray element floats at the room panel's bottom-left
-    // corner.
-    H.check('tax UI: home column headers share one baseline and the right heading reads "Tax profile for Shawn · 2026"',
+    // even-height, the selector row holds the person switcher
+    // left and the year selector right at fitting width, and
+    // each project card shows title + highlighted balance only
+    // (no meta line).
+    H.check('tax UI: home column panels start at the same height and their headers share one baseline ("Tax profile for Shawn · 2026")',
       await until(() => {
+        const lp = document.querySelector('#taxRoomPanel');
+        const rp = document.querySelector('#taxPersonPanel');
         const lh = document.querySelector('#taxRoomPanel > .section-head h3');
-        const rh = document.querySelector('#taxPersonBody > .section-head h3');
-        if (!lh || !rh) return null;
-        return Math.abs(lh.getBoundingClientRect().top - rh.getBoundingClientRect().top) <= 2
+        const rh = document.querySelector('#taxPersonPanel > .section-head h3');
+        if (!lp || !rp || !lh || !rh) return null;
+        return Math.abs(lp.getBoundingClientRect().top - rp.getBoundingClientRect().top) <= 2
+          && Math.abs(lh.getBoundingClientRect().top - rh.getBoundingClientRect().top) <= 2
           && rh.textContent.trim() === 'Tax profile for Shawn · 2026' ? true : null;
       }),
       await page.evaluate(() => {
+        const lp = document.querySelector('#taxRoomPanel');
+        const rp = document.querySelector('#taxPersonPanel');
         const lh = document.querySelector('#taxRoomPanel > .section-head h3');
-        const rh = document.querySelector('#taxPersonBody > .section-head h3');
-        return `left h3 top ${lh ? Math.round(lh.getBoundingClientRect().top) : '?'} right h3 top ${rh ? Math.round(rh.getBoundingClientRect().top) : '?'} heading "${rh ? rh.textContent.trim() : '?'}"`;
+        const rh = document.querySelector('#taxPersonPanel > .section-head h3');
+        return `room panel top ${lp ? Math.round(lp.getBoundingClientRect().top) : '?'} person panel top ${rp ? Math.round(rp.getBoundingClientRect().top) : '?'} left h3 top ${lh ? Math.round(lh.getBoundingClientRect().top) : '?'} right h3 top ${rh ? Math.round(rh.getBoundingClientRect().top) : '?'} heading "${rh ? rh.textContent.trim() : '?'}"`;
       }));
     H.check('tax UI: home room grid rows are even-height (all four cards the same height)',
       await until(() => {
@@ -577,14 +604,54 @@ export async function run(H, S) {
         return Math.max(...hs) - Math.min(...hs) <= 2 ? true : null;
       }),
       await page.evaluate(() => [...document.querySelectorAll('#taxHomeCharts .tax-room-grid > *')].map((c) => Math.round(c.getBoundingClientRect().height)).join(',')));
-    H.check('tax UI: project card meta line never breaks mid-segment (each segment is one line box)',
+    H.check('tax UI: selector row holds the person switcher left and the year selector right at fitting width',
       await until(() => {
-        const card = document.querySelector('[data-tax-open]');
-        if (!card) return null;
-        const spans = [...card.querySelectorAll('.nowrap')];
-        return spans.length > 0 && spans.every((s) => s.getClientRects().length === 1) ? true : null;
+        const row = document.querySelector('.tax-selector-row');
+        const tabs = document.querySelector('#taxPersonTabs');
+        const sel = document.querySelector('#taxYearSel');
+        if (!row || !tabs || !sel) return null;
+        const rr = row.getBoundingClientRect();
+        const tr = tabs.getBoundingClientRect();
+        const sr = sel.getBoundingClientRect();
+        return Math.abs(tr.top - sr.top) <= 6 && tr.left < sr.left
+          && sr.right <= rr.right + 1 && sr.width < rr.width / 2 ? true : null;
       }),
-      await page.evaluate(() => [...document.querySelectorAll('[data-tax-open] .nowrap')].map((s) => `${s.textContent}=>${s.getClientRects().length}`).join(' | ')));
+      await page.evaluate(() => {
+        const row = document.querySelector('.tax-selector-row');
+        const tabs = document.querySelector('#taxPersonTabs');
+        const sel = document.querySelector('#taxYearSel');
+        const r = (el) => { const b = el.getBoundingClientRect(); return `${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}x${Math.round(b.height)}`; };
+        return `row ${r(row)} tabs ${r(tabs)} year ${r(sel)}`;
+      }));
+    // Project A has items — its card shows title + the highlighted
+    // balance from the list endpoint, matching the /refund figure
+    // exactly (label + amount + sign class). Project B has items
+    // too; the empty draft has none — its card shows the title
+    // only, no figure, no meta line.
+    const expectedCardFigure = Number(refundA.displayAmount).toLocaleString('en-CA', { style: 'currency', currency: 'CAD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const expectedCardClass = refundA.isRefund ? 'positive' : 'negative';
+    H.check('tax UI: project card shows title + highlighted balance only, matching the refund endpoint',
+      await page.evaluate((id, label, amount, cls) => {
+        const card = document.querySelector(`[data-tax-open="${id}"]`);
+        if (!card) return false;
+        const k = card.querySelector('.k');
+        const v = card.querySelector('.v');
+        return !!k && !!v && k.textContent.trim() === label && v.textContent.trim() === amount
+          && v.classList.contains(cls) && !/item/.test(card.textContent);
+      }, projA, refundA.label, expectedCardFigure, expectedCardClass),
+      await page.evaluate((id) => {
+        const card = document.querySelector(`[data-tax-open="${id}"]`);
+        return card ? card.textContent.replace(/\s+/g, ' ').trim() : 'no card';
+      }, projA));
+    H.check('tax UI: empty project card shows the title only (no balance, no meta line)',
+      await page.evaluate((id) => {
+        const card = document.querySelector(`[data-tax-open="${id}"]`);
+        return !!card && !card.querySelector('.v') && !/item/.test(card.textContent);
+      }, projEmpty),
+      await page.evaluate((id) => {
+        const card = document.querySelector(`[data-tax-open="${id}"]`);
+        return card ? card.textContent.replace(/\s+/g, ' ').trim() : 'no card';
+      }, projEmpty));
     H.check('tax UI: no stray element floats at the room panel bottom-left corner',
       await until(() => {
         const rp = document.querySelector('#taxRoomPanel');

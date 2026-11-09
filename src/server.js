@@ -4402,7 +4402,10 @@ app.get('/api/tax/filings', requireApiAuth, (req, res) => {
     const projects = db.prepare('SELECT * FROM tax_filings WHERE person_id = ? AND tax_year = ? ORDER BY id').all(u.id, year)
       .map((f) => {
         const view = taxFilingView(f);
-        return { ...view, items: undefined, slips: undefined, itemCount: view.items.length };
+        // The home card's highlighted balance — the same T1 figure
+        // as the detail headline, or null when there is nothing
+        // computable to show (the card then shows the title only).
+        return { ...view, items: undefined, slips: undefined, itemCount: view.items.length, refund: filingCardRefund(f, view) };
       });
     return {
       person: { id: u.id, username: u.username },
@@ -5000,19 +5003,17 @@ app.get('/api/tax/filings/:id/rrsp-benefit', requireApiAuth, (req, res) => {
   });
 });
 
-// ---------------------------------------------------- tax refund ----
-// The T1 computation behind the refund headline + popup (user
-// 2026-11-08 16:20): one big refund/balance-owing figure at the top
-// of the detail, with a line-by-line popup. Computed from the
-// project's items via the region engine (computeT1 — federal +
-// province modules); headline + popup only, no filing flow.
-// Province = the filer's first job's province, else BC (the app
-// has no residence field). A province/year with no verified table
-// returns the unsupported flag, never a guessed number.
-app.get('/api/tax/filings/:id/refund', requireApiAuth, (req, res) => {
-  const filing = getTaxFiling(req.params.id);
-  if (!filing) return res.status(404).json({ error: 'filing not found' });
-  const view = taxFilingView(filing);
+// The T1 computation for one filing, shared by the detail
+// headline + popup (GET …/refund) and the home project card
+// (GET /api/tax/filings). Province = the filer's first job's
+// province, else BC (the app has no residence field). Returns the
+// full computeT1 output plus province — including the
+// unsupported flags when a table is missing, never a guessed
+// number. The caller decides whether the figure is showable:
+// the home card shows it only when the project has at least one
+// counted item (region countedItems — the same rule the T1 math
+// uses), otherwise null.
+function filingT1(filing, view) {
   const person = view.person;
   const jobRows = person
     ? db.prepare('SELECT * FROM earn_jobs WHERE tax_year = ? AND owner = ? ORDER BY employer')
@@ -5030,7 +5031,37 @@ app.get('/api/tax/filings/:id/refund', requireApiAuth, (req, res) => {
     slips: (view.slips || []).map((s) => ({ kind: s.kind, fields: s.fields || {} })),
     jobs: jobRows,
   });
-  res.json({ filingId: filing.id, taxYear: filing.tax_year, province, ...out });
+  return { province, ...out };
+}
+
+// The card balance for the home project list: the same T1 figure
+// as the detail headline, or null when there is nothing
+// computable to show (no counted items, or an unsupported
+// province/year) — the card then shows the title only, never a
+// guessed $0.
+function filingCardRefund(filing, view) {
+  const t1 = filingT1(filing, view);
+  if (t1.unsupportedProvince || t1.unsupportedYear) return null;
+  const regionTax = taxRegionFor(filing);
+  if (!regionTax.countedItems(view.items).length) return null;
+  return { refund: t1.refund, isRefund: t1.isRefund, label: t1.label, displayAmount: t1.displayAmount };
+}
+
+// ---------------------------------------------------- tax refund ----
+// The T1 computation behind the refund headline + popup (user
+// 2026-11-08 16:20): one big refund/balance-owing figure at the top
+// of the detail, with a line-by-line popup. Computed from the
+// project's items via the region engine (computeT1 — federal +
+// province modules); headline + popup only, no filing flow.
+// Province = the filer's first job's province, else BC (the app
+// has no residence field). A province/year with no verified table
+// returns the unsupported flag, never a guessed number.
+app.get('/api/tax/filings/:id/refund', requireApiAuth, (req, res) => {
+  const filing = getTaxFiling(req.params.id);
+  if (!filing) return res.status(404).json({ error: 'filing not found' });
+  const view = taxFilingView(filing);
+  const out = filingT1(filing, view);
+  res.json({ filingId: filing.id, taxYear: filing.tax_year, ...out });
 });
 
 // ------------------------------------------------------- tax charts ---
