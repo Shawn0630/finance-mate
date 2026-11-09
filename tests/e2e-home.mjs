@@ -781,6 +781,72 @@ export async function run(H, S) {
         && c.xLabels.some((l) => /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2}$/.test(l))
         && (c.range === 0 || new Set(c.yLabels).size > 1)),
       JSON.stringify(reportDetail && reportDetail.map((c) => ({ x: c.xLabels.slice(0, 2), y: c.yLabels.slice(0, 2), blue: c.blue, range: c.range }))));
+    // Report-mode payment cards carry a calendar for the card's own
+    // month, with that payment's day filled in its kind colour. The
+    // calendar needs room, so these pins run at 1280x800 (restored
+    // to 800x600 right after).
+    await page.setViewport({ width: 1280, height: 800 });
+    await wait(300);
+    const reportCal = await until(() => {
+      const slot = document.querySelector('.report-section.is-active .report-slot.is-active .home-pay-card');
+      const cal = slot && slot.querySelector('.report-cal .home-cal-grid');
+      if (!cal || !cal.children.length) return null;
+      const day = slot.querySelector('.home-cal-day.is-focus');
+      if (!day) return null;
+      return {
+        payDate: slot.dataset.payDate, kind: slot.dataset.payKind,
+        title: slot.querySelector('.home-cal-title').textContent,
+        focusDate: day.dataset.calDate, focusClass: day.className,
+        nav: !!slot.querySelector('[data-cal-nav]'),
+        tabbable: !!slot.querySelector('.home-cal-day[tabindex]'),
+      };
+    });
+    const calMonth = reportCal && reportCal.payDate
+      ? `${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][Number(reportCal.payDate.split('-')[1]) - 1]} ${reportCal.payDate.split('-')[0]}` : null;
+    H.check('home UI: report-mode payment card contains a calendar for the payment month, no nav, days not focusable',
+      !!reportCal && reportCal.title === calMonth && !reportCal.nav && !reportCal.tabbable,
+      JSON.stringify({ reportCal, calMonth }));
+    H.check('home UI: report-mode payment card highlights its own payment day in its kind colour',
+      !!reportCal && reportCal.focusDate === reportCal.payDate
+      && reportCal.focusClass.includes('is-focus') && reportCal.focusClass.includes(`kind-${reportCal.kind}`),
+      JSON.stringify(reportCal));
+    // The calendar fits inside its card (no overflow past the card edge).
+    const calFit = await page.evaluate(() => {
+      const card = document.querySelector('.report-section.is-active .report-slot.is-active .home-pay-card');
+      const cal = card && card.querySelector('.report-cal');
+      if (!card || !cal) return null;
+      const cr = card.getBoundingClientRect();
+      const r = cal.getBoundingClientRect();
+      return { cardTop: cr.top, cardBottom: cr.bottom, calTop: r.top, calBottom: r.bottom };
+    });
+    H.check('home UI: report-mode payment calendar fits inside its card',
+      !!calFit && calFit.calTop >= calFit.cardTop - 1 && calFit.calBottom <= calFit.cardBottom + 1,
+      JSON.stringify(calFit));
+    // Moving to the next payment card follows it: the new card's
+    // calendar shows ITS month with ITS day focused.
+    await page.keyboard.press('ArrowRight');
+    await wait(700); // the 600ms navigation lock
+    const reportCalNext = await until(() => {
+      const slot = document.querySelector('.report-section.is-active .report-slot.is-active .home-pay-card');
+      const cal = slot && slot.querySelector('.report-cal .home-cal-grid');
+      if (!cal || !cal.children.length) return null;
+      const day = slot.querySelector('.home-cal-day.is-focus');
+      if (!day) return null;
+      return {
+        payDate: slot.dataset.payDate, kind: slot.dataset.payKind,
+        title: slot.querySelector('.home-cal-title').textContent,
+        focusDate: day.dataset.calDate, focusClass: day.className,
+      };
+    });
+    const calMonthNext = reportCalNext && reportCalNext.payDate
+      ? `${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][Number(reportCalNext.payDate.split('-')[1]) - 1]} ${reportCalNext.payDate.split('-')[0]}` : null;
+    H.check('home UI: moving to the next payment card moves its calendar to that payment month + day',
+      !!reportCalNext && reportCalNext.payDate !== (reportCal && reportCal.payDate)
+      && reportCalNext.title === calMonthNext && reportCalNext.focusDate === reportCalNext.payDate
+      && reportCalNext.focusClass.includes('is-focus'),
+      JSON.stringify({ reportCalNext, calMonthNext }));
+    await page.setViewport({ width: 800, height: 600 });
+    await wait(300);
     // Fullscreen report mode: the top bar hides and the gradient
     // view covers the whole viewport, no page margins.
     const full = await page.evaluate(() => {
@@ -979,6 +1045,11 @@ export async function run(H, S) {
       return t && t.textContent === 'Nov 2026' ? t.textContent : null;
     });
     H.check('home UI: calendar prev returns to Nov 2026', backTitle === 'Nov 2026', String(backTitle));
+    // The focus fill is report-mode only: the insight calendar never
+    // carries an is-focus day.
+    const insightFocus = await page.evaluate(() => document.querySelector('#homeCalendar .home-cal-day.is-focus'));
+    H.check('home UI: insight-mode calendar has no focused day (focus lives in report-mode cards only)',
+      insightFocus === null, String(insightFocus));
 
     // Calendar → highlight link: clicking a day focuses its payment
     // card in the highlight carousel. At 1280px the carousel sits

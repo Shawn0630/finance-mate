@@ -19796,7 +19796,12 @@ function homeCalDayActionable(date, entries, highlights) {
 // a marked occurrence (received === 1, the same mark state the
 // highlight shows) renders its dot done. Today gets .is-today.
 // Days are plain numbers + dots — no prose.
-function homeCalendarHtml(data, highlights) {
+// opts.focusDate / opts.focusKind: the day this calendar belongs to
+// (a report-mode payment card) gets .is-focus, filled in its kind
+// colour, on top of its dot. opts.static: a display-only calendar
+// (report mode) — a plain month title instead of prev/next nav, and
+// days are not focusable/clickable.
+function homeCalendarHtml(data, highlights, opts = {}) {
   const [y, m] = data.month.split('-').map(Number);
   const dim = new Date(y, m, 0).getDate();
   const firstDow = new Date(y, m - 1, 1).getDay();
@@ -19815,14 +19820,18 @@ function homeCalendarHtml(data, highlights) {
     // highlight card (see homeCalendarFocusDay). Every other day is
     // dimmed and does nothing.
     const actionable = homeCalDayActionable(date, marks, highlights);
-    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}${actionable ? ' has-pay' : ' is-dim'}" data-cal-date="${date}"${actionable ? ' tabindex="0" role="button"' : ''}><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
+    const focus = opts.focusDate === date;
+    cells += `<div class="home-cal-day${date === data.today ? ' is-today' : ''}${focus ? ` is-focus${opts.focusKind ? ` kind-${opts.focusKind}` : ''}` : ''}${actionable ? ' has-pay' : ' is-dim'}" data-cal-date="${date}"${actionable && !opts.static ? ' tabindex="0" role="button"' : ''}><span class="home-cal-num">${d}</span><span class="home-cal-dots">${dots}</span></div>`;
   }
   const legend = HOME_CAL_KINDS.map((k) => `<span class="home-cal-legend-item"><span class="home-cal-dot kind-${k.kind}"></span>${k.label}</span>`).join('');
-  return `<div class="home-cal-head">
+  const head = opts.static
+    ? `<div class="home-cal-head"><span class="home-cal-title">${MONTH_NAMES[m - 1]} ${y}</span></div>`
+    : `<div class="home-cal-head">
       <button class="home-cal-nav" data-cal-nav="-1" aria-label="Previous month">‹</button>
       <span class="home-cal-title">${MONTH_NAMES[m - 1]} ${y}</span>
       <button class="home-cal-nav" data-cal-nav="1" aria-label="Next month">›</button>
-    </div>
+    </div>`;
+  return `${head}
     <div class="home-cal-week">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<span>${d}</span>`).join('')}</div>
     <div class="home-cal-grid">${cells}</div>
     <div class="home-cal-legend">${legend}</div>`;
@@ -19947,7 +19956,7 @@ function homeInsightCardHtml(c, opts) {
     ${sparkHtml}</div>`;
 }
 
-function homePayCardHtml(h) {
+function homePayCardHtml(h, opts = {}) {
   const isMortgage = h.kind === 'mortgage';
   const state = h.received === 1 ? (isMortgage ? 'Paid' : 'Received')
     : h.received === 0 ? (isMortgage ? 'Not paid' : 'Not received') : 'Pending';
@@ -19957,6 +19966,10 @@ function homePayCardHtml(h) {
   // Mortgage rows link to their property's detail page (same
   // card-linking pattern as insight cards); salary/rental rows do not link.
   const linkAttrs = isMortgage ? ` data-home-link="#property/${h.sourceId}" role="link" tabindex="0"` : '';
+  // Report mode only: the card carries a calendar for its own month,
+  // filled in by homeDrawReportCalendars (the host is empty until the
+  // month's /api/home/calendar data arrives).
+  const reportCal = opts.report ? `<div class="report-cal" data-report-cal-month="${h.date.slice(0, 7)}" data-report-cal-date="${h.date}" data-report-cal-kind="${h.kind}"></div>` : '';
   return `<div class="insight-card home-pay-card" data-pay-kind="${h.kind}" data-pay-source="${h.sourceId}" data-pay-date="${h.date}"${linkAttrs}>
     <div class="insight-text">
       <div class="insight-label">${esc(h.sourceLabel)} · ${label}</div>
@@ -19967,6 +19980,7 @@ function homePayCardHtml(h) {
     <div class="insight-toggle">
       <button class="recv-toggle ${h.received === 1 ? 'on' : ''}" role="switch" aria-checked="${h.received === 1 ? 'true' : 'false'}" data-mark-kind="${h.kind}" data-mark-source="${h.sourceId}" data-mark-date="${h.date}" data-mark-received="${h.received === 1 ? 1 : 0}">${toggleLabel}</button>
     </div>
+    ${reportCal}
   </div>`;
 }
 
@@ -20123,7 +20137,7 @@ function renderHome() {
   if (income.length) parts.push(`${received} of ${income.length} received`);
   if (morts.length) parts.push(`${paid} of ${morts.length} paid`);
   $('#homeSummary').textContent = parts.length ? parts.join(' · ') : 'No upcoming payments';
-  $('#homeHighlightCarousel').innerHTML = highlights.map(homePayCardHtml).join('');
+  $('#homeHighlightCarousel').innerHTML = highlights.map((h) => homePayCardHtml(h)).join('');
   $('#homeHighlightEmpty').classList.toggle('hidden', highlights.length > 0);
   $('#homeSections').innerHTML = ['property', 'stock', 'earning', 'spending'].map((section) => {
     const cards = insights.filter((c) => c.section === section);
@@ -20205,7 +20219,7 @@ function renderHomeReport() {
       const html = sec.key === 'highlight'
         ? (c.empty
           ? `<div class="insight-card"><div class="insight-text"><div class="insight-empty">No upcoming payments</div></div></div>`
-          : homePayCardHtml(c))
+          : homePayCardHtml(c, { report: true }))
         : homeInsightCardHtml(c);
       return `<div class="report-slot" data-report-slot="${ci}">${html}</div>`;
     }).join('');
@@ -20217,6 +20231,38 @@ function renderHomeReport() {
     </div>`;
   }).join('');
   homeReportApply();
+  homeDrawReportCalendars();
+}
+
+// Report-mode payment calendars: each pay card carries a calendar
+// for the card's own month, fetched per month and cached (payments
+// span the current + previous month, so the insight calendar's
+// single displayed month is not enough). The same month grid as
+// insight mode, static (no nav, days not clickable), with the
+// card's own day filled in its kind colour. Re-runs on every
+// renderHomeReport (mode switch, mark toggle); the cache keeps it
+// to at most one fetch per month, and the mark handler drops the
+// cache so the ✓ marks refresh.
+let homeReportCalCache = {};
+async function homeDrawReportCalendars() {
+  const el = $('#homeReport');
+  if (!el) return;
+  const hosts = [...el.querySelectorAll('[data-report-cal-month]')];
+  if (!hosts.length) return;
+  const months = [...new Set(hosts.map((h) => h.dataset.reportCalMonth))];
+  for (const month of months) {
+    if (homeReportCalCache[month]) continue;
+    try { homeReportCalCache[month] = await api(`/api/home/calendar?month=${month}`); }
+    catch { /* a failed fetch leaves the host empty; the next render retries */ }
+  }
+  for (const host of hosts) {
+    if (!host.isConnected) continue;
+    const data = homeReportCalCache[host.dataset.reportCalMonth];
+    if (!data) continue;
+    host.innerHTML = homeCalendarHtml(data, homeData && homeData.highlights, {
+      focusDate: host.dataset.reportCalDate, focusKind: host.dataset.reportCalKind, static: true,
+    });
+  }
 }
 
 function homeReportApply() {
@@ -20529,6 +20575,10 @@ $('#view-home').addEventListener('click', async (e) => {
   // gaps/headers); the click then proceeds normally (a heading link
   // still navigates). Taps on a card stay in edit mode.
   if (homeEditSection && !(e.target.closest && e.target.closest('.insight-card'))) homeExitEditMode();
+  // Clicks inside a report-mode calendar do nothing (the calendar is
+  // a static display): they must not navigate a mortgage card to its
+  // property page via the card link below.
+  if (e.target.closest && e.target.closest('.report-cal')) return;
   const t = e.target.closest('[data-mark-kind]');
   if (t) {
     const next = t.dataset.markReceived === '1' ? 0 : 1;
@@ -20539,6 +20589,10 @@ $('#view-home').addEventListener('click', async (e) => {
       // The calendar only fetches once per page session: refresh it
       // for the displayed month so the day's dot checks at once.
       if (homeCalData) await loadHomeCalendar(homeCalMonth);
+      // Report-mode calendars cache the same month data: drop it so
+      // the day's dot checks at once, and redraw if report mode shows.
+      homeReportCalCache = {};
+      if (homeMode === 'report') homeDrawReportCalendars();
     } catch (err) { showMsg($('#globalError'), 'err', err.message); }
     return;
   }
