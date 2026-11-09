@@ -20373,23 +20373,38 @@ $('#homeModeBtn').addEventListener('click', () => homeSetMode(homeMode === 'repo
 // gesture locks to its dominant axis; the lock stops one flick from
 // skipping several pages. The listener is passive:false so the page
 // never scrolls under the report stage.
+// One gesture is exactly one move — including its momentum tail: a
+// hard flick's inertia outlives the 600ms lock, so the tail used to
+// re-accumulate past 48px into a second (or third) move. After a
+// wheel move, wheel events are therefore dropped until the gesture
+// stream actually ends (no wheel events for 220ms, the same quiet
+// interval that resets the accumulators); the 600ms lock still gates
+// discrete inputs (keys, dots, neighbour taps) and rapid re-flicks.
 let homeReportWheelDX = 0;
 let homeReportWheelDY = 0;
 let homeReportWheelTimer = 0;
+let homeReportWheelCooling = false;
 $('#homeReport').addEventListener('wheel', (e) => {
   if (homeMode !== 'report') return;
   e.preventDefault();
+  // Every wheel event re-arms the quiet timer — including events
+  // dropped below — so the timer only fires once this gesture's
+  // momentum stream has really ended.
+  clearTimeout(homeReportWheelTimer);
+  homeReportWheelTimer = setTimeout(() => {
+    homeReportWheelDX = 0; homeReportWheelDY = 0; homeReportWheelCooling = false;
+  }, 220);
+  if (homeReportWheelCooling) return;
   if (Date.now() < homeReportLockUntil) return;
   homeReportWheelDX += e.deltaX;
   homeReportWheelDY += e.deltaY;
-  clearTimeout(homeReportWheelTimer);
-  homeReportWheelTimer = setTimeout(() => { homeReportWheelDX = 0; homeReportWheelDY = 0; }, 220);
   const ax = Math.abs(homeReportWheelDX);
   const ay = Math.abs(homeReportWheelDY);
   if (Math.max(ax, ay) < HOME_REPORT_WHEEL_MIN) return;
   const dir = ax > ay ? (homeReportWheelDX > 0 ? 'right' : 'left') : (homeReportWheelDY > 0 ? 'down' : 'up');
   homeReportWheelDX = 0;
   homeReportWheelDY = 0;
+  homeReportWheelCooling = true;
   homeReportGo(dir);
 }, { passive: false });
 

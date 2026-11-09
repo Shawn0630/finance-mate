@@ -666,6 +666,63 @@ export async function run(H, S) {
       return s && s.querySelector('.insight-label').textContent === 'Total equity' ? 'Total equity' : null;
     });
     H.check('home UI: scrolling left in report mode moves back to the previous card', !!afterLeft, String(afterLeft));
+    // Momentum: one hard flick — a fast burst plus a long inertia
+    // tail that outlives the 600ms lock — moves EXACTLY one card.
+    // (user 2026-11-08: a swipe sometimes skipped a card.) The tail
+    // after the lock still totals >48px, so on the old code it
+    // re-accumulates into a second move; the fix must swallow the
+    // whole gesture's momentum, not just lengthen the lock.
+    // Starting point: Property section, card 0 (Total equity) — the
+    // previous pin left us there.
+    const reportActive = async () => page.evaluate(() => {
+      const sec = document.querySelector('.report-section.is-active');
+      const slot = sec && sec.querySelector('.report-slot.is-active');
+      const label = slot && slot.querySelector('.insight-label');
+      return sec ? `${sec.dataset.reportSection}:${label ? label.textContent : ''}` : null;
+    });
+    const reportFlick = async (axis) => {
+      const stage = await page.evaluate(() => {
+        const el = document.querySelector('#homeReport');
+        const r = el.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      });
+      await page.mouse.move(stage.x, stage.y);
+      for (const d of [60, 50, 40, 30, 25, 20, 15, 10]) {
+        await page.mouse.wheel(axis === 'down' ? { deltaY: d } : { deltaX: d });
+        await wait(16);
+      }
+      for (const d of [14, 13, 12, 11, 10, 10, 9, 9, 8, 8, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3]) {
+        await page.mouse.wheel(axis === 'down' ? { deltaY: d } : { deltaX: d });
+        await wait(50);
+      }
+      await wait(1500); // let the tail + lock settle
+    };
+    await reportFlick('right');
+    const afterFlick = await reportActive();
+    H.check('home UI: one hard right flick in report mode moves exactly one card (momentum tail must not skip a card)',
+      afterFlick === 'property:Assessed total', String(afterFlick));
+    // A second deliberate flick, after the first has settled, moves
+    // one more card — rapid successive gestures still advance one
+    // at a time.
+    await reportFlick('right');
+    const afterSecondFlick = await reportActive();
+    H.check('home UI: a second deliberate flick moves exactly one more card',
+      afterSecondFlick === 'property:Outstanding principal', String(afterSecondFlick));
+    // Same rule vertically: a hard flick down moves exactly one
+    // section (Property → Stocks), not two.
+    await reportFlick('down');
+    const afterDownFlick = await reportActive();
+    H.check('home UI: one hard flick down in report mode moves exactly one section',
+      afterDownFlick === 'stock:Portfolio value', String(afterDownFlick));
+    // Cleanup: walk back up to the Property section (entering it
+    // resets its carousel to card 0), wherever the flicks landed,
+    // so the reset pins below start from Property card 0.
+    for (let i = 0; i < 4; i++) {
+      const sec = await page.evaluate(() => document.querySelector('.report-section.is-active').dataset.reportSection);
+      if (sec === 'property') break;
+      await page.keyboard.press('ArrowUp');
+      await wait(700);
+    }
     // Entering a section resets its carousel to the first card: step
     // to Property's second card, move down to Stocks, and Stocks must
     // open on its first card (Portfolio value) with the first dot
