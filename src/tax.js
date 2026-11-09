@@ -151,6 +151,25 @@ export function rrspContributed(events) {
   }
   return round2(sum);
 }
+// -------------------------------------------------- room history ----
+// The Tax home's Contribution room charts for year Y are keyed to
+// year Y−1 (the last completed year): the 2026 view reads 2025
+// records, the 2025 view reads 2024 records, and so on. The
+// cutoff is the END of the last completed tax year — Dec 31 of
+// Y−1 — so the home charts show the carried-forward room state
+// as of that date, from previous years' history. The RRSP
+// first-60-days window still governs which year a contribution
+// DEDUCTS against; it does not move this cutoff. The in-project
+// Tax Profile is different: it follows the person's CURRENT
+// profile record plus the current project's items, with no
+// cutoff at all.
+export function taxRoomCutoff(asOfYear) {
+  return `${Number(asOfYear)}-12-31`;
+}
+export function throughDate(events, cutoff) {
+  if (!cutoff) return events || [];
+  return (events || []).filter((e) => !e.date || String(e.date).slice(0, 10) <= cutoff);
+}
 
 // -------------------------------------------- RRSP benefit estimate --
 // Tax saved by an RRSP contribution, computed with the region's

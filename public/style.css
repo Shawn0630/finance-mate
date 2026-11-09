@@ -309,6 +309,13 @@ tr.sub td { color: #71808f; font-size: 12px; }
 /* RRSP estimator result: the same block gap under it, before
    the room doughnut below. */
 #taxRrspResult { margin-bottom: 14px; }
+/* Tax room cards: side by side in a grid instead of a
+   full-width vertical stack — 2 columns in a narrow host (the
+   detail's Tax Profile block), up to 4 across on a wide home
+   panel, 1 column on a narrow screen. The .panel bottom margin
+   is neutralised inside the grid so the gap stays even. */
+.tax-room-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.tax-room-grid .panel { margin-bottom: 0; }
 /* Card-detail balance line: the owed figure is bold and enlarged
    against the small muted line; the as-of stays small. */
 .spend-balance-figure { font-size: 18px; font-weight: 700; color: #1c2733; }

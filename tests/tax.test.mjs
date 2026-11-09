@@ -21,6 +21,7 @@ import {
   TAX_ITEM_KINDS, TAX_ITEM_STATUSES, TAX_SECTIONS, sectionForKind, sectionSummary,
   RESP_LIFETIME_LIMIT, CESG_LIFETIME_MAX, respRoomSplit, cesgRoomSplit,
   tfsaNetContributed, rrspContributed, rrspBenefit,
+  taxRoomCutoff, throughDate,
   effectiveAmount, filingTotals, rentalDeductible, rentalNet,
   validSharePct, validTaxItemInput, validTaxSlipInput, validTaxProfileInput,
   buildExpectedContext, planOwnAnnual,
@@ -478,6 +479,24 @@ test('tfsaNetContributed / rrspContributed: only real records count — buys min
     { type: 'buy', own_amount: null },
   ]), 440.1);
   assert.equal(rrspContributed([]), 0);
+});
+
+test('taxRoomCutoff / throughDate: the home charts for year Y read year Y−1 records (through Dec 31)', () => {
+  assert.equal(taxRoomCutoff(2025), '2025-12-31');
+  assert.equal(taxRoomCutoff(2024), '2024-12-31');
+  const events = [
+    { type: 'buy', date: '2025-12-31', units: 10, price: 100 },
+    { type: 'buy', date: '2026-01-05', units: 10, price: 145 },
+    { type: 'sell', date: '2026-03-10', units: 5, price: 100 },
+  ];
+  assert.equal(tfsaNetContributed(throughDate(events, '2025-12-31')), 1000); // only the 2025 buy
+  assert.equal(tfsaNetContributed(throughDate(events, '2026-12-31')), 1950); // 1000 + 1450 − 500
+  assert.equal(throughDate(events, null).length, 3); // no cutoff: everything (project view)
+  assert.equal(throughDate([], '2025-12-31').length, 0);
+  assert.equal(rrspContributed(throughDate([
+    { type: 'buy', date: '2025-12-20', own_amount: 220.05 },
+    { type: 'buy', date: '2026-01-03', own_amount: 220.05 },
+  ], '2025-12-31')), 220.05);
 });
 
 // --------------------------------------------------- RRSP benefit estimate --

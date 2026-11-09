@@ -61,6 +61,7 @@ import {
   validSharePct, validTaxItemInput, validTaxSlipInput, validTaxProfileInput,
   buildExpectedContext, rrspBenefit, rentalDeductible, rentalNet,
   respRoomSplit, cesgRoomSplit, RESP_LIFETIME_LIMIT,
+  taxRoomCutoff, throughDate,
 } from './tax.js';
 import {
   applyStoredCustomSinkRate,
@@ -5048,10 +5049,22 @@ app.get('/api/tax/filings/:id/refund', requireApiAuth, (req, res) => {
 // contributed portion with a no-data note, never invented
 // history. `basis` tells the UI which source the contributed
 // figure came from ('project' | 'plans' | 'profile' | 'records').
-function personTaxCharts(person, filing) {
+// `asOf` (home only): { asOfYear } — the home charts for year Y
+// are keyed to Y−1, so dated records are cut off at Dec 31 of
+// Y−1 (taxRoomCutoff). The filing (project) charts never pass
+// asOf: the in-project view is the CURRENT profile record plus
+// the current project's items, with no cutoff. RESP/CESG
+// contributed comes from the profile split (limit minus the
+// recorded remaining room) — the app holds no dated RESP
+// history, so that side is the same in both views; only the
+// dated RRSP-plan and TFSA-event records move with the cutoff.
+// The TFSA "Current value" stays today's market value in both
+// views — it is labelled current, not a historical record.
+function personTaxCharts(person, filing, asOf) {
   const username = person ? person.username : '';
   const profile = person ? getTaxProfile(person.id) : null;
   const today = vancouverToday();
+  const cutoff = asOf && asOf.asOfYear ? taxRoomCutoff(asOf.asOfYear) : null;
   const fx = makeFxResolver(db);
   const toCad = (amount, currency, date) => {
     if (!currency || currency === 'CAD') return Number(amount) || 0;
@@ -5079,7 +5092,7 @@ function personTaxCharts(person, filing) {
       JOIN invest_accounts a ON a.id = p.account_id
       JOIN earn_jobs j ON j.id = p.job_id
       WHERE a.type = 'RRSP' AND e.type = 'buy' AND j.owner = ?`).all(username);
-    rrspContributedAmt = round2(rrspRows.reduce((s, r) => s + toCad(r.own_amount || 0, r.currency, r.date), 0));
+    rrspContributedAmt = round2(throughDate(rrspRows, cutoff).reduce((s, r) => s + toCad(r.own_amount || 0, r.currency, r.date), 0));
     rrspBasis = 'plans';
   }
   // TFSA: net buy-minus-sell across the person's TFSA accounts
@@ -5100,7 +5113,7 @@ function personTaxCharts(person, filing) {
       tfsaValue = round2(tfsaValue + (computed.summary ? computed.summary.value : 0));
     }
   }
-  const tfsaContributedAmt = round2(tfsaEvents.reduce((s, e) => {
+  const tfsaContributedAmt = round2(throughDate(tfsaEvents, cutoff).reduce((s, e) => {
     const v = toCad((Number(e.units) || 0) * (Number(e.price) || 0), e.currency, e.date);
     return s + (e.type === 'buy' ? v : -v);
   }, 0));
@@ -5120,6 +5133,9 @@ function personTaxCharts(person, filing) {
     respBasis = 'project';
   }
   return {
+    // The year the dated records are cut off at (home only,
+    // Y−1); null on the project view, which has no cutoff.
+    asOfYear: asOf && asOf.asOfYear ? Number(asOf.asOfYear) : null,
     rrsp: {
       contributed: rrspContributedAmt,
       room: profile && profile.rrsp_room != null ? Number(profile.rrsp_room) : null,
@@ -5154,13 +5170,22 @@ app.get('/api/tax/filings/:id/charts', requireApiAuth, (req, res) => {
 // The same contributed-vs-remaining charts for one person
 // WITHOUT a project (the Tax home switcher): the contributed
 // side reads the app's underlying records / the profile split,
-// since there is no project to draw items from.
+// since there is no project to draw items from. Keyed to the
+// requested year Y, the charts show year Y−1's records
+// (asOfYear = Y − 1) — the 2026 view reads 2025 records, the
+// 2025 view reads 2024 records. No year given defaults to the
+// current tax year.
 app.get('/api/tax/profiles/:personId/charts', requireApiAuth, (req, res) => {
   const person = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.personId));
   if (!person || person.username === adminUsername()) {
     return res.status(400).json({ error: 'person must be a household user (not admin).' });
   }
-  res.json(personTaxCharts(person, null));
+  const yearParam = Number.parseInt(req.query.year, 10);
+  const year = Number.isFinite(yearParam) ? yearParam : Number(vancouverToday().slice(0, 4));
+  if (!Number.isInteger(year) || year < 1900 || year > 2100) {
+    return res.status(400).json({ error: 'year must be a tax year (1900–2100).' });
+  }
+  res.json(personTaxCharts(person, null, { asOfYear: year - 1 }));
 });
 
 // ----------------------------------------------------- tax profiles ---

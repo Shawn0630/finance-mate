@@ -322,16 +322,32 @@ export async function run(H, S) {
   H.check('tax: negative amount is a 400', r.status === 400, JSON.stringify(r.status));
 
   // ---- Charts: contributed vs remaining — the home (profile)
-  // charts read the app records; the filing charts read this
-  // project's items when it has any (basis tells which) ----
-  r = await H.req('GET', `/api/tax/profiles/${shawnId}/charts`);
-  H.check('tax: home charts split contributed vs remaining (RRSP plan buys $5,061.15, TFSA $1,450, RESP $5,000 of $50,000, CESG $200 of $7,200)',
-    r.status === 200
-      && r.data.rrsp && r.data.rrsp.contributed === 5061.15 && r.data.rrsp.room === 20000 && r.data.rrsp.basis === 'plans'
-      && r.data.tfsa && r.data.tfsa.contributed === 1450 && r.data.tfsa.room === 5000
+  // charts are keyed to the requested year Y and read year Y−1
+  // (the last completed year); the filing charts read this
+  // project's items when it has any (basis tells which), with
+  // no cutoff. RESP/CESG come from the profile split (limit
+  // minus recorded remaining room) in both views — the app
+  // holds no dated RESP history. ----
+  r = await H.req('GET', `/api/tax/profiles/${shawnId}/charts?year=2026`);
+  H.check('tax: home charts for 2026 read 2025 records (RRSP plan buys + TFSA buy are 2026, so $0; RESP $5,000 of $50,000, CESG $200 of $7,200)',
+    r.status === 200 && r.data.asOfYear === 2025
+      && r.data.rrsp && r.data.rrsp.contributed === 0 && r.data.rrsp.room === 20000 && r.data.rrsp.basis === 'plans'
+      && r.data.tfsa && r.data.tfsa.contributed === 0 && r.data.tfsa.room === 5000
       && r.data.resp && r.data.resp.split && r.data.resp.split.contributed === 5000 && r.data.resp.split.remaining === 45000
       && r.data.resp.cesg && r.data.resp.cesg.earned === 200 && r.data.resp.cesg.remaining === 7000,
     JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/profiles/${shawnId}/charts?year=2027`);
+  H.check('tax: home charts for 2027 read 2026 records (RRSP plan buys $5,061.15, TFSA $1,450)',
+    r.status === 200 && r.data.asOfYear === 2026
+      && r.data.rrsp && r.data.rrsp.contributed === 5061.15 && r.data.rrsp.basis === 'plans'
+      && r.data.tfsa && r.data.tfsa.contributed === 1450,
+    JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/profiles/${shawnId}/charts`);
+  H.check('tax: home charts with no year default to the current year minus one (2025)',
+    r.status === 200 && r.data.asOfYear === 2025 && r.data.rrsp.contributed === 0 && r.data.tfsa.contributed === 0,
+    JSON.stringify(r.data));
+  r = await H.req('GET', `/api/tax/profiles/${shawnId}/charts?year=1800`);
+  H.check('tax: home charts with an out-of-range year is a 400', r.status === 400, JSON.stringify(r.status));
   r = await H.req('GET', `/api/tax/filings/${projA}/charts`);
   H.check('tax: filing charts use this project\'s RRSP items ($3,960.90, basis project)',
     r.status === 200 && r.data.rrsp && r.data.rrsp.contributed === 3960.9 && r.data.rrsp.basis === 'project' && r.data.rrsp.room === 20000,
@@ -455,6 +471,42 @@ export async function run(H, S) {
         return true;
       }),
       await page.evaluate(() => document.querySelector('#taxPersonBody').textContent.slice(0, 300)));
+    H.check('tax UI: open project cards carry no Open element at all (no status text)',
+      await until(() => {
+        const cards = [...document.querySelectorAll('#taxPersonBody [data-tax-open]')];
+        if (cards.length < 2) return null;
+        return cards.every((c) => !/Open/.test(c.textContent) && !/Filed/.test(c.textContent)) ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxPersonBody').textContent.slice(0, 300)));
+    // Filed: only a filed project carries a Filed tag — on its
+    // card and in its detail header. A throwaway probe project
+    // is created, filed, checked, then deleted.
+    r = await H.req('POST', '/api/tax/filings', { personId: shawnId, year: 2026, name: 'Filed probe' });
+    H.check('tax: filed-probe project created', r.status === 201 && !!r.data.id, JSON.stringify(r.data));
+    const probeId = r.data.id;
+    r = await H.req('PUT', `/api/tax/filings/${probeId}`, { status: 'filed' });
+    H.check('tax: probe project marked filed', r.status === 200 && r.data.status === 'filed', JSON.stringify(r.data));
+    await page.evaluate((id) => { location.hash = `#tax/filing/${id}`; }, probeId);
+    H.check('tax UI: the filed detail header shows Filed',
+      await until(() => {
+        const el = document.querySelector('#taxDetailStatus');
+        return el && el.textContent.trim() === 'Filed' ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxDetailStatus') || { textContent: 'missing' }).textContent));
+    await page.evaluate(() => { location.hash = '#tax'; });
+    H.check('tax UI: a filed project card shows Filed (and still no Open)',
+      await until(() => {
+        // No closure variables inside page.evaluate: find the
+        // probe card by its heading, then check its tag span.
+        const card = [...document.querySelectorAll('[data-tax-open]')]
+          .find((c) => c.querySelector('h3') && c.querySelector('h3').textContent.trim() === 'Filed probe');
+        if (!card) return null;
+        const tag = card.querySelector('.section-head span');
+        return tag && tag.textContent.trim() === 'Filed' && !/Open/.test(card.textContent) ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxPersonBody').textContent.slice(0, 300)));
+    r = await H.req('DELETE', `/api/tax/filings/${probeId}`);
+    H.check('tax: filed-probe project deleted', r.status === 200, JSON.stringify(r.status));
     H.check('tax UI: room line shows the recorded RRSP room ($20,000.00)',
       await until(() => {
         const el = document.querySelector('#taxRoomLine');
@@ -468,6 +520,21 @@ export async function run(H, S) {
           && el.querySelectorAll('canvas').length >= 4 ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxHomeCharts').textContent.slice(0, 300)));
+    H.check('tax UI: home room cards sit side by side in a grid (first two share a row)',
+      await until(() => {
+        const grid = document.querySelector('#taxHomeCharts .tax-room-grid');
+        if (!grid || grid.children.length < 4) return null;
+        const a = grid.children[0].getBoundingClientRect();
+        const b = grid.children[1].getBoundingClientRect();
+        return Math.abs(a.top - b.top) < 4 && b.left > a.left + 50 ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxHomeCharts .tax-room-grid') || { textContent: 'missing' }).textContent.slice(0, 200)));
+    H.check('tax UI: home room charts label the through-last-year basis (Through Dec 31, 2025)',
+      await until(() => {
+        const el = document.querySelector('#taxHomeCharts');
+        return el && el.textContent.includes('Through Dec 31, 2025') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxHomeCharts').textContent.slice(0, 200)));
     // Switch to Jiaying: no projects, no recorded room — then back.
     await page.evaluate((id) => { document.querySelector(`[data-tax-person="${id}"]`).click(); }, jiayingId);
     H.check('tax UI: switching to Jiaying shows her (empty) projects and rooms',
@@ -491,6 +558,14 @@ export async function run(H, S) {
         return el && el.textContent.includes('Tax return 2026') ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxDetailTitle').textContent));
+    H.check('tax UI: an open project detail shows no status element (no Open, no Filed)',
+      await until(() => {
+        const st = document.querySelector('#taxDetailStatus');
+        if (!st || st.textContent.trim() !== '') return null;
+        if ([...document.querySelectorAll('#taxSections span')].some((s) => s.textContent.trim() === 'Open')) return null;
+        return true;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxDetailStatus') || { textContent: 'missing' }).textContent));
     H.check('tax UI: detail has the four sections + Review + Finish and file, a plain Back link, and a danger Delete',
       await until(() => {
         const el = document.querySelector('#taxSections');
@@ -585,6 +660,36 @@ export async function run(H, S) {
         return el && el.textContent.includes('AI test income') ? true : null;
       }),
       await page.evaluate(() => document.querySelector('#taxSections').textContent.slice(0, 400)));
+    // The in-project Tax Profile follows the person's CURRENT
+    // profile record — one source of truth, no per-project copy.
+    // Editing it from inside the detail updates the in-project
+    // block (rooms + charts) with no navigation.
+    await until(() => document.querySelector('#taxDetailProfileEditBtn') ? true : null);
+    await page.evaluate(() => { document.querySelector('#taxDetailProfileEditBtn').click(); });
+    H.check('tax UI: profile Edit inside the detail opens with the saved rooms ($20,000 RRSP)',
+      await until(() => {
+        const f = document.querySelector('#taxProfileForm');
+        return f && f.querySelector('input[name="rrsp_room"]').value === '20,000' ? true : null;
+      }),
+      await page.evaluate(() => (document.querySelector('#taxProfileForm') || { textContent: 'missing' }).textContent.slice(0, 200)));
+    await page.evaluate(() => {
+      const f = document.querySelector('#taxProfileForm');
+      f.querySelector('input[name="rrsp_room"]').value = '21,000';
+      f.querySelector('button[type="submit"]').click();
+    });
+    H.check('tax UI: saving the profile inside the detail updates the in-project Tax Profile block ($21,000.00)',
+      await until(() => {
+        const body = document.querySelector('#taxDetailProfileBody');
+        const detail = document.querySelector('#taxDetail');
+        return body && body.textContent.includes('21,000.00') && detail && !detail.classList.contains('hidden') ? true : null;
+      }),
+      await page.evaluate(() => document.querySelector('#taxDetailProfileBody').textContent));
+    // Restore the $20,000 room via API so the later home pin
+    // reads it back; the detail re-render is not needed for that.
+    await H.req('PUT', `/api/tax/profiles/${shawnId}`, {
+      rrsp_room: 20000, tfsa_room: 5000, resp_beneficiary: 'Baby', resp_subscriber: 'Shawn',
+      resp_room: 45000, cesg_room: 7000, as_of_date: '2026-10-31',
+    });
     // Profile Edit from home saves a room change and stays on home.
     await page.evaluate(() => { location.hash = '#tax'; });
     await until(() => document.querySelector('#taxRoomEditBtn') ? true : null);

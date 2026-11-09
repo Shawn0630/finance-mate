@@ -594,11 +594,12 @@ async function loadTax() {
     $('#taxPersonBody').innerHTML = `<div class="section-head"><h3>${esc(filer.person.username)} · ${taxYear}</h3><div class="spacer"></div>
       <button class="small" id="taxCreateProjectBtn">+ Create project</button></div>` +
       (projects.map((p) => {
-        const status = p.status === 'filed' ? 'Filed' : 'Open';
         const kinds = Object.entries(p.totals.byKind || {})
           .map(([k, v]) => `${TAX_KIND_LABELS[k] || k} ${money2(v)}`).join(' · ');
+        // No status element on an open project — the whole card
+        // opens on click. A filed project alone carries a Filed tag.
         return `<div class="panel breakdown-card" data-tax-open="${p.id}"><div class="section-head"><h3>${esc(p.name)}</h3>
-          <div class="spacer"></div><span>${status}</span></div>
+          <div class="spacer"></div>${p.status === 'filed' ? '<span>Filed</span>' : ''}</div>
           <div>${p.itemCount} item${p.itemCount === 1 ? '' : 's'}${kinds ? ` · ${kinds}` : ''}</div></div>`;
       }).join('') || '<div class="note">No projects yet.</div>');
     document.querySelectorAll('[data-tax-open]').forEach((el) => el.addEventListener('click', () => { location.hash = `#tax/filing/${el.dataset.taxOpen}`; }));
@@ -614,7 +615,9 @@ async function loadTax() {
     $('#taxRoomAiBtn').onclick = () => taxProfileModal(filer.person.id, { aiOpen: true });
     // Room charts for the selected person — the same renderer
     // the detail page uses, with a 'home' prefix on canvas ids.
-    await taxRenderCharts($('#taxHomeCharts'), `/api/tax/profiles/${filer.person.id}/charts`, 'home');
+    // Keyed to the selected tax year: the home charts show the
+    // previous year's records (Y−1), not the current year's.
+    await taxRenderCharts($('#taxHomeCharts'), `/api/tax/profiles/${filer.person.id}/charts?year=${taxYear}`, 'home');
   } catch (err) { taxMsg(msg, 'err', err.message); }
 }
 
@@ -662,7 +665,7 @@ async function loadTaxFiling(id) {
     taxT776Form = data.t776Form || null;
     taxRrspWindow = data.rrspWindow || null;
     $('#taxDetailTitle').textContent = `${data.name} — ${data.person ? data.person.username : '?'} · ${data.tax_year}`;
-    $('#taxDetailStatus').textContent = data.status === 'filed' ? 'Filed' : 'Open';
+    $('#taxDetailStatus').textContent = data.status === 'filed' ? 'Filed' : '';
     $('#taxFileToggleBtn').textContent = data.status === 'filed' ? 'Reopen' : 'Mark filed';
     // Refund headline — the very top of the detail, above the
     // Tax Profile / Slips row.
@@ -722,7 +725,7 @@ async function loadTaxFiling(id) {
       const st = (data.sections && data.sections[s.key]) || { amount: 0, confirmed: 0, total: 0 };
       return `<div class="summary-card"><div class="k">${s.label}</div><div class="v">${money2(st.amount)}</div><div>${st.confirmed} of ${st.total} confirmed</div></div>`;
     }).join('');
-    const reviewHtml = `<div class="panel"><div class="section-head"><h3>Review</h3><div class="spacer"></div><span>${data.status === 'filed' ? 'Filed' : 'Open'}</span></div>
+    const reviewHtml = `<div class="panel"><div class="section-head"><h3>Review</h3><div class="spacer"></div>${data.status === 'filed' ? '<span>Filed</span>' : ''}</div>
       <div class="summary-row">${reviewCards}<div class="summary-card"><div class="k">Total</div><div class="v">${money2(data.totals.total)}</div></div></div></div>`;
     const finishHtml = `<div class="panel"><div class="section-head"><h3>Finish and file</h3></div>
       ${TAX_SECTIONS.map((s) => {
@@ -1318,7 +1321,15 @@ async function taxRenderCharts(host, url, prefix, keys) {
       'Net contributions from your TFSA accounts (buys minus sells).', c.tfsa ? c.tfsa.currentValue : null));
     if (want.includes('resp')) cards.push(`<div class="panel"><h3>RESP</h3><div class="note">${who}</div>${respLegend}</div>`);
     if (want.includes('cesg')) cards.push(`<div class="panel"><h3>CESG grant</h3><div class="note">20% on the first $2,500 contributed per year (max $500/yr).</div>${cesgLegend}</div>`);
-    host.innerHTML = cards.join('');
+    // Room cards sit side by side in a grid (2 columns, 4 across
+    // on wide screens) instead of a full-width vertical stack. A
+    // single card (the RRSP tool modal) renders unwrapped. The
+    // home charts carry asOfYear (Y−1) — label the basis so the
+    // through-last-year figures are not mistaken for current ones.
+    const asOfNote = c.asOfYear ? `<div class="note">Through Dec 31, ${c.asOfYear} — prior years' records.</div>` : '';
+    host.innerHTML = cards.length > 1
+      ? `${asOfNote}<div class="tax-room-grid">${cards.join('')}</div>`
+      : `${asOfNote}${cards.join('')}`;
     if (want.includes('rrsp')) taxDrawRoomDoughnut(prefix, 'rrsp', c.rrsp);
     if (want.includes('tfsa')) taxDrawRoomDoughnut(prefix, 'tfsa', c.tfsa);
     if (want.includes('resp')) taxDrawRoomDoughnut(prefix, 'resp', respSplit ? { contributed: respSplit.contributed, room: respSplit.remaining } : null);
