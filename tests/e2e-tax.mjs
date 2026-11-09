@@ -529,6 +529,42 @@ export async function run(H, S) {
         return Math.abs(a.top - b.top) < 4 && b.left > a.left + 50 ? true : null;
       }),
       await page.evaluate(() => (document.querySelector('#taxHomeCharts .tax-room-grid') || { textContent: 'missing' }).textContent.slice(0, 200)));
+    // Tax home layout: Contribution room (left) and the project
+    // list (right) sit side by side at desktop width, stacked on
+    // a narrow viewport (room first, projects below). Viewport set
+    // explicitly — the default 800px run is below the 900px stack
+    // point.
+    await page.setViewport({ width: 1280, height: 800 });
+    H.check('tax UI: home Contribution room (left) and projects (right) sit side by side at desktop width',
+      await until(() => {
+        const body = document.querySelector('#taxPersonBody');
+        const room = document.querySelector('#taxRoomPanel');
+        if (!body || !room) return null;
+        const a = body.getBoundingClientRect();
+        const b = room.getBoundingClientRect();
+        return Math.abs(a.top - b.top) < 4 && a.left > b.left + 100 && a.top < b.bottom ? true : null;
+      }),
+      await page.evaluate(() => {
+        const a = document.querySelector('#taxPersonBody').getBoundingClientRect();
+        const b = document.querySelector('#taxRoomPanel').getBoundingClientRect();
+        return `room ${Math.round(b.left)},${Math.round(b.top)} ${Math.round(b.width)}x${Math.round(b.height)} body ${Math.round(a.left)},${Math.round(a.top)} ${Math.round(a.width)}x${Math.round(a.height)}`;
+      }));
+    await page.setViewport({ width: 700, height: 900 });
+    H.check('tax UI: home Contribution room and projects stack vertically on a narrow viewport (room first)',
+      await until(() => {
+        const body = document.querySelector('#taxPersonBody');
+        const room = document.querySelector('#taxRoomPanel');
+        if (!body || !room) return null;
+        const a = body.getBoundingClientRect();
+        const b = room.getBoundingClientRect();
+        return a.top >= b.bottom - 2 && Math.abs(a.left - b.left) < 4 ? true : null;
+      }),
+      await page.evaluate(() => {
+        const a = document.querySelector('#taxPersonBody').getBoundingClientRect();
+        const b = document.querySelector('#taxRoomPanel').getBoundingClientRect();
+        return `room bottom ${Math.round(b.bottom)} body top ${Math.round(a.top)} lefts ${Math.round(b.left)}/${Math.round(a.left)}`;
+      }));
+    await page.setViewport({ width: 800, height: 600 });
     H.check('tax UI: home room charts label the through-last-year basis (Through Dec 31, 2025)',
       await until(() => {
         const el = document.querySelector('#taxHomeCharts');

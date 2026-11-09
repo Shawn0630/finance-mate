@@ -316,6 +316,13 @@ tr.sub td { color: #71808f; font-size: 12px; }
    is neutralised inside the grid so the gap stays even. */
 .tax-room-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
 .tax-room-grid .panel { margin-bottom: 0; }
+/* Tax home: Contribution room (left) and the project list
+   (right) sit side by side in two columns — the year selector,
+   person switcher and headings stay above them. Stacked on
+   narrow screens (900px matches the .portfolio-grid stack
+   point). The room cards' own grid is unchanged. */
+.tax-home-cols { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 900px) { .tax-home-cols { grid-template-columns: 1fr; } }
 /* Card-detail balance line: the owed figure is bold and enlarged
    against the small muted line; the as-of stays small. */
 .spend-balance-figure { font-size: 18px; font-weight: 700; color: #1c2733; }
