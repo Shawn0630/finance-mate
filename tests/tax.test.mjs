@@ -57,6 +57,9 @@ test('CA slip kinds: the seven slips, each with box fields — T4A, never T5A', 
     for (const f of s.fields) assert.ok(f.key && f.label);
   }
   assert.equal(caTax.slipKindDef('T4').fields.find((f) => f.key === 'box14').money, true);
+  // T4A box 105 is scholarships, bursaries and fellowships
+  // (user 2026-11-10 — "T4A是奖学金对吧？": yes, box 105).
+  assert.equal(caTax.slipKindDef('T4A').fields.find((f) => f.key === 'box105').label, 'Box 105 — Scholarships, bursaries, fellowships');
   assert.equal(caTax.slipKindDef('NOPE'), null);
 });
 
@@ -79,6 +82,7 @@ test('slipAmount: only the income boxes count — tax deducted and cost base nev
   assert.equal(caTax.slipAmount('T3', { box21: 500, box23: 40, box26: 10, box30: 5 }), 550);
   assert.equal(caTax.slipAmount('T5008', { box20: 1505, box21: 1200 }), 1505);
   assert.equal(caTax.slipAmount('T4A', { box016: 0, box020: 0 }), 0);
+  assert.equal(caTax.slipAmount('T4A', { box105: 5000, box022: 750 }), 5000);
   assert.equal(caTax.slipAmount('T4', {}), null);
   assert.equal(caTax.slipAmount('T4', { box22: 40000 }), null);
   assert.equal(caTax.slipAmount('NOPE', { box14: 1 }), null);
@@ -581,6 +585,43 @@ test('rrspBenefit: $0 saves $0; the Meta-like job saves $4,925.25 on $11,442.60'
   assert.equal(full.benefit, 4925.25);
   assert.equal(full.benefitRatePct, 43);
   assert.deepEqual(full.jobs, [{ employer: 'Meta', gross: 190704.02, allocated: 11442.6 }]);
+});
+
+// The additional semantics (user 2026-11-10): the baseline is tax
+// with the plans' deduction, and the benefit is the tax saved on
+// top of the plans. The slider value is the TOTAL contribution;
+// at the plan amount the additional benefit is $0.
+test('rrspBenefit: baseAmount — benefit is additional on top of the plans', () => {
+  const meta = jobRow();
+  // No base (no plans) is the old behaviour, unchanged.
+  assert.equal(rrspBenefit({ jobRows: [meta], payroll, amount: 11442.6 }).benefit, 4925.25);
+  // At the plan amount itself the additional benefit is $0.
+  const atPlan = rrspBenefit({ jobRows: [meta], payroll, amount: 11442.6, baseAmount: 11442.6 });
+  assert.equal(atPlan.baseAmount, 11442.6);
+  assert.equal(atPlan.additional, 0);
+  assert.equal(atPlan.taxWithout, 48763.32);
+  assert.equal(atPlan.taxWith, 48763.32);
+  assert.equal(atPlan.benefit, 0);
+  assert.equal(atPlan.benefitRatePct, 0);
+  // $20,000 total on top of the $11,442.60 plans: the additional
+  // benefit is the vs-$0 benefit of $20,000 minus that of the plans.
+  const extra = rrspBenefit({ jobRows: [meta], payroll, amount: 20000, baseAmount: 11442.6 });
+  assert.equal(extra.additional, 8557.4);
+  assert.equal(extra.taxWithout, 48763.32);
+  assert.equal(extra.taxWith, 45280.46);
+  assert.equal(extra.benefit, 3482.86);
+  assert.equal(extra.benefitRatePct, 40.7);
+  assert.deepEqual(extra.jobs, [{ employer: 'Meta', gross: 190704.02, allocated: 20000 }]);
+  assert.ok(Math.abs(
+    (extra.benefit + rrspBenefit({ jobRows: [meta], payroll, amount: 11442.6 }).benefit)
+    - rrspBenefit({ jobRows: [meta], payroll, amount: 20000 }).benefit,
+  ) < 0.01);
+  // A total below the plans is clamped up to the plans: $0 additional.
+  const below = rrspBenefit({ jobRows: [meta], payroll, amount: 5000, baseAmount: 11442.6 });
+  assert.equal(below.amount, 11442.6);
+  assert.equal(below.additional, 0);
+  assert.equal(below.taxWith, below.taxWithout);
+  assert.equal(below.benefit, 0);
 });
 
 test('rrspBenefit: no jobs → no income, no benefit; unverified province → federal-only', () => {

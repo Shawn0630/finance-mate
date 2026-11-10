@@ -5069,9 +5069,11 @@ app.post('/api/tax/items/fill', requireApiAuth, async (req, res) => {
 });
 
 // --------------------------------------------------- tax RRSP benefit --
-// Tax saved by an RRSP contribution of `amount`, from the
-// region's own T4127-style engine (rrspBenefit in src/tax.js —
-// the same code Earnings uses: tax without minus tax with).
+// ADDITIONAL tax saved by raising the RRSP contribution to
+// `amount` on top of the person's linked contribution plans for
+// the year (rrspBenefit in src/tax.js — the same code Earnings
+// uses): tax with the plans' deduction minus tax with the total
+// deduction. The baseline is the plans, not $0 (user 2026-11-10).
 // Capped at the person's recorded remaining RRSP room when the
 // Tax Profile has one; otherwise the amount is free. ESTIMATE
 // ONLY — the same "Estimate — actual tax is settled on the T1."
@@ -5088,7 +5090,16 @@ app.get('/api/tax/filings/:id/rrsp-benefit', requireApiAuth, (req, res) => {
   const profile = person ? getTaxProfile(person.id) : null;
   const room = profile && profile.rrsp_room != null ? Number(profile.rrsp_room) : null;
   const effectiveAmount = room != null ? Math.min(amount, room) : amount;
-  const out = rrspBenefit({ jobRows, payroll: region.payroll, amount: effectiveAmount });
+  // The baseline: this person's linked RRSP plan amounts for the
+  // year — same derivation as the filing detail's rrspPlanAnnual
+  // (actual generated events first, projected due periods
+  // otherwise — planOwnAnnual, over the CRA first-60-days window
+  // for the tax year).
+  const ctx = deriveTaxContext(filing.tax_year);
+  const baseAmount = person
+    ? round2(ctx.plans.filter((p) => p.owner === person.username).reduce((s, p) => s + (Number(p.ownAnnual) || 0), 0))
+    : 0;
+  const out = rrspBenefit({ jobRows, payroll: region.payroll, amount: effectiveAmount, baseAmount });
   res.json({
     ...out,
     requestedAmount: round2(amount),

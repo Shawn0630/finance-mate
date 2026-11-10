@@ -105,6 +105,7 @@ export const slipKinds = [
       { key: 'payer_name', label: 'Payer name' },
       { key: 'box016', label: 'Box 016 — Pension or superannuation', money: true },
       { key: 'box020', label: 'Box 020 — Other income', money: true },
+      { key: 'box105', label: 'Box 105 — Scholarships, bursaries, fellowships', money: true },
       { key: 'box022', label: 'Box 022 — Income tax deducted', money: true },
     ],
   },
@@ -163,7 +164,7 @@ export function slipKindDef(kind) {
 // box 21 is the cost base, kept in the item detail instead.
 const SLIP_AMOUNT_FIELDS = {
   T4: ['box14'],
-  T4A: ['box016', 'box020'],
+  T4A: ['box016', 'box020', 'box105'],
   T5: ['box11', 'box13'],
   T3: ['box21', 'box23', 'box26'],
   T4RSP: ['box16'],

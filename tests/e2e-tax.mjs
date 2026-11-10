@@ -434,8 +434,8 @@ export async function run(H, S) {
 
   // ---- RRSP benefit slider endpoint (reuses the Earnings engine) ----
   r = await H.req('GET', `/api/tax/filings/${projA}/rrsp-benefit?amount=11442.60`);
-  H.check('tax: $11,442.60 saves $4,925.25 (his paystub figure, to the cent of the engine)',
-    r.status === 200 && r.data.benefit === 4925.25 && r.data.capped === false && r.data.effectiveAmount === 11442.6,
+  H.check('tax: $11,442.60 on top of the $3,960.90 plan saves $3,182.65 additional (baseline = tax with the plans)',
+    r.status === 200 && r.data.benefit === 3182.65 && r.data.baseAmount === 3960.9 && r.data.capped === false && r.data.effectiveAmount === 11442.6,
     JSON.stringify(r.data));
   r = await H.req('GET', `/api/tax/filings/${projA}/rrsp-benefit?amount=25000`);
   H.check('tax: amount above the recorded room is capped at $20,000',
@@ -882,7 +882,15 @@ export async function run(H, S) {
     await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });
     // RRSP contribution tool: the button opens the modal with the
     // slider, the highlighted tax-saved figure and the doughnut.
+    // Wait for the projA page itself (its title) before clicking:
+    // the button already exists on the 2025 filing's page, and
+    // clicking it before the navigation lands opens the modal on
+    // the wrong filing.
     await page.evaluate((id) => { location.hash = `#tax/filing/${id}`; }, projA);
+    await until(() => {
+      const t = document.querySelector('#taxDetailTitle');
+      return t && t.textContent.includes('Tax return 2026') ? true : null;
+    });
     await until(() => document.querySelector('[data-tax-rrsp-tool]') ? true : null);
     await page.evaluate(() => { document.querySelector('[data-tax-rrsp-tool]').click(); });
     H.check('tax UI: RRSP tool opens with slider + highlighted tax-saved figure + doughnut',
@@ -890,12 +898,10 @@ export async function run(H, S) {
         const s = document.querySelector('#taxRrspSlider');
         const res = document.querySelector('#taxRrspResult');
         const chart = document.querySelector('#taxRrspEstimatorChart');
-        return s && res && res.textContent.includes('Estimated tax saved')
+        return s && res && res.textContent.includes('Additional estimated tax saved')
           && chart && chart.querySelector('canvas') ? true : null;
       }),
       await page.evaluate(() => (document.querySelector('#taxRrspResult') || { textContent: 'missing' }).textContent));
-    const savedBefore = await page.evaluate(() => (document.querySelector('#taxRrspResult .v') || { textContent: '' }).textContent);
-    await page.evaluate((v) => { window.__savedBefore = v; }, savedBefore);
     await page.evaluate(() => {
       const s = document.querySelector('#taxRrspSlider');
       s.value = '5000';
@@ -905,7 +911,8 @@ export async function run(H, S) {
       await until(() => {
         const amt = document.querySelector('#taxRrspAmount');
         const res = document.querySelector('#taxRrspResult .v');
-        return amt && amt.value === '5,000' && res && res.textContent !== '' && res.textContent !== window.__savedBefore ? true : null;
+        // $5,000 total on top of the $3,960.90 plan: $457.15 additional.
+        return amt && amt.value === '5,000' && res && res.textContent === '$457.15' ? true : null;
       }),
       await page.evaluate(() => `${document.querySelector('#taxRrspAmount').value} / ${(document.querySelector('#taxRrspResult .v') || {}).textContent}`));
     await page.evaluate(() => { document.querySelector('#taxModal [data-close-modal]').click(); });

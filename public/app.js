@@ -1367,13 +1367,16 @@ async function taxRenderCharts(host, url, prefix, keys) {
 // --------------------------------------------- RRSP benefit slider --
 // The RRSP contribution tool: a BUTTON in Registered savings
 // plans opens it as a modal — never an always-visible section.
-// Dragging the contribution shows the tax it saves, live, from
+// Dragging the contribution shows the ADDITIONAL tax it saves on
+// top of the person's linked RRSP plans for the year, live, from
 // the existing Earnings engine (GET rrsp-benefit), as one
 // highlighted big figure, with the RRSP room doughnut below.
-// The slider starts from the person's linked RRSP plan amounts
-// for the year; it caps at the recorded remaining RRSP room
+// The slider is the TOTAL annual contribution and starts from
+// the person's linked RRSP plan amounts for the year; it cannot
+// go below the plans (the benefit is only defined for the extra
+// on top of them). It caps at the recorded remaining RRSP room
 // when the profile has one, otherwise the amount is free.
-// Estimate only. Baseline: tax with RRSP deduction 0.
+// Estimate only. Baseline: tax with the plans' deduction.
 function taxRrspEstimatorModal() {
   const data = taxFiling;
   if (!data) return;
@@ -1381,10 +1384,16 @@ function taxRrspEstimatorModal() {
   const room = data.profile && data.profile.rrsp_room != null ? Number(data.profile.rrsp_room) : null;
   const start = room != null ? Math.min(planAnnual, room) : planAnnual;
   const max = room != null ? room : Math.max(20000, Math.ceil((planAnnual * 2) / 1000) * 1000);
+  // The slider floor is the plans' amount, but the min is rounded
+  // down to the step grid (step 100) so round totals stay
+  // reachable — a min of exactly the plan amount shifts the grid
+  // (e.g. min 3,961 makes 5,000 unsnappable, it lands on 4,961).
+  // onAmount below enforces the plan floor itself.
+  const sliderMin = Math.floor(start / 100) * 100;
   taxOpenModal('RRSP contribution tool', `
     <div class="note">${room != null ? `Capped at your recorded RRSP room ${money2(room)}${data.profile.as_of_date ? ` (as of ${esc(data.profile.as_of_date)})` : ''}` : 'No RRSP room recorded — add it on your profile'}</div>
     <div class="grid2"><div><label>Contribution ($)</label>
-      <input type="range" id="taxRrspSlider" min="0" max="${Math.round(max)}" step="100" value="${Math.round(start)}">
+      <input type="range" id="taxRrspSlider" min="${Math.round(sliderMin)}" max="${Math.round(max)}" step="100" value="${Math.round(start)}">
     </div><div><label>Amount</label><input id="taxRrspAmount" type="text" inputmode="decimal" data-money value="${formatMoneyInput(start)}"></div></div>
     <div id="taxRrspResult"></div>
     <div id="taxRrspEstimatorChart"></div>
@@ -1398,9 +1407,10 @@ function taxRrspEstimatorModal() {
     try {
       const r = await api(`/api/tax/filings/${data.id}/rrsp-benefit?amount=${amount}`);
       resultEl.innerHTML = `<div class="summary-card" style="text-align:center">
-        <div class="k">Estimated tax saved</div>
+        <div class="k">Additional estimated tax saved</div>
         <div class="v positive">${money2(r.benefit)}</div>
-        <div class="n">Tax without ${money2(r.taxWithout)} → with ${money2(r.taxWith)} · ${r.benefitRatePct}% of the contribution</div></div>
+        <div class="n">Tax with plans ${money2(r.taxWithout)} → with ${money2(r.taxWith)}${r.additional > 0 ? ` · ${r.benefitRatePct}% of the additional ${money2(r.additional)}` : ' · drag the slider to add a contribution on top of your plans'}</div></div>
+        ${r.baseAmount > 0 ? `<div class="note">Your plans already contribute ${money2(r.baseAmount)} this year — this is the tax saved on top of that.</div>` : ''}
         ${r.income ? `<div class="note">Income ${money2(r.income)}${r.province ? ` · ${esc(r.province)}` : ''}${r.provinceVerified ? '' : ' · provincial estimate unavailable — federal only'}</div>` : '<div class="note">No salary income for this year — the estimate needs a linked job.</div>'}
         ${r.capped ? `<div class="note">Capped at your recorded RRSP room ${money2(r.room)}.</div>` : ''}`;
     } catch (err) {
@@ -1409,7 +1419,7 @@ function taxRrspEstimatorModal() {
   };
   const onAmount = (v) => {
     const n = Math.max(0, Number(parseMoneyInput(String(v))) || 0);
-    const clamped = room != null ? Math.min(n, room) : n;
+    const clamped = room != null ? Math.min(Math.max(n, start), room) : Math.max(n, start);
     if (clamped > Number(slider.max)) slider.max = Math.ceil(clamped / 1000) * 1000;
     slider.value = String(Math.round(clamped));
     amountInput.value = formatMoneyInput(clamped);

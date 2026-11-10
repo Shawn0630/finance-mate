@@ -171,10 +171,17 @@ export function throughDate(events, cutoff) {
 }
 
 // -------------------------------------------- RRSP benefit estimate --
-// Tax saved by an RRSP contribution, computed with the region's
-// own T4127-style engine (calcSalary — the same code Earnings
-// uses): total income tax (federal + provincial) without the
-// contribution minus total income tax with it. CPP/CPP2/EI are
+// ADDITIONAL tax saved by an RRSP contribution on top of what the
+// person's linked contribution plans already put in this year
+// (user 2026-11-10 — "要的 额外的"). Baseline: total income tax
+// (federal + provincial) with the RRSP deduction equal to the
+// plans' amount (`baseAmount`, 0 when there are no plans) minus
+// total income tax with the deduction raised to the slider's total
+// (`amount`). The slider value is the TOTAL annual contribution;
+// at the plan amount the additional benefit is $0. A total below
+// the plans is clamped up to the plans (it cannot save less than
+// $0). Computed with the region's own T4127-style engine
+// (calcSalary — the same code Earnings uses). CPP/CPP2/EI are
 // unchanged by an RRSP deduction (full gross), so they cancel
 // out of the difference and are not part of the benefit. The
 // contribution is applied to the person's jobs highest-gross
@@ -184,8 +191,10 @@ export function throughDate(events, cutoff) {
 // false — the caller says so. ESTIMATE ONLY: the same
 // "Estimate — actual tax is settled on the T1." disclaimer
 // Earnings carries. This is not a T1 computation.
-export function rrspBenefit({ jobRows, payroll, amount }) {
-  const contribution = Math.max(0, round2(Number(amount) || 0));
+export function rrspBenefit({ jobRows, payroll, amount, baseAmount = 0 }) {
+  const base = Math.max(0, round2(Number(baseAmount) || 0));
+  const total = Math.max(base, round2(Number(amount) || 0));
+  const additional = round2(total - base);
   const jobs = (jobRows || [])
     .filter((j) => j && PAY_FREQUENCIES[j.frequency])
     .map((j) => ({
@@ -194,7 +203,8 @@ export function rrspBenefit({ jobRows, payroll, amount }) {
     }))
     .sort((a, b) => b.annualGross - a.annualGross);
   const income = round2(jobs.reduce((s, j) => s + j.annualGross, 0));
-  let remaining = contribution;
+  let baseRemaining = base;
+  let totalRemaining = total;
   let taxWithout = 0;
   let taxWith = 0;
   let provinceVerified = true;
@@ -202,25 +212,28 @@ export function rrspBenefit({ jobRows, payroll, amount }) {
   const allocations = [];
   for (const j of jobs) {
     const periods = PAY_FREQUENCIES[j.frequency].periods;
-    const base = { ...j, bonus_total: j.bonus_total || 0 };
-    const calc0 = calcSalary({ ...base, rrspDeduction: 0 }, payroll);
-    const allocated = Math.min(remaining, Math.max(0, j.annualGross));
-    const calc1 = calcSalary({ ...base, rrspDeduction: allocated / periods }, payroll);
+    const baseAlloc = Math.min(baseRemaining, Math.max(0, j.annualGross));
+    const totalAlloc = Math.min(totalRemaining, Math.max(0, j.annualGross));
+    const calc0 = calcSalary({ ...j, bonus_total: j.bonus_total || 0, rrspDeduction: baseAlloc / periods }, payroll);
+    const calc1 = calcSalary({ ...j, bonus_total: j.bonus_total || 0, rrspDeduction: totalAlloc / periods }, payroll);
     taxWithout = round2(taxWithout + calc0.totalTax);
     taxWith = round2(taxWith + calc1.totalTax);
     if (!calc0.provinceVerified) provinceVerified = false;
     for (const w of calc0.warnings || []) if (!warnings.includes(w)) warnings.push(w);
-    allocations.push({ employer: j.employer, gross: calc0.annualGross, allocated: round2(allocated) });
-    remaining = round2(remaining - allocated);
+    allocations.push({ employer: j.employer, gross: calc0.annualGross, allocated: round2(totalAlloc) });
+    baseRemaining = round2(baseRemaining - baseAlloc);
+    totalRemaining = round2(totalRemaining - totalAlloc);
   }
   const benefit = round2(Math.max(0, taxWithout - taxWith));
   return {
-    amount: contribution,
+    amount: total,
+    baseAmount: base,
+    additional,
     income,
     province: jobs.length ? jobs[0].province : null,
     provinceVerified,
     taxWithout, taxWith, benefit,
-    benefitRatePct: contribution > 0 ? Math.round((benefit / contribution) * 1000) / 10 : 0,
+    benefitRatePct: additional > 0 ? Math.round((benefit / additional) * 1000) / 10 : 0,
     jobs: allocations,
     warnings,
     estimateNote: 'Estimate — actual tax is settled on the T1.',
