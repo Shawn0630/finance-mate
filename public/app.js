@@ -527,7 +527,7 @@ window.addEventListener('hashchange', route);
 // (removed 2026-11-08). Project cards open on click; there is no
 // Open button. The detail page is sectioned like a guided return
 // (Income / Registered savings plans / Deductions / Provincial /
-// Review / Finish and file), with the refund headline at the very
+// Finish and file), with the refund headline at the very
 // top (computed T1 — see src/regions/ca/t1.js), Tax Profile +
 // Slips side by side below it, and the RRSP contribution tool as
 // a button in Registered savings plans. Room doughnuts are one
@@ -739,12 +739,6 @@ async function loadTaxFiling(id) {
           ? `<table><thead><tr><th>Kind</th><th>Item</th><th class="num">Amount</th><th class="num">Share</th><th class="num">Effective</th><th>Status</th><th></th></tr></thead><tbody>${items.map((it) => taxItemRowHtml(it, data.slips)).join('')}</tbody></table>`
           : '<div class="note">No items yet.</div>'}</div>`;
     }).join('');
-    const reviewCards = TAX_SECTIONS.map((s) => {
-      const st = (data.sections && data.sections[s.key]) || { amount: 0, confirmed: 0, total: 0 };
-      return `<div class="summary-card"><div class="k">${s.label}</div><div class="v">${money2(st.amount)}</div><div>${st.confirmed} of ${st.total} confirmed</div></div>`;
-    }).join('');
-    const reviewHtml = `<div class="panel"><div class="section-head"><h3>Review</h3><div class="spacer"></div>${data.status === 'filed' ? '<span>Filed</span>' : ''}</div>
-      <div class="summary-row">${reviewCards}<div class="summary-card"><div class="k">Total</div><div class="v">${money2(data.totals.total)}</div></div></div></div>`;
     const finishHtml = `<div class="panel"><div class="section-head"><h3>Finish and file</h3></div>
       ${TAX_SECTIONS.map((s) => {
         const st = (data.sections && data.sections[s.key]) || { total: 0, confirmed: 0 };
@@ -752,7 +746,7 @@ async function loadTaxFiling(id) {
       }).join('')}
       <div>Contribution room: ${prof ? (prof.rrsp_room != null || prof.tfsa_room != null ? 'Recorded' : 'No room recorded') : 'No profile yet'}</div>
       <div>Slips: ${data.slips.length} attached</div></div>`;
-    $('#taxSections').innerHTML = sectionsHtml + reviewHtml + finishHtml;
+    $('#taxSections').innerHTML = sectionsHtml + finishHtml;
     document.querySelectorAll('[data-tax-confirm]').forEach((b) => b.addEventListener('click', () => taxSetItemStatus(Number(b.dataset.taxConfirm), 'confirmed')));
     document.querySelectorAll('[data-tax-unconfirm]').forEach((b) => b.addEventListener('click', () => taxSetItemStatus(Number(b.dataset.taxUnconfirm), 'linked')));
     document.querySelectorAll('[data-tax-edit-item]').forEach((b) => b.addEventListener('click', () => taxEditItemModal(Number(b.dataset.taxEditItem))));

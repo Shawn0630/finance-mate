@@ -447,7 +447,7 @@ test('validTaxSlipInput: unknown kind, unknown box, bad year', () => {
 // The guided-return checklist (TurboTax-style, user 2026-11-08
 // 16:19 — supersedes the Income / Deductions / Credits split):
 // Income, Registered savings plans, Deductions, Provincial, then
-// Review (a summary, not a kind bucket) and Finish and file.
+// Finish and file (a summary, not a kind bucket).
 // 'credit' is a first-class item kind and renders under
 // Provincial (BC) — there is no federal-credits section. The
 // disability amount is technically a non-refundable credit; it
