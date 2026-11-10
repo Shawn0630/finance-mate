@@ -10,8 +10,9 @@
 //   - nothing generates automatically — Generate runs only on
 //     the user's explicit action on a project;
 //   - the detail page is sectioned (TAX_SECTIONS in src/tax.js):
-//     Income, Registered savings plans, Deductions, Provincial,
-//     Review, Finish and file (2026-11-08 re-split);
+//     Income, Registered savings plans, Deductions, Provincial
+//     (2026-11-08 re-split; Review + Finish and file removed
+//     2026-11-09);
 //   - the RRSP benefit estimate reuses the region's T4127-style
 //     engine (calcSalary over the region's payroll tables —
 //     src/tax.js rrspBenefit). The region provides the payroll

@@ -25,7 +25,7 @@
 //     never overwritten or pruned;
 //   - the detail page is sectioned like a guided return
 //     (TAX_SECTIONS): Income, Registered savings plans,
-//     Deductions, Provincial, then Finish and file;
+//     Deductions, Provincial;
 //   - the RRSP benefit estimate reuses the region's T4127-style
 //     engine (calcSalary): tax without the contribution minus
 //     tax with it. It is an ESTIMATE, never a T1 computation;
@@ -47,10 +47,9 @@ export const TAX_FILING_STATUSES = ['open', 'filed'];
 
 // Guided-return sections (TurboTax-style checklist, user
 // 2026-11-08 16:19 — supersedes the Income / Deductions /
-// Credits split). Finish and file is a summary, not a kind
-// bucket: a completeness/readiness summary, never a filing
-// calculation (v1 has no T1 math). The sub-labels name what
-// each section holds, as on the TurboTax checklist.
+// Credits split). The Review and Finish and file summary panels
+// were removed 2026-11-09 at the user's request. The sub-labels
+// name what each section holds, as on the TurboTax checklist.
 //   - Income: T4 employment, T5 investment, T4RSP RRSP income,
 //     rental properties (the T776's deductible expenses ride
 //     along as a DERIVED row under their rental item — the

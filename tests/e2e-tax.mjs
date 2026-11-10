@@ -843,11 +843,11 @@ export async function run(H, S) {
         return true;
       }),
       await page.evaluate(() => (document.querySelector('#taxDetailStatus') || { textContent: 'missing' }).textContent));
-    H.check('tax UI: detail has the four sections + Finish and file, a plain Back link, and a danger Delete',
+    H.check('tax UI: detail has the four sections, a plain Back link, and a danger Delete',
       await until(() => {
         const el = document.querySelector('#taxSections');
-        if (!el || !['Income', 'Registered savings plans', 'Deductions', 'Provincial', 'Finish and file'].every((s) => el.textContent.includes(s))) return null;
-        if (el.textContent.includes('Review')) return null;
+        if (!el || !['Income', 'Registered savings plans', 'Deductions', 'Provincial'].every((s) => el.textContent.includes(s))) return null;
+        if (el.textContent.includes('Review') || el.textContent.includes('Finish and file')) return null;
         const back = document.querySelector('#taxBackLink');
         if (!back || back.tagName !== 'A' || back.getAttribute('href') !== '#tax') return null;
         const del = document.querySelector('#taxDeleteBtn');
