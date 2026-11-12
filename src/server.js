@@ -43,8 +43,9 @@ import {
 import {
   buildStandardInsights, homeHighlightRows, buildHomeMetricLibrary, resolveHomeMetric, homeAiPrompt,
   displayedSalaryMonths, homeOrderKey, applyHomeInsightOrder, mortgageMonthPaymentDates, jobTakehomePeriods,
-  homeCalendarDates, daysInMonth as homeDaysInMonth,
-  nextMonth as homeNextMonth, prevMonth as homePrevMonth,
+  homeCalendarDates, daysInMonth as homeDaysInMonth, validateHomeComposite, parseHomeCompositeMetric,
+  nextMonth as homeNextMonth, prevMonth as homePrevMonth, lastCompletedMonth as homeLastCompletedMonth,
+  addMonthsYm as homeAddMonthsYm,
 } from './home.js';
 import {
   snapshotByAggregate, emptySnapshot, recordCommit, listCommits, getCommit, getCommitFull,
@@ -6275,6 +6276,55 @@ async function collectHomeData() {
     }
   }
 
+  // Mortgages: monthly payment totals per property + all properties,
+  // over the trailing year ending at the last completed month — the
+  // series the mortgage_payment library metrics and composite
+  // formulas read. Same per-month derivation as the highlight above
+  // (governing term → monthly payment → per-period amount × payment
+  // dates in the month); a month with no payment due is 0, and a
+  // month before the mortgage starts is 0 too.
+  const mortgageById = {};
+  const mortgageMonths = [];
+  {
+    const lcm = homeLastCompletedMonth(cur);
+    const startM = homeAddMonthsYm(lcm, -12);
+    const monthTotals = new Map(); // month -> total across properties
+    for (const p of props) {
+      if (!(p.mortgage_balance > 0)) continue;
+      let proj = projById.has(p.id) ? projById.get(p.id) : undefined;
+      if (proj === undefined) { proj = projectionFor(p); projById.set(p.id, proj); }
+      if (!proj || !proj.series.length) continue;
+      const terms = termsOf(p.id);
+      const totals = new Map();
+      let mm = startM;
+      let guard = 0;
+      while (mm <= cur && guard < 60) {
+        const monthEnd = `${mm}-${String(homeDaysInMonth(mm)).padStart(2, '0')}`;
+        const to = monthEnd > today ? today : monthEnd;
+        const info = mortgageMonthInfo(p, proj, terms, mm, `${mm}-01`, to);
+        let total = 0;
+        if (info.row && info.dates.length) {
+          let perPeriod = null;
+          if (!info.gov || info.gov.repayment_method !== 'equal_principal') {
+            const monthly = (info.gov && proj.termPayments && proj.termPayments[info.gov.id]
+              && proj.termPayments[info.gov.id].paymentUsed != null)
+              ? proj.termPayments[info.gov.id].paymentUsed : proj.paymentUsed;
+            if (monthly != null) perPeriod = periodPaymentFor(monthly, info.freq);
+          }
+          if (perPeriod == null) perPeriod = homeR2(info.row.payment / info.dates.length);
+          total = homeR2(perPeriod * info.dates.length);
+        }
+        totals.set(mm, total);
+        monthTotals.set(mm, homeR2((monthTotals.get(mm) || 0) + total));
+        mm = homeNextMonth(mm); guard++;
+      }
+      mortgageById[p.id] = { label: String(p.address).split(',')[0], months: [...totals.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([month, payment]) => ({ month, payment })) };
+    }
+    for (const [month, payment] of [...monthTotals.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      mortgageMonths.push({ month, payment });
+    }
+  }
+
   return {
     currentYm: cur,
     property: propertyMonths, propertyById, propertyLabels,
@@ -6282,9 +6332,11 @@ async function collectHomeData() {
     accountById, accountTypeById,
     earnings: earningMonths, jobById, jobPeriodById, rentalById,
     spending: spendingMonths, categorySeries, holdingById,
+    mortgage: mortgageMonths, mortgageById,
     jobsForHighlight, rentalsForHighlight, mortgagesForHighlight,
     entities: {
       properties: props.filter((p) => propertyById[p.id]).map((p) => ({ id: p.id, label: String(p.address).split(',')[0] })),
+      mortgageProperties: Object.entries(mortgageById).map(([id, s]) => ({ id: Number(id), label: s.label })),
       holdings: holdings.map((h) => ({ id: h.id, label: h.symbol || h.name || `#${h.id}` })),
       accounts: accountLabels,
       accountTypes: [...new Set(accountLabels.map((a) => a.type))],
@@ -6414,6 +6466,34 @@ function refreshSalaryAiInsights(userId, insights, data) {
   return changed ? out : insights;
 }
 
+// Composite AI cards are stored snapshots too, and their legs move
+// when a job, rental, mortgage or spending series changes — so
+// recompute every composite from live data on each Home load and
+// keep the model's title/section. On an error the stored snapshot
+// is kept (a leg may only temporarily have no data); composites are
+// never deleted on read.
+function refreshCompositeAiInsights(userId, insights, data) {
+  const now = new Date().toISOString();
+  let changed = false;
+  const out = [];
+  for (const row of insights) {
+    if (row.kind !== 'ai' || !String(row.metric).startsWith('composite:')) { out.push(row); continue; }
+    const computed = resolveHomeMetric(row.metric, data);
+    if (!computed || computed.error) { out.push(row); continue; }
+    const fresh = { ...computed, title: row.title, section: row.section };
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy]);
+    if (sig(fresh) !== sig(row)) {
+      db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(fresh), now, now, row.id);
+      changed = true;
+      out.push({ ...row, ...fresh, generated_at: now });
+    } else {
+      out.push(row);
+    }
+  }
+  return changed ? out : insights;
+}
+
 // Recompute the standard set only; AI cards are untouched.
 function generateStandardInsights(userId, data) {
   const cards = buildStandardInsights(data);
@@ -6444,6 +6524,9 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   // Salary-dependent AI cards refresh from live data (see
   // refreshSalaryAiInsights): a pay or plan edit must move them at once.
   insights = refreshSalaryAiInsights(userId, insights, data);
+  // Composite AI cards refresh from live data (see
+  // refreshCompositeAiInsights): a leg change must move them at once.
+  insights = refreshCompositeAiInsights(userId, insights, data);
   // Report mode shows a property card's house photo: attach the
   // first gallery photo (or the legacy photo_url) to property-entity
   // cards. No photo → photo: null, and the card renders no
@@ -6558,6 +6641,20 @@ app.post('/api/home/insights/ai-append', requireApiAuth, async (req, res) => {
   if (parsed.ask) return res.json({ ask: String(parsed.ask).slice(0, 500) });
   if (parsed.decline) return res.json({ decline: String(parsed.decline).slice(0, 500) });
   if (parsed.card && typeof parsed.card === 'object') {
+    // A composite proposal: the model writes a formula over library
+    // metrics; the server validates it and computes it
+    // deterministically. A failed validation is a decline, never a
+    // guessed number.
+    if (parsed.card.composite && typeof parsed.card.composite === 'object') {
+      const v = validateHomeComposite(parsed.card.composite, library);
+      if (!v.ok) return res.json({ decline: v.message });
+      const section = String(parsed.card.section || v.section);
+      if (section !== v.section) return res.json({ decline: 'That combination belongs to a different section.' });
+      const title = String(parsed.card.title || '').slice(0, 80) || 'Combined flow';
+      const computed = resolveHomeMetric(v.metricId, data);
+      if (computed && computed.error) return res.json({ decline: computed.message || 'That combination has no data yet.' });
+      return res.json({ proposal: { section, title, metric: v.metricId, preview: { ...computed, title } } });
+    }
     const metric = String(parsed.card.metric || '');
     const libEntry = library.find((m) => m.metric === metric);
     if (!libEntry) return res.json({ decline: 'That metric is not one the home page can compute.' });
@@ -6584,11 +6681,24 @@ app.post('/api/home/insights/ai-apply', requireApiAuth, async (req, res) => {
   }
   const data = await collectHomeData();
   const library = buildHomeMetricLibrary(data.entities);
-  const libEntry = library.find((m) => m.metric === metric);
-  if (!libEntry || libEntry.section !== section) {
-    return res.status(400).json({ error: 'Unknown metric or section mismatch.' });
+  let computed;
+  if (metric.startsWith('composite:')) {
+    // A composite id carries its own formula: re-validate it
+    // against the live library (a hand-posted id cannot smuggle in
+    // an unknown or non-flow leg) and require the canonical form.
+    const terms = parseHomeCompositeMetric(metric);
+    const v = terms ? validateHomeComposite({ terms }, library) : null;
+    if (!v || !v.ok) return res.status(400).json({ error: (v && v.message) || 'Invalid composite formula.' });
+    if (v.metricId !== metric) return res.status(400).json({ error: 'Composite formula is not in canonical form.' });
+    if (v.section !== section) return res.status(400).json({ error: 'Section mismatch.' });
+    computed = resolveHomeMetric(metric, data);
+  } else {
+    const libEntry = library.find((m) => m.metric === metric);
+    if (!libEntry || libEntry.section !== section) {
+      return res.status(400).json({ error: 'Unknown metric or section mismatch.' });
+    }
+    computed = resolveHomeMetric(metric, data);
   }
-  const computed = resolveHomeMetric(metric, data);
   if (computed && computed.error) return res.status(400).json({ error: computed.message });
   const card = { ...computed, title, section };
   const existing = db.prepare('SELECT * FROM home_insights WHERE user_id = ? AND kind = ? AND metric = ? AND title = ?')

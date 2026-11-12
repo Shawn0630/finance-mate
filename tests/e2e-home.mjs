@@ -438,6 +438,53 @@ export async function run(H, S) {
   H.check('home AI: a genuinely uncomputable request still declines',
     r.status === 200 && r.data.decline === 'I cannot forecast next year.', JSON.stringify(r.data));
 
+  // ---- AI-append: composite formula (monthly net cashflow, 2026-11-11) ----
+  // The user's own request: Meta take-home + rent − mortgage
+  // payments, as ONE new card. The AI writes the formula; the
+  // server validates the legs and computes it to the cent.
+  const cashflowTerms = [
+    { metric: `job_takehome:${jobId}`, sign: '+' },
+    { metric: `rental_income:${rentalId}`, sign: '+' },
+    { metric: 'mortgage_payment', sign: '-' },
+  ];
+  const cashflowMetric = `composite:job_takehome:${jobId}+rental_income:${rentalId}-mortgage_payment`;
+  const cashflowValue = Math.round((octSalary + 2000 - 1744.81) * 100) / 100;
+  const cashflowDef = { section: 'earning', title: 'Monthly net cashflow', metric: cashflowMetric };
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'earning', title: 'Monthly net cashflow', composite: { terms: cashflowTerms } } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Calculate my monthly cashflow: Meta salary + rent minus mortgage', history: [] });
+  H.check('home AI: composite append proposes the cashflow card with the exact October value',
+    r.status === 200 && r.data.proposal && r.data.proposal.metric === cashflowMetric
+      && r.data.proposal.preview && r.data.proposal.preview.value === cashflowValue
+      && r.data.proposal.preview.period === '2026-10'
+      && r.data.proposal.preview.method === 'Acme Corp take-home + Basement suite income − Mortgage payments, last completed month.',
+    JSON.stringify(r.data));
+  const cashflowProposal = r.data.proposal;
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: cashflowProposal });
+  H.check('home AI: composite Apply appends the cashflow card',
+    r.status === 201 && r.data.insight && r.data.insight.kind === 'ai' && r.data.insight.value === cashflowValue
+      && r.data.insight.metric === cashflowMetric,
+    JSON.stringify(r.data));
+  const cashflowAiId = r.data.insight.id;
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: cashflowProposal });
+  H.check('home AI: second Apply of the composite does not double-append',
+    r.status === 200 && r.data.duplicate === true, JSON.stringify(r.data));
+  r = await H.req('GET', '/api/home');
+  H.check('home AI: composite card re-resolves on read with the same value',
+    r.data.insights.some((c) => c.metric === cashflowMetric && c.value === cashflowValue),
+    JSON.stringify(r.data.insights.filter((c) => c.kind === 'ai')));
+  // A hand-posted non-canonical composite id is a 400, not a card.
+  r = await H.req('POST', '/api/home/insights/ai-apply', { definition: { ...cashflowDef, metric: `composite:+job_takehome:${jobId}+rental_income:${rentalId}-mortgage_payment` } });
+  H.check('home AI: a non-canonical composite id is rejected on Apply',
+    r.status === 400, JSON.stringify(r.data));
+  // An invalid composite — a point-in-time leg cannot combine — declines.
+  fs.writeFileSync(H.aiStubFile, JSON.stringify({ card: { section: 'property', title: 'Bad combo', composite: { terms: [{ metric: 'property_equity', sign: '+' }, { metric: `job_takehome:${jobId}`, sign: '+' }] } } }));
+  r = await H.req('POST', '/api/home/insights/ai-append', { text: 'Combine equity and salary', history: [] });
+  H.check('home AI: a composite with a non-flow leg declines',
+    r.status === 200 && typeof r.data.decline === 'string' && r.data.decline.length > 0, JSON.stringify(r.data));
+  r = await H.req('DELETE', `/api/home/insights/${cashflowAiId}`);
+  H.check('home AI: composite AI card deletes',
+    r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+
   // ---- browser: default landing, carousels with peek, toggle persists ----
   if (!H.chromeAvailable) {
     H.check('home UI: skipped (no Chrome)', true, 'no chrome');
@@ -1012,6 +1059,40 @@ export async function run(H, S) {
     });
     H.check('home UI: switching back to insight mode still shows the bare mini sparklines (axes hidden)',
       !!insightCharts && insightCharts.bare, JSON.stringify(insightCharts));
+    // ---- composite card in the browser (2026-11-11) ----
+    // Re-apply the cashflow composite, reload, and check it renders
+    // in the Earning section with its value + formula, then capture
+    // it for the evidence folder and clean up.
+    r = await H.req('POST', '/api/home/insights/ai-apply', { definition: cashflowDef });
+    H.check('home AI: composite card re-applies for the browser pin',
+      r.status === 201 && r.data.insight && r.data.insight.value === cashflowValue, JSON.stringify(r.data));
+    const compositeBrowserId = r.data.insight.id;
+    await page.reload({ waitUntil: 'networkidle0' });
+    await toInsight();
+    const compositeSeen = await until(() => {
+      const cards = [...document.querySelectorAll('[data-home-section="earning"] .insight-card')];
+      const card = cards.find((c) => c.querySelector('.insight-label')?.textContent.startsWith('Monthly net cashflow'));
+      if (!card) return null;
+      card.scrollIntoView({ block: 'center' });
+      return { value: card.querySelector('.insight-value')?.textContent,
+        method: card.getAttribute('title'),
+        hasSpark: !!card.querySelector('canvas[data-spark]') };
+    });
+    // Insight cards render money to whole dollars ($5,211 for
+    // $5,210.83); the API pin above already asserts the exact cents.
+    const compositeDisplay = `$${Math.round(cashflowValue).toLocaleString('en-CA')}`;
+    H.check('home UI: the composite cashflow card renders in the Earning section with its value + formula',
+      compositeSeen && compositeSeen.value && compositeSeen.value.includes(compositeDisplay)
+        && compositeSeen.method && compositeSeen.method.includes('Acme Corp take-home')
+        && compositeSeen.hasSpark,
+      JSON.stringify(compositeSeen));
+    const compositeEl = await page.evaluateHandle(() => [...document.querySelectorAll('[data-home-section="earning"] .insight-card')]
+      .find((c) => c.querySelector('.insight-label')?.textContent.startsWith('Monthly net cashflow')));
+    const compositeNode = compositeEl.asElement();
+    if (compositeNode) await compositeNode.screenshot({ path: '/home/hatch/workspace/fm-verify/home-ai-composite-/composite-card.png' });
+    r = await H.req('DELETE', `/api/home/insights/${compositeBrowserId}`);
+    H.check('home AI: composite card cleaned up after the browser pin',
+      r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
     // Deltas: the insight chips stay small (12px) while the report
     // cards render them larger (17px, measured above) — and the YoY
     // line is color-coded in insight mode too, not plain gray.

@@ -745,6 +745,7 @@ export const HOME_STANDARD_METRICS = [
   { metric: 'property_equity', section: 'property', title: 'Total equity' },
   { metric: 'property_assessed', section: 'property', title: 'Assessed total' },
   { metric: 'property_outstanding', section: 'property', title: 'Outstanding principal' },
+  { metric: 'mortgage_payment', section: 'property', title: 'Mortgage payments' },
   { metric: 'stock_value', section: 'stock', title: 'Portfolio value' },
   { metric: 'stock_gain', section: 'stock', title: 'Total gain' },
   { metric: 'stock_top_gainer', section: 'stock', title: 'Top gainer' },
@@ -760,12 +761,16 @@ export const HOME_STANDARD_METRICS = [
 //   properties: [{id, label}], holdings: [{id, label}], categories: [name]
 //   jobs: [{id, label}], rentals: [{id, label}]
 //   accounts: [{id, label, type}], accountTypes: [type]
+//   mortgageProperties: [{id, label}] (properties with a live mortgage)
 export function buildHomeMetricLibrary(entities) {
   const lib = [...HOME_STANDARD_METRICS];
   for (const p of entities.properties || []) {
     lib.push({ metric: `property_equity:${p.id}`, section: 'property', title: `${p.label} equity` });
     lib.push({ metric: `property_assessed:${p.id}`, section: 'property', title: `${p.label} assessed` });
     lib.push({ metric: `property_outstanding:${p.id}`, section: 'property', title: `${p.label} outstanding` });
+  }
+  for (const p of entities.mortgageProperties || []) {
+    lib.push({ metric: `mortgage_payment:${p.id}`, section: 'property', title: `${p.label} mortgage` });
   }
   for (const h of entities.holdings || []) {
     lib.push({ metric: `holding_value:${h.id}`, section: 'stock', title: `${h.label} value` });
@@ -792,6 +797,170 @@ export function buildHomeMetricLibrary(entities) {
   return lib;
 }
 
+// ------------------------------------------------------------ composite cards --
+// A composite card is a NEW card the AI proposes as a FORMULA over
+// existing library metrics (+/− only, v1). The AI writes the formula
+// (a spec), never numbers; the server validates every leg and
+// evaluates the combination deterministically, month by month, from
+// the stored series — the same discipline as the Planning AI engine
+// (validateAiEngine / evaluateAiEngine). Historical months only:
+// a composite shows the last completed month and its trailing
+// history, never a projection. Forecasts still decline.
+//
+// Only monthly money-flow metrics may be combined: point-in-time
+// values (equity, outstanding, stock value/gain), percents (top
+// gainer) and per-period figures (job_takehome_period) are not
+// monthly flows and cannot be legs.
+const HOME_FLOW_BASES = new Set([
+  'earning_total', 'earning_salary', 'earning_rental', 'spending_total',
+  'job_takehome', 'rental_income', 'category_spend', 'mortgage_payment',
+]);
+export function isHomeFlowMetric(metric) {
+  const colon = String(metric).indexOf(':');
+  const base = colon === -1 ? String(metric) : String(metric).slice(0, colon);
+  return HOME_FLOW_BASES.has(base);
+}
+
+// The monthly money-flow series behind a composable metric:
+// {months: [{month, value}], label}, or {error}. A leg with no
+// series at all is no_data; a month missing from a leg's series
+// counts as 0 when combined (no flow that month).
+export function homeFlowSeries(metric, data) {
+  const colon = String(metric).indexOf(':');
+  const base = colon === -1 ? String(metric) : String(metric).slice(0, colon);
+  const entityId = colon === -1 ? null : String(metric).slice(colon + 1);
+  const pick = (series, field, label) => {
+    if (!series || !series.length) return { error: 'no_data', message: 'That metric has no data yet.' };
+    return { months: series.map((r) => ({ month: r.month, value: r[field] ?? 0 })), label };
+  };
+  if (base === 'earning_total') return pick(data.earnings, 'total', 'Total income');
+  if (base === 'earning_salary') return pick(data.earnings, 'salary', 'Salary take-home');
+  if (base === 'earning_rental') return pick(data.earnings, 'rental', 'Rental income');
+  if (base === 'spending_total') return pick(data.spending, 'total', 'Total spend');
+  if (base === 'job_takehome') {
+    const s = (data.jobById || {})[entityId];
+    if (!s) return { error: 'no_data', message: 'That job has no pay history yet.' };
+    return pick(s.months, 'salary', `${s.label} take-home`);
+  }
+  if (base === 'rental_income') {
+    const s = (data.rentalById || {})[entityId];
+    if (!s) return { error: 'no_data', message: 'That rental has no rent history yet.' };
+    return pick(s.months, 'rental', `${s.label} income`);
+  }
+  if (base === 'category_spend') {
+    const series = (data.categorySeries || {})[entityId];
+    if (!series) return { error: 'no_data', message: 'That category has no spending yet.' };
+    return pick(series, 'total', `${entityId} spend`);
+  }
+  if (base === 'mortgage_payment') {
+    if (entityId == null) return pick(data.mortgage, 'payment', 'Mortgage payments');
+    const s = (data.mortgageById || {})[entityId];
+    if (!s) return { error: 'no_data', message: 'That property has no mortgage payments yet.' };
+    return pick(s.months, 'payment', `${s.label} mortgage`);
+  }
+  return { error: 'not_composable', message: 'That metric is not a monthly money flow.' };
+}
+
+// Parse a composite metric id back into its terms:
+// 'composite:job_takehome:3+rental_income:1-mortgage_payment'
+// → [{metric: 'job_takehome:3', sign: '+'}, ...]. Returns null when
+// the id is not a well-formed composite. Metric ids never contain
+// '+' or '−' (category names are checked: none do), so the signs
+// are unambiguous separators; a misparse fails validation below
+// instead of ever producing a wrong number.
+export function parseHomeCompositeMetric(metric) {
+  const s = String(metric || '');
+  if (!s.startsWith('composite:')) return null;
+  const body = s.slice('composite:'.length);
+  if (!body) return null;
+  const terms = [];
+  let i = 0;
+  while (i < body.length) {
+    let sign = '+';
+    if (body[i] === '+' || body[i] === '-') { sign = body[i]; i++; }
+    const start = i;
+    while (i < body.length && body[i] !== '+' && body[i] !== '-') i++;
+    const id = body.slice(start, i);
+    if (!id) return null;
+    terms.push({ metric: id, sign });
+  }
+  return terms;
+}
+
+// Canonical id for a validated term list: the first term carries no
+// sign (it is always '+'), later terms carry theirs. The id IS the
+// formula, so a stored composite card re-resolves from its metric
+// id alone — dedupe, ordering and read-time refresh all work on it
+// exactly like a single-metric id.
+function canonicalHomeCompositeId(terms) {
+  return 'composite:' + terms.map((t, i) => (i === 0 ? t.metric : `${t.sign}${t.metric}`)).join('');
+}
+
+// Validate a model-proposed composite {terms: [{metric, sign}]}.
+// Returns {ok: true, terms, metricId, section, method} or
+// {error, message}. The section is the FIRST term's section; the
+// method line states the formula in plain words.
+export function validateHomeComposite(composite, library) {
+  const terms = composite && Array.isArray(composite.terms) ? composite.terms : null;
+  if (!terms) return { error: 'bad_formula', message: 'A composite needs a list of terms.' };
+  if (terms.length < 2) return { error: 'bad_formula', message: 'A composite needs at least two metrics.' };
+  if (terms.length > 8) return { error: 'bad_formula', message: 'A composite has at most eight terms.' };
+  const seen = new Set();
+  const clean = [];
+  for (let i = 0; i < terms.length; i++) {
+    const t = terms[i] || {};
+    const metric = String(t.metric || '');
+    const sign = t.sign == null && i === 0 ? '+' : String(t.sign || '');
+    if (sign !== '+' && sign !== '-') return { error: 'bad_formula', message: 'Each term needs a + or − sign.' };
+    if (i === 0 && sign !== '+') return { error: 'bad_formula', message: 'A composite starts with a + term.' };
+    if (!metric) return { error: 'bad_formula', message: 'Each term needs a metric.' };
+    if (seen.has(metric)) return { error: 'bad_formula', message: 'A metric can appear only once in a formula.' };
+    seen.add(metric);
+    const libEntry = (library || []).find((m) => m.metric === metric);
+    if (!libEntry) return { error: 'unknown_metric', message: `“${metric}” is not a metric the home page can compute.` };
+    if (!isHomeFlowMetric(metric)) return { error: 'not_composable', message: `“${libEntry.title}” is not a monthly money flow, so it cannot be combined.` };
+    clean.push({ metric, sign });
+  }
+  const firstEntry = (library || []).find((m) => m.metric === clean[0].metric) || {};
+  const method = clean.map((t, i) => {
+    const title = ((library || []).find((m) => m.metric === t.metric) || {}).title || t.metric;
+    return i === 0 ? title : `${t.sign === '+' ? '+' : '−'} ${title}`;
+  }).join(' ') + ', last completed month.';
+  return { ok: true, terms: clean, metricId: canonicalHomeCompositeId(clean), section: firstEntry.section, method };
+}
+
+// Compute a composite card from its metric id: parse, validate
+// against the live library, then sum the legs month by month. A leg
+// missing a month contributes 0 that month; a leg with no series at
+// all makes the whole composite no_data.
+function resolveHomeComposite(metric, data) {
+  const terms = parseHomeCompositeMetric(metric);
+  if (!terms) return { error: 'unknown_metric', message: 'That metric is not computable.' };
+  const library = buildHomeMetricLibrary(data.entities || {});
+  const v = validateHomeComposite({ terms }, library);
+  if (!v.ok) return { error: v.error, message: v.message };
+  const legs = [];
+  for (const t of v.terms) {
+    const s = homeFlowSeries(t.metric, data);
+    if (s.error) return { error: s.error, message: s.message };
+    legs.push({ ...t, months: s.months });
+  }
+  const byMonth = new Map();
+  for (const leg of legs) {
+    for (const row of leg.months) {
+      byMonth.set(row.month, (byMonth.get(row.month) || 0) + (leg.sign === '+' ? 1 : -1) * Number(row.value || 0));
+    }
+  }
+  const series = [...byMonth.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([month, value]) => ({ month, value: r2(value) }));
+  const card = flowCard({
+    section: v.section, title: '', metric, currentYm: data.currentYm,
+    series, field: 'value', method: v.method,
+  });
+  if (!card.hasData) return { error: 'no_data', message: 'That combination has no data yet.' };
+  return card;
+}
+
 // Compute ONE card from a metric id (standard or per-entity) using
 // the same series the standard set uses. data matches
 // buildStandardInsights, plus:
@@ -813,6 +982,9 @@ export function resolveHomeMetric(metric, data) {
     if (!standard.hasData) return { error: 'no_data', message: 'That metric has no data yet.' };
     return standard;
   }
+  // A composite id carries its own formula — it re-resolves from
+  // the live library and the stored series, no extra state needed.
+  if (String(metric).startsWith('composite:')) return resolveHomeComposite(metric, data);
   const currentYm = data.currentYm;
   const colon = String(metric).indexOf(':');
   const base = colon === -1 ? String(metric) : String(metric).slice(0, colon);
@@ -905,6 +1077,24 @@ export function resolveHomeMetric(metric, data) {
       entity: { kind: 'job', id: Number(entityId) },
     };
   }
+  if (base === 'mortgage_payment') {
+    if (entityId == null) {
+      const series = data.mortgage || [];
+      if (!series.length) return { error: 'no_data', message: 'No mortgage payments yet.' };
+      return flowCard({ section: 'property', title: 'Mortgage payments', metric, currentYm,
+        series, field: 'payment', downIsGood: true,
+        method: 'Mortgage payments due in the month, all properties. Down is good.' });
+    }
+    const s = (data.mortgageById || {})[entityId];
+    if (!s || !s.months || !s.months.length) return { error: 'no_data', message: 'That property has no mortgage payments yet.' };
+    const label = (data.propertyLabels || {})[entityId] || s.label || 'Property';
+    return {
+      ...flowCard({ section: 'property', title: `${label} mortgage`, metric, currentYm,
+        series: s.months, field: 'payment', downIsGood: true,
+        method: 'One property’s mortgage payments due in the month. Down is good.' }),
+      entity: { kind: 'property', id: Number(entityId) },
+    };
+  }
   if (base === 'rental_income') {
     const s = (data.rentalById || {})[entityId];
     if (!s || !s.months || !s.months.length) return { error: 'no_data', message: 'That rental has no rent history yet.' };
@@ -921,15 +1111,17 @@ export function resolveHomeMetric(metric, data) {
 // ------------------------------------------------------------ AI prompt --
 export function homeAiPrompt({ text, history, library, existingTitles }) {
   const lines = (history || []).slice(-10).map((h) => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.text}`).join('\n');
-  const libLines = library.map((m) => `- ${m.metric} (${m.section}): ${m.title}`).join('\n');
+  const libLines = library.map((m) => `- ${m.metric} (${m.section}): ${m.title}${isHomeFlowMetric(m.metric) ? ' [monthly flow]' : ''}`).join('\n');
   return [
     'You help add ONE insight card to a family finance home page.',
-    'You may ONLY propose a card whose metric is in the computable library below.',
+    'You may propose a card whose metric is in the computable library below, OR a composite formula combining library metrics.',
     'Reply with a single JSON object, no other text:',
     '  {"card": {"section": "<one of property|stock|earning|spending>", "title": "<short card title>", "metric": "<metric id from the library>"}}',
     '  — when the request maps to exactly one library metric. The title should name the thing being measured.',
+    '  {"card": {"section": "<section of the FIRST term>", "title": "<short card title>", "composite": {"terms": [{"metric": "<library id>", "sign": "+" | "-"}, ...]}}}',
+    '  — when the request combines monthly-flow metrics, e.g. take-home + rent − mortgage payments. 2–8 terms, first term "+", no metric twice, ONLY metrics marked [monthly flow] may be used. The card shows the last completed month and its trailing history — historical months only, never a forecast.',
     '  {"ask": "<one short question>"} — when the request is ambiguous (e.g. which property, which holding, which category) and you need one detail before you can pick a metric. Ask, never guess.',
-    '  {"decline": "<one plain sentence>"} — when the request cannot be computed from the library (e.g. a forecast, a comparison the app does not track, a non-financial topic). Plain words, never validation jargon.',
+    '  {"decline": "<one plain sentence>"} — when the request cannot be computed from the library or from a formula over monthly-flow metrics (e.g. a forecast, a metric that is not a monthly flow, a comparison the app does not track, a non-financial topic). Plain words, never validation jargon.',
     'Computable metric library:',
     libLines,
     existingTitles && existingTitles.length ? `Cards already on the page (do not duplicate these titles): ${existingTitles.join(', ')}` : '',

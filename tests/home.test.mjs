@@ -8,6 +8,7 @@ import {
   jobTakehomePeriods, homeCalendarDates, rentalMonthOccurrences, homeCalendarFocusTarget,
   homeCalDayIsActionable, homeLongPressMoved, homeDropBefore, homeReportSections, homeReportMove,
   trailing12, lastCompletedMonth, monthLabel,
+  validateHomeComposite, parseHomeCompositeMetric, isHomeFlowMetric, homeFlowSeries, homeAiPrompt,
 } from '../src/home.js';
 import { calcSalary } from '../src/earnings.js';
 import { payroll } from '../src/regions/ca.js';
@@ -768,4 +769,139 @@ test('home: report mode move — left/right clamp, up/down reset to the first ca
   ];
   assert.deepEqual(homeReportMove({ section: 0, card: 1 }, wide, 'down'), { section: 1, card: 0 });
   assert.deepEqual(homeReportMove({ section: 1, card: 2 }, wide, 'up'), { section: 0, card: 0 });
+});
+
+// ---- composite cards (2026-11-11): the Home AI may propose a NEW
+// card as a formula over monthly-flow library metrics (+/− only).
+// The AI writes the formula; the server validates and computes it.
+const compositeLib = () => buildHomeMetricLibrary({
+  properties: [{ id: 5, label: '77 Riverbend' }],
+  mortgageProperties: [{ id: 5, label: '77 Riverbend' }],
+  jobs: [{ id: 3, label: 'Acme Corp' }],
+  rentals: [{ id: 7, label: 'Basement' }],
+  categories: ['Groceries'],
+});
+
+const compositeData = () => ({
+  currentYm: '2026-11',
+  property: [], stocks: { months: [], topGainer: null },
+  earnings: [], spending: [],
+  categorySeries: { Groceries: months('2026-09', [400, 500], 'total') },
+  jobById: { 3: { label: 'Acme Corp', months: months('2026-09', [4800, 5000], 'salary') } },
+  rentalById: { 7: { label: 'Basement', months: months('2026-09', [2000, 2000], 'rental') } },
+  mortgage: months('2026-09', [1744.81, 1744.81], 'payment'),
+  mortgageById: { 5: { label: '77 Riverbend', months: months('2026-09', [1744.81, 1744.81], 'payment') } },
+  propertyLabels: { 5: '77 Riverbend' },
+  entities: {
+    properties: [{ id: 5, label: '77 Riverbend' }],
+    mortgageProperties: [{ id: 5, label: '77 Riverbend' }],
+    jobs: [{ id: 3, label: 'Acme Corp' }],
+    rentals: [{ id: 7, label: 'Basement' }],
+    categories: ['Groceries'],
+  },
+});
+
+test('home: composite validation — unknown, non-flow and malformed formulas are rejected', () => {
+  const lib = compositeLib();
+  const bad = (terms) => validateHomeComposite({ terms }, lib);
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '+' }, { metric: 'nope:1', sign: '+' }]).error, 'unknown_metric');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '+' }, { metric: 'property_equity', sign: '+' }]).error, 'not_composable');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '+' }, { metric: 'stock_value', sign: '+' }]).error, 'not_composable');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '+' }, { metric: 'job_takehome_period:3', sign: '+' }]).error, 'not_composable');
+  assert.equal(validateHomeComposite({ terms: [] }, lib).error, 'bad_formula');
+  assert.equal(validateHomeComposite({}, lib).error, 'bad_formula');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '+' }]).error, 'bad_formula');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '+' }, { metric: 'job_takehome:3', sign: '-' }]).error, 'bad_formula');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: '-' }, { metric: 'rental_income:7', sign: '+' }]).error, 'bad_formula');
+  assert.equal(bad([{ metric: 'job_takehome:3', sign: 'x' }, { metric: 'rental_income:7', sign: '+' }]).error, 'bad_formula');
+  const nine = [
+    'job_takehome:3', 'rental_income:7', 'mortgage_payment', 'mortgage_payment:5',
+    'earning_total', 'earning_salary', 'earning_rental', 'spending_total', 'category_spend:Groceries',
+  ].map((metric) => ({ metric, sign: '+' }));
+  assert.equal(bad(nine).error, 'bad_formula');
+  // A valid three-term formula: canonical id, first term's section, method line.
+  const v = validateHomeComposite({ terms: [
+    { metric: 'job_takehome:3', sign: '+' },
+    { metric: 'rental_income:7', sign: '+' },
+    { metric: 'mortgage_payment', sign: '-' },
+  ] }, lib);
+  assert.equal(v.ok, true);
+  assert.equal(v.metricId, 'composite:job_takehome:3+rental_income:7-mortgage_payment');
+  assert.equal(v.section, 'earning');
+  assert.equal(v.method, 'Acme Corp take-home + Basement income − Mortgage payments, last completed month.');
+});
+
+test('home: composite — the metric id parses back into its terms', () => {
+  assert.deepEqual(parseHomeCompositeMetric('composite:job_takehome:3+rental_income:7-mortgage_payment'), [
+    { metric: 'job_takehome:3', sign: '+' },
+    { metric: 'rental_income:7', sign: '+' },
+    { metric: 'mortgage_payment', sign: '-' },
+  ]);
+  assert.equal(parseHomeCompositeMetric('job_takehome:3'), null);
+  assert.equal(parseHomeCompositeMetric('composite:'), null);
+  assert.equal(parseHomeCompositeMetric('composite:job_takehome:3+'), null);
+});
+
+test('home: composite — monthly net cashflow evaluates to the cent', () => {
+  const data = compositeData();
+  const card = resolveHomeMetric('composite:job_takehome:3+rental_income:7-mortgage_payment', data);
+  assert.equal(card.value, 5255.19); // Oct: 5000 + 2000 − 1744.81
+  assert.equal(card.period, '2026-10');
+  assert.deepEqual(card.mom, { delta: 200, pct: 3.96 }); // Sep: 4800 + 2000 − 1744.81 = 5055.19
+  assert.equal(card.yoy, null);
+  assert.equal(card.spark[11], 5255.19);
+  assert.equal(card.spark[10], 5055.19);
+  assert.equal(card.method, 'Acme Corp take-home + Basement income − Mortgage payments, last completed month.');
+  assert.equal(card.section, 'earning');
+  assert.equal(card.valueKind, 'money');
+  // A per-property mortgage leg works the same way.
+  const perProp = resolveHomeMetric('composite:job_takehome:3+rental_income:7-mortgage_payment:5', data);
+  assert.equal(perProp.value, 5255.19);
+});
+
+test('home: mortgage_payment metrics resolve as flow cards, down is good', () => {
+  const data = compositeData();
+  const total = resolveHomeMetric('mortgage_payment', data);
+  assert.equal(total.value, 1744.81);
+  assert.equal(total.period, '2026-10');
+  assert.equal(total.downIsGood, true);
+  assert.equal(total.section, 'property');
+  const one = resolveHomeMetric('mortgage_payment:5', data);
+  assert.equal(one.value, 1744.81);
+  assert.deepEqual(one.entity, { kind: 'property', id: 5 });
+  assert.deepEqual(resolveHomeMetric('mortgage_payment:9', data),
+    { error: 'no_data', message: 'That property has no mortgage payments yet.' });
+  const lib = compositeLib();
+  assert.ok(lib.some((m) => m.metric === 'mortgage_payment'));
+  assert.ok(lib.some((m) => m.metric === 'mortgage_payment:5'));
+});
+
+test('home: composite — a leg with no data makes the whole card no_data', () => {
+  const data = compositeData();
+  delete data.rentalById;
+  assert.deepEqual(
+    resolveHomeMetric('composite:job_takehome:3+rental_income:7-mortgage_payment', data),
+    { error: 'no_data', message: 'That rental has no rent history yet.' });
+});
+
+test('home: composite — flow helpers only admit monthly money flows', () => {
+  assert.equal(isHomeFlowMetric('earning_total'), true);
+  assert.equal(isHomeFlowMetric('job_takehome:3'), true);
+  assert.equal(isHomeFlowMetric('category_spend:Groceries'), true);
+  assert.equal(isHomeFlowMetric('mortgage_payment:5'), true);
+  assert.equal(isHomeFlowMetric('property_equity'), false);
+  assert.equal(isHomeFlowMetric('job_takehome_period:3'), false);
+  assert.equal(isHomeFlowMetric('stock_top_gainer'), false);
+  assert.deepEqual(homeFlowSeries('mortgage_payment', compositeData()).months,
+    [{ month: '2026-09', value: 1744.81 }, { month: '2026-10', value: 1744.81 }]);
+  assert.equal(homeFlowSeries('property_equity', compositeData()).error, 'not_composable');
+});
+
+test('home: composite — the prompt offers the formula shape and marks flow metrics', () => {
+  const p = homeAiPrompt({ text: 'cashflow?', history: [], library: compositeLib(), existingTitles: [] });
+  assert.ok(p.includes('"composite"'));
+  assert.ok(p.includes('job_takehome:3 (earning): Acme Corp take-home [monthly flow]'));
+  assert.ok(p.includes('property_equity (property): Total equity'));
+  assert.ok(!p.includes('property_equity (property): Total equity [monthly flow]'));
+  assert.ok(p.includes('never a forecast'));
 });
