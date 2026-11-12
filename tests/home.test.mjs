@@ -938,3 +938,220 @@ test('home: composite — the prompt offers the formula shape and marks flow met
   assert.ok(!p.includes('property_equity (property): Total equity [monthly flow]'));
   assert.ok(p.includes('never a forecast'));
 });
+
+test('home: standard cards carry the numbered breakdown (equation) for the hover tooltip', () => {
+  // Fixture: two properties (A no mortgage, B $250,000 outstanding),
+  // one TFSA account + one empty RRSP, one holding, one job, one
+  // rental, two spend categories. currentYm 2026-11 → flows show Oct.
+  const property = months('2025-11', Array(13).fill(1250000), 'equity')
+    .map((r) => ({ ...r, assessed: 1500000, outstanding: 250000 }));
+  const stockMonths = months('2025-12', Array(12).fill(6000), 'value')
+    .map((r) => ({ ...r, gain: 1000 }));
+  const earnings = months('2025-10', [4000, 4100, 4200, 4300, 4400, 4500, 4600, 4700, 4800, 4900, 5000, 5100, 6955.64, 7000], 'total')
+    .map((r, i) => ({ ...r, salary: i === 12 ? 4955.64 : r.total - 1000, rental: i === 12 ? 2000 : 1000 }));
+  const spending = [
+    { month: '2025-10', total: 1000, byCategory: { Groceries: 400, Dining: 600 } },
+    { month: '2026-09', total: 300, byCategory: { Groceries: 200, Dining: 100 } },
+    { month: '2026-10', total: 700, byCategory: { Groceries: 400, Dining: 300 } },
+  ];
+  const data = {
+    currentYm: '2026-11',
+    property,
+    propertyById: {
+      1: [{ month: '2026-11', equity: 1000000, assessed: 1000000, outstanding: 0 }],
+      2: [{ month: '2026-11', equity: 250000, assessed: 500000, outstanding: 250000 }],
+    },
+    propertyLabels: { 1: '1 Home Test Way', 2: '2 Home Test Way' },
+    stocks: {
+      months: stockMonths,
+      topGainer: {
+        label: 'XQQ.TO', returnPct: 25,
+        points: [{ date: '2025-11-30', price: 48 }, { date: '2026-11-28', price: 60 }],
+        valueSeries: stockMonths,
+      },
+    },
+    accountById: {
+      1: { label: 'TFSA', type: 'TFSA', months: [{ month: '2026-11', value: 6000, gain: 1000 }] },
+      2: { label: 'RRSP', type: 'RRSP', months: [{ month: '2026-11', value: 0, gain: 0 }] },
+    },
+    holdingById: {
+      1: { label: 'XQQ.TO', months: [{ month: '2026-11', value: 6000, gain: 1000 }] },
+    },
+    earnings,
+    jobById: { 1: { label: 'Acme Corp', months: [{ month: '2026-10', salary: 4955.64 }] } },
+    rentalById: { 1: { label: 'Basement suite', months: [{ month: '2026-10', rental: 2000 }] } },
+    spending,
+  };
+  const cards = buildStandardInsights(data);
+  const card = (m) => cards.find((c) => c.metric === m);
+  // A sum card's shown legs add to its value to the cent.
+  const sumLegs = (eq) => eq.legs.reduce((a, l) => a + (l.sign === '-' ? -1 : 1) * l.value, 0);
+  const assertSum = (metric, legs) => {
+    const c = card(metric);
+    assert.deepEqual(c.equation.legs, legs);
+    assert.equal(c.equation.total, c.value);
+    assert.equal(Math.round(sumLegs(c.equation) * 100) / 100, c.value);
+  };
+  assertSum('property_equity', [
+    { label: '1 Home Test Way', sign: '+', value: 1000000 },
+    { label: '2 Home Test Way', sign: '+', value: 250000 },
+  ]);
+  assert.equal(card('property_equity').equation.footnote, 'At month-end.');
+  assertSum('property_assessed', [
+    { label: '1 Home Test Way', sign: '+', value: 1000000 },
+    { label: '2 Home Test Way', sign: '+', value: 500000 },
+  ]);
+  // A has no mortgage: its $0 outstanding leg is omitted, the shown
+  // leg still sums to the total.
+  assertSum('property_outstanding', [{ label: '2 Home Test Way', sign: '+', value: 250000 }]);
+  assertSum('stock_value', [{ label: 'TFSA', sign: '+', value: 6000 }]); // empty RRSP omitted
+  assertSum('stock_gain', [{ label: 'XQQ.TO', sign: '+', value: 1000 }]);
+  assertSum('earning_total', [
+    { label: 'Salary take-home', sign: '+', value: 4955.64 },
+    { label: 'Rental income', sign: '+', value: 2000 },
+  ]);
+  assertSum('earning_salary', [{ label: 'Acme Corp', sign: '+', value: 4955.64 }]);
+  assertSum('earning_rental', [{ label: 'Basement suite', sign: '+', value: 2000 }]);
+  assertSum('spending_total', [
+    { label: 'Groceries', sign: '+', value: 400 },
+    { label: 'Dining', sign: '+', value: 300 },
+  ]);
+  // Definition cards: the legs do not sum to the value — they are
+  // the inputs the value is computed from, and the total line
+  // states the result.
+  const tg = card('stock_top_gainer');
+  assert.deepEqual(tg.equation.legs, [
+    { label: 'Price Nov 2025', sign: '', value: 48 },
+    { label: 'Price Nov 2026', sign: '', value: 60 },
+  ]);
+  assert.equal(tg.equation.totalText, '= +25% (trailing 12 months)');
+  assert.equal(tg.equation.footnote, 'Price return only.');
+  assert.equal(Math.round((60 / 48 - 1) * 10000) / 100, 25); // the shown prices reproduce the %
+  const top = card('spending_top_category');
+  assert.deepEqual(top.equation.legs, [
+    { label: 'Groceries', sign: '', value: 400 },
+    { label: 'Total spend', sign: '', value: 700 },
+  ]);
+  assert.equal(top.equation.totalText, '= 57.14% of spend');
+  const mover = card('spending_biggest_mover');
+  assert.deepEqual(mover.equation.legs, [
+    { label: 'Groceries · Sep 2026', sign: '', value: 200 },
+    { label: 'Groceries · Oct 2026', sign: '', value: 400 },
+  ]);
+  assert.equal(mover.equation.totalText, '= +$200.00 vs Sep 2026');
+  assert.equal(mover.equation.total, 200);
+});
+
+test('home: per-entity cards carry equations where the value decomposes, and keep the method line otherwise', () => {
+  const data = {
+    currentYm: '2026-11',
+    property: [],
+    propertyById: {
+      1: [{ month: '2026-11', equity: 1000000, assessed: 1000000, outstanding: 0 }],
+      2: [{ month: '2026-11', equity: 250000, assessed: 500000, outstanding: 250000 }],
+    },
+    propertyLabels: { 1: '1 Home Test Way', 2: '2 Home Test Way' },
+    stocks: { months: [] },
+    accountById: {
+      1: { label: 'TFSA', type: 'TFSA', months: [{ month: '2026-11', value: 6000, gain: 1000 }] },
+      2: { label: 'RRSP', type: 'RRSP', months: [{ month: '2026-11', value: 0, gain: 0 }] },
+    },
+    accountTypeById: {
+      TFSA: { label: 'TFSA accounts', months: [{ month: '2026-11', value: 6000, gain: 1000 }] },
+      RRSP: { label: 'RRSP accounts', months: [{ month: '2026-11', value: 0, gain: 0 }] },
+    },
+    holdingById: {
+      1: { label: 'XQQ.TO', months: [{ month: '2026-11', value: 6000, gain: 1000 }] },
+    },
+    earnings: [],
+    jobById: { 1: { label: 'Acme Corp', months: [{ month: '2026-10', salary: 4955.64 }] } },
+    jobPeriodById: { 1: { label: 'Acme Corp', periods: [{ date: '2026-10-23', value: 2477.82 }, { date: '2026-11-06', value: 2477.82 }] } },
+    rentalById: { 1: { label: 'Basement suite', months: [{ month: '2026-10', rental: 2000 }] } },
+    spending: [
+      { month: '2026-09', total: 300, byCategory: { Groceries: 200, Dining: 100 } },
+      { month: '2026-10', total: 700, byCategory: { Groceries: 400, Dining: 300 } },
+    ],
+    categorySeries: { Groceries: [{ month: '2026-10', total: 400 }] },
+    mortgage: [{ month: '2026-10', payment: 1744.81 }],
+    mortgageById: { 2: { label: '2 Home Test Way', months: [{ month: '2026-10', payment: 1744.81 }] } },
+  };
+  // Per-property equity = assessed − outstanding, with the numbers.
+  // The $0 outstanding leg still shows: it is a definition row,
+  // not a sum part.
+  const eq1 = resolveHomeMetric('property_equity:1', data);
+  assert.equal(eq1.value, 1000000);
+  assert.deepEqual(eq1.equation.legs, [
+    { label: 'Assessed value', sign: '+', value: 1000000 },
+    { label: 'Outstanding principal', sign: '-', value: 0 },
+  ]);
+  assert.equal(eq1.equation.total, 1000000);
+  assert.equal(eq1.equation.footnote, 'At month-end.');
+  // Account-type cards sum their accounts.
+  const typeVal = resolveHomeMetric('account_type_value:TFSA', data);
+  assert.deepEqual(typeVal.equation.legs, [{ label: 'TFSA', sign: '+', value: 6000 }]);
+  assert.equal(typeVal.equation.total, 6000);
+  const typeGain = resolveHomeMetric('account_type_gain:TFSA', data);
+  assert.deepEqual(typeGain.equation.legs, [{ label: 'TFSA', sign: '+', value: 1000 }]);
+  // An all-$0 type has no parts to show.
+  assert.equal(resolveHomeMetric('account_type_value:RRSP', data).equation, undefined);
+  // A category's share of the month's total spend.
+  const cat = resolveHomeMetric('category_spend:Groceries', data);
+  assert.deepEqual(cat.equation.legs, [
+    { label: 'Groceries', sign: '', value: 400 },
+    { label: 'Total spend', sign: '', value: 700 },
+  ]);
+  assert.equal(cat.equation.totalText, '= 57.14% of spend');
+  // Total mortgage payments sum the per-property payments.
+  const mort = resolveHomeMetric('mortgage_payment', data);
+  assert.deepEqual(mort.equation.legs, [{ label: '2 Home Test Way', sign: '+', value: 1744.81 }]);
+  assert.equal(mort.equation.total, 1744.81);
+  // No meaningful decomposition: the method line stays, no equation.
+  for (const metric of [
+    'property_assessed:1', 'property_outstanding:2',
+    'holding_value:1', 'holding_gain:1',
+    'account_value:1', 'account_gain:1',
+    'job_takehome:1', 'job_takehome_period:1',
+    'mortgage_payment:2', 'rental_income:1',
+  ]) {
+    const c = resolveHomeMetric(metric, data);
+    assert.equal(c.equation, undefined, metric);
+    assert.ok(c.method && c.method.length > 0, metric);
+  }
+});
+
+test('home: a card with no parts data carries no equation (graceful degradation)', () => {
+  // Old callers and minimal fixtures pass no *ById maps: the cards
+  // that need them keep their words-only method line, while the
+  // cards whose parts come from their own series still break down.
+  const property = months('2025-11', Array(13).fill(1250000), 'equity')
+    .map((r) => ({ ...r, assessed: 1500000, outstanding: 250000 }));
+  const earnings = months('2025-10', [4000, 4100, 4200, 4300, 4400, 4500, 4600, 4700, 4800, 4900, 5000, 5100, 6955.64, 7000], 'total')
+    .map((r, i) => ({ ...r, salary: i === 12 ? 4955.64 : r.total - 1000, rental: i === 12 ? 2000 : 1000 }));
+  const spending = [
+    { month: '2026-09', total: 300, byCategory: { Groceries: 200, Dining: 100 } },
+    { month: '2026-10', total: 700, byCategory: { Groceries: 400, Dining: 300 } },
+  ];
+  const stockMonths = months('2025-12', Array(12).fill(6000), 'value')
+    .map((r) => ({ ...r, gain: 1000 }));
+  const cards = buildStandardInsights({
+    currentYm: '2026-11', property, earnings, spending,
+    stocks: {
+      months: stockMonths,
+      topGainer: {
+        label: 'XQQ.TO', returnPct: 25,
+        points: [{ date: '2025-11-30', price: 48 }, { date: '2026-11-28', price: 60 }],
+        valueSeries: stockMonths,
+      },
+    },
+  });
+  const card = (m) => cards.find((c) => c.metric === m);
+  for (const m of ['property_equity', 'property_assessed', 'property_outstanding', 'stock_value', 'stock_gain', 'earning_salary', 'earning_rental']) {
+    assert.equal(card(m).equation, undefined, m);
+    assert.ok(card(m).method.length > 0, m);
+  }
+  assert.ok(card('earning_total').equation);
+  assert.ok(card('spending_total').equation);
+  assert.ok(card('spending_top_category').equation);
+  assert.ok(card('spending_biggest_mover').equation);
+  assert.ok(card('stock_top_gainer').equation);
+});

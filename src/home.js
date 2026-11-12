@@ -294,25 +294,84 @@ function at(series, ym, field) {
   return row ? row[field] : undefined;
 }
 
+// A numbered breakdown for a card's hover tooltip:
+//   {legs: [{label, sign: '+' | '-' | '', value}], total, totalText?, footnote?}
+// - legs are the parts (sign '+' / '-') or definition rows (sign ''
+//   renders with no operator, e.g. a price then / now pair).
+// - total is the card value; the total line renders `= $X (Period)`
+//   unless totalText is set, which replaces the whole `= ...` line
+//   (for values that are not a money sum — a % or a signed delta).
+// - footnote is the last line; it defaults to 'Last completed month.'
+//   (flow cards), point-in-time cards set 'At month-end.', and ''
+//   omits the line.
+// Sum cards: the legs are the parts that add to the total. A part
+// worth $0 in the displayed month is omitted — it adds nothing, so
+// the shown legs still sum to the card value to the cent. Definition
+// cards show all their rows, including a $0 one (the $0 is the
+// point: e.g. an outstanding principal of $0 still subtracts).
+// A card with no parts data at all carries no equation and keeps its
+// words-only method line.
+function partsLegs(byId, ym, field) {
+  const legs = [];
+  for (const [id, s] of Object.entries(byId || {})) {
+    const row = (s.months || []).find((r) => r.month === ym);
+    const v = r2(Number(row ? row[field] : 0) || 0);
+    if (v !== 0) legs.push({ label: s.label, sign: '+', value: v });
+  }
+  return legs;
+}
+// Per-property parts: propertyById maps id -> series (an array, no
+// label); labels live in propertyLabels.
+function propertyPartsLegs(propertyById, propertyLabels, ym, field) {
+  const legs = [];
+  for (const [id, series] of Object.entries(propertyById || {})) {
+    const row = (series || []).find((r) => r.month === ym);
+    const v = r2(Number(row ? row[field] : 0) || 0);
+    if (v !== 0) legs.push({ label: (propertyLabels || {})[id] || 'Property', sign: '+', value: v });
+  }
+  return legs;
+}
+function sumEquation(legs, total, footnote) {
+  if (!legs.length) return null;
+  return footnote === undefined ? { legs, total } : { legs, total, footnote };
+}
+// Legs from one row's named fields: [{label, field, sign?}] — a $0
+// field is omitted, like partsLegs.
+function rowLegs(row, fields) {
+  const legs = [];
+  for (const f of fields) {
+    const v = r2(Number(row ? row[f.field] : 0) || 0);
+    if (v !== 0) legs.push({ label: f.label, sign: f.sign || '+', value: v });
+  }
+  return legs;
+}
+function pctText(v) {
+  return `${v > 0 ? '+' : ''}${Number.isInteger(v) ? v : r2(v)}%`;
+}
+function signedMoney2(v) {
+  return (v < 0 ? '−$' : '+$') + Math.abs(v).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 // ------------------------------------------------------------ cards --
 const SECTIONS = ['property', 'stock', 'earning', 'spending'];
 export const HOME_SECTIONS = SECTIONS;
 
 function baseCard({ section, title, metric, period, value, valueKind = 'money', sublabel = null,
   mom = null, yoy = null, spark = [], sparkMonths = [], downIsGood = false,
-  hasData = true, method = '', periodLabel = null, momVs = null, yoyVs = null }) {
+  hasData = true, method = '', periodLabel = null, momVs = null, yoyVs = null, equation = null }) {
   return {
     section, title, metric, period, periodLabel: periodLabel || monthLabel(period),
     value: value == null ? null : r2(value), valueKind, sublabel,
     mom, yoy, momVs, yoyVs, spark: (spark || []).map((v) => (v == null ? null : r2(v))), sparkMonths,
     downIsGood, hasData, method,
+    ...(equation ? { equation } : {}),
   };
 }
 
 // A point-in-time card: value at the current month-end, sparkline
 // trailing 12 months ending at the current month.
 function pointCard({ section, title, metric, currentYm, series, field, valueKind = 'money',
-  downIsGood = false, method = '' }) {
+  downIsGood = false, method = '', equation = null }) {
   const months = trailing12(currentYm);
   const value = at(series, currentYm, field);
   const spark = months.map((m) => at(series, m, field) ?? null);
@@ -321,13 +380,13 @@ function pointCard({ section, title, metric, currentYm, series, field, valueKind
     at(series, addMonthsYm(currentYm, -12), field) ?? null);
   return baseCard({ section, title, metric, period: currentYm, value: hasData ? value : null,
     valueKind, mom: hasData ? mom : null, yoy: hasData ? yoy : null,
-    spark, sparkMonths: months, downIsGood, hasData, method });
+    spark, sparkMonths: months, downIsGood, hasData, method, equation });
 }
 
 // A flow card: value in the last completed month, sparkline trailing
 // 12 months ending at the last completed month.
 function flowCard({ section, title, metric, currentYm, series, field, valueKind = 'money',
-  downIsGood = false, method = '', sublabel = null }) {
+  downIsGood = false, method = '', sublabel = null, equation = null }) {
   const lcm = lastCompletedMonth(currentYm);
   const months = trailing12(lcm);
   const value = at(series, lcm, field);
@@ -337,7 +396,7 @@ function flowCard({ section, title, metric, currentYm, series, field, valueKind 
     at(series, addMonthsYm(lcm, -12), field) ?? null);
   return baseCard({ section, title, metric, period: lcm, value: hasData ? value : null,
     valueKind, sublabel, mom: hasData ? mom : null, yoy: hasData ? yoy : null,
-    spark, sparkMonths: months, downIsGood, hasData, method });
+    spark, sparkMonths: months, downIsGood, hasData, method, equation });
 }
 
 function emptyCard(section, title, metric, currentYm, flow) {
@@ -381,28 +440,46 @@ export function buildStandardInsights(data) {
   const cards = [];
 
   const propMethod = 'Monthly equity = assessed value in force − outstanding principal at month-end.';
+  // Per-entity parts at the displayed month, for the tooltip
+  // breakdowns. A part with no row that month or a $0 value is
+  // omitted (it adds nothing); the shown legs still sum to the card
+  // value to the cent. When the parts data is absent entirely (old
+  // callers, minimal fixtures) the card carries no equation and
+  // keeps its words-only method line.
+  const atMonthEnd = 'At month-end.';
+  const propParts = (field) => propertyPartsLegs(data.propertyById, data.propertyLabels, currentYm, field);
+  const acctParts = (field) => partsLegs(data.accountById, currentYm, field);
+  const holdingParts = (field) => partsLegs(data.holdingById, currentYm, field);
+  const lcm = lastCompletedMonth(currentYm);
+  const jobParts = () => partsLegs(data.jobById, lcm, 'salary');
+  const rentalParts = () => partsLegs(data.rentalById, lcm, 'rental');
   cards.push(property.length
     ? pointCard({ section: 'property', title: 'Total equity', metric: 'property_equity',
-      currentYm, series: property, field: 'equity', method: propMethod })
+      currentYm, series: property, field: 'equity', method: propMethod,
+      equation: sumEquation(propParts('equity'), at(property, currentYm, 'equity'), atMonthEnd) })
     : emptyCard('property', 'Total equity', 'property_equity', currentYm, false));
   cards.push(property.length
     ? pointCard({ section: 'property', title: 'Assessed total', metric: 'property_assessed',
-      currentYm, series: property, field: 'assessed', method: 'Sum of assessed values in force at month-end.' })
+      currentYm, series: property, field: 'assessed', method: 'Sum of assessed values in force at month-end.',
+      equation: sumEquation(propParts('assessed'), at(property, currentYm, 'assessed'), atMonthEnd) })
     : emptyCard('property', 'Assessed total', 'property_assessed', currentYm, false));
   cards.push(property.length
     ? pointCard({ section: 'property', title: 'Outstanding principal', metric: 'property_outstanding',
       currentYm, series: property, field: 'outstanding', downIsGood: true,
-      method: 'Sum of outstanding principal at month-end. Down is good.' })
+      method: 'Sum of outstanding principal at month-end. Down is good.',
+      equation: sumEquation(propParts('outstanding'), at(property, currentYm, 'outstanding'), atMonthEnd) })
     : emptyCard('property', 'Outstanding principal', 'property_outstanding', currentYm, false));
 
   const stockMethod = 'Portfolio value at month-end, CAD.';
   cards.push(stockMonths.length
     ? pointCard({ section: 'stock', title: 'Portfolio value', metric: 'stock_value',
-      currentYm, series: stockMonths, field: 'value', method: stockMethod })
+      currentYm, series: stockMonths, field: 'value', method: stockMethod,
+      equation: sumEquation(acctParts('value'), at(stockMonths, currentYm, 'value'), atMonthEnd) })
     : emptyCard('stock', 'Portfolio value', 'stock_value', currentYm, false));
   cards.push(stockMonths.length
     ? pointCard({ section: 'stock', title: 'Total gain', metric: 'stock_gain',
-      currentYm, series: stockMonths, field: 'gain', method: 'Cumulative gain (value − contributions + dividends) at month-end, CAD.' })
+      currentYm, series: stockMonths, field: 'gain', method: 'Cumulative gain (value − contributions + dividends) at month-end, CAD.',
+      equation: sumEquation(holdingParts('gain'), at(stockMonths, currentYm, 'gain'), atMonthEnd) })
     : emptyCard('stock', 'Total gain', 'stock_gain', currentYm, false));
   const tg = data.stocks && data.stocks.topGainer;
   if (tg && tg.returnPct != null) {
@@ -415,36 +492,61 @@ export function buildStandardInsights(data) {
     const yoyRet = trailing12Return(tg.points, addMonthsYm(currentYm, -12));
     const mom = momRet == null ? null : { delta: r2(tg.returnPct - momRet), pct: null };
     const yoy = yoyRet == null ? null : { delta: r2(tg.returnPct - yoyRet), pct: null };
+    // The % is a price return: show the two prices it comes from.
+    // priceAtMonthEnd reads the last point on or before month-end,
+    // the same lookup trailing12Return uses, so the shown prices
+    // reproduce the % exactly.
+    const priceThen = priceAtMonthEnd(tg.points, addMonthsYm(currentYm, -12));
+    const priceNow = priceAtMonthEnd(tg.points, currentYm);
+    const tgEquation = (priceThen != null && priceNow != null && priceThen > 0) ? {
+      legs: [
+        { label: `Price ${monthLabel(addMonthsYm(currentYm, -12))}`, sign: '', value: r2(priceThen) },
+        { label: `Price ${monthLabel(currentYm)}`, sign: '', value: r2(priceNow) },
+      ],
+      total: tg.returnPct,
+      totalText: `= ${pctText(tg.returnPct)} (trailing 12 months)`,
+      footnote: 'Price return only.',
+    } : null;
     cards.push(baseCard({ section: 'stock', title: 'Top gainer', metric: 'stock_top_gainer',
       period: currentYm, value: tg.returnPct, valueKind: 'pct', sublabel: tg.label,
-      mom, yoy, spark, sparkMonths: months,
+      mom, yoy, spark, sparkMonths: months, equation: tgEquation,
       method: 'Highest trailing-12-month return among holdings with value. Deltas are percentage points of the 12-month return.' }));
   } else {
     cards.push(emptyCard('stock', 'Top gainer', 'stock_top_gainer', currentYm, false));
   }
 
   const earnMethod = 'Salary take-home (cash) + rental income for the month.';
+  const lcmEarnRow = earnings.find((r) => r.month === lcm);
   cards.push(earnings.length
     ? flowCard({ section: 'earning', title: 'Total income', metric: 'earning_total',
-      currentYm, series: earnings, field: 'total', method: earnMethod })
+      currentYm, series: earnings, field: 'total', method: earnMethod,
+      equation: sumEquation(rowLegs(lcmEarnRow, [
+        { label: 'Salary take-home', field: 'salary' },
+        { label: 'Rental income', field: 'rental' },
+      ]), at(earnings, lcm, 'total')) })
     : emptyCard('earning', 'Total income', 'earning_total', currentYm, true));
   cards.push(earnings.length
     ? flowCard({ section: 'earning', title: 'Salary take-home', metric: 'earning_salary',
-      currentYm, series: earnings, field: 'salary', method: 'Cash take-home across salary jobs for the month.' })
+      currentYm, series: earnings, field: 'salary', method: 'Cash take-home across salary jobs for the month.',
+      equation: sumEquation(jobParts(), at(earnings, lcm, 'salary')) })
     : emptyCard('earning', 'Salary take-home', 'earning_salary', currentYm, true));
   cards.push(earnings.length
     ? flowCard({ section: 'earning', title: 'Rental income', metric: 'earning_rental',
-      currentYm, series: earnings, field: 'rental', method: 'Rent due across rentals for the month.' })
+      currentYm, series: earnings, field: 'rental', method: 'Rent due across rentals for the month.',
+      equation: sumEquation(rentalParts(), at(earnings, lcm, 'rental')) })
     : emptyCard('earning', 'Rental income', 'earning_rental', currentYm, true));
 
-  const lcm = lastCompletedMonth(currentYm);
   const spendMonths = trailing12(lcm);
   const lcmRow = spending.find((r) => r.month === lcm);
   const prevRow = spending.find((r) => r.month === prevMonth(lcm));
   const yoyRow = spending.find((r) => r.month === addMonthsYm(lcm, -12));
+  const spendLegs = lcmRow ? Object.entries(lcmRow.byCategory || {})
+    .map(([cat, amt]) => ({ label: cat, sign: '+', value: r2(amt || 0) }))
+    .filter((l) => l.value !== 0) : [];
   cards.push(spending.length
     ? flowCard({ section: 'spending', title: 'Total spend', metric: 'spending_total',
-      currentYm, series: spending, field: 'total', method: 'Charges only, for the month. Payments and balance adjustments excluded.' })
+      currentYm, series: spending, field: 'total', method: 'Charges only, for the month. Payments and balance adjustments excluded.',
+      equation: sumEquation(spendLegs, at(spending, lcm, 'total')) })
     : emptyCard('spending', 'Total spend', 'spending_total', currentYm, true));
   // Top category in the last completed month.
   const topCat = (() => {
@@ -461,11 +563,21 @@ export function buildStandardInsights(data) {
     const yoyAmt = yoyRow ? ((yoyRow.byCategory || {})[topCat.category] ?? 0) : null;
     const { mom, yoy } = deltaPair(topCat.amount, prevAmt, yoyAmt);
     const share = lcmRow.total > 0 ? r2((topCat.amount / lcmRow.total) * 100) : null;
+    // The value is one category's amount; the arithmetic that
+    // explains the card is its share of the month's total spend.
+    const topCatEquation = share != null ? {
+      legs: [
+        { label: topCat.category, sign: '', value: topCat.amount },
+        { label: 'Total spend', sign: '', value: lcmRow.total },
+      ],
+      total: topCat.amount,
+      totalText: `= ${share}% of spend`,
+    } : null;
     cards.push(baseCard({ section: 'spending', title: 'Top category', metric: 'spending_top_category',
       period: lcm, value: topCat.amount, valueKind: 'money',
       sublabel: `${topCat.category}${share != null ? ` · ${share}% of spend` : ''}`,
       mom, yoy, spark: spendMonths.map((m) => { const r = catSeries.find((x) => x.month === m); return r ? r.v : null; }),
-      sparkMonths: spendMonths, method: 'Largest spending category in the last completed month.' }));
+      sparkMonths: spendMonths, equation: topCatEquation, method: 'Largest spending category in the last completed month.' }));
   } else {
     cards.push(emptyCard('spending', 'Top category', 'spending_top_category', currentYm, true));
   }
@@ -490,12 +602,24 @@ export function buildStandardInsights(data) {
   if (mover) {
     const catSeries = spending.map((r) => ({ month: r.month, v: (r.byCategory || {})[mover.category] ?? 0 }));
     const share = lcmRow.total > 0 && mover.amount > 0 ? r2((mover.amount / lcmRow.total) * 100) : null;
+    // The big number is the signed MoM change: show the two months
+    // it comes from. Both rows always show, including a $0 month
+    // (a vanished category's $0 is the point).
+    const prevAmt = (prevRow.byCategory || {})[mover.category] ?? 0;
+    const moverEquation = {
+      legs: [
+        { label: `${mover.category} · ${monthLabel(prevMonth(lcm))}`, sign: '', value: r2(prevAmt) },
+        { label: `${mover.category} · ${monthLabel(lcm)}`, sign: '', value: r2(mover.amount) },
+      ],
+      total: mover.delta,
+      totalText: `= ${signedMoney2(mover.delta)} vs ${monthLabel(prevMonth(lcm))}`,
+    };
     cards.push(baseCard({ section: 'spending', title: 'Biggest mover', metric: 'spending_biggest_mover',
       period: lcm, value: mover.delta, valueKind: 'money',
       sublabel: `${mover.category} · ${monthLabel(lcm)} ${mover.amount != null ? `$${mover.amount.toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : ''}${share != null ? ` · ${share}%` : ''}`,
       mom: null, yoy: null,
       spark: spendMonths.map((m) => { const r = catSeries.find((x) => x.month === m); return r ? r.v : null; }),
-      sparkMonths: spendMonths,
+      sparkMonths: spendMonths, equation: moverEquation,
       method: 'Largest month-over-month change by category. The big number is the signed change vs the previous month.' }));
   } else {
     cards.push(emptyCard('spending', 'Biggest mover', 'spending_biggest_mover', currentYm, true));
@@ -1008,10 +1132,29 @@ export function resolveHomeMetric(metric, data) {
     if (!series || !series.length) return { error: 'no_data', message: 'That property has no data yet.' };
     const field = base === 'property_equity' ? 'equity' : base === 'property_assessed' ? 'assessed' : 'outstanding';
     const label = (data.propertyLabels || {})[entityId] || 'Property';
+    const card = pointCard({ section: 'property', title: `${label} ${field === 'equity' ? 'equity' : field === 'assessed' ? 'assessed' : 'outstanding'}`,
+      metric, currentYm, series, field, downIsGood: base === 'property_outstanding',
+      method: `One property's ${field} at month-end.` });
+    // Equity decomposes into the two numbers that define it; a
+    // single assessed or outstanding figure has no decomposition
+    // and keeps its method line.
+    let equation = null;
+    if (base === 'property_equity') {
+      const row = (series || []).find((r) => r.month === currentYm);
+      if (row) {
+        equation = {
+          legs: [
+            { label: 'Assessed value', sign: '+', value: r2(row.assessed) },
+            { label: 'Outstanding principal', sign: '-', value: r2(row.outstanding) },
+          ],
+          total: card.value,
+          footnote: 'At month-end.',
+        };
+      }
+    }
     return {
-      ...pointCard({ section: 'property', title: `${label} ${field === 'equity' ? 'equity' : field === 'assessed' ? 'assessed' : 'outstanding'}`,
-        metric, currentYm, series, field, downIsGood: base === 'property_outstanding',
-        method: `One property's ${field} at month-end.` }),
+      ...card,
+      ...(equation ? { equation } : {}),
       entity: { kind: 'property', id: Number(entityId) },
     };
   }
@@ -1041,20 +1184,40 @@ export function resolveHomeMetric(metric, data) {
     const t = (data.accountTypeById || {})[entityId];
     if (!t || !t.months || !t.months.length) return { error: 'no_data', message: 'No accounts of that type yet.' };
     const field = base === 'account_type_value' ? 'value' : 'gain';
+    const card = pointCard({ section: 'stock', title: `${t.label} ${field}`,
+      metric, currentYm, series: t.months, field,
+      method: `All ${entityId} accounts summed, ${field} at month-end, CAD.` });
+    const accts = Object.fromEntries(Object.entries(data.accountById || {}).filter(([, a]) => a.type === entityId));
+    const equation = sumEquation(partsLegs(accts, currentYm, field), card.value, 'At month-end.');
     return {
-      ...pointCard({ section: 'stock', title: `${t.label} ${field}`,
-        metric, currentYm, series: t.months, field,
-        method: `All ${entityId} accounts summed, ${field} at month-end, CAD.` }),
+      ...card,
+      ...(equation ? { equation } : {}),
       entity: { kind: 'account_type', id: entityId },
     };
   }
   if (base === 'category_spend') {
     const series = (data.categorySeries || {})[entityId];
     if (!series || !series.length) return { error: 'no_data', message: 'That category has no spending yet.' };
+    const card = flowCard({ section: 'spending', title: `${entityId} spend`, metric,
+      currentYm, series, field: 'total',
+      method: `One category's spend in the last completed month.` });
+    // The value is one category's amount; the arithmetic that
+    // explains the card is its share of the month's total spend.
+    const lcm = lastCompletedMonth(currentYm);
+    const spendRow = (data.spending || []).find((r) => r.month === lcm);
+    const spendTotal = spendRow ? r2(spendRow.total || 0) : 0;
+    const share = (card.value != null && spendTotal > 0 && card.value > 0) ? r2((card.value / spendTotal) * 100) : null;
+    const equation = share != null ? {
+      legs: [
+        { label: entityId, sign: '', value: card.value },
+        { label: 'Total spend', sign: '', value: spendTotal },
+      ],
+      total: card.value,
+      totalText: `= ${share}% of spend`,
+    } : null;
     return {
-      ...flowCard({ section: 'spending', title: `${entityId} spend`, metric,
-        currentYm, series, field: 'total',
-        method: `One category's spend in the last completed month.` }),
+      ...card,
+      ...(equation ? { equation } : {}),
       entity: { kind: 'category', id: entityId },
     };
   }
@@ -1095,9 +1258,12 @@ export function resolveHomeMetric(metric, data) {
     if (entityId == null) {
       const series = data.mortgage || [];
       if (!series.length) return { error: 'no_data', message: 'No mortgage payments yet.' };
-      return flowCard({ section: 'property', title: 'Mortgage payments', metric, currentYm,
+      const card = flowCard({ section: 'property', title: 'Mortgage payments', metric, currentYm,
         series, field: 'payment', downIsGood: true,
         method: 'Mortgage payments due in the month, all properties. Down is good.' });
+      const equation = sumEquation(
+        partsLegs(data.mortgageById, lastCompletedMonth(currentYm), 'payment'), card.value);
+      return equation ? { ...card, equation } : card;
     }
     const s = (data.mortgageById || {})[entityId];
     if (!s || !s.months || !s.months.length) return { error: 'no_data', message: 'That property has no mortgage payments yet.' };

@@ -230,6 +230,78 @@ export async function run(H, S) {
     && /Groceries/.test(card('spending_biggest_mover').sublabel),
     JSON.stringify(card('spending_biggest_mover')));
 
+  // ---- API: every standard card carries the numbered breakdown ----
+  // Sum cards: the shown legs add to the card value to the cent.
+  // Definition cards: the legs are the inputs the value is computed
+  // from, and the total line states the result.
+  const r2e = (n) => Math.round(n * 100) / 100;
+  const sumEqLegs = (eq) => (eq && eq.legs ? eq.legs.reduce((a, l) => a + (l.sign === '-' ? -1 : 1) * l.value, 0) : null);
+  const assertSumEq = (metric, legs) => {
+    const c = card(metric);
+    return c && c.equation && JSON.stringify(c.equation.legs) === JSON.stringify(legs)
+      && c.equation.total === c.value && r2e(sumEqLegs(c.equation)) === c.value;
+  };
+  H.check('home API: total equity tooltip breaks down per property',
+    assertSumEq('property_equity', [
+      { label: '1 Home Test Way', sign: '+', value: 1000000 },
+      { label: '2 Home Test Way', sign: '+', value: r2e(500000 - outstandingB) },
+    ]) && card('property_equity').equation.footnote === 'At month-end.',
+    JSON.stringify(card('property_equity') && card('property_equity').equation));
+  H.check('home API: assessed total tooltip breaks down per property',
+    assertSumEq('property_assessed', [
+      { label: '1 Home Test Way', sign: '+', value: 1000000 },
+      { label: '2 Home Test Way', sign: '+', value: 500000 },
+    ]), JSON.stringify(card('property_assessed') && card('property_assessed').equation));
+  H.check('home API: outstanding tooltip is the mortgaged property only (no-mortgage property omitted)',
+    assertSumEq('property_outstanding', [{ label: '2 Home Test Way', sign: '+', value: outstandingB }]),
+    JSON.stringify(card('property_outstanding') && card('property_outstanding').equation));
+  H.check('home API: portfolio value tooltip breaks down per account (empty RRSP omitted)',
+    assertSumEq('stock_value', [{ label: 'TFSA', sign: '+', value: 6000 }]),
+    JSON.stringify(card('stock_value') && card('stock_value').equation));
+  H.check('home API: total gain tooltip breaks down per holding',
+    assertSumEq('stock_gain', [{ label: 'XQQ.TO', sign: '+', value: 1000 }]),
+    JSON.stringify(card('stock_gain') && card('stock_gain').equation));
+  H.check('home API: top gainer tooltip shows the two prices behind the %',
+    card('stock_top_gainer') && JSON.stringify(card('stock_top_gainer').equation) === JSON.stringify({
+      legs: [
+        { label: 'Price Nov 2025', sign: '', value: 48 },
+        { label: 'Price Nov 2026', sign: '', value: 60 },
+      ],
+      total: 25, totalText: '= +25% (trailing 12 months)', footnote: 'Price return only.',
+    }), JSON.stringify(card('stock_top_gainer') && card('stock_top_gainer').equation));
+  H.check('home API: total income tooltip is salary + rental',
+    assertSumEq('earning_total', [
+      { label: 'Salary take-home', sign: '+', value: octSalary },
+      { label: 'Rental income', sign: '+', value: 2000 },
+    ]), JSON.stringify(card('earning_total') && card('earning_total').equation));
+  H.check('home API: salary take-home tooltip breaks down per job',
+    assertSumEq('earning_salary', [{ label: 'Acme Corp', sign: '+', value: octSalary }]),
+    JSON.stringify(card('earning_salary') && card('earning_salary').equation));
+  H.check('home API: rental income tooltip breaks down per rental',
+    assertSumEq('earning_rental', [{ label: 'Basement suite', sign: '+', value: 2000 }]),
+    JSON.stringify(card('earning_rental') && card('earning_rental').equation));
+  H.check('home API: total spend tooltip breaks down per category',
+    assertSumEq('spending_total', [
+      { label: 'Groceries', sign: '+', value: 400 },
+      { label: 'Dining', sign: '+', value: 300 },
+    ]), JSON.stringify(card('spending_total') && card('spending_total').equation));
+  H.check('home API: top category tooltip shows the category vs total spend share',
+    card('spending_top_category') && JSON.stringify(card('spending_top_category').equation) === JSON.stringify({
+      legs: [
+        { label: 'Groceries', sign: '', value: 400 },
+        { label: 'Total spend', sign: '', value: 700 },
+      ],
+      total: 400, totalText: '= 57.14% of spend',
+    }), JSON.stringify(card('spending_top_category') && card('spending_top_category').equation));
+  H.check('home API: biggest mover tooltip shows the two months behind the change',
+    card('spending_biggest_mover') && JSON.stringify(card('spending_biggest_mover').equation) === JSON.stringify({
+      legs: [
+        { label: 'Groceries · Sep 2026', sign: '', value: 200 },
+        { label: 'Groceries · Oct 2026', sign: '', value: 400 },
+      ],
+      total: 200, totalText: '= +$200.00 vs Sep 2026',
+    }), JSON.stringify(card('spending_biggest_mover') && card('spending_biggest_mover').equation));
+
   // Equity MoM delta matches the overview chart's own series.
   r = await H.req('GET', '/api/overview/chart');
   const eqNov = r.data.propertyByMonth.find((x) => x.month === '2026-11');
@@ -331,6 +403,14 @@ export async function run(H, S) {
   H.check('home AI: Apply appends exactly one AI card with the computed value',
     r.status === 201 && r.data.insight && r.data.insight.kind === 'ai' && r.data.insight.value === 1000000,
     JSON.stringify(r.data));
+  H.check('home AI: per-property equity card carries the assessed − outstanding breakdown',
+    r.data.insight && JSON.stringify(r.data.insight.equation) === JSON.stringify({
+      legs: [
+        { label: 'Assessed value', sign: '+', value: 1000000 },
+        { label: 'Outstanding principal', sign: '-', value: 0 },
+      ],
+      total: 1000000, footnote: 'At month-end.',
+    }), JSON.stringify(r.data.insight && r.data.insight.equation));
   H.check('home AI: appended card stores its entity ref (property + id)',
     r.data.insight && JSON.stringify(r.data.insight.entity) === JSON.stringify({ kind: 'property', id: pidA }),
     JSON.stringify(r.data.insight && r.data.insight.entity));
@@ -362,6 +442,9 @@ export async function run(H, S) {
       && JSON.stringify(r.data.insight.entity) === JSON.stringify({ kind: 'job', id: jobId })
       && r.data.insight.value === octSalary && r.data.insight.period === '2026-10',
     JSON.stringify(r.data));
+  H.check('home AI: per-job take-home has no breakdown (one job, no decomposition) — method line only',
+    r.data.insight && r.data.insight.equation === undefined && typeof r.data.insight.method === 'string' && r.data.insight.method.length > 0,
+    JSON.stringify(r.data.insight && { equation: r.data.insight.equation, method: r.data.insight.method }));
   const jobAiId = r.data.insight.id;
   r = await H.req('DELETE', `/api/home/insights/${jobAiId}`);
   H.check('home AI: per-job AI card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
@@ -399,6 +482,11 @@ export async function run(H, S) {
     r.status === 201 && r.data.insight && r.data.insight.value === 6000
       && JSON.stringify(r.data.insight.entity) === JSON.stringify({ kind: 'account_type', id: 'TFSA' }),
     JSON.stringify(r.data));
+  H.check('home AI: all-TFSA card carries the per-account breakdown',
+    r.data.insight && JSON.stringify(r.data.insight.equation) === JSON.stringify({
+      legs: [{ label: 'TFSA', sign: '+', value: 6000 }],
+      total: 6000, footnote: 'At month-end.',
+    }), JSON.stringify(r.data.insight && r.data.insight.equation));
   const typeAiId = r.data.insight.id;
   r = await H.req('DELETE', `/api/home/insights/${typeAiId}`);
   H.check('home AI: all-TFSA AI card deletes', r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
@@ -1118,6 +1206,76 @@ export async function run(H, S) {
     r = await H.req('DELETE', `/api/home/insights/${compositeBrowserId}`);
     H.check('home AI: composite card cleaned up after the browser pin',
       r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+    // ---- numbered tooltips on the standard cards (2026-11-11) ----
+    // Every card's hover tooltip shows the arithmetic behind its
+    // value, with numbers; the card itself shows none of it. The
+    // native title tooltip is drawn by the browser, not the page,
+    // so the tooltip content is asserted from the title attribute.
+    const fmt2 = (n) => `$${n.toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const tips = await page.evaluate(() => {
+      const read = (section, label) => {
+        const c = [...document.querySelectorAll(`[data-home-section="${section}"] .insight-card`)]
+          .find((x) => x.querySelector('.insight-label')?.textContent.startsWith(label));
+        if (!c) return null;
+        c.scrollIntoView({ block: 'center' });
+        return { tip: c.getAttribute('title'), visibleText: c.textContent };
+      };
+      return {
+        rental: read('earning', 'Rental income'),
+        equity: read('property', 'Total equity'),
+        gain: read('stock', 'Total gain'),
+        income: read('earning', 'Total income'),
+        spend: read('spending', 'Total spend'),
+      };
+    });
+    const equityB = Math.round((500000 - outstandingB) * 100) / 100;
+    const equityTotal = `$${Math.round(1500000 - outstandingB).toLocaleString('en-CA')}`;
+    const incomeTotal = `$${Math.round(octSalary + 2000).toLocaleString('en-CA')}`;
+    H.check('home UI: rental income tooltip shows the per-rental breakdown, the card shows none',
+      tips.rental && tips.rental.tip && tips.rental.tip.includes('Basement suite $2,000.00')
+        && tips.rental.tip.includes('= $2,000 (Oct 2026)')
+        && tips.rental.tip.includes('Last completed month.')
+        && !tips.rental.visibleText.includes('Basement suite')
+        && !tips.rental.visibleText.includes('2,000.00'),
+      JSON.stringify(tips.rental));
+    H.check('home UI: total equity tooltip shows the per-property breakdown, the card shows none',
+      tips.equity && tips.equity.tip && tips.equity.tip.includes('1 Home Test Way $1,000,000.00')
+        && tips.equity.tip.includes(`2 Home Test Way ${fmt2(equityB)}`)
+        && tips.equity.tip.includes(`= ${equityTotal} (Nov 2026)`)
+        && tips.equity.tip.includes('At month-end.')
+        && !tips.equity.visibleText.includes('1 Home Test Way')
+        && !tips.equity.visibleText.includes('1,000,000.00'),
+      JSON.stringify(tips.equity));
+    H.check('home UI: total gain tooltip shows the per-holding breakdown, the card shows none',
+      tips.gain && tips.gain.tip && tips.gain.tip.includes('XQQ.TO $1,000.00')
+        && tips.gain.tip.includes('= $1,000 (Nov 2026)')
+        && tips.gain.tip.includes('At month-end.')
+        && !tips.gain.visibleText.includes('XQQ.TO')
+        && !tips.gain.visibleText.includes('1,000.00'),
+      JSON.stringify(tips.gain));
+    H.check('home UI: total income tooltip shows salary + rental, the card shows none',
+      tips.income && tips.income.tip && tips.income.tip.includes(`Salary take-home ${fmt2(octSalary)}`)
+        && tips.income.tip.includes('+ Rental income $2,000.00')
+        && tips.income.tip.includes(`= ${incomeTotal} (Oct 2026)`)
+        && !tips.income.visibleText.includes(fmt2(octSalary))
+        && !tips.income.visibleText.includes('Salary take-home')
+        && !tips.income.visibleText.includes('Rental income'),
+      JSON.stringify(tips.income));
+    H.check('home UI: total spend tooltip shows the per-category breakdown, the card shows none',
+      tips.spend && tips.spend.tip && tips.spend.tip.includes('Groceries $400.00')
+        && tips.spend.tip.includes('+ Dining $300.00')
+        && tips.spend.tip.includes('= $700 (Oct 2026)')
+        && !tips.spend.visibleText.includes('Groceries')
+        && !tips.spend.visibleText.includes('400.00'),
+      JSON.stringify(tips.spend));
+    const rentalEl = await page.evaluateHandle(() => [...document.querySelectorAll('[data-home-section="earning"] .insight-card')]
+      .find((c) => c.querySelector('.insight-label')?.textContent.startsWith('Rental income')));
+    const rentalNode = rentalEl.asElement();
+    if (rentalNode) {
+      await rentalNode.hover();
+      await new Promise((r) => setTimeout(r, 1200));
+      await rentalNode.screenshot({ path: '/home/hatch/workspace/fm-verify/home-all-cards-equation-/shots/rental-card.png' });
+    }
     // Deltas: the insight chips stay small (12px) while the report
     // cards render them larger (17px, measured above) — and the YoY
     // line is color-coded in insight mode too, not plain gray.

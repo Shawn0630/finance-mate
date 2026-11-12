@@ -6407,7 +6407,7 @@ function refreshRentalAiInsights(userId, insights, data) {
       continue;
     }
     const fresh = { ...computed, title: row.title, section: row.section };
-    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy]);
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy, c.equation]);
     if (sig(fresh) !== sig(row)) {
       db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
         .run(JSON.stringify(fresh), now, now, row.id);
@@ -6453,7 +6453,7 @@ function refreshSalaryAiInsights(userId, insights, data) {
       continue;
     }
     const fresh = { ...computed, title: row.title, section: row.section };
-    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy]);
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy, c.equation]);
     if (sig(fresh) !== sig(row)) {
       db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
         .run(JSON.stringify(fresh), now, now, row.id);
@@ -6478,6 +6478,73 @@ function refreshCompositeAiInsights(userId, insights, data) {
   const out = [];
   for (const row of insights) {
     if (row.kind !== 'ai' || !String(row.metric).startsWith('composite:')) { out.push(row); continue; }
+    const computed = resolveHomeMetric(row.metric, data);
+    if (!computed || computed.error) { out.push(row); continue; }
+    const fresh = { ...computed, title: row.title, section: row.section };
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy, c.equation]);
+    if (sig(fresh) !== sig(row)) {
+      db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(fresh), now, now, row.id);
+      changed = true;
+      out.push({ ...row, ...fresh, generated_at: now });
+    } else {
+      out.push(row);
+    }
+  }
+  return changed ? out : insights;
+}
+
+// Standard (system) cards are stored snapshots, regenerated only
+// when >7 days stale — but the numbers behind a card move with an
+// edit (a new assessment, a rent change) long before that, and the
+// breakdown is new code on old rows. Re-resolve the standard set
+// from live data on every Home load and update stored rows whose
+// value, period, spark, deltas or equation moved — the same
+// read-time refresh the AI cards get. In-place payload update only:
+// ids and the user's drag order are untouched.
+function refreshStandardInsights(userId, insights, data) {
+  const fresh = buildStandardInsights(data);
+  const byMetric = new Map(fresh.map((c) => [c.metric, c]));
+  const now = new Date().toISOString();
+  let changed = false;
+  const out = [];
+  for (const row of insights) {
+    if (row.kind !== 'system') { out.push(row); continue; }
+    const computed = byMetric.get(row.metric);
+    if (!computed) { out.push(row); continue; }
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy, c.equation]);
+    if (sig(computed) !== sig(row)) {
+      db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(computed), now, now, row.id);
+      changed = true;
+      out.push({ ...row, ...computed, generated_at: now });
+    } else {
+      out.push(row);
+    }
+  }
+  return changed ? out : insights;
+}
+
+// The remaining AI cards — per-property / holding / account /
+// account-type / category / mortgage, plus AI cards on a standard
+// metric (e.g. an AI 'Total gain' card) — are stored snapshots too
+// and never refreshed on read (the known property/stock gap). This
+// closes that gap for the tooltip round: re-resolve them from live
+// data on every Home load, like the other AI cards. On an error the
+// stored snapshot is kept (never deleted on read); the rental and
+// salary refreshes above keep their own delete-when-the-entity-is-
+// gone rules, so this runs last and skips what they already cover.
+function refreshOtherAiInsights(userId, insights, data) {
+  const now = new Date().toISOString();
+  let changed = false;
+  const out = [];
+  for (const row of insights) {
+    if (row.kind !== 'ai') { out.push(row); continue; }
+    const colon = String(row.metric).indexOf(':');
+    const base = colon === -1 ? String(row.metric) : String(row.metric).slice(0, colon);
+    if (String(row.metric).startsWith('composite:')) { out.push(row); continue; }
+    if (RENTAL_AI_METRICS.has(row.metric) || base === 'rental_income') { out.push(row); continue; }
+    if (SALARY_AI_METRICS.has(row.metric) || base === 'job_takehome' || base === 'job_takehome_period') { out.push(row); continue; }
     const computed = resolveHomeMetric(row.metric, data);
     if (!computed || computed.error) { out.push(row); continue; }
     const fresh = { ...computed, title: row.title, section: row.section };
@@ -6527,6 +6594,14 @@ app.get('/api/home', requireApiAuth, async (req, res) => {
   // Composite AI cards refresh from live data (see
   // refreshCompositeAiInsights): a leg change must move them at once.
   insights = refreshCompositeAiInsights(userId, insights, data);
+  // Standard cards refresh from live data too (see
+  // refreshStandardInsights): an edit moves them at once instead
+  // of waiting for the 7-day regeneration.
+  insights = refreshStandardInsights(userId, insights, data);
+  // The remaining AI cards refresh from live data (see
+  // refreshOtherAiInsights): this closes the property/stock gap
+  // for the tooltip round.
+  insights = refreshOtherAiInsights(userId, insights, data);
   // Report mode shows a property card's house photo: attach the
   // first gallery photo (or the legacy photo_url) to property-entity
   // cards. No photo → photo: null, and the card renders no

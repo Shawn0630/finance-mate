@@ -19932,19 +19932,26 @@ function homeYoyHtml(d, kind, downIsGood, vsLabel) {
 // that leg's CONTRIBUTION (formula sign × leg value), so the lines
 // always add to the total even if a leg value were ever negative;
 // in practice every flow series is non-negative, so the operators
-// match the formula signs exactly. Newlines in the title attribute
-// render as line breaks in the native tooltip.
+// match the formula signs exactly. A leg with sign '' renders with
+// no operator (a definition row, e.g. a price then / now pair).
+// totalText replaces the whole `= $X (Period)` line when the value
+// is not a money sum (a % or a signed delta). footnote is the last
+// line: it defaults to 'Last completed month.' (flow cards);
+// point-in-time cards set 'At month-end.'; '' omits the line.
+// Newlines in the title attribute render as line breaks in the
+// native tooltip.
 function homeEquationTooltip(c) {
   const eq = c && c.equation;
   if (!eq || !Array.isArray(eq.legs) || !eq.legs.length) return null;
   const lines = eq.legs.map((leg, i) => {
     const contribution = (leg.sign === '-' ? -1 : 1) * Number(leg.value || 0);
     const amount = money2(Math.abs(contribution));
+    if (leg.sign === '') return `${esc(leg.label)} ${amount}`;
     if (i === 0) return contribution < 0 ? `− ${esc(leg.label)} ${amount}` : `${esc(leg.label)} ${amount}`;
     return `${contribution < 0 ? '− ' : '+ '}${esc(leg.label)} ${amount}`;
   });
-  lines.push(`= ${money(eq.total != null ? eq.total : c.value)} (${esc(c.periodLabel || '')})`);
-  lines.push('Last completed month.');
+  lines.push(eq.totalText != null ? eq.totalText : `= ${money(eq.total != null ? eq.total : c.value)} (${esc(c.periodLabel || '')})`);
+  if (eq.footnote !== '') lines.push(eq.footnote != null ? eq.footnote : 'Last completed month.');
   return lines.join('\n');
 }
 
