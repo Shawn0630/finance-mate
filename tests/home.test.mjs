@@ -854,9 +854,42 @@ test('home: composite — monthly net cashflow evaluates to the cent', () => {
   assert.equal(card.method, 'Acme Corp take-home + Basement income − Mortgage payments, last completed month.');
   assert.equal(card.section, 'earning');
   assert.equal(card.valueKind, 'money');
+  // The tooltip equation: each leg's label + exact value for the
+  // displayed month, and the total — the legs sum to the card value
+  // to the cent.
+  assert.deepEqual(card.equation, {
+    legs: [
+      { label: 'Acme Corp take-home', sign: '+', value: 5000 },
+      { label: 'Basement income', sign: '+', value: 2000 },
+      { label: 'Mortgage payments', sign: '-', value: 1744.81 },
+    ],
+    total: 5255.19,
+  });
+  const legSum = card.equation.legs.reduce((s, l) => s + (l.sign === '-' ? -l.value : l.value), 0);
+  assert.equal(Math.round(legSum * 100) / 100, card.value);
   // A per-property mortgage leg works the same way.
   const perProp = resolveHomeMetric('composite:job_takehome:3+rental_income:7-mortgage_payment:5', data);
   assert.equal(perProp.value, 5255.19);
+  assert.deepEqual(perProp.equation.legs[2], { label: '77 Riverbend mortgage', sign: '-', value: 1744.81 });
+});
+
+test('home: composite — a leg missing the displayed month counts as 0 and still shows', () => {
+  const data = compositeData();
+  // Rental has September only: October's composite is salary − mortgage.
+  data.rentalById = { 7: { label: 'Basement', months: months('2026-09', [2000], 'rental') } };
+  const card = resolveHomeMetric('composite:job_takehome:3+rental_income:7-mortgage_payment', data);
+  assert.equal(card.value, 3255.19); // Oct: 5000 + 0 − 1744.81
+  assert.equal(card.period, '2026-10');
+  assert.deepEqual(card.equation, {
+    legs: [
+      { label: 'Acme Corp take-home', sign: '+', value: 5000 },
+      { label: 'Basement income', sign: '+', value: 0 },
+      { label: 'Mortgage payments', sign: '-', value: 1744.81 },
+    ],
+    total: 3255.19,
+  });
+  const legSum = card.equation.legs.reduce((s, l) => s + (l.sign === '-' ? -l.value : l.value), 0);
+  assert.equal(Math.round(legSum * 100) / 100, card.value);
 });
 
 test('home: mortgage_payment metrics resolve as flow cards, down is good', () => {

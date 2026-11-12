@@ -19924,6 +19924,30 @@ function homeYoyHtml(d, kind, downIsGood, vsLabel) {
   return `<span class="delta-yoy ${good ? 'good' : 'bad'}">YoY ${arrow} ${amt}${pct} vs ${esc(vsLabel)}</span>`;
 }
 
+// Hover tooltip for a composite card: the equation WITH numbers for
+// the displayed month — each leg's label + exact value with its sign,
+// and the total. The card itself shows no equation; the tooltip is
+// the only place the breakdown lives. Single-metric cards keep the
+// words-only method line. The operator on each line is the sign of
+// that leg's CONTRIBUTION (formula sign × leg value), so the lines
+// always add to the total even if a leg value were ever negative;
+// in practice every flow series is non-negative, so the operators
+// match the formula signs exactly. Newlines in the title attribute
+// render as line breaks in the native tooltip.
+function homeEquationTooltip(c) {
+  const eq = c && c.equation;
+  if (!eq || !Array.isArray(eq.legs) || !eq.legs.length) return null;
+  const lines = eq.legs.map((leg, i) => {
+    const contribution = (leg.sign === '-' ? -1 : 1) * Number(leg.value || 0);
+    const amount = money2(Math.abs(contribution));
+    if (i === 0) return contribution < 0 ? `− ${esc(leg.label)} ${amount}` : `${esc(leg.label)} ${amount}`;
+    return `${contribution < 0 ? '− ' : '+ '}${esc(leg.label)} ${amount}`;
+  });
+  lines.push(`= ${money(eq.total != null ? eq.total : c.value)} (${esc(c.periodLabel || '')})`);
+  lines.push('Last completed month.');
+  return lines.join('\n');
+}
+
 function homeInsightCardHtml(c, opts) {
   const delBtn = c.kind === 'ai'
     ? `<button class="home-card-del" data-home-del="${c.id}" aria-label="Delete card">×</button>` : '';
@@ -19931,8 +19955,9 @@ function homeInsightCardHtml(c, opts) {
   const link = homeCardLink(c);
   const linkAttrs = ` data-home-link="${link.href}"${link.category ? ` data-home-category="${esc(link.category)}"` : ''} role="link" tabindex="0"`;
   const keyAttr = ` data-home-key="${esc(homeCardKey(c))}"`;
+  const tip = homeEquationTooltip(c) || c.method || '';
   if (!c.hasData) {
-    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
+    return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(tip)}"${linkAttrs}${keyAttr}>${delBtn}
       <div class="insight-text">
         <div class="insight-label">${esc(c.title)}${aiTag}</div>
         <div class="insight-empty">No data yet</div>
@@ -19944,7 +19969,7 @@ function homeInsightCardHtml(c, opts) {
       <canvas data-spark='${JSON.stringify(c.spark)}' data-spark-months='${JSON.stringify(c.sparkMonths || [])}' data-spark-kind="${esc(c.valueKind || 'money')}"></canvas>
       <div class="spark-ends"><span>${homeCompactValue(sparkVals[0], c.valueKind)}</span><span>${homeCompactValue(sparkVals[sparkVals.length - 1], c.valueKind)}</span></div>
     </div>` : '';
-  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(c.method || '')}"${linkAttrs}${keyAttr}>${delBtn}
+  return `<div class="insight-card" data-insight-id="${c.id}" title="${esc(tip)}"${linkAttrs}${keyAttr}>${delBtn}
     <div class="insight-text">
       <div class="insight-label">${esc(c.title)}${aiTag}</div>
       <div class="insight-value">${homeFormatValue(c)}</div>

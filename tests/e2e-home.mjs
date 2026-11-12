@@ -456,7 +456,12 @@ export async function run(H, S) {
     r.status === 200 && r.data.proposal && r.data.proposal.metric === cashflowMetric
       && r.data.proposal.preview && r.data.proposal.preview.value === cashflowValue
       && r.data.proposal.preview.period === '2026-10'
-      && r.data.proposal.preview.method === 'Acme Corp take-home + Basement suite income − Mortgage payments, last completed month.',
+      && r.data.proposal.preview.method === 'Acme Corp take-home + Basement suite income − Mortgage payments, last completed month.'
+      && JSON.stringify(r.data.proposal.preview.equation) === JSON.stringify({ legs: [
+        { label: 'Acme Corp take-home', sign: '+', value: octSalary },
+        { label: 'Basement suite income', sign: '+', value: 2000 },
+        { label: 'Mortgage payments', sign: '-', value: 1744.81 },
+      ], total: cashflowValue }),
     JSON.stringify(r.data));
   const cashflowProposal = r.data.proposal;
   r = await H.req('POST', '/api/home/insights/ai-apply', { definition: cashflowProposal });
@@ -1075,21 +1080,41 @@ export async function run(H, S) {
       if (!card) return null;
       card.scrollIntoView({ block: 'center' });
       return { value: card.querySelector('.insight-value')?.textContent,
-        method: card.getAttribute('title'),
-        hasSpark: !!card.querySelector('canvas[data-spark]') };
+        tip: card.getAttribute('title'),
+        hasSpark: !!card.querySelector('canvas[data-spark]'),
+        visibleText: card.textContent };
     });
     // Insight cards render money to whole dollars ($5,211 for
     // $5,210.83); the API pin above already asserts the exact cents.
+    // The numbered equation lives in the hover tooltip (the title
+    // attribute) only — the card itself shows no equation text.
     const compositeDisplay = `$${Math.round(cashflowValue).toLocaleString('en-CA')}`;
-    H.check('home UI: the composite cashflow card renders in the Earning section with its value + formula',
+    const octSalary2 = `$${octSalary.toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    H.check('home UI: the composite card tooltip shows the numbered equation, the card itself shows none',
       compositeSeen && compositeSeen.value && compositeSeen.value.includes(compositeDisplay)
-        && compositeSeen.method && compositeSeen.method.includes('Acme Corp take-home')
-        && compositeSeen.hasSpark,
+        && compositeSeen.tip && compositeSeen.tip.includes(`Acme Corp take-home ${octSalary2}`)
+        && compositeSeen.tip.includes('+ Basement suite income $2,000.00')
+        && compositeSeen.tip.includes('− Mortgage payments $1,744.81')
+        && compositeSeen.tip.includes('= $5,211 (Oct 2026)')
+        && compositeSeen.tip.includes('Last completed month.')
+        && compositeSeen.tip.split('\n').length === 5
+        && compositeSeen.hasSpark
+        && compositeSeen.visibleText && !compositeSeen.visibleText.includes('4,955.64')
+        && !compositeSeen.visibleText.includes('Basement suite income')
+        && !compositeSeen.visibleText.includes('Mortgage payments'),
       JSON.stringify(compositeSeen));
     const compositeEl = await page.evaluateHandle(() => [...document.querySelectorAll('[data-home-section="earning"] .insight-card')]
       .find((c) => c.querySelector('.insight-label')?.textContent.startsWith('Monthly net cashflow')));
     const compositeNode = compositeEl.asElement();
-    if (compositeNode) await compositeNode.screenshot({ path: '/home/hatch/workspace/fm-verify/home-ai-composite-/composite-card.png' });
+    if (compositeNode) {
+      // Hover the card first (the real hover path); a native title
+      // tooltip is drawn by the browser, not the page, so the
+      // screenshot shows the unchanged card — the tooltip content
+      // itself is asserted from the title attribute above.
+      await compositeNode.hover();
+      await new Promise((r) => setTimeout(r, 1200));
+      await compositeNode.screenshot({ path: '/home/hatch/workspace/fm-verify/home-ai-composite-equation-/shots/composite-card.png' });
+    }
     r = await H.req('DELETE', `/api/home/insights/${compositeBrowserId}`);
     H.check('home AI: composite card cleaned up after the browser pin',
       r.status === 200 && r.data.ok === true, JSON.stringify(r.data));

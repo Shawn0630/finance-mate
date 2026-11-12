@@ -943,7 +943,7 @@ function resolveHomeComposite(metric, data) {
   for (const t of v.terms) {
     const s = homeFlowSeries(t.metric, data);
     if (s.error) return { error: s.error, message: s.message };
-    legs.push({ ...t, months: s.months });
+    legs.push({ ...t, months: s.months, label: s.label });
   }
   const byMonth = new Map();
   for (const leg of legs) {
@@ -958,7 +958,21 @@ function resolveHomeComposite(metric, data) {
     series, field: 'value', method: v.method,
   });
   if (!card.hasData) return { error: 'no_data', message: 'That combination has no data yet.' };
-  return card;
+  // The hover tooltip shows the equation WITH numbers for the
+  // displayed month: each leg's label + exact value + its sign, and
+  // the total. A leg missing the displayed month counts as 0 and
+  // still shows. Leg values are cent-exact by construction (every
+  // flow series is r2'd per month), so the legs sum to the card
+  // value to the cent. The card itself shows no equation — the
+  // tooltip is the only place the breakdown lives.
+  const equation = {
+    legs: legs.map((leg) => {
+      const row = leg.months.find((r) => r.month === card.period);
+      return { label: leg.label, sign: leg.sign, value: r2(Number(row ? row.value : 0) || 0) };
+    }),
+    total: card.value,
+  };
+  return { ...card, equation };
 }
 
 // Compute ONE card from a metric id (standard or per-entity) using

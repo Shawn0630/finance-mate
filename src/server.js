@@ -6481,7 +6481,7 @@ function refreshCompositeAiInsights(userId, insights, data) {
     const computed = resolveHomeMetric(row.metric, data);
     if (!computed || computed.error) { out.push(row); continue; }
     const fresh = { ...computed, title: row.title, section: row.section };
-    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy]);
+    const sig = (c) => JSON.stringify([c.value, c.period, c.spark, c.mom, c.yoy, c.equation]);
     if (sig(fresh) !== sig(row)) {
       db.prepare('UPDATE home_insights SET payload = ?, generated_at = ?, updated_at = ? WHERE id = ?')
         .run(JSON.stringify(fresh), now, now, row.id);
